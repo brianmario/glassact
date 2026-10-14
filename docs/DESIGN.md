@@ -802,13 +802,13 @@ Why two tunnels instead of one: the transport is built on the
 streams (extracting a datagram flow from the group fails). The
 `NetworkConnection` API that does needed macOS 26, newer than the
 deployment target when the transport was written. The floor is now
-macOS 27, so that reason is gone; **issue #16** tracks moving to one tunnel
+macOS 27, so that reason is gone; **issue #10** tracks moving to one tunnel
 (one port, one handshake, no tunnel pairing). A 2026-09 spike of that API
 is in BENCHMARKS ("`NetworkConnection<QUIC>` spike"). The details are in the
 `## Deviations` note at the top of `QUICTransport.swift`.
 
 Tile records over QUIC streams (one stream per batch) were prototyped and
-removed: they stalled under 1–3 % random loss. Issue #5 tracks whether to
+removed: they stalled under 1–3 % random loss. Issue #10 tracks whether to
 revisit them (BENCHMARKS "PROTOTYPE: tile records over QUIC streams").
 
 **`InProcTransport`** (tests and bench) has the same interface and runs in
@@ -1016,7 +1016,7 @@ What an observer still sees:
   (directory 0700, files 0600, written atomically) and imported memory-only;
   the keychain isn't used.
 - The PKCS#12 passphrase is a fixed constant, so the files' permissions are the
-  only protection (issue #13).
+  only protection (issue #2).
 - A key file that can be read but not imported (another passphrase,
   corruption) is replaced with a fresh identity, written the same way. Peers
   then see a new key: viewers get the changed-key refusal from a host, and a
@@ -1072,7 +1072,7 @@ What an observer still sees:
 - Under "Ask", nothing rate-limits approval prompts from new keys. (Under
   "Sign in", new keys cause no prompts.)
 - First contact is only as safe as the person comparing codes.
-- The apps are unsandboxed (issue #14) and use private API: CGVirtualDisplay
+- The apps are unsandboxed (issue #8) and use private API: CGVirtualDisplay
   and `SACLockScreenImmediate`.
 - Bonjour advertises the computer name.
 
@@ -1115,4 +1115,4 @@ hand-rolled JSON-RPC 2.0 over stdio) whose tools mirror computer use.
   Typed text is counted, not recorded.
 - A headless agent leaving doesn't trigger the lock-on-leave.
 
-A private display for agents is deferred (issue #12).
+A private display for agents is deferred (issue #7).

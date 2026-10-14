@@ -26,7 +26,7 @@ import Synchronization
 // (https://developer.apple.com/forums/thread/813467). That API needed
 // macOS 26, newer than the deployment target when this transport was
 // written. The floor is now macOS 27, so that reason is gone; the transport
-// simply hasn't moved yet. Issue #16 tracks moving to one tunnel via
+// simply hasn't moved yet. Issue #10 tracks moving to one tunnel via
 // `NetworkConnection`.
 //
 // The *video stream* is a second stream extracted from the control group

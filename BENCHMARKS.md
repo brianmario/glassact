@@ -125,7 +125,7 @@ the numbers and the reasoning.
 
 | idea | verdict | key number | entry |
 |---|---|---|---|
-| LZBITMAP tile codec (0x09) | kept, for Mac-only peers | typing 514 → 313 KB/s at adoption; dropping it now costs 1–11 % of tile bytes and saves ~20 % encode CPU. Replacement plan: issue #9 | [adoption](#codec-evaluation--lzbitmap-baseline-2026-08-05), [re-check](#lzbitmap-is-the-apple-only-codec-worth-keeping-2026-10-06) |
+| LZBITMAP tile codec (0x09) | kept, for Mac-only peers | typing 514 → 313 KB/s at adoption; dropping it now costs 1–11 % of tile bytes and saves ~20 % encode CPU. Replacement plan: the multi-platform notes in the pre-release archive | [adoption](#codec-evaluation--lzbitmap-baseline-2026-08-05), [re-check](#lzbitmap-is-the-apple-only-codec-worth-keeping-2026-10-06) |
 | VP8L tiles (vendored libwebp, 0x0A) | kept | scroll 14.6 → 9.83 MB/s, typing 313 → 159 KB/s | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | In-house spatial predictors + LZBITMAP | rejected | 0 % on the text corpus (728 → 728 B/tile) | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
@@ -190,8 +190,8 @@ the numbers and the reasoning.
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
 | CUBIC-style video cap recovery | kept | back to 70 % in 2.0 s instead of 9.25 s | [entry](#video-cap-cubic-style-recovery-after-a-hiccup-2026-09-29) |
 | 3 Mbit/s video cap until the link is measured | kept | p95 from connect 574–755 → 145–673 ms | [entry](#video-startup-3-mbits-cap-until-the-link-is-measured-2026-09-30) |
-| Tile records over QUIC streams | prototype removed 2026-10-13; issue #5 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
-| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #16 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
+| Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
+| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
 
 **Engine and build**
 
@@ -450,7 +450,7 @@ adaptive VP8L routing (probe backoff when a cheaper codec wins) interacts
 with what sits in that slot, so a replacement needs the routing re-tuned
 with it, not a drop-in swap. zlib compresses best but costs ~1.5× the CPU.
 Kept for now (Mac-only peers; bitrate efficiency is the default); the
-multi-platform issue (#9) carries the replacement plan.
+multi-platform notes in the pre-release archive carry the replacement plan.
 
 ### Video startup: 3 Mbit/s cap until the link is measured (2026-09-30)
 
@@ -910,7 +910,7 @@ cheap part: fewer, larger receive units (e.g. a stream only for cold-start
 / settle bursts on a clean path).
 
 *2026-10-13:* the prototype was removed (wire v3; viewers no longer accept
-`0x54` streams). It is in the pre-release archive; issue #5 tracks whether
+`0x54` streams). It is in the pre-release archive; issue #10 tracks whether
 to revisit.
 
 ### Auto send rate replaces the fixed 25 Mbit ladder (2026-09-27)
@@ -1108,7 +1108,7 @@ tunnel on `port + 1` (DESIGN §6) would go away. Spike on loopback with
 
 Verdict: not adopted then. Revisit if Apple adds batch or idempotent
 datagram sends, or when the two-port split becomes a deployment problem
-(NAT, firewalls). Issue #16 tracks a single tunnel.
+(NAT, firewalls). Issue #10 tracks a single tunnel.
 
 ### Review pass: section-5 performance (2026-09-26)
 
