@@ -15,7 +15,7 @@ import Synchronization
 /// CryptoKit key, hand-encoded certificate and PKCS#12 (SelfSignedIdentity)
 /// — and kept in `~/Library/Application Support/Glass Act` (directory 0700, PKCS#12 file 0600). They are
 /// imported memory-only: nothing touches a keychain, so rebuilds never
-/// prompt. (Issue #13 tracks keeping them in the Keychain instead.)
+/// prompt. (Issue #2 tracks keeping them in the Keychain instead.)
 public enum QUICIdentity {
     /// The PKCS#12 container needs *a* passphrase; the file's secrecy comes
     /// from its permissions (0600 in a 0700 directory), not from this.

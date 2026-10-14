@@ -85,8 +85,10 @@ Data Access** (remote input). Setup asks for both on first launch.
 `main` is protected: every change lands through a pull request, and CI
 must pass first.
 
-- CI (`.github/workflows/ci.yml`) runs the full test suite and builds both
-  apps, unsigned, on GitHub's macOS 27 / Xcode 27 runner.
+- CI (`.github/workflows/ci.yml`) runs the test suite and builds both
+  apps, unsigned, on GitHub's macOS 27 / Xcode 27 runner. It skips
+  `VideoSendGateTests`, a link-emulation rig that needs real hardware to
+  reproduce its baseline, so run `just test` locally before pushing.
 - A pull request must be up to date with `main` before it merges. Use
   **Update branch** on the pull request to catch up.
 - Keep each pull request to one change, with DESIGN.md and BENCHMARKS.md
