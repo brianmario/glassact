@@ -1,0 +1,19 @@
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+.DS_Store
+
+# Xcode build output (xcodebuild -derivedDataPath)
+Apps/build/
+
+# Per-developer signing (team, bundle ID prefix) — see Apps/Signing.xcconfig
+Apps/Signing.local.xcconfig
+
+# Claude Code: per-user settings and agent worktrees
+.claude/settings.local.json
+.claude/worktrees/
+
+# Recorded traces and release archives
+*.scap
+*.xcarchive

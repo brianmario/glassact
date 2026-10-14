@@ -1,0 +1,19 @@
+// Code signing for Glass Act Host and Glass Act Viewer.
+//
+// The defaults build for anyone. To sign with your own Apple developer
+// account, create Signing.local.xcconfig next to this file (git-ignored):
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//   GLASSACT_BUNDLE_PREFIX = com.example.glassact
+//
+// If you set your own DEVELOPMENT_TEAM, set your own GLASSACT_BUNDLE_PREFIX
+// too: the default `app.glassact` is registered to the project owner's team,
+// so signing app.glassact.host or app.glassact.viewer with any other team
+// fails. macOS ties Screen Recording and Device Control grants to the bundle
+// ID and team, so keep both stable once you've granted them. Apps/release.sh
+// reads both from these files too.
+
+DEVELOPMENT_TEAM =
+GLASSACT_BUNDLE_PREFIX = app.glassact
+
+#include? "Signing.local.xcconfig"
