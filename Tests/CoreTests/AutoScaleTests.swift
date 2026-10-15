@@ -5,7 +5,7 @@ import GlassActCore
 import GlassActTransport
 import GlassActTestSupport
 
-/// Auto-scale pressure (the airplane-wifi story): resolution is the adaptive
+/// Auto-scale pressure (e.g. airplane Wi-Fi): resolution is the adaptive
 /// ladder's rung below quality. Sustained severe ack-delay fires a
 /// once-per-session "constrained" suggestion (the app halves the capture);
 /// the rung latches — restoration happens on disconnect, never mid-session.
@@ -73,10 +73,10 @@ import GlassActTestSupport
     }
 
     /// A stale reading must not build the streak. ackDelay only updates on
-    /// tile-batch ACKs, but video bytes kept the "activity" gate open — so
-    /// one congested settle, followed by a recovered link carrying only
-    /// pinned video (no tile batches), counted the frozen severe value every
-    /// second and downscaled the session.
+    /// tile-batch ACKs, but video bytes keep the "activity" gate open — so
+    /// after one congested settle, a recovered link carrying only pinned
+    /// video (no tile batches) would count the frozen severe value every
+    /// second and downscale the session.
     @Test(.tags(.slow), .notInFastLane) func staleSevereReadingDoesNotBuildStreak() {
         var severe = FaultConfig()
         severe.latencyMinUS = 450_000 // ~1 s RTT → ack-delay above severe

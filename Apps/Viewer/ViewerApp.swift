@@ -211,7 +211,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             .sorted { $0.1 > $1.1 }
         // Only what this host doesn't have yet: a file goes again only if it
         // grew since it was sent (the current log always has). Re-sending the
-        // whole day each time was 2.7 MB on a tether (2026-10-01).
+        // whole day each time would cost ~2.7 MB on a tether.
         let hostKey = controller.uploadHostKey
         let sentSizes = Self.uploadedLogs(for: hostKey)
         // ≤ 512 KB per upload, newest first (~30 s at the paced 16 KB/s);
@@ -684,7 +684,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// Reconfigure the presentation to a new grid IN PLACE, keeping the same
     /// window (and its user-chosen size) and the same CanvasView — the new-dim
     /// canvas fit-scales into it, crisp once the host's native pixels match.
-    /// Swapping the contentView here crashed AppKit's window-transform
+    /// Swapping the contentView here would crash AppKit's window-transform
     /// animation, so we reconfigure the existing view instead.
     private func rebuildCanvasContent(grid: TileGrid) {
         (canvasWindow?.contentView as? CanvasView)?.reconfigure(grid: grid)
@@ -757,7 +757,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             model.phase = .reconnecting(attempt: attempt)
         } else if code == nil, trustingOnFirstUse {
             // A host that hasn't approved this viewer can also just hold the
-            // handshake while its user decides (live, loopback).
+            // handshake while its user decides.
             model.connectHint = "If this is your first time connecting, “\(sessionName)” may be asking "
                 + "its user to allow this viewer."
         }
@@ -772,8 +772,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     // MARK: - Signing in to a host (§3.9)
 
     /// Ask the host how new viewers get in: sign in (show the form), ask its
-    /// user (the code), or not at all. No answer (unreachable, or an older
-    /// host without sign-in) carries on as before.
+    /// user (the code), or not at all. No answer (unreachable, or a host
+    /// without sign-in) carries on with the usual redial.
     private func askHowToJoin(code: String?, presentedKey: String?, reason: String) {
         let generation = signInGeneration
         // Pin what this dial pinned; on a first connection, the key the host
@@ -885,9 +885,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                                 + "connect in Glass Act Host › Options › New Viewers.")
     }
 
-    /// Drop the presentation window and everything scoped to it (the title
-    /// timer and occlusion observer were previously never removed, so they
-    /// piled up across reconnects and kept polling the old session).
+    /// Drop the presentation window and everything scoped to it (otherwise
+    /// the title timer and occlusion observer would pile up across
+    /// reconnects and keep polling the old session).
     private func teardownCanvasWindow() {
         titleTimer?.invalidate()
         titleTimer = nil
@@ -1038,7 +1038,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             // (green → host fullscreen, red → end session, yellow → local
             // minimize + auto-pause). We deliberately do NOT make the viewer
             // window itself fullscreen/zoom — a local window-transform
-            // animation over the live present layer crashed AppKit's animation
+            // animation over the live present layer crashes AppKit's animation
             // machinery. The host fullscreens; our window fit-scales the result.
             window.title = selectedWindowTitle.isEmpty ? "Shared Window" : selectedWindowTitle
             window.subtitle = sessionName
@@ -1120,7 +1120,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// Green → drive the HOST window fullscreen and REFUSE the local zoom
     /// (return false). The host reconfigures in-session and re-HELLOs at
     /// fullscreen dims, which fit-scale crisp into our window — no local
-    /// window-transform animation (that path crashed AppKit).
+    /// window-transform animation (that path crashes AppKit).
     func windowShouldZoom(_ window: NSWindow, toFrame newFrame: NSRect) -> Bool {
         guard window == canvasWindow, selectedWindowID != 0 else { return true }
         controller?.windowControl(action: WindowAction.fullscreen)
@@ -1131,10 +1131,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     // MARK: - Full screen (full-display sessions)
 
     /// The full-screen transition animates the window; presenting into it
-    /// mid-animation is what crashed AppKit in the shared-window experiment
-    /// (see windowShouldZoom), so presents pause across the transition. The
-    /// windowed size limits (≤ 1:1, canvas aspect) are lifted while full
-    /// screen — the canvas aspect-fits on black.
+    /// mid-animation crashes AppKit (see windowShouldZoom), so presents
+    /// pause across the transition. The windowed size limits (≤ 1:1, canvas
+    /// aspect) are lifted while full screen — the canvas aspect-fits on
+    /// black.
     private var windowedLimits: (max: NSSize, aspect: NSSize)?
 
     /// Full screen means "I'm using the other Mac": a pointer sweep into a
@@ -1232,7 +1232,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     /// Like Client Resolution's window: the largest session window that
     /// fits this screen's usable area under its title bar (a small margin
-    /// all round, as the Client Resolution window had).
+    /// all round, as the Client Resolution window has).
     static func largestWindowContentSize(on screen: NSScreen) -> NSSize {
         let vis = screen.visibleFrame
         let frame = NSWindow.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 100, height: 100),

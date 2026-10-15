@@ -72,8 +72,8 @@ import GlassActTestSupport
     }
 
     /// Auto on an uncongested path: the governor stops being the bottleneck
-    /// of a sustained flood — its rate climbs well past the old fixed
-    /// 8.4 MB/s ceiling and the flood settles far sooner than a 25 Mbit cap.
+    /// of a sustained flood — its rate climbs well past a fixed 8.4 MB/s
+    /// ceiling and the flood settles far sooner than a 25 Mbit cap.
     @Test(.tags(.slow), .notInFastLane) func autoFollowsAFastPath() {
         func settleTime(_ limit: RateLimit) -> (UInt64, Int) {
             var rng = SplitMix64(seed: 1404)
@@ -130,11 +130,11 @@ import GlassActTestSupport
         #expect(lateMean < 250_000, "network backlog before each change: \(backlogs) µs")
     }
 
-    /// Plane Wi-Fi (live 2026-09-28): ~2 Mbps with a deep buffer. Auto
-    /// must follow the link DOWN — its old 1 MB/s floor sat 4× above it, a
-    /// dissolve repaint queued seconds in the network, datagrams timed out
-    /// into re-encodes, and control starved until the session reset. Also
-    /// no fixed 16 MB burst: the bucket is a quarter-second of the rate.
+    /// Plane Wi-Fi: ~2 Mbps with a deep buffer. Auto must follow the link
+    /// DOWN — a 1 MB/s floor would sit 4× above it: a dissolve repaint would
+    /// queue seconds in the network, datagrams would time out into
+    /// re-encodes, and control would starve until the session reset. Nor is
+    /// there a fixed 16 MB burst: the bucket is a quarter-second of the rate.
     @Test(.tags(.slow), .notInFastLane) func autoFollowsAThinLinkDown() {
         var rng = SplitMix64(seed: 1407)
         let h = Harness(width: 1280, height: 768)
@@ -216,8 +216,8 @@ import GlassActTestSupport
 
     /// The settle drain probes VP8L even when the governor's burst bucket
     /// admits the whole repaint in one tick larger than the 60 Hz live
-    /// limit (webpTileLimit 320): the all-or-nothing probe gate was
-    /// shipping ENTIRE dissolve repaints as LZ4 (~3× the bytes on text —
+    /// limit (webpTileLimit 320): an all-or-nothing probe gate would ship
+    /// ENTIRE dissolve repaints as LZ4 (~3× the bytes on text —
     /// BENCHMARKS.md "Settle coalescing").
     @Test func settleDrainProbesVP8LBeyondLiveTickLimit() {
         var rng = SplitMix64(seed: 1407)
@@ -235,10 +235,10 @@ import GlassActTestSupport
 
     /// The ack-delay EWMA must track the path, not the viewer's ACK
     /// cadence. Keepalive re-ACKs of incomplete batches (every 100 ms)
-    /// confirm nothing new; sampling them made loss inflate the EWMA, which
-    /// raised the timeout floor (2 × ackDelay), which let more re-ACKs land
-    /// before timeout — 120 ms RTT at 5 % loss read ~275 ms (past the
-    /// degraded threshold), vs ~127 ms sampling only confirming ACKs.
+    /// confirm nothing new; sampling them would let loss inflate the EWMA,
+    /// which raises the timeout floor (2 × ackDelay), which lets more re-ACKs
+    /// land before timeout — 120 ms RTT at 5 % loss would read ~275 ms (past
+    /// the degraded threshold), vs ~127 ms sampling only confirming ACKs.
     @Test func ackDelayIgnoresKeepaliveReAcks() {
         var faults = FaultConfig()
         faults.dropPermille = 50
@@ -264,8 +264,8 @@ import GlassActTestSupport
 
     /// Pinned re-form must key on churn, not qualification. A dissolve
     /// repaint's cold tiles qualify for their whole ACK round trip, and with
-    /// loss the timed-out ones re-qualify en masse — counting them re-formed
-    /// the full-screen region from its own repaint on a static screen
+    /// loss the timed-out ones re-qualify en masse — counting them would
+    /// re-form the full-screen region from its own repaint on a static screen
     /// (3 forms and ~10.8 s to settle here, vs 1 form and ~2.3 s).
     @Test func pinnedSettleUnderLossDoesNotReformFromRepaint() {
         var faults = FaultConfig()
@@ -383,8 +383,8 @@ import GlassActTestSupport
 }
 
 /// Fresh before owed: what the user just changed ships ahead of a backlog of
-/// owed repaint tiles (live, a 150 ms tether: keystrokes queued behind up to
-/// 1.8 s of dissolve repaint).
+/// owed repaint tiles (otherwise, on a 150 ms tether, keystrokes queue behind
+/// up to 1.8 s of dissolve repaint).
 @Suite struct AdmissionPriorityTests {
     @Test func freshChangeShipsAheadOfOwedRepaint() {
         var rng = SplitMix64(seed: 2901)

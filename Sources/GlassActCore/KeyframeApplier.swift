@@ -72,7 +72,7 @@ struct KeyframeApplier: ~Copyable {
         guard (stripes.count - 1) * bandH < h else { return .dropped }
         // Stripes decode into disjoint row bands of the scratch, so they run
         // in parallel — the host encodes them that way; decoding them one by
-        // one stalled datagram apply, ACKs and present for the whole frame.
+        // one would stall datagram apply, ACKs and present for the whole frame.
         let job = StripeJob(stripes: stripes, scratch: scratch, rowBytes: rowBytes,
                             bandH: bandH, width: w, height: h, lossless: !transient)
         guard job.run() else {

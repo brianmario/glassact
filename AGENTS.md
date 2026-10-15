@@ -18,8 +18,6 @@ retransmission.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** is setup for a new contributor:
   requirements, building, signing, permissions, tests and filing issues.
 - **GitHub issues** hold the open work.
-- Commit hashes cited in BENCHMARKS.md (e.g. `40456d9`) are in the
-  pre-release archive, which holds the history from before this repository.
 - `## Deviations` notes at the top of a file (e.g. `QUICTransport.swift`)
   explain where the code departs from the SDK docs or the design.
 
@@ -48,8 +46,9 @@ retransmission.
   `-Ounchecked`. Wire parsing is always checked (§8, INV-6).
 - **Perf claims** need a `glassact-bench` number on a named trace, recorded in
   BENCHMARKS.md. A regression over 10 % needs a written reason.
-- **Wire changes** are fine pre-release: bump `WireVersion.current` and don't
-  keep old decode paths or migration code.
+- **Wire changes:** until 1.0 the wire protocol may change in any release.
+  Bump `WireVersion.current`, and keep no old decode paths or migration
+  code; both ends must run the same build.
 - **Loss tests** use fixed seeds. Goldens are byte-exact.
 - **Stranded-tile tests** drive explicit dirty rects. `Harness.settle()`
   full-scans every tick (nil dirty rects), which re-volunteers every tile

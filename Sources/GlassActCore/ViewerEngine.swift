@@ -269,7 +269,7 @@ public final class ViewerEngine: @unchecked Sendable {
         self.supportedVideoCodecs = supportedVideoCodecs
         // One spare byte: the Compression framework returns dst.count for a
         // stream that decodes to MORE than fits, so with an exactly-sized
-        // buffer an oversize LZ4/LZBITMAP payload passed the `== tightLen`
+        // buffer an oversize LZ4/LZBITMAP payload would pass the `== tightLen`
         // checks with truncated content. With the spare byte it decodes to
         // tightLen + 1 and fails them.
         decodeScratch = .allocate(byteCount: Self.maxTilePayload + 1, alignment: 64)
@@ -336,8 +336,8 @@ public final class ViewerEngine: @unchecked Sendable {
                           pixfmt == PixelFormat.bgra8sRGB,
                           width >= 1, height >= 1, width <= TileGrid.maxDimension, height <= TileGrid.maxDimension
                     else {
-                        // Ignoring it left the host holding pixels until its
-                        // HELLO_OK that never comes — a silent wedge. Fail
+                        // Ignoring it would leave the host holding pixels for
+                        // a HELLO_OK that never comes — a silent wedge. Fail
                         // loudly so the app reconnects.
                         enterFailed("in-session HELLO rejected (\(width)×\(height), ver \(ver))")
                         return
@@ -490,8 +490,8 @@ public final class ViewerEngine: @unchecked Sendable {
             }
         }
         // A malformed video stream is unrecoverable in-session (the byte
-        // stream has lost framing), and ignoring it froze every region —
-        // the whole screen, in pinned mode — while motion lasted. The canvas
+        // stream has lost framing), and ignoring it would freeze every region
+        // — the whole screen, in pinned mode — while motion lasts. The canvas
         // is still LWW-correct, but only a reconnect restores video.
         if videoDeframer.isMalformed {
             enterFailed("malformed video stream")
@@ -682,8 +682,8 @@ public final class ViewerEngine: @unchecked Sendable {
             }
         }
 
-        // In place, no snapshot (it was a full-canvas copy — 59 MB at 5K —
-        // per scroll op). Every destination must read PRE-op content, so rows
+        // In place, no snapshot (that would be a full-canvas copy — 59 MB at
+        // 5K — per scroll op). Every destination must read PRE-op content, so rows
         // are visited moving away from their sources: dy > 0 reads rows below
         // → ascending; dy < 0 → descending. Source rows are then always
         // untouched when read. Within one row (dy == 0) the spans are visited
@@ -733,9 +733,9 @@ public final class ViewerEngine: @unchecked Sendable {
         // Contamination report: ANY tile already carrying a seq ≥ this scroll's
         // (a record from this-or-a-later batch beat the TLV) may have polluted
         // the pre-scroll snapshot — including tiles OUTSIDE the rect that
-        // in-rect destinations sourced from (found via per-tile tracing of a
-        // real-trace golden divergence). In-rect such tiles were LWW-skipped
-        // above; out-of-rect ones are collected here.
+        // in-rect destinations sourced from (otherwise the real-trace golden
+        // diverges). In-rect such tiles were LWW-skipped above; out-of-rect
+        // ones are collected here.
         for idx in 0..<tileSeq.count where !Serial.newer(seq, than: tileSeq[idx]) && tileSeq[idx] != seq {
             scrollSkipped.append(UInt16(idx))
         }
@@ -882,7 +882,7 @@ public final class ViewerEngine: @unchecked Sendable {
         }
         if delta.mode == 0 {
             // `source` may point into the datagram at any byte offset: read
-            // it unaligned (binding it as UInt32 was undefined behaviour).
+            // it unaligned (binding it as UInt32 would be undefined behaviour).
             for row in 0..<th {
                 let canvasRow = canvas.baseAddress!
                     .advanced(by: ((y + row) * grid.width + x) * 4)
@@ -1063,8 +1063,8 @@ public final class ViewerEngine: @unchecked Sendable {
 
     // MARK: - Canvas access
 
-    /// RESIZE request (§3.5 reserved slot): ask the host for a session
-    /// geometry. The host resets the session; reconnect lands the new HELLO.
+    /// RESIZE request (§3.5): ask the host for a session geometry. The host
+    /// applies it in session and re-HELLOs on the same connection (§4.10).
     public func requestResize(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
         guard state == .running else { return }
         sendControl(.resize(mode: mode, width: UInt16(clamping: widthPoints),

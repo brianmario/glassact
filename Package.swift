@@ -1,7 +1,7 @@
 // swift-tools-version: 6.4
 import PackageDescription
 
-// Swift 7-track features, adopted now (Swift 6 language mode stays), and
+// Swift 7-track features, adopted early (Swift 6 language mode stays), and
 // warnings as errors for all our Swift code — the tree builds clean on the
 // 6.4 toolchain, so a new warning is a build break, not background noise.
 // (Vendored C — libwebp — keeps its own warning policy.)
@@ -49,8 +49,9 @@ let package = Package(
             ]
         ),
         // Hot-path codec: xxh64, RAW/LZ4/LZBITMAP/WEBPL tile codecs, arenas.
-        // Plain -O: -Ounchecked (§8.4) measured no gain and stripped the
-        // bounds preconditions guarding canvas writes (BENCHMARKS.md).
+        // Plain -O: -Ounchecked (§8.4) gains nothing measurable and would
+        // strip the bounds preconditions guarding canvas writes (BENCHMARKS
+        // "-Ounchecked on GlassActCodec").
         .target(
             name: "GlassActCodec",
             dependencies: ["libwebp"],

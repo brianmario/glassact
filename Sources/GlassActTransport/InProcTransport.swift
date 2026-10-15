@@ -98,7 +98,7 @@ public final class InProcTransport: GlassActTransport, @unchecked Sendable {
     }
 
     /// Pacing is modeled only when the link has a bottleneck (host → viewer),
-    /// so every other test keeps today's instant, unpaced datagrams.
+    /// so every other test gets instant, unpaced datagrams.
     public var pacesDatagrams: Bool { isA && link?.bottleneck != nil }
     public var queuedDatagramBytes: Int { isA ? link?.pacerQueuedBytes ?? 0 : 0 }
     public func setDatagramPaceRate(bytesPerSecond: Int) {

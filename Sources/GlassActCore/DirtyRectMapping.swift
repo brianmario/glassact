@@ -1,12 +1,12 @@
 /// ScreenCaptureKit dirty rects → canvas pixels (a hint only — §4.3; any
 /// doubt returns nil and the engine scans every tile).
 ///
-/// Unit, measured live 2026-09-29 (rect probe): SCK reports dirty rects in
-/// the capture SOURCE's backing pixels — a 2880×1620 frame of a 1440×810 pt
-/// @2x display carried rects reaching x = 2880; a 5120×2880 frame of a
-/// 2560×1440 pt @2x display, x = 5120. The host had been treating them as
-/// points and doubling them: rects in the right/bottom half fell off the
-/// frame (a full scan, by luck), the rest pointed at the wrong tiles.
+/// Unit, measured (rect probe): SCK reports dirty rects in the capture
+/// SOURCE's backing pixels — a 2880×1620 frame of a 1440×810 pt @2x display
+/// carries rects reaching x = 2880; a 5120×2880 frame of a 2560×1440 pt @2x
+/// display, x = 5120. Treating them as points and doubling them would push
+/// rects in the right/bottom half off the frame (a full scan, by luck) and
+/// point the rest at the wrong tiles.
 ///
 /// `sourcePixelWidth` = content width in points × SCK's scaleFactor. The
 /// canvas may be scaled from it (Scale mode, oversize clamps), so rects are

@@ -22,7 +22,7 @@ let synthCommand = Command(
         video     a fixed centered region re-noised every frame (video-region workload)
         panel     a text-like page that is replaced once, then only a left-side panel
                   animates every frame — one busy panel on an otherwise still screen
-                  (pinned video's worst case: 2026-10-10, minutes of soft text)
+                  (pinned video's worst case: minutes of soft static text)
     """,
     run: cmdSynth
 )

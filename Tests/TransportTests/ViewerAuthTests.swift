@@ -138,9 +138,6 @@ import GlassActTestSupport
         #expect(!AuthorizedViewers(url: url).contains(fp))
     }
 
-    /// In-process generation (no openssl): the container imports memory-only
-    /// as an identity whose key is P-256 and whose certificate is valid for
-    /// ~10 years. (Import itself proves the PKCS#12 MAC and PBES2 layers.)
     /// View-only approvals (offered for agents) survive a restart, and an
     /// upgrade to control replaces them.
     @Test func viewOnlyApprovalsPersist() throws {
@@ -175,11 +172,14 @@ import GlassActTestSupport
         #expect(try again.remove(driver))
         #expect(!(try again.remove(driver)))
         #expect(AuthorizedViewers(url: url).all.map(\.fingerprint) == [watcher])
-        // Files written before scopes existed (one fingerprint per line) still mean control.
+        // A bare fingerprint per line (no scope) means control.
         try Data("\(driver)\n".utf8).write(to: url)
         #expect(AuthorizedViewers(url: url).contains(driver) && !AuthorizedViewers(url: url).isViewOnly(driver))
     }
 
+    /// In-process generation (no openssl): the container imports memory-only
+    /// as an identity whose key is P-256 and whose certificate is valid for
+    /// ~10 years. (Import itself proves the PKCS#12 MAC and PBES2 layers.)
     @Test func generatedIdentityIsP256() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("glassact-p256-\(UInt64.random(in: 0...UInt64.max))")

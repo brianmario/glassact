@@ -88,9 +88,10 @@ public enum XXH64 {
         // Fast path — every full-width tile (256-byte rows): when a row is a
         // whole number of 32-byte stripes, stripes never straddle rows, so
         // walking the rows with the accumulators in registers IS the
-        // one-shot hash of the tight bytes (no buffering, no tail). The
-        // streaming path below was the top self-owned hotspot in profiles
-        // (one non-inlined update call per row, state through memory).
+        // one-shot hash of the tight bytes (no buffering, no tail). Sending
+        // every tile through the streaming path below would make it the top
+        // self-owned hotspot in profiles (one non-inlined update call per
+        // row, state through memory).
         if rowBytes >= 32 && rowBytes & 31 == 0 && th > 0 {
             var a1 = seed &+ p1 &+ p2
             var a2 = seed &+ p2

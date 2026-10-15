@@ -7,8 +7,9 @@ import GlassActTestSupport
 
 /// Per-tile handoff inside a live region (VideoClaims / REVEAL): while one
 /// area keeps a pinned full-screen region alive, every tile that stops
-/// changing goes back to its exact canvas copy — live 2026-10-10, minutes of
-/// soft static text around one animating panel.
+/// changing goes back to its exact canvas copy. Otherwise static text around
+/// one animating panel stays soft for minutes (BENCHMARKS.md "Per-tile
+/// handoff inside a live video region").
 @Suite struct VideoHandoffTests {
     // 1280×640: 200 tiles. The strip is 40 tiles (≥ pinnedFormMinTiles, so
     // the pinned region stays up while it animates).

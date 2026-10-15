@@ -44,7 +44,7 @@ func cmdKeyframe(_ reader: ScapReader, traceName: String, opts: Options) throws 
         }
     }
 
-    // Baseline: today's cold start — per-tile best-of across the whole grid.
+    // Baseline: a per-tile cold start — best-of across the whole grid.
     let grid = TileGrid(width: width, height: height)
     let lz4 = LZ4Codec()
     var tight = [UInt8](repeating: 0, count: 64 * 64 * 4)

@@ -127,8 +127,8 @@ public final class HostEngine: @unchecked Sendable {
         /// Per datagram, the first tile entry it carries a record for (tiles
         /// are packed in order and each spans consecutive datagrams, so a
         /// datagram's tiles are the contiguous run starting here). Lets an
-        /// ACK touch only the tiles in newly confirmed datagrams — the scan
-        /// was O(datagrams × tiles), ~47M steps for a 16 MB batch.
+        /// ACK touch only the tiles in newly confirmed datagrams — a full scan
+        /// would be O(datagrams × tiles), ~47M steps for a 16 MB batch.
         var dgramFirstTile: [Int32] = []
     }
 
@@ -248,9 +248,10 @@ public final class HostEngine: @unchecked Sendable {
     // Re-sharpen (engine queue): VideoToolbox never re-codes content that
     // stops changing, so whatever a large change got coded at — the startup
     // cap, a thin moment, the frame after a blank first capture — is what
-    // the viewer sees for as long as the region lives (live 2026-10-10:
-    // minutes of soft text while a 704×1024 strip animated on). One
-    // keyframe once things settle re-codes it at the budget the gap earned.
+    // the viewer sees for as long as the region lives (e.g. minutes of soft
+    // text while a 704×1024 strip animates; BENCHMARKS 'Soft video for
+    // minutes: capture-time PTS, QP 34 floor, re-sharpen'). One keyframe
+    // once things settle re-codes it at the budget the gap earned.
     /// Region pixels changed by large updates since the last keyframe.
     var refreshDamagePixels = 0
     // Per-tile handoff inside a live region (engine queue). A tile that
@@ -296,8 +297,9 @@ public final class HostEngine: @unchecked Sendable {
     /// Record handoffs wait until the region has had no large update (¼ of
     /// its area) for this long: during scrolls, drags and slideshows a
     /// lossless copy of a tile is soon overwritten — and photographic tiles
-    /// are the most expensive to encode and send (measured 2026-10-10: ungated,
-    /// photos 38 → 95 MB, host encode p95 5 → 20 ms). A small animating
+    /// are the most expensive to encode and send (measured ungated: photos
+    /// 38 → 95 MB, host encode p95 5 → 20 ms; BENCHMARKS 'Per-tile handoff
+    /// inside a live video region'). A small animating
     /// panel doesn't count as large, so the still rest of the screen still
     /// gets its records. REVEAL (free) isn't gated.
     static let handoffRecordQuietUS: UInt64 = 2_000_000
@@ -315,9 +317,9 @@ public final class HostEngine: @unchecked Sendable {
     var regionLastChangeUS: UInt64 = 0
     var regionQuietTicks = 0
     /// A full-screen region is media browsing until proven otherwise: it
-    /// starts with gap-surviving patience (measured ~800 MB of uncovered
-    /// transitions on the photos trace while a 30-tick limit learned it
-    /// through dissolve/repaint cycles).
+    /// starts with gap-surviving patience (measured: starting at a 30-tick
+    /// limit leaves ~800 MB of uncovered transitions on the photos trace
+    /// while it learns through dissolve/repaint cycles).
     static let videoQuietTicksLimit = 90
     /// Paging anti-thrash: a region re-formed shortly after its predecessor
     /// dissolved means the quiet limit was shorter than the workload's gaps
@@ -393,10 +395,11 @@ public final class HostEngine: @unchecked Sendable {
     /// candidates (INV-4 skip, pause). Dirty rects
     /// are deltas against the PREVIOUS capture: drop a tick's rects and the
     /// tiles changed in that capture are never hashed again unless they
-    /// change again — stale on the viewer indefinitely (live 2026-09-30:
-    /// "every once in a while a tile stays out of date"; capture-drops ran
-    /// at up to 47 per 2 s). "The pixels re-qualify next tick" (INV-4) holds
-    /// only if next tick looks at them; this is what makes it look.
+    /// change again — stale on the viewer indefinitely (capture drops run
+    /// at up to 47 per 2 s; BENCHMARKS 'Stale tiles: damage from skipped
+    /// captures is carried forward'). "The pixels re-qualify next tick"
+    /// (INV-4) holds only if next tick looks at them; this is what makes it
+    /// look.
     var missedDirty: ContiguousArray<Bool>
     var missedDirtyTiles = ContiguousArray<Int32>()
     /// A skipped tick had no usable rects: the next tick scans every tile.
@@ -440,7 +443,7 @@ public final class HostEngine: @unchecked Sendable {
     // Scrolls awaiting their SCROLL_ACK (reliable control stream: every
     // applied scroll is ACKed). Entries leave on ACK. The cap only bounds a
     // stalled viewer; an entry evicted unACKed can never be verified, so its
-    // rect is demoted (see emitScroll). A fixed ring of 8 silently dropped
+    // rect is demoted (see emitScroll). A fixed ring of 8 would silently drop
     // the repair for scrolls older than the 8 most recent — > 8 scrolls per
     // RTT is ~130 ms RTT at 60 Hz, and scroll ticks with no residual tiles
     // open no batch, so INV-4 doesn't slow them.
@@ -532,8 +535,8 @@ public final class HostEngine: @unchecked Sendable {
     }
     // Lossless region keyframes (§4.7; striped VP8L on the video stream).
     // One whole-rect image instead of N tile records: the encoder's window
-    // finally spans tiles, measured 1.1–3× smaller and it retires the
-    // cold-start datagram flood (the blob rides the reliable stream). A
+    // spans tiles (measured 1.1–3× smaller), and the cold start needs no
+    // datagram flood (the blob rides the reliable stream). A
     // keyframe is a batch of one giant record: seq-stamped, per-tile LWW at
     // the viewer, confirmed by KEYFRAME_ACK, promoted into acked/shadow
     // exactly like a datagram batch. One in flight at a time.
@@ -562,7 +565,7 @@ public final class HostEngine: @unchecked Sendable {
     var currentCaptureUS: UInt64 = 0 // capture_ts of the frame being processed (video g2g)
     /// Liveness: time of the last PONG (0 until the first). PINGs go out 1/s;
     /// a running session with no PONG for many seconds is a dead peer the
-    /// transport hasn't noticed (measured live: host streamed video into a
+    /// transport hasn't noticed (otherwise a host can stream video into a
     /// torn-down viewer for 30+ s).
     public private(set) var lastPongUS: UInt64 = 0
     private var pingNonce: UInt64 = 0
@@ -571,11 +574,11 @@ public final class HostEngine: @unchecked Sendable {
     /// moment a batch, keyframe, HELLO or PING is handed to the transport
     /// (everything whose age later becomes an RTT/ACK-delay sample or a
     /// timeout). `nowUS` is the
-    /// tick's START: a slow tick (a 2048² noise cold start took 2.3 s to
-    /// encode) stamped its batch that much in the past, so the next tick
-    /// timed it out before the viewer could ACK it — every tile re-sent,
-    /// and the adaptive pace read the phantom loss and halved itself. Nil
-    /// (virtual-time tests) stamps with `nowUS` as before.
+    /// tick's START: stamped with it, a slow tick (a 2048² noise cold start
+    /// takes 2.3 s to encode) would date its batch that much in the past, so
+    /// the next tick would time it out before the viewer could ACK it —
+    /// every tile re-sent, and the adaptive pace reading the phantom loss
+    /// and halving itself. Nil (virtual-time tests) stamps with `nowUS`.
     let clock: (@Sendable () -> UInt64)?
     /// Real time (µs, any monotonic domain — only differences are used) for
     /// measuring encode duty, which bounds Auto's growth (SendGovernor).
@@ -817,8 +820,8 @@ public final class HostEngine: @unchecked Sendable {
         // Video: captures may stop entirely (video paused on an otherwise-static
         // screen) — quiescence dissolve must not depend on encode ticks.
         // Scaled by the same adaptive patience as the tick-based limit: an
-        // unscaled 700 ms fired in every Photos page gap (~2 s between
-        // pages) and silently bypassed the anti-thrash escalation.
+        // unscaled 700 ms would fire in every Photos page gap (~2 s between
+        // pages) and silently bypass the anti-thrash escalation.
         let quietUS = Self.videoQuietUSLimit
             &* UInt64(regionQuietLimit) / UInt64(Self.videoQuietTicksLimit)
         // contentPaused: quiet is expected (nothing is fed to the encoder) —
@@ -829,8 +832,8 @@ public final class HostEngine: @unchecked Sendable {
         // No application keepalive datagrams (INV-10 holds exactly): QUIC's
         // own keepalive on both tunnels (QUICTransport.keepAliveS) keeps an
         // idle flow — pinned mode can idle it for minutes — alive through
-        // idle timers and middleboxes. It replaced a header-only datagram
-        // every 10 s; `silentSessionOutlivesTheIdleTimeout` proves it.
+        // idle timers and middleboxes; `silentSessionOutlivesTheIdleTimeout`
+        // proves it.
         if state == .running && nowUS &- lastPingUS >= 1_000_000 {
             pingNonce &+= 1
             sendControl(.ping(nonce: pingNonce, tUS: sendStampUS(nowUS)))
@@ -839,7 +842,7 @@ public final class HostEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Auto-scale pressure (airplane story)
+    // MARK: - Auto-scale pressure (thin links)
 
     /// Resolution is the adaptive ladder's rung below quality: when the
     /// link's ack-delay sits above the severe threshold for a sustained
@@ -847,8 +850,8 @@ public final class HostEngine: @unchecked Sendable {
     /// the capture — fewer pixels shrink video bitrate and settle size at
     /// once. Latched for the session: native restores
     /// on disconnect (the app's captureModified path), never mid-session —
-    /// a healthy-streak swap-back cost a renegotiation blink and invited an
-    /// immediate return trip on an intermittently-healthy link.
+    /// a healthy-streak swap-back would cost a renegotiation blink and invite
+    /// an immediate return trip on an intermittently-healthy link.
     /// Fires at most once; evaluated on the 1 Hz PING cadence, and only on
     /// seconds that produced a fresh ack-delay reading (neither an idle
     /// session nor a video-only one may accumulate streaks off a stale EWMA).
@@ -864,8 +867,8 @@ public final class HostEngine: @unchecked Sendable {
         guard !scalePressureConstrained else { return }
         // Only seconds with a FRESH ack-delay reading count. ackDelayUS
         // updates solely on tile-batch ACKs, so gating on total send
-        // activity (video included) counted a value frozen since the last
-        // congested settle, every second, while pinned video carried the
+        // activity (video included) would count a value frozen since the
+        // last congested settle, every second, while pinned video carries the
         // motion over a recovered link. No fresh reading: hold.
         guard ackDelaySampleUS != scaleEvalPrevSampleUS else { return }
         scaleEvalPrevSampleUS = ackDelaySampleUS
@@ -929,11 +932,11 @@ public final class HostEngine: @unchecked Sendable {
         // The same holds for the transport's pacer: a batch encoded behind a
         // deep backlog only waits there, and an overflowing pacer queue
         // drops the OLDEST datagrams — the ones about to leave. Measured at
-        // cold start (2048² over QUIC): the first batch (~14.6k datagrams)
-        // plus the second open batch overflowed the queue, 1,431 datagrams
-        // died on the host, and the adaptive pace read them as viewer loss
-        // and halved itself. Waiting for the backlog to drain sends fresher
-        // pixels no later.
+        // cold start (2048² over QUIC) without this wait: the first batch
+        // (~14.6k datagrams) plus the second open batch overflow the queue,
+        // 1,431 datagrams die on the host, and the adaptive pace reads them
+        // as viewer loss and halves itself. Waiting for the backlog to drain
+        // sends fresher pixels no later.
         let pacerBacklogged = transport.pacesDatagrams
             && transport.queuedDatagramBytes > pace.rate / 1_000_000 * Self.pacerBacklogLimitUS
         guard openBatchCount < 2 && !pacerBacklogged else {
@@ -1020,8 +1023,8 @@ public final class HostEngine: @unchecked Sendable {
         // The batch seq is claimed AFTER any scroll emission: the scroll
         // consumes a seq of its own, and the residual batch must be strictly
         // newer or the viewer's LWW gate (tileSeq = scrollSeq) blocks every
-        // same-tick residual — found as a same-seq collision by per-tile
-        // tracing of a real-trace golden divergence.
+        // same-tick residual (a same-seq collision diverges the real-trace
+        // golden).
         let frameSeq = nextFrameSeq
 
         // Qualify (§4.3 step 5; serial, cheap): send iff changed vs ACKed AND
@@ -1045,10 +1048,11 @@ public final class HostEngine: @unchecked Sendable {
         let estimate = governor.admissionEstimate
         qualTiles.removeAll(keepingCapacity: true)
         qualHashes.removeAll(keepingCapacity: true)
-        // Fresh before owed (2026-09-29, live on a 150 ms tether): a
-        // dissolve's repaint — hundreds of owed tiles — was admitted in the
-        // same rotation as what the user just typed, so a keystroke queued
-        // behind up to 1.8 s of catch-up. Pass 0 admits this tick's dirty
+        // Fresh before owed: admitted in the same rotation as what the user
+        // just typed, a dissolve's repaint — hundreds of owed tiles — would
+        // queue a keystroke behind up to 1.8 s of catch-up on a 150 ms
+        // tether (BENCHMARKS 'Fresh-before-owed admission; video cap on an
+        // unmeasured queue'). Pass 0 admits this tick's dirty
         // rects; pass 1 the owed tiles, capped at `owedBurstUS` of the rate
         // per tick so a repaint trickles instead of bursting into the path
         // ahead of the next keystroke. Rotating admission (SendGovernor.rotor)
@@ -1112,7 +1116,7 @@ public final class HostEngine: @unchecked Sendable {
         // is static and the CPU idle, so probe VP8L at the settle cap
         // instead of the 60 Hz limit — the governor's burst bucket admits a
         // dissolve repaint in ticks of 1000s of tiles, and the all-or-
-        // nothing gate below was shipping ENTIRE settles as LZ4 (~3× the
+        // nothing gate below would ship ENTIRE settles as LZ4 (~3× the
         // bytes on text; measured in BENCHMARKS.md "Settle coalescing").
         // A full 5K settle (3,600 tiles) fits the 4096 cap ≈ 100 ms fanned
         // out — a one-time stall on a quiet queue.
@@ -1186,8 +1190,8 @@ public final class HostEngine: @unchecked Sendable {
         for q in 0..<qualCount {
             // dgram_cnt is a u16 and one tile can span up to 255 datagrams:
             // stop admitting before the count could overflow (a 6K/8K screen
-            // of incompressible RAW tiles passed the governor's estimate and
-            // tripped the precondition below). The rest ship next tick.
+            // of incompressible RAW tiles can pass the governor's estimate and
+            // would trip the precondition below). The rest ship next tick.
             if packer.closedCount > maxBatchDatagrams - 256 {
                 for rest in q..<qualCount { deferQualifiedTile(Int(qualTiles[rest])) }
                 capDeferred = qualCount - q
@@ -1208,9 +1212,9 @@ public final class HostEngine: @unchecked Sendable {
             //
             // A REF (11 B) beats every encoding, DELTA included — only the
             // STORE is barred for DELTA-coded tiles (a STORE wraps absolute
-            // content). The lookup used to be skipped for DELTA tiles too,
-            // so with DELTA on a revert to cached content (blink,
-            // window switch-back) always shipped the larger DELTA.
+            // content). Skipping the lookup for DELTA tiles too would make a
+            // revert to cached content (blink, window switch-back) always
+            // ship the larger DELTA.
             var cacheKind: UInt8 = 0
             var cacheSlot: UInt16 = 0
             if tw == TileGrid.tileSize && th == TileGrid.tileSize {
@@ -1351,7 +1355,7 @@ public final class HostEngine: @unchecked Sendable {
     var governor = SendGovernor()
 
     /// Tests only: start the send governor as if the link were already
-    /// known fast (old start: 8.4 MB/s, full 16 MB burst) — for tests of
+    /// known fast (fast-link start: 8.4 MB/s, full 16 MB burst) — for tests of
     /// scroll/encoder logic that assume one tick ships a whole frame.
     public func assumeFastLinkForTests() {
         governor = SendGovernor(fastLinkStart: true)
@@ -1364,14 +1368,14 @@ public final class HostEngine: @unchecked Sendable {
     public var vp8lEffort: Int32?
     public var keyframeEffort: Int32?
     /// Per-tile VP8L (and DELTA sub-rects): small ticks keep effort 4 —
-    /// bytes matter there and CPU is noise (typing: effort 1 cost +5 %
+    /// bytes matter there and CPU is noise (typing: effort 1 costs +5 %
     /// steady bytes for nothing); ticks past `vp8lBurstTiles` drop to 1,
-    /// which cost 0.4–1.5 % bytes for 23–40 % less encode CPU on scroll /
+    /// which costs 0.4–1.5 % bytes for 23–40 % less encode CPU on scroll /
     /// drag traces. 3 ≈ 4 and 5–6 buy only CPU.
     static let vp8lSmallTickEffort: Int32 = 4
     static let vp8lBurstEffort: Int32 = 1
     static let vp8lBurstTiles = 32
-    /// Keyframes: time to exact ≈ encode + bytes / rate. Effort 0 encoded a
+    /// Keyframes: time to exact ≈ encode + bytes / rate. Effort 0 encodes a
     /// 5K cold start in ~190 ms vs ~730–920 ms at 4 (+11 % bytes), winning
     /// above ~2.2 MB/s; effort 1 (~425 ms, +2.6 %) wins below that.
     static let keyframeFastEffort: Int32 = 0
@@ -1412,8 +1416,8 @@ public final class HostEngine: @unchecked Sendable {
         guard state == .helloSent else { return }
         extraHelloCaps |= WireCaps.geometryFinal
         // The SRTT seed is THIS exchange's round trip. Left at start()'s
-        // stamp, the seed spanned the whole negotiation (the app's display
-        // switch takes seconds): SRTT, and 3 × SRTT batch timeouts, ran
+        // stamp, the seed would span the whole negotiation (the app's display
+        // switch takes seconds): SRTT, and 3 × SRTT batch timeouts, would run
         // seconds long until PINGs decayed it (~20 s at α = 1/8, 1 Hz).
         helloSentUS = sendStampUS(nowUS)
         sendControl(.hello(ver: WireVersion.current,

@@ -24,16 +24,16 @@ extension HostEngine {
 
     /// `demandCount`: tiles that wanted to send this tick, admitted or
     /// deferred by the governor. Formation keys on it — gated on admitted
-    /// tiles alone, a thin (or just-starting) link's small budget kept big
-    /// motion off video, the cheaper path exactly there.
+    /// tiles alone, a thin (or just-starting) link's small budget would keep
+    /// big motion off video, the cheaper path exactly there.
     func videoPhase(frame: UnsafeRawBufferPointer, bytesPerRow: Int,
                     dirtyRects: [DirtyRect]?, demandCount: Int, nowUS: UInt64) {
         videoTickCounter += 1
         // A 3-tick guard after a dissolve only prevents same-instant thrash.
         // The trigger is CHURN, not qualification: a dissolve repaint's cold
         // tiles qualify for their whole ACK round trip, and any lost to
-        // datagram loss re-qualify again on timeout — counting those
-        // re-formed the full-screen region from its own repaint on a static
+        // datagram loss re-qualify again on timeout — counting those would
+        // re-form the full-screen region from its own repaint on a static
         // screen.
         if !regionActive
             && demandCount >= Self.pinnedFormMinTiles
@@ -208,7 +208,7 @@ extension HostEngine {
             // blink, keystrokes, a spinner) still ships — the change shows
             // now — but counts as quiet, so the region dissolves and the
             // lossless tile path (a few KB/s for typing vs ~0.5 Mbps of
-            // HEVC) takes over. Live, a blinking caret alone kept a
+            // HEVC) takes over. Otherwise a blinking caret alone keeps a
             // full-screen region up for a whole session.
             let lowActivity = changedTiles < Self.pinnedFormMinTiles
             if lowActivity {
@@ -240,7 +240,7 @@ extension HostEngine {
         // Hashing is the cost here (16 KB a tile): only tiles that could be
         // revealed are hashed, and at most `handoffHashesPerTick` a tick —
         // after a drag thousands go still at once, and one tick hashing them
-        // all was a visible encode spike. The rest wait a tick or two.
+        // all is a visible encode spike. The rest wait a tick or two.
         var hashBudget = Self.handoffHashesPerTick
         // Records only while something keeps the region alive (a real
         // change within the last second): a region whose motion stopped is
@@ -431,8 +431,8 @@ extension HostEngine {
     func submitRegionFrame(forceSync: Bool) -> Bool {
         guard let encoder = regionEncoder, let pixels = regionPixels else { return false }
         // Time, not bytes: the allowance is ~60 ms at the measured drain
-        // rate (VideoRateController). A byte limit (512 KB) was 1.6 s of lag
-        // at the 2.5 Mbps a remote Wi-Fi link carried.
+        // rate (VideoRateController). A byte limit (512 KB) would be 1.6 s of
+        // lag at the 2.5 Mbps a remote Wi-Fi link carries.
         let backlog = transport.videoBacklogBytes
         let networkQueueUS = videoNetworkQueueUS
         if videoRate.observe(nowUS: lastEncodeNowUS, backlogBytes: backlog, networkQueueUS: networkQueueUS) {

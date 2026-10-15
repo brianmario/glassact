@@ -103,9 +103,9 @@ import GlassActTestSupport
     /// standard fault mix must still converge byte-exact — the bar is
     /// graceful convergence, not speed. Video is on: the cold start is a
     /// pinned region whose dissolve repaint stays un-ACKed for ~the full RTT
-    /// (reading that as churn once re-formed the region from its own repaint
-    /// in a permanent dissolve/re-form livelock — settle never completed
-    /// even at 480 s of sim time).
+    /// (reading that as churn would re-form the region from its own repaint
+    /// in a permanent dissolve/re-form livelock — settle would never
+    /// complete, even at 480 s of sim time).
     @Test(arguments: [UInt64(11), 12, 13])
     func highRTTGoldenConvergence(seed: UInt64) {
         var faults = FaultConfig()

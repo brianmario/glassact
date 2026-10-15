@@ -163,8 +163,8 @@ import GlassActTestSupport
 }
 
 @Suite struct ResizeTests {
-    /// RESIZE reaches the host app hook (found live: a request that
-    /// silently vanished — this pins the engine half of the path).
+    /// RESIZE reaches the host app hook, so a request can't silently vanish
+    /// (this pins the engine half of the path).
     @Test func resizeRequestSurfacesToApp() {
         let (host, _) = makeRunningHost(width: 128, height: 64)
         var got: (Int, Int, Int, Int)?
