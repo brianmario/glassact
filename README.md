@@ -143,6 +143,9 @@ Agents work two ways:
 See [docs/DESIGN.md §13](docs/DESIGN.md#13-security-model) for the full
 model.
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md): please report it
+privately, not in a public issue.
+
 ## Files
 
 | what | where |
