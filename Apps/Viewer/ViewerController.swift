@@ -190,8 +190,6 @@ final class ViewerController: @unchecked Sendable {
         clipboardChangeCount = pb.changeCount
     }
 
-    func transportFailReason() -> String { session.transportFailReason() }
-
     /// Remote input (main thread → engine queue, reliable). Also the person
     /// at this viewer touching the session — an attached agent yields.
     func sendInput(kind: UInt8, x: Int, y: Int, a: Int, b: Int) {

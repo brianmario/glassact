@@ -1,6 +1,5 @@
 import Testing
 import GlassActCore
-import GlassActTransport
 import GlassActTestSupport
 
 /// Connect-to-first-picture milestones: the viewer's `SessionMilestones`

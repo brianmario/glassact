@@ -1,7 +1,6 @@
 import Foundation
 import Testing
 import GlassActWire
-import GlassActCodec
 import GlassActCore
 import GlassActTransport
 import GlassActTestSupport
@@ -151,5 +150,12 @@ import GlassActTestSupport
         }
         #expect(harness.settle())
         #expect(harness.canvasMatchesFrame())
+    }
+}
+
+extension TileGrid {
+    func tightByteCount(of idx: Int) -> Int {
+        let (_, _, tw, th) = rect(of: idx)
+        return tw * th * 4
     }
 }

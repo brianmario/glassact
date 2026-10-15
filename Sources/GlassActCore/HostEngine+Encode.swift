@@ -1,6 +1,5 @@
 import Foundation
 import GlassActCodec
-import GlassActTransport
 import GlassActWire
 
 /// Encode tick (§4.3): hashing candidates in parallel (§4.5) and the
@@ -89,7 +88,7 @@ extension HostEngine {
             }
         }
 
-        func run(all: Bool) {
+        func runSerially() {
             let ctx = workers[0]
             for q in 0..<count {
                 encodeOne(q, ctx)

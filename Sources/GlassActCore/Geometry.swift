@@ -30,12 +30,6 @@ public struct TileGrid: Equatable, Sendable {
         let y = row * Self.tileSize
         return (x, y, min(Self.tileSize, width - x), min(Self.tileSize, height - y))
     }
-
-    @inline(__always)
-    public func tightByteCount(of idx: Int) -> Int {
-        let (_, _, tw, th) = rect(of: idx)
-        return tw * th * 4
-    }
 }
 
 /// A changed region hint from capture (§4.1). Hints only: tiles intersecting

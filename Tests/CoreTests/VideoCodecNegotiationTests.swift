@@ -2,7 +2,6 @@ import Foundation
 import Testing
 import GlassActWire
 import GlassActCore
-import GlassActTransport
 import GlassActTestSupport
 
 /// Video codec negotiation (§4.6). The encoder factory is codec-keyed so a second

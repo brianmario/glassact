@@ -42,7 +42,6 @@ public final class ViewerSession: @unchecked Sendable {
 
     public let queue = DispatchQueue(label: "glassact.viewer.apply", qos: .userInteractive)
     public let engine: ViewerEngine
-    public let options: Options
 
     /// Status lines for logs and UI. Called on `queue` or main.
     public var onStatus: @Sendable (String) -> Void = { _ in }
@@ -97,7 +96,6 @@ public final class ViewerSession: @unchecked Sendable {
     /// (tests bind both to random ports).
     public init(host: String, port: UInt16, fingerprint: String, identity: SecIdentity?,
                 datagramPort: UInt16? = nil, options: Options = Options()) {
-        self.options = options
         pinnedHostFingerprint = QUICIdentity.normalize(fingerprint)
         viewerFingerprint = identity.flatMap { try? QUICIdentity.fingerprint(of: $0) } ?? ""
         target = "host=\(host) port=\(port)"

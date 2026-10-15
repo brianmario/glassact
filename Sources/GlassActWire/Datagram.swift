@@ -71,14 +71,6 @@ public struct DatagramHeader: Equatable, Sendable {
         self.captureTimestampUS = captureTimestampUS
     }
 
-    public func encode(into w: inout ByteWriter) {
-        w.writeU8(Self.wireVersion << 4) // high nibble = version, low nibble reserved (0)
-        w.writeU32(frameSeq)
-        w.writeU16(dgramIdx)
-        w.writeU16(dgramCnt)
-        w.writeU64(captureTimestampUS)
-    }
-
     /// Rejects a wrong version nibble, `dgram_cnt == 0`, and `dgram_idx ≥
     /// dgram_cnt`. Reserved low-nibble flag bits are ignored on parse.
     public static func parse(_ r: inout ByteReader) -> DatagramHeader? {
@@ -105,25 +97,6 @@ public struct DatagramHeader: Equatable, Sendable {
 }
 
 public enum Datagram {
-    /// Appends one tile record. Traps on structurally invalid fields (encoder
-    /// bug, not wire input): zero opcode, `fragCnt == 0`, `fragIdx ≥ fragCnt`.
-    public static func appendRecord(
-        opcode: UInt8,
-        tileIdx: UInt16,
-        fragIdx: UInt8,
-        fragCnt: UInt8,
-        payload: some Collection<UInt8>,
-        into w: inout ByteWriter
-    ) {
-        precondition(opcode != 0 && fragCnt >= 1 && fragIdx < fragCnt, "invalid record fields")
-        w.writeU8(opcode)
-        w.writeU16(tileIdx)
-        w.writeU8(fragIdx)
-        w.writeU8(fragCnt)
-        w.writeVarint(UInt32(payload.count))
-        w.writeBytes(payload)
-    }
-
     /// Parses a whole datagram. The datagram is fully validated before any
     /// callback fires; a malformed datagram is rejected atomically (returns
     /// false, `body` never called). Record payloads are views into `buf`.
@@ -143,11 +116,6 @@ public enum Datagram {
             unsafe body(header, record) // record.payload is valid only inside this call
         }
         return true
-    }
-
-    @discardableResult
-    public static func parse(_ bytes: [UInt8], _ body: (DatagramHeader, TileRecord) -> Void) -> Bool {
-        bytes.withUnsafeBytes { unsafe parse($0, body) }
     }
 
     static func parseRecord(_ r: inout ByteReader) -> TileRecord? {

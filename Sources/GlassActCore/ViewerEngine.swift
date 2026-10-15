@@ -44,8 +44,6 @@ public struct ViewerStats: Sendable {
     public var acksSent = 0
     public var videoStarts = 0
     public var videoStops = 0
-    /// Tiles handed back from video to their exact canvas copy by REVEAL.
-    public var overlayTilesRevealed = 0
     public var videoFramesApplied = 0
     public var videoDropped = 0
     public var keyframesApplied = 0
@@ -350,7 +348,7 @@ public final class ViewerEngine: @unchecked Sendable {
                     // is host-authoritative — no geometry to negotiate.
                     sendControl(.helloOK(ver: WireVersion.current,
                                          caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps,
-                                         geoMode: 0, geoWidth: 0, geoHeight: 0, geoScale: 0))
+                                         geoMode: GeometryMode.none, geoWidth: 0, geoHeight: 0, geoScale: 0))
                     break
                 }
                 guard state == .awaitingHello else { break }
@@ -377,7 +375,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 // both sides then fail symmetrically.
                 sendControl(.helloOK(ver: WireVersion.current,
                                      caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps,
-                                     geoMode: geo?.mode ?? 0,
+                                     geoMode: geo?.mode ?? GeometryMode.none,
                                      geoWidth: UInt16(clamping: geo?.w ?? 0),
                                      geoHeight: UInt16(clamping: geo?.h ?? 0),
                                      geoScale: UInt8(clamping: geo?.s ?? 0)))
@@ -586,7 +584,6 @@ public final class ViewerEngine: @unchecked Sendable {
         where overlayOn[t] && tiles[t >> 3] & (1 << UInt8(t & 7)) != 0 {
             overlayOn[t] = false
             dirty.mark(t)
-            stats.overlayTilesRevealed += 1
         }
     }
 

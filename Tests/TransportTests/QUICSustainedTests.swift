@@ -1,9 +1,7 @@
 import Foundation
 import Testing
-import GlassActCodec
 import GlassActCore
 import GlassActTransport
-import GlassActWire
 import GlassActTestSupport
 
 /// Regression for the live-demo failure: the session established and HELLO /

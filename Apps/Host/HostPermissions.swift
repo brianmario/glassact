@@ -42,11 +42,6 @@ final class HostPermissions {
     private(set) var screenRecordingAvailable = SCContentSharingPicker.shared.isAvailable
 
     var requiredGranted: Bool { screenRecording && accessibility }
-    var clipboardAllowed: Bool { clipboard == .alwaysAllow }
-    /// Anything the setup window would show as not done.
-    var everythingGranted: Bool {
-        requiredGranted && localNetwork != .blocked && clipboardAllowed
-    }
 
     @ObservationIgnored private var browser: NWBrowser?
 

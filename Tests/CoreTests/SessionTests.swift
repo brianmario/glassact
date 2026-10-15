@@ -2,7 +2,6 @@ import Foundation
 import Testing
 import GlassActCore
 import GlassActTransport
-import GlassActTestSupport
 
 /// Session lifecycle (formerly app-only, untestable): watchdogs, how a
 /// session ended, the redial budget — driven by real engines over the

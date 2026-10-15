@@ -111,9 +111,6 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
         maxDatagramSizeAtomic.load(ordering: .relaxed)
     }
     private let maxDatagramSizeAtomic = Atomic<Int>(1200)
-    /// Datagram sends the network rejected (e.g. larger than the path allows).
-    public var datagramSendErrors: Int { datagramSendErrorsAtomic.load(ordering: .relaxed) }
-    private let datagramSendErrorsAtomic = Atomic<Int>(0)
 
     private let role: Role
     private let queue: DispatchQueue
@@ -617,9 +614,8 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     private func transmitDatagram(_ data: Data) {
         guard !finished, let datagram else { return }
         datagramInflight += 1
-        datagram.send(content: data, completion: .contentProcessed { [weak self] error in
+        datagram.send(content: data, completion: .contentProcessed { [weak self] _ in
             guard let self, !self.finished else { return } // completion fires on `queue`
-            if error != nil { self.datagramSendErrorsAtomic.add(1, ordering: .relaxed) }
             self.datagramInflight -= 1
             if self.datagramRingCount > 0 && !self.paceTimerArmed { self.pumpDatagrams() }
         })
@@ -790,19 +786,8 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
 
     // MARK: - Shared plumbing
 
-    /// Tests / bench: cap QUIC packets (each side's max_udp_payload_size)
-    /// to emulate a real network's MTU on loopback, whose ~16 KB MTU lets
-    /// QUIC pack stream data into huge UDP packets and flatters stream
-    /// transports against per-datagram packets. 0 = the stack's default.
-    static let maxUDPPayloadOverride = Atomic<Int>(0)
-    public static func overrideMaxUDPPayload(_ bytes: Int) {
-        maxUDPPayloadOverride.store(bytes, ordering: .relaxed)
-    }
-
     static func tunnelOptions(datagram: Bool, alpns: [String] = [alpn]) -> NWProtocolQUIC.Options {
         let options = NWProtocolQUIC.Options(alpn: alpns)
-        let payloadCap = maxUDPPayloadOverride.load(ordering: .relaxed)
-        if payloadCap > 0 { options.maxUDPPayloadSize = payloadCap }
         // Pinned video mode leaves the datagram tunnel completely silent
         // (video + control + cursor all ride the other tunnel), so each
         // tunnel runs QUIC keepalives (enableKeepAlive, set once ready); the

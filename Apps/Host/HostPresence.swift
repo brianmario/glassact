@@ -52,8 +52,6 @@ enum HostPresence {
 final class NearbyAdvertiser {
     private var ref: DNSServiceRef?
 
-    var isAdvertising: Bool { ref != nil }
-
     func start(port: UInt16) {
         guard ref == nil else { return }
         // TXT: where to dial (the service name is the computer name, which

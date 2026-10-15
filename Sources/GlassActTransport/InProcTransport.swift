@@ -141,7 +141,6 @@ public final class InProcLink: @unchecked Sendable {
     public var silenceAToB = false
     public var silenceBToA = false
     public private(set) var severed = false
-    public private(set) var silencedMessages = 0
 
     /// Both transports report `.ready` (the rig's "handshake done").
     public func establish() {
@@ -170,12 +169,7 @@ public final class InProcLink: @unchecked Sendable {
 
     /// True if a send from this side must be dropped (severed or silenced).
     private func blocked(fromA: Bool) -> Bool {
-        if severed { return true }
-        if fromA ? silenceAToB : silenceBToA {
-            silencedMessages += 1
-            return true
-        }
-        return false
+        severed || (fromA ? silenceAToB : silenceBToA)
     }
 
     /// A receiver that drains host → viewer datagrams at `bytesPerSecond`
