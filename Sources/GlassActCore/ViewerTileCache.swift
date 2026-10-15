@@ -17,8 +17,8 @@ struct ViewerTileCache: ~Copyable {
     private var pixels: UnsafeMutableRawBufferPointer?
     private var hash: ContiguousArray<UInt64>
     private var valid: ContiguousArray<Bool>
-    /// Found by the keyframe golden: slots are LWW registers
-    /// keyed by the STORE's frame_seq. A host-side STORE timeout frees and
+    /// Slots are LWW registers keyed by the STORE's frame_seq (the keyframe
+    /// golden covers this). A host-side STORE timeout frees and
     /// reuses the slot, but the timed-out STORE's datagrams may arrive late
     /// and REORDERED after the reused slot's new STORE — without this gate
     /// the stale content poisons the slot, a later hash-guarded REF cleanly

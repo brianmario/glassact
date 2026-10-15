@@ -59,7 +59,7 @@ public final class AgentSocketServer: @unchecked Sendable {
     /// Bind and listen. Throws if another live server owns the path.
     public func start() throws {
         // Its own folder only — not AgentPaths.directory, which would set up
-        // (and migrate into) the data directory for a socket placed elsewhere.
+        // the data directory for a socket placed elsewhere.
         let folder = URL(fileURLWithPath: path).deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])

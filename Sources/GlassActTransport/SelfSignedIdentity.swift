@@ -7,8 +7,8 @@ import Security
 /// (CryptoKit) and an X.509 v3 certificate — packaged as PKCS#12 so the
 /// Security framework can import it memory-only as a `SecIdentity`. (A
 /// keychain-free SecIdentity can only be made by importing a PKCS#12
-/// container; the direct constructor is SPI.) Replaces shelling out to
-/// /usr/bin/openssl.
+/// container; the direct constructor is SPI.) No /usr/bin/openssl
+/// subprocess.
 ///
 /// Only what TLS with fingerprint pinning needs: no chain, no extensions.
 /// Peers trust the SHA-256 of the certificate DER, never the CA fields.

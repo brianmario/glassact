@@ -83,7 +83,8 @@ import GlassActTestSupport
     }
 
     /// Kind 7 (pixel scroll) and any future kind must parse — a range check
-    /// made the first trackpad scroll a malformed stream (session killed).
+    /// would make the first trackpad scroll a malformed stream (killing the
+    /// session).
     /// Kind 0 stays invalid.
     @Test func inputKindsAreAdditive() {
         roundTrip(.input(kind: 7, x: 100, y: 200, a: -12, b: 37))
@@ -268,7 +269,7 @@ import GlassActTestSupport
 
     /// The sender-side bound: a body the receiver would reject (and tear
     /// the stream down over) must never be produced for sending. An
-    /// exactly-1 MiB clipboard was one byte over (format byte + data).
+    /// exactly-1 MiB clipboard is one byte over (format byte + data).
     @Test func encodedForSendRefusesOversizeBodies() {
         let atLimit = ControlMessage.clipboard(format: 1,
                                                data: [UInt8](repeating: 0x61, count: ControlMessage.maxClipboardBytes))

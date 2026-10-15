@@ -82,7 +82,7 @@ public struct SignInResponse: Equatable, Sendable {
         /// (query) New viewers sign in with this Mac's account.
         case signInAvailable = 1
         /// (query) The host's user approves new viewers by hand: dial the
-        /// session as before and wait while they decide.
+        /// session as usual and wait while they decide.
         case askOnHost = 2
         /// This host isn't taking new viewers.
         case closed = 3

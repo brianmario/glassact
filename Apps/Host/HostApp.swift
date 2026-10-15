@@ -672,7 +672,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 }
 
-/// The menu's first row: one glance says whether this Mac can be reached.
 /// The menu's first row: what the Host is doing, and the switch that turns
 /// sharing on and off — the way Wi-Fi and Bluetooth put theirs. The menu
 /// stays open while it flips; the row updates in place.

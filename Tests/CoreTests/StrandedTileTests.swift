@@ -6,7 +6,7 @@ import GlassActCore
 import GlassActTransport
 import GlassActTestSupport
 
-/// Stale-tile regressions: states where the host believes the viewer is
+/// Stranded tiles: states where the host believes the viewer is
 /// wrong (or right) and nothing ever re-sends the tile. `Harness.settle()`
 /// full-scans every tick, which re-volunteers every tile and so masks all
 /// of these — each test here drives explicit dirty rects, the way live SCK

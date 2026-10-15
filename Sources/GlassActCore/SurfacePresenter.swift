@@ -12,9 +12,9 @@ import Dispatch
 ///
 /// Confined to the viewer engine's queue (`applyQueue`) — the canvas's own
 /// queue — so it reads the canvas without locks and the main thread never
-/// waits on apply work. Before, the display link ran `queue.sync { blit }`
-/// on main: main did the copy (up to a full 5K frame) AND first waited out
-/// whatever the apply queue was doing (a keyframe decode, a burst). The
+/// waits on apply work. A display link running `queue.sync { blit }` on
+/// main would make main do the copy (up to a full 5K frame) AND first wait
+/// out whatever the apply queue was doing (a keyframe decode, a burst). The
 /// caller flips `layer.contents` on main when a blit completes and starts
 /// the next one no sooner than the next display tick, so a surface is never
 /// written while it is the displayed one.

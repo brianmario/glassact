@@ -21,13 +21,13 @@ import Synchronization
 // Why two: this transport is built on the NWConnectionGroup /
 // NWMultiplexGroup API, which doesn't model QUIC datagrams alongside
 // streams — `group.extract(using: isDatagram options)` fails with ENETDOWN,
-// and Apple DTS guidance is that only the newer `NetworkConnection` API
-// models datagrams correctly
-// (https://developer.apple.com/forums/thread/813467). That API needed
-// macOS 26, newer than the deployment target when this transport was
-// written. The floor is now macOS 27, so that reason is gone; the transport
-// simply hasn't moved yet. Issue #10 tracks moving to one tunnel via
-// `NetworkConnection`.
+// and Apple DTS guidance is that only the `NetworkConnection` API models
+// datagrams correctly (https://developer.apple.com/forums/thread/813467).
+// That API's datagram send is async-only, with no batch or idempotent send,
+// and its `usableDatagramFrameSize` reads 0 after establishment (BENCHMARKS
+// "`NetworkConnection<QUIC>` spike"), so the pixel path stays on the group
+// API for now. Issue #10 tracks moving to one tunnel via `NetworkConnection`
+// (one port, one handshake, no tunnel pairing).
 //
 // The *video stream* is a second stream extracted from the control group
 // (host → viewer, reliable, ordered, head-of-line isolated from control).
@@ -98,9 +98,9 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     static let establishTimeoutS = 10.0
     /// QUIC idle timeout with keepalives every `keepAliveS` on both tunnels:
     /// a dead peer, a dead path, or a half-open session (one tunnel lost)
-    /// fails within ~idleTimeout instead of lingering. (Was 8 h with no
-    /// keepalive — a crashed host froze the viewer for hours, and a viewer
-    /// that vanished mid-handshake wedged the listener.)
+    /// fails within ~idleTimeout instead of lingering. A long timeout with
+    /// no keepalive would let a crashed host freeze the viewer for hours,
+    /// and a viewer that vanished mid-handshake would wedge the listener.
     public static let idleTimeoutMS = 30_000
     static let keepAliveS = 5
 
@@ -130,7 +130,7 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
 
     // Path RTT sampler (host): consecutive data-transfer reports on the
     // control stream, collected every `rttSampleInterval`. The thin-link
-    // rig (VideoSendGateTests) showed the report's smoothed RTT tracks a
+    // rig (VideoSendGateTests) shows the report's smoothed RTT tracks a
     // bottleneck queue per ACK while PING-derived SRTT lags seconds.
     private var rttReport: NWConnection.PendingDataTransferReport?
     private let rttSmoothedUS = Atomic<UInt64>(0)
@@ -147,11 +147,11 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
 
     // Datagram tunnel. Sends are paced by a token bucket on `queue`, at the
     // rate the host engine sets (starting at `DatagramPacing.bytesPerSecond`).
-    // Released unpaced, a batch left in microseconds and the viewer's UDP
-    // receive buffer kept ~675 datagrams
-    // of it (83 % of a 4000-datagram burst lost on loopback); earlier still,
-    // a synchronous blast overflowed NW's send path and starved the control
-    // stream. `contentProcessed` fires at stack handoff, not at the wire, so
+    // Released unpaced, a batch would leave in microseconds and the viewer's
+    // UDP receive buffer would keep only ~675 datagrams of it (83 % of a
+    // 4000-datagram burst lost on loopback); a synchronous blast would
+    // overflow NW's send path and starve the control stream.
+    // `contentProcessed` fires at stack handoff, not at the wire, so
     // it bounds NW's backlog (the in-flight cap below) but cannot pace.
     // Overflow of the (batch-sized) queue drops the oldest — correct by
     // contract (INV-5: affected tiles re-qualify and re-encode).
@@ -165,11 +165,12 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     private var datagram: NWConnection?
     private var datagramReady = false
     private var datagramInflight = 0
-    // Fixed ring (never grows, and a sent slot is released at once — the
-    // old array kept every consumed Data alive until it fully drained, which
-    // never happens under sustained load). Overflow drops the OLDEST queued
-    // datagram: by then its batch has likely timed out and its tiles are
-    // re-encoded fresh, so sending it late only duplicates work (INV-5).
+    // Fixed ring (never grows, and a sent slot is released at once — a
+    // growing array would keep every consumed Data alive until it fully
+    // drained, which never happens under sustained load). Overflow drops the
+    // OLDEST queued datagram: by then its batch has likely timed out and its
+    // tiles are re-encoded fresh, so sending it late only duplicates work
+    // (INV-5).
     private var datagramRing = [Data?](repeating: nil, count: QUICTransport.maxQueuedDatagrams)
     private var datagramRingHead = 0
     private var datagramRingCount = 0
@@ -245,7 +246,6 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
             self.fingerprint = fingerprint
             self.commonName = commonName
         }
-        /// Headless Glass Act agents present this common name.
         /// Headless Glass Act agents present this common name.
         public var isAgent: Bool { commonName == "glassact-agent" }
     }
@@ -529,7 +529,7 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     }
 
     /// One hop onto the transport queue for a whole batch (a 5K cold-start
-    /// batch is ~12k datagrams — one `queue.async` each was that many
+    /// batch is ~12k datagrams — one `queue.async` each would be that many
     /// dispatches on the engine's queue); the pacer releases it.
     public func sendDatagrams(_ batch: [Data]) {
         guard !batch.isEmpty else { return }
@@ -946,11 +946,11 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
             }
             if let error {
                 // A transient receive error on the UNRELIABLE flow is loss,
-                // not session death — measured live: a full-screen burst
-                // (9.3 MB/s) surfaced one and tore down an otherwise healthy
-                // session. Genuine connection death arrives separately via
-                // the state handler (.failed). Only a solid error streak
-                // (nothing readable at all) still ends the session.
+                // not session death: a full-screen burst (9.3 MB/s) can
+                // surface one, and treating it as fatal would tear down an
+                // otherwise healthy session. Genuine connection death arrives
+                // separately via the state handler (.failed). Only a solid
+                // error streak (nothing readable at all) ends the session.
                 quicDebug("\(self.role) datagram receive error: \(error)")
                 self.datagramReceiveErrorStreak += 1
                 if self.datagramReceiveErrorStreak >= 64 {
@@ -1031,16 +1031,6 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     }
 }
 
-/// Host-side QUIC listener pair (control on `port`, datagram flow on
-/// `port + 1`; with port 0 both are ephemeral — read `port`/`datagramPort`).
-/// It serves a single viewer session at a time; each accepted session arrives
-/// as an unstarted `QUICTransport` via `onTransport` — set callbacks, then
-/// `start()` it.
-///
-/// Pairing: the two tunnels are matched by remote host, newest first. A
-/// session that has not finished establishing yields to a newer dial from
-/// any viewer (the old one is cancelled): a dial that stalled half-built must
-/// never hold the only session slot. An established session is exclusive.
 /// Host side of one sign-in connection (§3.9). Confined to the server's
 /// queue; the server holds it until `end`. It never installs handlers on the
 /// group: the server's (set once, at accept) route to it, so nothing that
@@ -1105,6 +1095,16 @@ private final class SignInExchange: @unchecked Sendable {
     }
 }
 
+/// Host-side QUIC listener pair (control on `port`, datagram flow on
+/// `port + 1`; with port 0 both are ephemeral — read `port`/`datagramPort`).
+/// It serves a single viewer session at a time; each accepted session arrives
+/// as an unstarted `QUICTransport` via `onTransport` — set callbacks, then
+/// `start()` it.
+///
+/// Pairing: the two tunnels are matched by remote host, newest first. A
+/// session that has not finished establishing yields to a newer dial from
+/// any viewer (the old one is cancelled): a dial that stalled half-built must
+/// never hold the only session slot. An established session is exclusive.
 public final class QUICServer: @unchecked Sendable {
     /// §3.9 — a sign-in request on its own connection: answer through
     /// `reply` (any thread, once). The peer is the key that connection

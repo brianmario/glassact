@@ -93,8 +93,9 @@ import GlassActTestSupport
 
     /// INV-4 extended to the pacer: while a full-screen batch is still
     /// leaving (well over 20 ms of backlog), the next capture is skipped
-    /// instead of queued behind it — over QUIC, the second batch overflowed
-    /// the pacer queue at cold start and dropped the first batch's head.
+    /// instead of queued behind it — over QUIC, a queued second batch would
+    /// overflow the pacer queue at cold start and drop the first batch's
+    /// head.
     @Test func encoderWaitsOutThePacerBacklog() {
         var rng = SplitMix64(seed: 5105)
         let h = Harness(width: 1280, height: 1280, fastLink: true) // ~6.5 MB in one burst: ~130 ms at 50 MB/s

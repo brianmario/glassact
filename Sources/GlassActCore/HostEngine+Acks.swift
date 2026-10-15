@@ -20,9 +20,9 @@ extension HostEngine {
         // A batch already resolved by timeout (its slot not yet reused): its
         // tiles were invalidated and re-encode — nothing to commit (INV-9) —
         // but the ACK still MEASURES the path. Once a deep queue holds more
-        // than a timeout's worth, every ACK is late; ignoring them left the
-        // governor with only the few datagrams that skipped the queue (it
-        // read no queue at all) while the link sat 2 s deep.
+        // than a timeout's worth, every ACK is late; ignoring them would
+        // leave the governor with only the few datagrams that skipped the
+        // queue (it would read no queue at all) while the link sits 2 s deep.
         guard batches[batchIdx].active else {
             measureLateAck(batchIndex: batchIdx, bitmap: bitmap)
             return
@@ -31,17 +31,18 @@ extension HostEngine {
         // Datagram-path delay (send → ACK), the congestion signal for the
         // governor and the timeout floor. PING SRTT rides the CONTROL tunnel
         // — a separate QUIC connection that stays snappy while the datagram
-        // path drowns; measured live: a 13 s standing queue with SRTT
-        // reading a healthy 15–25 ms, so the rate boost never backed off and
-        // healthy-SRTT timeouts re-encoded batches that were merely queued
-        // (resend amplification). ACK delay includes the real queue.
+        // path drowns; measured: a 13 s standing queue with SRTT reading a
+        // healthy 15–25 ms, so an SRTT-driven rate would never back off and
+        // healthy-SRTT timeouts would re-encode batches that are merely
+        // queued (resend amplification). ACK delay includes the real queue.
         //
         // Sampled only from ACKs that confirm something new. The viewer
         // re-ACKs incomplete batches every 100 ms as keepalive; those carry
         // no new information, and their age is the ACK cadence, not the
-        // path. Sampling them made loss inflate the EWMA, which raised the
-        // timeout floor (2 × ackDelay), which let more re-ACKs arrive before
-        // timeout — a feedback loop (120 ms RTT at 5 % loss read 275 ms).
+        // path. Sampling them would make loss inflate the EWMA, which raises
+        // the timeout floor (2 × ackDelay), which lets more re-ACKs arrive
+        // before timeout — a feedback loop (120 ms RTT at 5 % loss reads
+        // 275 ms).
         var confirmedNew = false
         var newlyConfirmed = 0
         for d in 0..<batches[batchIdx].dgramCnt {
@@ -55,7 +56,7 @@ extension HostEngine {
             batches[batchIdx].confirmedCnt += 1
             newlyConfirmed += 1
             var t = Int(batches[batchIdx].dgramFirstTile[d])
-            guard t >= 0 else { continue } // header-only datagram (none today)
+            guard t >= 0 else { continue } // header-only datagram (none are sent)
             let tileCount = batches[batchIdx].tiles.count
             while t < tileCount && batches[batchIdx].tiles[t].firstDgram <= Int32(d) {
                 if Int32(d) <= batches[batchIdx].tiles[t].lastDgram {
@@ -147,7 +148,7 @@ extension HostEngine {
             // Keeping ackedHash would then misdescribe the viewer — and if the
             // tile's content REVERTS to that ackedHash (blinking cursor,
             // clock), `h == ackedHash` suppresses the re-send forever:
-            // permanent divergence, caught by the real-trace golden replay.
+            // permanent divergence (the real-trace golden replay checks it).
             // Timeout therefore drops the tile to cold state (ackedHash = 0),
             // forcing one re-send whose newer frame_seq wins on the viewer
             // whatever its actual state is.
@@ -177,14 +178,14 @@ extension HostEngine {
     /// allowance. Large batches (a 5K cold start is ~15 MB) take longer to
     /// *serialize onto the wire* than the bare RTT timeout — timing them out
     /// mid-transmission re-encodes and re-floods the full frame in a
-    /// permanent thrash loop (found by the sustained-session QUIC test at
-    /// live-demo scale). The allowance covers the batch plus what was queued
+    /// permanent thrash loop (the sustained-session QUIC test exercises
+    /// this). The allowance covers the batch plus what was queued
     /// ahead of it, at the pace in effect when it was sent.
     public func timeoutUS(serializationUS: UInt64) -> UInt64 {
         // Floor at 2× the observed datagram-path delay: under a standing
-        // queue, control-tunnel-SRTT timeouts fired while datagrams were
-        // still queued, re-encoding tiles whose first copies were in flight
-        // (live resend-amplification spiral). Bounded so a dead path still
+        // queue, control-tunnel-SRTT timeouts would fire while datagrams are
+        // still queued, re-encoding tiles whose first copies are in flight
+        // (a resend-amplification spiral). Bounded so a dead path still
         // times out.
         max(timeoutUS &+ serializationUS, min(2 &* ackDelayUS, 3_000_000))
     }
@@ -208,8 +209,8 @@ extension HostEngine {
         // Tile-cache resolution. Store-slot commitment needs MORE than
         // datagram receipt: a fragmented STORE superseded mid-flight by a
         // newer same-tile send gets discarded by the viewer's all-or-nothing
-        // reassembly while every datagram still ACKs (found by the windowed-
-        // scroll faulted golden). But that newer send necessarily overwrote
+        // reassembly while every datagram still ACKs (the windowed-scroll
+        // faulted golden covers this). But that newer send necessarily overwrote
         // this tile's inflight slot — so the INV-9 seq guard is exactly the
         // "no discard was possible" test. Guard passes ⇒ the viewer stored
         // (even if canvas-stale); guard fails ⇒ viewer state unknown ⇒ free

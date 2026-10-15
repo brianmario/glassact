@@ -17,7 +17,7 @@ import Synchronization
 public enum NewViewerPolicy: String, Sendable, CaseIterable {
     /// The viewer signs in with this Mac's account (no dialog here).
     case signIn
-    /// This Mac's user is asked, with the verification code (the original flow).
+    /// This Mac's user is asked, with the verification code.
     case ask
     /// Refused, silently.
     case closed

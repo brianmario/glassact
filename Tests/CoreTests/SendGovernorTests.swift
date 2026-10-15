@@ -163,7 +163,8 @@ import Testing
     }
 
     /// The bucket is a quarter-second of the rate: idle time never banks a
-    /// burst the link can't take (16 MB at 2 Mbps was a minute of queue).
+    /// burst the link can't take (16 MB at 2 Mbps would be a minute of
+    /// queue).
     @Test func bucketIsAQuarterSecondOfTheRate() {
         var g = SendGovernor()
         #expect(g.tokens == Int(Double(G.initialAutoRate) * G.bucketSeconds))

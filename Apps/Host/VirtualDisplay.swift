@@ -2,10 +2,11 @@ import CoreGraphics
 import Foundation
 
 /// A virtual display at a viewer's exact size, so the shared picture fills a
-/// screen whose shape no physical display mode matches (live: a 1470×918
+/// screen whose shape no physical display mode matches (e.g. a 1470×918
 /// MacBook Air full-screen area vs a Studio Display that only offers 16:9
-/// modes — Client Resolution left ~50 pt bars). The physical displays mirror
-/// it while it exists, so the whole desktop lives at the viewer's size.
+/// modes, where Client Resolution leaves ~50 pt bars). The physical
+/// displays mirror it while it exists, so the whole desktop lives at the
+/// viewer's size.
 ///
 /// Resizable in place (the viewer's window drives its size): new settings
 /// on the same display keep its id and the mirroring — measured ~0.9 s, no
@@ -18,7 +19,7 @@ import Foundation
 /// falls back to Client Resolution. Recipe measured on macOS 27: modes are
 /// given in POINTS with `hiDPI = 1` and maxPixels at 2× — the display then
 /// comes up in the HiDPI mode (1470×918 pt, 2940×1836 px); pixel-sized modes
-/// produced no usable display.
+/// produce no usable display.
 ///
 /// The display lives as long as this object (and the process).
 /// Main-thread confined (HostController's display state); `@unchecked
@@ -106,9 +107,9 @@ final class VirtualDisplay: @unchecked Sendable {
     }
 
     /// Currently in its w×h mode at `scale`. macOS can move it to the 1×
-    /// variant with the same pixels (live: after the Mac locked and its
-    /// display slept, 1450×778@2x came back as 2900×1556@1x — everything
-    /// half-size for the viewer).
+    /// variant with the same pixels (e.g. after the Mac locks and its
+    /// display sleeps, 1450×778@2x can come back as 2900×1556@1x —
+    /// everything half-size for the viewer).
     var isInMode: Bool {
         guard let cur = CGDisplayCopyDisplayMode(displayID) else { return false }
         return cur.width == widthPoints && cur.height == heightPoints && cur.pixelWidth == widthPoints * scale

@@ -17,8 +17,8 @@ import GlassActTransport
 /// - At most `cleanLossFraction` lost, on a batch of at least
 ///   `probeMinBytes`: probe upward by 1/16. A smaller clean batch proves
 ///   nothing — it fits the receive buffer at any pace (measured: clean
-///   ~300 KB batches walked the pace to the ceiling in one round, and the
-///   next full-screen burst paid for it).
+///   ~300 KB batches would walk the pace to the ceiling in one round, and
+///   the next full-screen burst pays for it).
 /// - In between: hold. Random loss in this band says nothing about pacing.
 ///
 /// Only batches that were actually paced count (larger than the pacer's

@@ -3,7 +3,7 @@ import Compression
 /// Apple Compression-framework wrapper for the tile codecs: LZ4 (framed,
 /// opcode 0x02) and LZBITMAP (opcode 0x09 — Apple's SIMD codec, built
 /// for pixel-shaped data). Both ends use this framework; liblz4 block
-/// interop is a non-goal. (Naming debt: the class predates LZBITMAP.)
+/// interop is a non-goal. (Despite its name, `LZ4Codec` serves both.)
 ///
 /// Holds preallocated scratch (INV-7: no per-frame allocation). Not
 /// thread-safe: one instance per engine, confined to that engine's queue.

@@ -6,10 +6,11 @@ import GlassActWire
 import GlassActTestSupport
 
 /// A batch's timeout clock starts when it is handed to the transport, not
-/// when its tick started. Found over real QUIC: a 2048² noise cold start
-/// spent 2.3 s in one encode tick, so its batch was "2.3 s old" at the next
-/// tick and timed out before the viewer had ACKed anything — every tile sent
-/// twice, and the adaptive pace halved itself on the phantom loss.
+/// when its tick started. Over real QUIC a 2048² noise cold start can spend
+/// 2.3 s in one encode tick; stamped at the tick's start, its batch would be
+/// "2.3 s old" at the next tick and time out before the viewer had ACKed
+/// anything — every tile sent twice, and the adaptive pace halving itself on
+/// the phantom loss.
 @Suite struct SendStampTests {
     /// Returns (tiles + keyframes sent, pace decreases) after a cold start
     /// whose encode tick "took" `stallUS`, then a settle.
@@ -42,8 +43,9 @@ import GlassActTestSupport
     /// Geometry negotiation (§4.10): HELLO → HELLO_OK asking for a switch → the
     /// app applies it (seconds: a display mode change) → final HELLO →
     /// HELLO_OK. The SRTT seed is the FINAL exchange's round trip; measured
-    /// from the first HELLO it seeded SRTT with the whole negotiation, and
-    /// batch timeouts (3 × SRTT) ran seconds long until PINGs decayed it.
+    /// from the first HELLO it would seed SRTT with the whole negotiation,
+    /// and batch timeouts (3 × SRTT) would run seconds long until PINGs
+    /// decayed it.
     @Test func renegotiatedHandshakeSeedsSRTTFromTheFinalHello() {
         let capture = CaptureTransport()
         let host = HostEngine(width: 640, height: 480, transport: capture)

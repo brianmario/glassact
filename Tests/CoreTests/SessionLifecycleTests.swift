@@ -58,9 +58,10 @@ import GlassActTestSupport
         return (viewer, capture)
     }
 
-    /// Previously a malformed video stream set a private "dead" latch: video
-    /// and keyframes were ignored for the rest of the session — in pinned
-    /// mode, the whole screen frozen while motion lasted, with no signal.
+    /// A malformed video stream fails the session. A private "dead" latch
+    /// that ignored video and keyframes for the rest of the session would,
+    /// in pinned mode, freeze the whole screen while motion lasted, with no
+    /// signal.
     @Test func malformedVideoStreamFailsTheSession() {
         let (viewer, _) = makeVideoViewer()
         var reasons: [String] = []
@@ -184,7 +185,7 @@ import GlassActTestSupport
     /// An incomplete batch must keep being reported while other batches
     /// complete around it: a late datagram is ACKed promptly, and the slot
     /// gets keepalive re-ACKs. A single global "last ACK" timestamp, reset
-    /// by every completion ACK, suppressed both under steady traffic.
+    /// by every completion ACK, would suppress both under steady traffic.
     @Test func incompleteBatchKeepsReportingUnderSteadyTraffic() {
         var rng = SplitMix64(seed: 2603)
         let (viewer, capture) = makeRunningViewer(width: 256, height: 64) // 4 tiles
@@ -268,9 +269,9 @@ import GlassActTestSupport
         #expect(capture.sentControl.count == sentBefore, "a failed engine sent \(capture.sentControl.count - sentBefore) message(s)")
     }
 
-    /// Found by the ViewerEngine split: a region undecodable for > 1 s fails
-    /// the engine from inside the video loop, and a keyframe later in the
-    /// SAME chunk still applied and sent KEYFRAME_ACK.
+    /// A region undecodable for > 1 s fails the engine from inside the video
+    /// loop; a keyframe later in the SAME chunk must then neither apply nor
+    /// send KEYFRAME_ACK.
     @Test func viewerSendsNothingAfterVideoFailsMidChunk() {
         let capture = CaptureTransport()
         let v = ViewerEngine(transport: capture, videoDecoderFactory: { MockVideoDecoder() },
@@ -322,7 +323,8 @@ import GlassActTestSupport
     }
 
     /// A switch/scale geometry request with nonsense dimensions is answered
-    /// as native instead of reaching the app (which computed a 0×0 capture).
+    /// as native instead of reaching the app (which would compute a 0×0
+    /// capture).
     @Test func insaneHandshakeGeometryIsTreatedAsNative() {
         let capture = CaptureTransport()
         let host = HostEngine(width: 128, height: 64, transport: capture)
@@ -349,7 +351,7 @@ import GlassActTestSupport
     }
 
     /// dgram_cnt is a u16: a batch must stop admitting tiles before it could
-    /// overflow (it trapped at 6K/8K with incompressible content), and the
+    /// overflow (it would trap at 6K/8K with incompressible content), and the
     /// tiles left out must still ship on later ticks without dirty rects.
     @Test func batchStopsAtItsDatagramCapAndDefersTheRest() {
         var rng = SplitMix64(seed: 2801)

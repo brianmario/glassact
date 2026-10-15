@@ -8,8 +8,8 @@ import Observation
 final class ConnectModel {
     enum ShareMode: Int { case display = 0, window = 1 }
 
-    /// Raw values are the legacy popup indices (persisted); the RESIZE
-    /// geometry mode is `rawValue + 1`.
+    /// Raw values are persisted, so keep them stable; the RESIZE geometry
+    /// mode is `rawValue + 1`.
     enum Resolution: Int, CaseIterable, Identifiable {
         case matchThisMac = 0, scaleToFit = 1, native = 2, fillWindow = 3
         var id: Int { rawValue }
@@ -110,7 +110,7 @@ final class ConnectModel {
         chosenNearby?.name == nearbyHost.name && trimmedHost == nearbyHost.host
     }
 
-    // MARK: - Persistence (keys predate this model; keep them)
+    // MARK: - Persistence (stored keys; keep them stable)
 
     private static let keys = (host: "glassact.viewer.host", port: "glassact.viewer.port",
                                fingerprint: "glassact.viewer.fingerprint",
@@ -154,8 +154,8 @@ final class ConnectModel {
     }
 }
 
-/// App-wide preferences (Settings window), read at each connect. Keys
-/// predate this type; keep them.
+/// App-wide preferences (Settings window), read at each connect. The
+/// stored keys must stay stable.
 @MainActor @Observable
 final class ViewerSettings {
     static let shared = ViewerSettings()

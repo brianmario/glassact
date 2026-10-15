@@ -6,9 +6,10 @@ import GlassActTestSupport
 
 /// A batch the governor admits whole (its bucket holds one full-screen
 /// change, up to ~14k datagrams) must reach the viewer, not the floor.
-/// Unpaced, the whole batch left in ~0.01 ms and the viewer's UDP receive
-/// buffer (~768 KB on macOS) kept ~675 datagrams of it: 83 % of a 4000-
-/// datagram burst lost on loopback, recovered only by timeout + re-send.
+/// Unpaced, the whole batch would leave in ~0.01 ms and the viewer's UDP
+/// receive buffer (~768 KB on macOS) would keep ~675 datagrams of it: 83 %
+/// of a 4000-datagram burst lost on loopback, recovered only by timeout +
+/// re-send.
 @Suite(.serialized, .tags(.quic), .notInFastLane) struct QUICBurstTests {
     @Test(arguments: [4_000, 12_000])
     func largeBurstArrivesNearlyWhole(count: Int) throws {

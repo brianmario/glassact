@@ -31,7 +31,7 @@ import SwiftUI
         w.title = "Choose a Window"
         // ARC owns this window; without this, the red-X close path has AppKit
         // release it too (isReleasedWhenClosed defaults true outside window
-        // controllers) — over-release crash on cancel, found live.
+        // controllers) — an over-release crash on cancel.
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.setContentSize(NSSize(width: 760, height: 560))

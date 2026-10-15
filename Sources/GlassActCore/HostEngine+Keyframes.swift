@@ -96,7 +96,7 @@ extension HostEngine {
     /// parallel into disjoint `bandCap` slices of `out`. Lossless VP8L
     /// (effort 4) when `lossyQuality` is nil. Nil if any stripe fails or the
     /// total exceeds keyframeMaxBytes. (Shared by the lossless keyframe and
-    /// the transient lossy paint, which had near-identical copies.)
+    /// the transient lossy paint.)
     func encodeStripes(pixels: UnsafeRawBufferPointer, width: Int, height: Int,
                                into out: UnsafeMutableRawBufferPointer, lossyQuality: Float?) -> [[UInt8]]? {
         let stripes = min(Self.keyframeStripes, height)

@@ -3,12 +3,13 @@
 /// rate the video stream actually drains at, so a thin link costs framerate
 /// and sharpness instead of seconds of lag.
 ///
-/// Why: the old gate allowed 4 MB (512 KB once SRTT > 50 ms) of unsent
-/// video. Bytes are not time — at the 2.5 Mbps an airport Wi-Fi link
-/// carried, 512 KB is ~1.6 s, and a live session read 1.6–2.2 s p50
-/// glass-to-glass for 30 s at a stretch. The transport's backlog count is
-/// accurate (VideoSendGateTests: it matches the stream's own
-/// sentApplicationByteCount to within a frame); the limit was the bug.
+/// Why time, not bytes: a byte gate (say 4 MB, 512 KB once SRTT > 50 ms,
+/// of unsent video) is not a lag bound — at the 2.5 Mbps an airport Wi-Fi
+/// link carries, 512 KB is ~1.6 s, enough for 1.6–2.2 s p50 glass-to-glass
+/// for 30 s at a stretch. The transport's backlog count is accurate
+/// (VideoSendGateTests: it matches the stream's own
+/// sentApplicationByteCount to within a frame); a byte limit is what fails
+/// (BENCHMARKS 'Video send gate: time at the drain rate, not bytes').
 ///
 /// - Drain rate: bytes that left the transport per window, i.e. handed −
 ///   Δbacklog. Only a window that stayed backlogged measures the link (the
@@ -43,22 +44,23 @@ public struct VideoRateController: Sendable {
     public static let capFraction = 0.85
     public static let burstUS = 100_000
     public static let probeFactor = 1.03
-    /// CUBIC-style recovery (2026-09-29, live): after a brief network
-    /// hiccup the cap sat at 0.3 Mbit/s and took ~60 s to climb back to
-    /// 2.6 at the gentle 1.03/window. `pushbackRate` (CUBIC's W_max) is the
+    /// CUBIC-style recovery: without it, after a brief network hiccup the
+    /// cap sits at 0.3 Mbit/s and takes ~60 s to climb back to 2.6 at the
+    /// gentle 1.03/window. `pushbackRate` (CUBIC's W_max) is the
     /// rate the link last pushed back at; a cut that lands below
     /// `recoveryEnter` of it (a hiccup — the normal saw-tooth never cuts
     /// that deep) probes at `recoveryProbeFactor` until `recoveryExit` of
-    /// it, then gently. (A "best clean rate" memory instead was inflated by
-    /// startup bursts and overshot every cycle: relay p95 60 → 134–430 ms.)
+    /// it, then gently. (A "best clean rate" memory instead would be inflated
+    /// by startup bursts and overshoot every cycle: relay p95 60 → 134–430 ms.)
     public static let recoveryProbeFactor = 1.15
     public static let recoveryEnter = 0.4
     public static let recoveryExit = 0.7
     /// Half-life of the pushback memory, in 250 ms windows (~60 s).
     public static let pushbackDecayPerWindow = 0.9971
     /// Backoff scales with the queue: 0.85× at the threshold, down to 0.5×
-    /// (a first estimate can read ~2× the link — it measured QUIC's opening
-    /// burst into the bottleneck's buffer — and fixed 0.85 steps took 3 s).
+    /// (a first estimate can read ~2× the link — it measures QUIC's opening
+    /// burst into the bottleneck's buffer — and fixed 0.85 steps would take
+    /// 3 s).
     public static let backoffFactor = 0.85
     public static let minBackoffFactor = 0.5
     /// Smoothed RTT trails the queue by a few RTTs: one backoff per this,
@@ -69,10 +71,11 @@ public struct VideoRateController: Sendable {
     /// The encoder's own ceiling (20 Mbps) — no point estimating past it.
     public static let maxRate = 2_500_000
     /// Startup: until the link is measured, the encoder is capped here
-    /// instead of running at its 20 Mbps base (2026-09-30, live on a phone
-    /// tether: the first keyframe and the frames behind it were sized for
-    /// 20 Mbps, queued in the path, and the first picture showed ~1.5 s
-    /// behind capture — 3 fps and 262 ms SRTT for the first seconds).
+    /// instead of running at its 20 Mbps base (on a phone tether, a first
+    /// keyframe and the frames behind it sized for 20 Mbps queue in the path
+    /// and the first picture shows ~1.5 s behind capture — 3 fps and 262 ms
+    /// SRTT for the first seconds; BENCHMARKS 'Video startup: 3 Mbit/s cap
+    /// until the link is measured').
     public static let startupCapBps = 3_000_000
     /// While unmeasured, a clean window that actually used the startup cap
     /// raises it by this (3 → 20 Mbps in ~2 s of motion). The first
@@ -157,7 +160,7 @@ public struct VideoRateController: Sendable {
         // the first cap at all.
         // Startup ramp in progress (grown past its first step): a queue that
         // stands now is the link pushing back on the ramp's own probe — the
-        // 1 s filter's lag let the ramp fill the bottleneck's buffer (relay
+        // 1 s filter's lag would let the ramp fill the bottleneck's buffer (relay
         // rig p95 57–67 → 422–486 ms). A short filter still ignores
         // single-reading jitter spikes.
         let ramping = rate == 0 && startupCap.map { $0 > Self.startupCapBps } ?? true
@@ -165,7 +168,7 @@ public struct VideoRateController: Sendable {
             : standingQueueUS(nowUS: nowUS, window: ramping ? Self.rampQueueFilterUS : Self.queueFilterUS)
         // A queue we aren't feeding isn't ours to drain: with nothing backed
         // up here and well under half the rate handed, cutting again only
-        // walks the cap to the floor (live: a 6 s queue at a quiet connect)
+        // walks the cap to the floor (measured: a 6 s queue at a quiet connect)
         // — hold instead. A burst that does queue backs up and cuts.
         // Over the last second, not this window: a queue in the path holds
         // what was sent up to its own depth ago, and right after a cut the
@@ -183,14 +186,14 @@ public struct VideoRateController: Sendable {
             lastBackoffUS = nowUS
             // The network is holding what we sent: whatever the drain says,
             // deliver less until it empties. Unmeasured (the host's send
-            // queue never backed up — live, a 150 ms tether: `vlink
+            // queue never backed up — e.g. a 150 ms tether: `vlink
             // unmeasured`, queue standing at 80–100 ms): start from what is
             // being sent, so the encoder gets a cap at all.
             let excess = Double(queue - Self.queueHighUS) / 1_000_000
             // With a startup cap in force, cut from the cap: a quiet screen
-            // sends far less than it allows, and cutting from that (live
-            // 2026-09-30: ~27 KB/s at a connect with a 200 ms queue) landed
-            // on the 0.3 Mbit/s floor and took minutes to probe back.
+            // sends far less than it allows, and cutting from that (~27 KB/s
+            // at a connect with a 200 ms queue) would land on the 0.3 Mbit/s
+            // floor and take minutes to probe back.
             let base = rate > 0 ? rate : max(sample, (startupCap ?? 0) / 8)
             // A pushback on a probe (or the first one) sets W_max. Repeated
             // cuts while a hiccup's queue drains don't: they would erase the

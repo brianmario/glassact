@@ -138,8 +138,8 @@ public enum ControlMessage: Equatable, Sendable {
     /// the acked hash (and drop any belief already promoted by the bitmap
     /// ACK), so the tile re-qualifies and heals with an absolute record.
     /// Without this, one base-miss cements a permanently wrong acked hash:
-    /// every later delta pins to a base the viewer never had (measured
-    /// diverging on the photos loop replay). Sent only when non-empty.
+    /// every later delta pins to a base the viewer never had (the photos
+    /// loop replay diverges). Sent only when non-empty.
     case deltaNack(frameSeq: UInt32, tiles: [UInt16])
     /// Cursor as metadata (§5) — host → viewer, pointer position
     /// in canvas pixels. Rides the control tunnel (measured to stay snappy
@@ -157,8 +157,8 @@ public enum ControlMessage: Equatable, Sendable {
     /// is assumed personal/unattended), mode 2 = "Scale" (host display
     /// stays native; capture output downscales to the viewer's pixel size).
     /// width/height are the viewer's logical points; scale its backing
-    /// factor. The host applies and resets the session; the viewer's
-    /// auto-reconnect lands on a fresh HELLO with the new dimensions.
+    /// factor. The host applies it in session and re-HELLOs on the same
+    /// connection with the new dimensions (§4.10).
     case resize(mode: UInt8, width: UInt16, height: UInt16, scale: UInt8)
     /// Bidirectional clipboard sync (either side → the other, reliable).
     /// format 1 = UTF-8 plain text (more types later). Each side watches its
@@ -188,8 +188,8 @@ public enum ControlMessage: Equatable, Sendable {
     ///   5 keyDown     keycode u16 (CGKeyCode), flags u32 (CGEventFlags subset)
     ///   6 keyUp       keycode, flags
     ///   7 scroll (px) x,y, dx,dy in points — precise devices (trackpad,
-    ///                 Magic Mouse). Kind 4's line units turned every pixel
-    ///                 of a trackpad swipe into a line (~10× overscroll).
+    ///                 Magic Mouse). Kind 4's line units would turn every
+    ///                 pixel of a trackpad swipe into a line (~10× overscroll).
     ///                 Additive: receivers parse any non-zero kind and
     ///                 ignore unknown ones.
     /// Coordinates are canvas pixels; the host maps to its display. Both ends
@@ -565,9 +565,9 @@ public enum ControlMessage: Equatable, Sendable {
             return .resize(mode: mode, width: w, height: h, scale: scale)
         case 0x0E:
             // Any non-zero kind parses; receivers ignore kinds they don't
-            // know. A range check here made kind 7 (pixel scroll) a
-            // "malformed control stream" that killed the session on the
-            // first trackpad scroll — additive kinds must stay additive.
+            // know. A range check here would make a newly added kind (e.g.
+            // 7, pixel scroll) a "malformed control stream" that kills the
+            // session on first use — additive kinds must stay additive.
             guard let kind = r.readU8(), kind >= 1,
                   let x = r.readU16(), let y = r.readU16(),
                   let a = r.readU32(), let b = r.readU32(),
@@ -670,8 +670,9 @@ extension ControlMessage: TLVMessage {
     /// ACK bitmap for 65 535 datagrams (≈ 8 KB); 1 MB leaves headroom without
     /// permitting unbounded buffering (INV-6).
     public static let maxBodyLength: UInt32 = 1 << 20
-    /// CLIPBOARD body = 1 format byte + data: an exactly-1 MiB clipboard
-    /// was one byte over the bound and tore the session down.
+    /// CLIPBOARD body = 1 format byte + data, so the data gets one byte
+    /// less: an exactly-1 MiB clipboard would be one byte over the bound
+    /// and tear the session down.
     public static let maxClipboardBytes = Int(maxBodyLength) - 1
 }
 
