@@ -106,6 +106,9 @@ trying an idea: many have been measured already.
 
 ## Filing issues
 
+Security vulnerabilities don't go in public issues: report them privately,
+as [SECURITY.md](SECURITY.md) describes.
+
 Open work lives in GitHub issues, labelled `bug`, `enhancement`,
 `performance`, `security`, `research`, `macos` or `agents`. For a bug,
 include:

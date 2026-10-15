@@ -28,6 +28,11 @@
 			path = Viewer;
 			sourceTree = "<group>";
 		};
+		AA0000000000000000000009 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -52,6 +57,7 @@
 				AA0000000000000000000040 /* Signing.xcconfig */,
 				AA0000000000000000000005 /* Host */,
 				AA0000000000000000000006 /* Viewer */,
+				AA0000000000000000000009 /* Shared */,
 				AA0000000000000000000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -80,6 +86,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				AA0000000000000000000005 /* Host */,
+				AA0000000000000000000009 /* Shared */,
 			);
 			name = Host;
 			packageProductDependencies = (
@@ -101,6 +108,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				AA0000000000000000000006 /* Viewer */,
+				AA0000000000000000000009 /* Shared */,
 			);
 			name = Viewer;
 			packageProductDependencies = (
@@ -216,7 +224,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act Host";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSUIElement = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
@@ -241,7 +249,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act Host";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_LSUIElement = YES;
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
@@ -265,7 +273,7 @@
 				INFOPLIST_FILE = "Viewer-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act Viewer";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
@@ -289,7 +297,7 @@
 				INFOPLIST_FILE = "Viewer-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act Viewer";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
-				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
