@@ -29,4 +29,9 @@ the exception to the default no-dependencies posture.
   tarball, re-strip non-library paths, record the new tag + tarball hash
   here, and re-run `swift test`, the golden replays, and
   `glassact-bench keyframe` plus `glassact-bench replay --mode encode` on a
-  named trace (VP8L size and speed).
+  named trace (VP8L size and speed). If `COPYING` or `PATENTS` changed,
+  update `Apps/Shared/Acknowledgements.txt` to match.
+- **Notices in the apps:** the BSD license requires binary distributions to
+  reproduce the copyright notice. Both apps bundle
+  `Apps/Shared/Acknowledgements.txt` (Glass Act's MIT license, libwebp's
+  `COPYING` and `PATENTS`) and show it in their About panel.

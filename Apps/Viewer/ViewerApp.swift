@@ -270,11 +270,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     @objc private func showAbout() {
-        let credits = NSAttributedString(
-            string: "Shows and controls another Mac’s screen — pixel-exact, over a lossy network.",
-            attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                         .foregroundColor: NSColor.secondaryLabelColor])
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        AboutPanel.show(tagline: "Shows and controls another Mac’s screen — pixel-exact, over a lossy network.")
     }
 
     /// The standard menus. Key equivalents are safe while a session has

@@ -668,11 +668,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     @objc private func showAbout() {
         NSApp.activate()
-        let credits = NSAttributedString(
-            string: "Shares this Mac’s screen with Glass Act Viewer — pixel-exact, over a lossy network.",
-            attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                         .foregroundColor: NSColor.secondaryLabelColor])
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        AboutPanel.show(tagline: "Shares this Mac’s screen with Glass Act Viewer — pixel-exact, over a lossy network.")
     }
 }
 
