@@ -6,8 +6,7 @@ import GlassActWire
 import GlassActTestSupport
 
 /// INV-6 past the framing: the datagram parser validates a whole datagram
-/// before any record is seen, so random bytes (the old engine fuzz, which
-/// also stamped the retired v1 version nibble) never reached a payload
+/// before any record is seen, so random bytes almost never reach a payload
 /// decoder. This corpus is REAL host output — RAW, LZ4, LZBITMAP, VP8L,
 /// DELTA and CACHE STORE/REF records — whose payloads are corrupted and
 /// re-framed validly, so every mutation lands in a decoder.

@@ -61,9 +61,9 @@ import GlassActTestSupport
     }
 
     /// ~1 s RTT: quality degrades, the region dissolves on quiesce, and the
-    /// settle converges byte-exact — slow is fine, stuck is not. (This once
-    /// livelocked: un-ACKed cold repaint tiles read as churn re-formed the
-    /// region from its own repaint; see `lastObservedHash` and
+    /// settle converges byte-exact — slow is fine, stuck is not. (Reading
+    /// un-ACKed cold repaint tiles as churn would re-form the region from its
+    /// own repaint, a livelock; see `lastObservedHash` and
     /// highRTTGoldenConvergence.)
     @Test func severeLinkStillConverges() {
         var faults = FaultConfig()

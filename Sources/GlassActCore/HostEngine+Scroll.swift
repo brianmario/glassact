@@ -24,7 +24,7 @@ extension HostEngine {
                               x0: Int, w: Int) -> UInt64 {
         let rowBase = base.advanced(by: row * rowStride + x0 * 4)
         var state = XXH64.Streaming()
-        // Never wider than the box's row (a < 4 px box used to read 16 B).
+        // Never wider than the box's row (a < 4 px box would otherwise read 16 B).
         let span = min(128 * 4, max(16, w), w * 4)
         state.update(UnsafeRawBufferPointer(start: rowBase, count: span))
         state.update(UnsafeRawBufferPointer(start: rowBase.advanced(by: max(0, (w / 2) * 4 - span / 2)), count: span))
@@ -195,7 +195,7 @@ extension HostEngine {
 
     static let dragProbeSize = 128
     static let dragProbeSampleGrid = 16 // 16×16 samples at stride 8
-    /// ±640, not ±224: live, the ACKed shadow lags a fast drag by several
+    /// ±640, not ±224: the ACKed shadow lags a fast drag by several
     /// steps (deferral + ACK RTT), so the frame-vs-shadow offset is the
     /// CUMULATIVE motion since the last successful sync — measured drags
     /// move ~100 px/frame at 5K. The anchor/memmem search makes the wider
@@ -213,7 +213,7 @@ extension HostEngine {
     /// frame for one 128×128 probe block. Probe positions form a 3×3 grid
     /// over the bbox ranked by texture (distinct sampled pixels — measured
     /// terminal content at 5K is ~90 % flat background, so a 64×64 probe
-    /// rarely spanned a glyph line and the probe size/threshold are tuned for
+    /// rarely spans a glyph line and the probe size/threshold are tuned for
     /// that), and the best few are each searched until one produces
     /// candidates.
     ///
@@ -221,7 +221,7 @@ extension HostEngine {
     /// from the probe's center row are located in the shadow's search window
     /// with memmem row by row (~1 MB of linear scanning), and only anchor
     /// hits get the sampled check + full-block memcmp. A naive ±radius²
-    /// offset sweep was measured breaking the QUIC sustained test's real-time
+    /// offset sweep measurably breaks the QUIC sustained test's real-time
     /// deadlines at -Onone — same candidates, ~200× the work. Candidates are
     /// ordered by |dx|+|dy| — consecutive drag frames move a small distance.
     func probe2DShift(frameBase: UnsafeRawPointer, bytesPerRow: Int,
@@ -533,7 +533,7 @@ extension HostEngine {
 
         // Mirror the viewer's op on the shadow, using exactly the viewer's
         // skip rules (out-of-canvas sources leave rows untouched) — in place,
-        // no snapshot (it was a full-canvas copy per scroll: 59 MB at 5K).
+        // no snapshot (that would be a full-canvas copy per scroll: 59 MB at 5K).
         let width = grid.width
         let height = grid.height
         let x0 = rectX, y0 = rectY, x1 = rectX + rectW, y1 = rectY + rectH

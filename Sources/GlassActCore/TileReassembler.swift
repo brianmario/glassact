@@ -58,8 +58,8 @@ struct TileReassembler: ~Copyable {
     private(set) var activeCount = 0
 
     // Reassembly buffers are pooled: a tile holds one only while a partial is
-    // live (it used to keep a 17.7 KB buffer forever once it had ever
-    // fragmented — ~64 MB at 5K — first allocated on the apply path). The
+    // live (a per-tile 17.7 KB buffer kept forever once the tile had ever
+    // fragmented would cost ~64 MB at 5K, allocated on the apply path). The
     // arena starts at arenaInitial buffers and doubles only when concurrent
     // partials exceed its high-water mark (bounded by the tile count);
     // steady state allocates nothing (INV-7).

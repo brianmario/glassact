@@ -139,9 +139,9 @@ import GlassActTestSupport
     /// INV-4 with dirty rects: a dropped capture's changes still re-qualify.
     /// Rects are deltas against the previous capture, so the tick after a
     /// drop does not report what changed in the dropped one — without
-    /// carrying that damage forward, the tile was never hashed again and
-    /// stayed stale on the viewer (live, 2026-09-30). The settle harness
-    /// hid it: its ticks pass `dirtyRects: nil`, a full scan.
+    /// carrying that damage forward, the tile would never be hashed again and
+    /// would stay stale on the viewer. The settle harness can't see this: its
+    /// ticks pass `dirtyRects: nil`, a full scan.
     @Test func INV_4_droppedCaptureDamageStillRequalifies() {
         var rng = SplitMix64(seed: 33)
         let (host, capture) = makeRunningHost(width: 128, height: 64)
@@ -243,9 +243,9 @@ import GlassActTestSupport
     }
 
     /// INV-10: no changes → no datagrams (keepalive ACK/PING ride control and
-    /// are exempt). Counted on the WIRE, not by the engine's stats: the old
-    /// 10 s keepalive datagram bypassed `datagramsSent`, so this test never
-    /// saw it.
+    /// are exempt). Counted on the WIRE, not by the engine's stats: a
+    /// datagram that bypassed `datagramsSent` (say, a 10 s keepalive) would
+    /// otherwise go unseen.
     @Test func INV_10_idleZeroBytes() {
         var rng = SplitMix64(seed: 61)
         let harness = Harness(width: 256, height: 192)
@@ -275,7 +275,7 @@ import GlassActTestSupport
         for _ in 0..<2_000 {
             var bytes = rng.bytes(rng.int(0..<600))
             if !bytes.isEmpty && rng.int(0..<2) == 0 {
-                bytes[0] = WireVersion.current << 4 // was 0x10 (v1): every one died at the header
+                bytes[0] = WireVersion.current << 4 // a valid version, or every one dies at the header
             }
             viewer.handleDatagram(Data(bytes), nowUS: 0)
         }
@@ -306,12 +306,12 @@ import GlassActTestSupport
         #expect(harness.canvasMatchesFrame())
     }
 
-    /// Regression (§4.4 cold-on-timeout, found by golden replay of a real capture):
-    /// a timed-out send may have been applied by the viewer even though its
-    /// confirmation was lost. If ackedHash survived the timeout and the tile's
-    /// content then REVERTED to it (clock/cursor blink), `h == ackedHash`
-    /// suppressed the re-send forever — permanent divergence. Timeout must
-    /// drop the tile to cold state so it re-sends unconditionally.
+    /// §4.4 cold-on-timeout: a timed-out send may have been applied by the
+    /// viewer even though its confirmation was lost. If ackedHash survived
+    /// the timeout and the tile's content then REVERTED to it (clock/cursor
+    /// blink), `h == ackedHash` would suppress the re-send forever —
+    /// permanent divergence. Timeout must drop the tile to cold state so it
+    /// re-sends unconditionally.
     @Test func timeoutInvalidatesShadowMap_revertRegression() {
         var rng = SplitMix64(seed: 67)
         let (host, capture) = makeRunningHost(width: 64, height: 64) // 1 tile
@@ -335,8 +335,8 @@ import GlassActTestSupport
         #expect(host.openBatchCount == 0)
         #expect(host.ackedHash(forTile: 0) == 0, "timeout must invalidate the shadow map")
 
-        // Content reverts to A. Pre-fix: h == stale ackedHash -> never sent,
-        // leaving a viewer that applied B diverged forever. Now: must re-send.
+        // Content reverts to A. It must re-send: h == a stale ackedHash would
+        // skip it, leaving a viewer that applied B diverged forever.
         let before = capture.sentDatagrams.count
         frameA.encode(host: host, nowUS: 30_000 + host.timeoutUS + 10_000)
         #expect(capture.sentDatagrams.count > before, "reverted content must re-send after timeout")

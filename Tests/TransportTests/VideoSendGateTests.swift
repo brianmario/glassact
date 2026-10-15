@@ -6,18 +6,17 @@ import Testing
 import GlassActCore
 import GlassActTestSupport
 
-/// Regression test for the video send gate on a thin link. A host offers
-/// ~10 Mbps of video into a 3 Mbps bottleneck (64 KB drop-tail buffer, 80 ms
-/// base RTT) — the shape of a remote session on airport Wi-Fi (live:
-/// 2.5 Mbps, 1.6–2.2 s p50 glass-to-glass under the old 512 KB byte gate).
-/// It asserts that the old gate fails (seconds of lag) and the new one,
-/// `VideoRateController` fed as `HostEngine` feeds it, passes.
+/// The video send gate on a thin link. A host offers ~10 Mbps of video into
+/// a 3 Mbps bottleneck (64 KB drop-tail buffer, 80 ms base RTT) — the shape
+/// of a remote session on airport Wi-Fi (2.5 Mbps, where a 512 KB byte gate
+/// gives 1.6–2.2 s p50 glass-to-glass). It asserts that a byte gate fails
+/// (seconds of lag) and the time gate, `VideoRateController` fed as
+/// `HostEngine` feeds it, passes.
 ///
-/// It began (2026-09-28, as `VideoQueueProbeTests`) as the probe behind the
-/// fix: the transport's contentProcessed backlog matches the stream report's
-/// sentApplicationByteCount to within a frame — the host could always see
-/// its send queue; the limit (bytes, not time) was the bug. The report's
-/// smoothed − minimum RTT shows the bottleneck's queue per ACK.
+/// The transport's contentProcessed backlog matches the stream report's
+/// sentApplicationByteCount to within a frame, so the host can always see
+/// its send queue; what matters is limiting it by time, not bytes. The
+/// report's smoothed − minimum RTT shows the bottleneck's queue per ACK.
 @Suite(.serialized, .tags(.quic, .slow), .notInFastLane) struct VideoSendGateTests {
     static let frameBytes = 20_000
 
@@ -49,8 +48,6 @@ import GlassActTestSupport
         defer { r1.cancel(); r2.cancel() }
         let client = QUICTransport.connect(host: "127.0.0.1", port: r1.port, fingerprint: fingerprint,
                                            datagramPort: r2.port, queue: clientQueue)
-        // Frames are fixed-size with the send time in their first 8 bytes;
-        // the stream delivers arbitrary chunks, so reassemble by offset.
         // Frame = [len u32][sent_us u64][fill]; the stream delivers
         // arbitrary chunks, so reassemble by length.
         let delays = Mutex<[Double]>([])
@@ -98,14 +95,14 @@ import GlassActTestSupport
     }
 
     @Test func timeGateBoundsVideoLatencyOnAThinLink() throws {
-        // The old gate: 512 KB of backlog once SRTT > 50 ms.
-        let old = try run(settleS: 1.5) { backlog, _, _, _ in backlog < 512 << 10 ? Self.frameBytes : 0 }
-        // The new one, fed exactly as HostEngine feeds it.
+        // Baseline byte gate: 512 KB of backlog once SRTT > 50 ms.
+        let byteGate = try run(settleS: 1.5) { backlog, _, _, _ in backlog < 512 << 10 ? Self.frameBytes : 0 }
+        // The time gate, fed exactly as HostEngine feeds it.
         nonisolated(unsafe) var c = VideoRateController()
         nonisolated(unsafe) var lastHanded = 0
         // Steady state: from 3 s — the startup ramp (3 Mbit/s, ×1.25 per clean
         // window) overshoots a link this thin once, inside the first seconds.
-        let new = try run(settleS: Double(ProcessInfo.processInfo.environment["GLASSACT_RIG_SETTLE"] ?? "") ?? 3) { backlog, host, now, handed in
+        let timeGate = try run(settleS: Double(ProcessInfo.processInfo.environment["GLASSACT_RIG_SETTLE"] ?? "") ?? 3) { backlog, host, now, handed in
             c.noteHanded(handed - lastHanded)
             lastHanded = handed
             let q = host.transportRTT.map { $0.smoothedUS > $0.minUS ? $0.smoothedUS - $0.minUS : 0 }
@@ -116,11 +113,11 @@ import GlassActTestSupport
             // The encoder aims at its cap (VT's average bitrate), at 60 Hz.
             return c.bitrateCap.map { min(Self.frameBytes, max(2_000, $0 / 8 / 60)) } ?? Self.frameBytes
         }
-        print("gate old: n=\(old.count) p50=\(p(old, 50)) p95=\(p(old, 95)) ms; new: n=\(new.count) p50=\(p(new, 50)) p95=\(p(new, 95)) ms rate=\(c.rate) B/s")
-        #expect(p(old, 95) > 1000, "rig must reproduce the seconds-of-lag failure (p95 \(p(old, 95)) ms)")
-        #expect(p(new, 95) < 500, "p95 one-way video delay \(p(new, 95)) ms")
+        print("byte gate: n=\(byteGate.count) p50=\(p(byteGate, 50)) p95=\(p(byteGate, 95)) ms; time gate: n=\(timeGate.count) p50=\(p(timeGate, 50)) p95=\(p(timeGate, 95)) ms rate=\(c.rate) B/s")
+        #expect(p(byteGate, 95) > 1000, "rig must reproduce the byte gate's seconds of lag (p95 \(p(byteGate, 95)) ms)")
+        #expect(p(timeGate, 95) < 500, "p95 one-way video delay \(p(timeGate, 95)) ms")
         // Throughput is the link's, not starved: ≥ 70 % of 3 Mbps over the
         // scored 3 s.
-        #expect(new.count * Self.frameBytes > 375_000 * 3 * 7 / 10, "delivered \(new.count) frames")
+        #expect(timeGate.count * Self.frameBytes > 375_000 * 3 * 7 / 10, "delivered \(timeGate.count) frames")
     }
 }

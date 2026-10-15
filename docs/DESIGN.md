@@ -5,11 +5,9 @@ How Glass Act works, as built. Code comments cite this document by section
 subsections rather than renumbering. When the code and this document
 disagree, the code wins. Fix this document in the same change.
 
-This document grew out of the v1 handoff spec. v1 covered tiles, LWW, ACKs and QUIC.
-Most of the "reserved roadmap" was built after that: scroll, cache, delta,
-video regions, keyframes and the cursor. Measurements and the reasons for
-each choice live in [`BENCHMARKS.md`](../BENCHMARKS.md), which this
-document points into by section title. Open work is in GitHub issues.
+Measurements and the reasons for each choice live in
+[`BENCHMARKS.md`](../BENCHMARKS.md), which this document points into by
+section title. Open work is in GitHub issues.
 
 ---
 
@@ -37,8 +35,8 @@ container. QUIC provides the framing, and the compositor provides the clock.
 ## 1. Invariants
 
 These are frozen. Each one has a named `INV_*` test, and a failing invariant
-test blocks merge. Several have been *extended* since v1. The extension is
-spelled out here, so the rule a test checks is the rule in this document.
+test blocks merge. Several carry extensions, spelled out here, so the rule
+a test checks is the rule in this document.
 
 - **INV-1 Absolute or pinned payloads.** No tile record depends on
   *unspecified* prior content:
@@ -159,8 +157,8 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 - Version compatibility is an **exact match**: the datagram header nibble,
   HELLO and HELLO_OK are all checked. Features are negotiated with caps bits
   (§3.8), not version bumps.
-- Pre-release, breaking the wire is allowed (§12): bump the version and don't
-  keep old decode paths.
+- Until 1.0 any release may change the wire (§12): bump the version and
+  keep no old decode paths; both ends run the same build.
 
 ### 3.1 Geometry
 
@@ -229,9 +227,9 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 
 - **Inner opcodes** (inside DELTA and CACHE STORE) are one of 0x01, 0x02, 0x09 or 0x0A.
 - **Cache** has 4096 slots on each end. The host allocates slots.
-- **Reserved, never reuse:** `0x03 COPY` (scroll became a control TLV),
-  `0x04 PALETTE`, `0x05 DCT`, `0x06 REFINE`, `0x08 VIDEO_REGION` (video got its
-  own stream).
+- **Reserved, never reuse:** `0x03 COPY`, `0x04 PALETTE`, `0x05 DCT`,
+  `0x06 REFINE`, `0x08 VIDEO_REGION`. Scroll is a control TLV (§3.5) and
+  video has its own stream (§3.7).
 - **Invalid:** `0x00`. Opcodes 0x0C+ are unassigned, and the viewer skips
   opcodes it doesn't know.
 - **SKIP** is the absence of a record.
@@ -331,12 +329,12 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 |---|---|---|
 | 0 | videoHEVC | HEVC video regions |
 | 1 | videoAV1 | reserved for AV1 once hardware encode exists; today only the test rig's alternate mock codec (0x7E) |
-| 2 | — | unassigned (was `keyframe`; since v3 every viewer decodes lossless keyframes) |
-| 3 | — | unassigned (was `delta`; since v3 every viewer decodes DELTA records) |
+| 2 | — | unassigned |
+| 3 | — | unassigned |
 | 4 | cursor | cursor as metadata (host stops burning it into pixels) |
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
-| 7 | — | unassigned (was `videoOverlay`; since v3 every viewer draws video as the overlay) |
+| 7 | — | unassigned |
 | 8 | — | unassigned |
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
@@ -474,9 +472,9 @@ whole batch with one `transport.sendDatagrams`, then
 - On timeout, each tile that still owns its slot goes **cold**: `ackedHash = 0`
   and it is queued for repaint.
 
-  This deviates from v1, which only cleared the in-flight slot. Golden replay
-  showed why that wasn't enough: an un-ACKed tile can sit on stale content
-  that the hash comparison no longer sees.
+  Clearing only the in-flight slot isn't enough: an un-ACKed tile can sit
+  on stale content that the hash comparison would never see again (golden
+  replay diverges).
 - The timeout also releases cache pins and feeds `PaceController` and the
   governor's loss signal.
 
@@ -780,8 +778,8 @@ tunnels:
 **Classification:** a control tunnel's ALPN is only known once its handshake
 completes, so the server starts each accepted tunnel and decides when it's
 ready:
-- `glassact` → a session. Only now may it displace a session that is still
-  establishing, so a dial refused at TLS can no longer cancel a viewer
+- `glassact` → a session. Only a classified session may displace one that
+  is still establishing, so a dial refused at TLS can't cancel a viewer
   mid-connect.
 - `glassact-signin` → one sign-in exchange (§3.9), at most 4 at once. It is
   never handed to the session code.
@@ -800,15 +798,16 @@ Both tunnels:
 Why two tunnels instead of one: the transport is built on the
 `NWConnectionGroup` API, which doesn't model QUIC datagrams alongside
 streams (extracting a datagram flow from the group fails). The
-`NetworkConnection` API that does needed macOS 26, newer than the
-deployment target when the transport was written. The floor is now
-macOS 27, so that reason is gone; **issue #10** tracks moving to one tunnel
-(one port, one handshake, no tunnel pairing). A 2026-09 spike of that API
-is in BENCHMARKS ("`NetworkConnection<QUIC>` spike"). The details are in the
-`## Deviations` note at the top of `QUICTransport.swift`.
+`NetworkConnection` API does model both, but its datagram send is
+async-only, with no batch or idempotent send, and its usable datagram frame
+size reads 0 after establishment (BENCHMARKS "`NetworkConnection<QUIC>`
+spike"), so the pixel path stays on the group API. **Issue #10** tracks
+moving to one tunnel on `NetworkConnection` (one port, one handshake, no
+tunnel pairing). The details are in the `## Deviations` note at the top of
+`QUICTransport.swift`.
 
-Tile records over QUIC streams (one stream per batch) were prototyped and
-removed: they stalled under 1–3 % random loss. Issue #10 tracks whether to
+Tile records over QUIC streams (one stream per batch) stall under 1–3 %
+random loss, so tile records stay on datagrams. Issue #10 tracks whether to
 revisit them (BENCHMARKS "PROTOTYPE: tile records over QUIC streams").
 
 **`InProcTransport`** (tests and bench) has the same interface and runs in
@@ -940,11 +939,9 @@ remote input and clipboard, mutual TLS with sign-in and approvals (§13),
 geometry modes and the virtual display, single-window mode, and agents
 (§14). P2 (palette), P4 (DCT) and P5 (Metal) were not built; §11 says why.
 
-The history from before this repository is in the pre-release archive.
-
 ### 10.1 v1 acceptance
 
-These were the original bars. Their status is in BENCHMARKS "§10.1 acceptance
+These are the v1 acceptance bars. Their status is in BENCHMARKS "§10.1 acceptance
 status".
 
 - All invariant, property and fuzz tests green. Goldens byte-exact at
@@ -965,7 +962,7 @@ status".
 | P4 DCT + REFINE | REFINE measured and rejected (the diff was larger than full lossless); DCT superseded by video regions |
 | P5 Metal surge path | not built; hardware HEVC covers surges |
 | P6 video regions | built on its own stream (not opcode 0x08); pinned full-screen HEVC with the overlay is the only mode |
-| P6 partial regions and codec ladder | removed 2026-10-13: hot-map partial-screen regions (with in-place resize) and the CPU-pressure codec demote/promote ladder. Both are recoverable from the pre-release archive (the history before wire v3). AV1 stays reserved for hardware encode; the codec-keyed factory keeps a second codec pluggable |
+| P6 partial regions and codec ladder | not kept: hot-map partial-screen regions (with in-place resize) and the CPU-pressure codec demote/promote ladder; pinned full-screen video supersedes both (BENCHMARKS decisions table). AV1 stays reserved for hardware encode; the codec-keyed factory keeps a second codec pluggable |
 
 Open work is in GitHub issues (labels: `performance`, `security`, `research`,
 `macos`, `agents`).
@@ -974,9 +971,9 @@ Open work is in GitHub issues (labels: `performance`, `security`, `research`,
 
 ## 12. Working agreements
 
-- Pre-release, the wire may break at will: bump `WireVersion.current` and
-  don't keep old decode paths. Before a public release this tightens back to
-  sign-off plus a decode path for `ver − 1`.
+- Until 1.0 the wire protocol may change in any release: bump
+  `WireVersion.current`, and keep no old decode paths or migration code.
+  Both ends must run the same build.
 - **No new dependencies.** System frameworks only, plus the vendored libwebp.
 - Every invariant keeps an `INV_*` test, and a failing one blocks merge.
 - Perf-relevant changes include before/after `glassact-bench` output on a

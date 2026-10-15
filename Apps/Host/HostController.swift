@@ -82,10 +82,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                             @unchecked Sendable {
     static let controlPort: UInt16 = 4433
 
-    /// Pinned full-screen video is simply how the host works (validated
-    /// live). GLASSACT_TILE_ONLY=1 is a debug-only escape hatch for A/B
-    /// measuring against the tile path — not a user-facing mode: no encoder
-    /// factory, so no video caps are offered and the session is tiles only.
+    /// Pinned full-screen video is simply how the host works.
+    /// GLASSACT_TILE_ONLY=1 is a debug-only escape hatch for A/B measuring
+    /// against the tile path — not a user-facing mode: no encoder factory,
+    /// so no video caps are offered and the session is tiles only.
     static var videoEnabled: Bool {
         ProcessInfo.processInfo.environment["GLASSACT_TILE_ONLY"] == nil
     }
@@ -131,13 +131,13 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var serverRequested = false
     /// main-thread: bumped by every capture (re)start and by stop(). A
     /// capture Task that finds the generation moved on abandons (and stops)
-    /// its stream — SCStreams used to survive overlapping restarts untracked.
+    /// its stream, so overlapping restarts can't leave an SCStream untracked.
     private var captureGeneration = 0
     /// Consecutive health checks that found the stream not capturing.
     private var captureMisses = 0
     private var pixelScale: CGFloat = 1
     private var contentOrigin: CGPoint = .zero
-    // RESIZE support (§3.5 reserved slot, landed): the viewer picks a
+    // RESIZE support (§3.5): the viewer picks a
     // geometry policy — "Client Resolution" switches the HOST DISPLAY
     // (personal/unattended hosts), "Scale" downsamples the capture.
     private var lastFilter: SCContentFilter?
@@ -209,7 +209,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var telePrevStats = HostStats()
     private var telePrevUS: UInt64 = 0
     /// The engine `telePrevStats` came from: a new session's engine starts
-    /// its counters at 0, and diffing against the old one's printed
+    /// its counters at 0, and diffing against the old one's would print
     /// negative rates (`bw -5675 Kbps · tiles -16974`).
     private var telePrevEngine: ObjectIdentifier?
     /// Where the screen changes (SCK dirty rects), per status interval —
@@ -222,9 +222,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     // Static-screen drain (encodeQueue-confined): SCK stops delivering frames
     // the moment the host screen goes quiet, but governor-deferred tiles,
     // post-dissolve repaints, and open batches only make progress on encode
-    // ticks — measured live: the viewer sat on a mixed-generation mosaic
-    // "until the next tick of data". Keep the last frame and self-tick from
-    // it while work remains.
+    // ticks — without them the viewer would sit on a mixed-generation
+    // mosaic until the screen next changes. Keep the last frame and
+    // self-tick from it while work remains.
     private var lastFrame: CMSampleBuffer?
     private var lastCaptureUS: UInt64 = 0
     private var lastSyntheticTickUS: UInt64 = 0
@@ -466,8 +466,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
 
     /// Log every display mode change with its new size — the host's own
     /// switches log just before theirs, so an unannounced one is external
-    /// (live: the display went back to native between reconnects with no
-    /// host restore in the log).
+    /// (e.g. macOS putting the display back to native between reconnects).
     private func watchDisplayReconfiguration() {
         guard !displayWatchRegistered else { return }
         displayWatchRegistered = true
@@ -486,10 +485,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     }
 
     /// Main thread. macOS can move the display off the viewer's Client
-    /// Resolution mid-session — live 2026-09-30: switched to 1440×810 on a
-    /// connect right after display wake, reverted to native 60 ms later, and
-    /// the viewer got the whole 5K desktop scaled down for the session (the
-    /// HELLO-time check only runs on a reconnect). Put it back after a short
+    /// Resolution mid-session (e.g. back to native 60 ms after a switch made
+    /// on a connect right after display wake). Left alone, the viewer gets
+    /// the whole native desktop scaled down for the session (the HELLO-time
+    /// check only runs on a reconnect). Put it back after a short
     /// settle (0.15 s: every frame in the wrong mode is a full-screen change
     /// on a link still warming up); at most 3 times a minute, so a system
     /// that insists wins.
@@ -571,8 +570,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                         ?? content.displays.first else {
                     // Asleep (or locked): nothing to capture yet. Launch has
                     // no viewer to wake it and the listener only starts on
-                    // the first frame — so without a retry the host sat
-                    // unreachable (live, a restart while the display slept).
+                    // the first frame — so without a retry a host launched
+                    // while the display sleeps would stay unreachable.
                     // Wake it and try again.
                     self.retryDefaultDisplay(after: 2, reason: "no display available to capture")
                     return
@@ -655,8 +654,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         captureGeneration += 1
         let generation = captureGeneration
         let boxed = UnsafeSendableBox(filter)
-        // @MainActor: every field below is main-thread state (this Task used
-        // to write them from the global executor).
+        // @MainActor: every field below is main-thread state.
         Task { @MainActor in
             do {
                 let filter = boxed.value
@@ -715,9 +713,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// menu-bar screen-recording control is a privacy decision made at the
     /// Mac: honor it and stop sharing. Anything else — display sleep or
     /// disconnect ("Failed to find any displays or windows to capture"),
-    /// the lock screen, a window gone — used to stop sharing too, which
-    /// stranded a remote user with no way back in. Keep the share (listener,
-    /// session, engine) and recover capture instead.
+    /// the lock screen, a window gone — keeps the share (listener, session,
+    /// engine) and recovers capture: stopping would strand a remote user
+    /// with no way back in.
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         let boxed = UnsafeSendableBox(stream)
         let ns = error as NSError
@@ -740,8 +738,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
 
     /// Main thread. Single-window capture stopped: if the window still exists
     /// (minimized, other Space…) recover as usual. If it's gone — closed, or
-    /// its app quit — end the session: recovery used to fall back to the
-    /// whole display, so the viewer suddenly saw the entire desktop.
+    /// its app quit — end the session: falling back to the whole display
+    /// would suddenly show the viewer the entire desktop.
     private func endSessionIfSharedWindowGone() {
         let windowID = singleWindowID
         Task { @MainActor in
@@ -976,9 +974,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// it, so we prompt once.
     /// Canvas pixels per display point, for input, cursor reports and dirty
     /// rects. Full-display capture: measured from the display's CURRENT
-    /// size every time — the configured scale assumed a display-mode switch
-    /// had happened, and when macOS refused one (at the lock screen) clicks
-    /// landed 78 % off (2.0 used where the native display needed 1.125).
+    /// size every time — the configured scale assumes a display-mode switch
+    /// happened, and when macOS refuses one (at the lock screen) clicks
+    /// would land 78 % off (2.0 used where the native display needs 1.125).
     /// Window capture: the stored scale (the window, not the display).
     private var mappingScale: CGFloat {
         guard singleWindowID == 0, captureWidth > 0 else { return pixelScale }
@@ -1037,9 +1035,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             case (2, _): type = .otherMouseDown
             default: type = .otherMouseUp
             }
-            // The viewer's click count (0 from viewers that predate it): a
-            // double-click is two downs/ups with click state 1 then 2 —
-            // stamped 1 every time, apps saw only single clicks.
+            // The viewer's click count (0 is read as 1): a double-click is
+            // two downs/ups with click state 1 then 2 — stamped 1 every
+            // time, apps would see only single clicks.
             let clickState = Int64(max(1, min(a, 32)))
             if kind == 2 { heldClickState = clickState }
             post(mouse: type, at: pt, button: button, clickState: clickState)
@@ -1234,10 +1232,11 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // same-geometry case): no display switch, no capture rebuild —
             // just finalize the handshake on the live connection.
             // The DISPLAY must be in that mode too, not just the capture at
-            // that size: after the display reverted to native (live, between
-            // two quick reconnects) a 2880×1620 capture of the native 5120
-            // display matched here and the switch was skipped — the viewer
-            // got the whole host desktop scaled down, not Client Resolution.
+            // that size: if macOS reverted the display to native (as it can
+            // between two quick reconnects), a 2880×1620 capture of the
+            // native 5120 display would match here and skip the switch — the
+            // viewer would get the whole host desktop scaled down, not
+            // Client Resolution.
             let current = CGDisplayCopyDisplayMode(display)
             if target.pixelWidth == captureWidth && target.pixelHeight == captureHeight
                 && current?.width == target.width && current?.height == target.height {
@@ -1258,9 +1257,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             let pw = target.pixelWidth
             let ph = target.pixelHeight
             // Report what the display IS, not what was asked: macOS refuses
-            // a mode change at the lock screen, and this line used to claim
-            // the switch regardless. (Input mapping measures the live
-            // display either way — see mappingScale.)
+            // a mode change at the lock screen. (Input mapping measures the
+            // live display either way — see mappingScale.)
             let now = CGDisplayBounds(display)
             if switched && Int(now.width) == target.width {
                 onStatus("resize: host display → \(target.width)×\(target.height) (\(pw)×\(ph) px)")
@@ -1524,8 +1522,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         lastFilter = filter
         // Input/cursor map through the window's SCREEN origin. A desktop-
         // independent window filter's contentRect.origin is content-relative
-        // (~0,0), which sent clicks to the screen corner and kept the cursor
-        // out of frame — use the AX (or SCWindow) screen frame instead.
+        // (~0,0), which would send clicks to the screen corner and keep the
+        // cursor out of frame — use the AX (or SCWindow) screen frame instead.
         let origin = originalWindowFrame?.origin ?? window.frame.origin
         onStatus("sharing window: \(window.owningApplication?.applicationName ?? "?") — \(window.title ?? "")")
         restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: scale,
@@ -1562,7 +1560,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Toggle the shared window's full-screen state via Accessibility, then
     /// re-capture at the settled geometry (fullscreen animates, so read the AX
     /// frame after a short delay). Best-effort — some windows have no
-    /// AXFullScreen; live tuning expected.
+    /// AXFullScreen.
     private func toggleFullscreen(_ window: SCWindow) {
         guard ensureAccessibility(), let ax = sharedAX(for: window) else {
             onStatus("fullscreen: no accessible window"); return
@@ -1707,17 +1705,17 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // Restore after ANY geometry change — a display switch (Client
             // Resolution) OR a capture downscale (Scale). The latter leaves no
             // originalDisplayMode but still needs the capture rebuilt at native
-            // (found live: a Scale session left the capture stuck at 2940×1652,
-            // which the next Native session then inherited).
+            // (otherwise a Scale session leaves the capture at, say, 2940×1652
+            // for the next Native session to inherit).
             guard self.captureModified else { return }
             self.pendingDisplayRestore?.cancel()
             self.pendingDisplayRestore = nil
             // Client Resolution with lock-on-disconnect: nobody local sees the
-            // switched display behind the lock, and restoring cost every
-            // reconnect a display switch (~440 ms), a capture restart and —
-            // seen on each connect after a lock — a macOS revert plus our
-            // re-apply (~0.5 s): ~1 s of the 1.5 s to first picture
-            // (2026-10-01). Keep it until a local unlock. The next HELLO is
+            // switched display behind the lock, and restoring would cost
+            // every reconnect a display switch (~440 ms), a capture restart
+            // and — on each connect after a lock — a macOS revert plus our
+            // re-apply (~0.5 s): ~1 s of a 1.5 s time to first picture.
+            // Keep it until a local unlock. The next HELLO is
             // NOT final, so a different viewer or preference still
             // negotiates; the same request finds the display already there.
             if self.lockOnDisconnect, let applied = self.appliedDisplaySize {
@@ -1779,7 +1777,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private func applyVirtualDisplay(widthPoints: Int, heightPoints: Int, scale: Int) {
         let s = max(1, min(2, scale))
         // Points may be odd at 2× (pixels are even either way): rounding a
-        // measured 1470×923 full screen down to 922 left a 1 pt gap.
+        // 1470×923 full screen down to 922 would leave a 1 pt gap.
         var w = max(320, min(widthPoints, TileGrid.maxDimension / s))
         var h = max(200, min(heightPoints, TileGrid.maxDimension / s))
         if s == 1 { w &= ~1; h &= ~1 }
@@ -1796,7 +1794,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             captureModified = true
             appliedDisplaySize = (w, h)
             // Mirroring set up for the old size keeps the physical display
-            // at it, and the desktop with it: live, the Dock sat laid out
+            // at it, and the desktop with it: the Dock would stay laid out
             // for 1470×923 on a 1382×763 display — below its bottom edge.
             // Un-mirror now; sharing re-mirrors once the new mode is in.
             vd.mirror(false)
@@ -1904,8 +1902,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     }
 
     /// Reliable display-mode switch via a configuration transaction. Bare
-    /// CGDisplaySetDisplayMode silently no-ops in some contexts (observed:
-    /// the down-switch took but the delayed restore did not); the
+    /// CGDisplaySetDisplayMode silently no-ops in some contexts (a
+    /// down-switch can take while the delayed restore does not); the
     /// begin/configure/complete transaction applies deterministically.
     @discardableResult
     private func setDisplayMode(_ mode: CGDisplayMode, on display: CGDirectDisplayID) -> Bool {
@@ -1913,9 +1911,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         guard CGBeginDisplayConfiguration(&config) == .success, let config else { return false }
         CGConfigureDisplayWithDisplayMode(config, display, mode, nil)
         // .forAppOnly: the system reverts the mode when this process exits —
-        // including a crash or force-quit. `.permanently` left the user's
-        // monitor at the viewer's resolution across logout and reboot
-        // whenever the graceful restore path didn't run.
+        // including a crash or force-quit. `.permanently` would leave the
+        // user's monitor at the viewer's resolution across logout and
+        // reboot whenever the graceful restore path didn't run.
         return CGCompleteDisplayConfiguration(config, .forAppOnly) == .success
     }
 
@@ -1936,8 +1934,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
 
     /// Clean-benchmark recording: arm after `delay` (menu closed, screen
     /// settled), auto-stop after `duration` — the recorder never captures
-    /// its own UI being operated (found the hard way: 71 % of the original
-    /// typing trace was the stop menu's vibrancy blur).
+    /// its own UI being operated (the stop menu's vibrancy blur can be 71 %
+    /// of a typing trace's changes).
     func timedRecording(delaySeconds: Double = 5, durationSeconds: Double = 30) {
         onStatus("timed recording: starts in \(Int(delaySeconds)) s, runs \(Int(durationSeconds)) s — hands off the menu bar")
         encodeQueue.asyncAfter(deadline: .now() + delaySeconds) { [weak self] in
@@ -2188,8 +2186,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private func reportTelemetry(_ engine: HostEngine, nowUS: UInt64) {
         let s = engine.stats
         // New session's engine: its counters restart at 0. Identity alone
-        // missed it when the new engine reused the old one's address (the
-        // `bw -143711 Kbps` line again); counters going backwards can't lie.
+        // misses it when the new engine reuses the old one's address (a
+        // `bw -143711 Kbps` line); counters going backwards can't lie.
         let p0 = telePrevStats
         if telePrevEngine != ObjectIdentifier(engine) || s.bytesOut < p0.bytesOut
             || s.tilesSent < p0.tilesSent || s.videoFramesSent < p0.videoFramesSent {
@@ -2332,8 +2330,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     // MARK: - Transport wiring
 
     /// encodeQueue (first captured frame). The server itself is main-thread
-    /// state — this used to create it right here, racing stop() (a queued
-    /// drain after Stop Sharing re-created the listener).
+    /// state — creating it right here would race stop() (a queued drain
+    /// after Stop Sharing would re-create the listener).
     private func bootstrapServerIfNeeded(width: Int, height: Int) {
         guard !serverRequested else { return }
         serverRequested = true
@@ -2502,8 +2500,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         // Always advertise single-window support (Screen Recording is a
         // runtime gate handled at enumeration — gating the cap would deadlock).
         // A settled geometry is only final while the display is still in the
-        // mode it settled on: if the display left it (macOS reverted it —
-        // seen live between reconnects), let the viewer's request through.
+        // mode it settled on: if the display left it (macOS can revert it
+        // between reconnects), let the viewer's request through.
         if geometrySettled, let applied = appliedDisplaySize {
             let now = CGDisplayBounds(CGMainDisplayID()).size
             if Int(now.width) != applied.width || Int(now.height) != applied.height {
@@ -2534,10 +2532,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                            ?? "video off — lossless tiles")
         }
         // Cursor state is SESSION-scoped, but lives on the controller: without
-        // this reset, only the first session after app launch ever receives
+        // this reset, only the first session after app launch would receive
         // the cursor image (the metadata latch stays set and the image
-        // resends only on a shape-hash change — found live as "hover works,
-        // no visible cursor" on every reconnect).
+        // resends only on a shape-hash change): hover works, but no cursor
+        // shows after a reconnect.
         cursorMetadataActive = false
         lastCursorX = Int.min
         lastCursorY = Int.min
@@ -2694,8 +2692,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Main thread. A new viewer session. Anything left of a previous one
     /// is torn down first — the server only hands us a new transport after
     /// the old one ended (or was superseded while still establishing), so
-    /// this also cancels the stale tick timer that used to pile up (one more
-    /// 10 ms timer per reconnect, all ticking the engine).
+    /// this also cancels its tick timer, which would otherwise pile up (one
+    /// more 10 ms timer per reconnect, all ticking the engine).
     private func adopt(_ transport: QUICTransport) {
         guard isRunning else {
             transport.cancel()
@@ -2722,9 +2720,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         transport.onControl = { [weak self] data in
             guard let self else { return }
             // Stamp ARRIVAL, on the transport queue: read after the hop, a
-            // message that landed during a slow encode tick (a cold start,
-            // a keyframe) was timed at the tick's end — ACK delay and SRTT
-            // samples inflated by host CPU time, which the governor and
+            // message that lands during a slow encode tick (a cold start,
+            // a keyframe) would be timed at the tick's end — ACK delay and
+            // SRTT samples inflated by host CPU time, which the governor and
             // auto-scale read as a congested path.
             let arrivedUS = MonotonicClock.nowUS
             self.encodeQueue.async {
@@ -2848,8 +2846,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         guard recordingArmed else { return }
         // The trace format has one geometry per file, and recordTight is
         // sized from the first frame: a geometry change mid-recording (RESIZE,
-        // window pick, auto-scale, native restore) wrote larger frames past
-        // the buffer. Close this file and continue in a new one.
+        // window pick, auto-scale, native restore) would write larger frames
+        // past the buffer. Close this file and continue in a new one.
         if let current = recorder, current.header.width != width || current.header.height != height {
             closeRecorder(status: "geometry changed — trace saved: \(recordName); continuing in a new file")
         }

@@ -654,15 +654,10 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     @objc private func showAbout() {
         NSApp.activate()
-        let credits = NSAttributedString(
-            string: "Shares this Mac’s screen with Glass Act Viewer — pixel-exact, over a lossy network.",
-            attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                         .foregroundColor: NSColor.secondaryLabelColor])
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        AboutPanel.show(tagline: "Shares this Mac’s screen with Glass Act Viewer — pixel-exact, over a lossy network.")
     }
 }
 
-/// The menu's first row: one glance says whether this Mac can be reached.
 /// The menu's first row: what the Host is doing, and the switch that turns
 /// sharing on and off — the way Wi-Fi and Bluetooth put theirs. The menu
 /// stays open while it flips; the row updates in place.

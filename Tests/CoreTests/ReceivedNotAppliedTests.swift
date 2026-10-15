@@ -108,7 +108,7 @@ import GlassActTestSupport
 @Suite struct DecodeStrictnessTests {
     /// The Compression framework returns dst.count for a stream that
     /// decodes to MORE than fits: with an exactly-sized scratch, an LZ4
-    /// payload decoding to one byte past a full tile applied truncated.
+    /// payload decoding to one byte past a full tile would apply truncated.
     @Test func oversizeLZ4PayloadIsRejectedNotTruncated() {
         var rng = SplitMix64(seed: 2701)
         let (viewer, capture) = makeRunningViewer(width: 128, height: 64)

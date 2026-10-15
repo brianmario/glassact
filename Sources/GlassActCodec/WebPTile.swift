@@ -7,9 +7,9 @@ import libwebp
 /// on text tiles, round-trip byte-lossless).
 ///
 /// INV-7 note (documented deviation): `WebPEncode` allocates internally per
-/// call. The ~2× bandwidth win was judged worth it; encode-side cost is
-/// included in the measured throughput and the encode phase runs off the
-/// capture path. Decode is allocation-free (`WebPDecodeBGRAInto`).
+/// call. The ~2× bandwidth win is worth it; encode-side cost is included in
+/// the measured throughput and the encode phase runs off the capture path.
+/// Decode is allocation-free (`WebPDecodeBGRAInto`).
 public enum WebPTile {
     /// Encodes tight BGRA tile bytes losslessly. Returns the byte count
     /// written to `dst`, or 0 on failure or when not strictly smaller than
@@ -25,9 +25,9 @@ public enum WebPTile {
               WebPConfigLosslessPreset(&config, effort) != 0 else { return 0 }
         // BYTE-lossless, not visually lossless: libwebp's default (exact = 0)
         // may discard RGB values under alpha≈0 pixels. Real screen content is
-        // opaque, so this lurked for months — until a golden with random
-        // alpha decoded a correct stream into different bytes (INV-1
-        // violation, found by the keyframe golden).
+        // opaque, so that rarely shows, but a keyframe golden with random
+        // alpha would decode a correct stream into different bytes (an INV-1
+        // violation).
         config.exact = 1
         var picture = WebPPicture()
         guard WebPPictureInit(&picture) != 0 else { return 0 }

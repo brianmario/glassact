@@ -1,8 +1,8 @@
 import Testing
 import GlassActCore
 
-/// SCK dirty rects arrive in source backing pixels (measured live). The
-/// host doubled them as if they were points.
+/// SCK dirty rects arrive in source backing pixels, not points; doubling
+/// them as if they were points throws them off the frame.
 @Suite struct DirtyRectMappingTests {
     typealias M = DirtyRectMapping
 
@@ -25,7 +25,7 @@ import GlassActCore
     }
 
     @Test func outOfFrameMeansTheUnitIsWrongScanEverything() {
-        // What the old doubling produced: a rect far past the frame.
+        // What doubling would produce: a rect far past the frame.
         #expect(M.map(raw: [(5664, 4, 96, 8)], frameWidth: 2880, frameHeight: 1620,
                       sourcePixelWidth: 2880) == .unknown)
     }

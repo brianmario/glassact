@@ -106,12 +106,10 @@ import GlassActTestSupport
         ackAll(60_000)
     }
 
-    /// Full-loop golden with blink/revert content — cache refs under faults
-    /// must stay byte-exact.
     /// Same revert with DELTA records on (as in every real session): every reverted
     /// tile has an ACKed base, so a DELTA is always available — but an
-    /// 11-byte REF beats any DELTA. The cache lookup used to be skipped for
-    /// DELTA-coded tiles (a STORE can't wrap a DELTA; the REF was collateral).
+    /// 11-byte REF beats any DELTA. Skipping the cache lookup for DELTA-coded
+    /// tiles (a STORE can't wrap a DELTA) would lose the REF as collateral.
     @Test func refBeatsDeltaForRevertedContent() {
         var rng = SplitMix64(seed: 95)
         let (host, capture) = makeRunningHost(width: 128, height: 128, deltas: true)
@@ -140,6 +138,8 @@ import GlassActTestSupport
         #expect(host.stats.bytesOut - bytesBefore < 4 * 64, "four REFs are ~11 B each")
     }
 
+    /// Full-loop golden with blink/revert content — cache refs under faults
+    /// must stay byte-exact.
     @Test(arguments: [UInt64(21), 22])
     func blinkingGoldenUnderFaults(seed: UInt64) {
         var faults = FaultConfig()

@@ -5,10 +5,10 @@ import GlassActTransport
 import GlassActTestSupport
 
 /// 2-D window-drag shift detection (§4.8): window drags move diagonally
-/// (dx and dy at once — dragscan measured byte-rigid (+106, +32) between
-/// consecutive live frames), which defeats both 1-D signature passes. The
-/// probe-based 2-D pass must find the shift and ship the drag as one
-/// scroll op plus edge residuals.
+/// (dx and dy at once — dragscan finds byte-rigid (+106, +32) shifts
+/// between consecutive real frames), which defeats both 1-D signature
+/// passes. The probe-based 2-D pass must find the shift and ship the drag
+/// as one scroll op plus edge residuals.
 @Suite struct DragTests {
     /// Build a frame: `background` everywhere, `winContent` painted at
     /// (ax, ay).
@@ -65,8 +65,8 @@ import GlassActTestSupport
     }
 
     /// A FAST drag: steps land quicker than ACKs, so the shadow lags and the
-    /// frame-vs-shadow offset is cumulative (the live case that starved the
-    /// detector at ±224). The widened search plus relaxed verification must
+    /// frame-vs-shadow offset is cumulative (reaching ±224, which starves a
+    /// narrow search). The widened search plus relaxed verification must
     /// still ship scroll ops, and settle stays byte-exact.
     @Test func fastDragWithLaggedShadowStillShipsOps() {
         var faults = FaultConfig()

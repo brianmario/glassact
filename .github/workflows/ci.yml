@@ -26,9 +26,10 @@ jobs:
         run: swift build --build-tests
       - name: Test
         # VideoSendGateTests emulates a 3 Mbit/s link through a loopback relay
-        # and first checks the rig reproduces the old gate's seconds of lag.
-        # Hosted VMs can't drive the relay hard enough for that (old-gate p95
-        # ~400 ms instead of > 1 s), so it only runs locally (`just test`).
+        # and first checks the rig reproduces the byte-gate baseline's seconds
+        # of lag. Hosted VMs can't drive the relay hard enough for that
+        # (byte-gate p95 ~400 ms instead of > 1 s), so it only runs locally
+        # (`just test`).
         run: swift test --skip VideoSendGateTests
 
   apps:

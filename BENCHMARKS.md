@@ -15,7 +15,7 @@ Layout:
 - [Decisions and rejected experiments](#decisions-and-rejected-experiments):
   one line per idea, with its verdict.
 - [Removed bench commands](#removed-bench-commands): experiment tools that
-  were retired, and where to recover them.
+  were removed, and why.
 - [Log](#log): every entry, newest first.
 
 Conventions:
@@ -125,7 +125,7 @@ the numbers and the reasoning.
 
 | idea | verdict | key number | entry |
 |---|---|---|---|
-| LZBITMAP tile codec (0x09) | kept, for Mac-only peers | typing 514 → 313 KB/s at adoption; dropping it now costs 1–11 % of tile bytes and saves ~20 % encode CPU. Replacement plan: the multi-platform notes in the pre-release archive | [adoption](#codec-evaluation--lzbitmap-baseline-2026-08-05), [re-check](#lzbitmap-is-the-apple-only-codec-worth-keeping-2026-10-06) |
+| LZBITMAP tile codec (0x09) | kept, for Mac-only peers | typing 514 → 313 KB/s at adoption; dropping it now costs 1–11 % of tile bytes and saves ~20 % encode CPU. For non-Apple peers a platform-agnostic codec (zlib or Brotli) would replace it, with VP8L routing re-tuned | [adoption](#codec-evaluation--lzbitmap-baseline-2026-08-05), [re-check](#lzbitmap-is-the-apple-only-codec-worth-keeping-2026-10-06) |
 | VP8L tiles (vendored libwebp, 0x0A) | kept | scroll 14.6 → 9.83 MB/s, typing 313 → 159 KB/s | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | In-house spatial predictors + LZBITMAP | rejected | 0 % on the text corpus (728 → 728 B/tile) | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
@@ -206,21 +206,23 @@ the numbers and the reasoning.
 ## Removed bench commands
 
 Experiment commands leave `glassact-bench` once their question is
-answered; each result stays in the log. All of them are in the pre-release
-archive:
+answered; each result stays in the log.
 
 - **2026-09-27:** `lossyscan`, `blockscan`, `svc` (with the libaom K-SVC
   shim in `ThirdParty/CAom`), `p2scan`, and the AVIF (`avifenc`) and
-  JPEG XL (`cjxl`) branches of `keyframe`. Recover them from the commit
-  before the removal (pre-release archive commit `40456d9`).
+  JPEG XL (`cjxl`) branches of `keyframe`: their questions were answered
+  (each tool's entry has the verdict), and they depended on a third-party
+  shim and external encoders the product doesn't use.
 - **2026-10-10:** the AV1 region encoder and decoder (the libaom shim),
-  the AV1 size gate and `--video av1`, when AV1 was retired (pre-release
-  archive commit `43d3d03`).
+  the AV1 size gate and `--video av1`, with AV1 itself: software AV1 needed
+  a library-validation exemption in the Host, and hardware HEVC covers the
+  role.
 - **2026-10-13:** `routescan`, `analyze`, `scrollscan`, `cachescan`, the
   in-house predictor pass of `codecs`, `keyframe --lossy`, and
   `vquality --quality` and `--pts index` (with the encoder's `qualityHint`
-  and its untimed `encode`). Recover them from the commit before the
-  removal (pre-release archive commit `6d88939`).
+  and its untimed `encode`): their questions were answered, and several
+  exercised code paths that no longer exist (partial-screen regions, the
+  codec ladder).
 
 ## Log
 
@@ -321,8 +323,7 @@ instead of loading Homebrew's.
 
 *Later the same day:* AV1 was retired instead. The libaom shim, AV1
 decode, the size gate and `--video av1` were removed along with the
-Host's library-validation exemption (pre-release archive commit
-`43d3d03`). The AV1 codec id and caps bit stay reserved on the wire for
+Host's library-validation exemption. The AV1 codec id and caps bit stay reserved on the wire for
 hardware AV1 encode.
 
 ### Per-tile handoff inside a live video region (2026-10-10)
@@ -449,12 +450,14 @@ but not on scroll-win, where Brotli does worse than nothing: the encoder's
 adaptive VP8L routing (probe backoff when a cheaper codec wins) interacts
 with what sits in that slot, so a replacement needs the routing re-tuned
 with it, not a drop-in swap. zlib compresses best but costs ~1.5× the CPU.
-Kept for now (Mac-only peers; bitrate efficiency is the default); the
-multi-platform notes in the pre-release archive carry the replacement plan.
+Kept for now (Mac-only peers; bitrate efficiency is the default). If
+non-Apple peers arrive, a platform-agnostic codec such as zlib or Brotli
+replaces LZBITMAP in its slot, with the VP8L routing re-tuned alongside
+it (the numbers above).
 
 ### Video startup: 3 Mbit/s cap until the link is measured (2026-09-30)
 
-Live on a phone tether (21:57:51 UTC connect): the encoder ran at its
+Live on a phone tether: the encoder ran at its
 20 Mbit/s base until the controller measured the link, so the first
 keyframe and the frames behind it queued in the path — 3–13 fps, SRTT
 142 → 262 ms, and the viewer's first-interval glass-to-glass p95 1.5 s
@@ -482,7 +485,7 @@ the worst case for this change, since the link equals the startup cap:
 The rig's score now starts at 3 s (it was 1.5 s, which hid the old start's
 transient and caught the new ramp's single overshoot).
 
-Follow-up, same day (first live connect on it, 23:19 UTC): a 208 → 24 ms
+Follow-up, same day (first live connect on it): a 208 → 24 ms
 network queue over the first ~8 s while video sent ~27 KB/s — the queue
 wasn't ours. The unmeasured cut started from that sample and hit the
 0.3 Mbit/s floor; 80 s later the gentle probe had reached only 1.7 Mbit/s
@@ -527,7 +530,7 @@ it doesn't exercise the bug — the INV test does.
 
 Live: a 2 s network stall (RTT 61 → 257 ms) cut the video cap to 0.3
 Mbit/s, and at the gentle 1.03 per 250 ms window it took ~60 s to climb
-back to 2.6 — the user saw low quality at a good frame rate for a minute.
+back to 2.6 — the viewer showed low quality at a good frame rate for a minute.
 
 `VideoRateController` now remembers the rate the link last pushed back at
 (CUBIC's W_max: set on a backoff that follows a probe, or the first; a
@@ -548,7 +551,7 @@ startup bursts: relay p95 60 → 134–430 ms; rejected.
 
 ### Fresh-before-owed admission; video cap on an unmeasured queue (2026-09-29)
 
-Live on a ~150 ms-RTT tether (viewer log 23:09–23:11 UTC): glass-to-glass
+Live on a ~150 ms-RTT tether (viewer log): glass-to-glass
 p50 90–150 ms (mostly path), but 0.6–1.8 s spikes right after each dissolve
 — the repaint's owed tiles were admitted in the same rotation as fresh
 changes, so keystrokes queued behind catch-up — and video uncapped
@@ -567,7 +570,7 @@ changes, so keystrokes queued behind catch-up — and video uncapped
   doesn't; each fails with its rule removed).
 
 LAN faulted golden, scroll 1785962837: 45.98 MB, settled byte-exact at
-21.1 s, host encode 4,260 ms — identical to the previous build (pre-release archive commit `3b9033b`).
+21.1 s, host encode 4,260 ms — identical to the previous build.
 
 ### Video-layer quality floor: VT MaxAllowedFrameQP (2026-09-29)
 
@@ -725,11 +728,9 @@ two interleaved runs per build:
 
 | Viewer | main blocked in `queue.sync` | main idle |
 |---|---|---|
-| before (`9cffd1e`) | **89–92 %** | 5–7 % |
-| blit off main (`8ef09e2`) | 6–8 % (the 1 Hz title poll) | 89–92 % |
+| before | **89–92 %** | 5–7 % |
+| blit off main | 6–8 % (the 1 Hz title poll) | 89–92 % |
 | + async title / configure polls | **0.0 %** | 97–98 % |
-
-Both builds are commits in the pre-release archive.
 
 Before, the Viewer's main thread spent ~90 % of the session waiting for
 the apply queue — window, input and cursor barely serviced. The remaining
@@ -910,7 +911,7 @@ cheap part: fewer, larger receive units (e.g. a stream only for cold-start
 / settle bursts on a clean path).
 
 *2026-10-13:* the prototype was removed (wire v3; viewers no longer accept
-`0x54` streams). It is in the pre-release archive; issue #10 tracks whether
+`0x54` streams); the results stay in this log. Issue #10 tracks whether
 to revisit.
 
 ### Auto send rate replaces the fixed 25 Mbit ladder (2026-09-27)
@@ -1285,9 +1286,8 @@ Conclusions:
    only in the settle, where exactness is the entire point of the pass.
 
 Decision: tile path stays lossless. `lossyscan` was removed on 2026-09-27
-(see "Removed bench commands"); recover it from the pre-release archive
-(commit `40456d9`) to re-test if the workload mix
-ever changes.
+(see "Removed bench commands"); the results stay in this log, for a
+re-test if the workload mix ever changes.
 
 ### VP8L vs AVIF lossless — VP8L wins both content types (2026-08-07)
 
@@ -1764,7 +1764,7 @@ trace's 15 burst ticks: frames 224–253 are the HOST'S OWN menu-bar menu
 being operated to stop the recording — an NSMenu with vibrancy blur over
 the wallpaper, re-blending ~180 tiles per hover (non-rigid by nature:
 this, not terminal transparency, is why scroll/delta/scrollscan all
-found nothing — the user's Ghostty terminal is opaque). Frames 2/33–34
+found nothing — the terminal is opaque). Frames 2/33–34
 are the terminal window appearing (legitimate one-time paint).
 
 Corrected steady-state decomposition: recorder-menu artifact ≈ 2.31 MB
@@ -2396,11 +2396,7 @@ captures ran at encode p50 61 µs/batch, 76.7 KB/frame.
 | idle | static screen, hands off (v2: 67 s hands-off span) | 31 | 67.5 s | — |
 | mixed | YouTube: scrolling + hover video playback | 835 | 41.3 s | ~20 |
 
-On-disk (sha256 prefix): `typing` = `glassact-1785961372.scap`
-(`45f2248486d9feed…`, 6.3 GB), `idle` = `glassact-1785961857.scap`
-(`f46609dfa356b727…`, 3.1 GB), `scroll` = `glassact-1785962837.scap`
-(`d975419a564b3aa9…`, 1.5 GB — dark-theme markdown LZ4s to 2.4 %, so the
-full-screen trace is the smallest file). Also on disk: scroll v2 `glassact-1785962451.scap`
-(`4b1e410a13e675f2…`, 7.4 GB — superseded by v3, safe to delete). Deleted
-after measurement: `mixed` (`c54809ee6e5919c5…`), `images`
-(`c3d95b2ada2b5fd8…`).
+Files: `typing` = `glassact-1785961372.scap` (6.3 GB), `idle` =
+`glassact-1785961857.scap` (3.1 GB), `scroll` = `glassact-1785962837.scap`
+(1.5 GB — dark-theme markdown LZ4s to 2.4 %, so the full-screen trace is
+the smallest file).

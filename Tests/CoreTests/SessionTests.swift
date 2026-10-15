@@ -3,9 +3,9 @@ import Testing
 import GlassActCore
 import GlassActTransport
 
-/// Session lifecycle (formerly app-only, untestable): watchdogs, how a
-/// session ended, the redial budget — driven by real engines over the
-/// virtual-time link with lifecycle faults (sever, half-open silence).
+/// Session lifecycle: watchdogs, how a session ended, the redial budget —
+/// driven by real engines over the virtual-time link with lifecycle faults
+/// (sever, half-open silence).
 @Suite struct SessionWatchdogTests {
     /// Runs `h` forward in 100 ms steps (engines ticked every 1 ms by
     /// `run`), returning the first non-ok verdict and when it fired.

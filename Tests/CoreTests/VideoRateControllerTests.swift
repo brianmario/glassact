@@ -36,10 +36,11 @@ import GlassActCore
     }
 
     @Test func thinLinkQueueStaysNearTarget() {
-        // The live case: ~10 Mbps of HEVC offered into a 2.5 Mbps link.
+        // A remote session on a thin link: ~10 Mbps of HEVC offered into a
+        // 2.5 Mbps link.
         let (c, worst) = simulate(offered: 1_250_000, link: 312_500, frameBytes: 20_000, seconds: 10)
         #expect(c.rate > 250_000 && c.rate < 400_000, "rate \(c.rate)")
-        // ≤ target + one frame of queueing, never the 1.6 s the byte gate allowed.
+        // ≤ target + one frame of queueing, never the 1.6 s a byte gate allows.
         #expect(worst < 0.2, "worst backlog \(worst) s")
         #expect(c.bitrateCap! < 2_500_000, "cap \(c.bitrateCap!) bps")
     }
@@ -86,8 +87,8 @@ import GlassActCore
 }
 
 /// Startup: the encoder starts at 3 Mbps, not its 20 Mbps base, and ramps
-/// only on a clean path that is actually carrying the cap (live: a tether's
-/// first picture showed ~1.5 s behind capture at the uncapped start).
+/// only on a clean path that is actually carrying the cap (an uncapped start
+/// puts a tether's first picture ~1.5 s behind capture).
 @Suite struct VideoStartupTests {
     /// 60 Hz, frames sized to the current cap when `busy`, into a link of
     /// `link` B/s whose queue is visible as network queue.
@@ -122,7 +123,7 @@ import GlassActCore
         let (c, trace, _) = run(seconds: 5, link: 12_500_000) // 100 Mbps
         let uncapped = trace.first { $0.cap == nil }
         #expect(uncapped != nil && uncapped!.t < 3, "uncapped at \(uncapped.map { String($0.t) } ?? "never") s")
-        #expect(c.rate == 0 && c.bitrateCap == nil) // same as before: a LAN is never throttled
+        #expect(c.rate == 0 && c.bitrateCap == nil) // a LAN is never throttled
     }
 
     @Test func aStaticScreenDoesNotRamp() {
@@ -131,8 +132,8 @@ import GlassActCore
     }
 
     @Test func aQueueAtAQuietStartKeepsAUsableCap() {
-        // Live: a connect saw a 200 ms queue while video sent ~27 KB/s; the
-        // cut from that sample hit the 0.3 Mbit/s floor.
+        // A connect can see a 200 ms queue while video sends ~27 KB/s; a cut
+        // from that sample alone would hit the 0.3 Mbit/s floor.
         var c = VideoRateController()
         var now: UInt64 = 1_000_000
         for _ in 0..<120 {
@@ -157,7 +158,7 @@ import GlassActCore
 }
 
 /// The network-queue signal: jitter-filtered, and able to act before the
-/// link is measured (live: a 150 ms tether, `vlink unmeasured`, 80–100 ms
+/// link is measured (e.g. a 150 ms tether: `vlink unmeasured`, 80–100 ms
 /// standing queue, video uncapped).
 @Suite struct VideoQueueSignalTests {
     /// 60 Hz ticks for `seconds`, sending `perTick` bytes (never backlogged).
@@ -193,8 +194,8 @@ import GlassActCore
     }
 }
 
-/// Recovery after a brief hiccup (live: cap stuck at 0.3 Mbit/s for ~60 s
-/// after a two-second network stall on a ~3 Mbit/s path).
+/// Recovery after a brief hiccup (without it, a two-second network stall on
+/// a ~3 Mbit/s path leaves the cap stuck at 0.3 Mbit/s for ~60 s).
 @Suite struct VideoRecoveryTests {
     /// 60 Hz encoder offering 10 Mbit/s (frames shrink to the cap) into a
     /// link whose rate follows `link(t)`; the queue sits in the path, so

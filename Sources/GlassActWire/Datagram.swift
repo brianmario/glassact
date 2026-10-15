@@ -12,11 +12,11 @@
 /// | 0x0A | WEBPL    | VP8L lossless (vendored libwebp) of RAW             |
 /// | 0x0B | DELTA    | hash-pinned delta vs ACKed content — `DeltaPayload` |
 ///
-/// Reserved, never reused: 0x03 COPY (scrolls ship as control TLVs instead),
-/// 0x04 PALETTE, 0x05 DCT, 0x06 REFINE, 0x08 VIDEO_REGION (video rides its
-/// own stream). The encoder picks the smallest absolute encoding per tile;
-/// LZBITMAP is skipped on very large batches where its encode cost would
-/// threaten the frame budget.
+/// Reserved, never reused: 0x03–0x06 and 0x08. Scrolls ship as control TLVs
+/// and video rides its own stream, so neither has a datagram opcode. The
+/// encoder picks the smallest absolute encoding per tile; LZBITMAP is skipped
+/// on very large batches where its encode cost would threaten the frame
+/// budget.
 public enum Opcode {
     public static let raw: UInt8 = 0x01
     public static let lz4: UInt8 = 0x02

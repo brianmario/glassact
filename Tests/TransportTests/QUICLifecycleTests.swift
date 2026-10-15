@@ -24,8 +24,9 @@ import GlassActTestSupport
         return true
     }
 
-    /// cancel() used to set `finished` before tearing down, so the terminal
-    /// state never fired — the viewer's connect-timeout redial hung forever.
+    /// cancel() must tear down before setting `finished`; otherwise the
+    /// terminal state never fires and the viewer's connect-timeout redial
+    /// hangs forever.
     @Test func localCancelEmitsExactlyOneTerminalState() throws {
         let (identity, fingerprint) = try QUICLoopbackTests.makeTestIdentity()
         let clientLog = StateLog()
@@ -52,8 +53,8 @@ import GlassActTestSupport
     /// Idle = zero bytes (INV-10) is safe only if QUIC's own keepalive holds
     /// both tunnels open: a session with no application traffic at all for
     /// longer than the idle timeout must still be alive and deliver on both
-    /// channels. (This is what made the host's app-level keepalive datagram
-    /// redundant.)
+    /// channels. (This is why the host needs no app-level keepalive
+    /// datagram.)
     @Test(.tags(.slow), .notInFastLane) func silentSessionOutlivesTheIdleTimeout() throws {
         let (identity, fingerprint) = try QUICLoopbackTests.makeTestIdentity()
         let hostLog = StateLog(), clientLog = StateLog()
@@ -137,8 +138,8 @@ import GlassActTestSupport
 
     /// A lost video stream degrades, not ends, the session: both sides are
     /// told (onVideoReset), and the next video rides a fresh stream the
-    /// viewer adopts — previously the viewer ignored the replacement and
-    /// video stayed dead for the rest of the session.
+    /// viewer adopts. Ignoring the replacement would leave video dead for the
+    /// rest of the session.
     @Test func lostVideoStreamRecoversInSession() throws {
         let (identity, fingerprint) = try QUICLoopbackTests.makeTestIdentity()
         let lock = NSLock()

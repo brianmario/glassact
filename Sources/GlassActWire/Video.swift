@@ -6,14 +6,12 @@ import Foundation
 public enum WireCaps {
     /// Video regions (§4.6) over the dedicated reliable video stream, HEVC.
     public static let videoHEVC: UInt32 = 1 << 0
-    /// Reserved for AV1 video regions once hardware AV1 encode exists (a
-    /// libaom software encoder was measured and dropped 2026-10-10). Today
-    /// only the rig's alternate mock codec (0x7E) advertises it, to test
-    /// codec negotiation.
+    /// Reserved for AV1 video regions once hardware AV1 encode exists
+    /// (software libaom would need `disable-library-validation`). Only the
+    /// rig's alternate mock codec (0x7E) advertises it, to test codec
+    /// negotiation.
     public static let videoAV1: UInt32 = 1 << 1
-    // Bits 2 and 3 are unassigned. (They were `keyframe` and `delta`; since
-    // v3 every viewer decodes lossless keyframes and DELTA records, so
-    // neither is negotiated.)
+    // Bits 2 and 3 are unassigned.
     /// Cursor as metadata (§5): the viewer composites the pointer
     /// at present time from CURSOR_POS/CURSOR_IMAGE control messages; a host
     /// seeing this bit stops burning the cursor into captured pixels.
@@ -26,8 +24,7 @@ public enum WireCaps {
     /// Screen Recording permission) and therefore supports single-window mode.
     /// The viewer greys out the mode when this bit is absent.
     public static let windowList: UInt32 = 1 << 6
-    // Bits 7 and 8 are unassigned. (7 was `videoOverlay`; the overlay is
-    // now how every viewer shows video, so it is no longer negotiated.)
+    // Bits 7 and 8 are unassigned.
     /// Host → viewer in HELLO: the host saves VIEWER_LOG uploads (the
     /// viewer's "Send Logs to Host").
     public static let logUpload: UInt32 = 1 << 9
@@ -58,8 +55,9 @@ public enum VideoCodec {
     /// Reserved: 2 = H.264. Do not reuse.
     public static let reservedH264: UInt8 = 2
     /// Reserved for AV1 once hardware AV1 encode exists (no Apple chip
-    /// through M6 has it; libaom software encode was measured and dropped
-    /// 2026-10-10). Its config record would be the ISO `av1C` box.
+    /// through M6 has it, and software libaom would need
+    /// `disable-library-validation`). Its config record would be the ISO
+    /// `av1C` box.
     public static let reservedAV1: UInt8 = 3
 
     /// Human-readable name for status lines and logs.
@@ -81,9 +79,10 @@ public enum VideoCodec {
 /// only which tiles SHOW video from then on. A tile the frame doesn't claim
 /// keeps showing what it showed — its exact canvas copy if the host handed
 /// it off (a newer record, or REVEAL), else its earlier video. That is what
-/// lets the still majority of a screen be exact while a small area moves
-/// (2026-10-10: a full-screen region carried minutes of soft static text
-/// around one animating panel).
+/// lets the still majority of a screen be exact while a small area moves;
+/// otherwise a full-screen region carries minutes of soft static text
+/// around one animating panel (BENCHMARKS "Per-tile handoff inside a live
+/// video region").
 public enum VideoClaims: Equatable, Sendable {
     /// Every tile of the region (a generation's first frame).
     case all

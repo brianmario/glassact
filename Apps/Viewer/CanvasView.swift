@@ -8,7 +8,7 @@ import GlassActTransport
 /// canvas's own queue — via `SurfacePresenter` (two IOSurfaces, buffer-age
 /// dirty union), and the main thread only flips the content layer's
 /// contents when it completes. Main never copies pixels or waits on apply
-/// work (it used to `queue.sync` the whole blit).
+/// work.
 ///
 /// Two presentation modes share one content layer (so the cursor sublayer and
 /// input mapping are mode-agnostic):
@@ -87,7 +87,7 @@ final class CanvasView: NSView {
 
     /// In-session resize (§4.10): adopt a new canvas grid IN PLACE — fresh flip
     /// surfaces, reset present state — without recreating the view. Swapping a
-    /// window's contentView mid-transaction crashed AppKit's window animation
+    /// window's contentView mid-transaction crashes AppKit's window animation
     /// (over-release in _NSWindowTransformAnimation); reconfiguring keeps the
     /// view, its display link, and the window untouched. Main thread; a
     /// blit still running for the old presenter is dropped when it lands.
@@ -138,8 +138,9 @@ final class CanvasView: NSView {
         } else {
             var fit = min(bounds.width / cp.width, bounds.height / cp.height)
             // Within 1% of the window: show it 1:1 and crop/pad the point or
-            // two. Live: a 1470×924 virtual display in a 1470×923 full-screen
-            // window was drawn at 99.9% — every pixel resampled, visibly soft.
+            // two. Otherwise a 1470×924 virtual display in a 1470×923
+            // full-screen window would draw at 99.9% — every pixel
+            // resampled, visibly soft.
             if abs(fit - 1) < 0.01 { fit = 1 }
             let w = cp.width * fit, h = cp.height * fit
             contentLayer.anchorPoint = .zero
@@ -174,7 +175,7 @@ final class CanvasView: NSView {
     /// The view's size settled (a drag ended, or a resize that wasn't a
     /// drag: zoom, tiling, full screen). Virtual Display sizes the host's
     /// display from it. Fired from the view itself: window-delegate
-    /// notifications missed live drags in the field.
+    /// notifications can miss live drags.
     var onSizeSettled: ((CGSize) -> Void)?
     private var lastSettledSize = CGSize.zero
 
@@ -370,7 +371,7 @@ final class CanvasView: NSView {
 
     /// Precise devices (trackpad, Magic Mouse) report points → input kind 7
     /// (host posts pixel units); a wheel mouse reports lines → kind 4. Sent
-    /// as lines, a trackpad swipe scrolled ~10× too far.
+    /// as lines, a trackpad swipe would scroll ~10× too far.
     override func scrollWheel(with event: NSEvent) {
         guard let (cx, cy) = canvasPoint(event) else { return }
         scrollRemainderX += event.scrollingDeltaX

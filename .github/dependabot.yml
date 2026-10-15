@@ -1,0 +1,9 @@
+# Keeps the GitHub Actions used by CI up to date. There are no other
+# package ecosystems: the package uses system frameworks only, plus the
+# vendored libwebp (ThirdParty/), which is updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

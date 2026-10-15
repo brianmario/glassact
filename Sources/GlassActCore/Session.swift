@@ -7,8 +7,8 @@
 /// Host side: a viewer that connected but never finished the handshake
 /// (vanished, or stuck in geometry negotiation) must not hold the single
 /// session slot forever, and a running viewer that stops answering PINGs is
-/// gone even if the transport hasn't noticed (measured live: a host
-/// streamed video into a torn-down viewer for 30+ s).
+/// gone even if the transport hasn't noticed (otherwise a host can stream
+/// video into a torn-down viewer for 30+ s).
 public struct HostSessionWatchdog: Sendable {
     public enum Verdict: Equatable, Sendable {
         case ok

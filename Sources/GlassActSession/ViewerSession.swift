@@ -156,10 +156,10 @@ public final class ViewerSession: @unchecked Sendable {
         engine.onGeometryChanged = { [weak self] w, h in
             DispatchQueue.main.async { self?.onGeometryChanged?(w, h) }
         }
-        // Weak: the engine holds the transport, so strong captures here made
-        // an engine ↔ transport cycle that leaked a whole session (canvas,
-        // cache, VT session) on every reconnect. (The transport also drops
-        // its callbacks at teardown.)
+        // Weak: the engine holds the transport, so strong captures here would
+        // form an engine ↔ transport cycle that leaks a whole session (canvas,
+        // cache, VT session) per reconnect. (The transport also drops its
+        // callbacks at teardown.)
         transport.onControl = { [weak engine] data in
             engine?.handleControl(data, nowUS: MonotonicClock.nowUS)
         }

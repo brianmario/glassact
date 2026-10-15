@@ -65,7 +65,7 @@ import GlassActTestSupport
 
     /// The resize converges exactly even with in-flight old-geometry stragglers
     /// under loss/dup/reorder/jitter — the LWW self-heal that the whole system
-    /// rests on, now spanning a mid-session canvas swap. Seeded, zero-tolerance.
+    /// rests on, here spanning a mid-session canvas swap. Seeded, zero-tolerance.
     @Test func resizeUnderFaultsSettlesExact() {
         var faults = FaultConfig()
         faults.dropPermille = 50

@@ -36,14 +36,15 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     private var lastPTSUS: Int64 = -1
     /// Claimed on VT's output thread when the parameter sets are extracted
     /// (emit runs there, not on callbackQueue) — a plain Bool read there
-    /// and written on callbackQueue was a data race.
+    /// and written on callbackQueue would be a data race.
     private let configClaimed = Mutex(false)
     private var onFrame: (([UInt8], Bool, [UInt8]?) -> Void)?
 
     /// Ask VideoToolbox for its low-latency rate control (the video-call
     /// mode). Falls back to the normal session if refused; `lowLatencyActive`
-    /// says which ran. Off in the product: measured 2026-09-29 (`glassact-bench
-    /// vquality`, BENCHMARKS.md) it overshot the target 20–100 % (9× on
+    /// says which ran. Off in the product: measured (`glassact-bench
+    /// vquality`, BENCHMARKS 'Video-layer quality: low-latency RC and
+    /// half-res encode, measured') it overshoots the target 20–100 % (9× on
     /// photos) with 2–3× burstier frames — wrong for a send gate that
     /// trusts the encoder's cap — for a quality edge that is mostly bytes.
     public let lowLatency: Bool
@@ -51,8 +52,9 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// Applied at `start`: a ceiling on frame QP — a quality floor: the
     /// encoder may not quantize coarser than this. Nil = VT's choice.
     public var maxFrameQP: Int? = VTHEVCRegionEncoder.defaultMaxFrameQP
-    /// The floor in the product (2026-10-10, `glassact-bench vquality`,
-    /// BENCHMARKS.md): with capture-time stamps it never binds on a healthy
+    /// The floor in the product (`glassact-bench vquality`, BENCHMARKS
+    /// 'Soft video for minutes: capture-time PTS, QP 34 floor, re-sharpen'):
+    /// with capture-time stamps it never binds on a healthy
     /// link (byte-identical output at 12 Mbit/s on every reference trace),
     /// and on a thin one it keeps text legible (worst-frame SSIM 0.76 →
     /// 0.93 at 1 Mbit/s) — the bytes over the cap come out of frame rate
@@ -185,8 +187,8 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
 
     /// Stamped with the capture time. VT's rate control spends the average
     /// bitrate over presentation time: stamped 1/60 s apart, frames that
-    /// actually arrive 1/10 s apart (newest-wins skips on a thin link) got
-    /// a sixth of the bits the link could carry — soft beyond reading.
+    /// actually arrive 1/10 s apart (newest-wins skips on a thin link) would
+    /// get a sixth of the bits the link could carry — soft beyond reading.
     public func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
         guard let session, let pool else { return }
         var pb: CVPixelBuffer?
@@ -462,8 +464,8 @@ public final class VTRegionDecoder: VideoRegionDecoder {
         }
         awaitingSync = false
         // Hand the engine the decoder's own buffer and stride — it blits
-        // straight into the canvas (this used to copy the frame into a tight
-        // array first: a full extra frame copy per frame).
+        // straight into the canvas (copying into a tight array first would
+        // be a full extra frame copy per frame).
         CVPixelBufferLockBaseAddress(imageBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(imageBuffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(imageBuffer) else { return false }

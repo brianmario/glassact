@@ -191,7 +191,7 @@ extension HostEngine {
                 }
                 // VP8L on the sub-rect draws from a per-worker pixel budget —
                 // sub-rect probes are where the scroll-residual win lives
-                // (measured 8.5 → 5.4 MB/s), but unbounded they doubled the
+                // (measured 8.5 → 5.4 MB/s), but unbounded they double the
                 // tick p95. Tiny rects ride free.
                 let subPx = sw * sh
                 var allowWebp = webpTry[q] != 0 || subPx <= 1024

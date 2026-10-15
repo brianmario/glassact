@@ -42,11 +42,11 @@ public enum QUICIdentity {
     /// (re)asserts owner-only permissions.
     ///
     /// A file that can be read but not imported (sealed with another
-    /// passphrase, say the project's earlier one, or corrupt) is replaced
-    /// with a fresh identity rather than failing: an app that can't load its
-    /// key can't do anything, and the old key is unusable either way. Peers
-    /// then see a new key — the host's viewers get the changed-key refusal,
-    /// and a viewer or agent is approved again like a new one.
+    /// passphrase, or corrupt) is replaced with a fresh identity rather than
+    /// failing: an app that can't load its key can't do anything, and the old
+    /// key is unusable either way. Peers then see a new key — the host's
+    /// viewers get the changed-key refusal, and a viewer or agent is approved
+    /// again like a new one.
     public static func loadOrCreate(directory: URL, name: String, commonName: String) throws -> SecIdentity {
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true,
@@ -127,11 +127,10 @@ public enum QUICIdentity {
 /// `view` (approved to watch only; offered for agents), `kind=agent|viewer`,
 /// `label=…` (an agent's name), `device=…` (the computer it said it runs
 /// on), `name=…` (what the host's user called it), `addr=…` (where it last
-/// connected from),
-/// `approved=…` / `seen=…` (Unix seconds). Values are percent-encoded;
-/// unknown fields are ignored, and a bare fingerprint (files from before
-/// any of this) means full control. Thread-safe: the TLS verify block
-/// consults it on the listener queue while the app edits it on main.
+/// connected from), `approved=…` / `seen=…` (Unix seconds). Values are
+/// percent-encoded; unknown fields are ignored, and a bare fingerprint means
+/// full control. Thread-safe: the TLS verify block consults it on the
+/// listener queue while the app edits it on main.
 public final class AuthorizedViewers: Sendable {
     public struct Entry: Sendable, Equatable {
         public enum Kind: String, Sendable { case viewer, agent, unknown }

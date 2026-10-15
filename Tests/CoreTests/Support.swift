@@ -76,7 +76,8 @@ struct TestFrame {
 
     /// Exactly the bytes `rng.bytes(dst.count)` would produce (each word
     /// little-endian, the last one truncated), written in place — the
-    /// per-byte array version dominated the big video tests in debug builds.
+    /// per-byte array version would dominate the big video tests in debug
+    /// builds.
     private static func fill(_ dst: UnsafeMutableRawBufferPointer, _ rng: inout SplitMix64) {
         var i = 0
         while i + 8 <= dst.count {

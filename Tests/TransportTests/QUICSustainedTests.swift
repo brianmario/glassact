@@ -4,15 +4,15 @@ import GlassActCore
 import GlassActTransport
 import GlassActTestSupport
 
-/// Regression for the live-demo failure: the session established and HELLO /
-/// HELLO_OK flowed, but every subsequent control message (viewer ACKs, host
-/// PINGs) vanished until the stream timed out. A sustained session with a
-/// realistic cold-start datagram burst and multiple control exchanges in both
-/// directions must keep converging.
+/// Guards against a control path that dies after the handshake: the session
+/// establishes and HELLO / HELLO_OK flow, but every subsequent control
+/// message (viewer ACKs, host PINGs) vanishes until the stream times out. A
+/// sustained session with a realistic cold-start datagram burst and multiple
+/// control exchanges in both directions must keep converging.
 @Suite(.serialized, .tags(.quic), .notInFastLane) struct QUICSustainedSessionTests {
     @Test func sustainedSessionKeepsConverging() throws {
         let (identity, fingerprint) = try QUICLoopbackTests.makeTestIdentity()
-        let width = 2048, height = 2048 // 1024 tiles; noise → RAW → ~14k datagrams per full batch (live-demo scale)
+        let width = 2048, height = 2048 // 1024 tiles; noise → RAW → ~14k datagrams per full batch
         var host: HostEngine?
         var viewer: ViewerEngine?
 
@@ -70,7 +70,7 @@ import GlassActTestSupport
         // Multiple rounds: each mutates the frame, then drives real time until
         // the viewer's canvas is byte-identical. Round 1 exercises the
         // cold-start burst; later rounds only work if control (ACKs) keeps
-        // flowing both ways — the exact thing that died in the live demo.
+        // flowing both ways.
         var completedRounds = 0
         for round in 0..<4 {
             if round > 0 {
@@ -78,9 +78,9 @@ import GlassActTestSupport
             }
             // Generous: this test exists to catch the control path DYING
             // (which never converges, at any deadline), not to benchmark
-            // convergence latency. 8 s measured flaky when the full suite's
-            // heavy CoreTests run in parallel and starve this real-time
-            // loop — the deadline is not the assertion.
+            // convergence latency. 8 s is flaky when the full suite's heavy
+            // CoreTests run in parallel and starve this real-time loop — the
+            // deadline is not the assertion.
             let deadline = Date().addingTimeInterval(25)
             var matched = false
             while Date() < deadline && !matched {

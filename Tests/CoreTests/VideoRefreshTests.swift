@@ -5,9 +5,10 @@ import GlassActTestSupport
 
 /// Re-sharpening keyframes. VideoToolbox never re-codes content that stops
 /// changing, so a large change coded under a thin budget (the startup cap,
-/// a blank first capture) stays soft for as long as the region lives — live
-/// 2026-10-10, minutes of unreadable text while one panel animated. The
-/// host owes one keyframe once the region goes quiet after large changes.
+/// a blank first capture) stays soft for as long as the region lives —
+/// minutes of unreadable text while one panel animates (BENCHMARKS.md "Soft
+/// video for minutes"). The host owes one keyframe once the region goes
+/// quiet after large changes.
 @Suite struct VideoRefreshTests {
     /// Records when (capture µs) a keyframe was asked for.
     final class SyncRecordingEncoder: VideoRegionEncoder {

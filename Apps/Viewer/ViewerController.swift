@@ -66,9 +66,9 @@ final class ViewerController: @unchecked Sendable {
     private var clipboardChangeCount = -1
     // Session-scoped App Nap exemption: held only while a session is live —
     // the ACK/PONG cadence has millisecond deadlines then (App Nap throttling
-    // a hidden viewer's timers ran SRTT to seconds on the first live 5K
-    // sessions). Outside a session the app naps normally. Deliberately no
-    // display/system-sleep assertions.
+    // a hidden viewer's timers runs SRTT up to seconds). Outside a session
+    // the app naps normally. Deliberately no display/system-sleep
+    // assertions.
     private var sessionActivity: NSObjectProtocol?
     // Occlusion-aware pausing. Hidden/occluded ≥ 3 s → ask the host to
     // pause content and release the activity assertion (App Nap becomes
@@ -225,11 +225,11 @@ final class ViewerController: @unchecked Sendable {
 
     /// Upload log files to the host over the control stream, paced: 2 KB
     /// every 125 ms (~16 KB/s). The stream also carries ACKs and PINGs: at
-    /// 8 KB / 100 ms (~640 kbit/s) a 2.7 MB upload on a phone tether queued
-    /// them for seconds — the host read it as a collapsing link (SRTT 44 →
-    /// 320 ms, tile and video rates to their floors, viewer g2g p50 3 s;
-    /// 2026-10-01). `onFileSent` (main) fires per completed file;
-    /// `onProgress` runs on main.
+    /// 8 KB / 100 ms (~640 kbit/s) a 2.7 MB upload on a phone tether queues
+    /// them for seconds, which the host reads as a collapsing link (SRTT 44
+    /// → 320 ms, tile and video rates to their floors, viewer g2g p50 3 s).
+    /// `onFileSent` (main) fires per completed file; `onProgress` runs on
+    /// main.
     func sendLogs(_ files: [URL], onFileSent: @escaping @Sendable (_ name: String, _ size: Int) -> Void = { _, _ in },
                   onProgress: @escaping @Sendable (String) -> Void) {
         queue.async { [weak self] in
@@ -320,7 +320,8 @@ final class ViewerController: @unchecked Sendable {
     func hostSupportsWindowList() -> Bool { session.hostSupportsWindowList() }
     /// Ask the host to enumerate + send its window list.
     func requestWindowList() { session.requestWindowList() }
-    /// Pick a window (host swaps its capture filter → session reset → we redial).
+    /// Pick a window (the host swaps its capture filter and re-HELLOs in
+    /// place — see onGeometryChanged).
     func selectWindow(_ id: UInt32) { session.selectWindow(id) }
     /// A window-chrome action (fullscreen / resize / endSession).
     func windowControl(action: UInt8, width: Int = 0, height: Int = 0) {
@@ -490,8 +491,8 @@ final class ViewerController: @unchecked Sendable {
 
     /// Received bandwidth + video framerate, plus the active codec — e.g.
     /// "623 KB/s · 42 fps (HEVC)". Computed on the apply queue, delivered on
-    /// main: measured live, the 1 s title poll's `queue.sync` had the main
-    /// thread blocked on apply work 33 % of the time.
+    /// main: a `queue.sync` from the 1 s title poll would block the main
+    /// thread on apply work up to 33 % of the time.
     func bandwidthSummary(_ done: @escaping @MainActor (String?) -> Void) {
         queue.async { [self] in
             let line = bandwidthSummaryOnQueue()

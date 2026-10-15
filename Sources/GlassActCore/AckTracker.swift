@@ -91,10 +91,10 @@ struct AckTracker {
             if chosen < 0 {
                 // Evict a COMPLETE, non-latest slot first (oldest such): its
                 // ACK already rode the reliable control stream, so nothing
-                // is lost. Evicting the serially-oldest slot instead threw
-                // away incomplete batches — exactly the ones whose late
+                // is lost. Evicting the serially-oldest slot instead would
+                // throw away incomplete batches — exactly the ones whose late
                 // datagrams still need reporting — as soon as four newer
-                // batches had completed around them.
+                // batches completed around them.
                 for i in 0..<slots.count
                 where slots[i].complete && slots[i].frameSeq != latestSeq
                     && (chosen < 0 || Serial.newer(slots[chosen].frameSeq, than: slots[i].frameSeq)) {
@@ -144,10 +144,10 @@ struct AckTracker {
     ///    reordered datagrams are reported promptly, coalesced;
     ///  - keepalive: the latest batch and every incomplete one, 100 ms
     ///    after THAT slot's last ACK. (Incomplete older batches too:
-    ///    latest-only left their late datagrams unconfirmed, forcing
+    ///    latest-only would leave their late datagrams unconfirmed, forcing
     ///    timeout → cold invalidation → redundant re-sends. And per slot:
-    ///    a single global timestamp, reset by every completion ACK, meant
-    ///    incomplete slots were never re-ACKed under steady traffic.)
+    ///    a single global timestamp, reset by every completion ACK, would
+    ///    never re-ACK incomplete slots under steady traffic.)
     ///  - incomplete slots expire after `slotExpiryUS` (the host timed
     ///    them out long ago; re-ACKing forever is noise).
     mutating func tick(nowUS: UInt64, send: Send) {

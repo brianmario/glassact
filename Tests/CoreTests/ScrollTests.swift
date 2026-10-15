@@ -356,7 +356,7 @@ import GlassActTestSupport
     }
 
     /// A SCROLL_ACK for a scroll older than the 8 most recent must still
-    /// be verified — the old fixed 8-entry ring dropped it silently.
+    /// be verified — a fixed 8-entry ring would drop it silently.
     @Test func scrollAckForOlderScrollStillRepairs() {
         var rng = SplitMix64(seed: 1302)
         let (host, capture) = makeRunningHost(width: 640, height: 640)
@@ -505,7 +505,7 @@ import GlassActTestSupport
             h.run(untilUS: h.now + 150_000) // ACKs land between line-scrolls (sources quiesce)
         }
         #expect(h.host.stats.scrollsSent > 0, "seed \(seed): window scrolls must engage")
-        #expect(h.viewer.stats.cacheRefMisses == 0, "seed \(seed): REF misses are structurally impossible now")
+        #expect(h.viewer.stats.cacheRefMisses == 0, "seed \(seed): REF misses are structurally impossible")
         #expect(h.settle(maxSimMS: 120_000), "seed \(seed)")
         #expect(h.canvasMatchesFrame(), "seed \(seed): byte-exact after window scrolls under faults")
     }
