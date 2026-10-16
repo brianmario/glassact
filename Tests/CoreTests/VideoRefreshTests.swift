@@ -1,8 +1,6 @@
 import Foundation
 import Testing
-import GlassActWire
 import GlassActCore
-import GlassActTransport
 import GlassActTestSupport
 
 /// Re-sharpening keyframes. VideoToolbox never re-codes content that stops

@@ -25,10 +25,6 @@ public protocol GlassActTransport: AnyObject {
     func sendDatagram(_ data: Data)
     func sendVideo(_ data: Data)
     var videoBacklogBytes: Int { get }
-    var onControl: (Data) -> Void { get set }
-    var onDatagram: (Data) -> Void { get set }
-    var onVideo: (Data) -> Void { get set }
-    var onState: (TransportState) -> Void { get set }
     /// A batch's datagrams in order — one handoff instead of one per datagram.
     func sendDatagrams(_ batch: [Data])
     /// Datagram bytes handed over but still waiting in the transport's pacer

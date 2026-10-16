@@ -2,7 +2,6 @@ import Testing
 import GlassActCore
 import GlassActTransport
 import GlassActWire
-import GlassActTestSupport
 
 /// HELLO_OK geoMode 4 (virtual display) goes only to a host that advertises
 /// WireCaps.virtualDisplay (one without the virtual-display SPI can't make

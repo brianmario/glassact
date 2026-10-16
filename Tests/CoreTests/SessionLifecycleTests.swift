@@ -3,7 +3,6 @@ import Testing
 import GlassActWire
 import GlassActCodec
 import GlassActCore
-import GlassActTransport
 import GlassActTestSupport
 
 /// Engine-side session lifecycle: failures are terminal AND reported (never

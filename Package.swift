@@ -84,7 +84,8 @@ let package = Package(
             swiftSettings: strict
         ),
         // Shared test helpers (one seeded PRNG instead of a copy per target).
-        .target(name: "GlassActTestSupport", path: "Tests/GlassActTestSupport", swiftSettings: strictLibrary),
+        .target(name: "GlassActTestSupport", dependencies: ["GlassActWire"], path: "Tests/GlassActTestSupport",
+                swiftSettings: strictLibrary),
         .testTarget(name: "WireTests", dependencies: ["GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "CodecTests", dependencies: ["GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),

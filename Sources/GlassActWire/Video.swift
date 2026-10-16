@@ -158,14 +158,6 @@ public enum VideoMessage: Equatable, Sendable {
         }
     }
 
-    /// Full TLV encoding (type + varint length + body). Total: encodes any
-    /// message, including one whose body exceeds `maxBodyLength` — which the
-    /// receiver treats as a malformed stream and tears the session down.
-    /// Senders use `encodedForSend()`.
-    public func encoded() -> [UInt8] {
-        Self.frame(type: tlvType, body: encodedBody())
-    }
-
     /// The TLV encoding, or nil when the body exceeds `maxBodyLength` (the
     /// receiver's bound). Every engine send path goes through this: an
     /// oversize message is dropped or handled at the sender instead of

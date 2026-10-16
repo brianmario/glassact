@@ -1,9 +1,7 @@
 import Foundation
 import Testing
-import GlassActCodec
 import GlassActCore
 import GlassActTransport
-import GlassActWire
 import GlassActTestSupport
 
 /// Real QUIC over loopback: TLS with a freshly generated self-signed identity,

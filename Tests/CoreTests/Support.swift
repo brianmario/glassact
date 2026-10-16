@@ -14,10 +14,6 @@ final class CaptureTransport: GlassActTransport {
     var sentControl: [Data] = []
     var sentDatagrams: [Data] = []
     var sentVideo: [Data] = []
-    var onControl: (Data) -> Void = { _ in }
-    var onDatagram: (Data) -> Void = { _ in }
-    var onVideo: (Data) -> Void = { _ in }
-    var onState: (TransportState) -> Void = { _ in }
 
     func sendControl(_ data: Data) { sentControl.append(data) }
     func sendDatagram(_ data: Data) { sentDatagrams.append(data) }

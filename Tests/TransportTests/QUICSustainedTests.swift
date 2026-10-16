@@ -1,9 +1,7 @@
 import Foundation
 import Testing
-import GlassActCodec
 import GlassActCore
 import GlassActTransport
-import GlassActWire
 import GlassActTestSupport
 
 /// Guards against a control path that dies after the handshake: the session

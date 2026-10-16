@@ -1,7 +1,6 @@
 import Foundation
 import GlassActCodec
 import GlassActTransport
-import GlassActWire
 
 /// ACK / timeout resolution (§4.4), NACK repairs, send stamps, SRTT.
 /// HostEngine extension: encodeQueue-confined like the engine itself.

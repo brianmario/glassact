@@ -66,9 +66,6 @@ public protocol VideoRegionDecoder: AnyObject {
 /// lossless repaint. Never negotiated on a real wire (rig-only codec id).
 public final class MockVideoEncoder: VideoRegionEncoder {
     public static let mockCodecID: UInt8 = 0x7F
-    /// Test hook: last quality level the engine set (0 = best).
-    public private(set) var qualityLevel = 0
-    public func setQualityLevel(_ level: Int) { qualityLevel = level }
     /// Second rig-only id (maps to the reserved AV1 caps bit) for codec
     /// negotiation tests.
     public static let mockAltCodecID: UInt8 = 0x7E

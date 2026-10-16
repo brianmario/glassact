@@ -143,7 +143,6 @@ public final class HostEngine: @unchecked Sendable {
     var batches = [OpenBatch(), OpenBatch()]
     var nextFrameSeq: UInt32 = 1
     private var deframer = ControlDeframer()
-    private let lz4 = LZ4Codec()
     let tileScratch: UnsafeMutableRawBufferPointer
     private let lz4Out: UnsafeMutableRawBufferPointer
     private let bitmapOut: UnsafeMutableRawBufferPointer
@@ -711,7 +710,7 @@ public final class HostEngine: @unchecked Sendable {
                     enterFailed("incompatible viewer version \(ver)")
                     return
                 }
-                if geoMode != 0 {
+                if geoMode != GeometryMode.none {
                     // Geometry requested in the handshake: hold ALL pixel
                     // data (never enter .running), surface to the app — it
                     // applies (display switch / capture scale) and resets the
@@ -721,7 +720,8 @@ public final class HostEngine: @unchecked Sendable {
                     // (mode 3) — the viewer still gets its final HELLO, and
                     // the app never computes a 0×0 capture from it.
                     let sane = geoWidth >= 1 && geoHeight >= 1 && (1...4).contains(geoScale)
-                    let mode = (geoMode == 1 || geoMode == 2) && !sane ? 3 : geoMode
+                    let resizes = geoMode == GeometryMode.clientResolution || geoMode == GeometryMode.scale
+                    let mode = resizes && !sane ? GeometryMode.native : geoMode
                     onResizeRequested?(Int(mode), Int(geoWidth), Int(geoHeight), Int(geoScale))
                     break
                 }
@@ -1165,7 +1165,7 @@ public final class HostEngine: @unchecked Sendable {
                             if qualCount >= 8 {
                                 DispatchQueue.concurrentPerform(iterations: encodeWorkers.count) { job.run($0) }
                             } else {
-                                job.run(all: true)
+                                job.runSerially()
                             }
                         }
                     }
@@ -1392,7 +1392,6 @@ public final class HostEngine: @unchecked Sendable {
         keyframeEffort ?? (governor.rate(rateLimit) >= Self.keyframeFastRateBytesPerSecond
                            ? Self.keyframeFastEffort : Self.keyframeSlowEffort)
     }
-    public static let governorHealthyAckDelayUS = SendGovernor.healthyAckDelayUS
     public static let governorSevereAckDelayUS = SendGovernor.severeAckDelayUS
     public static let governorBucketCap = SendGovernor.bucketCap
     public internal(set) var ackDelayUS: UInt64 = 0

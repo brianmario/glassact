@@ -1,7 +1,6 @@
 import Testing
 import GlassActCore
 import GlassActTransport
-import GlassActWire
 import GlassActTestSupport
 
 /// In-session geometry renegotiation (§4.10): a window resize (or pick / fullscreen)
