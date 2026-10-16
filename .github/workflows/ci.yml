@@ -15,7 +15,8 @@ permissions:
 jobs:
   test:
     name: Tests
-    # macOS 27 on Apple Silicon with Xcode 27 (the package's floor).
+    # Apple silicon, macOS 27, Xcode 27. The package targets macOS 15.5, so
+    # availability mistakes fail the build here too.
     runs-on: xcode-27
     timeout-minutes: 30
     steps:
@@ -47,4 +48,26 @@ jobs:
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer
           -configuration Debug -destination 'generic/platform=macOS'
+          CODE_SIGNING_ALLOWED=NO build
+
+  intel:
+    name: Intel
+    # Builds for Intel Macs (x86_64) from the same Apple-silicon runner:
+    # hosted Intel runners stop at macOS 15, which can't run Xcode 27, so
+    # the tests themselves run on Intel only on real hardware.
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build package and tests (x86_64)
+        run: swift build --arch x86_64 --build-tests
+      - name: Build Host (universal Release)
+        run: >
+          xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host
+          -configuration Release -destination 'generic/platform=macOS'
+          CODE_SIGNING_ALLOWED=NO build
+      - name: Build Viewer (universal Release)
+        run: >
+          xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer
+          -configuration Release -destination 'generic/platform=macOS'
           CODE_SIGNING_ALLOWED=NO build

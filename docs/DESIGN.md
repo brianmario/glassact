@@ -887,7 +887,7 @@ These apply to the hot paths: diff, encode, parse, apply and blit.
 ## 9. Repository layout
 
 ```
-Package.swift              tools 6.4, macOS 27, warnings as errors
+Package.swift              tools 6.4, macOS 15.5, warnings as errors
 Sources/
   GlassActWire/            bytes: varint, TLV, datagrams, control, video, serial (checked)
   GlassActCodec/           xxh64, RAW/LZ4/LZBITMAP/VP8L tile codecs, arenas

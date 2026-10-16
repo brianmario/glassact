@@ -120,7 +120,8 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         // quality on photographic churn; a half-5K region caps at 20 Mbps —
         // in family with Apple's high-performance screen-sharing budget.
         baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
-        if let cqf = constantQualityFactor {
+        // Bench-only knob; the key exists from macOS 27.
+        if #available(macOS 27, *), let cqf = constantQualityFactor {
             constantQualityAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ConstantQualityFactor,
                                                            value: cqf as CFNumber) == noErr
         }
@@ -172,7 +173,8 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         // Re-setting VT's rate costs a rate-control reset; skip < 5% moves.
         guard appliedBitrate == 0 || abs(target - appliedBitrate) * 20 > appliedBitrate else { return }
         appliedBitrate = target
-        if capWithVBV {
+        // Bench-only knob; the VBV keys exist from macOS 26.
+        if #available(macOS 26, *), capWithVBV {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_VBVMaxBitRate, value: target as CFNumber)
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_VBVBufferDuration, value: 1.0 as CFNumber)
             return

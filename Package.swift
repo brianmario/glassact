@@ -19,7 +19,7 @@ let strictLibrary: [SwiftSetting] = strict + [
 
 let package = Package(
     name: "glassact",
-    platforms: [.macOS(.v27)],
+    platforms: [.macOS("15.5")],
     products: [
         .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession"]),
         .executable(name: "glassact", targets: ["glassact"]),
