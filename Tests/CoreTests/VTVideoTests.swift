@@ -1,7 +1,8 @@
+import CoreMedia
 import Foundation
 import Testing
 import GlassActWire
-import GlassActCore
+@testable import GlassActCore
 import GlassActTestSupport
 
 /// VideoToolbox HEVC round trip on real hardware (Apple Silicon media
@@ -128,5 +129,29 @@ import GlassActTestSupport
                                              config: out[0].config ?? [], width: width, height: height))
         #expect(!VTRegionDecoder().start(codec: VideoCodec.hevc,
                                              config: [3, 1, 0, 9], width: width, height: height))
+    }
+
+    /// Sync detection reads NotSync's value. The Apple silicon encoder omits
+    /// the key on sync frames; the software encoder (used under Rosetta and
+    /// on Macs without a hardware HEVC encoder) writes NotSync = false.
+    @Test func syncFlagReadsNotSyncValue() throws {
+        func sample(notSync: Bool?) throws -> CMSampleBuffer {
+            var sb: CMSampleBuffer?
+            #expect(CMSampleBufferCreate(allocator: nil, dataBuffer: nil, dataReady: true,
+                                         makeDataReadyCallback: nil, refcon: nil, formatDescription: nil,
+                                         sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+                                         sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb) == noErr)
+            let buffer = try #require(sb)
+            if let notSync {
+                let attachments = try #require(CMSampleBufferGetSampleAttachmentsArray(buffer, createIfNecessary: true))
+                let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+                CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                                     Unmanaged.passUnretained(notSync ? kCFBooleanTrue : kCFBooleanFalse).toOpaque())
+            }
+            return buffer
+        }
+        #expect(VTHEVCRegionEncoder.isSync(try sample(notSync: nil)))
+        #expect(VTHEVCRegionEncoder.isSync(try sample(notSync: false)))
+        #expect(!VTHEVCRegionEncoder.isSync(try sample(notSync: true)))
     }
 }
