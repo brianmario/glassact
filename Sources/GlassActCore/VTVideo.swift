@@ -244,13 +244,7 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     private func emit(_ sampleBuffer: CMSampleBuffer) {
-        let sync = !(CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-            .map { attachments -> Bool in
-                guard CFArrayGetCount(attachments) > 0 else { return false }
-                let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
-                return CFDictionaryContainsKey(dict,
-                    Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque())
-            } ?? false)
+        let sync = Self.isSync(sampleBuffer)
         // Copy out the payload. CopyDataBytes, not GetDataPointer: the
         // pointer from GetDataPointer is only valid for the first
         // contiguous piece, and a block buffer is not guaranteed to be one.
@@ -285,6 +279,21 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             guard let self, let onFrame = self.onFrame else { return }
             onFrame(data, sync, config)
         }
+    }
+
+    /// NotSync's value, not just its presence: the Apple silicon encoder
+    /// leaves the key off sync frames, but the software HEVC encoder writes
+    /// NotSync = false on them. Reading presence alone marks every frame
+    /// not-sync there, and the Viewer waits for an IDR that never comes.
+    static func isSync(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false),
+              CFArrayGetCount(attachments) > 0
+        else { return true }
+        let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFDictionary.self)
+        guard let value = CFDictionaryGetValue(dict,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque())
+        else { return true }
+        return !CFBooleanGetValue(unsafeBitCast(value, to: CFBoolean.self))
     }
 
     static func extractParameterSets(_ desc: CMFormatDescription) -> [UInt8]? {
