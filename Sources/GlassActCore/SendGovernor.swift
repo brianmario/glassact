@@ -62,12 +62,10 @@ public enum RateLimit: Equatable, Sendable {
 ///
 /// Stored inline in `HostEngine` and confined to its encode queue.
 struct SendGovernor {
-    /// ACK-delay thresholds (send → first confirmation, queue included).
-    /// Not the governor's signal (that is standing path delay, above); they
-    /// grade video quality and drive auto-scale, which want the delay the
-    /// user actually experiences.
-    static let healthyAckDelayUS: UInt64 = 60_000
-    static let degradedAckDelayUS: UInt64 = 200_000
+    /// ACK-delay threshold (send → first confirmation, queue included).
+    /// Not the governor's signal (that is standing path delay, above); it
+    /// drives auto-scale, which wants the delay the user actually
+    /// experiences.
     static let severeAckDelayUS: UInt64 = 700_000
     /// 16 MB, not 2 MB: measured at 5K, a single full-screen transition is
     /// 10–25 MB coded — a 2 MB bucket would turn every window switch into a

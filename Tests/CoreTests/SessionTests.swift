@@ -2,7 +2,6 @@ import Foundation
 import Testing
 import GlassActCore
 import GlassActTransport
-import GlassActTestSupport
 
 /// Session lifecycle: watchdogs, how a session ended, the redial budget —
 /// driven by real engines over the virtual-time link with lifecycle faults

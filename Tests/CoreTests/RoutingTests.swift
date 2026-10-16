@@ -1,7 +1,6 @@
 import Foundation
 import Testing
 import GlassActCore
-import GlassActWire
 import GlassActTestSupport
 
 /// Codec routing memory (design from BENCHMARKS "Codec routing

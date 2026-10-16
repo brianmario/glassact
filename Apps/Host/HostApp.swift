@@ -64,7 +64,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var approvalsWindow: NSWindow?
     private var approvalsModel: ApprovedViewersModel?
     private var approvalsTimer: Timer?
-    private var permissionTimer: Timer?
     /// Last check's answer — a true → false edge means something got
     /// turned off while running, which reopens setup.
     private var requiredWereGranted = false
@@ -103,7 +102,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         requiredWereGranted = permissions.requiredGranted
         // Cheap no-prompt checks; catches a permission switched off in
         // System Settings while the Host runs, instead of failing quietly.
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkPermissions() }
         }
         if let error = OpenAtLogin.applyDefault() { controller.onStatus(error) }
@@ -592,19 +591,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let dir = HostController.dataDirectory.appendingPathComponent("traces")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
-    }
-
-    @objc private func forgetApprovedViewers() {
-        let alert = NSAlert()
-        alert.messageText = "Forget all approved viewers?"
-        alert.informativeText = "Each viewer and agent will need your approval again the next time it connects. "
-            + "One that’s connected now is disconnected."
-        alert.addButton(withTitle: "Cancel")
-        let forget = alert.addButton(withTitle: "Forget Viewers")
-        forget.hasDestructiveAction = true
-        NSApp.activate()
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
-        controller.forgetApprovedViewers()
     }
 
     @objc private func pauseAgent() {

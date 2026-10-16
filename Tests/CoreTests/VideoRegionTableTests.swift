@@ -1,7 +1,6 @@
 import Testing
 @testable import GlassActCore
 import GlassActWire
-import GlassActTestSupport
 
 /// Viewer video regions (§5), driven on the table alone against a local
 /// overlay buffer and a scripted decoder.

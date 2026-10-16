@@ -1,7 +1,5 @@
 import Testing
 import GlassActCore
-import GlassActTransport
-import GlassActTestSupport
 
 /// Single-window mode: when the shared window closes on the host, the
 /// host tells the viewer the session is over (WINDOW_CONTROL endSession,

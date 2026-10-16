@@ -66,11 +66,6 @@ final class NearbyHosts {
         }
     }
 
-    func stop() {
-        browser?.cancel()
-        browser = nil
-    }
-
     private func update(_ found: [NearbyHost]) {
         // One row per Mac, however many interfaces it answers on.
         var seen = Set<String>()

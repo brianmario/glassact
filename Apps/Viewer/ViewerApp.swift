@@ -90,7 +90,6 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var noPause = false
     private var cursorMetadata = true
     private var reconnect = ReconnectPolicy()
-    private var resizeRequested = false
     // Single-window mode
     private var singleWindowMode = false
     private var selectedWindowID: UInt32 = 0

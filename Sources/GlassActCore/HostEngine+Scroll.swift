@@ -1,6 +1,5 @@
 import Foundation
 import GlassActCodec
-import GlassActTransport
 import GlassActWire
 
 /// Scroll detection & emission (§4.8): global/windowed shift estimation, 2D

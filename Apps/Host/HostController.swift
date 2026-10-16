@@ -158,7 +158,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var mouseButtonsDown = 0 // bitmask (bit 0 L, 1 R, 2 other) — drag vs move
     /// The held press's click count: a double-click-drag selects by word.
     private var heldClickState: Int64 = 1
-    private var lastInjectPoint = CGPoint.zero
     private var warnedNoAccessibility = false
     private var loggedFirstInject = false // one-time "input works" log line
     // Single-window mode (main-thread). The viewer drives the pick: it asks
@@ -268,8 +267,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// What agents may do here, and the record of what they did.
     let agentAccess = AgentAccess()
     let agentAudit = AgentAudit(directory: HostController.dataDirectory)
-    /// Main: the agent indicator or policy changed (the menu bar follows).
-    var onAgentChanged: (() -> Void)?
     /// Main: the approved-viewers list changed (its window follows).
     var onApprovalsChanged: (() -> Void)?
 
@@ -1017,7 +1014,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         let gx = contentOrigin.x + CGFloat(canvasX) / scale
         let gy = contentOrigin.y + CGFloat(canvasY) / scale
         let pt = CGPoint(x: gx, y: gy)
-        lastInjectPoint = pt
         switch kind {
         case 1: // move (or drag if a button is held)
             if mouseButtonsDown != 0 {

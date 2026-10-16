@@ -1,7 +1,6 @@
 import Foundation
 import Testing
 import GlassActCore
-import GlassActTransport
 import GlassActWire
 import GlassActTestSupport
 

@@ -1,7 +1,6 @@
 // replay --mode encode: the host engine alone with instant ACKs; reports
 // bytes/frame, encode timings, and where the steady-state bytes live.
 import Foundation
-import GlassActCodec
 import GlassActCore
 import GlassActTransport
 import GlassActWire
@@ -9,14 +8,9 @@ import GlassActWire
 final class BenchTransport: GlassActTransport {
     var maxDatagramSize: Int = 1452
     var videoBacklogBytes: Int { 0 }
-    var onControl: (Data) -> Void = { _ in }
-    var onDatagram: (Data) -> Void = { _ in }
-    var onVideo: (Data) -> Void = { _ in }
-    var onState: (TransportState) -> Void = { _ in }
     var pendingDatagrams: [Data] = []
     var totalDatagrams = 0
     var totalBytes = 0
-    var totalVideoBytes = 0
 
     func sendControl(_ data: Data) {}
     func sendDatagram(_ data: Data) {
@@ -28,7 +22,6 @@ final class BenchTransport: GlassActTransport {
     var pendingKeyframeSeqs: [UInt32] = []
 
     func sendVideo(_ data: Data) {
-        totalVideoBytes += data.count
         totalBytes += data.count
         var d = VideoDeframer()
         d.append([UInt8](data))
