@@ -67,7 +67,7 @@ struct ConnectView: View {
                     .labelsHidden()
                     .onSubmit { if model.canConnect { model.onConnect() } }
                     .textInputSuggestions {
-                        ForEach(model.recents, id: \.self) { address in
+                        ForEach(model.addressSuggestions, id: \.self) { address in
                             Text(address).textInputCompletion(address)
                         }
                     }
