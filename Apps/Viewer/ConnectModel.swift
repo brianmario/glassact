@@ -144,6 +144,18 @@ final class ConnectModel {
         d.set(chosenNearby?.name ?? "", forKey: k.hostName)
     }
 
+    /// Recent addresses that match what's typed. Empty until something is
+    /// typed: on macOS the suggestion menu opens whenever the field has
+    /// focus and has suggestions, so offering every recent address would
+    /// pop it up on focus alone.
+    var addressSuggestions: [String] {
+        let typed = trimmedHost
+        guard !typed.isEmpty else { return [] }
+        return recents.filter {
+            $0.localizedCaseInsensitiveContains(typed) && $0.caseInsensitiveCompare(typed) != .orderedSame
+        }
+    }
+
     /// A session came up: this address goes to the top of the suggestions.
     func noteConnected() {
         let address = trimmedHost
