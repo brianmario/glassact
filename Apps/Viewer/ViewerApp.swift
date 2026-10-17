@@ -1140,7 +1140,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions = [])
         -> NSApplication.PresentationOptions {
         guard window == canvasWindow else { return proposedOptions }
-        var options = proposedOptions.union(.disableScreenCornerInteractions)
+        var options = proposedOptions
+        // Hot corners stay live in full screen before macOS 27, which has no option for them.
+        if #available(macOS 27, *) { options.formUnion(.disableScreenCornerInteractions) }
         // AppKit raises on hideDock + autoHideDock together; add one only if neither is set.
         if options.isDisjoint(with: [.hideDock, .autoHideDock]) { options.insert(.autoHideDock) }
         return options

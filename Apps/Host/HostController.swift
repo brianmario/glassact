@@ -784,7 +784,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// and cleared during a restart, so a miss here is a real stall. Two in a
     /// row, then the same recovery a reported stop gets.
     func checkCaptureHealth() {
-        guard isRunning, let stream else { captureMisses = 0; return }
+        // Earlier systems have no `isCapturing`; there a silent stop shows
+        // only as a frozen picture.
+        guard #available(macOS 27, *), isRunning, let stream else { captureMisses = 0; return }
         if stream.isCapturing { captureMisses = 0; return }
         captureMisses += 1
         guard captureMisses >= 2 else { return }

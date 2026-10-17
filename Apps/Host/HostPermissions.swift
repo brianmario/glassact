@@ -39,16 +39,24 @@ final class HostPermissions {
     /// Screen recording is allowed on this Mac at all (macOS 27). False when
     /// a device-management policy forbids it: no grant in System Settings
     /// can fix that, so setup says so instead of offering "Allow…" forever.
-    private(set) var screenRecordingAvailable = SCContentSharingPicker.shared.isAvailable
+    private(set) var screenRecordingAvailable = HostPermissions.screenRecordingAllowedByPolicy()
 
     var requiredGranted: Bool { screenRecording && accessibility }
+
+    /// macOS 27 can say whether a policy forbids screen recording; earlier
+    /// systems can't, so they report it as allowed and setup offers the
+    /// usual grant.
+    private static func screenRecordingAllowedByPolicy() -> Bool {
+        guard #available(macOS 27, *) else { return true }
+        return SCContentSharingPicker.shared.isAvailable
+    }
 
     @ObservationIgnored private var browser: NWBrowser?
 
     func refresh() {
         let screen = CGPreflightScreenCaptureAccess()
         if screen != screenRecording { screenRecording = screen }
-        let available = SCContentSharingPicker.shared.isAvailable
+        let available = Self.screenRecordingAllowedByPolicy()
         if available != screenRecordingAvailable { screenRecordingAvailable = available }
         let ax = AXIsProcessTrusted()
         if ax != accessibility { accessibility = ax }

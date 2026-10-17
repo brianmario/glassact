@@ -20,7 +20,12 @@ headless connection of their own.
 
 ## Requirements
 
-- macOS 27 or later, on Apple Silicon. That applies to both ends.
+- macOS 15.5 or later, on Apple silicon or Intel. That applies to both ends.
+  Intel Macs are newly supported and still need performance testing; expect
+  a heavier CPU load on the Host than on Apple silicon.
+- A few extras need macOS 27: the Host noticing a capture stream that stopped
+  silently, setup recognising screen recording blocked by device management,
+  and the Viewer turning off hot corners in full screen.
 - To build: Xcode 27 (Swift 6.4) and [`just`](https://github.com/casey/just).
 - The Host needs two permissions: **Screen & System Audio Recording** and
   **Device Control and Data Access** (remote input).

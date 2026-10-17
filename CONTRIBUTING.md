@@ -7,10 +7,11 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Requirements
 
-- A Mac with Apple Silicon running macOS 27 or later. The Host and the
+- To build: Xcode 27 (Swift 6.4), on a Mac that runs it.
+- To run: macOS 15.5 or later, on Apple silicon or Intel. The Host and the
   Viewer both need it. One Mac is enough to start: the Viewer can connect
-  to a Host on the same machine.
-- Xcode 27 (Swift 6.4).
+  to a Host on the same machine. Release builds are universal; Debug builds
+  are for the Mac you build on.
 - [`just`](https://github.com/casey/just).
 
 The package uses system frameworks only, plus the vendored libwebp in
@@ -86,7 +87,10 @@ Data Access** (remote input). Setup asks for both on first launch.
 must pass first.
 
 - CI (`.github/workflows/ci.yml`) runs the test suite and builds both
-  apps, unsigned, on GitHub's macOS 27 / Xcode 27 runner. It skips
+  apps, unsigned, on GitHub's Apple-silicon macOS 27 / Xcode 27 runner, and
+  builds everything for Intel too. It can't run the tests on Intel (hosted
+  Intel runners stop at macOS 15, which can't run Xcode 27), so test
+  Intel-sensitive changes on an Intel Mac. It skips
   `VideoSendGateTests`, a link-emulation rig that needs real hardware to
   reproduce its baseline, so run `just test` locally before pushing.
 - A pull request must be up to date with `main` before it merges. Use

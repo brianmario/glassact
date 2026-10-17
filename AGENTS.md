@@ -23,8 +23,12 @@ retransmission.
 
 ## Constraints
 
-- macOS 27+, Apple Silicon only, Xcode 27 / Swift 6.4, Swift 6 strict
-  concurrency, warnings as errors.
+- Runs on macOS 15.5+, Apple silicon and Intel (universal Release builds).
+  Built with Xcode 27 / Swift 6.4, Swift 6 strict concurrency, warnings as
+  errors. Anything newer than macOS 15.5 goes behind `#available` with a
+  sensible fallback; the CI build at the 15.5 target catches misses.
+- Perf work is measured on Apple silicon; check that big changes don't
+  regress on Intel, where the Host's tile encoding costs more CPU.
 - System frameworks only. The one exception is the vendored libwebp
   (`ThirdParty/`). Add no dependencies.
 - The apps (`Apps/Host`, `Apps/Viewer`) are thin: UI and wiring only. Logic
