@@ -54,6 +54,7 @@ public extension ViewerStats {
         add("video_frames", videoFramesApplied, earlier.videoFramesApplied)
         add("video_dropped", videoDropped, earlier.videoDropped)
         add("video_decode_failures", videoDecodeFailures, earlier.videoDecodeFailures)
+        add("video_sync_requests", videoSyncRequests, earlier.videoSyncRequests)
         add("keyframes", keyframesApplied, earlier.keyframesApplied)
         add("keyframes_dropped", keyframesDropped, earlier.keyframesDropped)
         add("acks_sent", acksSent, earlier.acksSent)

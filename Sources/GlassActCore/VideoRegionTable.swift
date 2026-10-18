@@ -8,18 +8,27 @@ import GlassActWire // Serial
 /// (newer seqs) takes the tile back.
 ///
 /// It owns decoder lifecycle (start / stop / stop-all), the per-frame
-/// LWW-gated blit, and the undecodable-streak escalation; the engine keeps
-/// the stream deframing, stats, callbacks and the decision to fail.
+/// LWW-gated blit, and the undecodable streak (when to ask for a sync
+/// frame, when to give up); the engine keeps the stream deframing, stats,
+/// callbacks, the SYNC_REQUEST send and the decision to fail.
 ///
 /// Queue confinement: stored inline in `ViewerEngine` and called only on
 /// the engine's confining queue (the app's `applyQueue`); decoders deliver
 /// pixels synchronously on it.
 struct VideoRegionTable {
     static let slotCount = 4
-    /// A region undecodable for this long (no sync frame arrives to resync a
-    /// rebuilt decoder — encoders send them only on demand) fails the
-    /// session: a reconnect's cold start beats a frozen region.
-    static let undecodableLimitUS: UInt64 = 1_000_000
+    /// An undecodable frame asks the host for a sync frame (SYNC_REQUEST,
+    /// §3.5) at once, and again at most this often while the region stays
+    /// undecodable — encoders send sync frames only on demand, so without
+    /// asking, a rebuilt decoder would wait for one until the deadline below.
+    /// Matches the host's own minimum interval between answered requests.
+    static let syncRequestIntervalUS: UInt64 = 500_000
+    /// Last resort: a region still undecodable this long after its first
+    /// failed frame fails the session — a reconnect's cold start beats a
+    /// frozen region. 2 s leaves room for the answer to the first request
+    /// (one RTT plus a sync frame, which on a thin link can take most of a
+    /// second to arrive) and for one or two re-asks if that one fails too.
+    static let undecodableLimitUS: UInt64 = 2_000_000
 
     private struct Slot {
         var active = false
@@ -28,6 +37,7 @@ struct VideoRegionTable {
         var codec: UInt8 = 0
         var decoder: (any VideoRegionDecoder)?
         var failingSinceUS: UInt64 = 0 // first undecodable frame of the current streak
+        var syncRequestedUS: UInt64 = 0 // last SYNC_REQUEST of the current streak
     }
 
     /// What one video FRAME did.
@@ -43,6 +53,9 @@ struct VideoRegionTable {
         /// The region has now been undecodable for longer than
         /// `undecodableLimitUS`: the engine fails the session.
         var undecodableTooLong = false
+        /// The frame didn't decode and no SYNC_REQUEST went out for this
+        /// region within `syncRequestIntervalUS`: the engine sends one.
+        var requestSync = false
     }
 
     private let decoderFactory: (() -> any VideoRegionDecoder)?
@@ -86,7 +99,8 @@ struct VideoRegionTable {
     /// FRAME: decodes into the region's rect of the viewer's `overlay`
     /// layer, tile-wise, LWW-gated by the frame's `stamp` (not advancing
     /// tileSeq); `overlaySeq`/`overlayOn` record the stamp each claimed tile
-    /// now shows. Tracks the region's undecodable streak.
+    /// now shows. Tracks the region's undecodable streak and paces its
+    /// sync requests.
     mutating func applyFrame(region: Int, generation: UInt32, stamp: UInt32,
                              sync: Bool, claims: VideoClaims = .all, data: [UInt8], nowUS: UInt64,
                              overlay: UnsafeMutableRawBufferPointer, grid: TileGrid,
@@ -158,10 +172,19 @@ struct VideoRegionTable {
         var result = FrameResult(blits: blits, decoded: decoded)
         if decoded {
             slots[region].failingSinceUS = 0
-        } else if slots[region].failingSinceUS == 0 {
+            slots[region].syncRequestedUS = 0
+            return result
+        }
+        if slots[region].failingSinceUS == 0 {
             slots[region].failingSinceUS = max(nowUS, 1)
         } else if nowUS &- slots[region].failingSinceUS > Self.undecodableLimitUS {
             result.undecodableTooLong = true
+            return result
+        }
+        if slots[region].syncRequestedUS == 0
+            || nowUS &- slots[region].syncRequestedUS >= Self.syncRequestIntervalUS {
+            slots[region].syncRequestedUS = max(nowUS, 1)
+            result.requestSync = true
         }
         return result
     }

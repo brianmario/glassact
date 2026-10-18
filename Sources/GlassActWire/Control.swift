@@ -254,6 +254,15 @@ public enum ControlMessage: Equatable, Sendable {
     /// viewers list. 1–`maxViewerNameBytes` bytes of UTF-8. Display only —
     /// approval is by key, never by name.
     case viewerInfo(name: String)
+    /// Video (§4.6, §5), viewer → host: the decoder of video region
+    /// (`region`, `generation`) can't decode (a rebuilt hardware session
+    /// waiting for a sync frame, or corrupt data) — send a fresh sync frame
+    /// so the region recovers in place instead of the session failing. The
+    /// host ignores it unless (region, generation) is its live region and
+    /// answers at most one every 500 ms (requests inside that window
+    /// coalesce into the next allowed sync); the viewer re-asks at most
+    /// every 500 ms while the region stays undecodable.
+    case syncRequest(region: UInt8, generation: UInt32)
 
     public static let maxViewerLogChunk = 64 << 10
     public static let maxTextInputBytes = 4096
@@ -300,6 +309,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .uiTree: 0x18
         case .agentScope: 0x19
         case .viewerInfo: 0x1A
+        case .syncRequest: 0x1B
         }
     }
 
@@ -471,6 +481,9 @@ public enum ControlMessage: Equatable, Sendable {
             body.writeBytes(r)
         case let .viewerInfo(name):
             body.writeBytes(Array(name.utf8))
+        case let .syncRequest(region, generation):
+            body.writeU8(region)
+            body.writeU32(generation)
         }
         return body.bytes
     }
@@ -653,6 +666,10 @@ public enum ControlMessage: Equatable, Sendable {
                   let bytes = unsafe r.readBytes(r.remaining),
                   let name = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
             return .viewerInfo(name: name)
+        case 0x1B:
+            guard let region = r.readU8(), let generation = r.readU32(),
+                  r.remaining == 0 else { return nil }
+            return .syncRequest(region: region, generation: generation)
         default:
             return nil
         }
@@ -661,7 +678,7 @@ public enum ControlMessage: Equatable, Sendable {
     /// Known TLV types. Everything beyond is skipped by the deframer
     /// using its declared length.
     public static func isKnownType(_ t: UInt8) -> Bool {
-        (0x01...0x1A).contains(t)
+        (0x01...0x1B).contains(t)
     }
 }
 

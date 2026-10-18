@@ -429,7 +429,8 @@ public final class VTRegionDecoder: VideoRegionDecoder {
     /// corrupt data — rebuilds the session from the stored format
     /// description and drops frames until the next sync frame (a P-frame
     /// references state the new session doesn't have). Failures report
-    /// `false`, so the engine can escalate a region that stays undecodable.
+    /// `false`, so the engine asks the host for a sync frame (SYNC_REQUEST,
+    /// §5) and, as a last resort, escalates a region that stays undecodable.
     @discardableResult
     public func decode(_ data: [UInt8], sync: Bool,
                        onPixels: (_ pixels: UnsafeRawBufferPointer, _ bytesPerRow: Int) -> Void) -> Bool {
