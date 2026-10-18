@@ -687,6 +687,18 @@ session never redials.
     `.forAppOnly`, so macOS undoes it when the Host exits.
   - Falls back to client resolution, which switches the physical display
     mode.
+- **Display changes the Host didn't make** (someone at the Mac picks another
+  resolution, rearranges displays or makes another display main): half a
+  second after the reconfiguration settles, the Host checks the full-display
+  capture against the display it shares, which is the one capture started
+  on, not whichever is main now.
+  - A moved display: input and cursor follow its new origin.
+  - A new size at native: capture rebuilds at the new mode, in session.
+  - A new shape under Scale: capture re-fits the viewer's last request.
+  - Under client resolution, the viewer's mode is re-applied, as when macOS
+    reverts it (at most 3 times a minute).
+  - The Host's own switches rebuild capture as they make them, so they
+    already match by then and the check does nothing.
 
 **Single window:**
 - WINDOW_LIST and WINDOW_SELECT rebuild the SCK filter around one window.
