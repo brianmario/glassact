@@ -71,3 +71,16 @@ jobs:
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer
           -configuration Release -destination 'generic/platform=macOS'
           CODE_SIGNING_ALLOWED=NO build
+
+  allocations:
+    name: Allocations
+    # The no-allocation hot-path tests (INV-7) assert their counts only in
+    # optimized code: in a debug build the stdlib's own hashing allocates
+    # per row and buries the engine's numbers. So they get a release build
+    # of their own (`just test-alloc`).
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Allocation-count tests (release)
+        run: swift test -c release --filter ScrollAllocationTests
