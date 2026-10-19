@@ -20,6 +20,10 @@ bench *ARGS:
 test-asan:
     swift test --sanitize=address
 
+# Allocation-count tests (INV-7): they assert only against optimized code
+test-alloc:
+    swift test -c release --filter ScrollAllocationTests
+
 # Full-size hash collision sweep (10^6 × 16 KB buffers, §4.5) — release mode
 test-exhaustive:
     GLASSACT_EXHAUSTIVE=1 swift test -c release --filter CodecTests

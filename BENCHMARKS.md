@@ -202,6 +202,7 @@ the numbers and the reasoning.
 | Present blit off the main thread | kept | Viewer main blocked 89–92 % → 0 % | [blit](#present-blit-off-the-main-thread-2026-09-27), [A/B](#live-ab-viewer-main-thread-same-machine-loopback-2026-09-27) |
 | Carry skipped captures' damage forward | kept | fixes tiles left stale until touched; bytes unchanged | [entry](#stale-tiles-damage-from-skipped-captures-is-carried-forward-2026-09-30) |
 | Hot-map churn keyed on hash changes, not "un-ACKed" | kept | 1 s RTT sessions converge; photos loop 14 → 9 regions | [entry](#high-rtt-convergence-hot-map-read-un-acked-as-churn-2026-08-10) |
+| Allocation-free scroll path (preallocated signatures, votes, probe buffers; pooled marks) | kept | `maybeEmitScroll` 779–2,097 → 2 allocations per tick (the SCROLL `Data`); timing unchanged | [entry](#allocation-free-scroll-ticks-2026-10-18) |
 
 ## Removed bench commands
 
@@ -229,6 +230,117 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Allocation-free scroll ticks (2026-10-18)
+
+Issue #3: the scroll path broke INV-7 on every heavy tick, and INV-7 listed
+it as a known exception. Each item and what replaced it:
+
+- **Row and column signature index** (`[UInt64: [Int]]`, one array per
+  distinct signature, about one per row of the bbox) and the **vote
+  dictionaries**: signatures go into a flat array sized to the canvas, and
+  each probe compares only the shadow rows within ±600 of itself, the
+  only ones it can vote for. Votes live in a flat array indexed by shift,
+  and `takeBestShift` picks the winner with the old tie order and zeroes
+  the votes as it reads them.
+- **`probe2DShift`:** the per-probe sample arrays, the `Set<UInt32>` of
+  distinct samples, a `Set<UInt8>` per 16-byte anchor window, and the
+  `found`, `collected` and result arrays. These became preallocated
+  sample, probe and candidate buffers, an open-addressed 512-slot table
+  for the distinct count, a 256-bit seen-set on the stack, and stable
+  insertion sorts that keep the old order.
+- **Array literals** in `colSignature` and the corner checks.
+- **SCROLL emission:** `ControlMessage.scroll` built two byte arrays per
+  op. It now goes through a new `ControlFrames.scroll` into a reused
+  buffer. One `Data` is left for the transport API, as for every datagram
+  and every viewer control frame; INV-7 now says so.
+- **The per-scroll marks array** (a new `ContiguousArray` per op) now
+  comes from a pool. Each buffer has capacity for the whole grid and goes
+  back to the pool on SCROLL_ACK or eviction.
+- **SCROLL_ACK repair:** the `Set<Int>` of skipped tiles became per-tile
+  marks.
+- **Re-hashing after a scroll:** `emitScroll` re-hashed the whole worklist
+  after appending the rect's static tiles. It now hashes only the
+  appended ones.
+- `cachePrefix`, also named in the issue, was already a preallocated
+  16-byte buffer, so nothing changed there.
+
+Allocations are counted with the new `replay --mode encode --count-allocs`.
+It hooks libmalloc's `malloc_logger`, the hook MallocStackLogging uses,
+while `encodeTick` runs. Counts are given for all threads. The
+encode-thread share moves between runs, because `concurrentPerform` runs
+some encode jobs on the calling thread. The all-threads totals repeat to
+within one allocation.
+
+| trace (5K), encode replay | ticks | before | after |
+|---|---|---|---|
+| scroll v3 at 22 Mbit, scroll ticks | 71 | 710,080 (p50 7,914/tick) | **613,509** (p50 6,462) |
+| scroll v3 at 22 Mbit, other ticks | 1,009 | 7,459,609 | **6,372,006** |
+| scroll-win at 22 Mbit, scroll ticks | 188 | 5,105,645 (p50 23,837/tick) | **4,103,829** (p50 18,226) |
+| scroll-win at 22 Mbit, other ticks | 430 | 4,262,699 | **3,467,923** |
+| typing-cc at 22 Mbit (no scrolls) | 265 | 68,908 | 68,907 |
+| scroll v3 Auto, scroll ticks | 456 | 49,972,611 | **49,376,189** |
+| scroll-win Auto, scroll ticks | 268 | 13,487,984 | **12,140,682** |
+
+The savings are ~1,300 allocations per scroll tick on scroll v3 and
+~5,000 on scroll-win, where the column and 2-D passes run. "Other ticks"
+drop too, because they include heavy ticks whose detection found no
+shift. What's left per tick is outside the scroll path: libwebp's VP8L
+encodes, about 150 allocations each (typing-cc's 276 per tick is almost
+all of it), one `Data` per datagram, and 4 allocations per
+`concurrentPerform` fan-out. The fan-out cost was found here, applies to
+every tick's hash and encode, and isn't listed under INV-7.
+
+The scroll path alone is measured by
+`INV_7_steadyStateScrollTickAllocatesOnlyTheControlFrame`
+(`just test-alloc`, release, 1280×768): it counts allocations in a
+steady-state `maybeEmitScroll` (detection, verification, emission and
+re-hash) and in `repairAfterScrollAck` with two skipped tiles.
+
+| tick | before | after |
+|---|---|---|
+| vertical scroll (row votes) | 779 | **2** (the SCROLL `Data`) |
+| horizontal pan (column votes) | 1,694–1,821 | **2** |
+| diagonal drag (2-D probe) | 2,097 | **2** |
+| SCROLL_ACK repair, 2 skipped | 2 | **0** |
+
+The counts are asserted only in optimized builds. At -Onone, xxh64's
+streaming state alone allocates ~100 times per hashed row.
+
+**Timing.** M4 Pro, release. Other agents were building and testing on
+the machine throughout (load average 36–60), so before and after runs
+were interleaved A B A B A B. Medians are given with [min–max]. Output is
+byte-identical in every pair: same bytes, datagrams, tiles, scrolls and
+satisfied tiles.
+
+| trace, encode replay | before p50 / p95 (µs) | after p50 / p95 (µs) | encode CPU before → after |
+|---|---|---|---|
+| scroll v3, 22 Mbit | 9,213 [8,763–12,113] / 26,856 [24,975–59,296] | 9,069 [8,533–11,293] / 25,417 [24,815–68,361] | 40.56 [39.30–42.63] → 40.31 [39.43–41.09] s |
+| scroll-win, 22 Mbit | 13,742 [13,703–13,967] / 38,493 [37,798–38,673] | 13,678 [13,530–13,747] / 37,585 [37,431–37,819] | 42.62 [42.59–42.83] → 42.45 [42.40–42.50] s |
+| typing-cc, 22 Mbit | 1,141 [1,123–1,146] / 2,390 [2,269–2,884] | 1,145 [1,136–1,164] / 2,216 [2,127–2,279] | 4.00 → 4.01 s |
+| scroll v3, Auto | 20,130 [19,491–20,557] / 57,112 [55,886–59,350] | 19,412 [18,891–19,487] / 56,366 [56,189–57,536] | 207.7 → 206.4 s |
+| scroll-win, Auto | 17,246 [17,159–19,895] / 51,373 [49,474–87,991] | 17,987 [16,697–30,262] / 52,541 [49,589–104,823] | 69.3 → 68.4 s |
+
+Every difference is within run-to-run noise. As the issue said, the
+dictionaries were small in profiles: the codecs dominate encode time. The
+change is about the INV-7 rule, not speed.
+
+**Intel sanity check.** x86_64 build under Rosetta 2, on the M4 Pro, scroll
+v3 at 22 Mbit, 5 interleaved pairs. These numbers say nothing about real
+Intel cost. The runs fall into two groups by machine load (~11 ms and
+~25 ms p50). The quietest runs were before p50 10.8 ms / 52.4 s CPU and
+after 10.3 ms / 51.7 s. The medians were before 21.8 ms / 63.3 s and
+after 12.6 ms / 53.3 s, which mostly shows which runs drew a busy
+machine. Output was byte-identical. No regression is visible. The change
+removes work and adds no SIMD or arch-specific paths.
+
+**Goldens.** The standard faulted golden (`--mode loop --drop 5 --dup 1
+--reorder 10 --latency 20-80 --golden`) on scroll v3 settled with a
+byte-identical canvas at 45.98 MB, both before and after. On scroll-win
+it did the same at 22.79 MB. Every datagram, drop, apply and ACK count is
+identical. Host encode CPU in those single runs was 4,666 → 4,234 ms and
+3,388 → 4,409 ms. The second pair ran alongside the full test suite, so
+treat it as noise.
 
 ### macOS 27 VideoToolbox: constant quality and super-resolution — neither usable (2026-10-10)
 

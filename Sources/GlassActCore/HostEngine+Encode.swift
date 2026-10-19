@@ -30,11 +30,16 @@ extension HostEngine {
     static let parallelHashThreshold = 128
     static let hashChunkSize = 32
 
-    func hashCandidates(frame: UnsafeRawBufferPointer, bytesPerRow: Int) {
-        let count = worklist.count
+    /// Hashes `worklist[start...]` into `hashResults` at the same indices.
+    /// A scroll passes the start of the tiles it appended: the rest of the
+    /// worklist was hashed earlier this tick, from the same frame.
+    func hashCandidates(frame: UnsafeRawBufferPointer, bytesPerRow: Int, from start: Int = 0) {
+        let count = worklist.count - start
         guard count > 0 else { return }
-        worklist.withUnsafeBufferPointer { candidates in
-            hashResults.withUnsafeMutableBufferPointer { results in
+        worklist.withUnsafeBufferPointer { all in
+            hashResults.withUnsafeMutableBufferPointer { allResults in
+                let candidates = UnsafeBufferPointer(rebasing: all[start...])
+                let results = UnsafeMutableBufferPointer(rebasing: allResults[start..<(start + count)])
                 if count >= Self.parallelHashThreshold {
                     let job = HashJob(frame: frame, bytesPerRow: bytesPerRow, grid: grid,
                                       candidates: candidates, results: results,

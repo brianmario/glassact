@@ -1,7 +1,7 @@
-/// Allocation-free encoders for the control messages a viewer sends at
-/// batch rate (§3.5 ACK, SCROLL_ACK, KEYFRAME_ACK, DELTA_NACK, PONG): each
-/// writes the complete TLV frame into a caller-owned buffer and returns its
-/// length. Byte-identical to `ControlMessage.encoded()` (tested); everything
+/// Allocation-free encoders for the control messages sent at batch rate
+/// (§3.5): the viewer's ACK, SCROLL_ACK, KEYFRAME_ACK, DELTA_NACK and PONG,
+/// and the host's SCROLL. Each writes the complete TLV frame into a
+/// caller-owned buffer and returns its length. Byte-identical to `ControlMessage.encoded()` (tested); everything
 /// else keeps using `ControlMessage`, which allocates and is fine off the
 /// per-batch path.
 public enum ControlFrames {
@@ -12,6 +12,22 @@ public enum ControlFrames {
     public static func scrollAckBytes(skippedCount: Int) -> Int {
         let body = 4 + 2 + 2 * skippedCount + 8
         return 1 + varintSize(body) + body
+    }
+
+    /// SCROLL frame size (fixed 16-byte body).
+    public static let scrollBytes = 1 + 1 + 16
+
+    public static func scroll(frameSeq: UInt32, x: UInt16, y: UInt16, width: UInt16, height: UInt16,
+                              dx: Int16, dy: Int16, into out: UnsafeMutableRawBufferPointer) -> Int {
+        var w = unsafe Cursor(out, type: 0x06, bodyLength: 16)
+        unsafe w.u32(frameSeq)
+        unsafe w.u16(x)
+        unsafe w.u16(y)
+        unsafe w.u16(width)
+        unsafe w.u16(height)
+        unsafe w.u16(UInt16(bitPattern: dx))
+        unsafe w.u16(UInt16(bitPattern: dy))
+        return unsafe w.offset
     }
 
     public static func ack(frameSeq: UInt32, dgramCnt: UInt16, bitmap: UnsafeRawBufferPointer,
