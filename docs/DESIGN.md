@@ -556,6 +556,17 @@ fewer than 2 frames pending and the rate gate passes.
   window was pressured, and back after 4 healthy windows.
 - The viewer's QUALITY message bounds the level: a downscaled presentation
   raises its minimum, and a quality floor of n (1–3) caps it at n.
+- **Prefer sharpness** (QUALITY `preferSharpness` = 1):
+  - Under pressure, the level holds and frame rate absorbs it instead: the
+    send gate skips frames, newest wins.
+  - With headroom, the frame-QP ceiling drops from 34 to
+    `sharpMaxFrameQP` (28). It goes on after `sharpHealthyNeeded`
+    pressure-free quality windows in a row (4 at first) and comes off at the
+    first pressured window.
+  - Each fall-back doubles the next wait, up to 64 windows, so a link that
+    can't carry it settles at 34 instead of flapping.
+  - A re-formed region starts under whichever ceiling is in effect, and
+    turning the preference off restores 34 and the first wait.
 
 **Overlay:**
 - The viewer decodes into an overlay buffer, never into the canvas.

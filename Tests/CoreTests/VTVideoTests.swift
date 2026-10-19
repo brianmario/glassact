@@ -154,4 +154,19 @@ import GlassActTestSupport
         #expect(VTHEVCRegionEncoder.isSync(try sample(notSync: false)))
         #expect(!VTHEVCRegionEncoder.isSync(try sample(notSync: true)))
     }
+
+    /// The frame-QP ceiling can change on a running session (prefer
+    /// sharpness switches it as link headroom comes and goes).
+    @Test func maxFrameQPChangesAtRuntime() {
+        let encoder = VTHEVCRegionEncoder(callbackQueue: DispatchQueue(label: "vt.qp.test"))
+        #expect(encoder.start(width: 640, height: 360) { _, _, _ in })
+        #expect(encoder.maxFrameQPAccepted, "the default ceiling applies at start")
+        encoder.setMaxFrameQP(HostEngine.sharpMaxFrameQP)
+        #expect(encoder.maxFrameQP == HostEngine.sharpMaxFrameQP)
+        #expect(encoder.maxFrameQPAccepted, "VideoToolbox takes the change mid-session")
+        encoder.setMaxFrameQP(nil)
+        #expect(encoder.maxFrameQP == VTHEVCRegionEncoder.defaultMaxFrameQP)
+        #expect(encoder.maxFrameQPAccepted)
+        encoder.stop()
+    }
 }

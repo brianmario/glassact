@@ -33,12 +33,17 @@ public protocol VideoRegionEncoder: AnyObject {
     /// nil = none. Applied under the quality level's own target. Runtime.
     /// Default no-op (the mock rig ignores it).
     func setBitrateCap(_ bitsPerSecond: Int?)
+    /// Ceiling on frame QP: the encoder may not quantize coarser than this
+    /// (a quality floor that overrides the bitrate target); nil = the
+    /// encoder's own default. Runtime. Default no-op (the mock rig ignores it).
+    func setMaxFrameQP(_ qp: Int?)
     func stop()
 }
 
 public extension VideoRegionEncoder {
     func setQualityLevel(_ level: Int) {}
     func setBitrateCap(_ bitsPerSecond: Int?) {}
+    func setMaxFrameQP(_ qp: Int?) {}
 }
 
 /// Video regions — viewer-side per-region decoder session. Same threading contract:

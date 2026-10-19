@@ -44,6 +44,10 @@ public struct HostStats: Sendable {
     public var scrollDigestRepairs = 0
     public var qualityDowngrades = 0
     public var qualityUpgrades = 0
+    /// Prefer sharpness: times the sharper frame-QP ceiling went on, and
+    /// times bandwidth pressure took it off again (§4.6).
+    public var sharpCeilingOn = 0
+    public var sharpCeilingOff = 0
     public var governorDeferredTiles = 0
     /// Cache slots dropped after a viewer REF miss (DELTA_NACK on a REF).
     public var cacheSlotsPoisoned = 0
@@ -223,6 +227,16 @@ public final class HostEngine: @unchecked Sendable {
     var policyScaleLevel = 0      // floor from presented scale (<100% → shed detail)
     var policyMaxLevel = 3        // cap from the client's quality floor (QualityFloor)
     var policyPreferSharpness = false // freeze quality, let framerate absorb pressure
+    /// Prefer sharpness, on a link with headroom: the encoder runs under
+    /// `sharpMaxFrameQP` instead of the default ceiling. Earned by
+    /// `sharpHealthyNeeded` pressure-free quality windows in a row; any
+    /// pressured window drops it and doubles what the next try needs.
+    var sharpCeiling = false
+    var sharpHealthyStreak = 0
+    var sharpHealthyNeeded = HostEngine.sharpHealthyWindowsMin
+    static let sharpMaxFrameQP = 28
+    static let sharpHealthyWindowsMin = 4
+    static let sharpHealthyWindowsMax = 64
     static let maxQualityLevel = 3
     static let videoQualityWindow = 30       // frames per evaluation
     static let videoQualityHealthyWindows = 4 // sustained-healthy windows to recover a level

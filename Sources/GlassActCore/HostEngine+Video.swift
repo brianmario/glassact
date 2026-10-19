@@ -115,6 +115,7 @@ extension HostEngine {
         regionEncoder = encoder
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
+        if sharpCeiling { encoder.setMaxFrameQP(Self.sharpMaxFrameQP) }
         regionActive = true
         regionTileBox = (c0, r0, c1, r1)
         regionPixelRect = (x, y, w, h)
@@ -547,6 +548,7 @@ extension HostEngine {
         qualityWindowAttempts = 0
         qualityWindowPressure = 0
         let before = effectiveQualityLevel
+        updateSharpCeiling(pressured: pressured)
         if pressured {
             qualityHealthyStreak = 0
             // preferSharpness: don't degrade quality on bandwidth pressure —
@@ -569,6 +571,29 @@ extension HostEngine {
         }
     }
 
+    /// Prefer sharpness (§4.6): the sharper frame-QP ceiling goes on after
+    /// `sharpHealthyNeeded` pressure-free windows in a row and comes off at
+    /// the first pressured one. Each fall-back doubles the healthy run the
+    /// next try needs (up to `sharpHealthyWindowsMax`), so a link that
+    /// can't carry it settles at the default instead of flapping.
+    func updateSharpCeiling(pressured: Bool) {
+        guard policyPreferSharpness else { return }
+        if pressured {
+            sharpHealthyStreak = 0
+            guard sharpCeiling else { return }
+            sharpCeiling = false
+            sharpHealthyNeeded = min(sharpHealthyNeeded * 2, Self.sharpHealthyWindowsMax)
+            stats.sharpCeilingOff += 1
+            regionEncoder?.setMaxFrameQP(nil)
+        } else {
+            sharpHealthyStreak += 1
+            guard !sharpCeiling, sharpHealthyStreak >= sharpHealthyNeeded else { return }
+            sharpCeiling = true
+            stats.sharpCeilingOn += 1
+            regionEncoder?.setMaxFrameQP(Self.sharpMaxFrameQP)
+        }
+    }
+
     /// Effective level fed to the encoder: at least the presented-scale floor,
     /// at most the client's quality-floor cap.
     var effectiveQualityLevel: Int {
@@ -584,6 +609,11 @@ extension HostEngine {
         policyMaxLevel = floor == QualityFloor.automatic ? Self.maxQualityLevel
             : min(Self.maxQualityLevel, Int(floor))
         policyPreferSharpness = preferSharpness
+        if !preferSharpness && sharpCeiling {
+            sharpCeiling = false
+            regionEncoder?.setMaxFrameQP(nil)
+        }
+        if !preferSharpness { sharpHealthyStreak = 0; sharpHealthyNeeded = Self.sharpHealthyWindowsMin }
         regionEncoder?.setQualityLevel(effectiveQualityLevel)
     }
 
