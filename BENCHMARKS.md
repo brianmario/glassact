@@ -64,7 +64,7 @@ quoting it against a change.
 | Faulted golden, tiles only | 45.98 MB, settled byte-exact at 21.1 s | scroll v3 | 2026-09-30 |
 | Golden status | byte-identical ×3 seeds under the standard faults on every reference trace | all | 2026-08-05 onward |
 | Video on a 3 Mbit/s bottleneck | steady p95 one-way delay 59–64 ms | relay rig (`VideoSendGateTests`) | 2026-09-30 |
-| Video quality at 1 Mbit/s (capture-time PTS, QP 34 floor) | typing-cc min SSIM 0.926 | `vquality` | 2026-10-10 |
+| Video quality at 1 Mbit/s (capture-time PTS, QP 34 floor) | typing-cc min SSIM 0.926; SSIMULACRA2 mean 63.1 / p5 49.8 / min 28.1 | `vquality`, 2940-wide | 2026-10-18 |
 | Tile governor on a thin link | 224–350 KB/s on a 250 KB/s link; worst backlog 183–380 ms | `GovernorTests` rig | 2026-09-28 |
 | Loopback QUIC, 2048² noise, 6 full-frame rounds | ~11 s; 0 lost, 0 redundant datagrams | `QUICSustainedSessionTests` scenario | 2026-09-27 |
 
@@ -229,6 +229,117 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### SSIMULACRA2 in vquality: the SSIM-based video decisions re-checked (2026-10-18)
+
+Luma SSIM on 8×8 blocks is weak at telling whether text has gone soft
+(issue #13). `glassact-bench vquality` now also scores SSIMULACRA2 when an
+`ssimulacra2` binary is on PATH (Homebrew's, from libjxl), or one named
+with `--ssimulacra2 <path>`; `--ssimulacra2 off` skips it. It scores every
+5th scored frame (`--ssimulacra2-every <n>`), plus the lowest-SSIM frame
+and every `--settle` step, and prints mean / p5 / min next to the SSIM
+line. The pairs go to a temp directory as PNG (ImageIO) and are scored
+after the run, at most 6 processes at a time, so the encode-latency line
+doesn't share the CPU with them. One 2940-wide pair takes 1.5–2 s on one
+core, so a 300-frame run gains ~60 pairs and 20–30 s. Without the binary,
+the output is unchanged. Scale: 100 is lossless, 90 visually lossless,
+70 high, 50 medium, 30 low quality, and below 0 very strong distortion.
+
+Apple M4 Pro, macOS 27.0.1, 2940×1652 canvas from the 5K traces (2880×1620
+for half-res, as on 2026-09-29), 300 frames (typing-cc has 266). Other
+work loaded the machine. Repeat runs gave identical numbers except in the
+`--settle` tail, which varied (one run's 3 settle frames came to 62 KB,
+an identical run's to 4 KB). Each cell below is SSIM, then SSIMULACRA2.
+
+**QP 34 frame-QP floor: holds, more clearly than under SSIM.**
+`vquality --trace <t> --width 2940 --mbit 1 [--kbit 300] [--submit-fps n] --max-qp 34|51`:
+
+| trace @ cap, submit | max QP | achieved | SSIM mean / p5 / min | SSIMULACRA2 mean / p5 / min |
+|---|---|---|---|---|
+| typing-cc @ 1, all | none | 0.20 | 0.967 / 0.947 / 0.762 | 59.7 / 25.4 / −51.3 |
+| | 34 | 0.21 | 0.972 / 0.957 / 0.926 | **63.1 / 49.8 / 28.1** |
+| typing-cc @ 0.3, all | none | 0.21 | 0.945 / 0.813 / 0.729 | 46.0 / −31.6 / −60.6 |
+| | 34 | 0.19 | 0.963 / 0.929 / 0.926 | **56.7 / 30.3 / 28.1** |
+| scroll-win @ 1, all | none | 0.92 | 0.949 / 0.877 / 0.823 | 37.1 / −3.6 / −35.1 |
+| | 34 | 1.15 | 0.965 / 0.963 / 0.955 | **49.9 / 49.0 / 40.8** |
+| scroll-win @ 1, ≤ 5 fps | none | 0.88 | 0.967 / 0.880 / 0.823 | 52.9 / −35.1 / −35.1 |
+| | 34 | 0.85 | 0.982 / 0.960 / 0.955 | **64.1 / 40.8 / 40.8** |
+| cursor-drag @ 0.3, ≤ 30 fps | none | 0.37 | 0.954 / 0.901 / 0.750 | 49.8 / 13.1 / −58.6 |
+| | 34 | 0.36 | 0.968 / 0.937 / 0.935 | **59.3 / 34.4 / 32.9** |
+| photos @ 1, all | none | 1.05 | 0.822 / 0.710 / 0.692 | −7.7 / −53.8 / −55.7 |
+| | 34 | 3.07 | 0.920 / 0.906 / 0.893 | **39.6 / 35.1 / 33.3** |
+
+Without the floor, the worst frames score far below zero. SSIM called
+them 0.73–0.82, which hides how bad they are. With the floor, the means
+on text rise 3–13 points, for −10 % to +25 % bytes. One caveat for #4
+(opt-in sharper video): even with the floor, the worst frames score only 28–41 (low
+quality), and SSIM's 0.926 hid that. On typing-cc that worst frame is the
+first keyframe (145 KB at QP 34). A lower ceiling for keyframes may be
+worth measuring there.
+
+**Capture-time PTS: holds.** The index clock (frames stamped n/60) was
+measured with a temporary, uncommitted `--pts-index` patch, which does
+what the removed `--pts index` did. Mean / p5:
+
+| trace @ cap, submit | max QP | index/60: achieved, SSIM, SSIMULACRA2 | capture time |
+|---|---|---|---|
+| typing-cc @ 1, all | none | 0.15, 0.894 / 0.795, 13.1 / −44.9 | 0.20, 0.967 / 0.947, **59.7 / 25.4** |
+| typing-cc @ 0.3, all | none | 0.05, 0.726 / 0.724, −60.5 / −60.7 | 0.21, 0.945 / 0.813, **46.0 / −31.6** |
+| scroll-win @ 1, ≤ 5 fps | none | 0.07, 0.822 / 0.811, −37.2 / −41.8 | 0.88, 0.967 / 0.880, **52.9 / −35.1** |
+| typing-cc @ 1, all | 34 | 0.15, 0.946 / 0.935, 41.9 / 32.7 | 0.21, 0.972 / 0.957, **63.1 / 49.8** |
+| typing-cc @ 0.3, all | 34 | 0.11, 0.935 / 0.935, 32.8 / 32.7 | 0.19, 0.963 / 0.929, **56.7 / 30.3** |
+| scroll-win @ 1, ≤ 5 fps | 34 | 0.49, 0.961 / 0.959, 45.0 / 44.3 | 0.85, 0.982 / 0.960, **64.1 / 40.8** |
+
+Means rise 19–24 points under the floor, and far more without it. Both
+metrics agree on the one small exception: with the floor, p5 and min drop
+a little under capture time (scroll ≤ 5 fps: 44.3 → 40.8; SSIM 0.958 →
+0.955). That comes from the first keyframe, which is also the worst frame
+in the QP table above.
+
+**Re-sharpen keyframe: holds, but the gain is small at QP 34.** The
+content arrives as an inter frame after a blank keyframe:
+`--width 2940 --kbit 3750 --from-black --frames 1 --settle 8 [--settle-sync]`
+(3.75 Mbit/s is the startup cap).
+
+| | typing-cc, QP 34 | scroll-win, QP 34 | typing-cc, none | scroll-win, none |
+|---|---|---|---|---|
+| arrival coding (what stays without a re-sharpen) | 0.934, 32.5 | 0.961, 45.6 | 0.893, 6.4 | 0.920, 18.9 |
+| re-sharpen keyframe (`--settle-sync`, step 1) | 0.942, **40.2** | 0.964, **49.1** | 0.924, **28.8** | 0.958, **45.3** |
+| same frame resubmitted every 250 ms, no keyframe, step 4 / 8 | 0.966 / 0.991, 57.7 / 79.4 | 0.980 / 0.994, 63.8 / 78.2 | 0.965 / 0.991, 57.7 / 79.4 | 0.979 / 0.994, 63.1 / 78.0 |
+| keyframe first, then resubmitted, step 4 / 8 | 0.944 / 0.986, 41.3 / 75.3 | 0.966 / 0.994, 50.5 / 77.9 | 0.949 / 0.990, 45.5 / 78.8 | 0.976 / 0.994, 59.6 / 77.5 |
+
+Both metrics rank the keyframe above keeping the arrival coding, so the
+decision stands. Under the QP 34 floor, though, it moves typing only from
+32.5 to 40.2: still low quality, which SSIM's 0.934 → 0.942 understated.
+This run also differs from 2026-10-10 in one way. That entry found
+resubmitting an unchanged frame gave skip frames (SSIM flat). Here, from
+`--from-black --frames 1`, VideoToolbox refines the resubmitted frame to
+~78–79 within 2 s, and forcing a keyframe first delays that (typing at
+step 4: 41.3 vs 57.7). The Host doesn't resubmit quiet captures, so this
+doesn't apply to the product as it is. "A few timed resubmissions of a
+quiet region instead of one keyframe" is an idea to measure live, not a
+change made here. The settle tail is the noisiest part of the bench (see
+above), so re-run it before relying on it.
+
+**Half-resolution encode: holds, more clearly than under SSIM.**
+2880×1620 canvas, product defaults (QP 34), `--scale 100|50`. Each cell is
+achieved Mbit/s, then SSIM mean, then SSIMULACRA2 mean / p5:
+
+| trace @ cap | full res | half res |
+|---|---|---|
+| typing-cc @ 1 | 0.20, 0.970, **62.5 / 50.1** | 0.08, 0.903, 26.6 / 27.3 |
+| typing-cc @ 3 | 0.21, 0.987, **76.0 / 76.7** | 0.10, 0.917, 32.7 / 32.7 |
+| scroll-win @ 1 | 0.97, 0.970, **54.5 / 49.5** | 0.82, 0.917, 25.4 / 16.8 |
+| scroll-win @ 3 | 2.51, 0.989, **72.0 / 63.6** | 1.39, 0.927, 30.5 / 29.8 |
+
+On text, half res tops out near 30, the cost of the resample round trip.
+Full res reaches 54–76 at the same caps.
+
+All four decisions stand, and the decisions table is unchanged.
+SSIMULACRA2 separates the cases much more widely than SSIM does on text.
+It also shows that the worst frames under the floor, and the single
+re-sharpen keyframe, still look low quality. That is the gap #4 should
+tune against.
 
 ### Real-codec loop: VT output on the rig's thread, awaited before time moves (2026-10-18)
 
