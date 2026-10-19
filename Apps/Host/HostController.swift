@@ -2346,6 +2346,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             let qup = s.qualityUpgrades - p.qualityUpgrades
             if qdown > 0 { line += " · quality↓\(qdown)" }
             if qup > 0 { line += " · quality↑\(qup)" }
+            let sharpOn = s.sharpCeilingOn - p.sharpCeilingOn
+            let sharpOff = s.sharpCeilingOff - p.sharpCeilingOff
+            if sharpOn > 0 { line += " · sharp on" }
+            if sharpOff > 0 { line += " · sharp off (pressure)" }
             // Still region tiles handed back to exact pixels while video runs
             // (free reveals, lossless records) — soft text with neither
             // showing means the handoff isn't firing.

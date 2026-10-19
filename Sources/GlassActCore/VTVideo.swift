@@ -162,6 +162,18 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         applyBitrate()
     }
 
+    /// Runtime change of the frame-QP ceiling (nil: the product default).
+    /// VT applies MaxAllowedFrameQP mid-session; `maxFrameQPAccepted` says
+    /// whether it took.
+    public func setMaxFrameQP(_ qp: Int?) {
+        let ceiling = qp ?? Self.defaultMaxFrameQP
+        guard ceiling != maxFrameQP else { return }
+        maxFrameQP = ceiling
+        guard let session else { return }
+        maxFrameQPAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                                                  value: ceiling as CFNumber) == noErr
+    }
+
     /// Quality level's share of the base, under the link cap. The cap also
     /// bounds bursts (DataRateLimits over 1 s): an average alone lets VT
     /// spend seconds of link time on one detailed frame.

@@ -357,6 +357,7 @@ final class BenchVTEncoder: VideoRegionEncoder {
 
     func setQualityLevel(_ level: Int) { inner.setQualityLevel(level) }
     func setBitrateCap(_ bitsPerSecond: Int?) { inner.setBitrateCap(bitsPerSecond) }
+    func setMaxFrameQP(_ qp: Int?) { inner.setMaxFrameQP(qp) }
 
     /// The stopped encoder drops deliveries still queued.
     func stop() {

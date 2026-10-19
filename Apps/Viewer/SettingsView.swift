@@ -27,7 +27,9 @@ struct SettingsView: View {
                 Text("Picture")
             } footer: {
                 Text("Keeping quality high holds text crisp on a slow network, at the cost of fewer frames "
-                     + "per second. Changes apply the next time you connect.")
+                     + "per second. Preferring sharpness also keeps moving content sharper whenever the "
+                     + "network has room to spare, using more bandwidth. Changes apply the next time you "
+                     + "connect.")
                     .settingsFooter()
             }
 

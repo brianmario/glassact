@@ -172,6 +172,7 @@ the numbers and the reasoning.
 | Capture-time PTS for the encoder | kept | typing-cc at 1 Mbit/s: SSIM 0.892 → 0.967 | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
 | QP 34 frame-QP floor | kept (default since 2026-10-10) | typing-cc at 1 Mbit/s: min SSIM 0.757 → 0.926, same bytes | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
 | Re-sharpen keyframe once a region goes quiet | kept | SSIM 0.879 → 0.975–0.985 | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
+| Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -230,6 +231,54 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Prefer sharpness: a QP 28 ceiling on a link with headroom (2026-10-19)
+
+Issue #4. The QP 34 frame ceiling keeps text legible on a thin link, but
+with room to spare it still leaves the frame after a big change soft: on
+typing-cc at 1 Mbit/s the worst frames score SSIMULACRA2 28–41 (the
+SSIMULACRA2 entry below). With the Viewer's "Prefer sharpness" on, the host
+now drops the ceiling to 28 once the link has shown headroom, and back to
+34 at the first sign of pressure (DESIGN §4.6).
+
+`glassact-bench vquality --mbit 6 --width 2880 --max-qp N`, 300 frames,
+M4 Pro. Achieved Mbit/s, largest frame, then SSIMULACRA2 mean / p5 / min:
+
+| trace | QP | achieved | max frame | SSIMULACRA2 |
+|---|---|---|---|---|
+| typing-cc | 34 | 0.27 | 179 KB | 78.4 / 78.8 / 50.2 |
+| typing-cc | 30 | 0.25 | 258 KB | 77.5 / 77.7 / 63.6 |
+| typing-cc | **28** | 0.24 | 304 KB | 76.8 / 76.8 / 68.5 |
+| typing-cc | 25 | 0.25 | 385 KB | 76.8 / 76.6 / 73.7 |
+| scroll-win | 34 | 3.27 | 155 KB | 77.3 / 76.8 / 60.0 |
+| scroll-win | 30 | 3.25 | 215 KB | 77.3 / 76.2 / 71.0 |
+| scroll-win | **28** | 3.24 | 247 KB | 77.4 / 76.5 / 74.5 |
+| scroll-win | 25 | 3.26 | 304 KB | 78.0 / 77.5 / 77.4 |
+| cursor-drag | 34 | 0.53 | 157 KB | 78.4 / 78.2 / 53.7 |
+| cursor-drag | 30 | 0.54 | 230 KB | 77.7 / 77.6 / 64.1 |
+| cursor-drag | **28** | 0.44 | 264 KB | 75.8 / 75.5 / 71.8 |
+| cursor-drag | 25 | 0.48 | 333 KB | 77.1 / 77.0 / 76.4 |
+| photos | 34 | 6.32 | 342 KB | 61.6 / 40.5 / 37.2 |
+| photos | 30 | 7.14 | 342 KB | 67.0 / 58.0 / 55.5 |
+| photos | **28** | 7.99 | 405 KB | 69.4 / 63.8 / 61.9 |
+| photos | 25 | 10.69 | 469 KB | 73.6 / 71.6 / 70.3 |
+
+- **Text:** the mean barely moves and neither do the bytes. The gain is
+  the worst frame (the one after a big change), up 14–25 points at 28.
+- **Photos:** the ceiling binds and costs bytes: +13 % at 30, +26 % at 28,
+  +69 % at 25.
+- **Largest frames grow** 1.6–1.9× at 28. They reach the link as one
+  burst, so on a link that can't absorb them the send gate drops frames.
+  That's why the ceiling waits for headroom and leaves at the first
+  pressured window.
+- **28, not 25:** most of 25's gain on text, at under half its cost on
+  photos and with smaller bursts.
+
+Gating, in `HostEngine.updateSharpCeiling`: on after 4 pressure-free
+quality windows in a row (30 submitted frames each), off at the first
+pressured one, and each fall-back doubles the next wait (up to 64
+windows). Covered by `SharpCeilingTests`; VideoToolbox accepting the change
+mid-session by `VTVideoTests.maxFrameQPChangesAtRuntime`.
 
 ### Allocation-free scroll ticks (2026-10-18)
 
