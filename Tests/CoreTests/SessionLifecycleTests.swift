@@ -86,14 +86,15 @@ import GlassActTestSupport
     }
 
     /// A region whose decoder keeps failing (dead hardware session, no sync
-    /// frame to resync on — encoders only send them on demand) escalates to
-    /// a session failure instead of freezing indefinitely.
+    /// frame to resync on — encoders only send them on demand) asks for a
+    /// sync frame, and when none fixes it within the 2 s deadline escalates
+    /// to a session failure instead of freezing indefinitely.
     @Test func persistentlyUndecodableRegionEscalates() {
-        let (viewer, _) = makeVideoViewer()
+        let (viewer, capture) = makeVideoViewer()
         var reasons: [String] = []
         viewer.onFailed = { reasons.append($0) }
         var t: UInt64 = 1_000
-        for seq in UInt32(2)..<UInt32(60) { // ~1.4 s of garbage at 40 fps
+        for seq in UInt32(2)..<UInt32(100) { // ~2.4 s of garbage at 40 fps
             let garbage = VideoMessage.frame(region: 0, generation: 1, seq: seq, sync: false,
                                              captureUS: 0, data: [9, 9, 9])
             viewer.handleVideo(Data(garbage.encoded()), nowUS: t)
@@ -102,6 +103,14 @@ import GlassActTestSupport
         #expect(viewer.stats.videoDecodeFailures > 0)
         #expect(viewer.state == .failed)
         #expect(reasons.count == 1)
+        // Nobody answers here: the viewer asked at most every 500 ms
+        // (t = 0, 0.5, 1.0, 1.5, 2.0 s) before giving up.
+        let requests = controlMessages(capture.sentControl).filter {
+            if case .syncRequest(0, 1) = $0 { return true }
+            return false
+        }
+        #expect(requests.count == 5)
+        #expect(viewer.stats.videoSyncRequests == 5)
     }
 
     @Test func briefDecodeFailureDoesNotEscalate() {
@@ -268,7 +277,7 @@ import GlassActTestSupport
         #expect(capture.sentControl.count == sentBefore, "a failed engine sent \(capture.sentControl.count - sentBefore) message(s)")
     }
 
-    /// A region undecodable for > 1 s fails the engine from inside the video
+    /// A region undecodable for > 2 s fails the engine from inside the video
     /// loop; a keyframe later in the SAME chunk must then neither apply nor
     /// send KEYFRAME_ACK.
     @Test func viewerSendsNothingAfterVideoFailsMidChunk() {
@@ -299,8 +308,9 @@ import GlassActTestSupport
                                              codec: KeyframeCodec.vp8lStriped,
                                              stripes: [[UInt8](out[0..<n])]).encoded()
         let sentBefore = capture.sentControl.count
-        // > 1 s later: this frame escalates to .failed; the keyframe follows in the same chunk.
-        v.handleVideo(Data(undecodable(2) + keyframe), nowUS: 1_100_000)
+        // > 2 s later: this frame escalates to .failed (and asks for no
+        // sync frame); the keyframe follows in the same chunk.
+        v.handleVideo(Data(undecodable(2) + keyframe), nowUS: 2_100_000)
         #expect(v.state == .failed)
         #expect(v.stats.keyframesApplied == 0, "nothing applies after the failure")
         #expect(capture.sentControl.count == sentBefore, "a failed engine sent a KEYFRAME_ACK")

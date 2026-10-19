@@ -255,6 +255,7 @@ final class Harness {
          hostCodecs: [UInt8] = [MockVideoEncoder.mockCodecID],
          viewerCodecs: [UInt8] = [MockVideoEncoder.mockCodecID],
          encoderFactory: ((UInt8) -> any VideoRegionEncoder?)? = nil,
+         decoderFactory: (() -> any VideoRegionDecoder)? = nil,
          fastLink: Bool = false,
          sendClock: Bool = false,
          encodeTimer: (@Sendable () -> UInt64)? = nil) {
@@ -278,7 +279,7 @@ final class Harness {
                           encodeTimer: encodeTimer)
         if fastLink { host.assumeFastLinkForTests() }
         viewer = ViewerEngine(transport: link.b,
-                              videoDecoderFactory: video ? { MockVideoDecoder() } : nil,
+                              videoDecoderFactory: video ? (decoderFactory ?? { MockVideoDecoder() }) : nil,
                               supportedVideoCodecs: viewerCodecs)
         link.a.onControl = { [weak self] data in
             guard let self else { return }

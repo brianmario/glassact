@@ -49,8 +49,8 @@ public protocol VideoRegionDecoder: AnyObject {
     func start(codec: UInt8, config: [UInt8], width: Int, height: Int) -> Bool
     /// Returns false when the frame could not be decoded (corrupt data, a
     /// dead hardware session, or a non-sync frame while re-synchronizing
-    /// after a failure). The engine uses it to detect a region that stays
-    /// undecodable.
+    /// after a failure). The engine then asks the host for a sync frame
+    /// (SYNC_REQUEST) and detects a region that stays undecodable.
     @discardableResult
     func decode(_ data: [UInt8], sync: Bool,
                 onPixels: (_ pixels: UnsafeRawBufferPointer, _ bytesPerRow: Int) -> Void) -> Bool

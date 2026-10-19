@@ -124,6 +124,7 @@ extension HostEngine {
         regionEmptyDeliveries = 0
         regionQuietTicks = 0
         regionLastChangeUS = nowUS
+        syncRequestPending = false // the new generation starts on a sync frame
         resetClaimsInFlight()
         for row in r0...r1 {
             for col in c0...c1 {
@@ -202,6 +203,9 @@ extension HostEngine {
             refreshQuietSinceUS = nowUS
         }
         let refresh = refreshDue(nowUS: nowUS, regionArea: regionArea)
+        // The viewer's decoder is waiting for a sync frame: send one now,
+        // changed or not (a static region's next frame might be far off).
+        let forced = refresh || syncRequestDue
         if changed {
             // A full-screen region must not live on typing. A frame
             // that touches fewer tiles than would FORM a region (caret
@@ -217,10 +221,10 @@ extension HostEngine {
                 regionQuietTicks = 0
                 regionLastChangeUS = nowUS
             }
-            if submitRegionFrame(forceSync: refresh) && refresh { stats.videoRefreshes += 1 }
+            if submitRegionFrame(forceSync: forced) && refresh { stats.videoRefreshes += 1 }
         } else {
             regionQuietTicks += 1
-            if refresh && submitRegionFrame(forceSync: true) { stats.videoRefreshes += 1 }
+            if forced && submitRegionFrame(forceSync: true) && refresh { stats.videoRefreshes += 1 }
         }
         handOffStillTiles(nowUS: nowUS)
     }
@@ -305,6 +309,47 @@ extension HostEngine {
         let cap = videoRate.bitrateCap ?? Int.max
         let budgetGrew = capAtLastSync > 0 && cap / Self.refreshCapGrowth >= capAtLastSync
         return damaged || budgetGrew
+    }
+
+    /// SYNC_REQUEST (§3.5), viewer → host: the viewer's decoder for
+    /// (region, generation) can't decode and waits for a sync frame. Only the
+    /// live region's current generation counts — a stale request (the
+    /// region dissolved or re-formed, and a new generation starts on a sync
+    /// frame anyway) or one before START is ignored. It is only noted here:
+    /// the next serviced tick answers it, no closer than
+    /// `syncRequestMinIntervalUS` to the previous answer.
+    func noteSyncRequest(region: UInt8, generation: UInt32) {
+        guard state == .running, regionActive, regionStartSent,
+              region == 0, generation == regionGeneration else {
+            stats.videoSyncRequestsIgnored += 1
+            return
+        }
+        stats.videoSyncRequests += 1
+        syncRequestPending = true
+    }
+
+    /// A SYNC_REQUEST is owed and the rate limit allows answering it now.
+    var syncRequestDue: Bool {
+        syncRequestPending
+            && (lastRequestedSyncUS == 0
+                || lastEncodeNowUS &- lastRequestedSyncUS >= Self.syncRequestMinIntervalUS)
+    }
+
+    /// Answering a SYNC_REQUEST: the viewer dropped every frame since its
+    /// decoder broke, claims included, so a tile the host believes shows
+    /// video may show stale overlay pixels — or its old canvas copy —
+    /// there. The sync frame claims all of those again (tiles already back
+    /// on their exact canvas copy stay there).
+    func reclaimShownTiles() {
+        let (c0, r0, c1, r1) = regionTileBox
+        for row in r0...r1 {
+            for col in c0...c1 {
+                let idx = row * grid.cols + col
+                guard videoShown[idx], !claimPending[idx] else { continue }
+                claimPending[idx] = true
+                claimPendingTiles.append(Int32(idx))
+            }
+        }
     }
 
     /// Pixels of `rects` inside the region (overlaps may count twice).
@@ -459,13 +504,24 @@ extension HostEngine {
         if stats.videoFramesSent == 0 && firstVideoSubmitUS == 0 {
             firstVideoSubmitUS = clock?() ?? lastEncodeNowUS
         }
-        if handoffActive { takePendingClaims() }
+        let answersRequest = forceSync && syncRequestPending
+        if handoffActive {
+            if answersRequest { reclaimShownTiles() }
+            takePendingClaims()
+        }
         encoder.encode(bgra: UnsafeRawBufferPointer(pixels), forceSync: forceSync, timeUS: lastEncodeNowUS)
         if forceSync {
             // A keyframe re-codes everything at today's budget.
             refreshDamagePixels = 0
             lastRegionSyncUS = lastEncodeNowUS
             capAtLastSync = videoRate.bitrateCap ?? Int.max
+        }
+        if answersRequest {
+            // Any sync frame answers the request (a re-sharpen included);
+            // the next answer waits out the minimum interval from this one.
+            syncRequestPending = false
+            lastRequestedSyncUS = max(lastEncodeNowUS, 1)
+            stats.videoSyncRequestSyncs += 1
         }
         return true
     }
@@ -641,6 +697,7 @@ extension HostEngine {
         regionEncoder?.stop()
         regionEncoder = nil
         regionActive = false
+        syncRequestPending = false
         resetClaimsInFlight()
         for t in claimPendingTiles { claimPending[Int(t)] = false }
         claimPendingTiles.removeAll(keepingCapacity: true)

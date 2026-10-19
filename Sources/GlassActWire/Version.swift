@@ -6,9 +6,11 @@
 /// format change bumps `current`, and no decode path or migration code for
 /// an older version is kept. Both ends must run the same build.
 public enum WireVersion {
-    /// The wire format this build speaks. Video always travels as the
-    /// overlay (§4.6), never written into the canvas.
-    public static let current: UInt8 = 3
+    /// The wire format this build speaks. v3: video always travels as the
+    /// overlay (§4.6), never written into the canvas. v4: SYNC_REQUEST
+    /// (control 0x1B) — the viewer asks for a sync frame instead of
+    /// reconnecting when a region can't decode.
+    public static let current: UInt8 = 4
 
     /// Exact match required. Handshake behavior on mismatch: the viewer
     /// still replies HELLO_OK carrying its own version (so both sides learn

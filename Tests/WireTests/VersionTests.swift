@@ -2,8 +2,8 @@ import Testing
 import GlassActWire
 
 @Suite struct VersionTests {
-    @Test func currentVersionIsThree() {
-        #expect(WireVersion.current == 3) // v3: video is always the overlay
+    @Test func currentVersionIsFour() {
+        #expect(WireVersion.current == 4) // v4: SYNC_REQUEST (v3: video is always the overlay)
         #expect(DatagramHeader.wireVersion == WireVersion.current)
     }
 
