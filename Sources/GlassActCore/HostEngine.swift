@@ -458,6 +458,11 @@ public final class HostEngine: @unchecked Sendable {
     // open no batch, so INV-4 doesn't slow them.
     var recentScrolls: [RecentScroll] = []
     public static let recentScrollCap = 32
+    /// Marks buffers of resolved or evicted scrolls, each with capacity for
+    /// the whole grid, reused by the next emitScroll (INV-7).
+    var scrollMarksPool: [ContiguousArray<UInt64>] = []
+    /// Scroll detection and repair scratch (§4.8, INV-7), sized at init.
+    let scrollScratch: ScrollScratch
     /// Wire limit on datagrams per batch (u16 dgram_cnt).
     public static let wireMaxBatchDatagrams = 65_535
     /// This engine's per-batch datagram cap (the wire limit; tests lower it).
@@ -673,6 +678,9 @@ public final class HostEngine: @unchecked Sendable {
         ]
         scrollSatisfied = ContiguousArray(repeating: false, count: grid.count)
         scrollQualified = ContiguousArray(repeating: false, count: grid.count)
+        scrollScratch = ScrollScratch(grid: grid)
+        recentScrolls.reserveCapacity(Self.recentScrollCap + 1)
+        scrollMarksPool.reserveCapacity(Self.recentScrollCap + 1)
         worklist.reserveCapacity(grid.count)
         outgoingDatagrams.reserveCapacity(4096)
         for i in 0..<batches.count {
@@ -684,6 +692,7 @@ public final class HostEngine: @unchecked Sendable {
 
     deinit {
         cachePrefix.deallocate()
+        scrollScratch.deallocate()
         tileScratch.deallocate()
         lz4Out.deallocate()
         bitmapOut.deallocate()

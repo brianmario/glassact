@@ -1,5 +1,6 @@
 import Foundation
 import GlassActCodec
+import GlassActTransport
 import GlassActWire
 
 /// Scroll detection & emission (§4.8): global/windowed shift estimation, 2D
@@ -7,6 +8,83 @@ import GlassActWire
 /// SCROLL emission and SCROLL_ACK repair.
 /// HostEngine extension: encodeQueue-confined like the engine itself.
 extension HostEngine {
+    /// A candidate shift from the 2-D probe search.
+    struct Shift: Equatable {
+        var dx: Int
+        var dy: Int
+    }
+
+    /// One 2-D probe position and its texture (distinct sampled pixels).
+    struct DragProbe {
+        var x = 0
+        var y = 0
+        var distinct = 0
+    }
+
+    /// Everything the scroll path writes on a heavy tick, allocated once
+    /// from the grid and reused (INV-7, §8.1): no dictionaries, sets or
+    /// per-tick arrays between capture and emission.
+    struct ScrollScratch {
+        /// Shadow row (vertical pass) or column (horizontal pass) signatures,
+        /// indexed from the bbox origin.
+        let sigs: UnsafeMutableBufferPointer<UInt64>
+        /// Votes per candidate shift, indexed by shift + scrollMaxDy. All zero
+        /// between passes: `takeBestShift` clears what it reads.
+        let votes: UnsafeMutableBufferPointer<Int32>
+        /// The 3×3 probe positions, their sampled pixels and their rank.
+        let probes: UnsafeMutableBufferPointer<DragProbe>
+        let samples: UnsafeMutableBufferPointer<UInt32>
+        let order: UnsafeMutableBufferPointer<Int>
+        /// Open-addressed set for counting a probe's distinct samples
+        /// (`UInt64.max` = empty; samples are 32-bit).
+        let distinctTable: UnsafeMutableBufferPointer<UInt64>
+        /// One probe's exact hits, and the deduplicated candidates of all
+        /// probes (≤ 3 kept + 4 new before the cap check).
+        let found: UnsafeMutableBufferPointer<Shift>
+        let candidates: UnsafeMutableBufferPointer<Shift>
+        /// SCROLL_ACK repair: the skipped tiles, marked per grid index.
+        let skipped: UnsafeMutableBufferPointer<Bool>
+        /// The SCROLL control frame.
+        let controlFrame: UnsafeMutableRawBufferPointer
+
+        init(grid: TileGrid) {
+            let probeSlots = 9 // 3×3 grid over the bbox
+            let samplesPerProbe = HostEngine.dragProbeSampleGrid * HostEngine.dragProbeSampleGrid
+            sigs = .allocate(capacity: max(grid.width, grid.height))
+            sigs.initialize(repeating: 0)
+            votes = .allocate(capacity: 2 * HostEngine.scrollMaxDy + 1)
+            votes.initialize(repeating: 0)
+            probes = .allocate(capacity: probeSlots)
+            probes.initialize(repeating: DragProbe())
+            samples = .allocate(capacity: probeSlots * samplesPerProbe)
+            samples.initialize(repeating: 0)
+            order = .allocate(capacity: probeSlots)
+            order.initialize(repeating: 0)
+            distinctTable = .allocate(capacity: 2 * samplesPerProbe)
+            distinctTable.initialize(repeating: .max)
+            found = .allocate(capacity: HostEngine.dragMaxCandidates)
+            found.initialize(repeating: Shift(dx: 0, dy: 0))
+            candidates = .allocate(capacity: 2 * HostEngine.dragMaxCandidates)
+            candidates.initialize(repeating: Shift(dx: 0, dy: 0))
+            skipped = .allocate(capacity: grid.count)
+            skipped.initialize(repeating: false)
+            controlFrame = .allocate(byteCount: ControlFrames.scrollBytes, alignment: 8)
+        }
+
+        func deallocate() {
+            sigs.deallocate()
+            votes.deallocate()
+            probes.deallocate()
+            samples.deallocate()
+            order.deallocate()
+            distinctTable.deallocate()
+            found.deallocate()
+            candidates.deallocate()
+            skipped.deallocate()
+            controlFrame.deallocate()
+        }
+    }
+
     static let scrollProbeCount = 24
     static let scrollMaxDy = 600
     static let scrollMinVotes = 6
@@ -38,7 +116,8 @@ extension HostEngine {
                               y0: Int, h: Int) -> UInt64 {
         var state = XXH64.Streaming()
         let span = min(64, max(4, h / 4), h) // never taller than the box
-        for start in [y0, y0 + max(0, h / 2 - span / 2), y0 + max(0, h - span)] {
+        for part in 0..<3 {
+            let start = part == 0 ? y0 : part == 1 ? y0 + max(0, h / 2 - span / 2) : y0 + max(0, h - span)
             for row in start..<(start + span) {
                 var px: UInt32 = 0
                 withUnsafeMutableBytes(of: &px) { dst in
@@ -91,69 +170,56 @@ extension HostEngine {
         let shadowBase = shadow.baseAddress!
         let frameBase = frame.baseAddress!
 
-        // Vertical pass: match probe-row signatures of the frame against an
-        // index of shadow rows, all scoped to the bbox. Voting is pure
-        // heuristic — INV-3 is enforced at verification below.
+        // Vertical pass: match probe-row signatures of the frame against the
+        // shadow's row signatures, all scoped to the bbox. Voting is pure
+        // heuristic — INV-3 is enforced at verification below. A probe can
+        // only vote for shadow rows within ±lim of itself, so it compares
+        // just that window: no signature index to build.
+        let sigs = scrollScratch.sigs
+        let votes = scrollScratch.votes
+        let maxDy = Self.scrollMaxDy
         var dx = 0
         var dy = 0
         do {
-            var shadowRows: [UInt64: [Int]] = [:]
-            shadowRows.reserveCapacity(bh)
             for row in by0..<by1 {
-                shadowRows[rowSignature(shadowBase, rowStride: width * 4, row: row,
-                                        x0: bx0, w: bw), default: []].append(row)
+                sigs[row - by0] = rowSignature(shadowBase, rowStride: width * 4, row: row,
+                                               x0: bx0, w: bw)
             }
-            var votes: [Int: Int] = [:]
+            let lim = min(maxDy, bh - 1)
             let step = max(1, bh / Self.scrollProbeCount)
             var probe = by0 + step / 2
             while probe < by1 {
                 defer { probe += step }
                 let sig = rowSignature(frameBase, rowStride: bytesPerRow, row: probe,
                                        x0: bx0, w: bw)
-                guard let matches = shadowRows[sig] else { continue }
-                for m in matches {
-                    let candidate = m - probe
-                    if candidate != 0 && abs(candidate) <= min(Self.scrollMaxDy, bh - 1) {
-                        votes[candidate, default: 0] += 1
-                    }
+                for m in max(by0, probe - lim)...min(by1 - 1, probe + lim)
+                where m != probe && sigs[m - by0] == sig {
+                    votes[m - probe + maxDy] += 1
                 }
             }
-            if let (best, voteCount) = votes.max(by: {
-                ($0.value, -abs($0.key), -$0.key) < ($1.value, -abs($1.key), -$1.key)
-            }), voteCount >= Self.scrollMinVotes {
-                dy = best
-            }
+            dy = Self.takeBestShift(votes, lim: lim)
         }
 
         // Horizontal pass, only when vertical found nothing and the bbox has
         // room for meaningful column signatures.
         if dy == 0 && bw >= 128 && bh >= 64 {
-            var shadowCols: [UInt64: [Int]] = [:]
-            shadowCols.reserveCapacity(bw)
             for col in bx0..<bx1 {
-                shadowCols[colSignature(shadowBase, rowStride: width * 4, col: col,
-                                        y0: by0, h: bh), default: []].append(col)
+                sigs[col - bx0] = colSignature(shadowBase, rowStride: width * 4, col: col,
+                                               y0: by0, h: bh)
             }
-            var votes: [Int: Int] = [:]
+            let lim = min(maxDy, bw - 1)
             let step = max(1, bw / Self.scrollProbeCount)
             var probe = bx0 + step / 2
             while probe < bx1 {
                 defer { probe += step }
                 let sig = colSignature(frameBase, rowStride: bytesPerRow, col: probe,
                                        y0: by0, h: bh)
-                guard let matches = shadowCols[sig] else { continue }
-                for m in matches {
-                    let candidate = m - probe
-                    if candidate != 0 && abs(candidate) <= min(Self.scrollMaxDy, bw - 1) {
-                        votes[candidate, default: 0] += 1
-                    }
+                for m in max(bx0, probe - lim)...min(bx1 - 1, probe + lim)
+                where m != probe && sigs[m - bx0] == sig {
+                    votes[m - probe + maxDy] += 1
                 }
             }
-            if let (best, voteCount) = votes.max(by: {
-                ($0.value, -abs($0.key), -$0.key) < ($1.value, -abs($1.key), -$1.key)
-            }), voteCount >= Self.scrollMinVotes {
-                dx = best
-            }
+            dx = Self.takeBestShift(votes, lim: lim)
         }
         // 1-D result first (when the votes found something), then the 2-D
         // pass as a fallback — NOT only when 1-D found nothing: repetitive
@@ -182,15 +248,61 @@ extension HostEngine {
                 traceDrag("2d pass took \(us) µs")
             }
         }
-        for candidate in probe2DShift(frameBase: frameBase, bytesPerRow: bytesPerRow,
-                                      shadowBase: shadowBase,
-                                      bx0: bx0, by0: by0, bx1: bx1, by1: by1) {
+        let candidates = scrollScratch.candidates
+        let candidateCount = probe2DShift(frameBase: frameBase, bytesPerRow: bytesPerRow,
+                                          shadowBase: shadowBase,
+                                          bx0: bx0, by0: by0, bx1: bx1, by1: by1)
+        for i in 0..<candidateCount {
+            let candidate = candidates[i]
             if verifyAndEmitScroll(dx: candidate.dx, dy: candidate.dy,
                                    qualifyCount: qualifyCount, relaxed: true,
                                    frame: frame, bytesPerRow: bytesPerRow) {
                 return
             }
         }
+    }
+
+    /// The winning 1-D shift in `votes` (indexed by shift + scrollMaxDy, for
+    /// shifts within ±lim): most votes, then the smallest |shift|, then the
+    /// negative one — or 0 below `scrollMinVotes`. Zeroes the votes it reads.
+    static func takeBestShift(_ votes: UnsafeMutableBufferPointer<Int32>, lim: Int) -> Int {
+        var best = 0
+        var bestVotes: Int32 = 0
+        for shift in -lim...lim {
+            let v = votes[shift + scrollMaxDy]
+            guard v > 0 else { continue }
+            votes[shift + scrollMaxDy] = 0
+            if v > bestVotes || (v == bestVotes && abs(shift) < abs(best)) {
+                best = shift
+                bestVotes = v
+            }
+        }
+        return bestVotes >= scrollMinVotes ? best : 0
+    }
+
+    /// Distinct values among `values`, counted in `table` (open addressing,
+    /// at least twice the size of `values`, a power of two).
+    @inline(__always)
+    static func countDistinct(_ values: UnsafeMutableBufferPointer<UInt32>,
+                              table: UnsafeMutableBufferPointer<UInt64>) -> Int {
+        table.update(repeating: .max)
+        let mask = table.count - 1
+        var distinct = 0
+        for v in values {
+            let key = UInt64(v)
+            var slot = Int(truncatingIfNeeded: (key &* 0x9E37_79B9_7F4A_7C15) >> 40) & mask
+            while true {
+                let entry = table[slot]
+                if entry == key { break }
+                if entry == .max {
+                    table[slot] = key
+                    distinct += 1
+                    break
+                }
+                slot = (slot + 1) & mask
+            }
+        }
+        return distinct
     }
 
     static let dragProbeSize = 128
@@ -224,9 +336,12 @@ extension HostEngine {
     /// offset sweep measurably breaks the QUIC sustained test's real-time
     /// deadlines at -Onone — same candidates, ~200× the work. Candidates are
     /// ordered by |dx|+|dy| — consecutive drag frames move a small distance.
+    ///
+    /// Writes the candidates to `scrollScratch.candidates` and returns how
+    /// many there are.
     func probe2DShift(frameBase: UnsafeRawPointer, bytesPerRow: Int,
                               shadowBase: UnsafeRawPointer,
-                              bx0: Int, by0: Int, bx1: Int, by1: Int) -> [(dx: Int, dy: Int)] {
+                              bx0: Int, by0: Int, bx1: Int, by1: Int) -> Int {
         let ps = Self.dragProbeSize
         let sg = Self.dragProbeSampleGrid
         let width = grid.width
@@ -239,31 +354,49 @@ extension HostEngine {
             }
             return px
         }
+        let probes = scrollScratch.probes
+        let samples = scrollScratch.samples
+        let order = scrollScratch.order
+        let found = scrollScratch.found
+        let collected = scrollScratch.candidates
+        let distinctTable = scrollScratch.distinctTable
 
         // 3×3 grid of candidate positions across the bbox, ranked by texture.
         let clampX = { (x: Int) in min(max(x, bx0), max(bx0, min(bx1, width) - ps)) }
         let clampY = { (y: Int) in min(max(y, by0), max(by0, min(by1, height) - ps)) }
-        var ranked: [(x: Int, y: Int, distinct: Int, samples: [UInt32])] = []
+        var probeCount = 0
         for fy in 1...3 {
             for fx in 1...3 {
                 let px0 = clampX(bx0 + fx * (bx1 - bx0) / 4 - ps / 2)
                 let py0 = clampY(by0 + fy * (by1 - by0) / 4 - ps / 2)
                 guard px0 + ps <= width, py0 + ps <= height else { continue }
-                var samples = [UInt32](repeating: 0, count: sg * sg)
-                var distinct = Set<UInt32>()
+                let own = UnsafeMutableBufferPointer(
+                    rebasing: samples[(probeCount * sg * sg)..<((probeCount + 1) * sg * sg)])
                 var s = 0
                 for sy in 0..<sg {
                     for sx in 0..<sg {
-                        let v = pixel(frameBase, bytesPerRow, px0 + sx * 8 + 4, py0 + sy * 8 + 4)
-                        samples[s] = v
+                        own[s] = pixel(frameBase, bytesPerRow, px0 + sx * 8 + 4, py0 + sy * 8 + 4)
                         s += 1
-                        distinct.insert(v)
                     }
                 }
-                ranked.append((px0, py0, distinct.count, samples))
+                probes[probeCount] = DragProbe(x: px0, y: py0,
+                                               distinct: Self.countDistinct(own, table: distinctTable))
+                order[probeCount] = probeCount
+                probeCount += 1
             }
         }
-        ranked.sort { $0.distinct > $1.distinct }
+        // Most distinct first; ties keep grid order (a stable insertion sort).
+        var sorted = 1
+        while sorted < probeCount {
+            let key = order[sorted]
+            var j = sorted - 1
+            while j >= 0 && probes[order[j]].distinct < probes[key].distinct {
+                order[j + 1] = order[j]
+                j -= 1
+            }
+            order[j + 1] = key
+            sorted += 1
+        }
 
         let r = Self.dragSearchRadius
         let shadowStride = width * 4
@@ -271,11 +404,14 @@ extension HostEngine {
         // Candidates are collected across ALL textured probes, not first-hit:
         // under live deferral the shadow is mixed-generation, and only some
         // areas match at the true cumulative offset.
-        var collected: [(dx: Int, dy: Int)] = []
-        for position in ranked {
+        var collectedCount = 0
+        for rank in 0..<probeCount {
             guard probesTried < Self.dragMaxProbes else { break }
+            let slot = order[rank]
+            let position = probes[slot]
             let probeX = position.x, probeY = position.y
-            let samples = position.samples
+            let probeSamples = UnsafeMutableBufferPointer(
+                rebasing: samples[(slot * sg * sg)..<((slot + 1) * sg * sg)])
             guard position.distinct >= Self.dragProbeMinDistinct else {
                 traceDrag("probe (\(probeX),\(probeY)) rejected: distinct=\(position.distinct)")
                 break // ranked: everything after is flatter
@@ -296,11 +432,18 @@ extension HostEngine {
                 let rowBase = frameBase.advanced(by: row * bytesPerRow + probeX * 4)
                 var window = 0
                 while window + al <= ps * 4 {
-                    var distinctBytes = Set<UInt8>()
+                    // Distinct byte values in the window: a 256-bit seen-set.
+                    var seen = SIMD4<UInt64>(repeating: 0)
+                    var distinctBytes = 0
                     for b in 0..<al {
-                        distinctBytes.insert(rowBase.load(fromByteOffset: window + b, as: UInt8.self))
+                        let byte = rowBase.load(fromByteOffset: window + b, as: UInt8.self)
+                        let bit = UInt64(1) << UInt64(byte & 63)
+                        if seen[Int(byte >> 6)] & bit == 0 {
+                            seen[Int(byte >> 6)] |= bit
+                            distinctBytes += 1
+                        }
                     }
-                    if distinctBytes.count >= 8 {
+                    if distinctBytes >= 8 {
                         anchorRow = row
                         anchorOffset = window
                         break rowScan
@@ -315,7 +458,7 @@ extension HostEngine {
             let anchor = frameBase.advanced(by: anchorRow * bytesPerRow + probeX * 4 + anchorOffset)
             let anchorByteX = probeX * 4 + anchorOffset // byte column of the anchor
 
-            var found: [(dx: Int, dy: Int)] = []
+            var foundCount = 0
             var blockVerifies = 0
             let syLo = max(0, anchorRow - r)
             let syHi = min(height - 1, anchorRow + r)
@@ -348,8 +491,8 @@ extension HostEngine {
                     var match = true
                     sampleLoop: for syy in 0..<sg {
                         for sxx in 0..<sg {
-                            if samples[si] != pixel(shadowBase, shadowStride,
-                                                    sx + sxx * 8 + 4, syTop + syy * 8 + 4) {
+                            if probeSamples[si] != pixel(shadowBase, shadowStride,
+                                                         sx + sxx * 8 + 4, syTop + syy * 8 + 4) {
                                 match = false
                                 break sampleLoop
                             }
@@ -369,19 +512,40 @@ extension HostEngine {
                         }
                     }
                     if exact {
-                        found.append((ddx, ddy))
-                        if found.count >= Self.dragMaxCandidates { break outer }
+                        found[foundCount] = Shift(dx: ddx, dy: ddy)
+                        foundCount += 1
+                        if foundCount >= Self.dragMaxCandidates { break outer }
                     }
                 }
             }
-            traceDrag("probe (\(probeX),\(probeY)) distinct=\(position.distinct) candidates=\(found)")
-            for c in found where !collected.contains(where: { $0.dx == c.dx && $0.dy == c.dy }) {
-                collected.append(c)
+            traceDrag("probe (\(probeX),\(probeY)) distinct=\(position.distinct) candidates=\((0..<foundCount).map { "(\(found[$0].dx), \(found[$0].dy))" })")
+            for k in 0..<foundCount {
+                let c = found[k]
+                var known = false
+                for j in 0..<collectedCount where collected[j] == c {
+                    known = true
+                    break
+                }
+                if !known {
+                    collected[collectedCount] = c
+                    collectedCount += 1
+                }
             }
-            if collected.count >= Self.dragMaxCandidates { break }
+            if collectedCount >= Self.dragMaxCandidates { break }
         }
-        collected.sort { abs($0.dx) + abs($0.dy) < abs($1.dx) + abs($1.dy) }
-        return collected
+        // Nearest first by |dx|+|dy|; ties keep discovery order (stable).
+        var next = 1
+        while next < collectedCount {
+            let key = collected[next]
+            var j = next - 1
+            while j >= 0 && abs(collected[j].dx) + abs(collected[j].dy) > abs(key.dx) + abs(key.dy) {
+                collected[j + 1] = collected[j]
+                j -= 1
+            }
+            collected[j + 1] = key
+            next += 1
+        }
+        return collectedCount
     }
 
     /// Verify one (dx, dy) candidate per qualifying tile — current tile ==
@@ -409,13 +573,11 @@ extension HostEngine {
             let srcX0 = x + dx
             let srcY0 = y + dy
             guard srcX0 >= 0, srcX0 + tw <= width, srcY0 >= 0, srcY0 + th <= height else { continue }
-            var cornersSafe = true
-            for cy in [srcY0, srcY0 + th - 1] {
-                for cx in [srcX0, srcX0 + tw - 1] {
-                    if !sourceSafe((cy / ts) * grid.cols + cx / ts) { cornersSafe = false }
-                }
-            }
-            guard cornersSafe else { continue }
+            // All four corner source tiles.
+            let srcRow0 = (srcY0 / ts) * grid.cols, srcRow1 = ((srcY0 + th - 1) / ts) * grid.cols
+            let srcCol0 = srcX0 / ts, srcCol1 = (srcX0 + tw - 1) / ts
+            guard sourceSafe(srcRow0 + srcCol0), sourceSafe(srcRow0 + srcCol1),
+                  sourceSafe(srcRow1 + srcCol0), sourceSafe(srcRow1 + srcCol1) else { continue }
             var ok = true
             for row in 0..<th {
                 if memcmp(frameBase.advanced(by: (y + row) * bytesPerRow + x * 4),
@@ -475,11 +637,12 @@ extension HostEngine {
             let idx = Int(s)
             guard idx < grid.count else { continue } // INV-6: hostile index
             let (sx, sy, stw, sth) = grid.rect(of: idx)
-            // Destinations that read from this source rect live at -(dx, dy).
-            for dstRow in [sy - scroll.dy, sy + sth - 1 - scroll.dy]
-            where dstRow >= 0 && dstRow < grid.height {
-                for dstCol in [sx - scroll.dx, sx + stw - 1 - scroll.dx]
-                where dstCol >= 0 && dstCol < grid.width {
+            // Destinations that read from this source rect live at -(dx, dy):
+            // the tiles under its four shifted corners.
+            for corner in 0..<4 {
+                let dstRow = corner < 2 ? sy - scroll.dy : sy + sth - 1 - scroll.dy
+                let dstCol = corner & 1 == 0 ? sx - scroll.dx : sx + stw - 1 - scroll.dx
+                if dstRow >= 0 && dstRow < grid.height && dstCol >= 0 && dstCol < grid.width {
                     let dstIdx = (dstRow / ts) * grid.cols + dstCol / ts
                     ledger.markCold(dstIdx)
                     traceTile(dstIdx, "host scrollAck-repair-invalidate (skipped source \(idx), scroll seq=\(frameSeq))")
@@ -494,19 +657,21 @@ extension HostEngine {
         // the host's source beliefs were mid-heal at emit — so every
         // promotion from this scroll is suspect: demote the whole rect and
         // let the hash gate re-verify (one-RTT heal, cost only bandwidth).
-        var skippedSet = Set<Int>()
-        for s in skipped { skippedSet.insert(Int(s)) }
+        let skippedMark = scrollScratch.skipped
+        for s in skipped where Int(s) < grid.count { skippedMark[Int(s)] = true }
         var expected: UInt64 = 0
         let tr0 = scroll.rectY / ts, tr1 = (scroll.rectY + scroll.rectH - 1) / ts
         let tc0 = scroll.rectX / ts, tc1 = (scroll.rectX + scroll.rectW - 1) / ts
         for tr in tr0...tr1 {
             for tc in tc0...tc1 {
                 let idx = tr * grid.cols + tc
-                guard !skippedSet.contains(idx) else { continue }
+                guard !skippedMark[idx] else { continue }
                 expected ^= scrollDigestMix(tile: idx,
                                             hash: scroll.marks[(tr - tr0) * (tc1 - tc0 + 1) + (tc - tc0)])
             }
         }
+        for s in skipped where Int(s) < grid.count { skippedMark[Int(s)] = false }
+        scrollMarksPool.append(scroll.marks)
         if expected != digest {
             stats.scrollDigestRepairs += 1
             for tr in tr0...tr1 {
@@ -524,10 +689,15 @@ extension HostEngine {
         let scrollSeq = nextFrameSeq
         nextFrameSeq &+= 1
         if nextFrameSeq == 0 { nextFrameSeq = 1 }
-        sendControl(.scroll(frameSeq: scrollSeq,
-                            x: UInt16(rectX), y: UInt16(rectY),
-                            width: UInt16(rectW), height: UInt16(rectH),
-                            dx: Int16(clamping: dx), dy: Int16(clamping: dy)))
+        // Encoded in place (ControlFrames); the one allocation left is the
+        // Data the transport API takes, as for every datagram.
+        let control = scrollScratch.controlFrame
+        let controlLength = ControlFrames.scroll(frameSeq: scrollSeq,
+                                                 x: UInt16(rectX), y: UInt16(rectY),
+                                                 width: UInt16(rectW), height: UInt16(rectH),
+                                                 dx: Int16(clamping: dx), dy: Int16(clamping: dy),
+                                                 into: control)
+        transport.sendControl(Data(bytes: control.baseAddress!, count: controlLength))
         stats.scrollsSent += 1
         stats.scrollSatisfiedTiles += satisfiedCount
 
@@ -541,7 +711,11 @@ extension HostEngine {
         let tr0 = y0 / ts, tr1 = (y1 - 1) / ts
         let tc0 = x0 / ts, tc1 = (x1 - 1) / ts
         let markCols = tc1 - tc0 + 1
-        var marks = ContiguousArray<UInt64>(repeating: 0, count: (tr1 - tr0 + 1) * markCols)
+        // A pooled buffer (capacity: the whole grid) — returned to the pool
+        // when the scroll is ACKed or evicted.
+        var marks = scrollMarksPool.popLast() ?? Self.makeMarksBuffer(capacity: grid.count)
+        marks.removeAll(keepingCapacity: true)
+        marks.append(contentsOf: repeatElement(0, count: (tr1 - tr0 + 1) * markCols))
 
         // Pass 1 — plan from the PRE-shift state (pass 3 mutates the ledger):
         // a tile's post-scroll content is known iff every source row existed
@@ -648,23 +822,28 @@ extension HostEngine {
                     ledger.markCold(tr * grid.cols + tc)
                 }
             }
+            scrollMarksPool.append(evicted.marks)
         }
 
         // Every rect tile must be (re)considered this tick — static content
-        // inside the rect was moved by the scroll and needs restoring.
-        var added = false
+        // inside the rect was moved by the scroll and needs restoring. Only
+        // the appended tiles need hashing: the rest were hashed this tick.
+        let firstAdded = worklist.count
         for tr in (y0 / ts)...((y1 - 1) / ts) {
             for tc in (x0 / ts)...((x1 - 1) / ts) {
                 let idx = tr * grid.cols + tc
                 if candidateMark[idx] != candidateEpoch && !inRegion[idx] {
                     candidateMark[idx] = candidateEpoch
                     worklist.append(Int32(idx))
-                    added = true
                 }
             }
         }
-        if added {
-            hashCandidates(frame: frame, bytesPerRow: bytesPerRow)
-        }
+        hashCandidates(frame: frame, bytesPerRow: bytesPerRow, from: firstAdded)
+    }
+
+    static func makeMarksBuffer(capacity: Int) -> ContiguousArray<UInt64> {
+        var marks = ContiguousArray<UInt64>()
+        marks.reserveCapacity(capacity)
+        return marks
     }
 }

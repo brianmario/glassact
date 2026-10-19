@@ -36,6 +36,13 @@ import GlassActTestSupport
             #expect(frame(8) { ControlFrames.keyframeAck(seq: seq, into: $0) }
                     == ControlMessage.keyframeAck(seq: seq).encoded())
 
+            let (x, y) = (UInt16(truncatingIfNeeded: rng.next()), UInt16(truncatingIfNeeded: rng.next()))
+            let (w, h) = (UInt16(truncatingIfNeeded: rng.next()), UInt16(truncatingIfNeeded: rng.next()))
+            let (dx, dy) = (Int16(truncatingIfNeeded: rng.next()), Int16(truncatingIfNeeded: rng.next()))
+            #expect(frame(ControlFrames.scrollBytes) {
+                ControlFrames.scroll(frameSeq: seq, x: x, y: y, width: w, height: h, dx: dx, dy: dy, into: $0)
+            } == ControlMessage.scroll(frameSeq: seq, x: x, y: y, width: w, height: h, dx: dx, dy: dy).encoded())
+
             let (a, b, c) = (rng.next(), rng.next(), rng.next())
             #expect(frame(32) { ControlFrames.pong(nonce: a, tUS: b, recvTUS: c, into: $0) }
                     == ControlMessage.pong(nonce: a, tUS: b, recvTUS: c).encoded())

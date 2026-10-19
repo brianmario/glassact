@@ -82,8 +82,8 @@ a test checks is the rule in this document.
   exceptions are known and documented:
   - libwebp allocates when it encodes.
   - Region and keyframe buffers are allocated when they form.
-  - One `Data` is created per datagram at the transport boundary.
-  - The scroll detector builds dictionaries on heavy ticks.
+  - One `Data` is created per datagram, and per control frame, at the
+    transport boundary.
 - **INV-8 Canvas is exactly-as-coded.** Nothing filters the canvas. Video and
   the cursor composite at present time from separate buffers.
   - Transient lossy paints (the cold-start first paint) do write
@@ -878,6 +878,7 @@ fixed seed.
 **`glassact-bench`** feeds a `.scap` into the host engine as if it came from SCK:
 the same inputs give the same outputs.
 - `replay --mode encode`: bytes/frame and stage timings, with instant ACKs.
+  `--count-allocs` adds the heap allocations made inside each tick.
 - `replay --mode loop`: host → InProc faults → viewer, over virtual time.
 - `synth`: synthetic traces.
 - `glassact-bench help` lists the rest.

@@ -75,7 +75,8 @@ Data Access** (remote input). Setup asks for both on first launch.
 
 - `just test-fast` while iterating. It skips the real-QUIC and slow tests.
 - `just test` (everything) must be green before you push. `just test-asan`
-  runs the suite under AddressSanitizer.
+  runs the suite under AddressSanitizer. `just test-alloc` runs the
+  allocation-count tests in release, the only build where they assert.
 - Every invariant in DESIGN §1 has an `INV_*` test. A failing one blocks
   the change. Don't weaken an invariant to make something work; open an
   issue and ask.
