@@ -91,6 +91,12 @@ func cmdReplayEncode(_ reader: ScapReader, traceName: String, opts: Options) thr
     var baseTS: UInt64?
     var lastTS: UInt64 = 0
     var frames = 0
+    let countAllocs = opts.has("count-allocs")
+    if countAllocs && !AllocCounter.install() {
+        throw BenchError("--count-allocs: malloc_logger is unavailable (MallocStackLogging or Instruments attached?)")
+    }
+    // Per tick, excluding cold start: (did the tick emit a SCROLL, allocations).
+    var tickAllocs: [(scrolled: Bool, counts: AllocCounter.Counts)] = []
 
     while let meta = try reader.readFrame(rects: &rects, into: frameBuf) {
         let base = baseTS ?? meta.timestampUS
@@ -99,11 +105,20 @@ func cmdReplayEncode(_ reader: ScapReader, traceName: String, opts: Options) thr
         let now = 1_000 + (meta.timestampUS &- base)
         let bytesBefore = transport.totalBytes
         let c0 = processCPU()
+        let scrollsBefore = host.stats.scrollsSent
+        let a0 = AllocCounter.counts
+        if countAllocs { AllocCounter.arm() }
         let t0 = DispatchTime.now().uptimeNanoseconds
         host.encodeTick(frame: UnsafeRawBufferPointer(frameBuf), bytesPerRow: width * 4,
                         dirtyRects: rects.isEmpty ? nil : rects,
                         captureTimestampUS: meta.timestampUS, nowUS: now)
         let t1 = DispatchTime.now().uptimeNanoseconds
+        if countAllocs {
+            AllocCounter.disarm()
+            if frames > 0 {
+                tickAllocs.append((host.stats.scrollsSent > scrollsBefore, AllocCounter.counts - a0))
+            }
+        }
         encodeCPU += processCPU() - c0
         instantAck(host, transport, nowUS: now)
         encodeUS.append(Double(t1 - t0) / 1000.0)
@@ -156,5 +171,23 @@ func cmdReplayEncode(_ reader: ScapReader, traceName: String, opts: Options) thr
             let bytes = rows.reduce(0) { $0 + $1.1 }
             print("        \(pad(name, 28)) \(pad("\(rows.count) ticks", 11)) \(pad(formatBytes(bytes), 10)) \(String(format: "%4.1f%%", 100.0 * Double(bytes) / Double(max(steadyBytes, 1))))")
         }
+    }
+    if countAllocs {
+        // All threads includes the encode workers (libwebp allocates per
+        // VP8L encode, INV-7); the encode thread is the engine's own queue.
+        func line(_ name: String, _ rows: [AllocCounter.Counts]) {
+            let all = rows.map { Double($0.allThreads) }.sorted()
+            let own = rows.map { Double($0.armedThread) }.sorted()
+            let total = rows.reduce(0) { $0 + $1.allThreads }
+            let ownTotal = rows.reduce(0) { $0 + $1.armedThread }
+            func dist(_ s: [Double]) -> String {
+                "p50 \(Int(percentile(s, 0.50))) / p95 \(Int(percentile(s, 0.95))) / max \(Int(s.last ?? 0))"
+            }
+            print("        \(pad(name, 13)) \(pad("\(rows.count) ticks", 11)) all threads \(total), per tick \(dist(all))")
+            print("        \(pad("", 13)) \(pad("", 11)) encode thread \(ownTotal), per tick \(dist(own))")
+        }
+        print("      heap allocations inside encodeTick (excluding cold start):")
+        line("scroll ticks", tickAllocs.filter { $0.scrolled }.map(\.counts))
+        line("other ticks", tickAllocs.filter { !$0.scrolled }.map(\.counts))
     }
 }

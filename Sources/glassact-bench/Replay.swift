@@ -29,6 +29,7 @@ let replayCommand = Command(
         .int("keyframe-effort", "<0-9>", 0...9, "libwebp lossless preset for keyframe stripes (default 4)"),
         .bool("no-lzbitmap", "experiment: drop LZBITMAP from the encoder's best-of (Apple-only payload)"),
         .choice("bitmap-codec", ["brotli", "zlib", "lzfse"], "experiment (encode mode only): this codec in LZBITMAP's slot"),
+        .bool("count-allocs", "encode mode only: count heap allocations inside encodeTick (scroll vs other ticks)"),
     ],
     notes: """
       modes:
@@ -40,7 +41,12 @@ let replayCommand = Command(
         glassact-bench replay --trace t.scap --mode loop --drop 5 --dup 1 --reorder 10 --latency 20-80 --golden
     """,
     validate: { opts in
-        guard opts.string("mode") != "loop" else { return }
+        guard opts.string("mode") != "loop" else {
+            if opts.has("count-allocs") {
+                throw UsageError(message: "--count-allocs only applies to --mode encode", command: opts.command)
+            }
+            return
+        }
         if let flag = loopOnlyFlags.first(where: { opts.has($0) }) {
             throw UsageError(message: "--\(flag) only applies to --mode loop", command: opts.command)
         }
