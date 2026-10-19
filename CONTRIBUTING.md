@@ -76,7 +76,8 @@ Data Access** (remote input). Setup asks for both on first launch.
 - `just test-fast` while iterating. It skips the real-QUIC and slow tests.
 - `just test` (everything) must be green before you push. `just test-asan`
   runs the suite under AddressSanitizer. `just test-alloc` runs the
-  allocation-count tests in release, the only build where they assert.
+  allocation-count tests in release, the only build where they assert
+  (CI runs them too).
 - Every invariant in DESIGN §1 has an `INV_*` test. A failing one blocks
   the change. Don't weaken an invariant to make something work; open an
   issue and ask.
@@ -88,7 +89,8 @@ Data Access** (remote input). Setup asks for both on first launch.
 must pass first.
 
 - CI (`.github/workflows/ci.yml`) runs the test suite and builds both
-  apps, unsigned, on GitHub's Apple-silicon macOS 27 / Xcode 27 runner, and
+  apps, unsigned, on GitHub's Apple-silicon macOS 27 / Xcode 27 runner,
+  runs the allocation-count tests in a release build of their own, and
   builds everything for Intel too. It can't run the tests on Intel (hosted
   Intel runners stop at macOS 15, which can't run Xcode 27), so test
   Intel-sensitive changes on an Intel Mac. It skips
