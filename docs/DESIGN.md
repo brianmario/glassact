@@ -75,6 +75,9 @@ a test checks is the rule in this document.
   input never crashes, over-reads or allocates without bound. Datagrams,
   control, video, claims, window lists, cache and DELTA payloads are all
   fuzzed.
+  - Past the parser, the vendored libwebp decoders are fuzzed too, with
+    mutated real WEBPL tiles and striped keyframes. A decode either fails
+    or fills exactly the expected rect, and never writes outside it.
 - **INV-7 No allocation / no ARC in per-frame tile paths** (§8). These
   exceptions are known and documented:
   - libwebp allocates when it encodes.
@@ -104,7 +107,10 @@ a test checks is the rule in this document.
 - `INV_4_newestWinsNeverQueue`, `INV_4_droppedCaptureDamageStillRequalifies`
 - `INV_5_reliabilityForStateNotPixels`
 - `INV_6_parserSafetyEngineLevel`, plus `INV_6_mutatedRealPayloadsNeverCrashTheViewer`
-  in `EngineFuzzTests.swift`
+  in `EngineFuzzTests.swift`, the `INV_6_mutated*` decoder fuzz in
+  `Tests/CodecTests/WebPDecodeFuzzTests.swift` and
+  `INV_6_mutatedStripedKeyframesApplyExactlyOrDropCleanly` in
+  `KeyframeDecodeFuzzTests.swift` (100× iterations under `just test-exhaustive`)
 - `INV_7_noPerFrameArenaGrowth`
 - `INV_8_canvasExactlyAsCoded`
 - `INV_9_oneInflightSlotPerTile`, plus `INV_9_staleAckAndStaleTimeoutAreIgnored`
