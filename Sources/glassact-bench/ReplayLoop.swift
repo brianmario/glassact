@@ -27,7 +27,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var decoderFactory: (() -> any VideoRegionDecoder)?
     var hostCodecs: [UInt8] = []
     var viewerCodecs: [UInt8] = []
-    let vtQueue = DispatchQueue(label: "bench.vt.callback")
+    let vtPipeline = BenchVTPipeline()
     switch videoMode {
     case nil:
         break
@@ -37,7 +37,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         hostCodecs = [MockVideoEncoder.mockCodecID]
         viewerCodecs = [MockVideoEncoder.mockCodecID]
     case "vt":
-        encoderFactory = { $0 == VideoCodec.hevc ? VTHEVCRegionEncoder(callbackQueue: vtQueue) : nil }
+        encoderFactory = { $0 == VideoCodec.hevc ? BenchVTEncoder(pipeline: vtPipeline) : nil }
         decoderFactory = { VTRegionDecoder() }
         hostCodecs = [VideoCodec.hevc]
         viewerCodecs = [VideoCodec.hevc]
@@ -54,7 +54,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     if opts.has("keyframe-effort") { host.keyframeEffort = Int32(opts.int("keyframe-effort", 4)) }
     let viewer = ViewerEngine(transport: link.b, videoDecoderFactory: decoderFactory,
                               supportedVideoCodecs: viewerCodecs)
-    viewer.onFailed = { reason in print("  VIEWER FAILED: \(reason)") }
+    var viewerFailure: String?
+    viewer.onFailed = { reason in
+        viewerFailure = reason
+        print("  VIEWER FAILED at \(link.nowUS / 1000) ms: \(reason)")
+    }
     // CPU time per engine entry point (single-threaded rig: wall ≈ CPU).
     // Section-5 perf work is judged on these (BENCHMARKS.md).
     final class LoopTimings {
@@ -73,12 +77,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     link.b.onControl = { data in timed(&timings.viewerControl) { viewer.handleControl(data, nowUS: link.nowUS) } }
     link.b.onDatagram = { data in timed(&timings.viewerDatagram) { viewer.handleDatagram(data, nowUS: link.nowUS) } }
     link.b.onVideo = { data in timed(&timings.viewerVideo) { viewer.handleVideo(data, nowUS: link.nowUS) } }
+    // Mock delivers inside encode(); VT delivers later, from its own threads,
+    // onto the main queue (this rig's engine queue). Every submitted frame is
+    // delivered before virtual time moves on (BenchVTPipeline).
     func drainVTOutput() {
-        // Give the async VT callback queue a chance to enqueue deliveries
-        // between virtual-time steps (mock is synchronous; vt is not).
-        if videoMode == "vt" {
-            usleep(500)
-        }
+        if videoMode == "vt" { vtPipeline.drain() }
     }
 
     // Video coverage: how much of the replay's screen-time the viewer
@@ -141,6 +144,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         let e1 = DispatchTime.now().uptimeNanoseconds
         timings.hostEncode &+= e1 &- e0
         timings.encodeSamplesUS.append(Double(e1 &- e0) / 1000)
+        drainVTOutput()
         frames += 1
     }
 
@@ -152,6 +156,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         if sinceEncodeMS >= 16 {
             host.encodeTick(frame: UnsafeRawBufferPointer(frameBuf), bytesPerRow: width * 4,
                             dirtyRects: nil, captureTimestampUS: link.nowUS, nowUS: link.nowUS)
+            drainVTOutput()
             sinceEncodeMS = 0
             if host.openBatchCount == 0 && host.stats.lastTickQualifiedTiles == 0
                 && host.activeVideoRegionCount == 0 && host.pendingRepaintTiles == 0
@@ -238,7 +243,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     acks \(viewer.stats.acksSent)
       video: regions formed \(host.stats.videoRegionsFormed) dissolved \(host.stats.videoRegionsDissolved)  \
     frames \(host.stats.videoFramesSent)  video bytes \(formatBytes(host.stats.videoBytesSent))  \
-    viewer applied \(viewer.stats.videoFramesApplied)
+    viewer applied \(viewer.stats.videoFramesApplied)  undecodable \(viewer.stats.videoDecodeFailures)  \
+    sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))
       video coverage: \(String(format: "%.1f", coverageSamples == 0 ? 0 : 100 * Double(coverageVideoTiles) / Double(coverageSamples * TileGrid(width: width, height: height).count)))% of screen-time on video  \
     handoffs: reveal \(host.stats.overlayHandoffReveals)  record \(host.stats.overlayHandoffRecords)  \
     re-sharpens \(host.stats.videoRefreshes)
@@ -258,7 +264,104 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       cpu viewer: datagrams \(ms(timings.viewerDatagram))  video \(ms(timings.viewerVideo))  \
     control \(ms(timings.viewerControl))  tick \(ms(timings.viewerTick))
     """)
+    if videoMode == "vt" {
+        print("  vt: \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
+              + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "
+              + "stalls \(vtPipeline.stalls)")
+    }
     if opts.has("golden") && !(settled && identical) {
-        throw BenchError("golden check FAILED")
+        throw BenchError("golden check FAILED" + (viewerFailure.map { " (viewer failed: \($0))" } ?? ""))
+    }
+}
+
+/// VideoToolbox in the virtual-time loop. VT encodes on its own threads, and
+/// the VideoRegionEncoder contract puts each delivery on the engine's
+/// confining queue. Here that is the main thread, which drives the host, the
+/// link and the viewer, so deliveries go to the main queue and `drain()` runs
+/// them, waiting in real time until every submitted frame is back. Virtual
+/// time never advances past an encode still in flight: whatever the CPU
+/// load, a frame lands at its submit's virtual instant, as with the mock.
+///
+/// The loop used to hand VT a private callback queue and sleep 0.5 ms per
+/// virtual millisecond. That ran `videoEncoderDelivered` on a second thread,
+/// concurrently with the main thread's engine calls and the link's event
+/// queue (a data race on both), and let encoder latency under load slide
+/// frames arbitrarily far along virtual time.
+final class BenchVTPipeline {
+    /// Frames submitted to an encoder and not yet delivered.
+    fileprivate(set) var outstanding = 0
+    /// Drains that gave up on an encoder that never answered.
+    private(set) var stalls = 0
+    /// Real time spent waiting for VT.
+    private(set) var waitNS: UInt64 = 0
+    private(set) var maxWaitNS: UInt64 = 0
+    /// Time inside VT's submit (the pixel-buffer copy and EncodeFrame) —
+    /// part of the host's encode time.
+    fileprivate(set) var submitNS: UInt64 = 0
+    fileprivate(set) var submits = 0
+    static let stallLimitNS: UInt64 = 5_000_000_000
+
+    func drain() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let start = DispatchTime.now().uptimeNanoseconds
+        var waited: UInt64 = 0
+        repeat {
+            // Runs the main queue's pending blocks (VT's deliveries); while
+            // frames are outstanding, sleeps until the next one arrives.
+            _ = RunLoop.main.run(mode: .default,
+                                 before: Date(timeIntervalSinceNow: outstanding > 0 ? 0.01 : 0))
+            waited = DispatchTime.now().uptimeNanoseconds &- start
+        } while outstanding > 0 && waited < Self.stallLimitNS
+        if outstanding > 0 {
+            stalls += 1
+            outstanding = 0
+        }
+        waitNS &+= waited
+        maxWaitNS = max(maxWaitNS, waited)
+    }
+}
+
+/// `VTHEVCRegionEncoder` on the main queue, counting submits against
+/// deliveries for `BenchVTPipeline.drain()`. VT delivers exactly once per
+/// submit (an empty frame for a failed encode) until `stop()`.
+final class BenchVTEncoder: VideoRegionEncoder {
+    private let inner = VTHEVCRegionEncoder(callbackQueue: .main)
+    private let pipeline: BenchVTPipeline
+    private var pending = 0
+
+    init(pipeline: BenchVTPipeline) {
+        self.pipeline = pipeline
+    }
+
+    var codecID: UInt8 { inner.codecID }
+
+    func start(width: Int, height: Int,
+               onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
+        inner.start(width: width, height: height) { [weak self] data, sync, config in
+            if let self, self.pending > 0 {
+                self.pending -= 1
+                self.pipeline.outstanding = max(0, self.pipeline.outstanding - 1)
+            }
+            onFrame(data, sync, config)
+        }
+    }
+
+    func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
+        pending += 1
+        pipeline.outstanding += 1
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
+        pipeline.submitNS &+= DispatchTime.now().uptimeNanoseconds &- t0
+        pipeline.submits += 1
+    }
+
+    func setQualityLevel(_ level: Int) { inner.setQualityLevel(level) }
+    func setBitrateCap(_ bitsPerSecond: Int?) { inner.setBitrateCap(bitsPerSecond) }
+
+    /// The stopped encoder drops deliveries still queued.
+    func stop() {
+        pipeline.outstanding = max(0, pipeline.outstanding - pending)
+        pending = 0
+        inner.stop()
     }
 }
