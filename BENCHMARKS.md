@@ -342,6 +342,52 @@ identical. Host encode CPU in those single runs was 4,666 → 4,234 ms and
 3,388 → 4,409 ms. The second pair ran alongside the full test suite, so
 treat it as noise.
 
+### Real-codec loop: VT output on the rig's thread, awaited before time moves (2026-10-18)
+
+Issue #6: `replay --mode loop --video vt` sometimes failed the viewer under
+CPU load. The cause was in the bench, not the engines. The loop gave
+`VTHEVCRegionEncoder` a private callback queue, so
+`HostEngine.videoEncoderDelivered` ran on a GCD thread while the main thread
+drove the same host engine and the `InProcLink` event queue. A ThreadSanitizer
+build of the old bench reported 17 races on a typing-cc run (the link's
+`pending` array, `claimsInFlight`, `regionFramesPending`, the video rate
+controller) and then trapped. A lost or torn video message breaks the ordered
+video stream: the viewer reports undecodable frames, or fails outright with
+"malformed video stream". SYNC_REQUEST (#21) recovers the undecodable case,
+but not a malformed stream.
+
+The fix: the bench's VT encoder delivers on the main queue, the rig's engine
+queue, as the VideoRegionEncoder contract requires. After each `encodeTick`
+the loop waits in real time until every submitted frame is delivered. A
+frame now lands at its submit's virtual instant, as with the mock, so encoder
+latency under load no longer slides frames along virtual time. The 0.5 ms
+sleep per virtual millisecond is gone, so an unloaded cursor-drag run takes
+~37 s of wall time instead of ~56 s. The summary gains `undecodable` and
+`sync requests` counts (both should be 0, because the bench's video channel
+is lossless) and a `vt:` line with submit time, wait time and stalls. A
+failed `--golden` names the viewer's failure reason.
+
+Standard faults, `--video vt`, 6 runs in parallel plus 16 `yes` processes
+(load average ~90–115), the same 16-run trace mix (6 cursor-drag, 5
+scroll-win, 3 typing-cc, 2 photos):
+
+| | viewer `.failed` | runs with undecodable frames | host encode p95 |
+|---|---|---|---|
+| before | 1 / 16 (cursor-drag, "malformed video stream" at 2.1 s; never settled) | 3 / 16 (11 frames, 4 sync requests) | 7–13 ms |
+| after | 0 / 16 | 0 / 16 | 19–94 ms (heavier load in that batch) |
+
+Without faults (8 runs each, under the same load), both settled 8/8. Earlier
+before-runs (20 runs: 8 lightly loaded, 12 under `yes` load) settled 20/20.
+The race needs load to show. A TSan build of the fixed bench is clean (0
+reports) and settles typing-cc byte-exact.
+
+Bytes are unchanged within real-codec noise: typing-cc 8.85 MB, cursor-drag
+16.88–16.92 MB (reference 16.81). Goldens are byte-exact: typing-cc and
+scroll-win tiles-only, typing-cc and cursor-drag `--video vt`. The host encode
+CPU isn't affected. Three cursor-drag runs at the same moment (awaited
+output, awaited with a busy-poll, and the old no-wait pipelining done safely)
+gave encode p95 7.4 / 7.0 / 7.5 ms and totals of 3.18 / 3.15 / 3.07 s.
+
 ### macOS 27 VideoToolbox: constant quality and super-resolution — neither usable (2026-10-10)
 
 **`kVTCompressionPropertyKey_ConstantQualityFactor` (new in 27): a no-op
