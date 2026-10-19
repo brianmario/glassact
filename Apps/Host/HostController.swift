@@ -137,6 +137,15 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var captureMisses = 0
     private var pixelScale: CGFloat = 1
     private var contentOrigin: CGPoint = .zero
+    /// main-thread: the physical display a full-display capture shows, set
+    /// when capture starts on it (0: not known yet). Geometry follows this
+    /// display, not whichever one is main: someone at the Mac can make
+    /// another display main mid-share.
+    private var sharedDisplayID: CGDirectDisplayID = 0
+    /// The viewer's last "Scale" request, to re-fit the capture when the
+    /// display changes shape under it (main-thread).
+    private var lastScaleRequest: (widthPoints: Int, heightPoints: Int, scale: Int)?
+    private var displayReconcilePending = false
     // RESIZE support (§3.5): the viewer picks a
     // geometry policy — "Client Resolution" switches the HOST DISPLAY
     // (personal/unattended hosts), "Scale" downsamples the capture.
@@ -464,6 +473,12 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
 
     private var displayWatchRegistered = false
 
+    /// The physical display the Host shares: the one capture started on,
+    /// or the main display before that (main-thread).
+    private var physicalDisplay: CGDirectDisplayID {
+        sharedDisplayID != 0 && CGDisplayIsOnline(sharedDisplayID) != 0 ? sharedDisplayID : CGMainDisplayID()
+    }
+
     /// Log every display mode change with its new size — the host's own
     /// switches log just before theirs, so an unannounced one is external
     /// (e.g. macOS putting the display back to native between reconnects).
@@ -473,15 +488,71 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         CGDisplayRegisterReconfigurationCallback({ display, flags, info in
             guard let info, !flags.contains(.beginConfigurationFlag) else { return }
             let controller = Unmanaged<HostController>.fromOpaque(info).takeUnretainedValue()
-            if flags.contains(.unMirrorFlag) || flags.contains(.mirrorFlag) {
-                // A virtual display's mirroring can be undone by the system.
-                DispatchQueue.main.async { controller.reapplyViewerModeIfReverted() }
-            }
-            guard flags.contains(.setModeFlag), display == CGMainDisplayID() else { return }
-            let b = CGDisplayBounds(display)
-            controller.onStatus("display mode changed → \(Int(b.width))×\(Int(b.height)) pt")
-            DispatchQueue.main.async { controller.reapplyViewerModeIfReverted() }
+            DispatchQueue.main.async { controller.displayReconfigured(display, flags: flags) }
         }, Unmanaged.passUnretained(self).toOpaque())
+    }
+
+    /// Main thread. One display's reconfiguration finished.
+    private func displayReconfigured(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        if flags.contains(.unMirrorFlag) || flags.contains(.mirrorFlag) {
+            // A virtual display's mirroring can be undone by the system.
+            reapplyViewerModeIfReverted()
+        }
+        if flags.contains(.setModeFlag), display == physicalDisplay {
+            let b = CGDisplayBounds(display)
+            onStatus("display mode changed → \(Int(b.width))×\(Int(b.height)) pt")
+            reapplyViewerModeIfReverted()
+        }
+        // One reconcile per burst: a rearrangement reports every display,
+        // and a mode switch reports itself and each display it moves.
+        guard !displayReconcilePending else { return }
+        displayReconcilePending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.displayReconcilePending = false
+            self.reconcileSharedDisplay()
+        }
+    }
+
+    /// Main thread. Brings a full-display capture back in line with its
+    /// display after a change the Host didn't make: someone at the Mac
+    /// picks another resolution, rearranges displays or makes another one
+    /// main. Left alone, input and the cursor map through the old origin
+    /// and size, so clicks land in the wrong place. The Host's own switches
+    /// rebuild the capture as they make them, so by the time this runs
+    /// those already match and nothing happens. Client Resolution is
+    /// `reapplyViewerModeIfReverted`'s, and a virtual display is the
+    /// Host's own.
+    private func reconcileSharedDisplay() {
+        guard isRunning, singleWindowID == 0, virtualDisplay == nil, stream != nil,
+              pendingDisplayRestore == nil, !restoreOnLocalUnlock else { return }
+        let display = physicalDisplay
+        let bounds = CGDisplayBounds(display)
+        guard bounds.width > 0 else { return }
+        if bounds.origin != contentOrigin {
+            contentOrigin = bounds.origin
+            onStatus("shared display moved to \(Int(bounds.minX)),\(Int(bounds.minY)) — input follows it")
+        }
+        guard appliedDisplayMode == nil else { return }
+        if captureModified {
+            // Scale: re-fit the downscaled capture to the display's new shape.
+            guard let request = lastScaleRequest else { return }
+            let size = Self.scaledCaptureSize(of: bounds.size, toFit: request)
+            let clamped = Self.clampCapture(size.w, size.h)
+            guard clamped.w != captureWidth || clamped.h != captureHeight else { return }
+            onStatus("display changed to \(Int(bounds.width))×\(Int(bounds.height)) — capture re-fit to \(size.w)×\(size.h) px")
+            restartCapture(pixelWidth: size.w, pixelHeight: size.h, pointScale: CGFloat(size.w) / bounds.width,
+                           origin: bounds.origin, inSession: true)
+        } else {
+            guard let mode = CGDisplayCopyDisplayMode(display) else { return }
+            let clamped = Self.clampCapture(mode.pixelWidth, mode.pixelHeight)
+            guard clamped.w != captureWidth || clamped.h != captureHeight else { return }
+            onStatus("display changed to \(Int(bounds.width))×\(Int(bounds.height)) — capture follows "
+                     + "(\(mode.pixelWidth)×\(mode.pixelHeight) px)")
+            restartCapture(pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight,
+                           pointScale: CGFloat(mode.pixelWidth) / bounds.width,
+                           origin: bounds.origin, inSession: true)
+        }
     }
 
     /// Main thread. macOS can move the display off the viewer's Client
@@ -518,14 +589,14 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             return
         }
         guard let applied = appliedDisplaySize, appliedDisplayMode != nil, !displayReapplyPending else { return }
-        let now = CGDisplayBounds(CGMainDisplayID()).size
+        let now = CGDisplayBounds(physicalDisplay).size
         guard Int(now.width) != applied.width || Int(now.height) != applied.height else { return }
         displayReapplyPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self else { return }
             self.displayReapplyPending = false
             guard let applied = self.appliedDisplaySize, let mode = self.appliedDisplayMode else { return }
-            let display = CGMainDisplayID()
+            let display = self.physicalDisplay
             let now = CGDisplayBounds(display).size
             guard Int(now.width) != applied.width || Int(now.height) != applied.height else { return }
             let cutoff = Date().addingTimeInterval(-60)
@@ -577,7 +648,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                     return
                 }
                 let filter = SCContentFilter(display: display, excludingWindows: [])
-                DispatchQueue.main.async { self.start(filter: filter) }
+                let displayID = display.displayID
+                DispatchQueue.main.async { self.start(filter: filter, displayID: displayID) }
             } catch {
                 self.retryDefaultDisplay(after: 5, reason: "display enumeration failed: \(error.localizedDescription)")
             }
@@ -647,7 +719,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         }
     }
 
-    private func start(filter: SCContentFilter) {
+    /// `displayID`: the display `filter` shows, when the caller knows it
+    /// (the picker's filter doesn't say; it's found from the filter's rect).
+    private func start(filter: SCContentFilter, displayID: CGDirectDisplayID? = nil) {
         guard !isRunning, identity != nil else { return }
         isRunning = true
         phase = .starting
@@ -670,7 +744,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                 configuration.queueDepth = 3
                 configuration.showsCursor = true // burned in until cursor metadata is negotiated
                 self.pixelScale = scale * size.factor
-                self.contentOrigin = filter.contentRect.origin
+                let shared = displayID ?? Self.display(containing: filter.contentRect)
+                self.sharedDisplayID = shared
+                self.contentOrigin = shared != 0 ? CGDisplayBounds(shared).origin : filter.contentRect.origin
                 self.lastFilter = filter
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.captureQueue)
@@ -694,6 +770,26 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                 self.onStatus("capture failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// "Scale": the capture size that aspect-fits a display of `size`
+    /// points into the viewer's request. Even dims for 4:2:0 codecs; floored
+    /// so a tiny (or hostile) request can't produce a zero-sized capture.
+    private static func scaledCaptureSize(of size: CGSize,
+                                          toFit request: (widthPoints: Int, heightPoints: Int, scale: Int))
+        -> (w: Int, h: Int) {
+        let f = min(CGFloat(request.widthPoints * request.scale) / size.width,
+                    CGFloat(request.heightPoints * request.scale) / size.height)
+        return (max(64, Int(size.width * f)) & ~1, max(64, Int(size.height * f)) & ~1)
+    }
+
+    /// The display under the middle of `rect` (global points), or 0.
+    private static func display(containing rect: CGRect) -> CGDirectDisplayID {
+        var display: CGDirectDisplayID = 0
+        var count: UInt32 = 0
+        guard CGGetDisplaysWithPoint(CGPoint(x: rect.midX, y: rect.midY), 1, &display, &count) == .success,
+              count > 0 else { return 0 }
+        return display
     }
 
     /// The wire's largest canvas (TileGrid.maxDimension per side — the
@@ -817,7 +913,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             }
             guard generation == self.captureGeneration, self.isRunning else { return }
             do {
-                let filter = try await self.recoveryFilter()
+                let recovered = try await self.recoveryFilter(
+                    window: self.singleWindowID, display: self.virtualDisplay?.displayID ?? self.physicalDisplay)
+                let filter = recovered.filter
                 let configuration = self.captureConfig ?? SCStreamConfiguration()
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.captureQueue)
@@ -829,7 +927,14 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                 self.stream = stream
                 self.lastFilter = filter
                 self.captureConfig = configuration
+                if self.virtualDisplay == nil, let id = recovered.displayID {
+                    // The shared display may have gone (unplugged): follow
+                    // the one capture fell back to.
+                    self.sharedDisplayID = id
+                    self.contentOrigin = CGDisplayBounds(id).origin
+                }
                 self.onStatus("capture recovered (attempt \(attempt))")
+                self.reconcileSharedDisplay()
             } catch {
                 guard generation == self.captureGeneration, self.isRunning else { return }
                 // Revoked, not flaky: retrying can't help until it's granted
@@ -848,19 +953,20 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         }
     }
 
-    /// The shared window if it still exists, else the main display.
-    private func recoveryFilter() async throws -> SCContentFilter {
+    /// The shared window if it still exists, else the display `wanted`
+    /// (or any display, if that one is gone), with the display's ID.
+    private func recoveryFilter(window windowID: UInt32, display wanted: CGDirectDisplayID) async throws
+        -> (filter: SCContentFilter, displayID: CGDirectDisplayID?) {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        if singleWindowID != 0,
-           let window = content.windows.first(where: { $0.windowID == CGWindowID(singleWindowID) }) {
-            return SCContentFilter(desktopIndependentWindow: window)
+        if windowID != 0,
+           let window = content.windows.first(where: { $0.windowID == CGWindowID(windowID) }) {
+            return (SCContentFilter(desktopIndependentWindow: window), nil)
         }
-        let wanted = virtualDisplay?.displayID ?? CGMainDisplayID()
         guard let display = content.displays.first(where: { $0.displayID == wanted })
                 ?? content.displays.first else {
             throw NSError(domain: "glassact", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display available"])
         }
-        return SCContentFilter(display: display, excludingWindows: [])
+        return (SCContentFilter(display: display, excludingWindows: []), display.displayID)
     }
 
     // MARK: - Display awake while a viewer watches
@@ -897,6 +1003,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         lastFilter = nil
         captureConfig = nil
         captureModified = false
+        lastScaleRequest = nil
         autoScaledDown = false
         clipboardTimer?.invalidate(); clipboardTimer = nil
         cursorImageTimer?.invalidate(); cursorImageTimer = nil
@@ -1170,6 +1277,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// the viewer's auto-reconnect lands on a fresh HELLO with new geometry.
     private func applyResize(mode: Int, widthPoints: Int, heightPoints: Int, scale: Int) {
         geometrySettled = true // whatever happens, the next HELLO is final
+        if mode != Int(GeometryMode.scale) { lastScaleRequest = nil }
         guard isRunning else { onStatus("resize: ignored (not running)"); return }
         guard lastFilter != nil else { onStatus("resize: ignored (no capture filter)"); return }
         if mode == Int(GeometryMode.virtualDisplay) {
@@ -1189,7 +1297,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // Explicit native: undo any display switch / capture downscale.
             restoreDisplayMode()
             captureModified = false
-            let display = CGMainDisplayID()
+            let display = physicalDisplay
             let bounds = CGDisplayBounds(display)
             onStatus("resize: restored to native")
             if let m = CGDisplayCopyDisplayMode(display) {
@@ -1202,7 +1310,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             return
         }
         captureModified = true // a display switch or a capture downscale
-        let display = CGMainDisplayID()
+        let display = physicalDisplay
         if mode == 1 {
             // "Client Resolution": switch the host display to the viewer's
             // logical size (prefer a HiDPI mode at its backing factor).
@@ -1276,13 +1384,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // viewer's pixel size — ASPECT-FIT of the host content, not a
             // stretch (a 16:9 host into a 3:2 viewer request).
             let bounds = CGDisplayBounds(display)
-            let maxW = CGFloat(widthPoints * scale)
-            let maxH = CGFloat(heightPoints * scale)
-            let f = min(maxW / bounds.width, maxH / bounds.height)
-            // Even dims for 4:2:0 codecs; floored so a tiny (or hostile)
-            // request can't produce a zero-sized capture.
-            let pw = max(64, Int(bounds.width * f)) & ~1
-            let ph = max(64, Int(bounds.height * f)) & ~1
+            lastScaleRequest = (widthPoints, heightPoints, scale)
+            let (pw, ph) = Self.scaledCaptureSize(of: bounds.size, toFit: (widthPoints, heightPoints, scale))
             if pw == captureWidth && ph == captureHeight {
                 // Still downscaled vs the display (a reconnect within the
                 // grace): restore must stay armed.
@@ -1318,7 +1421,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         configuration.queueDepth = 3
         configuration.showsCursor = captureConfig?.showsCursor ?? true
         pixelScale = pointScale * size.factor
-        contentOrigin = origin ?? CGDisplayBounds(CGMainDisplayID()).origin
+        contentOrigin = origin ?? CGDisplayBounds(physicalDisplay).origin
         captureWidth = pixelWidth
         captureHeight = pixelHeight
         let newStream = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -1748,6 +1851,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         restoreDisplayMode()      // no-op if only the capture was scaled
         geometrySettled = false
         captureModified = false
+        lastScaleRequest = nil
         autoScaledDown = false    // native rebuild clears the rung
         onStatus(status)
         // The physical display's mode and bounds settle a moment after a
@@ -1761,10 +1865,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         }
     }
 
-    /// Main thread. Rebuild the capture at the main display's current mode.
+    /// Main thread. Rebuild the capture at the shared display's current mode.
     private func restartCaptureAtNativeSize() {
         guard isRunning else { return }
-        let display = CGMainDisplayID()
+        let display = physicalDisplay
         let bounds = CGDisplayBounds(display)
         guard let mode = CGDisplayCopyDisplayMode(display) else { return }
         restartCapture(pixelWidth: mode.pixelWidth,
@@ -1898,7 +2002,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         appliedDisplaySize = nil
         appliedDisplayMode = nil
         if let original = originalDisplayMode {
-            setDisplayMode(original, on: CGMainDisplayID())
+            setDisplayMode(original, on: physicalDisplay)
             originalDisplayMode = nil
         }
     }
@@ -2505,7 +2609,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         // mode it settled on: if the display left it (macOS can revert it
         // between reconnects), let the viewer's request through.
         if geometrySettled, let applied = appliedDisplaySize {
-            let now = CGDisplayBounds(CGMainDisplayID()).size
+            let now = CGDisplayBounds(physicalDisplay).size
             if Int(now.width) != applied.width || Int(now.height) != applied.height {
                 onStatus("display is \(Int(now.width))×\(Int(now.height)), not the \(applied.width)×\(applied.height) "
                          + "set for the viewer — renegotiating geometry")
