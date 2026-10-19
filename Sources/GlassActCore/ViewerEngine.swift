@@ -41,6 +41,9 @@ public struct ViewerStats: Sendable {
     public var recordsRejectedNacked = 0
     /// Video frames a region decoder could not decode (see VideoRegionDecoder).
     public var videoDecodeFailures = 0
+    /// SYNC_REQUESTs sent: an undecodable region asking the host for a
+    /// sync frame instead of failing the session (§5).
+    public var videoSyncRequests = 0
     public var acksSent = 0
     public var videoStarts = 0
     public var videoStops = 0
@@ -432,7 +435,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 onUITree?(requestID, status, json)
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
-                 .viewerInfo:
+                 .viewerInfo, .syncRequest:
                 break // viewer-originated / not addressed to the viewer
             }
         }
@@ -571,7 +574,14 @@ public final class ViewerEngine: @unchecked Sendable {
         if !result.decoded {
             stats.videoDecodeFailures += 1
             if result.undecodableTooLong {
+                // Last resort: the sync frames asked for below never got
+                // the region decoding again.
                 enterFailed("video region undecodable for > \(VideoRegionTable.undecodableLimitUS / 1000) ms")
+            } else if result.requestSync {
+                // Recover in place: a fresh sync frame resynchronizes the
+                // decoder (VTRegionDecoder drops everything until one).
+                stats.videoSyncRequests += 1
+                sendControl(.syncRequest(region: UInt8(region), generation: generation))
             }
         }
     }

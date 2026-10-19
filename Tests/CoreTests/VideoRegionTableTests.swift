@@ -124,6 +124,34 @@ import GlassActWire
         #expect(!r.decoded && r.blits == 0 && r.undecodableTooLong)
     }
 
+    /// SYNC_REQUEST pacing (§5): the first undecodable frame asks at once,
+    /// then at most every `syncRequestIntervalUS` while the streak lasts; a
+    /// success re-arms it, and the frame that gives up asks for nothing.
+    @Test func undecodableFramesAskForASyncFrameAtABoundedRate() {
+        let h = Harness()
+        #expect(h.start(region: 0, generation: 3, x: 0, y: 0, w: 64, h: 64, codec: 1))
+        h.decoder.pixels = [UInt8](repeating: 1, count: 64 * 64 * 4)
+        let every = VideoRegionTable.syncRequestIntervalUS
+        #expect(h.frame(generation: 3, nowUS: 1_000).decoded)
+        #expect(!h.frame(generation: 3, nowUS: 2_000).requestSync, "a decoded frame asks for nothing")
+        h.decoder.succeed = false
+        #expect(h.frame(generation: 3, nowUS: 10_000).requestSync, "the first failure asks at once")
+        #expect(!h.frame(generation: 3, nowUS: 10_000 + every - 1).requestSync)
+        #expect(h.frame(generation: 3, nowUS: 10_000 + every).requestSync)
+        #expect(!h.frame(generation: 3, nowUS: 10_000 + every + 20_000).requestSync)
+        // Recovered: the next failure asks at once again.
+        h.decoder.succeed = true
+        #expect(h.frame(generation: 3, nowUS: 10_000 + every + 40_000).decoded)
+        h.decoder.succeed = false
+        let t = 10_000 + every + 60_000
+        #expect(h.frame(generation: 3, nowUS: t).requestSync)
+        // The streak that outlives the deadline gives up instead.
+        let last = h.frame(generation: 3, nowUS: t + VideoRegionTable.undecodableLimitUS + 1)
+        #expect(last.undecodableTooLong && !last.requestSync)
+        // The request goes out well before the deadline, with room to re-ask.
+        #expect(VideoRegionTable.undecodableLimitUS >= 3 * every)
+    }
+
     @Test func startStopAndStopAllManageTheDecoder() {
         let h = Harness()
         // Out-of-bounds rect and out-of-range slot are refused before any

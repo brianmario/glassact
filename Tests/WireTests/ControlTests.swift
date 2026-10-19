@@ -213,14 +213,14 @@ import GlassActTestSupport
 
     @Test func unknownTypesAreSkipped() {
         var unknown = ByteWriter()
-        unknown.writeU8(0x1B) // beyond the assigned range (deframer skips by length)
+        unknown.writeU8(0x1C) // beyond the assigned range (deframer skips by length)
         unknown.writeVarint(3)
         unknown.writeBytes([1, 2, 3] as [UInt8])
         var stream = unknown.bytes
         stream.append(contentsOf: ControlMessage.ping(nonce: 1, tUS: 2).encoded())
         var d = ControlDeframer()
         d.append(stream)
-        #expect(d.next() == .skippedUnknown(type: 0x1B))
+        #expect(d.next() == .skippedUnknown(type: 0x1C))
         #expect(d.next() == .message(.ping(nonce: 1, tUS: 2)))
         #expect(d.next() == nil)
         #expect(!d.isMalformed)
@@ -343,6 +343,21 @@ import GlassActTestSupport
         rejects(type: 0x19, body: [1, 3, 0x61], "reason shorter than declared")
         rejects(type: 0x1A, body: [], "empty viewer name")
         rejects(type: 0x1A, body: [UInt8](repeating: 0x61, count: 65), "viewer name over 64 bytes")
+    }
+
+    @Test func syncRequestRoundTripAndLayout() {
+        roundTrip(.syncRequest(region: 0, generation: 1))
+        roundTrip(.syncRequest(region: 3, generation: 0xFFFF_FFFF))
+        // type 0x1B, len 5, region u8, generation u32 LE.
+        #expect(ControlMessage.syncRequest(region: 2, generation: 0x0403_0201).encoded()
+                == [0x1B, 5, 2, 0x01, 0x02, 0x03, 0x04])
+        #expect(ControlMessage.isKnownType(0x1B))
+    }
+
+    @Test func malformedSyncRequestsAreRejected() {
+        rejects(type: 0x1B, body: [], "empty SYNC_REQUEST")
+        rejects(type: 0x1B, body: [0, 1, 0, 0], "generation truncated")
+        rejects(type: 0x1B, body: [0, 1, 0, 0, 0, 9], "trailing byte")
     }
 
     @Test func textChunksStayUnderTheBoundAtCharacterBoundaries() {

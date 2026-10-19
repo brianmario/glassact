@@ -53,6 +53,12 @@ public struct HostStats: Sendable {
     public var videoEncoderFailures = 0
     /// Regions dissolved because the transport lost the video stream.
     public var videoChannelResets = 0
+    /// SYNC_REQUESTs for the live region (§4.6), sync frames sent in answer
+    /// (requests coalesce: at most one every `syncRequestMinIntervalUS`), and
+    /// requests ignored (no live region, or a stale generation).
+    public var videoSyncRequests = 0
+    public var videoSyncRequestSyncs = 0
+    public var videoSyncRequestsIgnored = 0
     /// Qualified tiles deferred because the batch reached its datagram cap.
     public var batchCapDeferredTiles = 0
     public var tileBytesOut = 0 // datagram (tile-record) bytes only — the governed path
@@ -311,6 +317,10 @@ public final class HostEngine: @unchecked Sendable {
     /// When the last keyframe went to the encoder, and the cap it had then.
     var lastRegionSyncUS: UInt64 = 0
     var capAtLastSync = 0
+    /// The viewer asked for a sync frame (SYNC_REQUEST) and none has gone
+    /// to the encoder since; and when the last answer did (0 = never).
+    var syncRequestPending = false
+    var lastRequestedSyncUS: UInt64 = 0
     var regionEmptyDeliveries = 0 // consecutive empty encoder deliveries
     public static let videoMaxEmptyDeliveries = 30 // ~0.5 s of failed encodes at 60 Hz
     var regionLastChangeUS: UInt64 = 0
@@ -783,6 +793,8 @@ public final class HostEngine: @unchecked Sendable {
                 onUITreeRequest?(requestID, windowID, Int(maxNodes))
             case let .viewerInfo(name):
                 onViewerInfo?(name)
+            case let .syncRequest(region, generation):
+                noteSyncRequest(region: region, generation: generation)
             case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope:
                 break // host-originated / not addressed to the host
             }
@@ -1459,6 +1471,12 @@ public final class HostEngine: @unchecked Sendable {
     public static let refreshQuietUS: UInt64 = 1_000_000
     /// …at most this often (a keyframe costs a second or two of a thin link)…
     public static let refreshMinIntervalUS: UInt64 = 5_000_000
+    /// SYNC_REQUEST answers: at most one sync frame this often. A sync
+    /// frame is the most expensive frame there is, and the request comes
+    /// from the peer: a viewer asking every frame must not turn the region
+    /// into all-keyframe video. Requests inside the window aren't dropped —
+    /// they coalesce into one sync when it ends.
+    public static let syncRequestMinIntervalUS: UInt64 = 500_000
     /// A region tile still this long goes back to its exact canvas copy.
     public static let defaultHandoffStillUS: UInt64 = 1_000_000
     /// …when large changes since the last keyframe covered ≥ 1/this of the

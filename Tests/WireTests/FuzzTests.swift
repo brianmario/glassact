@@ -68,6 +68,7 @@ import GlassActTestSupport
             .pong(nonce: 8, tUS: 9, recvTUS: 10),
             .pauseHint(paused: true),
             .quality(presentedScalePct: 50, floor: QualityFloor.high, preferSharpness: 1),
+            .syncRequest(region: 0, generation: 42),
         ]
         for _ in 0..<300 {
             var stream: [UInt8] = []

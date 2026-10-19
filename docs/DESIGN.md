@@ -148,7 +148,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 
 ---
 
-## 3. Wire format (`WireVersion.current = 3`)
+## 3. Wire format (`WireVersion.current = 4`)
 
 - All integers are little-endian.
 - `varint` = unsigned LEB128, ≤ 4 bytes, so values are < 2²⁸. The reader accepts
@@ -269,6 +269,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x18 | UI_TREE | H→V | requestID u32, status u8, json |
 | 0x19 | AGENT_SCOPE | H→V | control u8, len u8, reason |
 | 0x1A | VIEWER_INFO | V→H | UTF-8 machine name, 1–64 B |
+| 0x1B | SYNC_REQUEST | V→H | region u8, generation u32. The viewer can't decode that region and asks for a sync frame (§4.6, §5) |
 
 **Cadence:**
 - **ACKs:**
@@ -570,6 +571,26 @@ and the last sync is ≥ 5 s old, provided either:
 - the damage since that sync covers ≥ 1/10 of the region, or
 - the bitrate cap has at least doubled.
 
+**Sync requests:** a SYNC_REQUEST (§3.5) from the viewer means its decoder
+lost the stream (§5). The host answers with a forced sync frame on the next
+serviced tick, even if the region didn't change.
+- Only the live region's current generation counts. A request for another
+  region, an older generation, or a region whose START hasn't gone out is
+  ignored. A new generation starts on a sync frame anyway.
+- At most one answer every 500 ms (`syncRequestMinIntervalUS`). A request
+  inside that window isn't dropped: it waits, and any number of them
+  coalesce into one sync frame when the window ends. Sync frames are the
+  most expensive frames there are, and the request comes from the peer, so
+  a viewer asking on every frame still costs at most 2 sync frames a second.
+- Any sync frame answers a pending request, a re-sharpen included. The
+  answer also counts as the region's last sync for the re-sharpen.
+- The answer re-claims every tile the host believes shows video, because
+  the viewer dropped the claims of the frames it couldn't decode. Tiles
+  already back on their exact canvas copy stay there.
+- The parameter sets don't change within a generation and travel only in
+  START. The viewer rebuilds its decoder from them, so the sync frame alone
+  is enough.
+
 ### 4.7 Lossless keyframes (`HostEngine+Keyframes`, `KeyframeApplier`)
 
 **Encoding:** a rect is encoded as 8 parallel VP8L stripes (≤ 7 MB) and sent as
@@ -747,7 +768,17 @@ the bitmap ACK. That covers records that were:
 - A tile shows the overlay iff `overlayOn && newer(overlaySeq, tileSeq)`.
 - STOP and REVEAL bitmaps clear `overlayOn` for tiles whose canvas copy is
   exact.
-- A region that stays undecodable for more than 1 s fails the session.
+- **An undecodable frame asks for a sync frame.** A decoder rebuilt after a
+  failure (a hardware session invalidated by sleep/wake or a media-engine
+  reset, or corrupt data) drops every frame until a sync frame arrives, and
+  the host sends those only on demand. So the first undecodable frame sends
+  SYNC_REQUEST at once, and the viewer asks again at most every 500 ms
+  while the region stays undecodable. The region recovers in place: no new
+  START, and the session carries on.
+- **Last resort:** a region still undecodable 2 s after its first failed
+  frame fails the session, and the app reconnects. That leaves room for the
+  first answer (a round trip plus a sync frame, which on a thin link can
+  take most of a second) and for a re-ask or two if it fails too.
 
 **ACK generation:** per-batch receive bitmaps, at the cadence in §3.5.
 
