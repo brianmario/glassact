@@ -20,9 +20,10 @@ bench *ARGS:
 test-asan:
     swift test --sanitize=address
 
-# Full-size hash collision sweep (10^6 × 16 KB buffers, §4.5) — release mode
+# Full-size hash collision sweep (10^6 × 16 KB buffers, §4.5) and 100× the
+# WebP / keyframe decoder fuzz iterations (INV-6) — release mode
 test-exhaustive:
-    GLASSACT_EXHAUSTIVE=1 swift test -c release --filter CodecTests
+    GLASSACT_EXHAUSTIVE=1 swift test -c release --filter 'CodecTests|KeyframeDecodeFuzzTests'
 
 # Developer ID-signed, notarized, stapled apps (Apps/build/release/<Scheme>/)
 release *SCHEMES="Viewer Host":
