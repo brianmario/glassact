@@ -85,6 +85,23 @@ other.
 **Ports:** the Host listens on UDP 4433 (control) and 4434 (pixels). When
 connecting over the internet, open both or use a VPN such as Tailscale.
 
+### If it crashes
+
+Glass Act sends nothing anywhere by itself: no analytics, no automatic
+crash uploads. macOS hands each app a report (MetricKit) on the launch after
+it crashed or hung, and the app keeps it on your Mac. It then asks once:
+**Report…** opens a new GitHub issue in your browser, filled in from the
+report, and shows the report file in Finder for you to attach; **Dismiss**
+lets it go. Nothing is filed until you submit the issue yourself.
+
+- The Host shows the notice in a small window, and keeps **Report Last
+  Crash…** at the top of its menu until you answer it. The Viewer shows it
+  at the top of its connect window.
+- Reports are kept (the newest 20) in `~/Library/Logs/Glass Act/CrashReports`
+  for the Host, and in the Viewer's container for the Viewer. **Show Crash
+  Reports in Finder** is in Host › Developer and Viewer › Help.
+- The Viewer's Help › Send Logs to Host includes its crash reports.
+
 ## Agents: the `glassact` CLI and MCP server
 
 ```sh
@@ -165,7 +182,9 @@ privately, not in a public issue.
 | CLI key, approvals, known hosts, agent sockets, audit log, traces | `~/Library/Application Support/Glass Act/` |
 | Viewer data and logs (sandboxed) | `~/Library/Containers/app.glassact.viewer/Data/`; Help › Show Logs in Finder |
 | Viewer log, live | `/usr/bin/log stream --predicate 'subsystem == "app.glassact.viewer"'` |
-| logs uploaded to the Host | `~/Library/Logs/Glass Act/` |
+| logs uploaded to the Host | `~/Library/Logs/Glass Act/from-viewer/` |
+| Host crash and hang reports | `~/Library/Logs/Glass Act/CrashReports/`; Host › Developer › Show Crash Reports in Finder |
+| Viewer crash and hang reports | in its container, `…/Data/Library/Logs/Glass Act/CrashReports/`; Help › Show Crash Reports in Finder |
 | Host's unified log | `/usr/bin/log stream --predicate 'subsystem == "app.glassact.host"'` |
 
 ## How it works and contributing

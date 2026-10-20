@@ -955,7 +955,7 @@ Sources/
   GlassActCore/            HostEngine(+Acks/Encode/Keyframes/Scroll/Video), ViewerEngine,
                            TileLedger, governor/pacing/video rate, VT HEVC, presenter, .scap
   GlassActTransport/       transport protocol, QUICTransport, InProcTransport, identity,
-                           known hosts, authorized viewers, AppPaths
+                           known hosts, authorized viewers, AppPaths, crash reports
   GlassActSession/         ViewerSession, AgentDriver, HeadlessAgent, agent socket, MCP
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
@@ -966,7 +966,9 @@ ThirdParty/libwebp/        vendored, BSD-3 (VP8L encode/decode)
 Apps/GlassActApps.xcodeproj
   Host/                    menu-bar app: capture, input, approvals, agents policy
   Viewer/                  window app: connect, render, input, settings
+  Shared/                  both apps: About panel, MetricKit crash reporter (§13)
   Signing.xcconfig         (+ git-ignored Signing.local.xcconfig), release.sh
+scripts/symbolicate-crash  a crash report's stacks → function names (§13)
 Justfile                   test, test-fast, test-asan, test-exhaustive, build, bench, release, install-cli
 docs/                      this file
 BENCHMARKS.md              the measurement record (§12)
@@ -1147,6 +1149,38 @@ video, the wire), so a flaw there stays inside its container. Its data
 the keychain. It uses no private API. Its session log is mirrored to the
 unified log (subsystem `app.glassact.viewer`), since other apps can't read
 its container.
+
+**No telemetry; crash reports stay on the Mac** (`CrashReportStore`,
+`Apps/Shared/CrashReporter.swift`). Neither app sends anything anywhere on
+its own: no analytics, no crash upload, no update check.
+- Both apps subscribe to MetricKit (`MXMetricManager`), which hands an app a
+  diagnostic payload on the launch after it crashed or hung. Each payload is
+  saved byte for byte as JSON in the app's `CrashReports` folder, next to its
+  logs: `~/Library/Logs/Glass Act/CrashReports` for the Host, the same path
+  in the Viewer's container. Files are named
+  `<host|viewer>-<kind>-<UTC time>-<hash>.json`; the newest 20 are kept.
+  Each also gets one summary line in the app's log (the Host's status log,
+  the Viewer's session log).
+- A crash or hang the person hasn't answered brings up a small, non-modal
+  notice: "Glass Act Host quit unexpectedly last time" (or "…was
+  unresponsive"). The Host shows it in a small window of its own, and offers
+  it at the top of its menu until answered; the Viewer shows it at the top
+  of its connect window. **Dismiss** forgets it. **Report…** opens a new
+  GitHub issue in the person's browser, prefilled from the payload alone
+  (app version and build, macOS version, the exception, signal or hang
+  duration, and the top frames as binary + offset, cut to keep the link
+  under 6000 characters), with the report's path (home folder shown as `~`)
+  and the file shown in Finder to attach. Nothing is submitted until the
+  person submits it. Answered reports are remembered (`.seen`, by hash), so
+  a payload MetricKit hands over again isn't shown again.
+- The Objective-C exception *message* (`composedMessage`) is left out of the
+  issue, since it can carry whatever the app had in hand; it stays in the
+  file, which the person can read before attaching.
+- **Help › Send Logs to Host** (Viewer) includes the crash reports, over the
+  session, like the logs (§3.5 VIEWER_LOG). They land in the Host's
+  `from-viewer` folder, on a Mac the same person chose to connect to.
+- `scripts/symbolicate-crash` turns a report's stacks into function names
+  with a release's dSYMs.
 
 **Known limits:**
 - Any process running as the same user can read the CLI's key file (and an

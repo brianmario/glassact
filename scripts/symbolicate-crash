@@ -1,0 +1,123 @@
+#!/bin/zsh
+# Symbolicate a Glass Act crash or hang report (a MetricKit diagnostic
+# payload, JSON) with the release's dSYMs. MetricKit stacks are binary name +
+# UUID + offset into the binary's __TEXT segment; this matches each binary to
+# a dSYM by UUID and asks atos for the function, file and line.
+#
+#   scripts/symbolicate-crash <report.json> <dSYM folder> [--all-threads]
+#
+# <dSYM folder> is searched recursively for *.dSYM, so the release's
+# .xcarchive (or its dSYMs folder) works as-is. Frames in binaries without a
+# matching dSYM (system libraries) stay as binary + offset. By default only
+# the crashing (or hung) thread is printed; --all-threads prints them all.
+# Needs only the Xcode command-line tools (dwarfdump, atos) and osascript.
+set -euo pipefail
+
+self=${0:t}
+usage() { print -u2 "usage: $self <report.json> <dSYM folder> [--all-threads]"; exit 2; }
+(( $# >= 2 )) || usage
+report=$1 dsyms=$2 all=0
+[[ ${3:-} == --all-threads ]] && all=1
+[[ -n ${3:-} && $all == 0 ]] && usage
+[[ -r $report ]] || { print -u2 "✗ can't read $report"; exit 1; }
+[[ -d $dsyms ]] || { print -u2 "✗ $dsyms is not a folder"; exit 1; }
+
+# UUID → DWARF file and architecture, from every dSYM under the folder.
+typeset -A dwarf arch
+while IFS= read -r line; do
+	# "UUID: 70B89F27-1634-3580-A695-57CDB41D7743 (arm64) /…/Foo.dSYM/Contents/Resources/DWARF/Foo"
+	if [[ $line =~ '^UUID: ([0-9A-Fa-f-]+) \(([^)]+)\) (.+)$' ]]; then
+		dwarf[${(U)match[1]}]=${match[3]}
+		arch[${(U)match[1]}]=${match[2]}
+	fi
+done < <(find "$dsyms" -name '*.dSYM' -type d -prune -print0 | xargs -0 -n1 xcrun dwarfdump --uuid 2>/dev/null)
+(( ${#dwarf} )) || print -u2 "! no dSYMs found under $dsyms — printing the report unsymbolicated"
+
+# The report, flattened by JavaScript for Automation (no dependencies):
+#   H <text>                                    a heading
+#   F <index> <samples> <binary> <UUID> <offset>  a frame of one thread's stack
+#   T <depth> <samples> <binary> <UUID> <offset>  a node of a sampled tree
+read -r -d '' jxa <<'EOF' || true
+function run(argv) {
+	ObjC.import('Foundation')
+	const text = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null)
+	if (!text || text.isNil()) throw new Error('cannot read ' + argv[0])
+	const payload = JSON.parse(text.js)
+	const all = argv[1] === '1'
+	const out = []
+	const kinds = [['crashDiagnostics', 'Crash'], ['hangDiagnostics', 'Hang'],
+		['cpuExceptionDiagnostics', 'CPU exception'], ['diskWriteExceptionDiagnostics', 'Disk-write exception'],
+		['appLaunchDiagnostics', 'Launch']]
+	for (const [key, label] of kinds) {
+		for (const d of payload[key] || []) {
+			const m = d.diagnosticMetaData || {}
+			const facts = [
+				m.appVersion && ('app ' + m.appVersion + (m.appBuildVersion ? ' (' + m.appBuildVersion + ')' : '')),
+				m.osVersion, m.platformArchitecture,
+				m.exceptionType !== undefined && ('exception type ' + m.exceptionType),
+				m.exceptionCode !== undefined && ('code ' + m.exceptionCode),
+				m.signal !== undefined && ('signal ' + m.signal),
+				m.hangDuration && ('hang ' + m.hangDuration),
+			].filter(Boolean)
+			out.push('H\t' + label + ': ' + facts.join(' · '))
+			if (m.terminationReason) out.push('H\t  termination reason: ' + m.terminationReason)
+			if (m.exceptionReason) out.push('H\t  exception: ' + (m.exceptionReason.exceptionName || '') + ' '
+				+ (m.exceptionReason.composedMessage || ''))
+			const tree = d.callStackTree || {}
+			const stacks = tree.callStacks || []
+			const perThread = tree.callStackPerThread !== false
+			stacks.forEach((stack, i) => {
+				if (!all && !stack.threadAttributed && stacks.some(s => s.threadAttributed)) return
+				out.push('H\t' + 'Thread ' + i + (stack.threadAttributed ? (key === 'hangDiagnostics' ? ' (hung)' : ' (crashed)') : '') + ':')
+				let index = 0
+				const walk = (frames, depth) => {
+					for (const f of frames || []) {
+						out.push([perThread ? 'F' : 'T', perThread ? index++ : depth, f.sampleCount || 0, f.binaryName || '???',
+							(f.binaryUUID || '').toUpperCase(), f.offsetIntoBinaryTextSegment || 0].join('\t'))
+						walk(f.subFrames, depth + 1)
+					}
+				}
+				walk(stack.callStackRootFrames, 0)
+			})
+			out.push('H\t')
+		}
+	}
+	return out.join('\n')
+}
+EOF
+flat=("${(@f)$(osascript -l JavaScript -e "$jxa" "$report" "$all")}")
+
+# One atos run per binary: the load address is arbitrary (0x100000000), as
+# long as each address is that plus the frame's offset.
+typeset -A symbol offsets
+typeset -ri base=$(( 0x100000000 ))
+for line in $flat; do
+	[[ $line == [FT]$'\t'* ]] || continue
+	f=("${(@ps:\t:)line}")
+	uuid=$f[5] off=$f[6]
+	[[ -n ${dwarf[$uuid]:-} ]] && offsets[$uuid]+=" $off"
+done
+for uuid in ${(k)offsets}; do
+	offs=(${(u)=offsets[$uuid]})
+	addrs=()
+	for off in $offs; do addrs+=$(printf '0x%x' $(( base + off ))); done
+	results=("${(@f)$(xcrun atos -o "$dwarf[$uuid]" -arch "$arch[$uuid]" -l $(printf '0x%x' $base) $addrs)}")
+	for (( i = 1; i <= $#offs; i++ )); do symbol[$uuid:$offs[i]]=$results[i]; done
+done
+
+for line in $flat; do
+	if [[ $line == H$'\t'* ]]; then
+		print -r -- "${line#H$'\t'}"
+		continue
+	fi
+	f=("${(@ps:\t:)line}")
+	depth=$f[2] samples=$f[3] name=$f[4] uuid=$f[5] off=$f[6]
+	where=${symbol[$uuid:$off]:-$(printf '+ 0x%x' $off)}
+	if [[ $where == 0x* ]]; then where=$(printf '+ 0x%x' $off); fi # atos found no symbol
+	if [[ $line == T* ]]; then
+		# A sampled tree: indent by depth, with sample counts.
+		printf '  %*s%-28s %s  [%s samples]\n' $(( depth * 2 )) '' "$name" "$where" $samples
+	else
+		printf '  %-3s %-28s %s\n' $depth "$name" "$where"
+	fi
+done

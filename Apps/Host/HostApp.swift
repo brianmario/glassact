@@ -71,6 +71,9 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     /// The latest raw status line (Developer submenu; the log has them all).
     private var statusLine = "starting"
     private var identityError: String?
+    /// MetricKit crash and hang reports, and the notice after one (§13).
+    private var crashReporter: CrashReporter!
+    private var crashNoticeWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -98,6 +101,11 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
                 self?.phaseChanged()
             }
         }
+        crashReporter = CrashReporter(appName: "Glass Act Host", prefix: "host") { [weak self] text in
+            self?.controller.onStatus(text)
+        }
+        crashReporter.onNotice = { [weak self] notice in self?.crashNoticeChanged(notice) }
+        crashReporter.start()
         permissions.startLocalNetworkCheck()
         requiredWereGranted = permissions.requiredGranted
         // Cheap no-prompt checks; catches a permission switched off in
@@ -170,6 +178,10 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     }
 
     func windowWillClose(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === crashNoticeWindow {
+            crashNoticeWindow = nil // closed unanswered: the menu keeps it, and so does the next launch
+            return
+        }
         if let window = notification.object as? NSWindow, window === approvalsWindow {
             approvalsTimer?.invalidate()
             approvalsTimer = nil
@@ -181,6 +193,54 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         guard let window = notification.object as? NSWindow, window === setupWindow else { return }
         if permissions.requiredGranted { UserDefaults.standard.set(true, forKey: Self.setupDoneKey) }
         setupWindow = nil
+    }
+
+    // MARK: - Crash notice
+
+    /// A small window of its own, in front but without taking focus from
+    /// whatever the person is doing; closing it leaves the report waiting
+    /// (the menu's first rows offer it until it's answered).
+    private func crashNoticeChanged(_ notice: CrashNotice?) {
+        guard let notice else {
+            crashNoticeWindow?.close()
+            return
+        }
+        let view = CrashNoticeContent(notice: notice,
+                                      onReport: { [weak self] in self?.crashReporter.report() },
+                                      onDismiss: { [weak self] in self?.crashReporter.dismiss() })
+            .padding(.horizontal, 20)
+            .padding(.top, 30) // under the transparent title bar
+            .padding(.bottom, 18)
+            .frame(width: 400)
+            .fixedSize(horizontal: false, vertical: true)
+        if let window = crashNoticeWindow, let hosting = window.contentViewController as? NSHostingController<AnyView> {
+            hosting.rootView = AnyView(view)
+            return
+        }
+        let hosting = NSHostingController(rootView: AnyView(view))
+        hosting.sizingOptions = [.preferredContentSize]
+        let window = NSWindow(contentViewController: hosting)
+        window.styleMask = [.titled, .closable, .fullSizeContentView]
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.title = "Glass Act Host"
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.setContentSize(hosting.view.fittingSize)
+        window.center()
+        window.orderFrontRegardless()
+        crashNoticeWindow = window
+    }
+
+    @objc private func showCrashNotice() {
+        if crashNoticeWindow == nil { crashNoticeChanged(crashReporter.notice) }
+        crashNoticeWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    @objc private func showCrashReports() {
+        crashReporter.revealReports()
     }
 
     @objc private func showSetupFromMenu() {
@@ -301,6 +361,13 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         headerItem.view = header
         menu.addItem(headerItem)
         menu.addItem(.separator())
+
+        if let notice = crashReporter.notice {
+            let hang = notice.summary.kind == .hang
+            menu.addItem(item(hang ? "Report Last Hang…" : "Report Last Crash…", symbol: "exclamationmark.bubble",
+                              tint: .systemOrange, action: #selector(showCrashNotice), subtitle: notice.title))
+            menu.addItem(.separator())
+        }
 
         // Anything blocking sharing comes first, with the way to fix it.
         permissions.refresh()
@@ -533,6 +600,8 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         sub.addItem(item("Record 30 Seconds", symbol: "timer", action: #selector(timedRecording),
                          subtitle: "Starts in 5 seconds"))
         sub.addItem(item("Show Traces in Finder", symbol: "folder", action: #selector(showTraces)))
+        sub.addItem(item("Show Crash Reports in Finder", symbol: "doc.text.magnifyingglass",
+                         action: #selector(showCrashReports)))
         sub.addItem(.separator())
         let latest = NSMenuItem(title: String(statusLine.prefix(64)) + (statusLine.count > 64 ? "…" : ""),
                                 action: nil, keyEquivalent: "")

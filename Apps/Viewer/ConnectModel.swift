@@ -1,4 +1,5 @@
 import Foundation
+import GlassActTransport
 import Observation
 
 /// What the connect window shows and edits. The app delegate owns the
@@ -68,6 +69,8 @@ final class ConnectModel {
 
     var phase: Phase = .idle
     var notice: Notice?
+    /// The last run crashed or hung, and the report waits for an answer (§13).
+    var crashNotice: CrashNotice?
     /// Secondary line under "Connecting…" once a dial has failed quietly.
     var connectHint: String?
     private(set) var recents: [String] = []
@@ -90,6 +93,8 @@ final class ConnectModel {
     @ObservationIgnored var onConnect: () -> Void = {}
     @ObservationIgnored var onCancel: () -> Void = {}
     @ObservationIgnored var onSignIn: () -> Void = {}
+    @ObservationIgnored var onReportCrash: () -> Void = {}
+    @ObservationIgnored var onDismissCrash: () -> Void = {}
 
     var trimmedHost: String { host.trimmingCharacters(in: .whitespaces) }
     var canConnect: Bool { phase == .idle && !trimmedHost.isEmpty }
