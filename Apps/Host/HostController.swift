@@ -188,20 +188,21 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var lastClipboardHash = 0
     private var clipboardChangeCount = -1
     private var pendingDisplayRestore: DispatchWorkItem? // main-thread
-    /// main-thread: a Client Resolution switch outlived its viewer because
-    /// the screen locks behind it — restore when someone unlocks the Mac
-    /// locally (or on Stop Sharing / a failed lock).
-    private var restoreOnLocalUnlock = false
     /// main-thread: the viewer asked for a virtual display at its size
     /// (geoMode 4); the physical displays mirror it while it exists.
     private var virtualDisplay: VirtualDisplay?
     /// main-thread: the physical display's capture filter, for teardown.
     private var physicalFilter: SCContentFilter?
-    private var unlockObserver: NSObjectProtocol?
     /// Lock-on-disconnect timer (main thread), and whether a viewer transport
     /// is up right now.
     private var pendingLock: DispatchWorkItem?
     private var viewerSessionLive = false
+    /// main-thread: the screen was locked when the current run of viewer
+    /// sessions began. Lock When Viewer Leaves only puts back a lock that
+    /// was there: a Mac someone left unlocked stays unlocked. A reconnect
+    /// within the lock grace keeps the first session's answer (the remote
+    /// user has unlocked it since).
+    private var lockedWhenViewerArrived = false
     // Auto-scale (airplane story, main-thread): sustained severe link
     // pressure halves the capture for the rest of the session; native
     // restores on disconnect (via the captureModified restore path) or on
@@ -526,7 +527,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Host's own.
     private func reconcileSharedDisplay() {
         guard isRunning, singleWindowID == 0, virtualDisplay == nil, stream != nil,
-              pendingDisplayRestore == nil, !restoreOnLocalUnlock else { return }
+              pendingDisplayRestore == nil else { return }
         let display = physicalDisplay
         let bounds = CGDisplayBounds(display)
         guard bounds.width > 0 else { return }
@@ -624,7 +625,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// this entirely (the viewer's pick swaps the filter to a single window).
     func startDefaultDisplay() {
         watchDisplayReconfiguration()
-        watchLocalUnlock()
         guard !isRunning, identity != nil else { return }
         // Preflight, not request: asking is the setup window's job (one
         // place, with context), not a bare system alert at launch.
@@ -992,7 +992,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     }
 
     func stop() {
-        restoreOnLocalUnlock = false // restoreDisplayMode below covers it
         isRunning = false
         phase = .stopped
         viewerConnectedAt = nil
@@ -1780,7 +1779,11 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// grace covers geometry-negotiation and flaky-radio reconnect cycles
     /// (an eager restore would undo the switch mid-handshake). Restoring
     /// also re-opens geometry negotiation for the next session.
-    private func scheduleDisplayRestore() {
+    /// Main thread. Puts the display (or the shared window) back the way it
+    /// was: at once when the viewer left on purpose (`clean`), else after a
+    /// grace in which a dropped connection can come back.
+    private func scheduleDisplayRestore(clean: Bool) {
+        let grace = clean ? 0 : 5
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // Single-window mode: after the grace (a transient reconnect cancels
@@ -1788,8 +1791,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // capture to the full display for the next session.
             if self.singleWindowID != 0 || self.originalWindowFrame != nil {
                 self.pendingDisplayRestore?.cancel()
-                let grace = 5
-                self.onStatus("viewer gone — restoring window in \(grace)s")
+                self.onStatus(grace == 0 ? "viewer gone — restoring window" : "viewer gone — restoring window in \(grace)s")
                 let work = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     self.restoreSharedWindowFrame()
@@ -1816,22 +1818,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             guard self.captureModified else { return }
             self.pendingDisplayRestore?.cancel()
             self.pendingDisplayRestore = nil
-            // Client Resolution with lock-on-disconnect: nobody local sees the
-            // switched display behind the lock, and restoring would cost
-            // every reconnect a display switch (~440 ms), a capture restart
-            // and — on each connect after a lock — a macOS revert plus our
-            // re-apply (~0.5 s): ~1 s of a 1.5 s time to first picture.
-            // Keep it until a local unlock. The next HELLO is
-            // NOT final, so a different viewer or preference still
-            // negotiates; the same request finds the display already there.
-            if self.lockOnDisconnect, let applied = self.appliedDisplaySize {
-                self.geometrySettled = false
-                self.restoreOnLocalUnlock = true
-                self.onStatus("viewer gone — keeping \(applied.width)×\(applied.height) behind the lock "
-                              + "(restores on local unlock or Stop Sharing)")
+            if grace == 0 {
+                self.restoreToNative(status: "viewer gone — display/capture restored to native")
                 return
             }
-            let grace = 5
             self.onStatus("viewer gone — restoring in \(grace)s (or on Stop Sharing)")
             let work = DispatchWorkItem { [weak self] in
                 self?.restoreToNative(status: "display/capture restored to native")
@@ -1844,7 +1834,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Main thread. Undo a display switch / capture downscale and rebuild
     /// the capture at the native display size.
     private func restoreToNative(status: String) {
-        restoreOnLocalUnlock = false
         pendingDisplayRestore?.cancel()
         pendingDisplayRestore = nil
         guard isRunning, captureModified else { return }
@@ -1982,20 +1971,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         physicalFilter = nil
         appliedDisplaySize = nil
         onStatus("virtual display removed")
-    }
-
-    /// Main thread, once: a local unlock with no viewer connected ends a
-    /// kept Client Resolution (see scheduleDisplayRestore).
-    private func watchLocalUnlock() {
-        guard unlockObserver == nil else { return }
-        unlockObserver = DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.restoreOnLocalUnlock, !self.viewerSessionLive else { return }
-                self.restoreToNative(status: "screen unlocked locally — display/capture restored to native")
-            }
-        }
     }
 
     private func restoreDisplayMode() {
@@ -2517,57 +2492,85 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             UserDefaults.standard.set(newValue, forKey: Self.lockOnDisconnectKey)
             if !newValue {
                 pendingLock?.cancel(); pendingLock = nil
-                // Turning the lock off exposes a kept Client Resolution.
-                if restoreOnLocalUnlock && !viewerSessionLive {
-                    restoreToNative(status: "lock on disconnect off — display/capture restored to native")
-                }
             }
             onStatus(newValue ? "lock on disconnect: on" : "lock on disconnect: off")
         }
     }
 
-    /// Main thread: after the grace, lock unless a viewer is back or sharing
-    /// was stopped locally (someone is at the Mac).
-    private func scheduleLockAfterDisconnect() {
+    /// Main thread: lock unless a viewer is back or sharing was stopped
+    /// locally (someone is at the Mac). A viewer that left on purpose
+    /// (`clean`) gets it a second later, once the display restore has
+    /// settled (macOS refuses mode changes at the lock screen); a dropped
+    /// connection gets `lockGraceSeconds` to come back.
+    private func scheduleLockAfterDisconnect(clean: Bool) {
         guard lockOnDisconnect else { return }
+        guard lockedWhenViewerArrived else {
+            onStatus("viewer gone — leaving the screen unlocked, as it was when the viewer connected")
+            return
+        }
         pendingLock?.cancel()
-        onStatus("viewer gone — locking the screen in \(Self.lockGraceSeconds)s unless it reconnects")
+        let delay = clean ? 1 : Self.lockGraceSeconds
+        onStatus(clean ? "viewer left — locking the screen"
+                       : "viewer gone — locking the screen in \(delay)s unless it reconnects")
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isRunning, self.lockOnDisconnect, !self.viewerSessionLive else { return }
             self.pendingLock = nil
-            if Self.lockScreen() {
-                self.onStatus("screen locked (viewer disconnected)")
-            } else {
-                self.onStatus("couldn't lock the screen")
-                // A kept Client Resolution is only fine behind a lock.
-                if self.restoreOnLocalUnlock {
-                    self.restoreToNative(status: "display/capture restored to native (screen not locked)")
+            MainActor.assumeIsolated { self.lockScreen { locked in
+                if locked {
+                    self.onStatus("screen locked (viewer disconnected)")
+                } else {
+                    self.onStatus("couldn't lock the screen — is ⌃⌘Q still the Lock Screen shortcut, "
+                                  + "and does Glass Act Host have Device Control?")
                 }
-            }
+            } }
         }
         pendingLock = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Double(Self.lockGraceSeconds), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(delay), execute: work)
     }
 
-    /// Locks the session like ⌃⌘Q: login.framework's SACLockScreenImmediate
-    /// (private, present since 10.13 — what the Lock Screen menu item
-    /// calls), else the ⌃⌘Q shortcut posted as keystrokes (needs the
-    /// Accessibility grant the host already holds for remote input).
-    static func lockScreen() -> Bool {
-        if let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY),
-           let sym = dlsym(handle, "SACLockScreenImmediate") {
-            typealias Fn = @convention(c) () -> Int32
-            _ = unsafeBitCast(sym, to: Fn.self)()
-            return true
+    /// Main thread. Locks the session with ⌃⌘Q, the system's own Lock
+    /// Screen shortcut, posted as keystrokes: public API, using the
+    /// Accessibility grant remote input already needs. `done` gets whether
+    /// the screen actually locked, from the system's `screenIsLocked`
+    /// notification within 2 s, so a remapped shortcut or a missing grant
+    /// reports failure instead of a false "locked".
+    @MainActor private func lockScreen(then done: @escaping @MainActor (Bool) -> Void) {
+        if Self.screenIsLocked { done(true); return }
+        let center = DistributedNotificationCenter.default()
+        let state = LockAttempt()
+        state.observer = center.addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"),
+                                            object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { state.finish(true, done) }
         }
         let q: CGKeyCode = 12
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: false) else { return false }
-        down.flags = [.maskControl, .maskCommand]
-        up.flags = [.maskControl, .maskCommand]
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        return true
+        if let down = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: true),
+           let up = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: false) {
+            down.flags = [.maskControl, .maskCommand]
+            up.flags = [.maskControl, .maskCommand]
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            MainActor.assumeIsolated { state.finish(Self.screenIsLocked, done) }
+        }
+    }
+
+    /// One lock attempt: answers once, then stops listening (main thread).
+    @MainActor private final class LockAttempt {
+        var observer: (any NSObjectProtocol)?
+        private var answered = false
+        func finish(_ locked: Bool, _ done: @MainActor (Bool) -> Void) {
+            guard !answered else { return }
+            answered = true
+            if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
+            done(locked)
+        }
+    }
+
+    /// The session's screen is locked (CGSessionCopyCurrentDictionary).
+    static var screenIsLocked: Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return (info["CGSSessionScreenIsLocked"] as? Bool) ?? false
     }
 
     // MARK: - Bandwidth setting
@@ -2890,11 +2893,13 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private func transportStateChanged(_ state: TransportState) {
         switch state {
         case .ready:
+            if pendingLock == nil {
+                lockedWhenViewerArrived = Self.screenIsLocked
+            }
             pendingDisplayRestore?.cancel()
             pendingDisplayRestore = nil
             pendingLock?.cancel()
             pendingLock = nil
-            restoreOnLocalUnlock = false // re-armed when this viewer leaves
             viewerSessionLive = true
             holdDisplayAwake(true)
             // Capture died while nobody watched (display slept, screen
@@ -2918,6 +2923,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             onStatus(peer?.isAgent == true ? "agent connected" : "viewer connected")
         case .failed, .cancelled:
             let reason = transport?.lastFailReason ?? ""
+            let clean = transport?.peerClosedCleanly ?? false
             let hadSession = viewerSessionLive
             viewerSessionLive = false
             viewerConnectedAt = nil
@@ -2930,8 +2936,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             endSession()
             server?.resetSession()
             onStatus("viewer disconnected" + (reason.isEmpty ? "" : " — \(reason)"))
-            if isRunning { scheduleDisplayRestore() }
-            if isRunning && hadSession && !agentLeft { scheduleLockAfterDisconnect() }
+            if isRunning { scheduleDisplayRestore(clean: clean) }
+            if isRunning && hadSession && !agentLeft { scheduleLockAfterDisconnect(clean: clean) }
         case .connecting:
             break
         }

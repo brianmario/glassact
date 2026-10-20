@@ -210,6 +210,11 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     var isFinished: Bool { finished }
     /// Why the session ended — set at the fail site, for the app's log.
     public private(set) var lastFailReason = ""
+    /// The peer ended the session on purpose: it closed the control stream
+    /// cleanly (Disconnect, or quitting), rather than the connection failing
+    /// or timing out. The Host acts on a clean close at once and gives a
+    /// dropped connection a grace to come back.
+    public private(set) var peerClosedCleanly = false
 
     // Viewer dial target
     private var dialHost: String = ""
@@ -914,6 +919,7 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
             if error != nil || isComplete {
                 quicDebug("\(self.role) control stream ended: error=\(String(describing: error)) complete=\(isComplete)")
                 if connection === self.control {
+                    if error == nil && isComplete && !self.finished { self.peerClosedCleanly = true }
                     self.fail("control stream ended: \(String(describing: error)) complete=\(isComplete)")
                 }
                 return
