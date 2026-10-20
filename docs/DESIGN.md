@@ -1151,13 +1151,21 @@ What an observer still sees:
 - First contact is only as safe as the person comparing codes.
 - The apps are unsandboxed (issue #8). The Host uses one private API,
   CGVirtualDisplay.
-- **Lock Screen When Viewer Leaves** puts back a lock that was there: it
-  locks 30 s after the viewer leaves only if the screen was locked when
-  that run of sessions began (a reconnect within the grace keeps the first
-  answer), so a Mac someone left unlocked stays unlocked. It posts ⌃⌘Q, the
-  system's Lock Screen shortcut, and confirms the lock from the
-  `screenIsLocked` notification; if it doesn't lock (a remapped shortcut, no
-  Device Control grant), the Host reports it and undoes any display switch.
+- **When a viewer leaves**, the Host puts the Mac back the way it was:
+  - The display comes back first: its own mode, the virtual display gone,
+    or the shared window back in place. That happens at once when the
+    viewer left on purpose (it closed the control stream cleanly:
+    Disconnect, or quitting), or after 5 s when the connection dropped, in
+    case it comes back.
+  - **Lock Screen When Viewer Leaves** then puts back a lock that was there:
+    it locks only if the screen was locked when that run of sessions began
+    (a reconnect within the grace keeps the first answer), so a Mac someone
+    left unlocked stays unlocked. It locks 1 s after a clean leave, once the
+    restore has settled (macOS refuses mode changes at the lock screen), or
+    30 s after a dropped connection.
+  - It posts ⌃⌘Q, the system's Lock Screen shortcut, and confirms the lock
+    from the `screenIsLocked` notification; if it doesn't lock (a remapped
+    shortcut, no Device Control grant), the Host reports it.
 - Bonjour advertises the computer name.
 
 ---
