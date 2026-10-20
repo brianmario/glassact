@@ -17,6 +17,8 @@ retransmission.
   that were measured and rejected. Check it before re-trying an idea.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** is setup for a new contributor:
   requirements, building, signing, permissions, tests and filing issues.
+- **[RELEASING.md](RELEASING.md)** is versions, tagging a release, and the
+  release workflow's one-time setup.
 - **GitHub issues** hold the open work.
 - `## Deviations` notes at the top of a file (e.g. `QUICTransport.swift`)
   explain where the code departs from the SDK docs or the design.
