@@ -87,17 +87,22 @@ under Variables.
      gh variable set VIEWER_PROFILE_NAME --body "Glass Act Viewer Developer ID"
      ```
 
-4. **App Store Connect API key** (secrets `ASC_KEY_ID`, `ASC_ISSUER_ID` and
-   `ASC_KEY_P8_BASE64`), for notarization:
-   - At App Store Connect › Users and Access › Integrations › Team Keys,
-     generate a key with the **Developer** role.
-   - Note its Key ID and the Issuer ID shown above the list, and download
-     the `AuthKey_….p8`; it can be downloaded only once.
+4. **App Store Connect API key** (secrets `ASC_KEY_ID` and `ASC_KEY_P8_BASE64`;
+   `ASC_ISSUER_ID` too for a team key), for notarization. It's an App Store
+   Connect key only because Apple's notary service lives there; nothing goes
+   to the App Store.
+   - At App Store Connect › Users and Access › Integrations, generate a key.
+     An **individual** developer account has **Individual Keys**: generate
+     one there (if you see *Request Access*, do that first). An organization
+     has **Team Keys**: generate one with the **Developer** role, and note the
+     Issuer ID shown above the list.
+   - Note the Key ID, and download the `AuthKey_….p8`; it can be downloaded
+     only once.
    - Then:
      ```sh
-     gh secret set ASC_KEY_ID --body "…"
-     gh secret set ASC_ISSUER_ID --body "…"
-     base64 -i AuthKey_XXXX.p8 | gh secret set ASC_KEY_P8_BASE64
+     gh secret set ASC_KEY_ID -R brianmario/glassact --body "…"
+     base64 -i AuthKey_XXXX.p8 | gh secret set ASC_KEY_P8_BASE64 -R brianmario/glassact
+     gh secret set ASC_ISSUER_ID -R brianmario/glassact --body "…"   # team keys only
      ```
    - Keep the `.p8` somewhere safe, or delete it; a new key can always be
      made.

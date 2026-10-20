@@ -17,7 +17,9 @@
 #   VIEWER_PROFILE    the Viewer's
 #   ASC_KEY_PATH, ASC_KEY_ID, ASC_ISSUER_ID
 #                     App Store Connect API key, for notarization
-#                     (NOTARIZE=0 skips it: a local check, not a release)
+#                     (NOTARIZE=0 skips it: a local check, not a release).
+#                     ASC_ISSUER_ID only for a team key; an individual key
+#                     has none.
 #   SPARKLE_KEY_FILE  the EdDSA private key updates are signed with
 #                     (optional locally: without it, no appcasts)
 #   TAG               optional; default: v<version> (the appcasts' URLs)
@@ -29,7 +31,7 @@ cd "${0:A:h}"
 
 : ${TEAM:?} ${HOST_PROFILE:?} ${VIEWER_PROFILE:?}
 NOTARIZE=${NOTARIZE:-1}
-if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?} ${ASC_ISSUER_ID:?}; fi
+if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?}; fi
 BUILD_NUMBER=${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}
 OUT=${OUT:-build/ci-release}
 VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9.]*\).*/\1/p' Version.xcconfig)
@@ -44,8 +46,9 @@ echo "▸ Glass Act $VERSION ($BUILD_NUMBER), team $TEAM"
 
 notarize() { # <zip>
 	(( NOTARIZE )) || { echo "  (notarization skipped)"; return; }
-	xcrun notarytool submit "$1" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
-		--wait --timeout 30m
+	local issuer=()
+	[[ -n ${ASC_ISSUER_ID:-} ]] && issuer=(--issuer "$ASC_ISSUER_ID") # team keys only
+	xcrun notarytool submit "$1" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" $issuer --wait --timeout 30m
 }
 
 for SCHEME in Host Viewer; do

@@ -46,7 +46,8 @@ jobs:
           SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           missing=()
-          for name in TEAM HOST_PROFILE VIEWER_PROFILE ASC_KEY_ID ASC_ISSUER_ID CERT CERT_PASSWORD \
+          # ASC_ISSUER_ID is only for a team API key; an individual key has none.
+          for name in TEAM HOST_PROFILE VIEWER_PROFILE ASC_KEY_ID CERT CERT_PASSWORD \
                       HOST_PROFILE_DATA VIEWER_PROFILE_DATA ASC_KEY SPARKLE_KEY; do
             [ -n "${!name}" ] || missing+=("$name")
           done
