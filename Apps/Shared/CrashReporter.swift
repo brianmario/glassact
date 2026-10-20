@@ -5,8 +5,10 @@ import SwiftUI
 
 /// Crash and hang reports (§13), the app side, shared by both apps.
 ///
-/// MetricKit hands each app a diagnostic payload on the launch after it
-/// crashed or hung. Every payload is saved, as MetricKit wrote it, to the
+/// MetricKit hands each app a diagnostic report on the launch after it
+/// crashed or hung: from `MetricManager` on macOS 27 and later, from the
+/// older `MXMetricManager` before that (MetricKitReports turns the new
+/// reports into the same JSON, so the rest is one path). Every payload is saved, as MetricKit wrote it, to the
 /// app's CrashReports folder (the newest 20 are kept) and summed up in one
 /// log line. A crash or hang the person hasn't answered yet becomes a
 /// notice: **Report…** opens a prefilled GitHub issue in their browser and
@@ -21,6 +23,9 @@ final class CrashReporter {
     private(set) var notice: CrashNotice?
     private let log: (String) -> Void
     private var subscriber: DiagnosticSubscriber?
+    /// macOS 27's MetricManager and the task reading its reports.
+    private var manager: AnyObject?
+    private var reportsTask: Task<Void, Never>?
 
     /// `prefix` names this app's report files ("host", "viewer").
     init(appName: String, prefix: String, log: @escaping (String) -> Void) {
@@ -32,14 +37,25 @@ final class CrashReporter {
     /// At launch: subscribe, take any payloads MetricKit already has, and
     /// bring up a notice left unanswered last time.
     func start() {
-        let subscriber = DiagnosticSubscriber { [weak self] payloads in
-            DispatchQueue.main.async { self?.ingest(payloads) }
+        if #available(macOS 27, *) {
+            let manager = MetricManager()
+            self.manager = manager
+            reportsTask = Task { [weak self] in
+                for await report in manager.diagnosticReports {
+                    guard let payload = MetricKitReports.payloadJSON(report) else { continue }
+                    self?.ingest([payload])
+                }
+            }
+        } else {
+            let subscriber = DiagnosticSubscriber { [weak self] payloads in
+                DispatchQueue.main.async { self?.ingest(payloads) }
+            }
+            MXMetricManager.shared.add(subscriber)
+            self.subscriber = subscriber
+            // Delivered before this launch subscribed (or again): saving
+            // dedupes by content, so these never show twice.
+            ingest(MXMetricManager.shared.pastDiagnosticPayloads.map(DiagnosticSubscriber.extract))
         }
-        MXMetricManager.shared.add(subscriber)
-        self.subscriber = subscriber
-        // Delivered before this launch subscribed (or again): saving
-        // dedupes by content, so these never show twice.
-        ingest(MXMetricManager.shared.pastDiagnosticPayloads.map(DiagnosticSubscriber.extract))
         refresh()
     }
 

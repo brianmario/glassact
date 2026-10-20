@@ -1153,9 +1153,12 @@ its container.
 **No telemetry; crash reports stay on the Mac** (`CrashReportStore`,
 `Apps/Shared/CrashReporter.swift`). Neither app sends anything anywhere on
 its own: no analytics, no crash upload, no update check.
-- Both apps subscribe to MetricKit (`MXMetricManager`), which hands an app a
-  diagnostic payload on the launch after it crashed or hung. Each payload is
-  saved byte for byte as JSON in the app's `CrashReports` folder, next to its
+- Both apps take MetricKit's diagnostics, which arrive on the launch after
+  an app crashed or hung: from `MetricManager` on macOS 27 and later, from
+  `MXMetricManager` before that. A macOS 27 report is turned into the JSON
+  `MXDiagnosticPayload` writes (`MetricKitReports`), so the rest is one path
+  and one file format. Each payload is
+  saved as JSON in the app's `CrashReports` folder, next to its
   logs: `~/Library/Logs/Glass Act/CrashReports` for the Host, the same path
   in the Viewer's container. Files are named
   `<host|viewer>-<kind>-<UTC time>-<hash>.json`; the newest 20 are kept.
