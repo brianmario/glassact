@@ -5,6 +5,6 @@
 GLASSACT_UPDATE_FEED_URL = https:/$()/github.com/brianmario/glassact/releases/latest/download/$(TARGET_NAME:lower)-appcast.xml
 
 // The EdDSA public key updates are signed with (Sparkle's generate_keys;
-// the private half is the SPARKLE_ED_PRIVATE_KEY secret). Empty: the apps
-// don't check for updates at all — a fork, or before the key exists.
-GLASSACT_SPARKLE_PUBLIC_KEY =
+// the private half is the SPARKLE_ED_PRIVATE_KEY secret). A fork that
+// publishes its own builds sets its own; empty, the apps never check.
+GLASSACT_SPARKLE_PUBLIC_KEY = ZIPK5My0QXCOP1w2NYAVzSOmYtlZagfppB6ZjlG2Y4c=
