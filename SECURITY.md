@@ -37,7 +37,7 @@ In scope:
 Out of scope are the limits [docs/DESIGN.md §13](docs/DESIGN.md#13-security-model)
 already documents, such as traffic size and timing being visible to an
 observer, other processes running as the same user reading the keys or
-using the agent sockets, and the apps being unsandboxed. Reports that
+using the agent sockets, and the Host being unsandboxed. Reports that
 change what those limits mean in practice are still welcome.
 
 ## What to expect

@@ -102,3 +102,23 @@ import GlassActSession
 enum AgentDriverOps {
     static var all: Set<String> { Set(AgentDriver.operations) }
 }
+
+/// The sandboxed Viewer's socket: where the CLI looks for it, and that the
+/// path fits a Unix socket address (104 bytes on macOS) for a typical home.
+@Suite struct ViewerSocketPathTests {
+    @Test func cliLooksInTheViewersContainer() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = AgentPaths.viewerSocket.path
+        #expect(ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] == nil, "tests aren't sandboxed")
+        let bundleID = ProcessInfo.processInfo.environment["GLASSACT_VIEWER_BUNDLE_ID"] ?? "app.glassact.viewer"
+        #expect(path == "\(home)/Library/Containers/\(bundleID)/Data/viewer.sock")
+    }
+
+    @Test func socketPathFitsWithRoomToSpare() {
+        // The path the default bundle ID gives under a long-ish home folder.
+        let path = "/Users/a-fairly-long-user-name/Library/Containers/app.glassact.viewer/Data/viewer.sock"
+        #expect(path.utf8.count < 104)
+        let viaAppSupport = "/Users/a/Library/Containers/app.glassact.viewer/Data/Library/Application Support/Glass Act/agent/viewer.sock"
+        #expect(viaAppSupport.utf8.count >= 104, "why the socket isn't under Application Support")
+    }
+}

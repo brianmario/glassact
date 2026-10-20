@@ -83,7 +83,9 @@ xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build   # or Viewer
 - **Replacing a signed binary:** `rm` it before `cp`. Overwriting it in place
   gets the new process killed (exit 137).
 - **Logs:** use `/usr/bin/log`, because zsh has a `log` builtin. The subsystem
-  is `app.glassact.host`. Viewer logs are in `~/Library/Logs/Glass Act/`.
+  is `app.glassact.host`. The Viewer is sandboxed: its log files are in its
+  container, which a terminal can't read without a prompt, so read it from
+  the unified log instead (subsystem `app.glassact.viewer`).
 - **Releases** notarize through the Apple ID signed in to Xcode. Xcode 27's
   xcodebuild sometimes drops that account ("No Accounts", or a notarization
   timeout). Check `defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists`;

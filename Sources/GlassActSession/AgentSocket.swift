@@ -2,14 +2,31 @@ import Darwin
 import GlassActTransport
 public import Foundation
 
-/// Where agent sessions live: one Unix socket per session under
-/// `~/Library/Application Support/Glass Act/agent` (directory 0700, sockets 0600, peers checked to be this
-/// same user). The Viewer app's live session is `viewer.sock`; a headless
-/// session is `<name>.sock`, with its log beside it.
+/// Where agent sessions live: one Unix socket per session (sockets 0600,
+/// peers checked to be this same user).
+/// - A headless session is `<name>.sock` under
+///   `~/Library/Application Support/Glass Act/agent` (directory 0700), with
+///   its log beside it.
+/// - The Viewer app's live session is `viewer.sock` at the top of the
+///   Viewer's sandbox container. A Unix socket path must fit in 104 bytes,
+///   and the container's Application Support folder is longer than that.
 public enum AgentPaths {
     public static var directory: URL { AppPaths.dataDirectory.appendingPathComponent("agent") }
     public static var dataDirectory: URL { AppPaths.dataDirectory }
-    public static var viewerSocket: URL { directory.appendingPathComponent("viewer.sock") }
+
+    /// The Viewer's socket: its own container's top level when called from
+    /// the (sandboxed) Viewer, else where that is for the Viewer's bundle ID
+    /// (`app.glassact.viewer`, or `GLASSACT_VIEWER_BUNDLE_ID` for a build
+    /// with another bundle prefix).
+    public static var viewerSocket: URL {
+        let env = ProcessInfo.processInfo.environment
+        if env["APP_SANDBOX_CONTAINER_ID"] != nil {
+            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("viewer.sock")
+        }
+        let bundleID = env["GLASSACT_VIEWER_BUNDLE_ID"] ?? "app.glassact.viewer"
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers/\(bundleID)/Data/viewer.sock")
+    }
     public static func headlessSocket(_ name: String) -> URL { directory.appendingPathComponent("\(name).sock") }
     public static func headlessLog(_ name: String) -> URL { directory.appendingPathComponent("\(name).log") }
     /// Headless agents dial with their own identity, named so the host can
