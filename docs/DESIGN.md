@@ -1149,8 +1149,11 @@ What an observer still sees:
 - Under "Ask", nothing rate-limits approval prompts from new keys. (Under
   "Sign in", new keys cause no prompts.)
 - First contact is only as safe as the person comparing codes.
-- The apps are unsandboxed (issue #8) and use private API: CGVirtualDisplay
-  and `SACLockScreenImmediate`.
+- The apps are unsandboxed (issue #8). The Host uses one private API,
+  CGVirtualDisplay. Lock Screen When Viewer Leaves posts ⌃⌘Q, the system's
+  Lock Screen shortcut, and confirms the lock from the `screenIsLocked`
+  notification; if it doesn't lock (a remapped shortcut, no Device Control
+  grant), the Host reports it and undoes any display switch.
 - Bonjour advertises the computer name.
 
 ---

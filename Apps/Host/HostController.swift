@@ -2535,39 +2535,66 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isRunning, self.lockOnDisconnect, !self.viewerSessionLive else { return }
             self.pendingLock = nil
-            if Self.lockScreen() {
-                self.onStatus("screen locked (viewer disconnected)")
-            } else {
-                self.onStatus("couldn't lock the screen")
-                // A kept Client Resolution is only fine behind a lock.
-                if self.restoreOnLocalUnlock {
-                    self.restoreToNative(status: "display/capture restored to native (screen not locked)")
+            MainActor.assumeIsolated { self.lockScreen { locked in
+                if locked {
+                    self.onStatus("screen locked (viewer disconnected)")
+                } else {
+                    self.onStatus("couldn't lock the screen — is ⌃⌘Q still the Lock Screen shortcut, "
+                                  + "and does Glass Act Host have Device Control?")
+                    // A kept Client Resolution is only fine behind a lock.
+                    if self.restoreOnLocalUnlock {
+                        self.restoreToNative(status: "display/capture restored to native (screen not locked)")
+                    }
                 }
-            }
+            } }
         }
         pendingLock = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Double(Self.lockGraceSeconds), execute: work)
     }
 
-    /// Locks the session like ⌃⌘Q: login.framework's SACLockScreenImmediate
-    /// (private, present since 10.13 — what the Lock Screen menu item
-    /// calls), else the ⌃⌘Q shortcut posted as keystrokes (needs the
-    /// Accessibility grant the host already holds for remote input).
-    static func lockScreen() -> Bool {
-        if let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY),
-           let sym = dlsym(handle, "SACLockScreenImmediate") {
-            typealias Fn = @convention(c) () -> Int32
-            _ = unsafeBitCast(sym, to: Fn.self)()
-            return true
+    /// Main thread. Locks the session with ⌃⌘Q, the system's own Lock
+    /// Screen shortcut, posted as keystrokes: public API, using the
+    /// Accessibility grant remote input already needs. `done` gets whether
+    /// the screen actually locked, from the system's `screenIsLocked`
+    /// notification within 2 s, so a remapped shortcut or a missing grant
+    /// reports failure instead of a false "locked".
+    @MainActor private func lockScreen(then done: @escaping @MainActor (Bool) -> Void) {
+        if Self.screenIsLocked { done(true); return }
+        let center = DistributedNotificationCenter.default()
+        let state = LockAttempt()
+        state.observer = center.addObserver(forName: NSNotification.Name("com.apple.screenIsLocked"),
+                                            object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { state.finish(true, done) }
         }
         let q: CGKeyCode = 12
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: false) else { return false }
-        down.flags = [.maskControl, .maskCommand]
-        up.flags = [.maskControl, .maskCommand]
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-        return true
+        if let down = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: true),
+           let up = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: false) {
+            down.flags = [.maskControl, .maskCommand]
+            up.flags = [.maskControl, .maskCommand]
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            MainActor.assumeIsolated { state.finish(Self.screenIsLocked, done) }
+        }
+    }
+
+    /// One lock attempt: answers once, then stops listening (main thread).
+    @MainActor private final class LockAttempt {
+        var observer: (any NSObjectProtocol)?
+        private var answered = false
+        func finish(_ locked: Bool, _ done: @MainActor (Bool) -> Void) {
+            guard !answered else { return }
+            answered = true
+            if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
+            done(locked)
+        }
+    }
+
+    /// The session's screen is locked (CGSessionCopyCurrentDictionary).
+    static var screenIsLocked: Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return (info["CGSSessionScreenIsLocked"] as? Bool) ?? false
     }
 
     // MARK: - Bandwidth setting

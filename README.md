@@ -147,8 +147,8 @@ Agents work two ways:
   - Other programs running as your user can read the CLI's key file and use
     the agent sockets.
   - Agent status is declared by the client.
-  - The apps are unsandboxed, and use private API for the virtual display and
-    screen locking.
+  - The apps are unsandboxed, and the Host uses private API for the virtual
+    display.
 
 See [docs/DESIGN.md §13](docs/DESIGN.md#13-security-model) for the full
 model.
