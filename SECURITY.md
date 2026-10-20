@@ -28,7 +28,7 @@ In scope:
   approval, sign-in and agent policy, and anything that lets a peer act on
   a Mac beyond what it was granted.
 - **The wire protocol and QUIC transport:** the TLS and identity checks
-  (trust on first use, pinning, `authorized_viewers`), the record parser
+  (trust on first use, pinning, `approved_viewers`), the record parser
   (wire parsing is always bounds-checked; any crash, over-read or
   out-of-bounds write from peer input is a bug), and the password exchange.
 - **The agent CLI and MCP server:** `glassact`, the local agent sockets, and

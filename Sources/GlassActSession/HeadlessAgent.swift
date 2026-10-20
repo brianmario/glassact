@@ -59,7 +59,7 @@ public final class HeadlessAgent {
         identity = try QUICIdentity.loadOrCreate(directory: AgentPaths.dataDirectory,
                                                  name: AgentPaths.agentIdentityName,
                                                  commonName: AgentPaths.agentCommonName)
-        knownHosts = KnownHosts(url: AgentPaths.dataDirectory.appendingPathComponent("known_hosts"))
+        knownHosts = KnownHosts(url: AgentPaths.dataDirectory.appendingPathComponent(IdentityFiles.knownHosts))
         pinned = config.fingerprint.isEmpty
             ? (knownHosts.fingerprint(host: config.host, port: config.port) ?? "")
             : QUICIdentity.normalize(config.fingerprint)
@@ -106,7 +106,7 @@ public final class HeadlessAgent {
         let target = "\(config.host):\(config.port)"
         let fingerprint = agentFingerprint
         driver.statusExtras = { [box = driverBox] in
-            var out: [String: Any] = ["host": target, "agent_key": String(fingerprint.prefix(16))]
+            var out: [String: Any] = ["host": target, "agent_key": QUICIdentity.keyString(fingerprint)]
             out.merge(box.phaseFields()) { $1 }
             return out
         }

@@ -251,14 +251,15 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var frameWidth = 0 // encodeQueue: size of the latest captured frame
     private var frameHeight = 0
 
-    // MARK: - Identity (self-signed, generated on first run)
+    // MARK: - Identity (self-signed, made on first run; §13)
 
     func loadIdentity() throws {
-        let loaded = try QUICIdentity.loadOrCreate(directory: Self.dataDirectory, name: "identity",
-                                                   commonName: "glassact-host")
+        let (loaded, source) = try QUICIdentity.loadForApp(directory: Self.dataDirectory, name: "identity",
+                                                           commonName: "glassact-host")
         identity = loaded
         fingerprint = try QUICIdentity.fingerprint(of: loaded)
-        print("glassact-host fingerprint: \(fingerprint)")
+        print("glassact-host key: \(QUICIdentity.keyString(fingerprint))")
+        onStatus("identity: \(source.description)")
         onStatus("ready (port \(Self.controlPort))")
     }
 
@@ -272,7 +273,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// viewer is refused during the TLS handshake, before it sees a pixel or
     /// can inject input.
     let authorizedViewers = AuthorizedViewers(
-        url: HostController.dataDirectory.appendingPathComponent("authorized_viewers"))
+        url: HostController.dataDirectory.appendingPathComponent(IdentityFiles.approvedViewers))
     /// What agents may do here, and the record of what they did.
     let agentAccess = AgentAccess()
     let agentAudit = AgentAudit(directory: HostController.dataDirectory)

@@ -1067,28 +1067,46 @@ What an observer still sees:
 - **The Bonjour advertisement.** It's unencrypted and names the Mac.
 
 **Identities:**
-- P-256 keys are generated in process (CryptoKit) as self-signed certificates.
-  Certificate names are `glassact-host`, `glassact-viewer` and `glassact-agent`.
-- A key's **fingerprint** is the SHA-256 of the leaf DER, in lowercase hex.
-- Keys are stored as PKCS#12 in `~/Library/Application Support/Glass Act`
-  (directory 0700, files 0600, written atomically) and imported memory-only;
-  the keychain isn't used.
-- The PKCS#12 passphrase is a fixed constant, so the files' permissions are the
-  only protection (issue #2).
-- A key file that can be read but not imported (another passphrase,
-  corruption) is replaced with a fresh identity, written the same way. Peers
-  then see a new key: viewers get the changed-key refusal from a host, and a
-  viewer or agent is approved again like a new one.
+- Every key is P-256, in a self-signed certificate named `glassact-host`,
+  `glassact-viewer` or `glassact-agent`.
+- **Key ID:** the SHA-256 of the key's SubjectPublicKeyInfo DER (the standard
+  SPKI pin), in lowercase hex. It names the key, not the certificate, so a
+  re-issued certificate keeps the device's identity.
+- **Key strings:** for people, a key ID is shown and copied as Bech32 with the
+  prefix `ga` ("ga1" then 58 characters). The checksum catches typos instead
+  of naming another key. Everything that takes a key accepts either form.
+- **Host and Viewer** keep their identity in the data protection keychain
+  (`KeychainIdentity`), in the app's own keychain access group:
+  - The private key is made in the **Secure Enclave** when the Mac has one
+    (Apple silicon, or an Intel Mac with a T2), so it can't be exported or
+    copied to another Mac. Elsewhere it's a software key in the keychain.
+  - Items are `…AfterFirstUnlockThisDeviceOnly` and never synchronized:
+    each Mac has its own identity, so one can be revoked alone.
+  - The access group comes from the `keychain-access-groups` entitlement,
+    which needs the team's provisioning profile. It admits every build the
+    team signs, Debug and Release alike, with no keychain prompts.
+  - A build without that entitlement (no signing team) falls back to the
+    file identity below. Any other keychain failure is an error, not a
+    fallback: a silent switch would change the Mac's identity.
+- **The `glassact` CLI** (headless agents), and unsigned builds, keep a file
+  identity: PKCS#12 in `~/Library/Application Support/Glass Act` (directory
+  0700, file 0600, written atomically), imported memory-only. A bare
+  executable can't carry a provisioning profile. The PKCS#12 passphrase is a
+  fixed constant, so the file's permissions are its only protection.
+  - A key file that can be read but not imported (another passphrase,
+    corruption) is replaced with a fresh identity. Peers then see a new key:
+    a host refuses it as changed, and an agent is approved again.
+  - Once an app's identity is in the keychain, its old key file is deleted.
 
 **Viewer → host:**
 - The viewer pins the host's fingerprint if one was given.
-- Otherwise it trusts on first use and records `host:port fingerprint` in
-  `known_hosts`, with SSH accept-new semantics.
+- Otherwise it trusts on first use and records `host:port <key ID>` in
+  `known_host_keys`, with SSH accept-new semantics.
 - A changed key is a hard refusal. The viewer never redials into it.
 
 **Host → viewer:**
 - Mutual TLS on both tunnels. The host's verify block admits only
-  fingerprints in `authorized_viewers`, so everyone else is refused during the
+  key IDs in `approved_viewers`, so everyone else is refused during the
   handshake, before any app data.
 - What happens to an unknown key is the Host's **New Viewers** setting
   (`NewViewerPolicy`):
@@ -1115,16 +1133,17 @@ What an observer still sees:
   that very first exchange could capture the password. The viewer shows the
   host's key prefix so it can be compared.
 - Both sides show a **verification code** for the pair of keys: 80 bits of
-  SHA-256 over a domain separator plus both fingerprints, as 16 Crockford
+  SHA-256 over a domain separator (`…-v2`) plus both key IDs, as 16 Crockford
   base32 characters. Matching codes rule out a man in the middle, which also
   covers the viewer's first-use trust.
-- `authorized_viewers` has one line per key:
-  `<fp> [view] [kind=] [label=] [device=] [name=] [addr=] [approved=] [seen=]`.
-  A bare fingerprint means full control.
+- `approved_viewers` has one line per key:
+  `<key ID> [view] [kind=] [label=] [device=] [name=] [addr=] [approved=] [seen=]`.
+  A bare key ID means full control.
 
 **Known limits:**
-- Any process running as the same user can read the keys and use the agent
-  sockets.
+- Any process running as the same user can read the CLI's key file (and an
+  unsigned build's), and can use the agent sockets. The Host's and Viewer's
+  keys can't be read; code signed by another team can't use them either.
 - Agent status is self-declared, by certificate name or the input flag, so a
   modified client can avoid agent policy.
 - Under "Ask", nothing rate-limits approval prompts from new keys. (Under

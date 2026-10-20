@@ -159,7 +159,7 @@ struct ApprovedViewersView: View {
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
-                    .help(entry.fingerprint)
+                    .help(QUICIdentity.keyString(entry.fingerprint))
             }
             Spacer(minLength: 8)
             if isAgent {
@@ -180,7 +180,7 @@ struct ApprovedViewersView: View {
                 }
                 Button("Copy Key") {
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(entry.fingerprint, forType: .string)
+                    NSPasteboard.general.setString(QUICIdentity.keyString(entry.fingerprint), forType: .string)
                 }
                 Divider()
                 Button(isAgent ? "Forget Agent…" : "Forget Viewer…", role: .destructive) { forgetting = entry }

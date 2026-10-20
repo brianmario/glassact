@@ -64,13 +64,15 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// When this run of approval-wait redials began (nil when not waiting).
     private var approvalWaitStarted: Date?
     private static let approvalWaitLimit: TimeInterval = 180
-    /// This viewer's TLS identity (~/Library/Application Support/Glass Act/viewer-identity.p12), presented
-    /// to hosts; they admit it once their user approves its fingerprint.
+    /// This viewer's TLS identity (in the keychain; a file in unsigned
+    /// builds), presented to hosts; they admit it once their user approves
+    /// its key.
     private var viewerIdentity: SecIdentity?
+    private var viewerIdentitySource = ""
     private var viewerFingerprint = ""
-    /// Remembered host keys (trust on first use, ~/Library/Application Support/Glass Act/known_hosts).
+    /// Remembered host keys (trust on first use, ~/Library/Application Support/Glass Act/known_host_keys).
     private let knownHosts = KnownHosts(
-        url: AppPaths.dataDirectory.appendingPathComponent("known_hosts"))
+        url: AppPaths.dataDirectory.appendingPathComponent(IdentityFiles.knownHosts))
     private var dialHost = ""
     private var dialPort: UInt16 = 0
     /// The key this dial pinned ("" = trust on first use).
@@ -108,16 +110,17 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
             let dir = AppPaths.dataDirectory
-            let identity = try QUICIdentity.loadOrCreate(directory: dir, name: "viewer-identity",
-                                                         commonName: "glassact-viewer")
+            let (identity, source) = try QUICIdentity.loadForApp(directory: dir, name: "viewer-identity",
+                                                                 commonName: "glassact-viewer")
             viewerIdentity = identity
+            viewerIdentitySource = source.description
             viewerFingerprint = try QUICIdentity.fingerprint(of: identity)
-            print("glassact-viewer fingerprint: \(viewerFingerprint)")
+            print("glassact-viewer key: \(QUICIdentity.keyString(viewerFingerprint)) (\(source.description))")
         } catch {
             print("glassact-viewer: identity error: \(error)")
         }
         SessionLog.shared.writeHeader(arguments: CommandLine.arguments)
-        SessionLog.shared.write("identity", "viewer_fp=\(viewerFingerprint)")
+        SessionLog.shared.write("identity", "viewer_fp=\(viewerFingerprint) source=\(viewerIdentitySource)")
         print("glassact-viewer: session log \(SessionLog.shared.url.path)")
         model.restore()
         model.onConnect = { [weak self] in self?.connect() }

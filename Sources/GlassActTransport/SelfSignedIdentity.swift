@@ -31,6 +31,18 @@ enum SelfSignedIdentity {
 
     static func makeCertificate(key: P256.Signing.PrivateKey, commonName: String,
                                 validFor days: Int, now: Date) throws -> [UInt8] {
+        try makeCertificate(publicKey: key.publicKey.x963Representation, commonName: commonName,
+                            validFor: days, now: now) { tbs in
+            try key.signature(for: Data(tbs)).derRepresentation
+        }
+    }
+
+    /// The same certificate for a key we can only sign with, not hold: one
+    /// in the Keychain or the Secure Enclave. `publicKey` is the X9.63 point
+    /// (65 bytes); `sign` returns an ECDSA-SHA256 signature over its input,
+    /// DER-encoded.
+    static func makeCertificate(publicKey: Data, commonName: String, validFor days: Int, now: Date,
+                                sign: ([UInt8]) throws -> Data) throws -> [UInt8] {
         var serial = [UInt8](repeating: 0, count: 16)
         for i in serial.indices { serial[i] = UInt8.random(in: 0...255) }
         serial[0] &= 0x7F // positive
@@ -41,7 +53,7 @@ enum SelfSignedIdentity {
         let signatureAlgorithm = DER.sequence([DER.oid(OID.ecdsaWithSHA256)])
         let spki = DER.sequence([
             DER.sequence([DER.oid(OID.ecPublicKey), DER.oid(OID.prime256v1)]),
-            DER.bitString([UInt8](key.publicKey.x963Representation)),
+            DER.bitString([UInt8](publicKey)),
         ])
         let notBefore = now.addingTimeInterval(-86_400) // tolerate clock skew
         let notAfter = now.addingTimeInterval(TimeInterval(days) * 86_400)
@@ -54,7 +66,7 @@ enum SelfSignedIdentity {
             name,
             spki,
         ])
-        let signature = try key.signature(for: Data(tbs)).derRepresentation
+        let signature = try sign(tbs)
         return DER.sequence([tbs, signatureAlgorithm, DER.bitString([UInt8](signature))])
     }
 

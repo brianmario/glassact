@@ -89,7 +89,12 @@ xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build   # or Viewer
   timeout). Check `defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists`;
   if it's empty, re-sign in to Xcode and re-run.
 - **Signing setup:** `Apps/Signing.local.xcconfig` (git-ignored) sets
-  `DEVELOPMENT_TEAM` and optionally `GLASSACT_BUNDLE_PREFIX`.
+  `DEVELOPMENT_TEAM` and optionally `GLASSACT_BUNDLE_PREFIX`. With a team,
+  the apps carry a keychain entitlement and need a provisioning profile:
+  the first signed build after a profile change needs
+  `-allowProvisioningUpdates` and the Xcode account. Builds signed by the
+  team, Debug and Release alike, share the apps' keychain keys, so
+  rebuilding never prompts or changes a key.
 - **Env flags** (Host): `GLASSACT_TILE_ONLY=1` disables video (no video caps
   are offered; tiles only). The `*_DEBUG` flags add logging, and
   `GLASSACT_TRACE_TILE=<idx>` logs every change to one tile.

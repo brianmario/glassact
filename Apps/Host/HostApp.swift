@@ -544,16 +544,9 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         return holder
     }
 
-    /// "e6c9 2d22 cb33 … 8c13 6390".
+    /// "ga1qz8fw3k5… …0d2yhqw4".
     nonisolated static func abbreviated(_ fp: String) -> String {
-        guard fp.count > 24 else { return fp }
-        func groups(_ s: Substring) -> String {
-            stride(from: 0, to: s.count, by: 4).map { i -> String in
-                let lo = s.index(s.startIndex, offsetBy: i)
-                return String(s[lo..<s.index(lo, offsetBy: min(4, s.count - i))])
-            }.joined(separator: " ")
-        }
-        return groups(fp.prefix(12)) + " … " + groups(fp.suffix(8))
+        QUICIdentity.abbreviatedKeyString(fp)
     }
 
     // MARK: - Actions
@@ -649,7 +642,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     @objc private func copyFingerprint() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(controller.fingerprint, forType: .string)
+        NSPasteboard.general.setString(QUICIdentity.keyString(controller.fingerprint), forType: .string)
     }
 
     @objc private func showAbout() {
