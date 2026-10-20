@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Toolchain
         run: xcodebuild -version && swift --version
+      - name: Version
+        run: scripts/check-version
       - name: Build
         run: swift build --build-tests
       - name: Test

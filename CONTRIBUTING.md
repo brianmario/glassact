@@ -62,7 +62,8 @@ where the key lives.
 
 `just release` builds Developer ID–signed, notarized apps. It needs a
 Developer ID certificate and an Apple ID signed in to Xcode; AGENTS.md
-covers its quirks.
+covers its quirks. Published releases come from a tag and the Release
+workflow instead; see [RELEASING.md](RELEASING.md).
 
 ## Permissions (TCC)
 

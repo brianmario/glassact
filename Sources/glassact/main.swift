@@ -11,7 +11,7 @@ import Foundation
 import GlassActSession
 import GlassActTransport
 
-let version = "0.1"
+let version = "0.1.0" // = GLASSACT_VERSION in Apps/Version.xcconfig (scripts/check-version)
 
 struct Usage: Error, CustomStringConvertible {
     let description: String
