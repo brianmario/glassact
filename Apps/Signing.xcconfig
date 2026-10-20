@@ -14,6 +14,7 @@
 // reads both from these files too.
 
 #include "Version.xcconfig"
+#include "Updates.xcconfig"
 
 DEVELOPMENT_TEAM =
 GLASSACT_BUNDLE_PREFIX = app.glassact

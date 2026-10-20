@@ -55,6 +55,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private let model = ConnectModel()
     /// MetricKit crash and hang reports, and the notice after one (§13).
     private var crashReporter: CrashReporter!
+    /// Sparkle updates (§13).
+    private var updater: AppUpdater!
     private let settings = ViewerSettings.shared
     private var connectWindow: NSWindow!
     private var settingsWindow: NSWindow?
@@ -131,6 +133,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         model.onReportCrash = { [weak self] in self?.crashReporter.report() }
         model.onDismissCrash = { [weak self] in self?.crashReporter.dismiss() }
         crashReporter.start()
+        updater = AppUpdater { [weak self] text in self?.note(text) }
+        updater.start()
         model.restore()
         model.onConnect = { [weak self] in self?.connect() }
         model.onCancel = { [weak self] in self?.cancelConnecting() }
@@ -325,6 +329,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         NSApp.servicesMenu = services
         submenu("Glass Act Viewer", [
             item("About Glass Act Viewer", #selector(showAbout), target: self),
+        ] + (updater.isEnabled ? [updater.menuItem()] : []) + [
             .separator(),
             item("Settings…", #selector(showSettings), ",", target: self),
             .separator(),
@@ -467,6 +472,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             guard let self, let controller, self.controller === controller else { return }
             self.handleHostEndedSession(reason)
         }
+        controller.onIncompatibleHost = { [weak self, weak controller] version in
+            guard let self, let controller, self.controller === controller else { return }
+            self.handleIncompatibleHost(version)
+        }
         controller.onGeometryChanged = { [weak self] w, h in self?.handleGeometryChanged(w, h) }
         singleWindowMode = model.shareMode == .window
         controller.setQualityPrefs(floor: settings.qualityFloor, preferSharpness: settings.preferSharpness)
@@ -566,6 +575,32 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         SessionLog.shared.write("ended_by_host", "reason=\"\(reason)\"")
         endSession()
         model.notice = .init(kind: .info, text: "“\(sessionName)” ended the session: \(reason).")
+    }
+
+    /// The host runs a different build (another wire version): the two
+    /// ends must match (until 1.0 the protocol changes between builds), so
+    /// redialing can't help. Say which side is behind, and offer to update.
+    private func handleIncompatibleHost(_ hostVersion: UInt8) {
+        SessionLog.shared.write("incompatible_host", "host_wire=\(hostVersion) viewer_wire=\(WireVersion.current)")
+        endSession()
+        let hostNewer = hostVersion > WireVersion.current
+        let which = hostNewer ? "this Viewer" : "Glass Act Host on “\(sessionName)”"
+        model.notice = .init(kind: .problem,
+                             text: "Didn’t connect: “\(sessionName)” runs a \(hostNewer ? "newer" : "older") "
+                                 + "version of Glass Act. Update \(which).",
+                             detail: "host protocol \(hostVersion), this Viewer \(WireVersion.current)")
+        let alert = NSAlert()
+        alert.messageText = "“\(sessionName)” runs a different version of Glass Act"
+        alert.informativeText = "Glass Act Host and Viewer must be the same version. "
+            + (hostNewer ? "The Host is newer: update this Viewer."
+                         : "This Viewer is newer: update Glass Act Host on “\(sessionName)” (its menu › Check for Updates…).")
+        if hostNewer && updater.isEnabled {
+            alert.addButton(withTitle: "Check for Updates…")
+            alert.addButton(withTitle: "Not Now")
+            if alert.runModal() == .alertFirstButtonReturn { updater.checkForUpdates(nil) }
+        } else {
+            alert.runModal()
+        }
     }
 
     /// A pinned host presented a different key: never redial into it. Like

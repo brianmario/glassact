@@ -5,7 +5,9 @@
 #   Archive both apps with manual Developer ID signing and explicit
 #   provisioning profiles → export → notarize with an App Store Connect API
 #   key → staple → verify → zip. Also a universal, Developer ID–signed
-#   `glassact` CLI, the archives' dSYMs, and SHA256SUMS.
+#   `glassact` CLI, the archives' dSYMs, each app's Sparkle appcast, and
+#   SHA256SUMS. File names have no spaces: GitHub renames those in release
+#   assets, and the appcasts point at the assets by name.
 #
 # Needs: the "Developer ID Application" certificate in a keychain on the
 # search list, both profiles installed, and these variables:
@@ -16,6 +18,10 @@
 #   ASC_KEY_PATH, ASC_KEY_ID, ASC_ISSUER_ID
 #                     App Store Connect API key, for notarization
 #                     (NOTARIZE=0 skips it: a local check, not a release)
+#   SPARKLE_KEY_FILE  the EdDSA private key updates are signed with
+#                     (optional locally: without it, no appcasts)
+#   TAG               optional; default: v<version> (the appcasts' URLs)
+#   REPO              optional; default: brianmario/glassact
 #   BUILD_NUMBER      optional; default: UTC YYYYMMDDHHMM
 #   OUT               optional; default: build/ci-release (under Apps/)
 set -euo pipefail
@@ -27,6 +33,8 @@ if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?} ${ASC_ISSUER_ID:?}; 
 BUILD_NUMBER=${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}
 OUT=${OUT:-build/ci-release}
 VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9.]*\).*/\1/p' Version.xcconfig)
+TAG=${TAG:-v$VERSION}
+REPO=${REPO:-brianmario/glassact}
 IDENTITY="Developer ID Application"
 PREFIX=$(sed -n 's/^ *GLASSACT_BUNDLE_PREFIX *= *\([^ ]*\).*/\1/p' Signing.xcconfig | tail -1)
 
@@ -45,7 +53,7 @@ for SCHEME in Host Viewer; do
 	ARCHIVE=$OUT/$SCHEME.xcarchive
 	echo "▸ $SCHEME: archiving"
 	xcodebuild archive -quiet -project GlassActApps.xcodeproj -scheme $SCHEME -configuration Release \
-		-destination 'generic/platform=macOS' -archivePath $ARCHIVE \
+		-destination 'generic/platform=macOS' -archivePath $ARCHIVE -clonedSourcePackagesDirPath $OUT/packages \
 		DEVELOPMENT_TEAM=$TEAM CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" \
 		GLASSACT_PROFILE_$SCHEME="$PROFILE" \
 		GLASSACT_VERSION=$VERSION CURRENT_PROJECT_VERSION=$BUILD_NUMBER
@@ -69,7 +77,8 @@ PL
 	xcodebuild -exportArchive -quiet -archivePath $ARCHIVE -exportOptionsPlist $OUT/$SCHEME-export.plist \
 		-exportPath $OUT/$SCHEME
 	APP=$(echo $OUT/$SCHEME/*.app)
-	ZIP="$OUT/dist/${APP:t:r}.zip"
+	NAME="Glass-Act-$SCHEME-$VERSION"
+	ZIP="$OUT/dist/$NAME.zip"
 
 	echo "▸ $SCHEME: notarizing"
 	ditto -c -k --keepParent "$APP" "$ZIP"
@@ -86,7 +95,19 @@ PL
 		xcrun stapler validate -q "$APP"
 		spctl --assess --type execute "$APP"
 	fi
-	ditto -c -k --keepParent $ARCHIVE/dSYMs "$OUT/dist/${APP:t:r} dSYMs.zip"
+	ditto -c -k --keepParent $ARCHIVE/dSYMs "$OUT/dist/$NAME-dSYMs.zip"
+
+	if [[ -n ${SPARKLE_KEY_FILE:-} ]]; then
+		echo "▸ $SCHEME: appcast"
+		FEED=$OUT/feed-${(L)SCHEME}
+		mkdir -p $FEED && cp "$ZIP" $FEED/
+		$OUT/packages/artifacts/sparkle/Sparkle/bin/generate_appcast --ed-key-file "$SPARKLE_KEY_FILE" \
+			--download-url-prefix "https://github.com/$REPO/releases/download/$TAG/" \
+			--full-release-notes-url "https://github.com/$REPO/releases/tag/$TAG" \
+			--link "https://github.com/$REPO" -o "$OUT/dist/${(L)SCHEME}-appcast.xml" $FEED
+	else
+		echo "  (no SPARKLE_KEY_FILE: no appcast)"
+	fi
 	echo "✓ $SCHEME: ${ZIP:t}"
 done
 

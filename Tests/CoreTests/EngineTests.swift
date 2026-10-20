@@ -42,6 +42,28 @@ import GlassActTestSupport
         #expect(ver == WireVersion.current)
     }
 
+    @Test func viewerReportsAnIncompatibleHostBeforeFailing() {
+        let capture = CaptureTransport()
+        let viewer = ViewerEngine(transport: capture)
+        var events: [String] = []
+        viewer.onIncompatibleHost = { events.append("incompatible \($0)") }
+        viewer.onFailed = { _ in events.append("failed") }
+        let newer = WireVersion.current &+ 1
+        viewer.handleControl(Data(ControlMessage.hello(ver: newer, width: 64, height: 64, tileSize: 64,
+                                                       pixfmt: PixelFormat.bgra8sRGB, caps: 0).encoded()), nowUS: 0)
+        #expect(events == ["incompatible \(newer)", "failed"], "the app hears why before the failure")
+
+        // Another rejected HELLO isn't a version problem.
+        let other = ViewerEngine(transport: CaptureTransport())
+        var incompatible = false
+        other.onIncompatibleHost = { _ in incompatible = true }
+        other.handleControl(Data(ControlMessage.hello(ver: WireVersion.current, width: 65_535, height: 65_535,
+                                                      tileSize: 64, pixfmt: PixelFormat.bgra8sRGB,
+                                                      caps: 0).encoded()), nowUS: 0)
+        #expect(other.state == .failed)
+        #expect(!incompatible)
+    }
+
     @Test func viewerRejectsUnreasonableGeometry() {
         let capture = CaptureTransport()
         let viewer = ViewerEngine(transport: capture)

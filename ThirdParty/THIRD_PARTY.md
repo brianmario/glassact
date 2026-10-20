@@ -35,3 +35,34 @@ the exception to the default no-dependencies posture.
   reproduce the copyright notice. Both apps bundle
   `Apps/Shared/Acknowledgements.txt` (Glass Act's MIT license, libwebp's
   `COPYING` and `PATENTS`) and show it in their About panel.
+
+## Sparkle 2.10.0 (apps only, through Swift Package Manager)
+
+- **Upstream:** https://github.com/sparkle-project/Sparkle, tag `2.10.0`
+  (revision `eef1a539a373c1f1a320624b1130fc5de7b2e100`, published
+  2026-09-13). Not vendored: the Xcode project depends on it at that exact
+  version, and `Apps/GlassActApps.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
+  pins it. Its Swift package ships a checksummed binary `Sparkle.xcframework`
+  (universal) and the `generate_appcast` / `generate_keys` tools.
+- **License:** MIT, plus the licenses of code it bundles (bsdiff, sais-lite,
+  an Ed25519 implementation, SUSignatureVerifier). All of it is reproduced
+  in `Apps/Shared/Acknowledgements.txt`, shown in both apps' About panels.
+- **Scope used:** the Host and Viewer apps only (`Apps/Shared/AppUpdater.swift`);
+  the Swift package and the `glassact` CLI don't link it. The Viewer, being
+  sandboxed, uses Sparkle's Installer XPC service
+  (`SUEnableInstallerLauncherService`, and the `-spks` / `-spki` mach-lookup
+  exceptions in `Apps/Shared/Viewer*.entitlements`).
+- **Why:** updates for apps distributed outside the App Store. Sparkle
+  verifies every update twice: an EdDSA signature from the release key
+  (the public half in `SUPublicEDKey`), and Apple's code signature, which
+  must match the running app's team. It replaces a running app and relaunches
+  it, from a sandboxed app as well. Writing that ourselves is
+  security-sensitive work with no upside; there's no system framework for it.
+  Chosen by the project owner as the second exception to the
+  no-dependencies rule (2026-10-20).
+- **Update procedure:** change the version in the Xcode project (the
+  `XCRemoteSwiftPackageReference "Sparkle"`), resolve
+  (`xcodebuild -resolvePackageDependencies`), and commit the new
+  `Package.resolved`. Replace the Sparkle section of
+  `Apps/Shared/Acknowledgements.txt` with the new `LICENSE`. Build both apps
+  and run the local update test in RELEASING.md before landing.

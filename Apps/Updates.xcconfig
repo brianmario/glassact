@@ -1,0 +1,10 @@
+// Updates through Sparkle (DESIGN §13, RELEASING.md).
+//
+// Each app reads its own appcast from the newest published GitHub release:
+// host-appcast.xml or viewer-appcast.xml, attached by the Release workflow.
+GLASSACT_UPDATE_FEED_URL = https:/$()/github.com/brianmario/glassact/releases/latest/download/$(TARGET_NAME:lower)-appcast.xml
+
+// The EdDSA public key updates are signed with (Sparkle's generate_keys;
+// the private half is the SPARKLE_ED_PRIVATE_KEY secret). Empty: the apps
+// don't check for updates at all — a fork, or before the key exists.
+GLASSACT_SPARKLE_PUBLIC_KEY =

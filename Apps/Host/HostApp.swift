@@ -73,6 +73,8 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
     private var identityError: String?
     /// MetricKit crash and hang reports, and the notice after one (§13).
     private var crashReporter: CrashReporter!
+    /// Sparkle updates (§13). An update waits while a viewer is connected.
+    private var updater: AppUpdater!
     private var crashNoticeWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -87,7 +89,10 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             DispatchQueue.main.async { self?.statusLine = text }
         }
         controller.onPhase = { [weak self] _ in
-            MainActor.assumeIsolated { self?.phaseChanged() }
+            MainActor.assumeIsolated {
+                self?.phaseChanged()
+                if self?.controller.phase != .viewerConnected { self?.updater?.relaunchMayProceed() }
+            }
         }
         controller.onPermissionProblem = { [weak self] in
             MainActor.assumeIsolated { self?.showSetup(recheck: true) }
@@ -106,6 +111,9 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         crashReporter.onNotice = { [weak self] notice in self?.crashNoticeChanged(notice) }
         crashReporter.start()
+        updater = AppUpdater { [weak self] text in self?.controller.onStatus(text) }
+        updater.mayRelaunch = { [weak self] in self?.controller.phase != .viewerConnected }
+        updater.start()
         permissions.startLocalNetworkCheck()
         requiredWereGranted = permissions.requiredGranted
         // Cheap no-prompt checks; catches a permission switched off in
@@ -438,6 +446,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         menu.addItem(developerItem())
         menu.addItem(.separator())
         menu.addItem(item("About Glass Act Host", symbol: nil, action: #selector(showAbout)))
+        if updater?.isEnabled == true { menu.addItem(updater.menuItem()) }
         let quit = NSMenuItem(title: "Quit Glass Act Host", action: #selector(NSApplication.terminate(_:)),
                               keyEquivalent: "q")
         menu.addItem(quit)

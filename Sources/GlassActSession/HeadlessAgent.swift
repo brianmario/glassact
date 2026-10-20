@@ -121,6 +121,13 @@ public final class HeadlessAgent {
                            + "refusing to connect. If that's expected, forget it: glassact forget \(target)")
             self?.stop("host key changed")
         }
+        session.onIncompatibleHost = { [weak self] version in
+            let hostNewer = version > WireVersion.current
+            self?.onStatus("the host runs a different Glass Act version (protocol \(version), this glassact "
+                           + "\(WireVersion.current)) — update \(hostNewer ? "glassact" : "Glass Act Host"); "
+                           + "both ends must be the same version")
+            self?.stop("incompatible host version")
+        }
         session.onHostEndedSession = { [weak self] reason in
             self?.onStatus("the host ended the session: \(reason)")
             self?.stop(reason)

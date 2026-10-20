@@ -137,6 +137,19 @@ Agents work two ways:
 - a menu bar indicator while an agent is active;
 - an audit log of every action. Typed text is counted, not recorded.
 
+## Updates
+
+Both apps update themselves through [Sparkle](https://sparkle-project.org)
+from this repository's releases. On the second launch each asks whether to
+check automatically; **Check for Updates…** is in the Host's menu and the
+Viewer's app menu either way. An update installs only if it's signed with
+the project's release key and by the same developer as the app you have.
+
+- The Host waits until no viewer is connected before installing, so an update
+  never drops your session.
+- Host and Viewer must be the same version. If they aren't, the Viewer says
+  which one to update.
+
 ## Security
 
 - **Always encrypted:** everything — pixels, video, input, clipboard — rides
@@ -208,4 +221,5 @@ Developer tools:
 ## License
 
 MIT — see [LICENSE](LICENSE). The bundled libwebp keeps its BSD-3-Clause
-license and patent grant; see [ThirdParty/THIRD_PARTY.md](ThirdParty/THIRD_PARTY.md).
+license and patent grant, and Sparkle (updates) its MIT license; see
+[ThirdParty/THIRD_PARTY.md](ThirdParty/THIRD_PARTY.md).

@@ -15,7 +15,8 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
 - [`just`](https://github.com/casey/just).
 
 The package uses system frameworks only, plus the vendored libwebp in
-`ThirdParty/`. Don't add dependencies.
+`ThirdParty/`; the apps also use Sparkle for updates. Don't add
+dependencies.
 
 ## Building
 

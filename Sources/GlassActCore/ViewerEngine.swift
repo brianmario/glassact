@@ -109,6 +109,10 @@ public final class ViewerEngine: @unchecked Sendable {
     /// peer, undecodable video). It sends nothing more; the app must tear
     /// the session down and reconnect. Fires on the engine queue, once.
     public var onFailed: ((_ reason: String) -> Void)?
+    /// The host speaks another wire version (§3.2): the two ends are
+    /// different builds. Fires on the engine queue just before `onFailed`,
+    /// so the app can stop redialing and say which side to update.
+    public var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
     /// Last time any control bytes arrived (the host PINGs at 1 Hz while
     /// running) — the app's liveness watchdog reads this. Engine queue.
     public private(set) var lastControlRxUS: UInt64 = 0
@@ -393,6 +397,7 @@ public final class ViewerEngine: @unchecked Sendable {
                     // connection (no reconnect); we configure from that one.
                     break
                 }
+                if !WireVersion.isCompatible(ver) { onIncompatibleHost?(ver) }
                 guard WireVersion.isCompatible(ver),
                       tileSize == UInt8(TileGrid.tileSize),
                       pixfmt == PixelFormat.bgra8sRGB,
