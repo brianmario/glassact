@@ -188,7 +188,7 @@ public final class MCPServer {
     static var tools: [[String: Any]] { [
         ["name": "connect", "description": "Connect a headless agent session to a Mac running Glass Act Host. The first time, the host's user must approve it (a verification code is shown).",
          "inputSchema": schema(["host": ["type": "string", "description": "host name or address, e.g. my-mac.local"],
-                                "port": int, "fingerprint": ["type": "string", "description": "host key to pin (optional)"],
+                                "port": int, "fingerprint": ["type": "string", "description": "host key to pin (optional): a ga1… key string or hex"],
                                 "size": ["type": "string", "description": "ask for a virtual display of WxH points, e.g. 1440x900 (optional)"],
                                 "label": ["type": "string", "description": "how the host names this agent"],
                                 "session": ["type": "string", "description": "session name (default: default)"]],

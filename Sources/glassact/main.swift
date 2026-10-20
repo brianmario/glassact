@@ -65,7 +65,8 @@ let usage = """
 
     Sessions
       glassact connect HOST [--port 4433] [--fingerprint KEY] [--size WxH] [--label NAME] [--name SESSION]
-                                       start a headless agent session (the host's user approves it once)
+                                       start a headless agent session (the host's user approves it once);
+                                       KEY pins the host's key, as Copy Host Key gives it (ga1…) or hex
       glassact disconnect                 end the headless session
       glassact sessions                   list running sessions
       glassact status                     connection, screen size, whether input is accepted
@@ -160,7 +161,7 @@ func runDaemon(_ p: Parsed) throws -> Never {
             let agent = try HeadlessAgent(config: config)
             func stamp() -> String { ISO8601DateFormatter().string(from: Date()) }
             agent.onStatus = { print("\(stamp()) \($0)"); fflush(stdout) }
-            agent.onStatus("agent key \(agent.agentFingerprint.prefix(16))… dialing \(host):\(config.port)")
+            agent.onStatus("agent key \(QUICIdentity.abbreviatedKeyString(agent.agentFingerprint)) dialing \(host):\(config.port)")
             let inner = agent.handler
             let server = AgentSocketServer(path: AgentPaths.headlessSocket(name)) { op, args in
                 if op == "disconnect" {
@@ -266,7 +267,7 @@ func run() throws {
         guard let target = p.positional.first else { throw Usage("forget needs HOST[:PORT]") }
         let parts = target.split(separator: ":")
         let port = parts.count > 1 ? UInt16(parts[1]) ?? 4433 : 4433
-        let known = KnownHosts(url: AgentPaths.dataDirectory.appendingPathComponent("known_hosts"))
+        let known = KnownHosts(url: AgentPaths.dataDirectory.appendingPathComponent(IdentityFiles.knownHosts))
         try known.forget(host: String(parts[0]), port: port)
         print("forgot \(parts[0]):\(port)")
     case "screenshot", "zoom":

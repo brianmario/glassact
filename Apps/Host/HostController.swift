@@ -251,14 +251,15 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var frameWidth = 0 // encodeQueue: size of the latest captured frame
     private var frameHeight = 0
 
-    // MARK: - Identity (self-signed, generated on first run)
+    // MARK: - Identity (self-signed, made on first run; §13)
 
     func loadIdentity() throws {
-        let loaded = try QUICIdentity.loadOrCreate(directory: Self.dataDirectory, name: "identity",
-                                                   commonName: "glassact-host")
+        let (loaded, source) = try QUICIdentity.loadForApp(directory: Self.dataDirectory, name: "identity",
+                                                           commonName: "glassact-host")
         identity = loaded
         fingerprint = try QUICIdentity.fingerprint(of: loaded)
-        print("glassact-host fingerprint: \(fingerprint)")
+        print("glassact-host key: \(QUICIdentity.keyString(fingerprint))")
+        onStatus("identity: \(source.description)")
         onStatus("ready (port \(Self.controlPort))")
     }
 
@@ -272,7 +273,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// viewer is refused during the TLS handshake, before it sees a pixel or
     /// can inject input.
     let authorizedViewers = AuthorizedViewers(
-        url: HostController.dataDirectory.appendingPathComponent("authorized_viewers"))
+        url: HostController.dataDirectory.appendingPathComponent(IdentityFiles.approvedViewers))
     /// What agents may do here, and the record of what they did.
     let agentAccess = AgentAccess()
     let agentAudit = AgentAudit(directory: HostController.dataDirectory)
@@ -347,7 +348,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         switch event {
         case let .signedIn(approval):
             let who = approval.device.isEmpty ? "A new viewer" : "“\(approval.device)”"
-            onStatus("viewer \(approval.fingerprint.prefix(12))… signed in from \(approval.address)")
+            onStatus("viewer \(QUICIdentity.abbreviatedKeyString(approval.fingerprint)) signed in from \(approval.address)")
             HostNotifications.post(title: "New viewer signed in",
                                    body: "\(who) can now connect to this Mac. Forget it in Approved Viewers if that wasn’t you.")
         case let .wrongPassword(address):
@@ -373,23 +374,23 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         let code = QUICIdentity.verificationCode(hostFingerprint: self.fingerprint,
                                                  viewerFingerprint: fingerprint)
         let who = peer.isAgent ? "agent" : "viewer"
-        onStatus("\(who) \(fingerprint.prefix(12))… is asking to connect (code \(code))")
+        onStatus("\(who) \(QUICIdentity.abbreviatedKeyString(fingerprint)) is asking to connect (code \(code))")
         let decision = MainActor.assumeIsolated {
             ApprovalAlert.run(code: code, viewerFingerprint: fingerprint, isAgent: peer.isAgent)
         }
         guard decision != .deny else {
             deniedThisRun.insert(fingerprint)
-            onStatus("\(who) \(fingerprint.prefix(12))… denied")
-            if peer.isAgent { agentAudit.log("approval denied for agent key \(fingerprint.prefix(16))") }
+            onStatus("\(who) \(QUICIdentity.abbreviatedKeyString(fingerprint)) denied")
+            if peer.isAgent { agentAudit.log("approval denied for agent key \(QUICIdentity.abbreviatedKeyString(fingerprint))") }
             return
         }
         do {
             try authorizedViewers.add(fingerprint, viewOnly: decision == .viewOnly,
                                       kind: peer.isAgent ? .agent : .viewer)
-            onStatus("\(who) \(fingerprint.prefix(12))… approved\(decision == .viewOnly ? " (view only)" : "") "
+            onStatus("\(who) \(QUICIdentity.abbreviatedKeyString(fingerprint)) approved\(decision == .viewOnly ? " (view only)" : "") "
                      + "— connecting on its next retry")
             if peer.isAgent {
-                agentAudit.log("approved agent key \(fingerprint.prefix(16)) for \(decision == .viewOnly ? "viewing only" : "control")")
+                agentAudit.log("approved agent key \(QUICIdentity.abbreviatedKeyString(fingerprint)) for \(decision == .viewOnly ? "viewing only" : "control")")
             }
             approvalsChanged()
         } catch {
@@ -414,13 +415,13 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         }
         deniedThisRun.remove(fingerprint)
         let what = entry?.kind == .agent ? "agent" : "viewer"
-        if entry?.kind == .agent { agentAudit.log("forgot agent key \(fingerprint.prefix(16))") }
+        if entry?.kind == .agent { agentAudit.log("forgot agent key \(QUICIdentity.abbreviatedKeyString(fingerprint))") }
         if connectedViewerFingerprint == fingerprint, transport != nil {
             endSession()
             server?.resetSession()
-            onStatus("\(what) \(fingerprint.prefix(12))… forgotten and disconnected")
+            onStatus("\(what) \(QUICIdentity.abbreviatedKeyString(fingerprint)) forgotten and disconnected")
         } else {
-            onStatus("\(what) \(fingerprint.prefix(12))… forgotten")
+            onStatus("\(what) \(QUICIdentity.abbreviatedKeyString(fingerprint)) forgotten")
         }
         approvalsChanged()
     }
@@ -444,7 +445,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             onStatus("couldn't change access: \(error.localizedDescription)")
             return
         }
-        agentAudit.log("key \(fingerprint.prefix(16)) set to \(viewOnly ? "view only" : "control") at this Mac")
+        agentAudit.log("key \(QUICIdentity.abbreviatedKeyString(fingerprint)) set to \(viewOnly ? "view only" : "control") at this Mac")
         if connectedViewerFingerprint == fingerprint { agentAccess.setViewOnly(viewOnly) }
         approvalsChanged()
     }
@@ -1205,7 +1206,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
 
     var sessionPeerSummary: String {
         guard let peer = transport?.peerCertificate ?? sessionTransport?.peerCertificate else { return "viewer key unknown" }
-        return "\(peer.isAgent ? "agent" : "viewer") key \(peer.fingerprint.prefix(16))"
+        return "\(peer.isAgent ? "agent" : "viewer") key \(QUICIdentity.abbreviatedKeyString(peer.fingerprint))"
     }
 
     /// TEXT_INPUT → Unicode key events (20 UTF-16 units per event, the most

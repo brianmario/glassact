@@ -84,11 +84,11 @@ struct SettingsView: View {
                             .font(.callout.monospaced())
                             .foregroundStyle(.secondary)
                             .fixedSize()
-                            .help(viewerFingerprint)
+                            .help(QUICIdentity.keyString(viewerFingerprint))
                             .textSelection(.enabled)
                         Button(copied ? "Copied" : "Copy") {
                             NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(viewerFingerprint, forType: .string)
+                            NSPasteboard.general.setString(QUICIdentity.keyString(viewerFingerprint), forType: .string)
                             copied = true
                         }
                         .disabled(viewerFingerprint.isEmpty)
@@ -143,16 +143,7 @@ struct SettingsView: View {
     }
 
     /// "e6c9 2d22 cb33 … 8c13 6390".
-    static func abbreviated(_ fp: String) -> String {
-        guard fp.count > 24 else { return fp }
-        func groups(_ s: Substring) -> String {
-            stride(from: 0, to: s.count, by: 4).map { i -> String in
-                let lo = s.index(s.startIndex, offsetBy: i)
-                return String(s[lo..<s.index(lo, offsetBy: min(4, s.count - i))])
-            }.joined(separator: " ")
-        }
-        return groups(fp.prefix(12)) + " … " + groups(fp.suffix(8))
-    }
+    static func abbreviated(_ fp: String) -> String { QUICIdentity.abbreviatedKeyString(fp) }
 }
 
 private extension Text {

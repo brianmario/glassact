@@ -136,11 +136,16 @@ Agents work two ways:
   - Signing in approves a key with the Host Mac's password, which travels
     encrypted and only to the Host key the Viewer trusts. Wrong passwords
     are rate-limited well below macOS's own lockout.
-- **Keys:** P-256 keys live in `~/Library/Application Support/Glass Act/`,
-  readable only by you. They are not yet in the keychain.
+- **Keys:** each Mac has its own P-256 key, never synced.
+  - The Host and Viewer keep theirs in the keychain, made in the Secure
+    Enclave when the Mac has one (Apple silicon, or Intel with a T2), so it
+    can't be copied off the Mac.
+  - The `glassact` CLI, and builds without a signing team, keep a key file in
+    `~/Library/Application Support/Glass Act/`, readable only by you.
+  - Keys are shown and copied as short checksummed strings (`ga1…`).
 - **Known limits:**
-  - Other programs running as your user can read those keys and use the
-    agent sockets.
+  - Other programs running as your user can read the CLI's key file and use
+    the agent sockets.
   - Agent status is declared by the client.
   - The apps are unsandboxed, and use private API for the virtual display and
     screen locking.
@@ -155,7 +160,8 @@ privately, not in a public issue.
 
 | what | where |
 |---|---|
-| keys, approvals, known hosts, agent sockets, audit log, traces | `~/Library/Application Support/Glass Act/` |
+| Host and Viewer keys | the login keychain (data protection), "Glass Act … identity" |
+| CLI key, approvals, known hosts, agent sockets, audit log, traces | `~/Library/Application Support/Glass Act/` |
 | Viewer logs, logs uploaded to the Host | `~/Library/Logs/Glass Act/` |
 | Host's unified log | `/usr/bin/log stream --predicate 'subsystem == "app.glassact.host"'` |
 

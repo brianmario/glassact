@@ -52,6 +52,14 @@ an app ID belongs to the team that registered it first, so your team
 can't sign `app.glassact.host`. Pick a prefix of your own and keep it
 stable; grants follow the bundle ID and team.
 
+With a team set, the apps also get a keychain entitlement and keep their
+keys in the keychain (DESIGN §13). That entitlement needs a provisioning
+profile: Xcode's automatic signing makes one the first time you build
+(from Xcode, or `xcodebuild … -allowProvisioningUpdates` with your Apple ID
+signed in to Xcode) and caches it. Without a team the apps get no
+entitlements and keep their keys in files, which works the same apart from
+where the key lives.
+
 `just release` builds Developer ID–signed, notarized apps. It needs a
 Developer ID certificate and an Apple ID signed in to Xcode; AGENTS.md
 covers its quirks.

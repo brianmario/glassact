@@ -1,4 +1,5 @@
 import AppKit
+import GlassActTransport
 
 /// The one decision the host ever asks of its user: let this viewer in?
 /// The verification code is the point of the dialog, so it's the biggest
@@ -113,15 +114,8 @@ enum ApprovalAlert {
         return container
     }
 
-    /// "e6c9 2d22 cb33 … 8c13 6390": enough to tell keys apart at a glance.
+    /// "ga1qz8fw3k5… …0d2yhqw4": enough to tell keys apart at a glance.
     private static func abbreviated(_ fp: String) -> String {
-        guard fp.count > 24 else { return fp }
-        func groups(_ s: Substring) -> String {
-            stride(from: 0, to: s.count, by: 4).map { i -> String in
-                let lo = s.index(s.startIndex, offsetBy: i)
-                return String(s[lo..<s.index(lo, offsetBy: min(4, s.count - i))])
-            }.joined(separator: " ")
-        }
-        return groups(fp.prefix(12)) + " … " + groups(fp.suffix(8))
+        QUICIdentity.abbreviatedKeyString(fp)
     }
 }

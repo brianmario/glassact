@@ -4,7 +4,8 @@ public import Security
 import Synchronization
 
 /// TLS identities for both ends. Each side has a self-signed certificate;
-/// the peer is authenticated by the SHA-256 fingerprint of its leaf DER:
+/// the peer is authenticated by its key ID, the SHA-256 of the leaf's
+/// public key (SPKI), not of the certificate:
 ///
 ///   - the viewer pins the host's fingerprint (typed in / passed by flag);
 ///   - the host admits only viewer fingerprints its user approved
@@ -96,10 +97,36 @@ public enum QUICIdentity {
         return fingerprint(of: cert)
     }
 
-    /// SHA-256 of the certificate DER, lowercase hex.
+    /// A device's key ID: SHA-256 of its public key's SubjectPublicKeyInfo
+    /// DER (the "SPKI pin"), lowercase hex. Keyed by the public key, not the
+    /// certificate, so a device keeps its identity when its certificate is
+    /// re-issued, and a key can be approved before its certificate is ever
+    /// seen. Every Glass Act key is P-256; anything else hashes its whole
+    /// certificate, which matches nothing we approve.
     public static func fingerprint(of certificate: SecCertificate) -> String {
-        let der = SecCertificateCopyData(certificate) as Data
-        return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
+        guard let key = SecCertificateCopyKey(certificate),
+              let point = SecKeyCopyExternalRepresentation(key, nil) as Data?,
+              point.count == 65, point.first == 0x04
+        else {
+            return hex(SHA256.hash(data: SecCertificateCopyData(certificate) as Data))
+        }
+        return hex(SHA256.hash(data: p256SPKIPrefix + point))
+    }
+
+    /// SHA-256 SPKI pin of a raw P-256 public key (X9.63, 65 bytes).
+    public static func fingerprint(p256PublicKey point: Data) -> String {
+        hex(SHA256.hash(data: p256SPKIPrefix + point))
+    }
+
+    /// DER of SubjectPublicKeyInfo for a P-256 key, up to the 65-byte point:
+    /// SEQUENCE { SEQUENCE { id-ecPublicKey, prime256v1 }, BIT STRING (0 unused) }.
+    static let p256SPKIPrefix = Data([
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ])
+
+    private static func hex(_ digest: SHA256.Digest) -> String {
+        digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Fingerprint of the leaf certificate a TLS peer presented, if any.
@@ -117,12 +144,54 @@ public enum QUICIdentity {
         return .init(fingerprint: fingerprint(of: leaf), commonName: (cn as String?) ?? "")
     }
 
+    /// A key ID as stored and compared: 64 lowercase hex digits. Accepts the
+    /// hex form (colons and case ignored) or a short key string
+    /// (`keyString`); anything else comes back unchanged, lowercased, and
+    /// fails the callers' 64-hex check.
     public static func normalize(_ fingerprint: String) -> String {
-        fingerprint.lowercased().replacingOccurrences(of: ":", with: "")
+        let trimmed = fingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let bytes = KeyString.decode(trimmed) { return bytes.map { String(format: "%02x", $0) }.joined() }
+        return trimmed.lowercased().replacingOccurrences(of: ":", with: "")
+    }
+
+    /// The short, checksummed form of a key ID for people to copy, paste and
+    /// compare: Bech32 with the prefix `ga` ("ga1" then 58 characters). A
+    /// typo fails the checksum instead of silently naming another key.
+    /// Returns the input unchanged if it isn't a key ID.
+    public static func keyString(_ fingerprint: String) -> String {
+        let hex = normalize(fingerprint)
+        guard hex.count == 64, let bytes = hexBytesStrict(hex) else { return fingerprint }
+        return KeyString.encode(bytes)
+    }
+
+    /// The start and end of the key string, "ga1qz8fw3k5… …0d2yhqw4": enough
+    /// to tell keys apart at a glance.
+    public static func abbreviatedKeyString(_ fingerprint: String) -> String {
+        let key = keyString(fingerprint)
+        guard key.count > 24 else { return key }
+        return key.prefix(11) + "… …" + key.suffix(8)
+    }
+
+    static func hexBytesStrict(_ hex: String) -> [UInt8]? {
+        var out: [UInt8] = []
+        var it = hex.makeIterator()
+        while let hi = it.next() {
+            guard let lo = it.next(), let byte = UInt8(String([hi, lo]), radix: 16) else { return nil }
+            out.append(byte)
+        }
+        return out
     }
 }
 
-/// The host's allowlist of viewer certificate fingerprints, persisted one per
+/// File names in the data directory. Key IDs changed from certificate to
+/// public-key hashes, so the lists moved to new names: an old entry can
+/// never match, and an old known host would read as a changed key.
+public enum IdentityFiles {
+    public static let approvedViewers = "approved_viewers"
+    public static let knownHosts = "known_host_keys"
+}
+
+/// The host's allowlist of viewer key IDs (`QUICIdentity.fingerprint`), persisted one per
 /// line (file 0600): `<fingerprint>` then optional space-separated fields —
 /// `view` (approved to watch only; offered for agents), `kind=agent|viewer`,
 /// `label=…` (an agent's name), `device=…` (the computer it said it runs
@@ -316,7 +385,8 @@ extension QUICIdentity {
     /// is ~2^30 — hours; at 80 bits ~2^40 per side, which is not practical.
     public static func verificationCode(hostFingerprint: String, viewerFingerprint: String) -> String {
         // Domain separator: changing it changes every code both screens show.
-        var input = Array("glassact-verification-code-v1\u{0}".utf8)
+        // v2: key IDs are public-key (SPKI) hashes, not certificate hashes.
+        var input = Array("glassact-verification-code-v2\u{0}".utf8)
         input += hexBytes(normalize(hostFingerprint))
         input += hexBytes(normalize(viewerFingerprint))
         let digest = Array(SHA256.hash(data: Data(input)))
@@ -406,5 +476,74 @@ public final class KnownHosts: Sendable {
         let text = map.keys.sorted().map { "\($0) \(map[$0]!)\n" }.joined()
         try Data(text.utf8).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+/// Bech32 (BIP-173) for key IDs: human-readable part `ga`, 32 data bytes.
+/// Case-insensitive on input; lowercase on output.
+enum KeyString {
+    static let hrp = "ga"
+    private static let charset = Array("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
+
+    static func encode(_ bytes: [UInt8]) -> String {
+        let data = convertBits(bytes, from: 8, to: 5, pad: true)!
+        let checksum = createChecksum(data)
+        return hrp + "1" + String((data + checksum).map { charset[Int($0)] })
+    }
+
+    /// The 32 bytes of a valid `ga1…` string, or nil.
+    static func decode(_ string: String) -> [UInt8]? {
+        let s = string.lowercased()
+        guard s.hasPrefix(hrp + "1"), s.count == hrp.count + 1 + 52 + 6 else { return nil }
+        var values: [UInt8] = []
+        for c in s.dropFirst(hrp.count + 1) {
+            guard let v = charset.firstIndex(of: c) else { return nil }
+            values.append(UInt8(v))
+        }
+        guard polymod(hrpExpand() + values) == 1 else { return nil }
+        guard let bytes = convertBits(Array(values.dropLast(6)), from: 5, to: 8, pad: false),
+              bytes.count == 32 else { return nil }
+        return bytes
+    }
+
+    private static func hrpExpand() -> [UInt8] {
+        let u = Array(hrp.utf8)
+        return u.map { $0 >> 5 } + [0] + u.map { $0 & 31 }
+    }
+
+    private static func polymod(_ values: [UInt8]) -> UInt32 {
+        let gen: [UInt32] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3]
+        var chk: UInt32 = 1
+        for v in values {
+            let top = chk >> 25
+            chk = (chk & 0x1ff_ffff) << 5 ^ UInt32(v)
+            for i in 0..<5 where (top >> i) & 1 == 1 { chk ^= gen[i] }
+        }
+        return chk
+    }
+
+    private static func createChecksum(_ data: [UInt8]) -> [UInt8] {
+        let pm = polymod(hrpExpand() + data + [0, 0, 0, 0, 0, 0]) ^ 1
+        return (0..<6).map { UInt8((pm >> (5 * (5 - $0))) & 31) }
+    }
+
+    private static func convertBits(_ data: [UInt8], from: Int, to: Int, pad: Bool) -> [UInt8]? {
+        var acc = 0, bits = 0, out: [UInt8] = []
+        let maxv = (1 << to) - 1
+        for value in data {
+            guard Int(value) >> from == 0 else { return nil }
+            acc = (acc << from) | Int(value)
+            bits += from
+            while bits >= to {
+                bits -= to
+                out.append(UInt8((acc >> bits) & maxv))
+            }
+        }
+        if pad {
+            if bits > 0 { out.append(UInt8((acc << (to - bits)) & maxv)) }
+        } else if bits >= from || ((acc << (to - bits)) & maxv) != 0 {
+            return nil
+        }
+        return out
     }
 }
