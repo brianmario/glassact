@@ -13,6 +13,8 @@
 // ID and team, so keep both stable once you've granted them. Apps/release.sh
 // reads both from these files too.
 
+#include "Version.xcconfig"
+
 DEVELOPMENT_TEAM =
 GLASSACT_BUNDLE_PREFIX = app.glassact
 
@@ -26,3 +28,9 @@ GLASSACT_BUNDLE_PREFIX = app.glassact
 // - the Viewer: the App Sandbox (outgoing network only), team or not.
 GLASSACT_ENTITLEMENTS_NONE = Shared/$(TARGET_NAME)-NoTeam.entitlements
 CODE_SIGN_ENTITLEMENTS = $(GLASSACT_ENTITLEMENTS_$(DEVELOPMENT_TEAM:default=NONE):default=Shared/$(TARGET_NAME).entitlements)
+
+// Release CI signs manually, without an Xcode account: it passes
+// CODE_SIGN_STYLE=Manual and each app's profile as GLASSACT_PROFILE_Host /
+// GLASSACT_PROFILE_Viewer (name or UUID). Empty otherwise, as automatic
+// signing requires.
+PROVISIONING_PROFILE_SPECIFIER = $(GLASSACT_PROFILE_$(TARGET_NAME))

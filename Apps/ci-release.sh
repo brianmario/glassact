@@ -1,0 +1,106 @@
+#!/bin/zsh
+# A release without an Xcode account (RELEASING.md): what the release
+# workflow runs, and what you can run locally to check it.
+#
+#   Archive both apps with manual Developer ID signing and explicit
+#   provisioning profiles → export → notarize with an App Store Connect API
+#   key → staple → verify → zip. Also a universal, Developer ID–signed
+#   `glassact` CLI, the archives' dSYMs, and SHA256SUMS.
+#
+# Needs: the "Developer ID Application" certificate in a keychain on the
+# search list, both profiles installed, and these variables:
+#
+#   TEAM              team ID
+#   HOST_PROFILE      the Host's Developer ID profile (name or UUID)
+#   VIEWER_PROFILE    the Viewer's
+#   ASC_KEY_PATH, ASC_KEY_ID, ASC_ISSUER_ID
+#                     App Store Connect API key, for notarization
+#                     (NOTARIZE=0 skips it: a local check, not a release)
+#   BUILD_NUMBER      optional; default: UTC YYYYMMDDHHMM
+#   OUT               optional; default: build/ci-release (under Apps/)
+set -euo pipefail
+cd "${0:A:h}"
+
+: ${TEAM:?} ${HOST_PROFILE:?} ${VIEWER_PROFILE:?}
+NOTARIZE=${NOTARIZE:-1}
+if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?} ${ASC_ISSUER_ID:?}; fi
+BUILD_NUMBER=${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}
+OUT=${OUT:-build/ci-release}
+VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9.]*\).*/\1/p' Version.xcconfig)
+IDENTITY="Developer ID Application"
+PREFIX=$(sed -n 's/^ *GLASSACT_BUNDLE_PREFIX *= *\([^ ]*\).*/\1/p' Signing.xcconfig | tail -1)
+
+rm -rf $OUT
+mkdir -p $OUT/dist
+echo "▸ Glass Act $VERSION ($BUILD_NUMBER), team $TEAM"
+
+notarize() { # <zip>
+	(( NOTARIZE )) || { echo "  (notarization skipped)"; return; }
+	xcrun notarytool submit "$1" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+		--wait --timeout 30m
+}
+
+for SCHEME in Host Viewer; do
+	if [[ $SCHEME == Host ]]; then PROFILE=$HOST_PROFILE; else PROFILE=$VIEWER_PROFILE; fi
+	ARCHIVE=$OUT/$SCHEME.xcarchive
+	echo "▸ $SCHEME: archiving"
+	xcodebuild archive -quiet -project GlassActApps.xcodeproj -scheme $SCHEME -configuration Release \
+		-destination 'generic/platform=macOS' -archivePath $ARCHIVE \
+		DEVELOPMENT_TEAM=$TEAM CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" \
+		GLASSACT_PROFILE_$SCHEME="$PROFILE" \
+		GLASSACT_VERSION=$VERSION CURRENT_PROJECT_VERSION=$BUILD_NUMBER
+
+	echo "▸ $SCHEME: exporting with Developer ID"
+	BUNDLE_ID=$PREFIX.${(L)SCHEME}
+	cat > $OUT/$SCHEME-export.plist <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>method</key><string>developer-id</string>
+	<key>teamID</key><string>$TEAM</string>
+	<key>signingStyle</key><string>manual</string>
+	<key>signingCertificate</key><string>$IDENTITY</string>
+	<key>provisioningProfiles</key>
+	<dict><key>$BUNDLE_ID</key><string>$PROFILE</string></dict>
+</dict>
+</plist>
+PL
+	xcodebuild -exportArchive -quiet -archivePath $ARCHIVE -exportOptionsPlist $OUT/$SCHEME-export.plist \
+		-exportPath $OUT/$SCHEME
+	APP=$(echo $OUT/$SCHEME/*.app)
+	ZIP="$OUT/dist/${APP:t:r}.zip"
+
+	echo "▸ $SCHEME: notarizing"
+	ditto -c -k --keepParent "$APP" "$ZIP"
+	notarize "$ZIP"
+	if (( NOTARIZE )); then
+		xcrun stapler staple -q "$APP"
+		rm "$ZIP" && ditto -c -k --keepParent "$APP" "$ZIP" # the stapled copy
+	fi
+
+	echo "▸ $SCHEME: verifying"
+	codesign --verify --deep --strict "$APP"
+	codesign -dvv "$APP" 2>&1 | grep -E "^Authority=Developer ID Application|^TeamIdentifier"
+	if (( NOTARIZE )); then
+		xcrun stapler validate -q "$APP"
+		spctl --assess --type execute "$APP"
+	fi
+	ditto -c -k --keepParent $ARCHIVE/dSYMs "$OUT/dist/${APP:t:r} dSYMs.zip"
+	echo "✓ $SCHEME: ${ZIP:t}"
+done
+
+echo "▸ glassact CLI: universal build"
+(cd .. && swift build -c release --product glassact --arch arm64 --arch x86_64 --scratch-path Apps/$OUT/cli-build)
+CLI=$(cd .. && swift build -c release --arch arm64 --arch x86_64 --scratch-path Apps/$OUT/cli-build --show-bin-path)/glassact
+mkdir -p $OUT/cli && cp "$CLI" $OUT/cli/glassact
+codesign --force --options runtime --timestamp --sign "$IDENTITY" --identifier $PREFIX.cli $OUT/cli/glassact
+lipo -archs $OUT/cli/glassact
+CLI_ZIP="$OUT/dist/glassact-$VERSION-macos.zip"
+ditto -c -k $OUT/cli "$CLI_ZIP"
+notarize "$CLI_ZIP" # a bare binary can't be stapled; Gatekeeper checks it online
+echo "✓ glassact CLI: ${CLI_ZIP:t}"
+
+(cd $OUT/dist && shasum -a 256 *.zip > SHA256SUMS)
+echo "✓ done: $OUT/dist"
+ls -la $OUT/dist
