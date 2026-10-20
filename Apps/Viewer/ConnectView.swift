@@ -58,6 +58,13 @@ struct ConnectView: View {
 
     private var form: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let crash = model.crashNotice {
+                Card {
+                    CrashNoticeContent(notice: crash, onReport: model.onReportCrash, onDismiss: model.onDismissCrash)
+                        .padding(12)
+                }
+                .transition(.opacity)
+            }
             nearbySection
             VStack(alignment: .leading, spacing: 6) {
                 SectionLabel("Address")
@@ -80,6 +87,7 @@ struct ConnectView: View {
             }
         }
         .animation(.smooth(duration: 0.2), value: model.notice)
+        .animation(.smooth(duration: 0.2), value: model.crashNotice)
         .animation(.smooth(duration: 0.2), value: model.shareMode)
     }
 

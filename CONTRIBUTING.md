@@ -139,3 +139,20 @@ include:
 
 Screen recordings and `.scap` traces contain whatever was on screen, so
 check them before attaching.
+
+**Crash and hang reports.** After a crash or hang, the app's **Report…**
+button opens an issue prefilled from its MetricKit report and shows the
+report file (`<host|viewer>-<crash|hang>-<time>-<hash>.json`) to attach.
+The stacks in it are unsymbolicated: binary name, UUID and offset. To read
+them, symbolicate with the dSYMs of the release that crashed (the release's
+`.xcarchive` keeps them; the script searches a folder recursively and
+matches binaries by UUID):
+
+```sh
+scripts/symbolicate-crash ~/Downloads/host-crash-20261019-095900-0a1b2c3d.json \
+    "Apps/build/release/Host.xcarchive"            # add --all-threads for every thread
+```
+
+It needs only the Xcode command-line tools (`dwarfdump`, `atos`). Frames in
+system libraries stay as binary + offset. Keep each release's archive (or
+its dSYMs) for this: a rebuild has different UUIDs.

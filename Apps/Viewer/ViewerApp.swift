@@ -53,6 +53,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     private let model = ConnectModel()
+    /// MetricKit crash and hang reports, and the notice after one (§13).
+    private var crashReporter: CrashReporter!
     private let settings = ViewerSettings.shared
     private var connectWindow: NSWindow!
     private var settingsWindow: NSWindow?
@@ -122,6 +124,13 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         SessionLog.shared.writeHeader(arguments: CommandLine.arguments)
         SessionLog.shared.write("identity", "viewer_fp=\(viewerFingerprint) source=\(viewerIdentitySource)")
         print("glassact-viewer: session log \(SessionLog.shared.url.path)")
+        crashReporter = CrashReporter(appName: "Glass Act Viewer", prefix: "viewer") { [weak self] text in
+            self?.note(text)
+        }
+        crashReporter.onNotice = { [weak self] notice in self?.model.crashNotice = notice }
+        model.onReportCrash = { [weak self] in self?.crashReporter.report() }
+        model.onDismissCrash = { [weak self] in self?.crashReporter.dismiss() }
+        crashReporter.start()
         model.restore()
         model.onConnect = { [weak self] in self?.connect() }
         model.onCancel = { [weak self] in self?.cancelConnecting() }
@@ -186,13 +195,18 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         NSWorkspace.shared.activateFileViewerSelecting([SessionLog.shared.url])
     }
 
+    @objc private func showCrashReports() {
+        crashReporter.revealReports()
+    }
+
     @objc private func openCurrentLog() {
         SessionLog.shared.flush()
         NSWorkspace.shared.open(SessionLog.shared.url)
     }
 
-    /// Help › Send Logs to Host: this launch's log and any others from the
-    /// last 24 h (capped at 4 MB), over the live session.
+    /// Help › Send Logs to Host: this launch's log, the crash and hang
+    /// reports (§13), and other logs from the last 24 h, over the live
+    /// session.
     @objc private func sendLogsToHost() {
         guard let controller else {
             model.notice = .init(kind: .info, text: "Connect to a host first, then send it your logs.")
@@ -211,6 +225,14 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 return (url, date, v?.fileSize ?? 0)
             }
             .sorted { $0.1 > $1.1 }
+        // Crash and hang reports first (newest first, any age: there are at
+        // most 20). Their bare names (`viewer-crash-….json`) are valid
+        // upload names, so they land beside the logs in the Host's
+        // from-viewer folder.
+        let reports = crashReporter.store.reports().map { url in
+            (url, Date.distantPast, (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        let candidates = reports + files
         // Only what this host doesn't have yet: a file goes again only if it
         // grew since it was sent (the current log always has). Re-sending the
         // whole day each time would cost ~2.7 MB on a tether.
@@ -219,7 +241,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // ≤ 512 KB per upload, newest first (~30 s at the paced 16 KB/s);
         // anything older still unsent goes on a later upload.
         var picked: [URL] = [], budget = 512 << 10, skipped = 0
-        for (url, _, size) in files where size <= budget {
+        for (url, _, size) in candidates where size <= budget {
             if sentSizes[url.lastPathComponent] == size { skipped += 1; continue }
             picked.append(url)
             budget -= size
@@ -348,6 +370,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             .separator(),
             item("Open Current Log", #selector(openCurrentLog), target: self),
             item("Show Logs in Finder", #selector(showSessionLogs), target: self),
+            item("Show Crash Reports in Finder", #selector(showCrashReports), target: self),
             .separator(),
             item("Copy Viewer ID", #selector(copyViewerFingerprint), target: self),
         ])
