@@ -1140,6 +1140,14 @@ What an observer still sees:
   `<key ID> [view] [kind=] [label=] [device=] [name=] [addr=] [approved=] [seen=]`.
   A bare key ID means full control.
 
+**The Viewer is sandboxed** (App Sandbox, outgoing network only). It's the
+app that decodes untrusted data from any Host it connects to (tile codecs,
+video, the wire), so a flaw there stays inside its container. Its data
+(known hosts, logs, the agent socket) lives in its container; its key is in
+the keychain. It uses no private API. Its session log is mirrored to the
+unified log (subsystem `app.glassact.viewer`), since other apps can't read
+its container.
+
 **Known limits:**
 - Any process running as the same user can read the CLI's key file (and an
   unsigned build's), and can use the agent sockets. The Host's and Viewer's
@@ -1149,8 +1157,8 @@ What an observer still sees:
 - Under "Ask", nothing rate-limits approval prompts from new keys. (Under
   "Sign in", new keys cause no prompts.)
 - First contact is only as safe as the person comparing codes.
-- The apps are unsandboxed (issue #8). The Host uses one private API,
-  CGVirtualDisplay.
+- The Host is unsandboxed and uses one private API, CGVirtualDisplay.
+  Remote input needs Accessibility, which no sandboxed app can have.
 - **When a viewer leaves**, the Host puts the Mac back the way it was:
   - The display comes back first: its own mode, the virtual display gone,
     or the shared window back in place. That happens at once when the
@@ -1176,6 +1184,12 @@ What an observer still sees:
 - a **headless** agent connection (`HeadlessAgent`, run by `glassact daemon`),
   or
 - the Viewer's own live session (`viewer.sock`, opt-in in Viewer › Settings).
+  The Viewer is sandboxed, so the socket sits at the top of its container,
+  `~/Library/Containers/<viewer bundle ID>/Data/viewer.sock`: the
+  container's Application Support path is past a Unix socket path's
+  104-byte limit. Other processes reach it by that path without a privacy
+  prompt; the CLI finds it from `app.glassact.viewer`, or
+  `GLASSACT_VIEWER_BUNDLE_ID`.
 
 **`AgentDriver`:**
 - Uses a computer-use vocabulary: screenshot, zoom, click, drag, scroll, key,

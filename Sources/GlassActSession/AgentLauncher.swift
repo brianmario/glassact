@@ -33,11 +33,13 @@ public enum AgentLauncher {
     /// Every session answering on its socket: (name, status).
     public static func sessions() -> [(name: String, status: [String: Any])] {
         let files = (try? FileManager.default.contentsOfDirectory(atPath: AgentPaths.directory.path)) ?? []
-        return files.filter { $0.hasSuffix(".sock") }.sorted().compactMap { file in
-            let name = String(file.dropLast(5))
-            let url = AgentPaths.directory.appendingPathComponent(file)
-            guard let status = try? AgentSocketClient(path: url, timeout: 2).call("status") else { return nil }
-            return (name, status)
+        var sockets = files.filter { $0.hasSuffix(".sock") }.sorted().map {
+            (name: String($0.dropLast(5)), url: AgentPaths.directory.appendingPathComponent($0))
+        }
+        sockets.append((name: "viewer", url: AgentPaths.viewerSocket)) // in the Viewer's container
+        return sockets.compactMap { socket in
+            guard let status = try? AgentSocketClient(path: socket.url, timeout: 2).call("status") else { return nil }
+            return (socket.name, status)
         }
     }
 

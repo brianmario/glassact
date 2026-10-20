@@ -18,9 +18,11 @@ GLASSACT_BUNDLE_PREFIX = app.glassact
 
 #include? "Signing.local.xcconfig"
 
-// Keys in the keychain (DESIGN §13): each app's own keychain access group.
-// That entitlement needs a provisioning profile, which only a build with a
-// team gets (Xcode's automatic signing makes it). Without a team the apps
-// sign ad hoc with no entitlements and keep their keys in files instead.
-GLASSACT_ENTITLEMENTS_NONE = Shared/NoEntitlements.entitlements
-CODE_SIGN_ENTITLEMENTS = $(GLASSACT_ENTITLEMENTS_$(DEVELOPMENT_TEAM:default=NONE):default=Shared/Keychain.entitlements)
+// Entitlements (DESIGN §13), per app in Shared/<target>.entitlements:
+// - both: keys in the keychain, each app's own keychain access group. That
+//   entitlement needs a provisioning profile, which only a build with a team
+//   gets (Xcode's automatic signing makes it). Without a team an app uses
+//   Shared/<target>-NoTeam.entitlements and keeps its key in a file instead.
+// - the Viewer: the App Sandbox (outgoing network only), team or not.
+GLASSACT_ENTITLEMENTS_NONE = Shared/$(TARGET_NAME)-NoTeam.entitlements
+CODE_SIGN_ENTITLEMENTS = $(GLASSACT_ENTITLEMENTS_$(DEVELOPMENT_TEAM:default=NONE):default=Shared/$(TARGET_NAME).entitlements)
