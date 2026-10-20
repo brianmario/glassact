@@ -202,6 +202,12 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// is up right now.
     private var pendingLock: DispatchWorkItem?
     private var viewerSessionLive = false
+    /// main-thread: the screen was locked when the current run of viewer
+    /// sessions began. Lock When Viewer Leaves only puts back a lock that
+    /// was there: a Mac someone left unlocked stays unlocked. A reconnect
+    /// within the lock grace keeps the first session's answer (the remote
+    /// user has unlocked it since).
+    private var lockedWhenViewerArrived = false
     // Auto-scale (airplane story, main-thread): sustained severe link
     // pressure halves the capture for the rest of the session; native
     // restores on disconnect (via the captureModified restore path) or on
@@ -1824,7 +1830,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // Keep it until a local unlock. The next HELLO is
             // NOT final, so a different viewer or preference still
             // negotiates; the same request finds the display already there.
-            if self.lockOnDisconnect, let applied = self.appliedDisplaySize {
+            if self.lockOnDisconnect && self.lockedWhenViewerArrived, let applied = self.appliedDisplaySize {
                 self.geometrySettled = false
                 self.restoreOnLocalUnlock = true
                 self.onStatus("viewer gone — keeping \(applied.width)×\(applied.height) behind the lock "
@@ -2530,6 +2536,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// was stopped locally (someone is at the Mac).
     private func scheduleLockAfterDisconnect() {
         guard lockOnDisconnect else { return }
+        guard lockedWhenViewerArrived else {
+            onStatus("viewer gone — leaving the screen unlocked, as it was when the viewer connected")
+            return
+        }
         pendingLock?.cancel()
         onStatus("viewer gone — locking the screen in \(Self.lockGraceSeconds)s unless it reconnects")
         let work = DispatchWorkItem { [weak self] in
@@ -2917,6 +2927,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private func transportStateChanged(_ state: TransportState) {
         switch state {
         case .ready:
+            if pendingLock == nil && !restoreOnLocalUnlock {
+                lockedWhenViewerArrived = Self.screenIsLocked
+            }
             pendingDisplayRestore?.cancel()
             pendingDisplayRestore = nil
             pendingLock?.cancel()
