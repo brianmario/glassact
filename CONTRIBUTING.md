@@ -130,8 +130,8 @@ include:
 
 - the build on each end (the wire protocol changes between builds, so both
   ends must run the same one) and the macOS versions;
-- the Viewer's log: Viewer › Help › Show Logs in Finder
-  (`~/Library/Logs/Glass Act/`), or Help › Send Logs to Host;
+- the Viewer's log: Viewer › Help › Show Logs in Finder (in the Viewer's
+  sandbox container), or Help › Send Logs to Host;
 - the Host's log:
   `/usr/bin/log show --predicate 'subsystem == "app.glassact.host"' --last 10m`
   (use `/usr/bin/log`; zsh has a `log` builtin).

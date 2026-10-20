@@ -147,8 +147,9 @@ Agents work two ways:
   - Other programs running as your user can read the CLI's key file and use
     the agent sockets.
   - Agent status is declared by the client.
-  - The apps are unsandboxed, and use private API for the virtual display and
-    screen locking.
+  - The Viewer is sandboxed. The Host can't be: remote input needs
+    Accessibility, which sandboxed apps can't have. It also uses private
+    API for the virtual display and screen locking.
 
 See [docs/DESIGN.md §13](docs/DESIGN.md#13-security-model) for the full
 model.
@@ -162,7 +163,9 @@ privately, not in a public issue.
 |---|---|
 | Host and Viewer keys | the login keychain (data protection), "Glass Act … identity" |
 | CLI key, approvals, known hosts, agent sockets, audit log, traces | `~/Library/Application Support/Glass Act/` |
-| Viewer logs, logs uploaded to the Host | `~/Library/Logs/Glass Act/` |
+| Viewer data and logs (sandboxed) | `~/Library/Containers/app.glassact.viewer/Data/`; Help › Show Logs in Finder |
+| Viewer log, live | `/usr/bin/log stream --predicate 'subsystem == "app.glassact.viewer"'` |
+| logs uploaded to the Host | `~/Library/Logs/Glass Act/` |
 | Host's unified log | `/usr/bin/log stream --predicate 'subsystem == "app.glassact.host"'` |
 
 ## How it works and contributing

@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import GlassActCore
 import GlassActTransport
+import os
 
 /// One plain-text log per Viewer launch in ~/Library/Logs/Glass Act, written off
 /// the main thread: a header (build, machine, displays, flags), timestamped
@@ -12,6 +13,7 @@ final class SessionLog: @unchecked Sendable {
     static let shared = SessionLog()
 
     let url: URL
+    private static let unified = Logger(subsystem: "app.glassact.viewer", category: "session")
     private let queue = DispatchQueue(label: "glassact.viewer.sessionlog", qos: .utility)
     private let handle: FileHandle?
     private let startUptimeUS = SurfacePresenter.uptimeUS()
@@ -31,10 +33,15 @@ final class SessionLog: @unchecked Sendable {
 
     /// `t=<s since launch> <kind> <fields>` — fields are `key=value`, or a
     /// quoted `text="…"` for free-form messages.
+    /// Also mirrored to the unified log (subsystem `app.glassact.viewer`):
+    /// the sandboxed Viewer's log file sits in its container, which other
+    /// apps — a terminal, a coding agent — can't read without asking.
     func write(_ kind: String, _ fields: String = "") {
         let t = Double(SurfacePresenter.uptimeUS() - startUptimeUS) / 1_000_000
         let wall = ISO8601DateFormatter().string(from: Date())
-        let line = String(format: "t=%.3f", t) + " wall=\(wall) \(kind)" + (fields.isEmpty ? "" : " \(fields)") + "\n"
+        let entry = "\(kind)" + (fields.isEmpty ? "" : " \(fields)")
+        Self.unified.notice("\(entry, privacy: .public)")
+        let line = String(format: "t=%.3f", t) + " wall=\(wall) \(entry)" + "\n"
         queue.async { [handle] in
             try? handle?.write(contentsOf: Data(line.utf8))
         }
