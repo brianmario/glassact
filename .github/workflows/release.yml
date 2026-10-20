@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 90
     env:
       TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
       TEAM: ${{ vars.APPLE_TEAM_ID }}
       HOST_PROFILE: ${{ vars.HOST_PROFILE_NAME }}
       VIEWER_PROFILE: ${{ vars.VIEWER_PROFILE_NAME }}
@@ -42,10 +43,11 @@ jobs:
           HOST_PROFILE_DATA: ${{ secrets.HOST_PROFILE_BASE64 }}
           VIEWER_PROFILE_DATA: ${{ secrets.VIEWER_PROFILE_BASE64 }}
           ASC_KEY: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           missing=()
           for name in TEAM HOST_PROFILE VIEWER_PROFILE ASC_KEY_ID ASC_ISSUER_ID CERT CERT_PASSWORD \
-                      HOST_PROFILE_DATA VIEWER_PROFILE_DATA ASC_KEY; do
+                      HOST_PROFILE_DATA VIEWER_PROFILE_DATA ASC_KEY SPARKLE_KEY; do
             [ -n "${!name}" ] || missing+=("$name")
           done
           if [ ${#missing[@]} -gt 0 ]; then
@@ -60,6 +62,7 @@ jobs:
           HOST_PROFILE_DATA: ${{ secrets.HOST_PROFILE_BASE64 }}
           VIEWER_PROFILE_DATA: ${{ secrets.VIEWER_PROFILE_BASE64 }}
           ASC_KEY: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           KEYCHAIN_PASSWORD=$(uuidgen)
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
@@ -79,6 +82,8 @@ jobs:
           done
           echo "$ASC_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
           echo "ASC_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          printf '%s' "$SPARKLE_KEY" > "$RUNNER_TEMP/sparkle.key"
+          echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle.key" >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize
         run: Apps/ci-release.sh
@@ -95,4 +100,4 @@ jobs:
         if: always()
         run: |
           security delete-keychain "$KEYCHAIN" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/cert.p12"
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/sparkle.key"

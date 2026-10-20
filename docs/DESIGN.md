@@ -1150,9 +1150,35 @@ the keychain. It uses no private API. Its session log is mirrored to the
 unified log (subsystem `app.glassact.viewer`), since other apps can't read
 its container.
 
+**Updates** (Sparkle 2.10.0, `Apps/Shared/AppUpdater.swift`; RELEASING.md):
+- Each app reads its own appcast from the newest published GitHub release:
+  `…/releases/latest/download/host-appcast.xml` or `viewer-appcast.xml`
+  (`SUFeedURL`, from `Apps/Updates.xcconfig`). The Release workflow writes
+  both with Sparkle's `generate_appcast`.
+- An update installs only if it carries an EdDSA signature from the release
+  key (the public half is `SUPublicEDKey`; the private half is the
+  `SPARKLE_ED_PRIVATE_KEY` secret) **and** its code signature matches the
+  running app's team. A build without a public key never checks: a fork, or
+  any build before the key exists.
+- Sparkle asks once whether to check automatically. **Check for Updates…**
+  (both apps' menus) works either way.
+- The Host holds a downloaded update while a viewer is connected and installs
+  it when the viewer leaves, so an update never drops a session.
+- The sandboxed Viewer installs through Sparkle's Installer XPC service
+  (`SUEnableInstallerLauncherService`, with mach-lookup exceptions for
+  `<bundle ID>-spks` and `-spki`).
+- Host and Viewer must run the same build (§3.2). A Viewer that reaches a Host
+  on another wire version stops redialing, says which side is behind, and,
+  when the Host is newer, offers Check for Updates… (`onIncompatibleHost`).
+  The `glassact` CLI says the same and stops.
+- `GLASSACT_UPDATE_FEED` overrides the feed, for testing an update from a
+  local server; the update still has to be signed with the release key.
+
 **No telemetry; crash reports stay on the Mac** (`CrashReportStore`,
 `Apps/Shared/CrashReporter.swift`). Neither app sends anything anywhere on
-its own: no analytics, no crash upload, no update check.
+its own: no analytics, no crash upload. The one thing either fetches by
+itself is its update feed (below), and only once the person has agreed to
+automatic checks.
 - Both apps take MetricKit's diagnostics, which arrive on the launch after
   an app crashed or hung: from `MetricManager` on macOS 27 and later, from
   `MXMetricManager` before that. A macOS 27 report is turned into the JSON

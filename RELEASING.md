@@ -36,10 +36,18 @@ Each release attaches:
 
 | file | what |
 |---|---|
-| `Glass Act Host.zip`, `Glass Act Viewer.zip` | the notarized, stapled apps (universal) |
+| `Glass-Act-Host-X.Y.Z.zip`, `Glass-Act-Viewer-X.Y.Z.zip` | the notarized, stapled apps (universal) |
+| `host-appcast.xml`, `viewer-appcast.xml` | each app's Sparkle update feed, pointing at the zips above |
 | `glassact-X.Y.Z-macos.zip` | the CLI, universal, Developer ID–signed and notarized |
-| `Glass Act Host dSYMs.zip`, `Glass Act Viewer dSYMs.zip` | symbols, to turn crash reports into function names |
-| `SHA256SUMS` | checksums of the above |
+| `Glass-Act-Host-X.Y.Z-dSYMs.zip`, `Glass-Act-Viewer-X.Y.Z-dSYMs.zip` | symbols, to turn crash reports into function names |
+| `SHA256SUMS` | checksums of the zips |
+
+File names have no spaces: GitHub renames those in release assets, and the
+appcasts link to the zips by name.
+
+**Updates go out when you publish.** The apps read
+`releases/latest/download/<app>-appcast.xml`, and "latest" means the newest
+*published* release. A draft changes nothing until you publish it.
 
 ## One-time setup
 
@@ -94,6 +102,27 @@ under Variables.
    - Keep the `.p8` somewhere safe, or delete it; a new key can always be
      made.
 
+5. **Update signing key** (secret `SPARKLE_ED_PRIVATE_KEY`, plus the public
+   key in `Apps/Updates.xcconfig`). Sparkle installs only updates signed with
+   this key, so it's the most important secret here.
+   - Build either app once (Xcode or `xcodebuild`) so Sparkle's tools are
+     downloaded, then generate the key. It's stored in your login keychain,
+     and the tool prints the public key:
+     ```sh
+     "$(find ~/Library/Developer/Xcode/DerivedData -path '*artifacts/sparkle/Sparkle/bin/generate_keys' | head -1)"
+     ```
+   - Put the public key in `Apps/Updates.xcconfig`
+     (`GLASSACT_SPARKLE_PUBLIC_KEY = …`) in a pull request.
+   - Export the private key, store it as the secret, and keep a copy in your
+     password manager:
+     ```sh
+     "$(find ~/Library/Developer/Xcode/DerivedData -path '*artifacts/sparkle/Sparkle/bin/generate_keys' | head -1)" -x sparkle-private.key
+     gh secret set SPARKLE_ED_PRIVATE_KEY -R brianmario/glassact < sparkle-private.key
+     rm sparkle-private.key
+     ```
+   - **Don't lose it.** Without the private key, installed copies can't be
+     updated any more; people would have to download a new build by hand.
+
 If anything is missing, the workflow stops at "Secrets present" and names
 it.
 
@@ -108,4 +137,25 @@ TEAM=VJ4FHSCMNE HOST_PROFILE="Glass Act Host Developer ID" \
   VIEWER_PROFILE="Glass Act Viewer Developer ID" NOTARIZE=0 Apps/ci-release.sh
 ```
 
-The output lands in `Apps/build/ci-release/dist`.
+The output lands in `Apps/build/ci-release/dist`. Add
+`SPARKLE_KEY_FILE=<private key file>` to also write the appcasts.
+
+## Trying an update locally
+
+To check an update end to end before a release, without publishing
+anything:
+
+1. Generate a throwaway key pair, and put its public half in
+   `Apps/Updates.xcconfig` for the test only. Never commit it.
+2. Build the current version with `Apps/ci-release.sh` (`NOTARIZE=0`) and copy
+   the app somewhere scratch.
+3. Bump `GLASSACT_VERSION`, build again, zip that app, and write an appcast
+   for it with `generate_appcast --ed-key-file <throwaway key>
+   --download-url-prefix http://localhost:8765/`.
+4. Serve that folder (`python3 -m http.server 8765 --bind 127.0.0.1`), then
+   open the older app with the feed overridden:
+   ```sh
+   open -n --env GLASSACT_UPDATE_FEED=http://localhost:8765/viewer-appcast.xml "/path/to/Glass Act Viewer.app"
+   ```
+5. Choose Check for Updates…: it should offer, install and relaunch into
+   the newer version. Then restore `Apps/Updates.xcconfig` and the version.

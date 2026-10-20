@@ -217,6 +217,8 @@ final class ViewerController: @unchecked Sendable {
     /// Main thread: the host ended the session on purpose (shared window
     /// closed) — show why, don't redial.
     var onHostEndedSession: ((String) -> Void)?
+    /// Main thread: the host runs a different build; don't redial.
+    var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
     /// Host advertised single-window support (has Screen Recording).
     /// Which host the upload ledger is kept for (the pinned or observed key).
     var uploadHostKey: String {
@@ -412,6 +414,7 @@ final class ViewerController: @unchecked Sendable {
             self?.onWindowList?(windows)
         }
         session.onHostEndedSession = { [weak self] reason in self?.onHostEndedSession?(reason) }
+        session.onIncompatibleHost = { [weak self] version in self?.onIncompatibleHost?(version) }
         session.onGeometryChanged = { [weak self] w, h in self?.onGeometryChanged?(w, h) }
         session.onConnectionFailed = { [weak self] in self?.onConnectionFailed?() }
         session.onHostKeyChanged = { [weak self] expected, presented in self?.onHostKeyChanged?(expected, presented) }

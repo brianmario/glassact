@@ -58,6 +58,9 @@ public final class ViewerSession: @unchecked Sendable {
     public var onWindowList: (([WireWindow]) -> Void)?
     /// Main: the host ended the session on purpose — show why, don't redial.
     public var onHostEndedSession: ((String) -> Void)?
+    /// Main thread: the host runs a different build (its wire version);
+    /// redialing can't help until one side updates.
+    public var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
     /// Main: in-session geometry change (the canvas was reconfigured).
     public var onGeometryChanged: ((_ width: Int, _ height: Int) -> Void)?
     /// Main: pointer position (canvas pixels) and visibility, metadata mode.
@@ -152,6 +155,9 @@ public final class ViewerSession: @unchecked Sendable {
         }
         engine.onHostEndedSession = { [weak self] reason in
             DispatchQueue.main.async { self?.onHostEndedSession?(reason) }
+        }
+        engine.onIncompatibleHost = { [weak self] version in
+            DispatchQueue.main.async { self?.onIncompatibleHost?(version) }
         }
         engine.onGeometryChanged = { [weak self] w, h in
             DispatchQueue.main.async { self?.onGeometryChanged?(w, h) }

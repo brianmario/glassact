@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		AA0000000000000000000017 /* GlassAct in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000015 /* GlassAct */; };
 		AA0000000000000000000027 /* GlassAct in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000025 /* GlassAct */; };
+		AA00000000000000000000B3 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000000B1 /* Sparkle */; };
+		AA00000000000000000000B4 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000000B2 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -40,12 +42,14 @@
 			isa = PBXFrameworksBuildPhase;
 			files = (
 				AA0000000000000000000017 /* GlassAct in Frameworks */,
+				AA00000000000000000000B3 /* Sparkle in Frameworks */,
 			);
 		};
 		AA0000000000000000000023 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
 				AA0000000000000000000027 /* GlassAct in Frameworks */,
+				AA00000000000000000000B4 /* Sparkle in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -91,6 +95,7 @@
 			name = Host;
 			packageProductDependencies = (
 				AA0000000000000000000015 /* GlassAct */,
+				AA00000000000000000000B1 /* Sparkle */,
 			);
 			productName = Host;
 			productReference = AA0000000000000000000016 /* Glass Act Host.app */;
@@ -113,6 +118,7 @@
 			name = Viewer;
 			packageProductDependencies = (
 				AA0000000000000000000025 /* GlassAct */,
+				AA00000000000000000000B2 /* Sparkle */,
 			);
 			productName = Viewer;
 			productReference = AA0000000000000000000026 /* Glass Act Viewer.app */;
@@ -138,6 +144,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				AA000000000000000000000A /* XCLocalSwiftPackageReference ".." */,
+				AA00000000000000000000B0 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 110;
 			productRefGroup = AA0000000000000000000004 /* Products */;
@@ -354,6 +361,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		AA00000000000000000000B0 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.10.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		AA0000000000000000000015 /* GlassAct */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -362,6 +380,16 @@
 		AA0000000000000000000025 /* GlassAct */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = GlassAct;
+		};
+		AA00000000000000000000B1 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000000B0 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+		AA00000000000000000000B2 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA00000000000000000000B0 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
