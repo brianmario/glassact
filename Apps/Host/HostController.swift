@@ -1158,7 +1158,14 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         case 5, 6: // key down / up
             if let ev = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(canvasX),
                                 keyDown: kind == 5) {
-                ev.flags = CGEventFlags(rawValue: UInt64(UInt32(bitPattern: Int32(a))))
+                // Keep the flags a key carries itself (numeric pad and
+                // function on arrows and the like), which an agent's flags
+                // may leave out; replacing them made a ← unlike a real one.
+                // Not for modifier keys (54–63): fn's own flag would keep fn
+                // held through its key-up.
+                let own = (54...63).contains(canvasX) ? []
+                    : ev.flags.intersection([.maskNumericPad, .maskSecondaryFn])
+                ev.flags = CGEventFlags(rawValue: UInt64(UInt32(bitPattern: Int32(a)))).union(own)
                 ev.post(tap: .cghidEventTap)
             }
         default: break

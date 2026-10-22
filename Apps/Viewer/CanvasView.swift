@@ -399,25 +399,19 @@ final class CanvasView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        controller.sendInput(kind: 5, x: Int(event.keyCode), y: 0, a: Int(cgFlags(event.modifierFlags)), b: 0)
+        controller.sendInput(kind: 5, x: Int(event.keyCode), y: 0, a: flags(event), b: 0)
     }
     override func keyUp(with event: NSEvent) {
-        controller.sendInput(kind: 6, x: Int(event.keyCode), y: 0, a: Int(cgFlags(event.modifierFlags)), b: 0)
+        controller.sendInput(kind: 6, x: Int(event.keyCode), y: 0, a: flags(event), b: 0)
     }
     override func flagsChanged(with event: NSEvent) {
-        let down = !event.modifierFlags.intersection([.shift, .control, .option, .command, .capsLock]).isEmpty
-        controller.sendInput(kind: down ? 5 : 6, x: Int(event.keyCode), y: 0,
-                             a: Int(cgFlags(event.modifierFlags)), b: 0)
+        guard let down = KeyModifiers.isDown(keyCode: event.keyCode, modifierFlags: event.modifierFlags.rawValue)
+        else { return }
+        controller.sendInput(kind: down ? 5 : 6, x: Int(event.keyCode), y: 0, a: flags(event), b: 0)
     }
 
-    private func cgFlags(_ m: NSEvent.ModifierFlags) -> UInt32 {
-        var f: UInt64 = 0
-        if m.contains(.capsLock) { f |= CGEventFlags.maskAlphaShift.rawValue }
-        if m.contains(.shift)    { f |= CGEventFlags.maskShift.rawValue }
-        if m.contains(.control)  { f |= CGEventFlags.maskControl.rawValue }
-        if m.contains(.option)   { f |= CGEventFlags.maskAlternate.rawValue }
-        if m.contains(.command)  { f |= CGEventFlags.maskCommand.rawValue }
-        return UInt32(truncatingIfNeeded: f)
+    private func flags(_ event: NSEvent) -> Int {
+        Int(Int32(bitPattern: KeyModifiers.forwarded(event.modifierFlags.rawValue)))
     }
 
     override func updateTrackingAreas() {
