@@ -8,7 +8,10 @@ import AppKit
 @MainActor
 enum AboutPanel {
     static func show(tagline: String) {
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits(tagline: tagline)])
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .credits: credits(tagline: tagline),
+            .version: BuildInfo.aboutVersion, // the build number and commit
+        ])
     }
 
     static func credits(tagline: String) -> NSAttributedString {

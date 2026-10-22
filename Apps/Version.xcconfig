@@ -1,8 +1,12 @@
 // The apps' version: set here, and in the glassact CLI (Sources/glassact/
-// main.swift), and nowhere else. A release tag vX.Y.Z must match it;
+// main.swift), and nowhere else. It's YY.M.N: the year and month of the
+// release, and N counting releases within that month from 0 (26.10.0,
+// 26.10.1, 26.11.0). A release tag vYY.M.N must match it;
 // scripts/check-version enforces that. RELEASING.md has the steps.
 //
 // GLASSACT_BUILD is overridden at release time with a UTC timestamp
 // (YYYYMMDDHHMM): it only ever increases, which update checks rely on.
-GLASSACT_VERSION = 0.1.0
+// GLASSACT_COMMIT is set at release time to the short commit hash.
+GLASSACT_VERSION = 26.10.0
 GLASSACT_BUILD = 1
+GLASSACT_COMMIT =

@@ -1,6 +1,6 @@
 # Releasing Glass Act
 
-A release is a git tag. Pushing `vX.Y.Z` runs the Release workflow
+A release is a git tag. Pushing `vYY.M.N` runs the Release workflow
 (`.github/workflows/release.yml`). It builds both apps and the `glassact`
 CLI, signs them with Developer ID, notarizes them, and attaches them to a
 **draft** GitHub release for you to review and publish.
@@ -12,23 +12,36 @@ works for builds you hand out yourself.
 
 ## Versions
 
+- Versions are `YY.M.N`: the year and month of the release, then N counting
+  releases within that month from 0. October 2026's first release is
+  `26.10.0`, a fix the same day `26.10.1`, and November's first `26.11.0`.
+  The version promises nothing about compatibility: until the wire protocol
+  settles, both ends must run the same build (AGENTS.md), whatever the
+  numbers say.
 - The version lives in `Apps/Version.xcconfig` (`GLASSACT_VERSION`) and in the
   CLI (`let version` in `Sources/glassact/main.swift`). `scripts/check-version`
-  checks they agree, and the workflow checks the tag names that version.
-- `0.x.y` while the wire protocol may still change in any release. Both ends
-  must run the same build (AGENTS.md).
+  checks they agree and are `YY.M.N`, and the workflow checks the tag names
+  that version.
 - The build number is a UTC timestamp (`YYYYMMDDHHMM`), set at build time. It
-  only increases, which update checks rely on.
+  only increases, which update checks rely on. Finder's Get Info shows it
+  after the version: `26.10.0 (202610222020)`.
+- Release builds also carry the short commit hash they were built from
+  (`GLASSACT_COMMIT`). The About panel, the apps' logs and
+  `glassact --version` show it, so a bug report names the exact commit:
+  `26.10.0 (202610222020, a1b2c3d)`. A build from Xcode or `swift build` has
+  none.
 
 ## Cutting a release
 
-1. Bump the version in both places in a pull request (and update the
-   changelog, once there is one). Merge it.
+1. Set the version in both places in a pull request: this month's `YY.M`,
+   and N one past this month's last release tag, or 0 if there's none yet
+   (`git tag -l 'v26.11.*'`). Update the changelog, once there is one.
+   Merge it.
 2. Tag the merge commit and push the tag:
    ```sh
-   git tag v0.2.0 && git push origin v0.2.0
+   git tag v26.11.0 && git push origin v26.11.0
    ```
-3. Wait for the Release workflow (about 20–30 minutes; notarization is most
+3. Wait for the Release workflow (about 5–30 minutes; notarization is most
    of it).
 4. Open the draft release, edit the notes, and publish it.
 
@@ -36,10 +49,10 @@ Each release attaches:
 
 | file | what |
 |---|---|
-| `Glass-Act-Host-X.Y.Z.zip`, `Glass-Act-Viewer-X.Y.Z.zip` | the notarized, stapled apps (universal) |
+| `Glass-Act-Host-YY.M.N.zip`, `Glass-Act-Viewer-YY.M.N.zip` | the notarized, stapled apps (universal) |
 | `host-appcast.xml`, `viewer-appcast.xml` | each app's Sparkle update feed, pointing at the zips above |
-| `glassact-X.Y.Z-macos.zip` | the CLI, universal, Developer ID–signed and notarized |
-| `Glass-Act-Host-X.Y.Z-dSYMs.zip`, `Glass-Act-Viewer-X.Y.Z-dSYMs.zip` | symbols, to turn crash reports into function names |
+| `glassact-YY.M.N-macos.zip` | the CLI, universal, Developer ID–signed and notarized |
+| `Glass-Act-Host-YY.M.N-dSYMs.zip`, `Glass-Act-Viewer-YY.M.N-dSYMs.zip` | symbols, to turn crash reports into function names |
 | `SHA256SUMS` | checksums of the zips |
 
 File names have no spaces: GitHub renames those in release assets, and the
@@ -154,7 +167,7 @@ anything:
    `Apps/Updates.xcconfig` for the test only. Never commit it.
 2. Build the current version with `Apps/ci-release.sh` (`NOTARIZE=0`) and copy
    the app somewhere scratch.
-3. Bump `GLASSACT_VERSION`, build again, zip that app, and write an appcast
+3. Raise `GLASSACT_VERSION`, build again, zip that app, and write an appcast
    for it with `generate_appcast --ed-key-file <throwaway key>
    --download-url-prefix http://localhost:8765/`.
 4. Serve that folder (`python3 -m http.server 8765 --bind 127.0.0.1`), then
