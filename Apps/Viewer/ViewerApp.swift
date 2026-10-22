@@ -15,16 +15,6 @@ import os
 @main
 @MainActor
 final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
-    /// The bundle's version and build number, e.g. "1.0 (202610131845)" —
-    /// release.sh stamps the build number with the archive's UTC time. The
-    /// About panel shows the same two values by default.
-    nonisolated static let buildStamp: String = {
-        let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(version) (\(build))"
-    }()
-
     /// Status paper trail. stdout only exists under Xcode/terminal; os_log
     /// makes `log show --predicate 'subsystem == "app.glassact.viewer"'` work
     /// for Finder-launched instances too.
@@ -34,8 +24,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     static func main() {
         setvbuf(stdout, nil, _IOLBF, 0) // stream prints when stdout is a pipe
-        print("glassact-viewer: build \(buildStamp)")
-        log.notice("build \(buildStamp, privacy: .public)")
+        print("glassact-viewer: build \(BuildInfo.stamp)")
+        log.notice("build \(BuildInfo.stamp, privacy: .public)")
         let app = NSApplication.shared
         let delegate = ViewerAppDelegate()
         app.delegate = delegate

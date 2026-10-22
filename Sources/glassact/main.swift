@@ -11,7 +11,10 @@ import Foundation
 import GlassActSession
 import GlassActTransport
 
-let version = "0.1.0" // = GLASSACT_VERSION in Apps/Version.xcconfig (scripts/check-version)
+let version = "26.10.0" // = GLASSACT_VERSION in Apps/Version.xcconfig (scripts/check-version)
+/// The commit a release was built from: Apps/ci-release.sh links it into the
+/// binary's embedded Info.plist. A build from source has none.
+let commit = Bundle.main.object(forInfoDictionaryKey: "GlassActCommit") as? String
 
 struct Usage: Error, CustomStringConvertible {
     let description: String
@@ -218,7 +221,7 @@ func run() throws {
     }
     switch command {
     case "version", "--version":
-        print("glassact \(version)")
+        print("glassact \(version)" + (commit.map { " (\($0))" } ?? ""))
     case "daemon":
         try runDaemon(p)
     case "mcp":

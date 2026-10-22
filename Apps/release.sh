@@ -19,6 +19,7 @@ PREFIX=${PREFIX:-$(bundle_prefix_in Signing.xcconfig)}
 [[ -n $PREFIX ]] || { echo "✗ no bundle ID prefix — set GLASSACT_BUNDLE_PREFIX in Apps/Signing.local.xcconfig"; exit 1; }
 OUT=build/release
 BUILD_NUMBER=$(date -u +%Y%m%d%H%M)
+COMMIT=$(git rev-parse --short=7 HEAD)
 mkdir -p $OUT
 
 cat > $OUT/ExportOptions.plist <<EOF
@@ -40,7 +41,7 @@ for SCHEME in "$@"; do
 	rm -rf $ARCHIVE $EXPORT
 	echo "▸ $SCHEME: archiving (build $BUILD_NUMBER)"
 	xcodebuild archive -quiet -project GlassActApps.xcodeproj -scheme $SCHEME -configuration Release \
-		-archivePath $ARCHIVE -allowProvisioningUpdates CURRENT_PROJECT_VERSION=$BUILD_NUMBER
+		-archivePath $ARCHIVE -allowProvisioningUpdates CURRENT_PROJECT_VERSION=$BUILD_NUMBER GLASSACT_COMMIT=$COMMIT
 
 	echo "▸ $SCHEME: signing with Developer ID and submitting for notarization"
 	xcodebuild -exportArchive -quiet -archivePath $ARCHIVE -exportOptionsPlist $OUT/ExportOptions.plist \

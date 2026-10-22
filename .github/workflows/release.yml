@@ -1,6 +1,6 @@
 name: Release
 
-# A tag vX.Y.Z builds both apps and the glassact CLI, signs them with
+# A tag vYY.M.N builds both apps and the glassact CLI, signs them with
 # Developer ID, notarizes them, and attaches them to a draft GitHub release
 # for review. RELEASING.md has the one-time setup (secrets) and the steps.
 

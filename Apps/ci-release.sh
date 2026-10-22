@@ -33,6 +33,7 @@ cd "${0:A:h}"
 NOTARIZE=${NOTARIZE:-1}
 if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?}; fi
 BUILD_NUMBER=${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}
+COMMIT=$(git rev-parse --short=7 HEAD)
 OUT=${OUT:-build/ci-release}
 VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9.]*\).*/\1/p' Version.xcconfig)
 TAG=${TAG:-v$VERSION}
@@ -42,7 +43,7 @@ PREFIX=$(sed -n 's/^ *GLASSACT_BUNDLE_PREFIX *= *\([^ ]*\).*/\1/p' Signing.xccon
 
 rm -rf $OUT
 mkdir -p $OUT/dist
-echo "▸ Glass Act $VERSION ($BUILD_NUMBER), team $TEAM"
+echo "▸ Glass Act $VERSION ($BUILD_NUMBER, $COMMIT), team $TEAM"
 
 notarize() { # <zip>
 	(( NOTARIZE )) || { echo "  (notarization skipped)"; return; }
@@ -59,7 +60,7 @@ for SCHEME in Host Viewer; do
 		-destination 'generic/platform=macOS' -archivePath $ARCHIVE -clonedSourcePackagesDirPath $OUT/packages \
 		DEVELOPMENT_TEAM=$TEAM CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" \
 		GLASSACT_PROFILE_$SCHEME="$PROFILE" \
-		GLASSACT_VERSION=$VERSION CURRENT_PROJECT_VERSION=$BUILD_NUMBER
+		GLASSACT_VERSION=$VERSION CURRENT_PROJECT_VERSION=$BUILD_NUMBER GLASSACT_COMMIT=$COMMIT
 
 	echo "▸ $SCHEME: exporting with Developer ID"
 	BUNDLE_ID=$PREFIX.${(L)SCHEME}
@@ -115,8 +116,16 @@ PL
 done
 
 echo "▸ glassact CLI: universal build"
-(cd .. && swift build -c release --product glassact --arch arm64 --arch x86_64 --scratch-path Apps/$OUT/cli-build)
-CLI=$(cd .. && swift build -c release --arch arm64 --arch x86_64 --scratch-path Apps/$OUT/cli-build --show-bin-path)/glassact
+# The commit goes in an Info.plist linked into the binary, where
+# `glassact --version` reads it (Bundle.main reads a CLI's __info_plist).
+CLI_PLIST=${OUT:A}/cli-Info.plist
+plutil -create xml1 $CLI_PLIST
+plutil -insert CFBundleIdentifier -string $PREFIX.cli $CLI_PLIST
+plutil -insert GlassActCommit -string $COMMIT $CLI_PLIST
+CLI_BUILD=(-c release --arch arm64 --arch x86_64 --scratch-path Apps/$OUT/cli-build
+	-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker $CLI_PLIST)
+(cd .. && swift build $CLI_BUILD --product glassact)
+CLI=$(cd .. && swift build $CLI_BUILD --show-bin-path)/glassact
 mkdir -p $OUT/cli && cp "$CLI" $OUT/cli/glassact
 codesign --force --options runtime --timestamp --sign "$IDENTITY" --identifier $PREFIX.cli $OUT/cli/glassact
 lipo -archs $OUT/cli/glassact
