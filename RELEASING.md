@@ -65,8 +65,9 @@ appcasts link to the zips by name.
 ## One-time setup
 
 Everything below goes into the repository's **Settings › Secrets and
-variables › Actions**. Values marked *secret* go under Secrets; the rest
-under Variables.
+variables › Actions**: secrets under Secrets, the rest under Variables. The
+`gh` commands name the repository (`-R`) because a checkout can have more
+than one remote; for a fork, use your own.
 
 1. **Team ID** (variable `APPLE_TEAM_ID`): your Apple developer team ID, for
    example `VJ4FHSCMNE`.
@@ -78,8 +79,8 @@ under Variables.
      a password.
    - Store it base64-encoded, and the password:
      ```sh
-     base64 -i DeveloperID.p12 | gh secret set DEVELOPER_ID_P12_BASE64
-     gh secret set DEVELOPER_ID_P12_PASSWORD
+     base64 -i DeveloperID.p12 | gh secret set DEVELOPER_ID_P12_BASE64 -R brianmario/glassact
+     gh secret set DEVELOPER_ID_P12_PASSWORD -R brianmario/glassact
      ```
    - Then delete the `.p12` file.
 
@@ -94,10 +95,10 @@ under Variables.
    - Do the same for `app.glassact.viewer`.
    - Download both, then:
      ```sh
-     base64 -i "Glass_Act_Host_Developer_ID.provisionprofile" | gh secret set HOST_PROFILE_BASE64
-     base64 -i "Glass_Act_Viewer_Developer_ID.provisionprofile" | gh secret set VIEWER_PROFILE_BASE64
-     gh variable set HOST_PROFILE_NAME --body "Glass Act Host Developer ID"
-     gh variable set VIEWER_PROFILE_NAME --body "Glass Act Viewer Developer ID"
+     base64 -i "Glass_Act_Host_Developer_ID.provisionprofile" | gh secret set HOST_PROFILE_BASE64 -R brianmario/glassact
+     base64 -i "Glass_Act_Viewer_Developer_ID.provisionprofile" | gh secret set VIEWER_PROFILE_BASE64 -R brianmario/glassact
+     gh variable set HOST_PROFILE_NAME -R brianmario/glassact --body "Glass Act Host Developer ID"
+     gh variable set VIEWER_PROFILE_NAME -R brianmario/glassact --body "Glass Act Viewer Developer ID"
      ```
 
 4. **App Store Connect API key** (secrets `ASC_KEY_ID` and `ASC_KEY_P8_BASE64`;
