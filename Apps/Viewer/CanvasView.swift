@@ -71,7 +71,7 @@ final class CanvasView: NSView {
         wantsLayer = true
         layer?.masksToBounds = true // clip the panned content to the window
         layer?.backgroundColor = NSColor.black.cgColor
-        contentLayer.magnificationFilter = .nearest // crisp at 1:1 / zoom-in
+        contentLayer.magnificationFilter = .nearest // per layout: whole-number zoom only
         contentLayer.minificationFilter = .linear   // smooth downsample in fit
         contentLayer.contentsGravity = .resize
         contentLayer.actions = ["contents": NSNull(), "frame": NSNull(),
@@ -146,9 +146,17 @@ final class CanvasView: NSView {
             // Scale the layer to the fit rect via its transform so the cursor
             // sublayer (in canvas-point space) scales with it.
             contentLayer.transform = CATransform3DMakeScale(place.fit, place.fit, 1)
+            // Nearest at 1:1 and whole-number zoom, where each received pixel
+            // becomes an exact block of screen pixels. Smooth at any other
+            // upscale (a half-size auto-scaled picture filling the window,
+            // a window grown past the picture): at 1.9× nearest doubles some
+            // pixels and triples others, and text goes uneven.
+            let whole = abs(place.fit - place.fit.rounded()) < 0.001
+            contentLayer.magnificationFilter = whole ? .nearest : .linear
             return
         }
         contentLayer.transform = CATransform3DIdentity
+        contentLayer.magnificationFilter = .nearest // the pan viewport is 1:1
     }
 
     /// The pan viewport is in use: opened as one, and the picture is bigger
