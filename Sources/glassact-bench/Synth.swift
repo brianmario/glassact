@@ -11,7 +11,7 @@ let synthCommand = Command(
         .int("height", "<px>", 32...16_384, "frame height (default 400)"),
         .int("frames", "<n>", 1...Int.max, "frame count (default 120)"),
         .int("seed", "<n>", 0...Int.max, "RNG seed (default 1)"),
-        .choice("kind", ["mixed", "noise", "ui", "fullscan", "video", "panel"], "content model (default mixed)"),
+        .choice("kind", ["mixed", "noise", "ui", "fullscan", "video", "panel", "spinner"], "content model (default mixed)"),
     ],
     notes: """
       kinds:
@@ -23,6 +23,9 @@ let synthCommand = Command(
         panel     a text-like page that is replaced once, then only a left-side panel
                   animates every frame — one busy panel on an otherwise still screen
                   (pinned video's worst case: minutes of soft static text)
+        spinner   a text page scrolls for 1.5 s, then only a 3-tile spinner changes,
+                  10 times a second (a terminal's status line after the output
+                  stops): a live region with nothing but small changes left
     """,
     run: cmdSynth
 )
@@ -80,7 +83,24 @@ func cmdSynth(_ opts: Options) throws {
         }
     }
 
-    func mutate() -> [DirtyRect] {
+    // spinner: frames come only on change, as a capture delivers them.
+    let spinnerScrollFrames = 90
+    func mutate(_ i: Int) -> [DirtyRect] {
+        if kind == "spinner" {
+            if i < spinnerScrollFrames {
+                // Scroll the page up one 16 px line; a new line at the bottom.
+                let rowBytes = width * 4, shift = 16 * rowBytes
+                frame.withUnsafeMutableBytes { raw in
+                    let base = raw.baseAddress!
+                    memmove(base, base + shift, raw.count - shift)
+                }
+                paintText(x: 0, y: height - 16, w: width, h: 16)
+                return [DirtyRect(x: 0, y: 0, width: width, height: height)]
+            }
+            let w = 192, h = 64, x = 0, y = height - 2 * h
+            paintText(x: x, y: y, w: w, h: h)
+            return [DirtyRect(x: x, y: y, width: w, height: h)]
+        }
         if kind == "panel" {
             // Frame 1: the whole page is replaced (the content arrives); then
             // only the panel moves.
@@ -135,14 +155,14 @@ func cmdSynth(_ opts: Options) throws {
         return rects
     }
 
-    if kind == "panel" { paintText(x: 0, y: 0, w: width, h: height) }
+    if kind == "panel" || kind == "spinner" { paintText(x: 0, y: 0, w: width, h: height) }
     for i in 0..<frames {
-        var rects = i == 0 ? [DirtyRect(x: 0, y: 0, width: width, height: height)] : mutate()
+        var rects = i == 0 ? [DirtyRect(x: 0, y: 0, width: width, height: height)] : mutate(i)
         if kind == "fullscan" { rects = [] }
         try frame.withUnsafeBytes { raw in
             try writer.appendFrame(timestampUS: ts, dirtyRects: rects, frame: raw)
         }
-        ts += 16_667
+        ts += kind == "spinner" && i >= spinnerScrollFrames ? 100_000 : 16_667
     }
     try writer.finish()
     print("synth: wrote \(frames) frames (\(width)x\(height), kind \(kind), seed \(seed)) to \(out)")

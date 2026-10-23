@@ -235,6 +235,35 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Small changes inside a live region: parked (2026-10-22)
+
+Plane Wi-Fi, live: with only a terminal's spinner changing (3 rects, about 9
+tiles), the region kept sending video at 577–890 Kbit/s, 9–11 fps, until it
+dissolved. The idea (an `agy` analysis): send such sub-32-tile updates as
+lossless tiles and let the encoder idle.
+
+Measured first, with `synth --kind spinner` (new: a text page scrolls for
+1.5 s, then only a 192×64 spinner changes at 10 Hz, frames only on change)
+at 2900×1572, `replay --mode loop --video vt --link-mbit 8 --link-buffer-ms
+2000 --latency 75-100 --drop 1 --golden --timeline`: the spinner phase sent
+~9 video frames a second, and video bytes barely moved (the timeline's
+running total stayed at 2 MB from the end of the scroll to the dissolve at
+~3.6 s; 2.14 MB in all, 1.13 MB of it the cold-start sync frame). The
+region dissolved on schedule and the screen was exact 100 ms after the last
+frame. At `--link-mbit 2` the synthetic page's 1.13 MB keyframe fills the
+link for the whole trace, so it says nothing about the spinner. (Real
+terminal text compresses far better: the live keyframe at 1450×786 was
+58 KB.)
+
+So most of the live 0.6–0.9 Mbit/s was likely the re-sharpen keyframes the
+next entry removes, plus the encoder refining a picture first coded under a
+thin budget. Routing the small changes to tiles would also need the region
+diff moved ahead of the tile pass: decided where it is now (after
+`collectCandidates`), the records would wait for the next tick, and with
+captures quiet the Host's drain ticks start only after 100 ms, which would
+make a keystroke in a live region later. Parked until a live session after
+the re-sharpen fix shows it still matters.
+
 ### No re-sharpen for a dying region (2026-10-22)
 
 Plane Wi-Fi, live: 6 re-sharpening keyframes in ~95 s, each followed 2–4 s
