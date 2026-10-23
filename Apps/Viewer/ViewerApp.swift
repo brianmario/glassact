@@ -500,6 +500,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             controller.setRequestedGeometry(mode: UInt8(mode),
                                             widthPoints: Int(pts.width),
                                             heightPoints: Int(pts.height), scale: scale)
+            requestedGeometry = (UInt8(mode), Int(pts.width), Int(pts.height), scale)
         }
         // Main-runloop timers fire on the main thread; the bodies are
         // main-actor methods (assumeIsolated also checks that at runtime).
@@ -758,7 +759,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let sameShape = previous.width > 0
             && abs((natural.width / natural.height) / (previous.width / previous.height) - 1) < 0.005
         if fullScreen {
-            // Applied on leaving full screen.
+            // Applied on leaving full screen; a full-screen reshape's
+            // picture isn't the windowed one (its restore re-fits).
+            guard !fullScreenReshaped else { return }
             let old = windowedLimits?.max ?? natural
             windowedLimits = (sameShape ? NSSize(width: max(natural.width, old.width), height: max(natural.height, old.height))
                                         : natural, natural)
@@ -991,6 +994,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// the title timer and occlusion observer would pile up across
     /// reconnects and keep polling the old session).
     private func teardownCanvasWindow() {
+        fullScreenReshaped = false
         titleTimer?.invalidate()
         titleTimer = nil
         if let occlusionObserver {
@@ -1287,6 +1291,38 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         (window.contentView as? CanvasView)?.startPresenting()
         SessionLog.shared.write("full_screen", "on=1 size=\(Int(window.frame.width))x\(Int(window.frame.height))")
         scheduleVirtualDisplayResize()
+        reshapeHostForFullScreen(window)
+    }
+
+    /// Full screen with a picture of another shape: ask the host to take
+    /// this screen's shape, so it fills the screen edge to edge. A virtual
+    /// display of the screen's size when the host can make one, else Client
+    /// Resolution. Not Native ("every pixel at full size"), Fit to Window
+    /// (it already follows the window) or a single shared window.
+    private func reshapeHostForFullScreen(_ window: NSWindow) {
+        guard settings.fullScreenReshapesHost, !virtualMode, !singleWindowMode, !canvasPanMode,
+              model.resolution != .native, let controller, let screen = window.screen,
+              let grid = controller.configuredGrid() else { return }
+        let screenSize = screen.frame.size
+        let pictureAspect = CGFloat(grid.width) / CGFloat(grid.height)
+        let screenAspect = screenSize.width / screenSize.height
+        guard abs(pictureAspect / screenAspect - 1) > 0.005 else { return } // already its shape
+        let mode = controller.hostSupportsVirtualDisplay() ? GeometryMode.virtualDisplay : GeometryMode.clientResolution
+        let scale = Int(screen.backingScaleFactor)
+        fullScreenReshaped = true
+        SessionLog.shared.write("full_screen_reshape", "on=1 mode=\(mode) size=\(Int(screenSize.width))x\(Int(screenSize.height))")
+        controller.requestResize(mode: mode, widthPoints: Int(screenSize.width),
+                                 heightPoints: Int(screenSize.height), scale: scale)
+    }
+
+    /// Leaving full screen after a reshape: ask for the session's own
+    /// geometry again; the window re-fits to it when it arrives.
+    private func restoreHostShapeAfterFullScreen() {
+        guard fullScreenReshaped else { return }
+        fullScreenReshaped = false
+        guard let controller, let g = requestedGeometry else { return }
+        SessionLog.shared.write("full_screen_reshape", "on=0 mode=\(g.mode) size=\(g.w)x\(g.h)")
+        controller.requestResize(mode: g.mode, widthPoints: g.w, heightPoints: g.h, scale: g.scale)
     }
 
     func windowWillExitFullScreen(_ notification: Notification) {
@@ -1306,6 +1342,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         (window.contentView as? CanvasView)?.startPresenting()
         SessionLog.shared.write("full_screen", "on=0")
         scheduleVirtualDisplayResize()
+        restoreHostShapeAfterFullScreen()
     }
 
     func windowDidFailToEnterFullScreen(_ window: NSWindow) {
@@ -1320,6 +1357,12 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var virtualMode = false
     /// The session window is a 1:1 pan viewport (Native on a smaller screen).
     private var canvasPanMode = false
+    /// The geometry this session asked for at connect, to ask for again
+    /// when a full-screen reshape ends.
+    private var requestedGeometry: (mode: UInt8, w: Int, h: Int, scale: Int)?
+    /// The host took this screen's shape for full screen
+    /// (`ViewerSettings.fullScreenReshapesHost`).
+    private var fullScreenReshaped = false
     /// The last size (points) asked of the host.
     private var lastVirtualRequest: (Int, Int)?
     private var virtualResizeWork: DispatchWorkItem?
