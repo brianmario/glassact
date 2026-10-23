@@ -887,29 +887,22 @@ public final class HostEngine: @unchecked Sendable {
     /// on disconnect (the app's captureModified path), never mid-session —
     /// a healthy-streak swap-back would cost a renegotiation blink and invite
     /// an immediate return trip on an intermittently-healthy link.
-    /// Fires at most once; evaluated on the 1 Hz PING cadence, and only on
-    /// seconds that produced a fresh ack-delay reading (neither an idle
-    /// session nor a video-only one may accumulate streaks off a stale EWMA).
+    /// Fires at most once; evaluated on the 1 Hz PING cadence, from fresh
+    /// readings only (`ScalePressure`).
     public var onScalePressureConstrained: (() -> Void)?
     /// The engine entered `.failed` (terminal). Engine queue, once.
     public var onFailed: ((_ reason: String) -> Void)?
-    public static let autoScaleSevereSeconds = 6
-    private var scalePressureConstrained = false
-    private var severeStreakS = 0
-    private var scaleEvalPrevSampleUS: UInt64 = 0
+    public static let autoScaleSevereSeconds = ScalePressure.severeSeconds
+    public static let autoScaleThinVideoSeconds = ScalePressure.thinVideoSeconds
+    private var scalePressure = ScalePressure()
 
     private func evaluateScalePressure() {
-        guard !scalePressureConstrained else { return }
-        // Only seconds with a FRESH ack-delay reading count. ackDelayUS
-        // updates solely on tile-batch ACKs, so gating on total send
-        // activity (video included) would count a value frozen since the
-        // last congested settle, every second, while pinned video carries the
-        // motion over a recovered link. No fresh reading: hold.
-        guard ackDelaySampleUS != scaleEvalPrevSampleUS else { return }
-        scaleEvalPrevSampleUS = ackDelaySampleUS
-        severeStreakS = ackDelayUS > Self.governorSevereAckDelayUS ? severeStreakS + 1 : 0
-        if severeStreakS >= Self.autoScaleSevereSeconds {
-            scalePressureConstrained = true
+        if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
+                                    severeAckDelayUS: Self.governorSevereAckDelayUS,
+                                    videoLinkMeasurements: videoRate.linkMeasurements,
+                                    videoRateBytesPerSecond: videoRate.rate,
+                                    videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
+                                    pixels: grid.width * grid.height) {
             onScalePressureConstrained?()
         }
     }
