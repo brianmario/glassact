@@ -486,10 +486,13 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             let scale = Int(screen.backingScaleFactor)
             // frame, not visibleFrame: display MODES are full-screen sizes.
             var pts = screen.frame.size
-            if mode == Int(GeometryMode.virtualDisplay) {
+            if mode == Int(GeometryMode.virtualDisplay) || mode == Int(GeometryMode.scale) {
                 // A virtual display the size of the session window (it then
                 // follows the window — see requestVirtualDisplaySize): the
                 // last windowed size on this screen, else most of the screen.
+                // Scale Down fits the same window, so its picture shows 1:1:
+                // scaled to the full screen, it overflowed the visible area
+                // (menu bar, Dock) and opened a pan viewport instead.
                 pts = Self.largestWindowContentSize(on: screen)
             }
             let name = ["", "Client Resolution", "Scale", "Native", "Virtual Display"][mode]
@@ -1085,14 +1088,18 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         SessionLog.shared.write("presenting", "canvas=\(grid.width)x\(grid.height) single_window=\(sharedWindow ? 1 : 0)")
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let natural = NSSize(width: CGFloat(grid.width) / scale, height: CGFloat(grid.height) / scale)
-        // Native mode = the canvas doesn't fit this screen at 1:1 → pan
-        // viewport (1:1, edge-scroll). Otherwise fit-scale the whole canvas.
+        // Native mode and the canvas doesn't fit this screen at 1:1 → pan
+        // viewport (1:1, edge-scroll). Otherwise fit-scale the whole canvas:
+        // only Native promises every pixel at full size, and any other mode's
+        // picture that turns out a little too big (the menu bar and Dock
+        // aren't part of a display mode) should shrink, not scroll.
         let visible = NSScreen.main?.visibleFrame.size ?? natural
         // Windowed mode always fit-scales into the viewer's screen — never pan
         // (pan is for a full display that exceeds the screen at 1:1). We also
         // ask the host to shrink the real window to fit (see maybeRequestHostFit),
         // so the fit-scale is transient and it settles crisp at native pixels.
-        var panMode = natural.width > visible.width || natural.height > visible.height
+        var panMode = model.resolution == .native
+            && (natural.width > visible.width || natural.height > visible.height)
         // Virtual Display: the canvas IS the window's size (1:1), never a
         // pan viewport; the window's size drives the host display's.
         virtualMode = !sharedWindow && model.resolution.rawValue + 1 == Int(GeometryMode.virtualDisplay)
