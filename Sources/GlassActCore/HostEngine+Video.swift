@@ -683,6 +683,7 @@ extension HostEngine {
             return
         }
         stats.videoFramesSent += 1
+        if sync { stats.videoSyncBytesSent += data.count }
         if stats.videoFramesSent == 1, let onFirstVideoFrame {
             let now = clock?() ?? lastEncodeNowUS
             onFirstVideoFrame(data.count, sync, now > firstVideoSubmitUS ? now - firstVideoSubmitUS : 0)

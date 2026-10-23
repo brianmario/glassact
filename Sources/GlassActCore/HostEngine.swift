@@ -30,6 +30,9 @@ public struct HostStats: Sendable {
     public var overlayHandoffRecords = 0
     public var videoFramesSent = 0
     public var videoBytesSent = 0
+    /// Of `videoBytesSent`, the sync frames' (a region's first picture,
+    /// re-sharpens, answered sync requests).
+    public var videoSyncBytesSent = 0
     public var videoBacklogSkips = 0
     /// Tiles a dissolve revealed for free (unchanged under the video)
     /// instead of repainting.

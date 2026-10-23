@@ -885,6 +885,13 @@ revisit them (BENCHMARKS "PROTOTYPE: tile records over QUIC streams").
 process. It adds deterministic, seeded fault injection: drop %, dup %,
 reorder %, and a latency distribution. Every test that involves loss uses a
 fixed seed.
+- An optional **bottleneck** (rate plus buffer) models a thin link. Tile
+  datagrams that don't fit its buffer drop. The host's control and video
+  share the same queue without dropping: video waits for room in a send
+  buffer, which the transport reports as `videoBacklogBytes`, and the
+  queueing shows in a modeled `transportRTT`. The video stream's
+  congestion window is the whole buffer, the worst case for standing queue
+  (`InProcLink.Bottleneck`).
 
 ---
 
@@ -902,6 +909,9 @@ the same inputs give the same outputs.
 - `replay --mode encode`: bytes/frame and stage timings, with instant ACKs.
   `--count-allocs` adds the heap allocations made inside each tick.
 - `replay --mode loop`: host → InProc faults → viewer, over virtual time.
+  `--link-mbit` and `--link-buffer-ms` put everything the host sends through
+  one bottleneck (§6), and the summary adds bytes by kind, the queueing
+  delay, and how long each still screen took to become exact.
 - `synth`: synthetic traces.
 - `glassact-bench help` lists the rest.
 

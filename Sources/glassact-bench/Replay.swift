@@ -5,7 +5,8 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden"]
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden",
+                             "link-mbit", "link-buffer-ms"]
 
 let replayCommand = Command(
     name: "replay",
@@ -18,6 +19,8 @@ let replayCommand = Command(
         .int("reorder", "<pct>", 0...100, "loop: datagram reorder % (default 0)"),
         .span("latency", "<lo-hi>", "loop: one-way latency range in ms, e.g. 20-80 (default 0-0)"),
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
+        .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
+        .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
         .choice("video", ["mock", "vt"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
@@ -37,6 +40,8 @@ let replayCommand = Command(
         loop    host engine -> seeded faults -> viewer engine over virtual time; verify canvas
       --video: mock = deterministic rig codec; vt = hardware HEVC. Real codecs vary in
                bytes but settle byte-exact.
+      thin link (plane Wi-Fi):
+        glassact-bench replay --trace t.scap --mode loop --video mock --link-mbit 2 --latency 75-100 --drop 1
       standard golden run:
         glassact-bench replay --trace t.scap --mode loop --drop 5 --dup 1 --reorder 10 --latency 20-80 --golden
     """,
