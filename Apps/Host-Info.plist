@@ -8,6 +8,8 @@
 	<string>$(GLASSACT_UPDATE_FEED_URL)</string>
 	<key>SUPublicEDKey</key>
 	<string>$(GLASSACT_SPARKLE_PUBLIC_KEY)</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>3600</integer>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_glassact._udp</string>

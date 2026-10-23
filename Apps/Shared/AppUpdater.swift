@@ -10,6 +10,11 @@ import Sparkle
 /// either way. A build without an update key (a fork, or before the key
 /// exists) never checks.
 ///
+/// With automatic checks on, each launch checks a few seconds in, and a
+/// running app every hour (`SUScheduledCheckInterval`). Sparkle alone
+/// checks at most once a day, so an app opened the day a release came out
+/// could keep the old version until the next.
+///
 /// `GLASSACT_UPDATE_FEED` overrides the feed, for trying an update from a
 /// local server; an update still has to carry the release key's signature.
 @MainActor
@@ -35,9 +40,20 @@ final class AppUpdater: NSObject, SPUUpdaterDelegate {
             log("updates: off (this build has no update key)")
             return
         }
-        controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self,
-                                                  userDriverDelegate: nil)
+        let controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self,
+                                                      userDriverDelegate: nil)
+        self.controller = controller
+        // Shortly after launch, once the app is up: no UI unless there's an
+        // update. A check already under way (Sparkle's own scheduled one)
+        // makes this a no-op.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.launchCheckDelayS) {
+            let updater = controller.updater
+            guard updater.automaticallyChecksForUpdates, updater.canCheckForUpdates else { return }
+            updater.checkForUpdatesInBackground()
+        }
     }
+
+    static let launchCheckDelayS = 3.0
 
     /// The Check for Updates… menu item's action.
     @objc func checkForUpdates(_ sender: Any?) {

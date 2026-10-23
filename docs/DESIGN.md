@@ -1203,8 +1203,10 @@ its container.
   `SPARKLE_ED_PRIVATE_KEY` secret) **and** its code signature matches the
   running app's team. A build without a public key never checks: a fork, or
   any build before the key exists.
-- Sparkle asks once whether to check automatically. **Check for Updates…**
-  (both apps' menus) works either way.
+- Sparkle asks once whether to check automatically. With checks on, each
+  launch checks after 3 s and a running app hourly (`SUScheduledCheckInterval`
+  3600, Sparkle's minimum); Sparkle alone checks at most daily.
+  **Check for Updates…** (both apps' menus) works either way.
 - The Host holds a downloaded update while a viewer is connected and installs
   it when the viewer leaves, so an update never drops a session.
 - The sandboxed Viewer installs through Sparkle's Installer XPC service

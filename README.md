@@ -141,8 +141,9 @@ Agents work two ways:
 
 Both apps update themselves through [Sparkle](https://sparkle-project.org)
 from this repository's releases. On the second launch each asks whether to
-check automatically; **Check for Updates…** is in the Host's menu and the
-Viewer's app menu either way. An update installs only if it's signed with
+check automatically. If you say yes, it checks a few seconds after every
+launch and hourly while it runs. **Check for Updates…** is in the Host's menu
+and the Viewer's app menu either way. An update installs only if it's signed with
 the project's release key and by the same developer as the app you have.
 
 - The Host waits until no viewer is connected before installing, so an update
