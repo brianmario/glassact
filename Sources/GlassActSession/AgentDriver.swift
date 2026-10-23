@@ -439,6 +439,10 @@ public final class AgentDriver: @unchecked Sendable {
     /// an agent needs is that what it's about to read has stopped moving.
     /// Everything that did settle is exact (lossless tiles). `moving` reports
     /// the tiles still changing at the end.
+    ///
+    /// The quiet window only starts once the first picture has arrived: right
+    /// after connecting, a canvas nothing has reached yet is also "still",
+    /// and on a slow machine it stayed blank past `quietUS`.
     private func waitSettled(timeout: Double, quietUS: UInt64 = 300_000,
                              stillFraction: Double = 0.005) throws -> (settled: Bool, moving: Int) {
         try requireRunning()
@@ -448,14 +452,15 @@ public final class AgentDriver: @unchecked Sendable {
         var moving = 0
         while true {
             Thread.sleep(forTimeInterval: 0.05)
-            let (changed, total, overlay) = session.queue.sync { () -> (Int, Int, Int) in
+            let (changed, total, overlay, pictured) = session.queue.sync { () -> (Int, Int, Int, Bool) in
                 let c = session.engine.tilesChanged(since: windowStart)
-                return (c.changed, c.total, session.engine.overlayVisibleTileCount)
+                return (c.changed, c.total, session.engine.overlayVisibleTileCount,
+                        session.engine.milestones.firstContentUS != 0)
             }
             let allowance = max(4, Int(Double(total) * stillFraction))
             let now = MonotonicClock.nowUS
             moving = max(changed, overlay)
-            if changed > allowance || overlay > allowance {
+            if !pictured || changed > allowance || overlay > allowance {
                 // Restart the quiet window from here.
                 windowStart = session.queue.sync { session.engine.contentVersion }
                 windowStartUS = now
