@@ -742,35 +742,52 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     /// The remote screen changed size mid-session (someone at the host
     /// picked another resolution, the shared display changed, auto-scale
-    /// halved the capture). A fit window keeps its aspect lock and 1:1
-    /// limit on the new picture and reshapes to it: left on the old one,
-    /// the new picture would sit in black bars.
+    /// halved the capture). A fit window keeps its aspect lock on the new
+    /// picture, so it stays edge to edge: left on the old one, a new shape
+    /// would sit in black bars. Same shape (auto-scale): the window keeps
+    /// its size and the picture scales to fill it, softer but whole, rather
+    /// than the window shrinking to the smaller picture's 1:1. A new shape:
+    /// the window reshapes at about its current area.
     private func refitWindow(to grid: TileGrid) {
         guard let window = canvasWindow, !singleWindowMode, !virtualMode, !canvasPanMode else { return }
         let scale = window.backingScaleFactor
         let natural = NSSize(width: CGFloat(grid.width) / scale, height: CGFloat(grid.height) / scale)
-        if window.styleMask.contains(.fullScreen) {
-            windowedLimits = (natural, natural) // applied on leaving full screen
+        let fullScreen = window.styleMask.contains(.fullScreen)
+        let current = window.contentLayoutRect.size
+        let previous = (fullScreen ? windowedLimits?.aspect : window.contentAspectRatio) ?? natural
+        let sameShape = previous.width > 0
+            && abs((natural.width / natural.height) / (previous.width / previous.height) - 1) < 0.005
+        if fullScreen {
+            // Applied on leaving full screen.
+            let old = windowedLimits?.max ?? natural
+            windowedLimits = (sameShape ? NSSize(width: max(natural.width, old.width), height: max(natural.height, old.height))
+                                        : natural, natural)
             return
         }
+        // The 1:1 limit, but never below the window as it is.
+        let limit = NSSize(width: max(natural.width, current.width), height: max(natural.height, current.height))
         window.contentAspectRatio = natural
-        window.contentMaxSize = natural
-        let current = window.contentLayoutRect.size
+        window.contentMaxSize = limit
+        guard !sameShape else { return }
         let bound = window.screen?.visibleFrame.size ?? current
-        // Keep about the window's current area, reshaped to the new picture.
+        let area = current.width * current.height
+        let wantW = (area * natural.width / natural.height).squareRoot()
         let target = Self.aspectFitSize(natural, within: NSSize(
-            width: min(bound.width - 40, max(current.width, current.height * natural.width / natural.height)),
-            height: min(bound.height - 40, max(current.height, current.width * natural.height / natural.width))))
+            width: min(bound.width - 40, wantW),
+            height: min(bound.height - 40, wantW * natural.height / natural.width)),
+            allowUpscale: true)
+        window.contentMaxSize = NSSize(width: max(natural.width, target.width), height: max(natural.height, target.height))
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: target))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height) // keep the top-left
         window.setFrame(frame, display: true, animate: false)
     }
 
     /// The largest size with `natural`'s aspect that fits `bound`, never
-    /// past 1:1. The height follows the rounded width, so the aspect is
+    /// past 1:1 unless `allowUpscale`. The height follows the rounded width, so the aspect is
     /// exact to the point and no sliver of the window goes uncovered.
-    static func aspectFitSize(_ natural: NSSize, within bound: NSSize) -> NSSize {
-        let fit = min(1, min(bound.width / natural.width, bound.height / natural.height))
+    static func aspectFitSize(_ natural: NSSize, within bound: NSSize, allowUpscale: Bool = false) -> NSSize {
+        let fit = min(allowUpscale ? .greatestFiniteMagnitude : 1,
+                      min(bound.width / natural.width, bound.height / natural.height))
         let width = floor(natural.width * fit)
         return NSSize(width: width, height: (width * natural.height / natural.width).rounded())
     }
