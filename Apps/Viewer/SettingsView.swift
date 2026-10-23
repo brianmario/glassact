@@ -23,13 +23,16 @@ struct SettingsView: View {
                     Text("Keep Quality Low").tag(3)
                 }
                 Toggle("Prefer sharpness over smooth motion", isOn: $settings.preferSharpness)
+                Toggle("Fill the screen in full screen", isOn: $settings.fullScreenReshapesHost)
             } header: {
                 Text("Picture")
             } footer: {
                 Text("Keeping quality high holds text crisp on a slow network, at the cost of fewer frames "
                      + "per second. Preferring sharpness also keeps moving content sharper whenever the "
                      + "network has room to spare, using more bandwidth. Changes apply the next time you "
-                     + "connect.")
+                     + "connect. Filling the screen asks the host to take this screen's shape while you're in "
+                     + "full screen with Scale Down or Match This Mac, instead of showing bars beside a "
+                     + "differently shaped picture; it goes back when you leave full screen.")
                     .settingsFooter()
             }
 

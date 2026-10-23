@@ -188,6 +188,15 @@ final class ViewerSettings {
         didSet { UserDefaults.standard.set(preferSharpness, forKey: Self.sharpnessKey) }
     }
 
+    private static let fullScreenReshapeKey = "glassact.viewer.fullScreenReshapesHost"
+    /// In full screen, a picture of another shape (Scale Down, or Match This
+    /// Mac when the host had no matching mode) asks the host to take this
+    /// screen's shape, so it fills the screen. Off by default: the picture
+    /// keeps the host's shape, with bars.
+    var fullScreenReshapesHost: Bool = UserDefaults.standard.bool(forKey: ViewerSettings.fullScreenReshapeKey) {
+        didSet { UserDefaults.standard.set(fullScreenReshapesHost, forKey: Self.fullScreenReshapeKey) }
+    }
+
     private static let allowAgentsKey = "glassact.viewer.allowAgents"
     static let allowAgentsChanged = Notification.Name("glassact.viewer.allowAgentsChanged")
     /// Agents on this Mac (the `glassact` CLI, an MCP client) may drive the
