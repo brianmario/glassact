@@ -136,12 +136,18 @@ final class CanvasView: NSView {
             contentLayer.position = CGPoint(x: -panX / s,
                                             y: bounds.height - cp.height + panY / s)
         } else {
-            var fit = min(bounds.width / cp.width, bounds.height / cp.height)
-            // Within 1% of the window: show it 1:1 and crop/pad the point or
-            // two. Otherwise a 1470×924 virtual display in a 1470×923
-            // full-screen window would draw at 99.9% — every pixel
+            let fitW = bounds.width / cp.width, fitH = bounds.height / cp.height
+            var fit = min(fitW, fitH)
+            // Never a black sliver: when covering the window crops no more
+            // than a point and a half (window sizes round to whole points),
+            // cover instead of fitting.
+            let cover = max(fitW, fitH)
+            if cp.width * cover - bounds.width <= 1.5 && cp.height * cover - bounds.height <= 1.5 { fit = cover }
+            // Within 1% of the window and covering it: show it 1:1 and crop
+            // the point or two. Otherwise a 1470×924 virtual display in a
+            // 1470×923 full-screen window would draw at 99.9% — every pixel
             // resampled, visibly soft.
-            if abs(fit - 1) < 0.01 { fit = 1 }
+            if abs(fit - 1) < 0.01 && cp.width >= bounds.width && cp.height >= bounds.height { fit = 1 }
             let w = cp.width * fit, h = cp.height * fit
             contentLayer.anchorPoint = .zero
             contentLayer.bounds = CGRect(x: 0, y: 0, width: cp.width, height: cp.height)

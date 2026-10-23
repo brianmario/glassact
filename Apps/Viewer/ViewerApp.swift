@@ -734,6 +734,42 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// animation, so we reconfigure the existing view instead.
     private func rebuildCanvasContent(grid: TileGrid) {
         (canvasWindow?.contentView as? CanvasView)?.reconfigure(grid: grid)
+        refitWindow(to: grid)
+    }
+
+    /// The remote screen changed size mid-session (someone at the host
+    /// picked another resolution, the shared display changed, auto-scale
+    /// halved the capture). A fit window keeps its aspect lock and 1:1
+    /// limit on the new picture and reshapes to it: left on the old one,
+    /// the new picture would sit in black bars.
+    private func refitWindow(to grid: TileGrid) {
+        guard let window = canvasWindow, !singleWindowMode, !virtualMode, !canvasPanMode else { return }
+        let scale = window.backingScaleFactor
+        let natural = NSSize(width: CGFloat(grid.width) / scale, height: CGFloat(grid.height) / scale)
+        if window.styleMask.contains(.fullScreen) {
+            windowedLimits = (natural, natural) // applied on leaving full screen
+            return
+        }
+        window.contentAspectRatio = natural
+        window.contentMaxSize = natural
+        let current = window.contentLayoutRect.size
+        let bound = window.screen?.visibleFrame.size ?? current
+        // Keep about the window's current area, reshaped to the new picture.
+        let target = Self.aspectFitSize(natural, within: NSSize(
+            width: min(bound.width - 40, max(current.width, current.height * natural.width / natural.height)),
+            height: min(bound.height - 40, max(current.height, current.width * natural.height / natural.width))))
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: target))
+        frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height) // keep the top-left
+        window.setFrame(frame, display: true, animate: false)
+    }
+
+    /// The largest size with `natural`'s aspect that fits `bound`, never
+    /// past 1:1. The height follows the rounded width, so the aspect is
+    /// exact to the point and no sliver of the window goes uncovered.
+    static func aspectFitSize(_ natural: NSSize, within bound: NSSize) -> NSSize {
+        let fit = min(1, min(bound.width / natural.width, bound.height / natural.height))
+        let width = floor(natural.width * fit)
+        return NSSize(width: width, height: (width * natural.height / natural.width).rounded())
     }
 
     /// A flaky radio should cost seconds, not a manual re-dial: tear the
@@ -1063,6 +1099,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             && controller.hostSupportsVirtualDisplay()
         lastVirtualRequest = virtualMode ? (Int(natural.width.rounded()), Int(natural.height.rounded())) : nil
         if sharedWindow || virtualMode { panMode = false }
+        canvasPanMode = panMode
         var size = natural
         if virtualMode {
             size = natural // requested to fit this screen; exactly the host display, 1:1
@@ -1071,8 +1108,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             // pointer pans into the full-resolution pixels near the edges.
             size = NSSize(width: floor(visible.width * 0.9), height: floor(visible.height * 0.9))
         } else if let vis = NSScreen.main?.visibleFrame {
-            let fit = min(1, min((vis.width - 40) / natural.width, (vis.height - 40) / natural.height))
-            size = NSSize(width: floor(natural.width * fit), height: floor(natural.height * fit))
+            size = Self.aspectFitSize(natural, within: NSSize(width: vis.width - 40, height: vis.height - 40))
         }
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -1199,6 +1235,19 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         return options
     }
 
+    /// Zoom (the green button's option-click, a title-bar double-click)
+    /// fills the screen, which can ignore the aspect lock: keep it.
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        guard window == canvasWindow, window.contentAspectRatio.width > 0,
+              !virtualMode, !canvasPanMode, !singleWindowMode else { return newFrame }
+        let room = window.contentRect(forFrameRect: newFrame).size
+        let content = Self.aspectFitSize(window.contentAspectRatio, within: NSSize(
+            width: min(room.width, window.contentMaxSize.width), height: min(room.height, window.contentMaxSize.height)))
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: content))
+        frame.origin = NSPoint(x: newFrame.midX - frame.width / 2, y: newFrame.maxY - frame.height)
+        return frame
+    }
+
     func windowWillEnterFullScreen(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window == canvasWindow else { return }
         inFullScreenTransition = true
@@ -1245,6 +1294,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     /// The session uses a host virtual display sized to this window.
     private var virtualMode = false
+    /// The session window is a 1:1 pan viewport (Native on a smaller screen).
+    private var canvasPanMode = false
     /// The last size (points) asked of the host.
     private var lastVirtualRequest: (Int, Int)?
     private var virtualResizeWork: DispatchWorkItem?
