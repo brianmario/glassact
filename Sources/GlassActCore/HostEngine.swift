@@ -899,7 +899,9 @@ public final class HostEngine: @unchecked Sendable {
     private func evaluateScalePressure() {
         if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
                                     severeAckDelayUS: Self.governorSevereAckDelayUS,
-                                    videoActive: regionActive, videoDrainBytesPerSecond: videoRate.rate,
+                                    videoLinkMeasurements: videoRate.linkMeasurements,
+                                    videoRateBytesPerSecond: videoRate.rate,
+                                    videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
                                     pixels: grid.width * grid.height) {
             onScalePressureConstrained?()
         }

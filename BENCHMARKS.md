@@ -243,20 +243,32 @@ consecutive seconds of severe (> 700 ms) tile ACK delay, while pinned video
 carried most of the motion and the tile path was often quiet. The ACK
 delay sat under 700 ms most seconds anyway (p50 170 ms).
 
-Change (`ScalePressure`): also count seconds with the video region up
-whose measured drain is under 0.75 bit/s per captured pixel **and** under
-4 Mbit/s. Five in a row halve the capture. The per-pixel bar puts
-2900×1572 at 3.4 Mbit/s (FaceTime's top screen-share tier is 0.87 bit/s per
-pixel). The 4 Mbit/s cap keeps a 5K capture on ordinary home Wi-Fi at native
+Change (`ScalePressure`): also count seconds with a fresh video link
+measurement whose drain is under 0.75 bit/s per captured pixel **and**
+under 4 Mbit/s. Five in a row halve the capture. A measurement is a window
+in which video stayed backlogged, so the link set the pace
+(`VideoRateController.linkMeasurements`). The controller's estimate alone
+isn't evidence: a backoff from its startup cap sets it with nothing
+backlogged (Codex's review of #53). The per-pixel bar puts 2900×1572 at
+3.4 Mbit/s (FaceTime's top screen-share tier is 0.87 bit/s per pixel). The
+4 Mbit/s cap keeps a 5K capture on ordinary home Wi-Fi at native
 resolution: that trade costs text sharpness and stays opt-in. Seconds
-without video, or before the link is measured, hold the streak. Replayed
-against the session's per-2 s video drains (2.29, 1.13, 0.63, 0.34, 0.30
-Mbit/s…), the rule fires on the fifth reading (`ScalePressureTests`), so
-roughly 5–10 s after the link thins instead of 45 s.
+without a new measurement hold the streak, whether that's no video or a
+quiet or paused region.
+
+`ScalePressureTests` drives the real controller over a simulated link,
+evaluated once a second:
+
+| case | fires? |
+|---|---|
+| video backed up behind a 2 Mbit/s link, 2900×1572 | yes, within 10 s; once |
+| busy video on a 100 Mbit/s link, 30 s | no |
+| 5K capture on a 10 Mbit/s link, 30 s | no |
+| quiet connect behind a 200 ms queue (estimate set by a backoff, nothing backlogged), then 30 s light | no |
+| 3 thin seconds, 30 s paused, then thin again | holds, then fires |
 
 No trace replay: the bench can't re-capture a trace at a lower resolution,
 and its loop doesn't yet constrain video (a thin-link model is in progress).
-Unchanged on a fast link: a LAN never gets past either bar.
 
 ### Prefer sharpness: a QP 28 ceiling on a link with headroom (2026-10-19)
 

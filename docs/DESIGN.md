@@ -708,7 +708,8 @@ capture for the rest of the session (`ScalePressure`) after either:
 - 6 s of severe ACK delay, counting only seconds with a fresh ACK-delay
   sample; or
 - 5 s of measured video drain under 0.75 bit/s per captured pixel and under
-  4 Mbit/s, counting only seconds with the video region up. The absolute cap
+  4 Mbit/s. Only seconds with a fresh link measurement count: a window in
+  which video stayed backlogged, so the link set the pace. The absolute cap
   keeps a 5K capture on ordinary home Wi-Fi at native resolution. Pinned video can carry a thin
   link's motion while the tile path stays quiet, so the ACK-delay rule
   alone can take tens of seconds (45 s on plane Wi-Fi).

@@ -7,13 +7,16 @@
 ///   a row, counting only seconds with a new ACK-delay sample (an idle or
 ///   video-only session would otherwise keep counting a stale value).
 /// - Video drain under `thinVideoBitsPerPixel` per captured pixel, and
-///   under `thinVideoMaxBitsPerSecond`, for `thinVideoSeconds` in a row, counting only seconds the video region is
-///   up and the rate controller has measured the link (a backlogged
-///   window: the link, not the screen, was the limit). Seconds without
-///   video hold the streak. Pinned video carries the motion, so on a thin
-///   link the tile path can go quiet for long stretches: on plane Wi-Fi the
-///   ACK-delay rule alone took 45 s to fire while video drained at
-///   0.3–2.3 Mbit/s for a 2900×1572 capture.
+///   under `thinVideoMaxBitsPerSecond`, for `thinVideoSeconds` in a row,
+///   counting only seconds with a fresh link measurement: a window in which
+///   video stayed backlogged, so the link set the pace
+///   (`VideoRateController.linkMeasurements`). Both the smoothed estimate
+///   and that window's drain must be under the bar. Seconds without a new
+///   measurement (no video, a quiet or paused region, a link that never
+///   backs up) hold the streak. Pinned video carries the motion, so on a
+///   thin link the tile path can go quiet for long stretches: on plane
+///   Wi-Fi the ACK-delay rule alone took 45 s to fire while video drained
+///   at 0.3–2.3 Mbit/s for a 2900×1572 capture.
 ///
 /// Plain value type; latches once fired.
 struct ScalePressure {
@@ -33,20 +36,23 @@ struct ScalePressure {
     private var severeStreakS = 0
     private var thinVideoStreakS = 0
     private var prevAckSampleUS: UInt64 = 0
+    private var prevVideoMeasurements = 0
 
     /// One second's evidence; true the one time it decides the link is
     /// constrained. `ackSampleUS` changes whenever a new ACK delay was
-    /// measured; `videoDrainBytesPerSecond` is 0 until the video rate
-    /// controller measures the link.
+    /// measured, and `videoLinkMeasurements` whenever a backlogged video
+    /// window measured the link.
     mutating func noteSecond(ackSampleUS: UInt64, ackDelayUS: UInt64, severeAckDelayUS: UInt64,
-                             videoActive: Bool, videoDrainBytesPerSecond: Int, pixels: Int) -> Bool {
+                             videoLinkMeasurements: Int, videoRateBytesPerSecond: Int,
+                             videoLastDrainBytesPerSecond: Int, pixels: Int) -> Bool {
         guard !constrained else { return false }
         if ackSampleUS != prevAckSampleUS {
             prevAckSampleUS = ackSampleUS
             severeStreakS = ackDelayUS > severeAckDelayUS ? severeStreakS + 1 : 0
         }
-        if videoActive && videoDrainBytesPerSecond > 0 {
-            let bits = videoDrainBytesPerSecond * 8
+        if videoLinkMeasurements != prevVideoMeasurements {
+            prevVideoMeasurements = videoLinkMeasurements
+            let bits = max(videoRateBytesPerSecond, videoLastDrainBytesPerSecond) * 8
             let thin = bits < Self.thinVideoMaxBitsPerSecond
                 && Double(bits) < Double(pixels) * Self.thinVideoBitsPerPixel
             thinVideoStreakS = thin ? thinVideoStreakS + 1 : 0

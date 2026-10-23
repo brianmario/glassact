@@ -85,6 +85,13 @@ public struct VideoRateController: Sendable {
 
     /// Drain estimate, bytes/s; 0 until the first backlogged window.
     public private(set) var rate = 0
+    /// Backlogged windows so far: each is a reading of what the link itself
+    /// carries (the send queue never emptied, so the link, not the screen,
+    /// set the pace). `rate` alone isn't that evidence: a backoff from the
+    /// startup cap sets it with no backlog at all.
+    public private(set) var linkMeasurements = 0
+    /// The last backlogged window's drain, bytes/s.
+    public private(set) var lastLinkDrain = 0
     public private(set) var backoffs = 0
     /// The rate the link last pushed back at (bytes/s, decaying).
     public private(set) var pushbackRate = 0.0
@@ -204,6 +211,8 @@ public struct VideoRateController: Sendable {
             if old == 0 { tokens = 0 }
             backoffs += 1
         } else if backlogged {
+            linkMeasurements += 1
+            lastLinkDrain = sample
             rate = rate == 0 ? sample : (rate * 3 + sample) / 4
             if old == 0 { tokens = 0 }
             // A first measurement (or a drain that halves the rate) taken in
