@@ -79,6 +79,35 @@ import GlassActTestSupport
         #expect(h.host.stats.videoRefreshes == 1, "small updates alone don't re-sharpen")
     }
 
+    /// Plane Wi-Fi: a large change, then only a spinner (under the 32 tiles
+    /// that keep a region up). The region counts down to its dissolve, and
+    /// the lossless repaint makes it exact anyway: no re-sharpening
+    /// keyframe, a full-screen burst, for the second or two in between.
+    @Test(.tags(.slow), .notInFastLane) func aDyingRegionIsNotResharpened() {
+        var rng = SplitMix64(seed: 9104)
+        let encoder = SyncRecordingEncoder()
+        let h = session(encoder, &rng)
+        // Motion for longer than the keyframe interval (a busy region is
+        // never re-sharpened), ending in a large change: a re-sharpen is
+        // due a second later, if nothing stopped it.
+        let busyEnd = h.now + 6_000_000
+        while h.now < busyEnd {
+            h.frame.fillRandom(&rng)
+            h.encodeFrame(dirtyRects: [Self.whole])
+            h.run(untilUS: h.now + 100_000)
+        }
+        let before = h.host.stats.videoRefreshes
+        let spinner = DirtyRect(x: 640, y: 576, width: 128, height: 64)
+        let end = h.now + 6_000_000
+        while h.now < end {
+            h.frame.fillRect(x: 640, y: 576, w: 128, h: 64, &rng)
+            h.encodeFrame(dirtyRects: [spinner])
+            h.run(untilUS: h.now + 100_000)
+        }
+        #expect(h.host.activeVideoRegionCount == 0, "only a spinner: the region dissolves")
+        #expect(h.host.stats.videoRefreshes == before, "no re-sharpen for a region about to dissolve")
+    }
+
     @Test(.tags(.slow), .notInFastLane) func busyRegionIsNotInterrupted() {
         var rng = SplitMix64(seed: 9102)
         let encoder = SyncRecordingEncoder()

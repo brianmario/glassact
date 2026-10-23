@@ -173,6 +173,7 @@ the numbers and the reasoning.
 | Capture-time PTS for the encoder | kept | typing-cc at 1 Mbit/s: SSIM 0.892 → 0.967 | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
 | QP 34 frame-QP floor | kept (default since 2026-10-10) | typing-cc at 1 Mbit/s: min SSIM 0.757 → 0.926, same bytes | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
 | Re-sharpen keyframe once a region goes quiet | kept | SSIM 0.879 → 0.975–0.985 | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
+| …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
@@ -233,6 +234,41 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### No re-sharpen for a dying region (2026-10-22)
+
+Plane Wi-Fi, live: 6 re-sharpening keyframes in ~95 s, each followed 2–4 s
+later by the region's dissolve, whose lossless repaint makes the screen
+exact anyway. `refreshDue` fired on "quiet for 1 s after large changes"
+without asking whether anything still kept the region alive; on a thin
+link that's a full-screen keyframe for a second or two of sharper video,
+sharing the bottleneck with the repaint behind it. It now also needs an
+update of ≥ 32 tiles within the last 1 s (the record handoff's own test,
+`handoffRecordActiveUS`). A busy panel on an otherwise still screen, the
+case the re-sharpen exists for, still gets its keyframe
+(`VideoRefreshTests.quietRegionGetsOneResharpeningKeyframe`); a large
+change followed only by a spinner doesn't
+(`aDyingRegionIsNotResharpened`, which fails without the guard).
+
+`replay --mode loop --video vt --link-mbit n --link-buffer-ms 2000
+--latency 75-100 --drop 1 --golden`, main (ae76a12) → guard. 6 Mbit/s for
+5K is about the bits per pixel of the plane session's 2 Mbit/s at
+2900×1572. All runs settled byte-exact.
+
+| trace, link | total bytes | video sync bytes | re-sharpens | queue p95 | last frame → exact |
+|---|---|---|---|---|---|
+| scroll-win, 6 Mbit/s | 12.55 → 12.05 MB (−4.0 %) | 1.00 MB → 519 KB | 1 → 0 | 275 → 264 ms | 16.4 → 15.7 s |
+| cursor-drag, 6 Mbit/s | 13.22 → 12.25 MB (−7.3 %) | 1.92 MB → 972 KB | 3 → 1 | 329 → 294 ms | 20.25 → 20.4 s |
+| scroll v3, 6 Mbit/s | 5.40 → 5.13 MB (−5.0 %) | 535 → 269 KB | 1 → 0 | 325 → 323 ms | 5.6 → 5.6 s |
+| typing-cc, 6 Mbit/s | 7.85 → 7.85 MB | 269 → 269 KB | 0 → 0 | 350 → 350 ms | 0.1 → 0.1 s |
+| scroll-win, 20 Mbit/s | 17.80 → 17.21 MB (−3.3 %) | 1.34 MB → 772 KB | 1 → 0 | — | 9.35 → 9.25 s |
+| cursor-drag, 20 Mbit/s | 14.59 → 13.35 MB (−8.5 %) | 2.04 MB → 937 KB | 3 → 1 | — | 7.4 → 7.35 s |
+| scroll v3, 20 Mbit/s | 23.07 → 22.77 MB (−1.3 %) | 581 → 269 KB | 1 → 0 | — | 3.75 → 3.75 s |
+| typing-cc, 20 Mbit/s | 7.91 → 7.91 MB | 269 → 269 KB | 0 → 0 | — | 0.15 → 0.15 s |
+
+Not measured: how soft the screen looks between the motion stopping and
+the dissolve's repaint landing (the loop has no quality metric); that
+stretch is what the skipped keyframe would have sharpened.
 
 ### Thin-link loop: one bottleneck for tiles, video and control (2026-10-22)
 

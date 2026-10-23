@@ -305,7 +305,13 @@ extension HostEngine {
     func refreshDue(nowUS: UInt64, regionArea: Int) -> Bool {
         guard regionStartSent, refreshQuietSinceUS != 0,
               nowUS &- refreshQuietSinceUS >= Self.refreshQuietUS,
-              nowUS &- lastRegionSyncUS >= Self.refreshMinIntervalUS else { return false }
+              nowUS &- lastRegionSyncUS >= Self.refreshMinIntervalUS,
+              // Only while something still keeps the region alive (the
+              // handoff's own test). Once nothing has, the region is
+              // counting down to its dissolve, whose lossless repaint makes
+              // it exact anyway: a keyframe then is a full-screen burst
+              // for a second or two of sharper video.
+              nowUS &- regionLastChangeUS < Self.handoffRecordActiveUS else { return false }
         let damaged = refreshDamagePixels * Self.refreshDamageDivisor >= max(1, regionArea)
         let cap = videoRate.bitrateCap ?? Int.max
         let budgetGrew = capAtLastSync > 0 && cap / Self.refreshCapGrowth >= capAtLastSync

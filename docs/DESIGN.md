@@ -591,6 +591,12 @@ and the last sync is ≥ 5 s old, provided either:
 - the damage since that sync covers ≥ 1/10 of the region, or
 - the bitrate cap has at least doubled.
 
+…and only while something still keeps the region alive (an update of
+≥ 32 tiles within the last 1 s, the record handoff's own test). A region
+that nothing keeps alive is counting down to its dissolve, whose lossless
+repaint makes it exact anyway; a keyframe then would be a full-screen
+burst for a second or two of sharper video.
+
 **Sync requests:** a SYNC_REQUEST (§3.5) from the viewer means its decoder
 lost the stream (§5). The host answers with a forced sync frame on the next
 serviced tick, even if the region didn't change.
