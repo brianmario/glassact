@@ -548,7 +548,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         if captureModified {
             // Scale: re-fit the downscaled capture to the display's new shape.
             guard let request = lastScaleRequest else { return }
-            let size = Self.scaledCaptureSize(of: bounds.size, toFit: request)
+            let size = Self.scaledCaptureSize(of: bounds.size, toFit: request,
+                                              maxPixelsPerPoint: Self.pixelsPerPoint(display))
             let clamped = Self.clampCapture(size.w, size.h)
             guard clamped.w != captureWidth || clamped.h != captureHeight else { return }
             onStatus("display changed to \(Int(bounds.width))×\(Int(bounds.height)) — capture re-fit to \(size.w)×\(size.h) px")
@@ -783,14 +784,24 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     }
 
     /// "Scale": the capture size that aspect-fits a display of `size`
-    /// points into the viewer's request. Even dims for 4:2:0 codecs; floored
-    /// so a tiny (or hostile) request can't produce a zero-sized capture.
+    /// points into the viewer's request, never past the display's own
+    /// pixels (`maxPixelsPerPoint`): a viewer window bigger than this
+    /// display gets its native picture, not an upscaled one. Even dims for
+    /// 4:2:0 codecs; floored so a tiny (or hostile) request can't produce a
+    /// zero-sized capture.
     private static func scaledCaptureSize(of size: CGSize,
-                                          toFit request: (widthPoints: Int, heightPoints: Int, scale: Int))
-        -> (w: Int, h: Int) {
-        let f = min(CGFloat(request.widthPoints * request.scale) / size.width,
+                                          toFit request: (widthPoints: Int, heightPoints: Int, scale: Int),
+                                          maxPixelsPerPoint: CGFloat) -> (w: Int, h: Int) {
+        let f = min(maxPixelsPerPoint,
+                    CGFloat(request.widthPoints * request.scale) / size.width,
                     CGFloat(request.heightPoints * request.scale) / size.height)
         return (max(64, Int(size.width * f)) & ~1, max(64, Int(size.height * f)) & ~1)
+    }
+
+    /// The display's current mode, pixels per point (2 for a Retina mode).
+    private static func pixelsPerPoint(_ display: CGDirectDisplayID) -> CGFloat {
+        guard let mode = CGDisplayCopyDisplayMode(display), mode.width > 0 else { return 2 }
+        return CGFloat(mode.pixelWidth) / CGFloat(mode.width)
     }
 
     /// The display under the middle of `rect` (global points), or 0.
@@ -1429,7 +1440,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // stretch (a 16:9 host into a 3:2 viewer request).
             let bounds = CGDisplayBounds(display)
             lastScaleRequest = (widthPoints, heightPoints, scale)
-            let (pw, ph) = Self.scaledCaptureSize(of: bounds.size, toFit: (widthPoints, heightPoints, scale))
+            let (pw, ph) = Self.scaledCaptureSize(of: bounds.size, toFit: (widthPoints, heightPoints, scale),
+                                                  maxPixelsPerPoint: Self.pixelsPerPoint(display))
             if pw == captureWidth && ph == captureHeight {
                 // Still downscaled vs the display (a reconnect within the
                 // grace): restore must stay armed.
