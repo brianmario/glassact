@@ -581,7 +581,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                              detail: "host protocol \(hostVersion), this Viewer \(WireVersion.current)")
         let alert = NSAlert()
         alert.messageText = "“\(sessionName)” runs a different version of Glass Act"
-        alert.informativeText = "Glass Act Host and Viewer must be the same version. "
+        alert.informativeText = "This Host and Viewer are too far apart in version to work together. "
             + (hostNewer ? "The Host is newer: update this Viewer."
                          : "This Viewer is newer: update Glass Act Host on “\(sessionName)” (its menu › Check for Updates…).")
         if hostNewer && updater.isEnabled {

@@ -53,9 +53,13 @@ retransmission.
   `-Ounchecked`. Wire parsing is always checked (§8, INV-6).
 - **Perf claims** need a `glassact-bench` number on a named trace, recorded in
   BENCHMARKS.md. A regression over 10 % needs a written reason.
-- **Wire changes:** until 1.0 the wire protocol may change in any release.
-  Bump `WireVersion.current`, and keep no old decode paths or migration
-  code; both ends must run the same build.
+- **Wire changes are additive.** A Host and Viewer of different releases
+  must work together (DESIGN §12). Add a new message type, or put new
+  behaviour, fields and enum values behind a caps bit (§3.8) and keep the
+  old path for peers without it. Never change how an existing message is
+  encoded: `WireCompatTests` pins every type's bytes as released builds
+  send them. Bumping `WireVersion.current` drops every older release, so it
+  needs the owner's sign-off and should be very rare.
 - **Loss tests** use fixed seeds. Goldens are byte-exact.
 - **Stranded-tile tests** drive explicit dirty rects. `Harness.settle()`
   full-scans every tick (nil dirty rects), which re-volunteers every tile

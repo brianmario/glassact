@@ -38,7 +38,6 @@ import GlassActTestSupport
     @Test func malformedRequestsAreRejected() {
         let valid = SignInRequest(op: .signIn, user: "alex", password: "pw", device: "Air").encoded()
         #expect(SignInRequest.parse([]) == nil)
-        #expect(SignInRequest.parse(valid + [0]) == nil, "trailing bytes")
         #expect(SignInRequest.parse(Array(valid.dropLast())) == nil, "truncated")
         var badVersion = valid; badVersion[0] = 2
         #expect(SignInRequest.parse(badVersion) == nil)
@@ -62,7 +61,6 @@ import GlassActTestSupport
 
     @Test func malformedResponsesAreRejected() {
         #expect(SignInResponse.parse([1, 4, 0]) == nil)
-        #expect(SignInResponse.parse([1, 4, 0, 0, 0]) == nil)
         #expect(SignInResponse.parse([2, 4, 0, 0]) == nil)
         #expect(SignInResponse.parse([1, 0, 0, 0]) == nil)
         #expect(SignInResponse.parse([1, 7, 0, 0]) == nil)

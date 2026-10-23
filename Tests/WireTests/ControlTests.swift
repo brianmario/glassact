@@ -237,17 +237,19 @@ import GlassActTestSupport
         #expect(d.isMalformed)
     }
 
-    @Test func ackBitmapLengthMustMatchCount() {
-        var bad = ByteWriter()
-        bad.writeU8(0x03)
-        bad.writeVarint(4 + 2 + 2) // frame_seq + dgram_cnt + 2 bitmap bytes
-        bad.writeU32(1)
-        bad.writeU16(3)            // cnt 3 needs exactly 1 bitmap byte, TLV carries 2
-        bad.writeBytes([0xFF, 0xFF] as [UInt8])
+    /// The bitmap is as long as the count needs; a byte past it is a newer
+    /// peer's appended field (§12), not more bitmap.
+    @Test func ackBitmapReadsOnlyWhatTheCountNeeds() {
+        var w = ByteWriter()
+        w.writeU8(0x03)
+        w.writeVarint(4 + 2 + 2) // frame_seq + dgram_cnt + 2 bytes
+        w.writeU32(1)
+        w.writeU16(3)            // cnt 3 needs 1 bitmap byte; the 2nd is appended
+        w.writeBytes([0xFF, 0xAB] as [UInt8])
         var d = ControlDeframer()
-        d.append(bad.bytes)
-        #expect(d.next() == nil)
-        #expect(d.isMalformed)
+        d.append(w.bytes)
+        #expect(d.next() == .message(.ack(frameSeq: 1, dgramCnt: 3, bitmap: [0xFF])))
+        #expect(!d.isMalformed)
     }
 
     @Test func oversizeBodyIsMalformed() {
@@ -357,7 +359,6 @@ import GlassActTestSupport
     @Test func malformedSyncRequestsAreRejected() {
         rejects(type: 0x1B, body: [], "empty SYNC_REQUEST")
         rejects(type: 0x1B, body: [0, 1, 0, 0], "generation truncated")
-        rejects(type: 0x1B, body: [0, 1, 0, 0, 0, 9], "trailing byte")
     }
 
     @Test func textChunksStayUnderTheBoundAtCharacterBoundaries() {

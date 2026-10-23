@@ -160,11 +160,12 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 - `varint` = unsigned LEB128, ≤ 4 bytes, so values are < 2²⁸. The reader accepts
   overlong encodings that are in range; the writer is canonical and traps
   out of range.
-- Version compatibility is an **exact match**: the datagram header nibble,
-  HELLO and HELLO_OK are all checked. Features are negotiated with caps bits
-  (§3.8), not version bumps.
-- Until 1.0 any release may change the wire (§12): bump the version and
-  keep no old decode paths; both ends run the same build.
+- The version is checked as an **exact match**: the datagram header nibble,
+  HELLO and HELLO_OK. It counts deliberate breaks only, which should be very
+  rare; v4 is the first released protocol (26.10.0).
+- Everything else is additive, so different releases work together (§12):
+  new message types, caps bits (§3.8), INPUT kinds and tile opcodes, and
+  fields appended to a fixed-layout message.
 
 ### 3.1 Geometry
 
@@ -243,7 +244,9 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 ### 3.5 Control stream
 
 **Framing:** reliable and ordered, as TLVs `{type u8, len varint, body}`.
-- A body is at most 1 MiB and must be consumed exactly.
+- A body is at most 1 MiB. Bytes after the fields a receiver knows are
+  ignored, so a newer peer may append fields; releases before 26.10.2
+  reject them, so an appended field still needs a caps bit (§12).
 - Unknown types with a valid length are skipped.
 - Any malformed frame latches the stream, and the connection is torn down.
 
@@ -1034,9 +1037,12 @@ Open work is in GitHub issues (labels: `performance`, `security`, `research`,
 
 ## 12. Working agreements
 
-- Until 1.0 the wire protocol may change in any release: bump
-  `WireVersion.current`, and keep no old decode paths or migration code.
-  Both ends must run the same build.
+- **Different releases work together.** The wire only grows: a new
+  message type, or new behaviour, fields and enum values behind a caps bit
+  with the old path kept for peers without it. Existing encodings never
+  change; `WireCompatTests` pins each message type's bytes as released
+  builds send them. Bumping `WireVersion.current` drops every older release:
+  a deliberate, very rare break that needs the owner's sign-off.
 - **No new dependencies.** System frameworks only, plus the vendored libwebp.
 - Every invariant keeps an `INV_*` test, and a failing one blocks merge.
 - Perf-relevant changes include before/after `glassact-bench` output on a
@@ -1167,8 +1173,9 @@ its container.
 - The sandboxed Viewer installs through Sparkle's Installer XPC service
   (`SUEnableInstallerLauncherService`, with mach-lookup exceptions for
   `<bundle ID>-spks` and `-spki`).
-- Host and Viewer must run the same build (§3.2). A Viewer that reaches a Host
-  on another wire version stops redialing, says which side is behind, and,
+- Host and Viewer of different releases work together (§12); only a wire
+  version break (very rare) separates them. A Viewer that reaches a Host on
+  another wire version stops redialing, says which side is behind, and,
   when the Host is newer, offers Check for Updates… (`onIncompatibleHost`).
   The `glassact` CLI says the same and stops.
 - `GLASSACT_UPDATE_FEED` overrides the feed, for testing an update from a

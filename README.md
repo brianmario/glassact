@@ -15,8 +15,8 @@ It also has a CLI and an MCP server, so **AI agents** can see and use a
 remote Mac. They can do that either through your Viewer session or on a
 headless connection of their own.
 
-> **Status:** pre-release. It works daily between two Macs, but the wire
-> protocol still changes without notice, so run the same build on both ends.
+> **Status:** early. It works daily between two Macs. Host and Viewer of
+> different releases work together, so you can update them one at a time.
 
 ## Requirements
 
@@ -147,8 +147,9 @@ the project's release key and by the same developer as the app you have.
 
 - The Host waits until no viewer is connected before installing, so an update
   never drops your session.
-- Host and Viewer must be the same version. If they aren't, the Viewer says
-  which one to update.
+- Host and Viewer don't have to be the same version: each updates on its own
+  schedule. In the rare case a release can't talk to an older one, the Viewer
+  says which one to update.
 
 ## Security
 

@@ -15,9 +15,9 @@ works for builds you hand out yourself.
 - Versions are `YY.M.N`: the year and month of the release, then N counting
   releases within that month from 0. October 2026's first release is
   `26.10.0`, a fix the same day `26.10.1`, and November's first `26.11.0`.
-  The version promises nothing about compatibility: until the wire protocol
-  settles, both ends must run the same build (AGENTS.md), whatever the
-  numbers say.
+  The version promises nothing by itself; compatibility comes from the
+  wire rules instead. Releases work with older and newer ones unless
+  `WireVersion.current` changes, which is a rare, deliberate break (AGENTS.md).
 - The version lives in `Apps/Version.xcconfig` (`GLASSACT_VERSION`) and in the
   CLI (`let version` in `Sources/glassact/main.swift`). `scripts/check-version`
   checks they agree and are `YY.M.N`, and the workflow checks the tag names
