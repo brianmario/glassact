@@ -474,6 +474,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private let logInbox = ViewerLogInbox()
 
     private var displayWatchRegistered = false
+    /// Capture is waiting for a display to wake (`recoverCapture`).
+    private var awaitingDisplay = false
 
     /// The physical display the Host shares: the one capture started on,
     /// or the main display before that (main-thread).
@@ -492,10 +494,17 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             let controller = Unmanaged<HostController>.fromOpaque(info).takeUnretainedValue()
             DispatchQueue.main.async { controller.displayReconfigured(display, flags: flags) }
         }, Unmanaged.passUnretained(self).toOpaque())
+        // Waking from display sleep isn't always a reconfiguration.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.displayMayBeBack() }
+        }
     }
 
     /// Main thread. One display's reconfiguration finished.
     private func displayReconfigured(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        displayMayBeBack()
         if flags.contains(.unMirrorFlag) || flags.contains(.mirrorFlag) {
             // A virtual display's mirroring can be undone by the system.
             reapplyViewerModeIfReverted()
@@ -902,14 +911,21 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Main thread. Rebuild the capture from a freshly enumerated display (or
     /// the shared window) at the SAME configured size — the live engine and
     /// viewer session carry on as if frames had just paused. Retries with
-    /// backoff (1 s, 2 s, … 5 s) until it works or sharing stops; a viewer
-    /// connecting kicks an immediate attempt (after waking the display).
-    private func recoverCapture(attempt: Int) {
+    /// backoff (1 s, 2 s, … 5 s) until it works or sharing stops. With no
+    /// display at all (asleep, nobody watching) it stops polling after
+    /// `recoveryQuickAttempts` and waits instead: the screens waking, a
+    /// display change, or a viewer connecting (which wakes the display)
+    /// each kick an immediate attempt, with a slow poll as a safety net. A
+    /// display that sleeps all night used to be enumerated every 5 s
+    /// (10,000+ attempts by morning).
+    private func recoverCapture(attempt: Int, after delay: Double? = nil) {
         guard isRunning else { return }
         captureGeneration += 1
         let generation = captureGeneration
         Task { @MainActor in
-            if attempt > 1 {
+            if let delay {
+                try? await Task.sleep(for: .seconds(delay))
+            } else if attempt > 1 {
                 try? await Task.sleep(for: .seconds(min(5, attempt - 1)))
             }
             guard generation == self.captureGeneration, self.isRunning else { return }
@@ -934,6 +950,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                     self.sharedDisplayID = id
                     self.contentOrigin = CGDisplayBounds(id).origin
                 }
+                self.awaitingDisplay = false
                 self.onStatus("capture recovered (attempt \(attempt))")
                 self.reconcileSharedDisplay()
             } catch {
@@ -946,12 +963,32 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
                     self.onPermissionProblem()
                     return
                 }
+                let noDisplay = (error as NSError).domain == "glassact" && (error as NSError).code == 1
+                if noDisplay && attempt >= Self.recoveryQuickAttempts {
+                    if !self.awaitingDisplay {
+                        self.awaitingDisplay = true
+                        self.onStatus("capture paused: no display to capture (asleep?) — waiting for one to wake")
+                    }
+                    self.recoverCapture(attempt: attempt + 1, after: Self.recoverySlowPollS)
+                    return
+                }
                 if attempt == 1 || attempt % 12 == 0 {
                     self.onStatus("capture recovery attempt \(attempt) failed: \(error.localizedDescription) — retrying")
                 }
                 self.recoverCapture(attempt: attempt + 1)
             }
         }
+    }
+
+    /// Quick retries before an absent display counts as asleep (about 15 s).
+    private static let recoveryQuickAttempts = 6
+    /// The safety-net poll while waiting for a display to wake.
+    private static let recoverySlowPollS = 60.0
+
+    /// Main thread. Something that can bring a display back happened: if
+    /// capture is waiting for one, try now.
+    private func displayMayBeBack() {
+        if isRunning && stream == nil && awaitingDisplay { recoverCapture(attempt: 1) }
     }
 
     /// The shared window if it still exists, else the display `wanted`
