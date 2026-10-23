@@ -145,8 +145,10 @@ check automatically; **Check for Updates…** is in the Host's menu and the
 Viewer's app menu either way. An update installs only if it's signed with
 the project's release key and by the same developer as the app you have.
 
-- The Host waits until no viewer is connected before installing, so an update
-  never drops your session.
+- **Install and Relaunch** goes ahead even while a viewer is connected (often
+  it's the viewer who clicked it): the Host restarts in a few seconds and the
+  Viewer reconnects by itself. Updates that install on their own wait until
+  the Host quits.
 - Host and Viewer don't have to be the same version: each updates on its own
   schedule. In the rare case a release can't talk to an older one, the Viewer
   says which one to update.

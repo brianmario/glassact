@@ -1205,8 +1205,11 @@ its container.
   any build before the key exists.
 - Sparkle asks once whether to check automatically. **Check for Updates…**
   (both apps' menus) works either way.
-- The Host holds a downloaded update while a viewer is connected and installs
-  it when the viewer leaves, so an update never drops a session.
+- Install and Relaunch goes ahead even with a viewer connected; Sparkle only
+  relaunches when someone chose it (automatic updates install at quit), and
+  often the viewer chose it. The session drops for the restart and the
+  Viewer's redial (`ReconnectPolicy`) brings it back. Holding the relaunch
+  until the viewer left made the button look dead from the Viewer.
 - The sandboxed Viewer installs through Sparkle's Installer XPC service
   (`SUEnableInstallerLauncherService`, with mach-lookup exceptions for
   `<bundle ID>-spks` and `-spki`).
