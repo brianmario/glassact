@@ -51,7 +51,7 @@ Each release attaches:
 |---|---|
 | `Glass-Act-Host-YY.M.N.zip`, `Glass-Act-Viewer-YY.M.N.zip` | the notarized, stapled apps (universal) |
 | `host-appcast.xml`, `viewer-appcast.xml` | each app's Sparkle update feed, pointing at the zips above |
-| `glassact-YY.M.N-macos.zip` | the CLI, universal, Developer ID–signed and notarized |
+| `glassact-cli-YY.M.N.zip` | the `glassact` CLI, universal, Developer ID–signed and notarized |
 | `Glass-Act-Host-YY.M.N-dSYMs.zip`, `Glass-Act-Viewer-YY.M.N-dSYMs.zip` | symbols, to turn crash reports into function names |
 | `SHA256SUMS` | checksums of the zips |
 

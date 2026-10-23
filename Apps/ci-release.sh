@@ -129,7 +129,7 @@ CLI=$(cd .. && swift build $CLI_BUILD --show-bin-path)/glassact
 mkdir -p $OUT/cli && cp "$CLI" $OUT/cli/glassact
 codesign --force --options runtime --timestamp --sign "$IDENTITY" --identifier $PREFIX.cli $OUT/cli/glassact
 lipo -archs $OUT/cli/glassact
-CLI_ZIP="$OUT/dist/glassact-$VERSION-macos.zip"
+CLI_ZIP="$OUT/dist/glassact-cli-$VERSION.zip"
 ditto -c -k $OUT/cli "$CLI_ZIP"
 notarize "$CLI_ZIP" # a bare binary can't be stapled; Gatekeeper checks it online
 echo "✓ glassact CLI: ${CLI_ZIP:t}"
