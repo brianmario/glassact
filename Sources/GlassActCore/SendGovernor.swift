@@ -12,9 +12,9 @@ public enum RateLimit: Equatable, Sendable {
 }
 
 /// Global tile-record send governor (§4.9): a token bucket whose refill rate
-/// is the tile path's average send rate. The bucket absorbs one full-screen
-/// change so ordinary workloads (typing, window scrolls, cold starts) never
-/// notice the governor; the transport paces each burst onto the wire
+/// is the tile path's average send rate. The bucket absorbs bursts in
+/// proportion to that rate, up to a full-screen change on a fast path;
+/// the transport paces each burst onto the wire
 /// (`DatagramPacing`, `PaceController`).
 ///
 /// Admission happens where tiles qualify (HostEngine.encodeTick): a tile
@@ -33,7 +33,8 @@ public enum RateLimit: Equatable, Sendable {
 ///  - halves under a severe queue (> 200 ms) so it drains.
 /// "Queue" is STANDING path delay: the minimum path delay (a confirmed
 /// datagram's ACK time minus its estimated departure from the transport's
-/// pacer) over the last ~200–400 ms, above its 10–20 s minimum. A short-
+/// pacer) over the last ~200–400 ms, above its 10–20 s minimum. On a long
+/// path the handshake seeds that minimum before tiles can queue. A short-
 /// window minimum rejects jitter — if even the fastest recent datagram was
 /// late, a queue stands; a mean would read 20–80 ms of random latency as
 /// 30–60 ms of "queue" and collapse the rate. The per-batch ACK delay can't serve
@@ -53,8 +54,10 @@ public enum RateLimit: Equatable, Sendable {
 /// the worst moment and, on delay alone, the rate would never move. A
 /// sizable batch that times out mostly unconfirmed halves the rate (at most
 /// once per `lossHoldUS`), path sample or not.
-/// Floor 32 KB/s (256 kbps) and a bucket of a quarter-second of the rate:
-/// a 1 MB/s floor and fixed 16 MB burst would sit 4× above a 2 Mbps link.
+/// Floor 32 KB/s (256 kbps) and a bucket of a quarter-second of the rate,
+/// with room for at least one RAW tile (16 KB). A 64 KB minimum burst alone
+/// takes 1.75 s on a 0.3 Mbit/s link. A 1 MB/s floor and fixed 16 MB burst
+/// would sit 4× above a 2 Mbps link.
 /// Delivery rate only bounds the rate when the governor was limiting: an
 /// app-limited sender's delivery rate is just what it sent (draining to it
 /// would spiral the rate to the floor); otherwise a building queue backs
@@ -74,7 +77,7 @@ struct SendGovernor {
     /// between `minBucket` and this.
     static let bucketCap = 16_777_216
     static let bucketSeconds = 0.25
-    static let minBucket = 65_536
+    static let minBucket = 16_384
     /// A timed-out batch this large, this unconfirmed, is a loss event.
     static let lossMinDatagrams = 8
     static let lossFraction = 0.5
@@ -85,9 +88,11 @@ struct SendGovernor {
     static let growthQuietAfterLossUS: UInt64 = 1_000_000
     /// The control loop can't outrun its own sensor: the queue estimate is
     /// a 200–400 ms minimum, so growth waits that long between steps and a
-    /// decrease is held that long for its effect to show. At one step per
-    /// 25 ms decision the rate would go 40 KB/s → 900 KB/s before a 250 KB/s
-    /// link's queue registered, then halve to the floor while it drained.
+    /// decrease is held that long for its effect to show. Growth also waits
+    /// at least the measured path delay; 200 ms steps outrun a long RTT.
+    /// At one step per 25 ms decision the rate would go 40 KB/s → 900 KB/s
+    /// before a 250 KB/s link's queue registered, then halve to the floor
+    /// while it drained.
     static let growthIntervalUS: UInt64 = 200_000
     static let decreaseHoldUS: UInt64 = 400_000
 
@@ -97,7 +102,11 @@ struct SendGovernor {
     /// first ACK comes back: missed PONGs, a reset, and the reconnect's cold
     /// start does it again (BENCHMARKS 'Tile governor on thin links: late
     /// ACKs, loss, slow start'). A LAN still reaches 100 MB/s in ~1.2 s.
+    /// At ≥ 150 ms handshake RTT, start with 32 KB per round trip instead;
+    /// latency isn't a capacity measurement, so retain slow start to probe.
     static let initialAutoRate = 2_000_000
+    static let highRTTUS: UInt64 = 150_000
+    static let initialWindowBytes = 32_000
     static let slowStartFactor = 2.0
     /// `fastLinkStart`: a fast-link start (8.4 MB/s, a full 16 MB
     /// bucket at every rate) for unit tests of logic that assumes one tick
@@ -201,6 +210,18 @@ struct SendGovernor {
 
     // MARK: Signals
 
+    /// The HELLO round trip is known before the first tile batch. On a
+    /// long path, start with 32 KB per round trip instead of a LAN's rate,
+    /// and seed the baseline before a congested first ACK can define it.
+    mutating func start(roundTripUS: UInt64, nowUS: UInt64) {
+        guard !fastLinkStart, roundTripUS >= Self.highRTTUS else { return }
+        autoRate = max(Self.minAutoRate, min(Self.initialAutoRate,
+            Int(UInt64(Self.initialWindowBytes) * 1_000_000 / roundTripUS)))
+        tokens = min(tokens, bucketCapacity(.auto))
+        baselineMinUS = roundTripUS
+        baselineWindowStartUS = nowUS
+    }
+
     /// A confirmed datagram's path delay: its ACK time minus its estimated
     /// departure from the pacer.
     mutating func notePathDelay(_ sampleUS: UInt64, nowUS: UInt64) {
@@ -213,7 +234,9 @@ struct SendGovernor {
         }
         baselineMinUS = min(baselineMinUS, sampleUS)
         if recentWindowStartUS == 0 || nowUS &- recentWindowStartUS > Self.recentWindowUS {
-            previousRecentMinUS = recentMinUS
+            // A quiet gap expires BOTH windows. Keeping the old clean
+            // minimum would let the first queued ACK after idle grow Auto.
+            previousRecentMinUS = nowUS &- recentWindowStartUS > Self.recentWindowUS * 2 ? .max : recentMinUS
             recentMinUS = .max
             recentWindowStartUS = nowUS
         }
@@ -327,9 +350,9 @@ struct SendGovernor {
                 lastDecreaseUS = nowUS
                 slowStart = false
             }
-        } else if queue < Self.queueHealthyUS && deferredSinceAdapt && encodeHeadroom
+        } else if queue < Self.queueHealthyUS && deferredSinceAdapt && encodeHeadroom && !decreaseHeld
                     && (lastLossEventUS == 0 || nowUS &- lastLossEventUS >= Self.growthQuietAfterLossUS)
-                    && (lastGrowthUS == 0 || nowUS &- lastGrowthUS >= Self.growthIntervalUS) {
+                    && (lastGrowthUS == 0 || nowUS &- lastGrowthUS >= max(Self.growthIntervalUS, pathDelayUS)) {
             autoRate = Int(Double(autoRate) * (slowStart ? Self.slowStartFactor : Self.growthFactor))
             lastGrowthUS = nowUS
         }

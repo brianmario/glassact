@@ -27,6 +27,94 @@ import Testing
         #expect(g.queueDelayUS < G.queueHealthyUS, "jitter read as \(g.queueDelayUS) µs of queue")
     }
 
+    @Test func lanStillReaches100MegabytesPerSecondInSlowStart() {
+        var g = SendGovernor()
+        g.start(roundTripUS: 10_000, nowUS: 10_000)
+        #expect(g.autoRate == G.initialAutoRate)
+        for step in 1...6 {
+            let now = UInt64(step) * 200_000
+            g.notePathDelay(10_000, nowUS: now)
+            g.noteDeferred()
+            g.adapt(nowUS: now, ceiling: G.maxAutoRate)
+        }
+        #expect(g.autoRate >= 100_000_000, "a LAN still climbs in 1.2 s")
+    }
+
+    @Test func highRTTBoundsTheInitialFlight() {
+        var g = SendGovernor()
+        g.start(roundTripUS: 700_000, nowUS: 700_000)
+        #expect(g.autoRate < 50_000, "a long path starts with a small flight, not 16 Mbit/s")
+        #expect(g.tokens >= g.admissionEstimate, "one RAW tile can ship immediately")
+        #expect(g.tokens <= 37_500 / 2, "the burst is under half a second at 0.3 Mbit/s")
+        g.refill(nowUS: 1_000_000, limit: .auto)
+        g.refill(nowUS: 5_000_000, limit: .auto)
+        #expect(g.tokens <= 37_500 / 2, "waiting for the first capture must not restore a LAN burst")
+    }
+
+    @Test func firstCongestedAckDoesNotDefineAHealthyPath() {
+        var g = SendGovernor()
+        g.start(roundTripUS: 175_000, nowUS: 175_000)
+        let before = g.autoRate
+        g.notePathDelay(700_000, nowUS: 1_000_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 1_000_000, ceiling: G.maxAutoRate)
+        #expect(g.queueDelayUS > G.queueSevereUS)
+        #expect(g.autoRate < before && !g.slowStart, "the handshake predates this queue")
+    }
+
+    @Test func growthWaitsForTheLongPathsFeedback() {
+        var g = SendGovernor()
+        g.start(roundTripUS: 700_000, nowUS: 700_000)
+        g.notePathDelay(700_000, nowUS: 1_400_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 1_400_000, ceiling: G.maxAutoRate)
+        let after = g.autoRate
+        for now in stride(from: UInt64(1_600_000), through: 2_000_000, by: 200_000) {
+            g.notePathDelay(700_000, nowUS: now)
+            g.noteDeferred()
+            g.adapt(nowUS: now, ceiling: G.maxAutoRate)
+            #expect(g.autoRate == after, "do not grow several times within one RTT")
+        }
+        g.notePathDelay(700_000, nowUS: 2_100_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 2_100_000, ceiling: G.maxAutoRate)
+        #expect(g.autoRate > after, "a clean long path still probes upward")
+    }
+
+    @Test func aQuietGapExpiresOldCleanSamples() {
+        var g = SendGovernor()
+        g.notePathDelay(10_000, nowUS: 100_000)
+        g.notePathDelay(510_000, nowUS: 1_000_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 1_000_000, ceiling: G.maxAutoRate)
+        #expect(g.queueDelayUS > G.queueSevereUS, "the clean sample is older than both recent windows")
+        #expect(g.autoRate < G.initialAutoRate, "back off on the new queue instead of growing")
+    }
+
+    @Test func theBaselineCanStillLearnAHigherRTTRoute() {
+        var g = SendGovernor()
+        g.start(roundTripUS: 175_000, nowUS: 175_000)
+        for step in 1...120 {
+            g.notePathDelay(700_000, nowUS: 1_000_000 + UInt64(step) * 250_000)
+        }
+        #expect(g.queueDelayUS < G.queueHealthyUS, "pinning the baseline forever mistakes a route change for a queue")
+    }
+
+    @Test func backoffHoldsGrowthToo() {
+        var g = SendGovernor()
+        sample(&g, queueUS: 100_000, at: 1_000_000)
+        g.adapt(nowUS: 1_000_000, ceiling: G.maxAutoRate)
+        let after = g.autoRate
+        g.notePathDelay(10_000, nowUS: 1_100_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 1_100_000, ceiling: G.maxAutoRate)
+        #expect(g.autoRate == after, "a clean ACK cannot immediately undo the cut")
+        g.notePathDelay(10_000, nowUS: 1_500_000)
+        g.noteDeferred()
+        g.adapt(nowUS: 1_500_000, ceiling: G.maxAutoRate)
+        #expect(g.autoRate > after)
+    }
+
     @Test func autoGrowsOnlyWhileLimitingOnAnUnqueuedPath() {
         var g = SendGovernor()
         sample(&g, queueUS: 0, at: 100_000)

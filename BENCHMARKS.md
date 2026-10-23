@@ -65,8 +65,8 @@ quoting it against a change.
 | Golden status | byte-identical ×3 seeds under the standard faults on every reference trace | all | 2026-08-05 onward |
 | Video on a 3 Mbit/s bottleneck | steady p95 one-way delay 59–64 ms | relay rig (`VideoSendGateTests`) | 2026-09-30 |
 | Video quality at 1 Mbit/s (capture-time PTS, QP 34 floor) | typing-cc min SSIM 0.926; SSIMULACRA2 mean 63.1 / p5 49.8 / min 28.1 | `vquality`, 2940-wide | 2026-10-18 |
-| Tile governor on a thin link | 224–350 KB/s on a 250 KB/s link; worst backlog 183–380 ms | `GovernorTests` rig | 2026-09-28 |
-| 5K trace over a 2 Mbit/s link, 2 s buffer (time from the last frame to exact) | typing-cc 51.1 s · scroll-win 50.6 s · cursor-drag 48.4 s; queue p95 2.0 s | loop replay `--video mock --link-mbit 2` | 2026-10-22 |
+| Tile governor on a thin link | 224 KB/s on a 250 KB/s link; worst backlog 268 ms in the last three rounds | `GovernorTests` rig | 2026-10-22 |
+| 5K trace over a 2 Mbit/s link, 2 s buffer (time from the last frame to exact) | typing-cc 53.4 s · scroll-win 24.4 s · cursor-drag 52.3 s; queue p95 1.999 s | loop replay, tiles only, `--link-mbit 2` | 2026-10-22 |
 | Loopback QUIC, 2048² noise, 6 full-frame rounds | ~11 s; 0 lost, 0 redundant datagrams | `QUICSustainedSessionTests` scenario | 2026-09-27 |
 
 ## §10.1 acceptance status
@@ -188,6 +188,8 @@ the numbers and the reasoning.
 | Auto send rate instead of a fixed 25 Mbit cap | kept | loopback rounds 2.35–3.98 s → 0.74–0.77 s | [entry](#auto-send-rate-replaces-the-fixed-25-mbit-ladder-2026-09-27) |
 | Auto bounded by encode duty | kept | scroll v3 on a fast link: 392 → 62 MB, 220 → 51 s encode CPU | [entry](#auto-bounded-by-encode-headroom-2026-09-27) |
 | Slow start, late-ACK delay samples, 32 KB/s floor | kept | thin-link rig: 8.4 MB/s → 224–350 KB/s on a 250 KB/s link | [entry](#tile-governor-on-thin-links-late-acks-loss-slow-start-2026-09-28) |
+| RTT-aware tile start, smaller minimum burst, feedback-paced growth | kept | 2 Mbit/s, 175 ms RTT rig: first-round queue 1,986 → 529 ms, drops 27 → 0; LAN golden unchanged | [entry](#tile-governor-high-rtt-start-and-feedback-cadence-2026-10-22) |
+| Pin the tile delay baseline while congested | rejected | full replay queue p95 still 1,999 ms; a 175 → 700 ms route change stays a false 525 ms queue | [entry](#tile-governor-high-rtt-start-and-feedback-cadence-2026-10-22) |
 | Fresh tiles before owed tiles | kept | keystrokes no longer queue behind a dissolve repaint (live spikes were 0.6–1.8 s) | [entry](#fresh-before-owed-admission-video-cap-on-an-unmeasured-queue-2026-09-29) |
 | Datagram pacing, then adaptive pace | kept | 6 loopback rounds ~28 s → ~11 s with 0 lost | [pacing](#datagram-pacing-burst-loss-at-the-viewers-receive-buffer-2026-09-27), [adaptive](#adaptive-datagram-pacing-2026-09-27), [cold start](#cold-start-phantom-loss-stale-send-stamps--pacer-overflow-2026-09-27) |
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
@@ -263,6 +265,122 @@ diff moved ahead of the tile pass: decided where it is now (after
 captures quiet the Host's drain ticks start only after 100 ms, which would
 make a keystroke in a live region later. Parked until a live session after
 the re-sharpen fix shows it still matters.
+### Tile governor: high-RTT start and feedback cadence (2026-10-22)
+
+Follow-up to **Tile governor on thin links: late ACKs, loss, slow start**
+(2026-09-28). Apple M4 Pro, macOS 27.0.1, Xcode 27.1, release build;
+builds and replays under `nice -n 15`. Baseline `2adf55e`. No hardware video
+replays. All cases below use seed 1 unless the rig specifies its own seed.
+
+The final HELLO/HELLO_OK exchange already seeds SRTT before any tile batch;
+geometry negotiation restarts that exchange's send stamp. Use the same
+sample to start Auto at 32,000 bytes / RTT when RTT is at least 150 ms,
+with the existing 32 KB/s floor. That is about 183 KB/s at 175 ms and
+46 KB/s at 700 ms. Shrink the initial tokens too, and seed the delay
+baseline before the first congested tile ACK can define it. The minimum
+bucket is now one RAW tile (16,384 bytes): the old 64 KB minimum alone
+takes 1.75 s at 0.3 Mbit/s. The LAN's 2 MB/s start is unchanged.
+
+Growth waits for max(200 ms, the path-delay EWMA) and honors the 400 ms
+decrease hold. A gap longer than both recent-delay windows now expires the
+old clean minimum; previously the first queued ACK after a quiet period
+could still read zero standing queue and grow Auto. No change to the 0.9
+drain factor, late-ACK measurement, wire format, or timeout commit rules.
+
+**Why the new loop's queue p95 stays full.** Tiles-only replay still sends
+a striped reliable keyframe plus a lossy first paint outside this governor.
+Those bytes fill the shared bottleneck for roughly 19–31 s on these 5K
+traces. The typing baseline's first measured tile path delay was 2.192 s,
+accepted as the baseline; after the reliable startup drained, the minimum
+returned to 166–178 ms. Its queued delivery samples then measured about
+238–254 KB/s, so the drain factor was operating on the expected 250 KB/s
+link. Late ACKs were reaching the sensor. An ending governor rate above
+the line is not by itself a standing queue: it is a token refill budget,
+and two open batches, admission estimates and capture gaps also limit the
+actual traffic. The reliable startup, not that last rate sample, dominates
+this replay's full-buffer p95. Fixing that startup stream is separate work.
+
+Commands (the bench prints byte sizes as “MB”, actually MiB; rates below
+are decimal MB/s). The governor summary now prints three decimal places
+so thin-link rates are distinguishable. Rebuilding the original governor
+with just that formatting change reproduced all baseline bytes and times.
+
+```sh
+nice -n 15 swift build -c release --product glassact-bench
+nice -n 15 .build/release/glassact-bench replay \
+  --trace "$HOME/Library/Application Support/Glass Act/traces/glassact-1786116323.scap" \
+  --mode loop --link-mbit 2 --link-buffer-ms 2000 --latency 75-100 --drop 1 --golden
+# Repeat for 1786116861 (cursor-drag) and 1786116475 (scroll-win).
+# LAN: 1785962837, --mode loop --drop 5 --dup 1 --reorder 10 --latency 20-80 --golden
+```
+
+Every cell is **before → after**. “Settle” is the summary's total virtual
+time; “last → exact” is the first exact canvas after the last captured frame,
+which can precede final ACK/repair quiescence.
+
+| trace | total bytes (MiB) | queue p95 / worst (ms) | bottleneck drops | last → exact (s) | governor at end (MB/s) | settle (s virtual) | settled byte-exact |
+|---|---:|---|---:|---:|---:|---:|---|
+| typing-cc, 1786116323 | 14.74 → 14.65 | 1,999 / 1,999 → 1,999 / 2,000 | 211 → 107 | 46.400 → 53.400 | 0.221 → 0.255 | 84.6 → 85.5 | yes → yes |
+| cursor-drag, 1786116861 | 14.37 → 14.09 | 1,999 / 2,000 → 1,999 / 2,000 | 307 → 110 | 48.250 → 52.300 | 0.224 → 0.222 | 80.5 → 85.0 | yes → yes |
+| scroll-win, 1786116475 | 8.80 → 8.79 | 1,999 / 2,000 → 1,999 / 2,000 | 189 → 25 | 22.550 → 24.400 | 0.958 → 0.221 | 54.2 → 55.7 | yes → yes |
+| LAN, 1785962837 | 45.98 → 45.98 | no bottleneck | 0 → 0 | 0.200 → 0.200 | 32.000 → 32.000 | 21.1 → 21.1 | yes → yes |
+
+Tile bytes: typing 7.29 → 7.20 MiB, cursor-drag 7.13 → 6.85 MiB,
+scroll-win 4.22 → 4.20 MiB. Striped keyframes stay 6.40 / 6.23 / 3.75 MiB;
+video and video sync frames stay zero. Still periods exact remain 0/2,
+0/3 and 0/10, respectively (p50/max unavailable); LAN has 0/0. LAN datagrams
+remain 52,698 sent, 2,590 randomly dropped, 488 duplicated: no bytes or
+settle regression. Its isolated slow-start test still reaches ≥ 100 MB/s
+in six 200 ms steps (1.2 s).
+
+**Cost:** typing's first exact canvas is 15.1% later. Kept because the
+smaller bursts and feedback holds prevent startup loss on the long, thin
+paths below, and cut replay bottleneck drops by 49–87%; this is not a
+claim that every exact settle is faster. Typing's fully quiescent settle
+is only 1.1% later; cursor-drag's is 5.6% later and scroll-win's 2.8%.
+
+**Governor rigs.** New `autoFollowsAHighLatencyLink`, seed 1408, 640×384
+incompressible frames changing every 2.4 s for 12 rounds, 1% loss, two-second
+buffer, reliable cold-start keyframes disabled to isolate tile admission:
+
+| link / RTT | first-round worst queue (ms) | worst over all rounds (ms) | bottleneck drops | rate at end (B/s) | final canvas |
+|---|---:|---:|---:|---:|---|
+| 0.3 Mbit/s / 700 ms | 1,975 → 859 | 1,975 → 1,319 | 565 → 0 | 32,000 → 50,000 | exact → exact |
+| 2 Mbit/s / 175 ms | 1,986 → 529 | 1,986 → 663 | 27 → 0 | 302,815 → 167,467 | exact → exact |
+| 5 Mbit/s / 700 ms | 824 → 144 | 824 → 599 | 0 → 0 | 558,416 → 665,678 | exact → exact |
+
+Existing `autoFollowsAThinLinkDown` (250 KB/s, no propagation latency):
+350,750 → 224,480 B/s; worst backlog in the last three rounds 184 → 268 ms;
+847 → 847 bottleneck drops; exact in both. The higher late peak is a cost
+of the changed growth/ACK schedule, still below 0.3 s, while the ending
+budget is now below the line. That rig's initial reliable cold start still
+fills the buffer; it does not exercise a high-RTT handshake.
+
+**Measured alternatives:**
+- Lower start alone: typing 14.75 MiB / 49.900 s last → exact, queue p95
+  still 1,999 ms. The 0.3 Mbit/s rig dropped only 7 datagrams instead of
+  565, but still reached 1,959 ms of queue. Keeping the 64 KB burst floor
+  after adding feedback pacing also left those 7 drops and 1,959 ms.
+  Rejected as incomplete: the minimum bucket needed to shrink too.
+- Freeze the baseline while queue > 20 ms, and pace growth by the baseline
+  RTT instead of the delay EWMA: typing 14.65 MiB / 53.800 s last → exact,
+  cursor-drag 14.10 MiB / 51.150 s, scroll-win 8.81 MiB / 25.100 s; all
+  exact, all queue p95 1,999 ms. The 0.3 Mbit/s rig's worst queue improved
+  to 859 ms, but a constant 175 → 700 ms route change still read 525 ms of
+  queue after 30 s, versus zero with aging. Rejected: it cannot distinguish
+  sustained queueing from a new route, and it did not solve the replay's
+  reliable startup. Baseline aging remains; the 0.3 Mbit/s rig still has
+  a late 1,319 ms excursion, so this is not a complete congestion controller.
+
+Validation: `swift test --filter GovernorTests` passes all 34 tests,
+including the slow rigs. The added unit cases pin LAN ramp time, the initial
+flight, the handshake delay seed, long-RTT growth spacing, expiry after a
+quiet gap, the growth hold after a cut, and learning a higher-RTT route.
+`GLASSACT_FAST=1 swift test`, the five `QUICLoopbackTests` /
+`QUICSustainedSessionTests`, and release `ScrollAllocationTests` (three
+directions) pass. The package and tests also cross-compile with
+`swift build --arch x86_64 --build-tests`; Intel performance and a live
+plane session have not been measured.
 
 ### No re-sharpen for a dying region (2026-10-22)
 

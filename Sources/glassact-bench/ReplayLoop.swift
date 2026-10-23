@@ -303,7 +303,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     handoffs: reveal \(host.stats.overlayHandoffReveals)  record \(host.stats.overlayHandoffRecords)  \
     re-sharpens \(host.stats.videoRefreshes)
       rate: \(opts.has("limit-mbit") ? "limit \(opts.int("limit-mbit", 25)) Mbit/s" : "auto")  \
-    governor \(String(format: "%.1f", Double(host.stats.governorRate) / 1e6)) MB/s at end  \
+    governor \(String(format: "%.3f", Double(host.stats.governorRate) / 1e6)) MB/s at end  \
     tiles deferred \(host.stats.governorDeferredTiles)
       settled: \(settled)   canvas byte-identical: \(identical)
     """)

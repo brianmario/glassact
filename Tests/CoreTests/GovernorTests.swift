@@ -158,6 +158,46 @@ import GlassActTestSupport
         #expect(h.settle(maxSimMS: 240_000) && h.canvasMatchesFrame())
     }
 
+    /// Long RTTs and a two-second buffer, with no reliable cold-start
+    /// keyframe masking the tile governor's own queue.
+    @Test(.tags(.slow), .notInFastLane,
+          arguments: [(UInt64(87_500), 250_000), (350_000, 37_500), (350_000, 625_000)])
+    func autoFollowsAHighLatencyLink(path: (UInt64, Int)) {
+        let (oneWayUS, drain) = path
+        var faults = FaultConfig()
+        faults.latencyMinUS = oneWayUS
+        faults.latencyMaxUS = oneWayUS
+        faults.dropPermille = 10
+        faults.seed = 1408
+        var rng = SplitMix64(seed: 1408)
+        let h = Harness(width: 640, height: 384, faults: faults)
+        h.run(untilUS: 1_000_000)
+        h.host.coldStartKeyframes = false
+        h.link.bottleneck = .init(bytesPerSecond: drain, bufferBytes: drain * 2)
+        #expect(h.host.governor.autoRate < SendGovernor.initialAutoRate,
+                "the handshake must lower the rate before the first tile batch")
+        var worst: [UInt64] = []
+        var rates: [Int] = []
+        for _ in 0..<12 {
+            h.frame.fillRandom(&rng)
+            var roundWorst: UInt64 = 0
+            for _ in 0..<150 {
+                h.encodeFrame()
+                h.run(untilUS: h.now + 16_000)
+                roundWorst = max(roundWorst, h.link.bottleneckBacklogUS)
+            }
+            worst.append(roundWorst)
+            rates.append(h.host.stats.governorRate)
+        }
+        print("high latency: RTT \(oneWayUS * 2) µs, link \(drain) B/s, rates \(rates), worst backlog \(worst.map { $0 / 1000 }) ms, drops \(h.link.bottleneckDroppedDatagrams)")
+        #expect(worst[0] < 1_000_000, "the first flight must not fill the two-second buffer")
+        #expect(worst.allSatisfy { $0 < 1_500_000 }, "backlog must not park at the buffer limit: \(worst)")
+        #expect(h.link.bottleneckDroppedDatagrams == 0)
+        let late = rates.suffix(4).reduce(0, +) / 4
+        #expect(late > drain / 2 && late < drain * 3 / 2, "late mean \(late), link \(drain)")
+        #expect(h.settle(maxSimMS: 240_000) && h.canvasMatchesFrame())
+    }
+
     /// Auto bounded by encode headroom: on a fast, queue-free link with a
     /// scripted encode cost (1 ms of "encode" per tile sent), Auto must stop
     /// where encoding would saturate the capture interval — without the
