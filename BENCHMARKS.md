@@ -191,6 +191,7 @@ the numbers and the reasoning.
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
 | CUBIC-style video cap recovery | kept | back to 70 % in 2.0 s instead of 9.25 s | [entry](#video-cap-cubic-style-recovery-after-a-hiccup-2026-09-29) |
 | 3 Mbit/s video cap until the link is measured | kept | p95 from connect 574–755 → 145–673 ms | [entry](#video-startup-3-mbits-cap-until-the-link-is-measured-2026-09-30) |
+| Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
 
@@ -231,6 +232,31 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Auto-scale from the video drain too (2026-10-22)
+
+Plane Wi-Fi, live (Host 26.10.2, laptop Viewer at 2900×1572): the video
+rate controller measured the link at 0.3–5 Mbit/s (p50 2.2), with SRTT p50
+170 ms, p90 690 ms, and spikes to 1.3 s. The resolution rung halved the
+capture to 1450×786 only **45 s** after connect. The rung fired only on 6
+consecutive seconds of severe (> 700 ms) tile ACK delay, while pinned video
+carried most of the motion and the tile path was often quiet. The ACK
+delay sat under 700 ms most seconds anyway (p50 170 ms).
+
+Change (`ScalePressure`): also count seconds with the video region up
+whose measured drain is under 0.75 bit/s per captured pixel **and** under
+4 Mbit/s. Five in a row halve the capture. The per-pixel bar puts
+2900×1572 at 3.4 Mbit/s (FaceTime's top screen-share tier is 0.87 bit/s per
+pixel). The 4 Mbit/s cap keeps a 5K capture on ordinary home Wi-Fi at native
+resolution: that trade costs text sharpness and stays opt-in. Seconds
+without video, or before the link is measured, hold the streak. Replayed
+against the session's per-2 s video drains (2.29, 1.13, 0.63, 0.34, 0.30
+Mbit/s…), the rule fires on the fifth reading (`ScalePressureTests`), so
+roughly 5–10 s after the link thins instead of 45 s.
+
+No trace replay: the bench can't re-capture a trace at a lower resolution,
+and its loop doesn't yet constrain video (a thin-link model is in progress).
+Unchanged on a fast link: a LAN never gets past either bar.
 
 ### Prefer sharpness: a QP 28 ceiling on a link with headroom (2026-10-19)
 
