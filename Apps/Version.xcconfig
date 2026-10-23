@@ -7,6 +7,6 @@
 // GLASSACT_BUILD is overridden at release time with a UTC timestamp
 // (YYYYMMDDHHMM): it only ever increases, which update checks rely on.
 // GLASSACT_COMMIT is set at release time to the short commit hash.
-GLASSACT_VERSION = 26.10.2
+GLASSACT_VERSION = 26.10.3
 GLASSACT_BUILD = 1
 GLASSACT_COMMIT =
