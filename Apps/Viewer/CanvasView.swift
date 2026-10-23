@@ -20,6 +20,9 @@ import GlassActTransport
 final class CanvasView: NSView {
     private let controller: ViewerController
     private var grid: TileGrid
+    /// Opened as a pan viewport (Native on a smaller screen). It pans only
+    /// while the picture is bigger than the view (`panning`): a picture
+    /// that shrank (auto-scale) fits instead of sitting in a corner.
     private let panMode: Bool
     /// Blit state, engine-queue confined; replaced (never mutated) on main.
     private var presenter: SurfacePresenter
@@ -127,7 +130,7 @@ final class CanvasView: NSView {
         let cp = canvasPoints
         contentLayer.bounds = CGRect(origin: .zero, size: cp)
         contentLayer.contentsScale = backingScale
-        if panMode {
+        if panning {
             clampPan()
             let s = backingScale
             // Bottom-left view coords: canvas row panY (viewport top) sits at
@@ -136,25 +139,47 @@ final class CanvasView: NSView {
             contentLayer.position = CGPoint(x: -panX / s,
                                             y: bounds.height - cp.height + panY / s)
         } else {
-            var fit = min(bounds.width / cp.width, bounds.height / cp.height)
-            // Within 1% of the window: show it 1:1 and crop/pad the point or
-            // two. Otherwise a 1470×924 virtual display in a 1470×923
-            // full-screen window would draw at 99.9% — every pixel
-            // resampled, visibly soft.
-            if abs(fit - 1) < 0.01 { fit = 1 }
-            let w = cp.width * fit, h = cp.height * fit
+            let place = fitPlacement()
             contentLayer.anchorPoint = .zero
             contentLayer.bounds = CGRect(x: 0, y: 0, width: cp.width, height: cp.height)
-            // Whole device pixels, or a 1:1 picture lands between pixels.
-            let s = backingScale
-            contentLayer.position = CGPoint(x: ((bounds.width - w) / 2 * s).rounded() / s,
-                                            y: ((bounds.height - h) / 2 * s).rounded() / s)
+            contentLayer.position = place.origin
             // Scale the layer to the fit rect via its transform so the cursor
             // sublayer (in canvas-point space) scales with it.
-            contentLayer.transform = CATransform3DMakeScale(fit, fit, 1)
+            contentLayer.transform = CATransform3DMakeScale(place.fit, place.fit, 1)
             return
         }
         contentLayer.transform = CATransform3DIdentity
+    }
+
+    /// The pan viewport is in use: opened as one, and the picture is bigger
+    /// than the view.
+    private var panning: Bool {
+        let cp = canvasPoints
+        return panMode && (cp.width > bounds.width || cp.height > bounds.height)
+    }
+
+    /// Where a fit picture goes: its scale and bottom-left corner (whole
+    /// device pixels). Layout and input both use it, so a click lands on
+    /// the pixel drawn under it.
+    private func fitPlacement() -> (fit: CGFloat, origin: CGPoint) {
+        let cp = canvasPoints
+        let fitW = bounds.width / cp.width, fitH = bounds.height / cp.height
+        var fit = min(fitW, fitH)
+        // Never a black sliver: when covering the window crops no more
+        // than a point and a half (window sizes round to whole points),
+        // cover instead of fitting.
+        let cover = max(fitW, fitH)
+        if cp.width * cover - bounds.width <= 1.5 && cp.height * cover - bounds.height <= 1.5 { fit = cover }
+        // Within 1% of the window and covering it: show it 1:1 and crop
+        // the point or two. Otherwise a 1470×924 virtual display in a
+        // 1470×923 full-screen window would draw at 99.9% — every pixel
+        // resampled, visibly soft.
+        if abs(fit - 1) < 0.01 && cp.width >= bounds.width && cp.height >= bounds.height { fit = 1 }
+        // Whole device pixels, or a 1:1 picture lands between pixels.
+        let s = backingScale
+        let w = cp.width * fit, h = cp.height * fit
+        return (fit, CGPoint(x: ((bounds.width - w) / 2 * s).rounded() / s,
+                             y: ((bounds.height - h) / 2 * s).rounded() / s))
     }
 
     private func clampPan() {
@@ -201,7 +226,7 @@ final class CanvasView: NSView {
     private func reportPresentedScale() {
         guard bounds.width > 0 else { return }
         let pct: Int
-        if panMode {
+        if panning {
             pct = 100
         } else {
             let s = backingScale
@@ -215,7 +240,7 @@ final class CanvasView: NSView {
     @objc private func present() {
         // Auto-pan runs every tick (even without a blit) so the viewport keeps
         // scrolling while the pointer rests near an edge.
-        if panMode {
+        if panning {
             advanceAutoPan()
             layoutContent()
             updateCursorLayer()
@@ -328,16 +353,14 @@ final class CanvasView: NSView {
         lastMouseView = p
         let s = backingScale
         var cx: Int, cy: Int
-        if panMode {
+        if panning {
             cx = Int((panX + p.x * s).rounded())
             cy = Int((panY + (bounds.height - p.y) * s).rounded())
         } else {
-            let cp = canvasPoints
-            let fit = min(bounds.width / cp.width, bounds.height / cp.height)
-            let ox = (bounds.width - cp.width * fit) / 2
-            let oy = (bounds.height - cp.height * fit) / 2
-            cx = Int(((p.x - ox) / fit * s).rounded())
-            cy = Int(((bounds.height - p.y - oy) / fit * s).rounded())
+            let place = fitPlacement()
+            let top = place.origin.y + canvasPoints.height * place.fit // the picture's top edge
+            cx = Int(((p.x - place.origin.x) / place.fit * s).rounded())
+            cy = Int(((top - p.y) / place.fit * s).rounded())
         }
         guard cx >= 0, cy >= 0, cx < grid.width, cy < grid.height else { return nil }
         return (cx, cy)
