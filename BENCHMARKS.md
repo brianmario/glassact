@@ -66,6 +66,7 @@ quoting it against a change.
 | Video on a 3 Mbit/s bottleneck | steady p95 one-way delay 59–64 ms | relay rig (`VideoSendGateTests`) | 2026-09-30 |
 | Video quality at 1 Mbit/s (capture-time PTS, QP 34 floor) | typing-cc min SSIM 0.926; SSIMULACRA2 mean 63.1 / p5 49.8 / min 28.1 | `vquality`, 2940-wide | 2026-10-18 |
 | Tile governor on a thin link | 224–350 KB/s on a 250 KB/s link; worst backlog 183–380 ms | `GovernorTests` rig | 2026-09-28 |
+| 5K trace over a 2 Mbit/s link, 2 s buffer (time from the last frame to exact) | typing-cc 51.1 s · scroll-win 50.6 s · cursor-drag 48.4 s; queue p95 2.0 s | loop replay `--video mock --link-mbit 2` | 2026-10-22 |
 | Loopback QUIC, 2048² noise, 6 full-frame rounds | ~11 s; 0 lost, 0 redundant datagrams | `QUICSustainedSessionTests` scenario | 2026-09-27 |
 
 ## §10.1 acceptance status
@@ -231,6 +232,38 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Thin-link loop: one bottleneck for tiles, video and control (2026-10-22)
+
+Plane Wi-Fi (2026-10-22, live: 0.3–5 Mbit/s, SRTT p50 170 ms / p90 690 ms,
+up to 4 s of queue) needed a bench that reproduces a thin link. The loop's
+`InProcLink` had a bottleneck for tile datagrams only; video, most of the
+bytes on such a link, bypassed it. Now `replay --mode loop --link-mbit n
+--link-buffer-ms m` sends everything the host sends through one FIFO:
+datagrams drop when it's full, control queues, and video waits in a send
+buffer (`videoBacklogBytes`, which the video rate controller gates on). The
+queueing feeds a modeled `transportRTT`, the controller's network-queue
+signal. The summary adds bytes by kind, the queue's p95 and worst, and
+"time to exact": in each still period (≥ 500 ms without a new frame) and
+after the last frame, how long until the viewer's canvas is byte-identical
+with no video over it. Without `--link-mbit` the output is unchanged
+(typing-cc and cursor-drag, standard faults, `--video mock`: identical).
+
+Baseline, `--video mock --link-mbit 2 --link-buffer-ms 2000 --latency
+75-100 --drop 1`, all settled byte-exact:
+
+| trace | tiles | striped keyframes | video | queue p95 / worst | datagrams dropped at the bottleneck | still periods exact | last frame → exact |
+|---|---:|---:|---:|---|---:|---|---:|
+| typing-cc | 7.58 MB | 6.40 MB | 0 | 2.0 s / 2.0 s | 483 | 0 of 2 | 51.1 s |
+| scroll-win | 4.40 MB | 0 | 11.15 MB (2 sync frames) | 2.0 s / 2.0 s | 424 | 0 of 10 | 50.6 s |
+| cursor-drag | 7.17 MB | 6.23 MB | 0 | 2.0 s / 2.0 s | 298 | 0 of 3 | 48.4 s |
+
+At 5K, the cold start alone (a 6.4 MB striped keyframe, or two mock sync
+frames) is ~25 s of a 2 Mbit/s link, so every trace spends its 30 s
+catching up and the queue stands at the full buffer throughout. The mock
+codec's frames are absolute LZ4 of the whole region (~5.5 MB each at 5K),
+so mock video bytes say nothing about HEVC: video experiments on this rig
+need `--video vt`.
 
 ### Prefer sharpness: a QP 28 ceiling on a link with headroom (2026-10-19)
 

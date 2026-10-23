@@ -49,9 +49,10 @@ struct SeededRNG {
 /// is single-threaded and driven by virtual time for determinism.
 public final class InProcTransport: GlassActTransport, @unchecked Sendable {
     public var maxDatagramSize: Int { 1452 }
-    /// Delivery inside `advance` is synchronous, so nothing ever sits queued
-    /// from the sender's perspective — the deterministic rig has no backlog.
-    public var videoBacklogBytes: Int { 0 }
+    /// Video not yet in the network: without a bottleneck delivery inside
+    /// `advance` is synchronous and nothing ever sits queued; with one, the
+    /// host's video waits for room in the bottleneck (`InProcLink.Bottleneck`).
+    public var videoBacklogBytes: Int { isA ? link?.videoSendBufferBytes ?? 0 : 0 }
     public var onControl: (Data) -> Void = { _ in }
     public var onDatagram: (Data) -> Void = { _ in }
     public var onVideo: (Data) -> Void = { _ in }
@@ -104,6 +105,8 @@ public final class InProcTransport: GlassActTransport, @unchecked Sendable {
     public func setDatagramPaceRate(bytesPerSecond: Int) {
         if isA { link?.paceRate = max(1_000_000, bytesPerSecond) }
     }
+    /// The host's QUIC RTT view, modeled only with a bottleneck.
+    public var transportRTT: (smoothedUS: UInt64, minUS: UInt64)? { isA ? link?.modeledRTT : nil }
 }
 
 /// In-process pair of transports joined by a virtual-time event queue with
@@ -155,6 +158,8 @@ public final class InProcLink: @unchecked Sendable {
         guard !severed else { return }
         severed = true
         pending.removeAll()
+        videoSendQueue.removeAll()
+        videoSendBufferBytes = 0
         a.emit(.failed)
         b.emit(.failed)
     }
@@ -163,6 +168,8 @@ public final class InProcLink: @unchecked Sendable {
         guard !severed else { return }
         severed = true
         pending.removeAll()
+        videoSendQueue.removeAll()
+        videoSendBufferBytes = 0
         (cancelledByA ? a : b).emit(.cancelled)
         (cancelledByA ? b : a).emit(.failed)
     }
@@ -177,6 +184,19 @@ public final class InProcLink: @unchecked Sendable {
     /// bottleneck link) — overflow drops. With one set, the host side also
     /// paces like QUICTransport: a GCRA token bucket at `paceRate` with a
     /// `DatagramPacing.burstBytes` instant burst. Virtual time, deterministic.
+    ///
+    /// The host's control and video streams share the same FIFO (one path
+    /// out of the host's network). They are reliable, so they never drop:
+    /// control joins the queue whatever its depth (it is small), and video
+    /// waits in a send buffer — `videoBacklogBytes` — until the bottleneck
+    /// has room for its next packet. Their queueing feeds `transportRTT`,
+    /// QUIC's smoothed and minimum RTT.
+    ///
+    /// Deviations from QUICTransport: the video stream's congestion window
+    /// is the whole buffer (a loss-based controller on a deep buffer that
+    /// never drops a stream packet, so the worst case for standing queue),
+    /// and the RTT is sampled per send rather than from Network.framework's
+    /// periodic data-transfer reports.
     public struct Bottleneck: Sendable {
         public var bytesPerSecond: Int
         public var bufferBytes: Int
@@ -190,6 +210,19 @@ public final class InProcLink: @unchecked Sendable {
     public private(set) var bottleneckDroppedDatagrams = 0
     private var paceTATUS: UInt64 = 0 // GCRA theoretical arrival time
     private var bottleneckFreeUS: UInt64 = 0
+    /// Host video waiting for room in the bottleneck, oldest first, with
+    /// the bytes of each not yet admitted.
+    private var videoSendQueue: [(data: Data, unadmitted: Int)] = []
+    private(set) var videoSendBufferBytes = 0
+    private var nextVideoAdmitUS: UInt64 = 0
+    /// Video enters the bottleneck a packet at a time.
+    static let videoPacketBytes = 1200
+    private var rttSampled = false
+    private var rttSmoothedUS: UInt64 = 0
+    private var rttMinUS: UInt64 = 0
+    var modeledRTT: (smoothedUS: UInt64, minUS: UInt64)? {
+        bottleneck != nil && rttSampled ? (rttSmoothedUS, rttMinUS) : nil
+    }
     /// Time the modeled bottleneck still needs to drain what it holds (its
     /// queueing delay right now; 0 when idle or unmodeled).
     public var bottleneckBacklogUS: UInt64 { bottleneckFreeUS > nowUS ? bottleneckFreeUS - nowUS : 0 }
@@ -219,7 +252,7 @@ public final class InProcLink: @unchecked Sendable {
     /// Video-channel messages still in flight (a STOP's reveal bitmap can be
     /// the last thing a settle is waiting on — no batch tracks it).
     public var pendingVideoCount: Int {
-        pending.reduce(0) { $0 + ($1.channel == .video ? 1 : 0) }
+        pending.reduce(0) { $0 + ($1.channel == .video ? 1 : 0) } + videoSendQueue.count
     }
 
     public init(faults: FaultConfig = .none) {
@@ -234,7 +267,9 @@ public final class InProcLink: @unchecked Sendable {
     func enqueueControl(fromA: Bool, _ data: Data) {
         guard !blocked(fromA: fromA) else { return }
         let latency = (faults.latencyMinUS + faults.latencyMaxUS) / 2
-        var deliver = nowUS &+ latency
+        var departUS = nowUS
+        if fromA, let bottleneck { departUS = bottleneckAdmit(data.count, bottleneck) }
+        var deliver = departUS &+ latency
         if fromA {
             deliver = max(deliver, lastControlDeliverToB)
             lastControlDeliverToB = deliver
@@ -250,6 +285,12 @@ public final class InProcLink: @unchecked Sendable {
     /// independent FIFO (its own stream).
     func enqueueVideo(fromA: Bool, _ data: Data) {
         guard !blocked(fromA: fromA) else { return }
+        if fromA, bottleneck != nil {
+            videoSendQueue.append((data, data.count))
+            videoSendBufferBytes += data.count
+            pumpVideo()
+            return
+        }
         let latency = (faults.latencyMinUS + faults.latencyMaxUS) / 2
         var deliver = nowUS &+ latency
         if fromA {
@@ -261,6 +302,57 @@ public final class InProcLink: @unchecked Sendable {
         }
         seqNo &+= 1
         pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .video, toA: !fromA, data: data))
+    }
+
+    /// Bytes the bottleneck holds at `t`.
+    private func bottleneckBacklogBytes(at t: UInt64, _ b: Bottleneck) -> Int {
+        let us = bottleneckFreeUS > t ? bottleneckFreeUS - t : 0
+        return Int(us * UInt64(b.bytesPerSecond) / 1_000_000)
+    }
+
+    /// Puts `bytes` of a reliable stream into the bottleneck now; returns when
+    /// they have left it. The queue ahead of them is this send's RTT sample.
+    private func bottleneckAdmit(_ bytes: Int, _ b: Bottleneck) -> UInt64 {
+        let aheadUS = bottleneckFreeUS > nowUS ? bottleneckFreeUS - nowUS : 0
+        let sample = faults.latencyMinUS &+ faults.latencyMaxUS &+ aheadUS // 2 × one way + queue
+        if rttSampled {
+            rttSmoothedUS = (rttSmoothedUS &* 7 &+ sample) / 8
+            rttMinUS = min(rttMinUS, sample)
+        } else {
+            rttSampled = true
+            rttSmoothedUS = sample
+            rttMinUS = sample
+        }
+        bottleneckFreeUS = max(nowUS, bottleneckFreeUS) &+ UInt64(bytes) * 1_000_000 / UInt64(b.bytesPerSecond)
+        return bottleneckFreeUS
+    }
+
+    /// Moves queued host video into the bottleneck while it has room; a
+    /// message is delivered once its last byte has left. Otherwise notes
+    /// when the next packet will fit (`advance` pumps again then).
+    private func pumpVideo() {
+        guard let b = bottleneck else { return }
+        let latency = (faults.latencyMinUS + faults.latencyMaxUS) / 2
+        while !videoSendQueue.isEmpty {
+            let room = b.bufferBytes - bottleneckBacklogBytes(at: nowUS, b)
+            let need = min(Self.videoPacketBytes, videoSendQueue[0].unadmitted)
+            guard room >= need else {
+                let waitUS = UInt64(need - room) * 1_000_000 / UInt64(b.bytesPerSecond)
+                nextVideoAdmitUS = nowUS &+ max(1, waitUS)
+                return
+            }
+            let take = min(room, videoSendQueue[0].unadmitted)
+            let departUS = bottleneckAdmit(take, b)
+            videoSendQueue[0].unadmitted -= take
+            videoSendBufferBytes -= take
+            if videoSendQueue[0].unadmitted == 0 {
+                let data = videoSendQueue.removeFirst().data
+                let deliver = max(departUS &+ latency, lastVideoDeliverToB)
+                lastVideoDeliverToB = deliver
+                seqNo &+= 1
+                pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .video, toA: false, data: data))
+            }
+        }
     }
 
     func enqueueDatagram(fromA: Bool, _ data: Data) {
@@ -310,6 +402,18 @@ public final class InProcLink: @unchecked Sendable {
     /// sort keeps large in-flight queues (heavy traces) O(k log k) per step
     /// while preserving exactly the order the per-event min-scan produced.
     public func advance(toUS: UInt64) {
+        // Host video waiting on the bottleneck enters it as room frees up,
+        // interleaved with deliveries in time order.
+        while !severed, !videoSendQueue.isEmpty, nextVideoAdmitUS <= toUS {
+            deliverDue(upTo: nextVideoAdmitUS)
+            nowUS = max(nowUS, nextVideoAdmitUS)
+            pumpVideo()
+        }
+        deliverDue(upTo: toUS)
+        nowUS = max(nowUS, toUS)
+    }
+
+    private func deliverDue(upTo toUS: UInt64) {
         while true {
             var due: [Event] = []
             due.reserveCapacity(64)
@@ -340,6 +444,5 @@ public final class InProcLink: @unchecked Sendable {
                 }
             }
         }
-        nowUS = max(nowUS, toUS)
     }
 }

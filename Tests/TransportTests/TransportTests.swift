@@ -119,4 +119,47 @@ import GlassActTransport
         #expect(controlSeen.count == 1)
         #expect(link.a.videoBacklogBytes == 0)
     }
+
+    /// Behind a bottleneck, host video waits for room instead of dropping:
+    /// it backs up in the send buffer (`videoBacklogBytes`), shares the
+    /// queue with datagrams (which drop when it's full), arrives whole and
+    /// in order at the link's rate, and shows up in the modeled RTT.
+    @Test func videoSharesTheBottleneck() {
+        var faults = FaultConfig()
+        faults.latencyMinUS = 50_000
+        faults.latencyMaxUS = 50_000
+        let link = InProcLink(faults: faults)
+        let rate = 250_000 // 2 Mbit/s
+        link.bottleneck = .init(bytesPerSecond: rate, bufferBytes: rate / 2) // 500 ms deep
+        var videoSeen: [(Int, UInt64)] = []
+        link.b.onVideo = { videoSeen.append((Int($0[0]), link.nowUS)) }
+        var datagramsSeen = 0
+        link.b.onDatagram = { _ in datagramsSeen += 1 }
+
+        let frame = 50_000 // 4 frames = 200 KB, 800 ms at the link's rate
+        for i in 0..<4 {
+            link.a.sendVideo(Data([UInt8(i)] + [UInt8](repeating: 0, count: frame - 1)))
+        }
+        #expect(link.a.videoBacklogBytes == 4 * frame - rate / 2, "only the buffer's worth is in the network")
+        for _ in 0..<20 { link.a.sendDatagram(Data(repeating: 0, count: 1000)) }
+        #expect(link.bottleneckDroppedDatagrams == 20, "a buffer full of video leaves datagrams no room")
+
+        link.advance(toUS: 2_000_000)
+        #expect(videoSeen.map { $0.0 } == [0, 1, 2, 3])
+        #expect(link.a.videoBacklogBytes == 0)
+        let lastArrival = videoSeen.last?.1 ?? 0
+        #expect(lastArrival >= 800_000 + 50_000 && lastArrival <= 900_000, "drained at the link's rate: \(lastArrival)")
+        let rtt = link.a.transportRTT
+        #expect(rtt.map { $0.smoothedUS > $0.minUS } == true, "queueing shows in the RTT: \(String(describing: rtt))")
+        #expect(rtt?.minUS == 100_000, "minimum RTT is the path's: \(String(describing: rtt))")
+    }
+
+    /// Without a bottleneck nothing models an RTT: the engine falls back to
+    /// PING, as before.
+    @Test func noBottleneckNoTransportRTT() {
+        let link = InProcLink()
+        link.a.sendVideo(Data([1]))
+        link.advance(toUS: 1_000)
+        #expect(link.a.transportRTT == nil)
+    }
 }
