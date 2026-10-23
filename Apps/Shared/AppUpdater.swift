@@ -16,12 +16,6 @@ import Sparkle
 final class AppUpdater: NSObject, SPUUpdaterDelegate {
     private let log: (String) -> Void
     private var controller: SPUStandardUpdaterController?
-    private var postponedInstall: (() -> Void)?
-
-    /// Whether relaunching into an update now is fine. The Host says no
-    /// while a viewer is connected; the install then waits for
-    /// `relaunchMayProceed()`.
-    var mayRelaunch: () -> Bool = { true }
 
     init(log: @escaping (String) -> Void) {
         self.log = log
@@ -52,31 +46,19 @@ final class AppUpdater: NSObject, SPUUpdaterDelegate {
         return item
     }
 
-    /// The moment `mayRelaunch` turns true again: install a held update.
-    func relaunchMayProceed() {
-        guard let install = postponedInstall else { return }
-        postponedInstall = nil
-        log("updates: installing the held update")
-        install()
-    }
-
     // MARK: - SPUUpdaterDelegate
 
     nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
         ProcessInfo.processInfo.environment["GLASSACT_UPDATE_FEED"]
     }
 
-    nonisolated func updater(_ updater: SPUUpdater, shouldPostponeRelaunchForUpdate item: SUAppcastItem,
-                             untilInvokingBlock installHandler: @escaping () -> Void) -> Bool {
-        let version = item.displayVersionString
-        // Sparkle calls its delegate on the main thread, and so the handler.
-        nonisolated(unsafe) let install = installHandler
-        return MainActor.assumeIsolated {
-            guard !mayRelaunch() else { return false }
-            postponedInstall = install
-            log("updates: \(version) is ready; it installs when the viewer leaves")
-            return true
-        }
+    /// Sparkle relaunches only when someone chose Install and Relaunch
+    /// (automatic updates install when the app quits), so the choice goes
+    /// ahead even with a viewer connected: often it's the viewer who chose,
+    /// and holding it until they left made the button look dead. The
+    /// Viewer reconnects once the Host is back.
+    nonisolated func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        MainActor.assumeIsolated { log("updates: relaunching into the update") }
     }
 
     nonisolated func updater(_ updater: SPUUpdater, didAbortWithError error: any Error) {

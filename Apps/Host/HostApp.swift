@@ -81,7 +81,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         controller.onPhase = { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.phaseChanged()
-                if self?.controller.phase != .viewerConnected { self?.updater?.relaunchMayProceed() }
             }
         }
         controller.onPermissionProblem = { [weak self] in
@@ -102,7 +101,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         crashReporter.onNotice = { [weak self] notice in self?.crashNoticeChanged(notice) }
         crashReporter.start()
         updater = AppUpdater { [weak self] text in self?.controller.onStatus(text) }
-        updater.mayRelaunch = { [weak self] in self?.controller.phase != .viewerConnected }
         updater.start()
         permissions.startLocalNetworkCheck()
         requiredWereGranted = permissions.requiredGranted
