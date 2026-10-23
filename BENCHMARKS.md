@@ -192,6 +192,7 @@ the numbers and the reasoning.
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
 | CUBIC-style video cap recovery | kept | back to 70 % in 2.0 s instead of 9.25 s | [entry](#video-cap-cubic-style-recovery-after-a-hiccup-2026-09-29) |
 | 3 Mbit/s video cap until the link is measured | kept | p95 from connect 574–755 → 145–673 ms | [entry](#video-startup-3-mbits-cap-until-the-link-is-measured-2026-09-30) |
+| Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
 
@@ -264,6 +265,42 @@ catching up and the queue stands at the full buffer throughout. The mock
 codec's frames are absolute LZ4 of the whole region (~5.5 MB each at 5K),
 so mock video bytes say nothing about HEVC: video experiments on this rig
 need `--video vt`.
+### Auto-scale from the video drain too (2026-10-22)
+
+Plane Wi-Fi, live (Host 26.10.2, laptop Viewer at 2900×1572): the video
+rate controller measured the link at 0.3–5 Mbit/s (p50 2.2), with SRTT p50
+170 ms, p90 690 ms, and spikes to 1.3 s. The resolution rung halved the
+capture to 1450×786 only **45 s** after connect. The rung fired only on 6
+consecutive seconds of severe (> 700 ms) tile ACK delay, while pinned video
+carried most of the motion and the tile path was often quiet. The ACK
+delay sat under 700 ms most seconds anyway (p50 170 ms).
+
+Change (`ScalePressure`): also count seconds with a fresh video link
+measurement whose drain is under 0.75 bit/s per captured pixel **and**
+under 4 Mbit/s. Five in a row halve the capture. A measurement is a window
+in which video stayed backlogged, so the link set the pace
+(`VideoRateController.linkMeasurements`). The controller's estimate alone
+isn't evidence: a backoff from its startup cap sets it with nothing
+backlogged (Codex's review of #53). The per-pixel bar puts 2900×1572 at
+3.4 Mbit/s (FaceTime's top screen-share tier is 0.87 bit/s per pixel). The
+4 Mbit/s cap keeps a 5K capture on ordinary home Wi-Fi at native
+resolution: that trade costs text sharpness and stays opt-in. Seconds
+without a new measurement hold the streak, whether that's no video or a
+quiet or paused region.
+
+`ScalePressureTests` drives the real controller over a simulated link,
+evaluated once a second:
+
+| case | fires? |
+|---|---|
+| video backed up behind a 2 Mbit/s link, 2900×1572 | yes, within 10 s; once |
+| busy video on a 100 Mbit/s link, 30 s | no |
+| 5K capture on a 10 Mbit/s link, 30 s | no |
+| quiet connect behind a 200 ms queue (estimate set by a backoff, nothing backlogged), then 30 s light | no |
+| 3 thin seconds, 30 s paused, then thin again | holds, then fires |
+
+No trace replay: the bench can't re-capture a trace at a lower resolution,
+and its loop doesn't yet constrain video (a thin-link model is in progress).
 
 ### Prefer sharpness: a QP 28 ceiling on a link with headroom (2026-10-19)
 
