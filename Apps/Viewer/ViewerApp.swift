@@ -741,14 +741,15 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         refitWindow(to: grid)
     }
 
+    static let unlimitedSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+
     /// The remote screen changed size mid-session (someone at the host
     /// picked another resolution, the shared display changed, auto-scale
     /// halved the capture). A fit window keeps its aspect lock on the new
     /// picture, so it stays edge to edge: left on the old one, a new shape
-    /// would sit in black bars. Same shape (auto-scale): the window keeps
-    /// its size and the picture scales to fill it, softer but whole, rather
-    /// than the window shrinking to the smaller picture's 1:1. A new shape:
-    /// the window reshapes at about its current area.
+    /// would sit in black bars. Same shape (auto-scale, a Scale Down
+    /// re-fit): the window keeps its size and the picture scales to fill
+    /// it. A new shape: the window reshapes at about its current area.
     private func refitWindow(to grid: TileGrid) {
         guard let window = canvasWindow, !singleWindowMode, !virtualMode, !canvasPanMode else { return }
         let scale = window.backingScaleFactor
@@ -762,15 +763,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             // Applied on leaving full screen; a full-screen reshape's
             // picture isn't the windowed one (its restore re-fits).
             guard !fullScreenReshaped else { return }
-            let old = windowedLimits?.max ?? natural
-            windowedLimits = (sameShape ? NSSize(width: max(natural.width, old.width), height: max(natural.height, old.height))
-                                        : natural, natural)
+            windowedLimits = (Self.unlimitedSize, natural)
             return
         }
-        // The 1:1 limit, but never below the window as it is.
-        let limit = NSSize(width: max(natural.width, current.width), height: max(natural.height, current.height))
         window.contentAspectRatio = natural
-        window.contentMaxSize = limit
         guard !sameShape else { return }
         let bound = window.screen?.visibleFrame.size ?? current
         let area = current.width * current.height
@@ -779,7 +775,6 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             width: min(bound.width - 40, wantW),
             height: min(bound.height - 40, wantW * natural.height / natural.width)),
             allowUpscale: true)
-        window.contentMaxSize = NSSize(width: max(natural.width, target.width), height: max(natural.height, target.height))
         var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: target))
         frame.origin = NSPoint(x: window.frame.minX, y: window.frame.maxY - frame.height) // keep the top-left
         window.setFrame(frame, display: true, animate: false)
@@ -1174,8 +1169,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         } else if panMode {
             window.contentMaxSize = NSSize(width: natural.width, height: natural.height)
         } else {
+            // Locked to the picture's shape, any size: a window bigger than
+            // the picture upscales it (Scale Down then re-fits the host's
+            // picture to the window, `scheduleScaleRefit`).
             window.contentAspectRatio = natural
-            window.contentMaxSize = natural // never upscale past 1:1
         }
         window.center()
         let canvas = CanvasView(controller: controller, grid: grid, panMode: panMode)
@@ -1183,6 +1180,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         canvas.autoresizingMask = [.width, .height]
         if virtualMode {
             canvas.onSizeSettled = { [weak self] _ in self?.scheduleVirtualDisplayResize() }
+        } else if !sharedWindow && !panMode && model.resolution == .scaleToFit {
+            canvas.onSizeSettled = { [weak self] _ in self?.scheduleScaleRefit() }
         }
         window.contentView = canvas
         window.makeKeyAndOrderFront(nil)
@@ -1363,6 +1362,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     /// The host took this screen's shape for full screen
     /// (`ViewerSettings.fullScreenReshapesHost`).
     private var fullScreenReshaped = false
+    private var scaleRefitWork: DispatchWorkItem?
     /// The last size (points) asked of the host.
     private var lastVirtualRequest: (Int, Int)?
     private var virtualResizeWork: DispatchWorkItem?
@@ -1379,6 +1379,39 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
         virtualResizeWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// Scale Down follows the window: once a resize settles, ask the host to
+    /// re-fit its picture to the window, so a bigger window gets more host
+    /// pixels instead of an upscaled picture (never past the host display's
+    /// own resolution). Not during a full-screen reshape, which asks for the
+    /// screen's shape itself.
+    private func scheduleScaleRefit() {
+        scaleRefitWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.requestScaleRefit() }
+        }
+        scaleRefitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func requestScaleRefit() {
+        guard model.resolution == .scaleToFit, !fullScreenReshaped, !inFullScreenTransition,
+              let window = canvasWindow, let size = window.contentView?.bounds.size,
+              let screen = window.screen, let controller else { return }
+        // Only when it matters: the window outgrew the picture (it would
+        // upscale) or is far smaller (pixels nobody sees). A small
+        // difference, like the window's first layout, isn't worth a capture
+        // rebuild.
+        guard let grid = controller.configuredGrid(), grid.width > 0 else { return }
+        let ratio = size.width * screen.backingScaleFactor / CGFloat(grid.width)
+        guard ratio > 1.02 || ratio < 0.75 else { return }
+        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
+        let scale = Int(screen.backingScaleFactor)
+        if let g = requestedGeometry, g.mode == GeometryMode.scale, g.w == w, g.h == h, g.scale == scale { return }
+        requestedGeometry = (GeometryMode.scale, w, h, scale)
+        SessionLog.shared.write("scale_refit", "size=\(w)x\(h) scale=\(scale)")
+        controller.requestResize(mode: GeometryMode.scale, widthPoints: w, heightPoints: h, scale: scale)
     }
 
     private func requestVirtualDisplaySize() {
