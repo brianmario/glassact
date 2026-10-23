@@ -56,7 +56,8 @@ public struct SignInRequest: Equatable, Sendable {
     }
 
     /// Nil on anything malformed: wrong version, unknown op, a field out of
-    /// bounds, invalid UTF-8, trailing bytes, or credentials on a query.
+    /// bounds, invalid UTF-8, or credentials on a query. Bytes after the
+    /// known fields are ignored (a newer viewer's additions, §12).
     public static func parse(_ bytes: [UInt8]) -> SignInRequest? {
         guard bytes.count <= maxEncodedBytes else { return nil }
         return bytes.withUnsafeBytes { buf -> SignInRequest? in
@@ -68,8 +69,7 @@ public struct SignInRequest: Equatable, Sendable {
                   let passwordLen = r.readU16(),
                   let password = r.readString(length: Int(passwordLen), max: maxPasswordBytes),
                   let deviceLen = r.readU8(),
-                  let device = r.readString(length: Int(deviceLen), max: maxDeviceBytes),
-                  r.remaining == 0 else { return nil }
+                  let device = r.readString(length: Int(deviceLen), max: maxDeviceBytes) else { return nil }
             if op == .query, !user.isEmpty || !password.isEmpty { return nil }
             return SignInRequest(op: op, user: user, password: password, device: device)
         }
@@ -113,7 +113,7 @@ public struct SignInResponse: Equatable, Sendable {
     }
 
     public static func parse(_ bytes: [UInt8]) -> SignInResponse? {
-        guard bytes.count == encodedBytes else { return nil }
+        guard bytes.count >= encodedBytes else { return nil } // a newer host may append fields (§12)
         return bytes.withUnsafeBytes { buf -> SignInResponse? in
             var r = unsafe ByteReader(buf)
             guard r.readU8() == SignInVersion.current,

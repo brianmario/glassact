@@ -125,7 +125,7 @@ public final class HeadlessAgent {
             let hostNewer = version > WireVersion.current
             self?.onStatus("the host runs a different Glass Act version (protocol \(version), this glassact "
                            + "\(WireVersion.current)) — update \(hostNewer ? "glassact" : "Glass Act Host"); "
-                           + "both ends must be the same version")
+                           + "these versions are too far apart to work together")
             self?.stop("incompatible host version")
         }
         session.onHostEndedSession = { [weak self] reason in

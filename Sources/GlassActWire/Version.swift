@@ -2,14 +2,19 @@
 /// appears on the wire: the datagram header's high nibble (§3.3) and the
 /// HELLO / HELLO_OK handshake fields (§3.5).
 ///
-/// §12 — until 1.0 the wire protocol may change in any release: every wire
-/// format change bumps `current`, and no decode path or migration code for
-/// an older version is kept. Both ends must run the same build.
+/// §12 — Host and Viewer of different releases work together, so the wire
+/// only grows. New control or video message types (receivers skip unknown
+/// ones), fields appended to a fixed-layout message (receivers ignore what
+/// they don't read), new INPUT kinds and tile opcodes, and new behaviour or
+/// enum values behind a caps bit (§3.8), with the old path kept for peers
+/// without it. Bumping `current` drops every older release, so it's for a
+/// deliberate, very rare break only.
 public enum WireVersion {
     /// The wire format this build speaks. v3: video always travels as the
     /// overlay (§4.6), never written into the canvas. v4: SYNC_REQUEST
     /// (control 0x1B) — the viewer asks for a sync frame instead of
-    /// reconnecting when a region can't decode.
+    /// reconnecting when a region can't decode. v4 is the first released
+    /// protocol (26.10.0); everything since extends it additively.
     public static let current: UInt8 = 4
 
     /// Exact match required. Handshake behavior on mismatch: the viewer

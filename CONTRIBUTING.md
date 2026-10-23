@@ -130,8 +130,8 @@ Open work lives in GitHub issues, labelled `bug`, `enhancement`,
 `performance`, `security`, `research`, `macos` or `agents`. For a bug,
 include:
 
-- the build on each end (the wire protocol changes between builds, so both
-  ends must run the same one) and the macOS versions;
+- the version on each end (Host and Viewer may differ) and the macOS
+  versions;
 - the Viewer's log: Viewer › Help › Show Logs in Finder (in the Viewer's
   sandbox container), or Help › Send Logs to Host;
 - the Host's log:

@@ -488,83 +488,74 @@ public enum ControlMessage: Equatable, Sendable {
         return body.bytes
     }
 
-    /// Strict body parse for a known TLV type: the body must be consumed
-    /// exactly (no trailing bytes). Returns nil for unknown types or any
-    /// structural mismatch.
+    /// Body parse for a known TLV type. Bytes after the fields this build
+    /// knows are ignored: a newer peer may append fields (§12). Returns nil
+    /// for unknown types or any structural mismatch.
     public static func parseBody(type: UInt8, _ buf: UnsafeRawBufferPointer) -> ControlMessage? {
         var r = unsafe ByteReader(buf)
         switch type {
         case 0x01:
             guard let ver = r.readU8(), let width = r.readU16(), let height = r.readU16(),
-                  let tileSize = r.readU8(), let pixfmt = r.readU8(), let caps = r.readU32(),
-                  r.remaining == 0 else { return nil }
+                  let tileSize = r.readU8(), let pixfmt = r.readU8(), let caps = r.readU32() else { return nil }
             return .hello(ver: ver, width: width, height: height, tileSize: tileSize, pixfmt: pixfmt, caps: caps)
         case 0x02:
             guard let ver = r.readU8(), let caps = r.readU32(),
                   let geoMode = r.readU8(), geoMode <= GeometryMode.virtualDisplay,
-                  let gw = r.readU16(), let gh = r.readU16(), let gs = r.readU8(),
-                  r.remaining == 0 else { return nil }
+                  let gw = r.readU16(), let gh = r.readU16(), let gs = r.readU8() else { return nil }
             return .helloOK(ver: ver, caps: caps,
                             geoMode: geoMode, geoWidth: gw, geoHeight: gh, geoScale: gs)
         case 0x03:
             guard let seq = r.readU32(), let cnt = r.readU16(), cnt >= 1,
-                  let bitmap = unsafe r.readBytes((Int(cnt) + 7) / 8),
-                  r.remaining == 0 else { return nil }
+                  let bitmap = unsafe r.readBytes((Int(cnt) + 7) / 8) else { return nil }
             return unsafe .ack(frameSeq: seq, dgramCnt: cnt, bitmap: [UInt8](bitmap))
         case 0x04:
-            guard let nonce = r.readU64(), let t = r.readU64(),
-                  r.remaining == 0 else { return nil }
+            guard let nonce = r.readU64(), let t = r.readU64() else { return nil }
             return .ping(nonce: nonce, tUS: t)
         case 0x05:
-            guard let nonce = r.readU64(), let t = r.readU64(), let recv = r.readU64(),
-                  r.remaining == 0 else { return nil }
+            guard let nonce = r.readU64(), let t = r.readU64(), let recv = r.readU64() else { return nil }
             return .pong(nonce: nonce, tUS: t, recvTUS: recv)
         case 0x06:
             guard let seq = r.readU32(), let x = r.readU16(), let y = r.readU16(),
                   let w = r.readU16(), let h = r.readU16(), w >= 1, h >= 1,
-                  let dx = r.readU16(), let dy = r.readU16(),
-                  r.remaining == 0 else { return nil }
+                  let dx = r.readU16(), let dy = r.readU16() else { return nil }
             return .scroll(frameSeq: seq, x: x, y: y, width: w, height: h,
                            dx: Int16(bitPattern: dx), dy: Int16(bitPattern: dy))
         case 0x07:
             // Validate before allocating (INV-6): cnt indices + the digest.
             guard let seq = r.readU32(), let cnt = r.readU16(),
-                  r.remaining == Int(cnt) * 2 + 8 else { return nil }
+                  r.remaining >= Int(cnt) * 2 + 8 else { return nil }
             var skipped: [UInt16] = []
             skipped.reserveCapacity(Int(cnt))
             for _ in 0..<cnt {
                 guard let idx = r.readU16() else { return nil }
                 skipped.append(idx)
             }
-            guard let digest = r.readU64(), r.remaining == 0 else { return nil }
+            guard let digest = r.readU64() else { return nil }
             return .scrollAck(frameSeq: seq, skipped: skipped, digest: digest)
         case 0x08:
-            guard let paused = r.readU8(), paused <= 1, r.remaining == 0 else { return nil }
+            guard let paused = r.readU8(), paused <= 1 else { return nil }
             return .pauseHint(paused: paused == 1)
         case 0x09:
-            guard let seq = r.readU32(), r.remaining == 0 else { return nil }
+            guard let seq = r.readU32() else { return nil }
             return .keyframeAck(seq: seq)
         case 0x0A:
             guard let seq = r.readU32(), let cnt = r.readU16(),
-                  r.remaining == Int(cnt) * 2 else { return nil }
+                  r.remaining >= Int(cnt) * 2 else { return nil }
             var tiles: [UInt16] = []
             tiles.reserveCapacity(Int(cnt))
             for _ in 0..<cnt {
                 guard let idx = r.readU16() else { return nil }
                 tiles.append(idx)
             }
-            guard r.remaining == 0 else { return nil }
             return .deltaNack(frameSeq: seq, tiles: tiles)
         case 0x0B:
-            guard let x = r.readU16(), let y = r.readU16(), let v = r.readU8(), v <= 1,
-                  r.remaining == 0 else { return nil }
+            guard let x = r.readU16(), let y = r.readU16(), let v = r.readU8(), v <= 1 else { return nil }
             return .cursorPos(x: x, y: y, visible: v == 1)
         case 0x0C:
             guard let w = r.readU16(), let h = r.readU16(),
                   let hx = r.readU16(), let hy = r.readU16(), let scale = r.readU8(),
                   w >= 1, h >= 1, w <= 512, h <= 512, scale >= 1, scale <= 4,
-                  let bgra = unsafe r.readBytes(Int(w) * Int(h) * 4),
-                  r.remaining == 0 else { return nil }
+                  let bgra = unsafe r.readBytes(Int(w) * Int(h) * 4) else { return nil }
             return unsafe .cursorImage(width: w, height: h, hotspotX: hx, hotspotY: hy,
                                 scale: scale, bgra: [UInt8](bgra))
         case 0x0D:
@@ -573,8 +564,7 @@ public enum ControlMessage: Equatable, Sendable {
             // size changed).
             guard let mode = r.readU8(), mode == 1 || mode == 2 || mode == GeometryMode.virtualDisplay,
                   let w = r.readU16(), let h = r.readU16(), w >= 1, h >= 1,
-                  let scale = r.readU8(), scale >= 1, scale <= 4,
-                  r.remaining == 0 else { return nil }
+                  let scale = r.readU8(), scale >= 1, scale <= 4 else { return nil }
             return .resize(mode: mode, width: w, height: h, scale: scale)
         case 0x0E:
             // Any non-zero kind parses; receivers ignore kinds they don't
@@ -583,8 +573,7 @@ public enum ControlMessage: Equatable, Sendable {
             // session on first use — additive kinds must stay additive.
             guard let kind = r.readU8(), kind >= 1,
                   let x = r.readU16(), let y = r.readU16(),
-                  let a = r.readU32(), let b = r.readU32(),
-                  r.remaining == 0 else { return nil }
+                  let a = r.readU32(), let b = r.readU32() else { return nil }
             return .input(kind: kind, x: x, y: y,
                           a: Int32(bitPattern: a), b: Int32(bitPattern: b))
         case 0x0F:
@@ -593,7 +582,7 @@ public enum ControlMessage: Equatable, Sendable {
             return .clipboard(format: format, data: bytes)
         case 0x10:
             guard let scale = r.readU8(), let floor = r.readU8(), floor <= QualityFloor.maxKnown,
-                  let pref = r.readU8(), pref <= 1, r.remaining == 0 else { return nil }
+                  let pref = r.readU8(), pref <= 1 else { return nil }
             return .quality(presentedScalePct: scale, floor: floor, preferSharpness: pref)
         case 0x11:
             // Every window is ≥ 12 bytes (id 4, three empty varints 3, fmt 1,
@@ -615,15 +604,13 @@ public enum ControlMessage: Equatable, Sendable {
                     title: String(decoding: ttl, as: UTF8.self),
                     thumbFormat: fmt, thumbWidth: tw, thumbHeight: th, thumb: [UInt8](thumb)))
             }
-            guard r.remaining == 0 else { return nil }
             return .windowList(windows: windows)
         case 0x12:
-            guard let windowID = r.readU32(), r.remaining == 0 else { return nil }
+            guard let windowID = r.readU32() else { return nil }
             return .windowSelect(windowID: windowID)
         case 0x13:
             guard let action = r.readU8(), action >= 1, action <= 3,
-                  let w = r.readU16(), let h = r.readU16(),
-                  r.remaining == 0 else { return nil }
+                  let w = r.readU16(), let h = r.readU16() else { return nil }
             return .windowControl(action: action, width: w, height: h)
         case 0x14:
             guard let nameLen = r.readU8(), let nameBytes = unsafe r.readBytes(Int(nameLen)),
@@ -643,12 +630,12 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x16:
             guard let active = r.readU8(), active <= 1,
                   let len = r.readU8(), Int(len) <= Self.maxAgentLabelBytes,
-                  let bytes = unsafe r.readBytes(Int(len)), r.remaining == 0,
+                  let bytes = unsafe r.readBytes(Int(len)),
                   let label = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
             return .agentState(active: active == 1, label: label)
         case 0x17:
             guard let requestID = r.readU32(), let windowID = r.readU32(),
-                  let maxNodes = r.readU16(), maxNodes >= 1, r.remaining == 0 else { return nil }
+                  let maxNodes = r.readU16(), maxNodes >= 1 else { return nil }
             return .uiTreeRequest(requestID: requestID, windowID: windowID, maxNodes: maxNodes)
         case 0x18:
             guard let requestID = r.readU32(), let status = r.readU8(),
@@ -658,7 +645,7 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x19:
             guard let control = r.readU8(), control <= 1,
                   let len = r.readU8(), Int(len) <= Self.maxAgentReasonBytes,
-                  let bytes = unsafe r.readBytes(Int(len)), r.remaining == 0,
+                  let bytes = unsafe r.readBytes(Int(len)),
                   let reason = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
             return .agentScope(control: control == 1, reason: reason)
         case 0x1A:
@@ -667,8 +654,7 @@ public enum ControlMessage: Equatable, Sendable {
                   let name = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
             return .viewerInfo(name: name)
         case 0x1B:
-            guard let region = r.readU8(), let generation = r.readU32(),
-                  r.remaining == 0 else { return nil }
+            guard let region = r.readU8(), let generation = r.readU32() else { return nil }
             return .syncRequest(region: region, generation: generation)
         default:
             return nil

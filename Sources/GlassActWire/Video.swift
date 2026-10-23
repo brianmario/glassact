@@ -252,9 +252,8 @@ extension VideoMessage: TLVMessage {
                   let x = r.readU16(), let y = r.readU16(),
                   let w = r.readU16(), let h = r.readU16(), w >= 1, h >= 1,
                   let codec = r.readU8(), codec != 0,
-                  let cfgLen = r.readVarint(), Int(cfgLen) == r.remaining,
-                  let config = unsafe r.readBytes(Int(cfgLen)),
-                  r.remaining == 0 else { return nil }
+                  let cfgLen = r.readVarint(), Int(cfgLen) <= r.remaining,
+                  let config = unsafe r.readBytes(Int(cfgLen)) else { return nil }
             return unsafe .start(region: region, generation: generation, x: x, y: y,
                           width: w, height: h, codec: codec, config: [UInt8](config))
         case 0x02:
@@ -307,7 +306,6 @@ extension VideoMessage: TLVMessage {
                       let blob = unsafe r.readBytes(Int(len)) else { return nil }
                 unsafe stripes.append([UInt8](blob))
             }
-            guard r.remaining == 0 else { return nil }
             return .keyframe(seq: seq, x: x, y: y, width: w, height: h,
                              codec: codec, stripes: stripes)
         default:
