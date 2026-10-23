@@ -681,18 +681,31 @@ paint. They blit without advancing `tileSeq` and are never ACKed.
 ### 4.9 Rate control and pacing
 
 **`SendGovernor`** — a token bucket for tiles:
-- The bucket holds 0.25 s of rate, clamped to 64 KB–16 MB.
+- The bucket holds 0.25 s of rate, clamped to 16 KB–16 MB. The minimum
+  admits one RAW tile; a 64 KB minimum alone queues 1.75 s at 0.3 Mbit/s.
 - **Automatic** mode:
-  - Slow start at 2 MB/s, doubling per step until the first backoff; after
-    that, ×1.25 per 200 ms.
+  - Slow start at 2 MB/s. When the final HELLO round trip is ≥ 150 ms,
+    start at 32 KB / RTT (floored at 32 KB/s) and shrink the initial bucket
+    before the first tile batch. The handshake also seeds the delay baseline
+    on these long paths, before tile traffic can build a queue.
+  - Double per growth step until the first backoff; after that, ×1.25.
+    Steps wait at least max(200 ms, the tile-path delay EWMA), and growth
+    also observes the 400 ms hold after a queue/loss decrease. A LAN still
+    reaches 100 MB/s in about 1.2 s.
   - Growth happens only while the governor is the limit and the standing
-    queue is < 20 ms.
+    queue is < 20 ms. Standing queue is the minimum path delay in the last
+    two 200 ms windows minus its 10–20 s baseline. A gap longer than both
+    recent windows expires the old clean sample. The baseline still ages
+    so a route change can be learned.
   - A standing queue > 60 ms backs off to 0.9 × the measured delivery rate;
     > 200 ms halves the rate.
   - A large batch that times out mostly unconfirmed halves the rate and holds
     for 1 s.
   - Encode duty caps growth: none above 50 %, and ×0.85 above 75 %.
   - The floor is 32 KB/s.
+  - The rate is an admission budget, not a capacity estimate: two open
+    batches and other engine gates can limit actual traffic below it. The
+    reliable cold-start keyframes (§4.7) do not use this tile bucket.
 - **Capped** mode is a fixed 25, 50 or 100 Mbit/s (Host › Bandwidth).
 
 **`PaceController`** sets the transport's datagram pacer, 10–120 MB/s, from

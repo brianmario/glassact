@@ -768,10 +768,14 @@ public final class HostEngine: @unchecked Sendable {
                     videoNegotiated = !negotiatedVideoCodecs.isEmpty
                     cursorNegotiated = caps & WireCaps.cursor != 0
                     // The handshake round trip seeds SRTT so the first batch
-                    // timeout is already RTT-aware. (An arrival stamp can
-                    // predate a re-offered HELLO's stamp only for a stale
-                    // reply; no sample beats a wrapped one.)
-                    if nowUS > helloSentUS { updateSRTT(sample: nowUS - helloSentUS) }
+                    // timeout and tile-governor start are already RTT-aware.
+                    // (An arrival stamp can predate a re-offered HELLO's
+                    // stamp only for a stale reply; no sample beats a
+                    // wrapped one.)
+                    if nowUS > helloSentUS {
+                        updateSRTT(sample: nowUS - helloSentUS)
+                        governor.start(roundTripUS: nowUS - helloSentUS, nowUS: nowUS)
+                    }
                     lastPingUS = nowUS
                 }
             case let .ack(frameSeq, dgramCnt, bitmap):
