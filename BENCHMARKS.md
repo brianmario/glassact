@@ -355,8 +355,30 @@ AV1 3.07 · 46.1 · 78.7 vs HEVC 3.67 · 43.5 · 78.2.
   `rc_overshoot_pct` (10 %) left the VBR output byte-identical, since
   realtime libaom applies them only in CBR. On scroll-win VBR sent every
   frame (482) with 3.9–4.2 MB to CBR's 9.6 MB, so it would pay off if the
-  gate tolerated its bursts; that's a gate change (it gates HEVC too), left
-  for later.
+  gate tolerated its bursts.
+- **Gate changes, tried and rejected.** `replay --timeline` now prints the
+  gate's estimate, cap, cuts and skips each second. On cursor-drag the
+  estimate never measures the link (0 link measurements in every run): it
+  moves by cuts when a queue builds and by probes on "used" windows. Twice
+  the trace's lossless tiles flood the shared bottleneck (network queue
+  400–500 ms), and each time the video estimate is cut: HEVC and CBR take 2
+  cuts and recover, VBR 6, ending at 0.6 Mbit/s. Two changes, over HEVC,
+  AV1 CBR and VBR, on 10 Mbit/s (500 ms buffer, 30–40 ms) and 2 Mbit/s
+  (2 s buffer, 75–100 ms, 1 % loss):
+  - *Refused frames count as demand* (a window where the gate refused a
+    frame on a clean path probes up, as one that used half the estimate
+    does): HEVC and CBR unchanged on both links (2 Mbit/s cursor-drag HEVC
+    321 frames either way, scroll-win 141 vs 143); VBR cursor-drag at
+    10 Mbit/s worse, 247 → 175.
+  - *The token budget binds only while the network shows a queue*: 10 Mbit/s
+    unchanged (HEVC cursor-drag 434 → 441); 2 Mbit/s HEVC cursor-drag
+    **321 → 224 frames**. The bucket is doing its job on thin links.
+
+  Neither went in.
+- **AV1 on a thin link loses to HEVC.** At 2 Mbit/s cursor-drag: HEVC 321
+  frames, queue p95 532 ms; AV1 CBR 75 frames, 764 ms (scroll-win 141 vs
+  141, 784 vs 1226 ms). AV1 is an option for a link with room; the Viewer's
+  setting says so ("on a slow network, HEVC looks better").
 - 40 % holds the frame rate as well as 60 % with more room, so the Host
   aims at 40 % of both the base bitrate and the link cap
   (`AOMRegionEncoder.targetPercent`). `vquality` and the loop default to it
