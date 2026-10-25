@@ -57,7 +57,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             $0 == VideoCodec.av1 ? BenchPipelinedEncoder(AOMRegionEncoder(callbackQueue: .main), vtPipeline) : nil
         }
         // The Viewer's path, hardware decode, where this Mac has it.
-        decoderFactory = { VTRegionDecoder.hasHardwareAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
+        decoderFactory = { VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
         hostCodecs = [VideoCodec.av1]
         viewerCodecs = [VideoCodec.av1]
     default:

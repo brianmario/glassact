@@ -26,7 +26,7 @@ struct SettingsView: View {
                 Toggle("Prefer sharpness over smooth motion", isOn: $settings.preferSharpness)
                 Toggle("Fill the screen in full screen", isOn: $settings.fullScreenReshapesHost)
                 Toggle("Use AV1 video", isOn: $settings.videoAV1)
-                    .disabled(!VTRegionDecoder.hasHardwareAV1)
+                    .disabled(!VTRegionDecoder.canDecodeAV1)
             } header: {
                 Text("Picture")
             } footer: {
@@ -36,7 +36,7 @@ struct SettingsView: View {
                      + "connect. Filling the screen asks the host to take this screen's shape while you're in "
                      + "full screen with Scale Down or Match This Mac, instead of showing bars beside a "
                      + "differently shaped picture; it goes back when you leave full screen. "
-                     + (VTRegionDecoder.hasHardwareAV1
+                     + (VTRegionDecoder.canDecodeAV1
                         ? "AV1 video keeps moving text sharper than the default HEVC and reaches you a little "
                             + "sooner, but it uses more bandwidth and more of the host's processor; on a slow "
                             + "network, HEVC looks better. It needs an up-to-date host with Apple silicon; other "
