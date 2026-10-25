@@ -191,7 +191,7 @@ public final class ScreenCapture<Backend: CaptureBackend>: @unchecked Sendable {
         guard let stream, var settings else { return }
         settings.framesPerSecond = framesPerSecond
         self.settings = settings
-        Task { await stream.apply(settings) }
+        stream.apply(settings)
     }
 
     /// Main thread: draw the pointer into the pixels, or leave it to cursor
@@ -200,7 +200,7 @@ public final class ScreenCapture<Backend: CaptureBackend>: @unchecked Sendable {
         guard let stream, var settings else { return }
         settings.showsCursor = showsCursor
         self.settings = settings
-        Task { await stream.apply(settings) }
+        stream.apply(settings)
     }
 
     // MARK: - Recovery

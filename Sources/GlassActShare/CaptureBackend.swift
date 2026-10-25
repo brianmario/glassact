@@ -32,8 +32,9 @@ public protocol CaptureBackend: Sendable {
 public protocol CaptureStream: AnyObject, Sendable {
     func start() async throws
     func stop() async
-    /// Applies new settings to the running stream.
-    func apply(_ settings: CaptureSettings) async
+    /// Main thread. Applies new settings to the running stream; calls take
+    /// effect in the order they're made.
+    func apply(_ settings: CaptureSettings)
     /// The stream stopped without telling its delegate (only macOS 27 can
     /// tell; earlier systems always say false).
     var isStalled: Bool { get }

@@ -221,6 +221,19 @@ import GlassActShare
         await rig.finish()
     }
 
+    /// A pause and a resume in quick succession land in that order: the
+    /// stream must not be left at 1 fps, or with the pointer drawn back in.
+    @Test func settingsChangesApplyInOrder() async {
+        let rig = await Rig().started()
+        rig.capture.setFrameRate(1)
+        rig.capture.setShowsCursor(false)
+        rig.capture.setFrameRate(60)
+        #expect(rig.backend.streams[0].applied.map(\.framesPerSecond) == [1, 1, 60])
+        #expect(rig.backend.streams[0].applied.last
+                == CaptureSettings(width: 200, height: 100, framesPerSecond: 60, showsCursor: false))
+        await rig.finish()
+    }
+
     /// Restarts on top of each other: only the last one's stream is left
     /// running.
     @Test func overlappingRestartsLeaveOneStream() async {

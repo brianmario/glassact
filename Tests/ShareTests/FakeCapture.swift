@@ -107,9 +107,9 @@ final class FakeStream: CaptureStream {
         backend.log.append("stop \(index)")
     }
 
-    nonisolated func apply(_ settings: CaptureSettings) async { await record(settings) }
-
-    private func record(_ settings: CaptureSettings) { applied.append(settings) }
+    nonisolated func apply(_ settings: CaptureSettings) {
+        MainActor.assumeIsolated { applied.append(settings) }
+    }
 
     nonisolated var isStalled: Bool { stalled }
 

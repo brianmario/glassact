@@ -55,13 +55,14 @@ public final class SCKCaptureStream: CaptureStream, @unchecked Sendable {
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.queueDepth = 3
+        Self.configure(configuration, settings)
         output = Output(frames: frames, onFrame: onFrame, onStop: onStop)
+        // SCStream copies the configuration here: it must be complete first.
         stream = SCStream(filter: filter, configuration: configuration, delegate: output)
-        configure(settings)
         try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: queue)
     }
 
-    private func configure(_ settings: CaptureSettings) {
+    private static func configure(_ configuration: SCStreamConfiguration, _ settings: CaptureSettings) {
         configuration.width = settings.width
         configuration.height = settings.height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(clamping: settings.framesPerSecond))
@@ -76,9 +77,13 @@ public final class SCKCaptureStream: CaptureStream, @unchecked Sendable {
         try? await stream.stopCapture()
     }
 
-    public func apply(_ settings: CaptureSettings) async {
-        configure(settings)
-        try? await stream.updateConfiguration(configuration)
+    /// Main thread. The change lands in `configuration` now, in call
+    /// order, and every update sends that one object: updates that finish
+    /// out of order still leave the stream at the latest settings.
+    public func apply(_ settings: CaptureSettings) {
+        Self.configure(configuration, settings)
+        let update = Unchecked((stream, configuration))
+        Task { try? await update.value.0.updateConfiguration(update.value.1) }
     }
 
     public var isStalled: Bool {
