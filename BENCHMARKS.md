@@ -175,6 +175,7 @@ the numbers and the reasoning.
 | Re-sharpen keyframe once a region goes quiet | kept | SSIM 0.879 → 0.975–0.985 | [entry](#soft-video-for-minutes-capture-time-pts-qp-34-floor-re-sharpen-2026-10-10) |
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
+| HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -236,6 +237,47 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### HEVC Main 4:4:4 for video regions: rejected (2026-10-25)
+
+VMPal Remote (VMPal 0.97, static analysis) sends its screen as HEVC Main
+4:4:4 when both ends can. Apple silicon's hardware encoder lists
+`HEVC_Main444_AutoLevel` among its supported profiles (M4 Pro,
+`VTCopySupportedPropertyDictionaryForEncoder`), though the SDK declares no
+constant for it, and the M4 Pro decodes it in hardware (2940×1912 in about
+10 ms). Two catches:
+- With low-latency rate control the encoder quietly emits 4:2:0 from BGRA
+  input; only 4:4:4 YUV input ('444v'/'444f', which VMPal converts to with
+  `VTPixelTransferSession`) stays 4:4:4. The product doesn't use low-latency
+  rate control, so BGRA works.
+- Other Macs' decoders (Intel especially) are untested, so shipping it
+  would need a caps bit and the 4:2:0 fallback.
+
+`vquality --chroma444` (new bench knob), 200 frames, `--settle 6`, the
+product's QP 34 cap, no low-latency, M4 Pro. Achieved bitrate (Mbit/s) and
+SSIMULACRA2 mean / min; the target bitrate rarely binds, since the QP cap
+does:
+
+| trace | target | 4:2:0 | 4:4:4 |
+|---|---|---|---|
+| typing-cc | 1 | 0.45 · 65.7 / 37.5 | 0.57 · 67.8 / 40.7 |
+| typing-cc | 8 | 0.57 · 77.2 / 54.7 | 0.77 · 79.8 / 54.5 |
+| scroll-win | 1 | 1.95 · 50.8 / 48.8 | 2.17 · 54.2 / 52.1 |
+| scroll-win | 3 | 2.71 · 66.9 / 48.8 | 2.93 · 67.5 / 52.1 |
+| scroll-win | 8 | 4.23 · 75.4 / 61.0 | 4.97 · 78.0 / 61.8 |
+| cursor-drag | 1 | 1.03 · 66.0 / 37.5 | 1.31 · 68.1 / 41.0 |
+| cursor-drag | 8 | 1.29 · 76.8 / 54.5 | 1.74 · 80.0 / 55.1 |
+| scroll v3 | 3 | 23.3 · 68.4 / 63.7 | 24.6 · 70.1 / 66.2 |
+| photos | 3 | 8.13 · 36.4 / 28.7 | 8.97 · 39.8 / 32.2 |
+
+4:4:4 scores 2–3.5 points higher at every setting, but spends 5–35 % more
+to do it. At equal bytes 4:2:0 wins: typing-cc 0.57 Mbit/s is 77.2 for
+4:2:0 against 67.8 for 4:4:4, and cursor-drag at about 1.3 Mbit/s is 76.8
+against 68.1. Encode time is the same (p50 24–37 ms at 5K). What 4:4:4 does
+better, crisp coloured text, Glass Act gets from the lossless tile handoff
+and dissolve once motion stops; video carries motion, where the bits are
+better spent on luma. Revisit if a trace of coloured text in motion (syntax
+highlighting while scrolling) shows chroma fringing that SSIMULACRA2 misses.
 
 ### Small changes inside a live region: parked (2026-10-22)
 
