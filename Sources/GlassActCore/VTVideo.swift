@@ -69,6 +69,11 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     public var capWithVBV = false
     /// Experiment: kVTCompressionPropertyKey_RealTime (the product: true).
     public var realTime = true
+    /// Experiment: full-resolution chroma. Apple silicon's hardware HEVC
+    /// encoder lists `HEVC_Main444_AutoLevel` among its supported profiles,
+    /// though the SDK declares no constant for it.
+    public var chroma444 = false
+    public private(set) var chroma444Accepted = false
     /// Whether VT accepted each knob (VTSessionSetProperty status).
     public private(set) var maxFrameQPAccepted = false
     public private(set) var constantQualityAccepted = false
@@ -112,8 +117,14 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                              value: realTime ? kCFBooleanTrue : kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: kVTProfileLevel_HEVC_Main_AutoLevel)
+        if chroma444 {
+            chroma444Accepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
+                                                     value: "HEVC_Main444_AutoLevel" as CFString) == noErr
+        }
+        if !chroma444Accepted {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
+                                 value: kVTProfileLevel_HEVC_Main_AutoLevel)
+        }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
                              value: 3600 as CFNumber) // IDRs are on-demand, not periodic
         // ~0.2 bpp at 60 fps (12 bits/pixel/s), clamped: broadcast-ish

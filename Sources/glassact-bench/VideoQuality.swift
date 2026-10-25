@@ -28,6 +28,7 @@ let videoQualityCommand = Command(
         .bool("low-latency", "request VideoToolbox's low-latency rate control"),
         .int("cqf", "<0-100>", 0...100, "experiment: constant-quality factor ×100 (kVTCompressionPropertyKey_ConstantQualityFactor, macOS 27)"),
         .bool("no-realtime", "experiment: kVTCompressionPropertyKey_RealTime = false"),
+        .bool("chroma444", "experiment: HEVC Main 4:4:4 (full-resolution chroma) instead of Main 4:2:0"),
         .bool("cqf-vbv", "experiment: with --cqf, cap the rate as a VBV peak (1 s) instead of an average"),
         .int("max-qp", "<n>", 1...51, "quality floor: cap frame QP (kVTCompressionPropertyKey_MaxAllowedFrameQP; default \(VTHEVCRegionEncoder.defaultMaxFrameQP), as in the product; 51 = none)"),
         .string("ssimulacra2", "<path|off>", "also score SSIMULACRA2 with this binary (default: `ssimulacra2` on PATH, if any; off = SSIM/PSNR only)"),
@@ -73,6 +74,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
     if opts.has("cqf") { encoder.constantQualityFactor = Float(opts.int("cqf", 50)) / 100 }
     encoder.capWithVBV = opts.has("cqf-vbv")
     encoder.realTime = !opts.has("no-realtime")
+    encoder.chroma444 = opts.has("chroma444")
     let submitW = encW, submitH = encH, outW = encW, outH = encH
     let delivered = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var lastData: [UInt8] = []
@@ -96,6 +98,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
           + ", max-qp \(encoder.maxFrameQP.map(String.init) ?? "none") \(encoder.maxFrameQPAccepted ? "accepted" : "REFUSED")"
           + (opts.has("cqf") ? ", cqf \(opts.int("cqf", 0)) \(encoder.constantQualityAccepted ? "accepted" : "REFUSED")"
              + (encoder.capWithVBV ? " (VBV cap)" : "") : "")
+          + (opts.has("chroma444") ? ", chroma 4:4:4 \(encoder.chroma444Accepted ? "accepted" : "REFUSED")" : "")
           + (ssimu2.map { ", SSIMULACRA2 every \(ssimu2Every)th frame (\($0.binary.path))" } ?? ""))
 
     var rects: [DirtyRect] = []
