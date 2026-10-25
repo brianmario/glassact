@@ -224,5 +224,6 @@ Developer tools:
 ## License
 
 MIT — see [LICENSE](LICENSE). The bundled libwebp keeps its BSD-3-Clause
-license and patent grant, and Sparkle (updates) its MIT license; see
+license and patent grant, libaom its BSD-2-Clause license and the AOM
+patent license, and Sparkle (updates) its MIT license; see
 [ThirdParty/THIRD_PARTY.md](ThirdParty/THIRD_PARTY.md).

@@ -48,6 +48,20 @@ let package = Package(
                 .define("WEBP_USE_THREAD"),
             ]
         ),
+        // Vendored libaom (AV1), arm64 only — see ThirdParty/THIRD_PARTY.md.
+        // `scripts/vendor-libaom` copies the sources and generates the
+        // config headers and the per-file wrappers compiled here; Swift
+        // sees only Glass Act's C API (glassact/include).
+        .target(
+            name: "libaom",
+            path: "ThirdParty/libaom",
+            sources: ["glassact/wrappers", "glassact/shim"],
+            publicHeadersPath: "glassact/include",
+            cSettings: [
+                .headerSearchPath("."),
+                .headerSearchPath("glassact"),
+            ]
+        ),
         // Hot-path codec: xxh64, RAW/LZ4/LZBITMAP/WEBPL tile codecs, arenas.
         // Plain -O: -Ounchecked (§8.4) gains nothing measurable and would
         // strip the bounds preconditions guarding canvas writes (BENCHMARKS
@@ -92,7 +106,7 @@ let package = Package(
                 swiftSettings: strictLibrary),
         .testTarget(name: "WireTests", dependencies: ["GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "CodecTests", dependencies: ["GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
-        .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
+        .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "SessionTests", dependencies: ["GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "ShareTests", dependencies: ["GlassActShare", "GlassActCore"], swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),

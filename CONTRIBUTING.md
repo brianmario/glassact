@@ -14,8 +14,8 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
   are for the Mac you build on.
 - [`just`](https://github.com/casey/just).
 
-The package uses system frameworks only, plus the vendored libwebp in
-`ThirdParty/`; the apps also use Sparkle for updates. Don't add
+The package uses system frameworks only, plus the vendored libwebp and
+libaom in `ThirdParty/`; the apps also use Sparkle for updates. Don't add
 dependencies.
 
 ## Building
