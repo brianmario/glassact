@@ -4,7 +4,7 @@ import GlassActWire
 import libaom
 
 /// Video regions (§4.6): software AV1 via the vendored libaom, for a Viewer
-/// that opts in. Realtime mode with screen tools (palette, IntraBC), low
+/// that opts in. Realtime speed 9 with screen tools (palette, IntraBC), low
 /// delay, CBR, key frames only on demand (region start / forceSync).
 /// Apple silicon only: `isAvailable` is false on Intel, where the Host
 /// doesn't offer AV1.
@@ -46,6 +46,11 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     private var appliedBitrate = 0
     private var maxFrameQP = VTHEVCRegionEncoder.defaultMaxFrameQP
 
+    /// Experiments (the bench), applied at `start`: libaom's realtime speed
+    /// (the product: 9), and VBR instead of CBR.
+    public var speed = 9
+    public var vbr = false
+
     /// libaom worker threads: most of the machine, leaving room for the tile
     /// path and capture. Measured at 8 (BENCHMARKS "AV2 on screen text").
     private let threads = min(8, max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
@@ -66,8 +71,9 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         // sharper text, not more bandwidth.
         baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
         appliedBitrate = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap)
-        guard let raw = glassact_aom_enc_create(Int32(width), Int32(height), Int32(threads),
-                                                Int32(appliedBitrate / 1000)) else { return false }
+        var options = glassact_aom_enc_options(speed: Int32(speed), vbr: vbr ? 1 : 0)
+        guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
+                                                     Int32(appliedBitrate / 1000), &options) else { return false }
         handle = Handle(raw: raw)
         glassact_aom_enc_set_max_quantizer(raw, Int32(Self.quantizer(forFrameQP: maxFrameQP)))
         var header = [UInt8](repeating: 0, count: 256)

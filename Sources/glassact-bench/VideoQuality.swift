@@ -16,6 +16,8 @@ let videoQualityCommand = Command(
     flags: [
         .trace,
         .choice("codec", ["hevc", "av1"], "video codec: hardware HEVC (default) or software AV1, as the Host runs them"),
+        .int("av1-speed", "<n>", 0...12, "experiment: libaom realtime speed (default 9, as in the product)"),
+        .bool("av1-vbr", "experiment: libaom VBR instead of CBR"),
         .int("mbit", "<n>", 1...200, "target average bitrate in Mbit/s (default 3)"),
         .int("kbit", "<n>", 50...200_000, "target average bitrate in kbit/s (overrides --mbit; thin links)"),
         .int("submit-fps", "<n>", 1...60, "submit at most this many frames per second of trace time — what newest-wins pacing does on a thin link (default: every trace frame)"),
@@ -77,7 +79,12 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
         throw BenchError("--\(knob) is a VideoToolbox knob; it doesn't apply to --codec av1")
     }
     let hevc = av1 ? nil : VTHEVCRegionEncoder(callbackQueue: queue, lowLatency: lowLatency)
-    let encoder: any VideoRegionEncoder = hevc ?? AOMRegionEncoder(callbackQueue: queue)
+    let encoder: any VideoRegionEncoder = hevc ?? {
+        let aom = AOMRegionEncoder(callbackQueue: queue)
+        aom.speed = opts.int("av1-speed", 9)
+        aom.vbr = opts.has("av1-vbr")
+        return aom
+    }()
     if let hevc {
         if opts.has("max-qp") { hevc.maxFrameQP = opts.int("max-qp", 30) }
         if opts.has("cqf") { hevc.constantQualityFactor = Float(opts.int("cqf", 50)) / 100 }

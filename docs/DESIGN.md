@@ -571,14 +571,15 @@ first negotiated codec whose encoder starts; START carries its id.
 - While the viewer has paused content (§4.10) the region idles: nothing is
   encoded and it doesn't dissolve, so resuming continues it.
 
-**AV1 encoder** (`AOMRegionEncoder`, vendored libaom): realtime speed 10
+**AV1 encoder** (`AOMRegionEncoder`, vendored libaom): realtime speed 9
 with screen tools, CBR with a one-second rate buffer, no dropped frames, key
 frames on demand (up to 15 average frames each), at most 8 threads. It takes
 the same base bitrate, quality ladder and link cap as HEVC, and the
 frame-QP ceiling mapped to libaom's quantizer scale (34 → 42). BGRA → I420
 on the engine's queue, the encode on its own queue; one delivery per submit.
-On text it's much sharper than HEVC for more bytes (BENCHMARKS "AV1 back, as
-a Viewer opt-in").
+It's a sharpness and latency choice, not a bandwidth saving: at equal bytes
+HEVC looks better on text and photos, AV1 better on scrolling (BENCHMARKS "AV1
+back, as a Viewer opt-in").
 
 **HEVC encoder** (`VTHEVCRegionEncoder`):
 - Realtime, no B-frames, IDR only on demand, capture-time PTS.
