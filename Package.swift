@@ -21,7 +21,7 @@ let package = Package(
     name: "glassact",
     platforms: [.macOS("15.5")],
     products: [
-        .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession"]),
+        .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession", "GlassActShare"]),
         .executable(name: "glassact", targets: ["glassact"]),
         .executable(name: "glassact-bench", targets: ["glassact-bench"]),
         .executable(name: "glassact-trace", targets: ["glassact-trace"]),
@@ -66,6 +66,10 @@ let package = Package(
         // `glassact` CLI.
         .target(name: "GlassActSession", dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport"],
                 swiftSettings: strictLibrary),
+        // Sharing a screen (#42): ScreenCaptureKit capture and its recovery,
+        // and in time the rest of what the Host app does to share. Apps add
+        // UI on top.
+        .target(name: "GlassActShare", dependencies: ["GlassActCore"], swiftSettings: strictLibrary),
         // `glassact`: drive a remote Mac from a shell or an MCP client —
         // through the Viewer app's live session, or a headless one of its own.
         .executableTarget(
@@ -90,6 +94,7 @@ let package = Package(
         .testTarget(name: "CodecTests", dependencies: ["GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "SessionTests", dependencies: ["GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
+        .testTarget(name: "ShareTests", dependencies: ["GlassActShare", "GlassActCore"], swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
     ]
 )
