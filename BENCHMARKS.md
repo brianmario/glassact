@@ -176,6 +176,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
+| AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -237,6 +238,130 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### AV2 on screen text: AVM research-v15.0.0 (2026-10-25)
+
+How much would a future hardware AV2 encoder save over today's video
+path? An offline measurement, not a product option: AV2 has no
+hardware encoder or decoder on any Apple chip and no VideoToolbox
+support, and the only encoder, AOM's reference AVM, has no realtime
+mode.
+
+**Setup.** The first 30 frames of typing-cc and scroll-win, exported
+with `glassact-bench y4m` (4:2:0, BT.709 video range) and cropped to the
+top-left 1920×1080, on an M4 Pro. All low-delay (no B-frames or
+lookahead). Y-plane PSNR against the source, via ffmpeg.
+
+- **hevc-vt:** VideoToolbox hardware HEVC through ffmpeg
+  (`hevc_videotoolbox -realtime 1 -bf 0`, `-q:v` 60–90), the encoder
+  the Host ships.
+- **hevc-x265:** x265 `medium`, `bframes=0`, no lookahead, crf 8–32.
+- **av1-aom:** aomenc 3.x, good quality, `--cpu-used=6`,
+  `--tune-content=screen`, `--lag-in-frames=0`, cq 40–60.
+- **av2-avm:** AVM research-v15.0.0 (917ddae), built from source
+  outside the repo, `--good --cpu-used=9 --tune-content=screen
+  --lag-in-frames=0`, qp 120–230 (its 0–255 scale).
+
+Bytes for 30 frames at matched PSNR (log-interpolated between
+measured points; – means that encoder's range didn't reach it):
+
+| clip | PSNR | hevc-vt | hevc-x265 | av1-aom | av2-avm |
+|---|---|---|---|---|---|
+| typing-cc | 56 dB | 557 KB | 171 KB | – | 30 KB |
+| typing-cc | 60 dB | – (q90: 59.0 dB, 647 KB) | 233 KB | 141 KB | 38 KB |
+| scroll-win | 56 dB | 461 KB | 141 KB | – | 53 KB |
+| scroll-win | 60 dB | – (q90: 59.2 dB, 549 KB) | 189 KB | 113 KB | 66 KB |
+
+libaom's screen tools put a floor near 58 dB even at cq 60, so it has
+no 56 dB point.
+
+Speed: hevc-vt ~100 fps, x265 ~120 fps, libaom ~25 fps, **AVM 0.09
+fps** (four encodes of 4 threads in parallel; about 11 s per frame
+with 14 threads).
+
+**Reading it:**
+- **On text, screen-content coding tools dominate.** AV2 at 60 dB is
+  0.16× x265 on typing and 0.35× on scroll; AV1 is 0.6× on both. Against
+  the hardware HEVC the Host ships, AV2 is about 9× (scroll) to 18×
+  (typing) smaller at 56 dB.
+- **The hardware HEVC encoder is itself ~3.2× bigger than x265** at the
+  same PSNR. Some of every gap above is encoder effort, not the codec.
+- **These are ceilings.** AVM's good mode searches far harder than any
+  realtime hardware encoder will, and 30 frames of a 1080p crop is small.
+  A hardware AV2 encoder would give back part of the gain.
+- Nothing changes in the product. The video codec ids reserve AV1 for
+  hardware encode (§3.8); AV2 would be another reserved id once hardware
+  exists. Worth re-measuring when Apple ships AV1 or AV2 encode.
+
+**Realtime speed at the sizes the Host sends.** The same day: 60 frames
+of each trace at 5120×2880 and at 2900×1572 (a Scale/virtual-display
+session's size), realtime low-delay settings, on the M4 Pro with nothing
+else running. These timings come from command-line runs, file reading
+included, so treat them as approximate. x265 used `-tune zerolatency`,
+crf 20. libaom was the old engine's configuration: `--rt --cpu-used=10`,
+screen tune, 8 threads, row-mt, 8 tile columns, cq 30. The hardware and
+Apple software HEVC used `hevc_videotoolbox` at q75, the latter with
+`-require_sw 1`.
+
+| encoder | 2900×1572 fps | typing-cc | scroll-win | 5K fps | typing-cc | scroll-win |
+|---|---|---|---|---|---|---|
+| hardware HEVC (shipping) | ~79 | 2.17 MB · 46.2 dB | 2.16 MB · 47.5 dB | ~50 | 4.33 MB · 45.3 dB | 4.20 MB · 45.8 dB |
+| Apple software HEVC | 14–15 | 2.51 MB · 38.0 dB | 2.36 MB · 39.5 dB | 6 | 5.91 MB · 38.6 dB | 3.88 MB · 40.7 dB |
+| x265 ultrafast | 75–80 | 0.90 MB · 49.0 dB | 2.15 MB · 47.6 dB | 26–27 | 1.72 MB · 50.5 dB | 4.10 MB · 49.5 dB |
+| x265 superfast | 66–71 | 0.60 MB · 50.3 dB | 1.36 MB · 49.0 dB | 23–24 | 1.02 MB · 52.2 dB | 3.28 MB · 51.0 dB |
+| x265 medium | 32–35 | 0.63 MB · 50.8 dB | 1.00 MB · 50.9 dB | 11 | 1.10 MB · 53.1 dB | 1.87 MB · 54.2 dB |
+| libaom AV1 rt, speed 10 | 129–136 | 0.80 MB · 50.5 dB | 0.90 MB · 49.6 dB | 61–62 | 1.19 MB · 53.0 dB | 1.00 MB · 54.6 dB |
+
+- **x265 can't hold 60 fps at 5K.** Zero latency turns off frame
+  threading, so even superfast runs at about 24 fps on every core. It's
+  also GPL, which would change the licence of the Host binary.
+- **Apple's software HEVC is unusable:** slower than the hardware encoder
+  and worse.
+- **libaom realtime is the only software encoder fast enough at 5K.** It's
+  3.6–4× smaller than the hardware HEVC there, at 7–9 dB higher PSNR.
+  That was the case for AV1 before it was retired on 2026-10-10 (the
+  library-validation exemption, and software decode on M1/M2 Viewers).
+
+**Software AV1 decode keeps up.** dav1d 1.5.4, one frame at a time
+(`--framedelay 1`, as a live session decodes), on the libaom realtime
+streams above plus Photos.app browsing (photos, the heaviest content).
+Bitrates are the encoder's at cq 30, uncapped.
+
+| stream | Mbit/s at 60 fps | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| typing-cc 2900×1572 | 6.4 | 415 fps | 741 | 1185 | 1175 |
+| typing-cc 5K | 9.5 | 167 | 281 | 427 | 483 |
+| scroll-win 2900×1572 | 7.2 | 328 | 619 | 986 | 904 |
+| scroll-win 5K | 8.0 | 176 | 296 | 465 | 474 |
+| photos 2900×1572 | 26.4 | 101 | 196 | 372 | 567 |
+| photos 5K | 38.3 | 82 | 155 | 273 | 374 |
+
+The worst case, 5K photos at 4 threads, uses about a fifth of four M4 Pro
+cores at 60 fps. An AV1 Viewer wouldn't need AV1 hardware decode (M3 and
+later). dav1d's output is YUV, which the Viewer would convert to BGRA
+itself. Not measured on M1/M2 or Intel.
+
+**libaom 3.15.2 corrupts screen content at these sizes.** With
+`--tune-content=screen` in realtime mode (IntraBC on) and 2 or more
+threads:
+- **5K photos:** frames the decoders reject ("Invalid intrabc dv", in
+  both aomdec and dav1d). Since 2026-10-12 libaom's main explains it:
+  on frames wider or taller than 2048 pixels the nonrd IntraBC search
+  could read past the DV cost table and pick a DV the decoder rejects
+  (b57fd44).
+- **2900×1572 photos:** silent drift. `aomenc --test-decode` reports an
+  encode/decode mismatch from frame 2: with IntraBC and 2+ threads, the
+  reconstruction stops matching the decoder until the next keyframe
+  (3ca3bea).
+- fb357ae (2026-10-21) also removes a thread-timing dependence in the
+  same path.
+
+One thread, or `--enable-intrabc=0`, avoids it, at a cost in speed or
+in compression on text. 3.15.3-rc1 still corrupts 5K photos. libaom main
+at 9ace39e (2026-10-24) is clean on every clip here: no decode errors,
+and no `--test-decode` mismatch. A Host that ships AV1 needs a libaom
+with those commits (or a pinned main) and a regression test that
+round-trips 5K screen content.
 
 ### HEVC Main 4:4:4 for video regions: rejected (2026-10-25)
 
