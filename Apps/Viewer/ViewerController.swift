@@ -145,9 +145,9 @@ final class ViewerController: @unchecked Sendable {
     /// TLS). The host admits only viewer fingerprints its user approved.
     /// `fingerprint` pins the host; empty = trust on first use.
     init(host: String, port: UInt16, fingerprint: String, identity: SecIdentity?,
-         cursorMetadata: Bool = true) {
+         cursorMetadata: Bool = true, av1: Bool = false) {
         session = ViewerSession(host: host, port: port, fingerprint: fingerprint, identity: identity,
-                                options: .init(cursorMetadata: cursorMetadata, video: true))
+                                options: .init(cursorMetadata: cursorMetadata, video: true, av1: av1))
         sessionTarget = session.target
         cursorMode = cursorMetadata ? "metadata" : "burned"
         engine.onVideoCodecChanged = { [weak self] codec in

@@ -437,7 +437,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         if model.phase == .idle { model.phase = .connecting }
         note(trustingOnFirstUse ? "connecting to a new host (trust on first use)…" : "connecting…")
         let controller = ViewerController(host: host, port: port, fingerprint: fingerprint,
-                                          identity: viewerIdentity, cursorMetadata: cursorMetadata)
+                                          identity: viewerIdentity, cursorMetadata: cursorMetadata,
+                                          av1: settings.videoAV1)
         controller.onStatus = { text in
             print("glassact-viewer: \(text)")
             SessionLog.shared.text("status", text)

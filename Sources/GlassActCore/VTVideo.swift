@@ -359,14 +359,24 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 }
 
-/// Decode side: hardware HEVC (parameter-set config).
+/// Decode side: hardware HEVC (parameter-set config) and hardware AV1
+/// (`av1C` config; M3 and later — VideoToolbox has no software AV1 decoder,
+/// so `start` fails on older Macs).
 /// Synchronous decode (no async decompression flag), so `onPixels` fires
 /// inline on the caller's thread — the viewer engine's queue — honoring the
 /// VideoRegionDecoder contract without any hop.
 public final class VTRegionDecoder: VideoRegionDecoder {
-    /// What this machine can decode, in Glass Act codec ids — the viewer's caps
-    /// advertisement comes from this.
-    public static var supportedCodecs: [UInt8] { [VideoCodec.hevc] }
+    /// Hardware AV1 decode: Apple silicon M3 and later.
+    public static var hasHardwareAV1: Bool {
+        VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+    }
+
+    /// What this Viewer advertises, in Glass Act codec ids. AV1 only when the
+    /// user opted in and this Mac decodes it in hardware: the Host prefers
+    /// AV1 whenever it's offered (§4.6).
+    public static func supportedCodecs(av1: Bool) -> [UInt8] {
+        av1 && hasHardwareAV1 ? [VideoCodec.av1, VideoCodec.hevc] : [VideoCodec.hevc]
+    }
 
     private var session: VTDecompressionSession?
     private var formatDescription: CMVideoFormatDescription?
@@ -386,8 +396,27 @@ public final class VTRegionDecoder: VideoRegionDecoder {
     public func start(codec: UInt8, config: [UInt8], width: Int, height: Int) -> Bool {
         self.width = width
         self.height = height
-        guard codec == VideoCodec.hevc else { return false }
-        return startHEVC(config: config)
+        switch codec {
+        case VideoCodec.hevc: return startHEVC(config: config)
+        case VideoCodec.av1: return startAV1(config: config)
+        default: return false
+        }
+    }
+
+    /// AV1: the wire config is the av1C record. It becomes the format
+    /// description's sample description extension, as in an MP4 file.
+    private func startAV1(config: [UInt8]) -> Bool {
+        guard Self.hasHardwareAV1, config.count >= 5, config[0] == 0x81 else { return false }
+        var desc: CMVideoFormatDescription?
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: ["av1C": Data(config)] as CFDictionary,
+        ]
+        guard CMVideoFormatDescriptionCreate(
+            allocator: nil, codecType: kCMVideoCodecType_AV1, width: Int32(width), height: Int32(height),
+            extensions: extensions as CFDictionary, formatDescriptionOut: &desc) == noErr,
+              let desc else { return false }
+        formatDescription = desc
+        return createSession(with: desc)
     }
 
     private func startHEVC(config: [UInt8]) -> Bool {

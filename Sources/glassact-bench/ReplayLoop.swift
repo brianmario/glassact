@@ -28,7 +28,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         link.bottleneck = .init(bytesPerSecond: rate, bufferBytes: rate * bufferMS / 1000)
     }
     // --video mock (deterministic rig codec), vt (hardware HEVC) or av1
-    // (libaom, decoded with libaom here; the Viewer decodes in hardware) —
+    // (libaom, decoded in hardware as the Viewer does, else with libaom) —
     // real codecs are nondeterministic in bytes but still byte-exact at settle.
     let videoMode = opts.string("video") // nil | mock | vt | av1
     var encoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
@@ -56,7 +56,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         encoderFactory = {
             $0 == VideoCodec.av1 ? BenchPipelinedEncoder(AOMRegionEncoder(callbackQueue: .main), vtPipeline) : nil
         }
-        decoderFactory = { AOMRegionDecoder() }
+        // The Viewer's path, hardware decode, where this Mac has it.
+        decoderFactory = { VTRegionDecoder.hasHardwareAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
         hostCodecs = [VideoCodec.av1]
         viewerCodecs = [VideoCodec.av1]
     default:
