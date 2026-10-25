@@ -176,6 +176,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
+| AV2 (AVM reference encoder) for video | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -237,6 +238,60 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### AV2 on screen text: AVM research-v15.0.0 (2026-10-25)
+
+How much would a future hardware AV2 encoder save over today's video
+path? An offline measurement, not a product option: AV2 has no
+hardware encoder or decoder on any Apple chip and no VideoToolbox
+support, and the only encoder, AOM's reference AVM, has no realtime
+mode.
+
+**Setup.** The first 30 frames of typing-cc and scroll-win, exported
+with `glassact-bench y4m` (4:2:0, BT.709 video range) and cropped to the
+top-left 1920×1080, on an M4 Pro. All low-delay (no B-frames or
+lookahead). Y-plane PSNR against the source, via ffmpeg.
+
+- **hevc-vt:** VideoToolbox hardware HEVC through ffmpeg
+  (`hevc_videotoolbox -realtime 1 -bf 0`, `-q:v` 60–90), the encoder
+  the Host ships.
+- **hevc-x265:** x265 `medium`, `bframes=0`, no lookahead, crf 8–32.
+- **av1-aom:** aomenc 3.x, good quality, `--cpu-used=6`,
+  `--tune-content=screen`, `--lag-in-frames=0`, cq 40–60.
+- **av2-avm:** AVM research-v15.0.0 (917ddae), built from source
+  outside the repo, `--good --cpu-used=9 --tune-content=screen
+  --lag-in-frames=0`, qp 120–230 (its 0–255 scale).
+
+Bytes for 30 frames at matched PSNR (log-interpolated between
+measured points; – means that encoder's range didn't reach it):
+
+| clip | PSNR | hevc-vt | hevc-x265 | av1-aom | av2-avm |
+|---|---|---|---|---|---|
+| typing-cc | 56 dB | 557 KB | 171 KB | – | 30 KB |
+| typing-cc | 60 dB | – (q90: 59.0 dB, 647 KB) | 233 KB | 141 KB | 38 KB |
+| scroll-win | 56 dB | 461 KB | 141 KB | – | 53 KB |
+| scroll-win | 60 dB | – (q90: 59.2 dB, 549 KB) | 189 KB | 113 KB | 66 KB |
+
+libaom's screen tools put a floor near 58 dB even at cq 60, so it has
+no 56 dB point.
+
+Speed: hevc-vt ~100 fps, x265 ~120 fps, libaom ~25 fps, **AVM 0.09
+fps** (four encodes of 4 threads in parallel; about 11 s per frame
+with 14 threads).
+
+**Reading it:**
+- **On text, screen-content coding tools dominate.** AV2 at 60 dB is
+  0.16× x265 on typing and 0.35× on scroll; AV1 is 0.6× on both. Against
+  the hardware HEVC the Host ships, AV2 is about 9× (scroll) to 18×
+  (typing) smaller at 56 dB.
+- **The hardware HEVC encoder is itself ~3.2× bigger than x265** at the
+  same PSNR. Some of every gap above is encoder effort, not the codec.
+- **These are ceilings.** AVM's good mode searches far harder than any
+  realtime hardware encoder will, and 30 frames of a 1080p crop is small.
+  A hardware AV2 encoder would give back part of the gain.
+- Nothing changes in the product. The video codec ids reserve AV1 for
+  hardware encode (§3.8); AV2 would be another reserved id once hardware
+  exists. Worth re-measuring when Apple ships AV1 or AV2 encode.
 
 ### HEVC Main 4:4:4 for video regions: rejected (2026-10-25)
 
