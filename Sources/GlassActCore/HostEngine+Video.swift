@@ -122,6 +122,7 @@ extension HostEngine {
         regionStartSent = false
         regionFrameSeq = 0
         regionFramesPending = 0
+        regionSubmitHead = 0
         regionEmptyDeliveries = 0
         regionQuietTicks = 0
         regionLastChangeUS = nowUS
@@ -506,7 +507,11 @@ extension HostEngine {
         let queued = networkQueueUS.map { $0 > Self.videoQualityQueueUS } ?? (srttUS > Self.videoQualitySrttUS)
         notePressure(bandwidth: queued, cpu: encoderFull)
         evaluateQualityPressure()
-        guard !encoderFull else { return false }
+        guard !encoderFull else {
+            stats.videoEncoderFullSkips += 1
+            return false
+        }
+        regionSubmitUS[(regionSubmitHead + regionFramesPending) % Self.videoMaxPendingFrames] = clock?() ?? 0
         regionFramesPending += 1
         if stats.videoFramesSent == 0 && firstVideoSubmitUS == 0 {
             firstVideoSubmitUS = clock?() ?? lastEncodeNowUS
@@ -627,7 +632,14 @@ extension HostEngine {
     /// The generation guard drops async stragglers from a dissolved session.
     func videoEncoderDelivered(generation: UInt32, data: [UInt8], sync: Bool, config: [UInt8]?) {
         guard regionActive, generation == regionGeneration else { return }
-        if regionFramesPending > 0 { regionFramesPending -= 1 }
+        if regionFramesPending > 0 {
+            regionFramesPending -= 1
+            if let clock {
+                stats.videoEncodeUSSum &+= clock() &- regionSubmitUS[regionSubmitHead]
+                stats.videoEncodeCount += 1
+            }
+            regionSubmitHead = (regionSubmitHead + 1) % Self.videoMaxPendingFrames
+        }
         // This delivery's claims (one entry per submit, in order).
         let claimed: ContiguousArray<Int32>? = handoffActive && !claimsInFlight.isEmpty
             ? claimsInFlight.removeFirst() : nil

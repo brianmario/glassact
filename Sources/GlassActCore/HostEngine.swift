@@ -34,6 +34,14 @@ public struct HostStats: Sendable {
     /// re-sharpens, answered sync requests).
     public var videoSyncBytesSent = 0
     public var videoBacklogSkips = 0
+    /// Frames the gate skipped because the encoder still had
+    /// `videoMaxPendingFrames` in flight: the encoder, not the link, is
+    /// behind.
+    public var videoEncoderFullSkips = 0
+    /// Submit → delivery time of encoded frames, summed (with `clock`;
+    /// virtual-time rigs record 0), and how many.
+    public var videoEncodeUSSum: UInt64 = 0
+    public var videoEncodeCount = 0
     /// Tiles a dissolve revealed for free (unchanged under the video)
     /// instead of repainting.
     public var overlayTilesRevealed = 0
@@ -267,6 +275,10 @@ public final class HostEngine: @unchecked Sendable {
     var regionPixels: UnsafeMutableRawBufferPointer?
     var regionScratch: UnsafeMutableRawBufferPointer?
     var regionFramesPending = 0
+    /// Submit times of the frames in flight, oldest at `regionSubmitHead`
+    /// (deliveries come back in order). Fixed size: no allocation per frame.
+    var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
+    var regionSubmitHead = 0
     // Re-sharpen (engine queue): VideoToolbox never re-codes content that
     // stops changing, so whatever a large change got coded at — the startup
     // cap, a thin moment, the frame after a blank first capture — is what
