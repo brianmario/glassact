@@ -328,8 +328,8 @@ with a single preamble byte `0x56` ('V'), then carries TLVs framed as in §3.5.
 byte t/8, LSB first. Missing trailing bytes count as 0.
 
 **Codec ids:**
-- `VideoCodec`: 1 = HEVC. 2 (H.264) is reserved; 3 is reserved for AV1
-  once hardware AV1 encode exists. 0x7E and 0x7F are mock codecs for tests.
+- `VideoCodec`: 1 = HEVC, 3 = AV1 (config record: the ISO `av1C` box). 2
+  (H.264) is reserved. 0x7E and 0x7F are mock codecs for tests.
 - `KeyframeCodec`: 1 = striped VP8L (lossless), 2 = reserved (JXL),
   3 = striped WebP-lossy. Codec 3 is a transient paint: it never advances
   `tileSeq` and is never ACKed.
@@ -341,7 +341,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | bit | name | meaning |
 |---|---|---|
 | 0 | videoHEVC | HEVC video regions |
-| 1 | videoAV1 | reserved for AV1 once hardware encode exists; today only the test rig's alternate mock codec (0x7E) |
+| 1 | videoAV1 | AV1 regions: an Apple silicon Host (vendored libaom) offers it; a Viewer advertises it only when its user opts in. The test rig's alternate mock codec (0x7E) maps here too |
 | 2 | — | unassigned |
 | 3 | — | unassigned |
 | 4 | cursor | cursor as metadata (host stops burning it into pixels) |
@@ -551,9 +551,11 @@ side.
 
 **Codecs:** the encoder factory is keyed by codec id. The host's preference
 list is intersected with the viewer's caps, and the region starts on the
-first negotiated codec whose encoder starts; START carries its id. Today
-that is HEVC only. AV1 (codec 3, caps bit 1) is reserved for when hardware
-AV1 encode exists.
+first negotiated codec whose encoder starts; START carries its id.
+- An Apple silicon Host prefers AV1 (codec 3, caps bit 1), then HEVC. A
+  Viewer advertises AV1 only when its user opts in, so the choice is the
+  Viewer's; every other session runs HEVC.
+- On Intel, libaom isn't compiled in and the Host offers HEVC only.
 
 **Lifecycle:**
 - Each region is a *generation*. The viewer drops stragglers from older
@@ -569,7 +571,16 @@ AV1 encode exists.
 - While the viewer has paused content (§4.10) the region idles: nothing is
   encoded and it doesn't dissolve, so resuming continues it.
 
-**Encoder** (`VTHEVCRegionEncoder`):
+**AV1 encoder** (`AOMRegionEncoder`, vendored libaom): realtime speed 10
+with screen tools, CBR with a one-second rate buffer, no dropped frames, key
+frames on demand (up to 15 average frames each), at most 8 threads. It takes
+the same base bitrate, quality ladder and link cap as HEVC, and the
+frame-QP ceiling mapped to libaom's quantizer scale (34 → 42). BGRA → I420
+on the engine's queue, the encode on its own queue; one delivery per submit.
+On text it's much sharper than HEVC for more bytes (BENCHMARKS "AV1 back, as
+a Viewer opt-in").
+
+**HEVC encoder** (`VTHEVCRegionEncoder`):
 - Realtime, no B-frames, IDR only on demand, capture-time PTS.
 - `MaxAllowedFrameQP = 34` is the quality floor.
 - Bitrate is set by `VideoRateController` (§4.9). Quality levels 0–3 step it
@@ -1094,7 +1105,7 @@ status".
 | P4 DCT + REFINE | REFINE measured and rejected (the diff was larger than full lossless); DCT superseded by video regions |
 | P5 Metal surge path | not built; hardware HEVC covers surges |
 | P6 video regions | built on its own stream (not opcode 0x08); pinned full-screen HEVC with the overlay is the only mode |
-| P6 partial regions and codec ladder | not kept: hot-map partial-screen regions (with in-place resize) and the CPU-pressure codec demote/promote ladder; pinned full-screen video supersedes both (BENCHMARKS decisions table). AV1 stays reserved for hardware encode; the codec-keyed factory keeps a second codec pluggable |
+| P6 partial regions and codec ladder | not kept: hot-map partial-screen regions (with in-place resize) and the CPU-pressure codec demote/promote ladder; pinned full-screen video supersedes both (BENCHMARKS decisions table). AV1 returned on 2026-10-25 as a Viewer opt-in (vendored libaom), through the codec-keyed factory |
 
 Open work is in GitHub issues (labels: `performance`, `security`, `research`,
 `macos`, `agents`).

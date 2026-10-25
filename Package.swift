@@ -71,7 +71,7 @@ let package = Package(
             dependencies: ["libwebp"],
             swiftSettings: strictLibrary
         ),
-        .target(name: "GlassActCore", dependencies: ["GlassActWire", "GlassActCodec", "GlassActTransport"],
+        .target(name: "GlassActCore", dependencies: ["GlassActWire", "GlassActCodec", "GlassActTransport", "libaom"],
                 swiftSettings: strictLibrary),
         .target(name: "GlassActTransport", dependencies: ["GlassActWire"], swiftSettings: strictLibrary),
         // A viewer session without a window, and everything that lets an

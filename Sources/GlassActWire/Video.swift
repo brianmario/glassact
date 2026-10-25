@@ -6,10 +6,10 @@ import Foundation
 public enum WireCaps {
     /// Video regions (§4.6) over the dedicated reliable video stream, HEVC.
     public static let videoHEVC: UInt32 = 1 << 0
-    /// Reserved for AV1 video regions once hardware AV1 encode exists
-    /// (software libaom would need `disable-library-validation`). Only the
-    /// rig's alternate mock codec (0x7E) advertises it, to test codec
-    /// negotiation.
+    /// AV1 video regions (§4.6). The Host advertises it on Apple silicon
+    /// (software libaom, vendored); a Viewer advertises it only when its
+    /// user opts in and it can decode AV1. The rig's alternate mock codec
+    /// (0x7E) maps here too, to test codec negotiation.
     public static let videoAV1: UInt32 = 1 << 1
     // Bits 2 and 3 are unassigned.
     /// Cursor as metadata (§5): the viewer composites the pointer
@@ -43,7 +43,7 @@ public enum WireCaps {
     /// mock ids map onto the real bits (0x7F → HEVC bit, 0x7E → AV1 bit) so
     /// negotiation logic is testable without real codecs.
     public static func bit(forVideoCodec codec: UInt8) -> UInt32 {
-        codec == VideoCodec.reservedAV1 || codec == 0x7E ? videoAV1 : videoHEVC
+        codec == VideoCodec.av1 || codec == 0x7E ? videoAV1 : videoHEVC
     }
 }
 
@@ -54,17 +54,15 @@ public enum VideoCodec {
     public static let hevc: UInt8 = 1
     /// Reserved: 2 = H.264. Do not reuse.
     public static let reservedH264: UInt8 = 2
-    /// Reserved for AV1 once hardware AV1 encode exists (no Apple chip
-    /// through M6 has it, and software libaom would need
-    /// `disable-library-validation`). Its config record would be the ISO
-    /// `av1C` box.
-    public static let reservedAV1: UInt8 = 3
+    /// AV1, software-encoded with libaom on Apple silicon Hosts, for a
+    /// Viewer that opts in. The config record is the ISO `av1C` box.
+    public static let av1: UInt8 = 3
 
     /// Human-readable name for status lines and logs.
     public static func name(_ codec: UInt8) -> String {
         switch codec {
         case hevc: "HEVC"
-        case reservedAV1: "AV1"
+        case av1: "AV1"
         default: "codec 0x\(String(codec, radix: 16))"
         }
     }

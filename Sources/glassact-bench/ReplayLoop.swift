@@ -27,9 +27,10 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         let bufferMS = opts.int("link-buffer-ms", 2000)
         link.bottleneck = .init(bytesPerSecond: rate, bufferBytes: rate * bufferMS / 1000)
     }
-    // --video mock (deterministic rig codec) or vt (hardware HEVC) —
+    // --video mock (deterministic rig codec), vt (hardware HEVC) or av1
+    // (libaom, decoded with libaom here; the Viewer decodes in hardware) —
     // real codecs are nondeterministic in bytes but still byte-exact at settle.
-    let videoMode = opts.string("video") // nil | mock | vt
+    let videoMode = opts.string("video") // nil | mock | vt | av1
     var encoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
     var decoderFactory: (() -> any VideoRegionDecoder)?
     var hostCodecs: [UInt8] = []
@@ -44,12 +45,22 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         hostCodecs = [MockVideoEncoder.mockCodecID]
         viewerCodecs = [MockVideoEncoder.mockCodecID]
     case "vt":
-        encoderFactory = { $0 == VideoCodec.hevc ? BenchVTEncoder(pipeline: vtPipeline) : nil }
+        encoderFactory = {
+            $0 == VideoCodec.hevc ? BenchPipelinedEncoder(VTHEVCRegionEncoder(callbackQueue: .main), vtPipeline) : nil
+        }
         decoderFactory = { VTRegionDecoder() }
         hostCodecs = [VideoCodec.hevc]
         viewerCodecs = [VideoCodec.hevc]
+    case "av1":
+        guard AOMRegionEncoder.isAvailable else { throw BenchError("--video av1 needs Apple silicon (libaom is arm64 only)") }
+        encoderFactory = {
+            $0 == VideoCodec.av1 ? BenchPipelinedEncoder(AOMRegionEncoder(callbackQueue: .main), vtPipeline) : nil
+        }
+        decoderFactory = { AOMRegionDecoder() }
+        hostCodecs = [VideoCodec.av1]
+        viewerCodecs = [VideoCodec.av1]
     default:
-        throw BenchError("--video expects mock or vt")
+        throw BenchError("--video expects mock, vt or av1")
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -88,7 +99,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // onto the main queue (this rig's engine queue). Every submitted frame is
     // delivered before virtual time moves on (BenchVTPipeline).
     func drainVTOutput() {
-        if videoMode == "vt" { vtPipeline.drain() }
+        if videoMode == "vt" || videoMode == "av1" { vtPipeline.drain() }
     }
 
     // Video coverage: how much of the replay's screen-time the viewer
@@ -336,8 +347,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       cpu viewer: datagrams \(ms(timings.viewerDatagram))  video \(ms(timings.viewerVideo))  \
     control \(ms(timings.viewerControl))  tick \(ms(timings.viewerTick))
     """)
-    if videoMode == "vt" {
-        print("  vt: \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
+    if videoMode == "vt" || videoMode == "av1" {
+        print("  \(videoMode!): \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
               + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "
               + "stalls \(vtPipeline.stalls)")
     }
@@ -393,15 +404,17 @@ final class BenchVTPipeline {
     }
 }
 
-/// `VTHEVCRegionEncoder` on the main queue, counting submits against
-/// deliveries for `BenchVTPipeline.drain()`. VT delivers exactly once per
-/// submit (an empty frame for a failed encode) until `stop()`.
-final class BenchVTEncoder: VideoRegionEncoder {
-    private let inner = VTHEVCRegionEncoder(callbackQueue: .main)
+/// An asynchronous encoder (VideoToolbox HEVC, libaom AV1) delivering to
+/// the main queue, counting submits against deliveries for
+/// `BenchVTPipeline.drain()`. Both deliver exactly once per submit (an empty
+/// frame for a failed encode) until `stop()`.
+final class BenchPipelinedEncoder: VideoRegionEncoder {
+    private let inner: any VideoRegionEncoder
     private let pipeline: BenchVTPipeline
     private var pending = 0
 
-    init(pipeline: BenchVTPipeline) {
+    init(_ inner: any VideoRegionEncoder, _ pipeline: BenchVTPipeline) {
+        self.inner = inner
         self.pipeline = pipeline
     }
 

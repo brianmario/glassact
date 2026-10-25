@@ -176,6 +176,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
+| Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | text much sharper (typing-cc @3M: 48.1 vs 41.3 dB, SSIMULACRA2 81.0 vs 76.0) for 2–3× HEVC's bytes, which undershoots far below its cap on text; scroll +3.8 dB at equal bytes; photos even; encode 2–8 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
@@ -238,6 +239,75 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### AV1 back, as a Viewer opt-in (2026-10-25)
+
+Software AV1 returns as a choice the Viewer makes. The Host gets a
+statically linked, vendored libaom (main at 9ace39e, arm64 only;
+`AOMRegionEncoder`); hardware HEVC stays the default. The encoder is
+libaom realtime speed 10 with screen tools, CBR with a one-second rate
+buffer, no frame drops, and key frames on demand. Rate control follows
+the HEVC encoder's: the same base bitrate, quality ladder and link cap,
+with the frame-QP ceiling mapped to libaom's quantizer scale (34 → 42,
+28 → 35).
+
+**Full loop, standard faults, golden** (`replay --mode loop --drop 5
+--dup 1 --reorder 10 --latency 20-80 --golden --video vt|av1`, 5K, M4
+Pro; AV1 decoded with libaom in the rig): every trace settled
+byte-identical with both.
+
+| trace | HEVC video | AV1 video | total HEVC → AV1 |
+|---|---|---|---|
+| typing-cc | 428 KB | 512 KB | 8.85 → 8.98 MB |
+| cursor-drag | 4.19 MB | 8.89 MB | 15.76 → 22.76 MB |
+| scroll-win | 12.18 MB | 13.61 MB | 17.61 → 19.06 MB |
+| photos | 27.37 MB | 32.96 MB | 37.34 → 43.43 MB |
+
+The loop has no link cap, so both run at the 5K base (20 Mbit/s): CBR
+AV1 spends more of it than VideoToolbox's average-bitrate HEVC, which
+undershoots on easy content. The loop says nothing about quality, so:
+
+**Quality at a cap** (`vquality --codec hevc|av1 --mbit n --width 2880`,
+300 frames, Client Resolution canvas; achieved rate · PSNR · SSIMULACRA2
+mean):
+
+| trace | cap | HEVC | AV1 |
+|---|---|---|---|
+| typing-cc | 1M | 0.17 · 38.2 · 63.8 | 0.62 · 47.5 · 80.2 |
+| typing-cc | 3M | 0.21 · 41.3 · 76.0 | 0.40 · 48.1 · 81.0 |
+| typing-cc | 8M | 0.24 · 43.8 · 79.9 | 0.42 · 48.6 · 81.5 |
+| cursor-drag | 1M | 0.39 · 38.6 · 64.3 | 1.09 · 46.3 · 78.7 |
+| cursor-drag | 3M | 0.47 · 41.7 · 75.9 | 1.42 · 48.8 · 81.0 |
+| cursor-drag | 8M | 0.51 · 43.2 · 78.5 | 1.37 · 49.3 · 81.7 |
+| scroll-win | 1M | 0.95 · 35.7 · 58.6 | 1.24 · 40.8 · 70.9 |
+| scroll-win | 3M | 2.41 · 40.6 · 74.1 | 2.45 · 44.4 · 76.2 |
+| scroll-win | 8M | 3.28 · 42.8 · 77.4 | 5.35 · 49.0 · 79.7 |
+| photos | 1M | 2.86 · 31.7 · 40.7 | 4.05 · 33.2 · 47.7 |
+| photos | 3M | 3.84 · 33.3 · 51.6 | 4.40 · 33.6 · 49.9 |
+| photos | 8M | 8.27 · 36.8 · 66.3 | 7.90 · 36.4 · 62.9 |
+
+(At 1M on photos both overshoot: their quality floors bind, and the send
+gate takes the difference out of frame rate.) Encode latency per frame:
+HEVC 12.5–14.6 ms p50, AV1 2.0–7.9 ms.
+
+- **Text:** AV1 is far sharper, 5–9 dB PSNR, for 2–3× HEVC's bytes. HEVC
+  sits far under any cap on text, so its bytes are hard to beat.
+- **Scrolling:** at equal bytes (3M: 2.45 vs 2.41 Mbit/s), AV1 is
+  +3.8 dB and +2.1 SSIMULACRA2.
+- **Photos:** even.
+- **Latency:** AV1's software encode returns 5–10 ms sooner than the
+  media engine.
+- **Key frames:** capped at WebRTC's 3× an average frame, a region's
+  first frame came out unreadably soft (worst-frame SSIMULACRA2 30 on
+  typing-cc and cursor-drag at 3M). At 15× (1500 %, a quarter second at
+  60 fps) the worst frame is 56, means 81.7 and 81.7, bytes 0.43 and
+  1.31 Mbit/s. The largest key frame is 260 KB at 3 Mbit/s, inside the
+  one-second limit HEVC's encoder runs under. Kept at 15×.
+
+So AV1 is a sharpness choice, not a bandwidth saving, with lower encode
+latency. That's why it's the Viewer's opt-in, with HEVC the default.
+Host CPU: libaom runs 8 threads at most, out of the tile path's way; the
+earlier realtime-speed table above puts 5K at ~60 fps on this machine.
 
 ### AV2 on screen text: AVM research-v15.0.0 (2026-10-25)
 

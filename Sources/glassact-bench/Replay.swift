@@ -21,7 +21,7 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
-        .choice("video", ["mock", "vt"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
+        .choice("video", ["mock", "vt", "av1"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
         .bool("timeline", "loop: print engine state once per virtual second (video coverage, handoffs, tiles, repaint debt)"),
