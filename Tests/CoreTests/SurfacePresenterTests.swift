@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import IOSurface
 import Testing
@@ -41,6 +42,19 @@ import GlassActTestSupport
         // Idle: nothing new, nothing to flip (after both surfaces caught up).
         _ = presenter.blit(from: h.viewer)
         #expect(presenter.blit(from: h.viewer) == nil)
+    }
+
+    /// Both surfaces say they're sRGB, so Core Animation colour-matches
+    /// them to the screen instead of showing sRGB values as P3.
+    @Test func surfacesAreTaggedSRGB() throws {
+        let presenter = SurfacePresenter(grid: TileGrid(width: 128, height: 64))
+        let h = Harness(width: 128, height: 64)
+        h.encodeFrame()
+        #expect(h.settle())
+        let frame = try #require(presenter.blit(from: h.viewer))
+        let tag = try #require(IOSurfaceCopyValue(frame.surface, kIOSurfaceColorSpace))
+        let space = try #require(CGColorSpace(propertyListPlist: tag))
+        #expect(space.name == CGColorSpace.sRGB)
     }
 
     @Test func mismatchedGridPresentsNothing() {
