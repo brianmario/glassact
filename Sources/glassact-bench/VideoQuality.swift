@@ -12,9 +12,12 @@ import GlassActWire
 
 let videoQualityCommand = Command(
     name: "vquality",
-    summary: "video-layer quality at a bitrate: VT HEVC encode → decode → SSIM/PSNR vs source",
+    summary: "video-layer quality at a bitrate: HEVC (VT) or AV1 (libaom) encode → decode → SSIM/PSNR vs source",
     flags: [
         .trace,
+        .choice("codec", ["hevc", "av1"], "video codec: hardware HEVC (default) or software AV1, as the Host runs them"),
+        .int("av1-speed", "<n>", 0...12, "experiment: libaom realtime speed (default 9, as in the product)"),
+        .bool("av1-vbr", "experiment: libaom VBR instead of CBR"),
         .int("mbit", "<n>", 1...200, "target average bitrate in Mbit/s (default 3)"),
         .int("kbit", "<n>", 50...200_000, "target average bitrate in kbit/s (overrides --mbit; thin links)"),
         .int("submit-fps", "<n>", 1...60, "submit at most this many frames per second of trace time — what newest-wins pacing does on a thin link (default: every trace frame)"),
@@ -69,12 +72,26 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
     defer { worstRef.deallocate(); worstShown.deallocate() }
 
     let queue = DispatchQueue(label: "vquality.encoder")
-    let encoder = VTHEVCRegionEncoder(callbackQueue: queue, lowLatency: lowLatency)
-    if opts.has("max-qp") { encoder.maxFrameQP = opts.int("max-qp", 30) }
-    if opts.has("cqf") { encoder.constantQualityFactor = Float(opts.int("cqf", 50)) / 100 }
-    encoder.capWithVBV = opts.has("cqf-vbv")
-    encoder.realTime = !opts.has("no-realtime")
-    encoder.chroma444 = opts.has("chroma444")
+    let av1 = opts.string("codec") == "av1"
+    let codec = av1 ? VideoCodec.av1 : VideoCodec.hevc
+    if av1 && !AOMRegionEncoder.isAvailable { throw BenchError("--codec av1 needs Apple silicon (libaom is arm64 only)") }
+    if av1, let knob = ["low-latency", "cqf", "cqf-vbv", "no-realtime", "chroma444"].first(where: opts.has) {
+        throw BenchError("--\(knob) is a VideoToolbox knob; it doesn't apply to --codec av1")
+    }
+    let hevc = av1 ? nil : VTHEVCRegionEncoder(callbackQueue: queue, lowLatency: lowLatency)
+    let encoder: any VideoRegionEncoder = hevc ?? {
+        let aom = AOMRegionEncoder(callbackQueue: queue)
+        aom.speed = opts.int("av1-speed", 9)
+        aom.vbr = opts.has("av1-vbr")
+        return aom
+    }()
+    if let hevc {
+        if opts.has("max-qp") { hevc.maxFrameQP = opts.int("max-qp", 30) }
+        if opts.has("cqf") { hevc.constantQualityFactor = Float(opts.int("cqf", 50)) / 100 }
+        hevc.capWithVBV = opts.has("cqf-vbv")
+        hevc.realTime = !opts.has("no-realtime")
+        hevc.chroma444 = opts.has("chroma444")
+    }
     let submitW = encW, submitH = encH, outW = encW, outH = encH
     let delivered = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var lastData: [UInt8] = []
@@ -85,20 +102,24 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
         lastSync = sync
         if let cfg { config = cfg }
         delivered.signal()
-    }) else { throw BenchError("VideoToolbox HEVC encoder failed to start at \(encW)×\(encH)") }
+    }) else { throw BenchError("\(VideoCodec.name(codec)) encoder failed to start at \(encW)×\(encH)") }
     defer { encoder.stop() }
     encoder.setBitrateCap(bitrate)
-    let decoder = VTRegionDecoder()
+    if av1, opts.has("max-qp") { encoder.setMaxFrameQP(opts.int("max-qp", 34)) }
+    let decoder: any VideoRegionDecoder = av1 ? AOMRegionDecoder() : VTRegionDecoder()
     var decoderStarted = false
 
     print("vquality: \(traceName)")
     print("  canvas \(canvasW)×\(canvasH), encode \(encW)×\(encH) (\(pct)%), target \(bitrate / 1_000) kbit/s, "
           + "submit \(submitIntervalUS.map { "≤ \(1_000_000 / $0) fps" } ?? "every frame"), "
-          + "low-latency \(lowLatency ? (encoder.lowLatencyActive ? "on" : "REFUSED (normal session)") : "off")"
-          + ", max-qp \(encoder.maxFrameQP.map(String.init) ?? "none") \(encoder.maxFrameQPAccepted ? "accepted" : "REFUSED")"
-          + (opts.has("cqf") ? ", cqf \(opts.int("cqf", 0)) \(encoder.constantQualityAccepted ? "accepted" : "REFUSED")"
-             + (encoder.capWithVBV ? " (VBV cap)" : "") : "")
-          + (opts.has("chroma444") ? ", chroma 4:4:4 \(encoder.chroma444Accepted ? "accepted" : "REFUSED")" : "")
+          + "codec \(VideoCodec.name(codec))"
+          + (hevc.map { hevc in
+              ", low-latency \(lowLatency ? (hevc.lowLatencyActive ? "on" : "REFUSED (normal session)") : "off")"
+              + ", max-qp \(hevc.maxFrameQP.map(String.init) ?? "none") \(hevc.maxFrameQPAccepted ? "accepted" : "REFUSED")"
+              + (opts.has("cqf") ? ", cqf \(opts.int("cqf", 0)) \(hevc.constantQualityAccepted ? "accepted" : "REFUSED")"
+                 + (hevc.capWithVBV ? " (VBV cap)" : "") : "")
+              + (opts.has("chroma444") ? ", chroma 4:4:4 \(hevc.chroma444Accepted ? "accepted" : "REFUSED")" : "")
+          } ?? ", max-qp \(opts.int("max-qp", VTHEVCRegionEncoder.defaultMaxFrameQP)) (HEVC scale)")
           + (ssimu2.map { ", SSIMULACRA2 every \(ssimu2Every)th frame (\($0.binary.path))" } ?? ""))
 
     var rects: [DirtyRect] = []
@@ -120,7 +141,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
         guard !data.isEmpty else { return nil } // dropped by the encoder: no frame to score
         if !decoderStarted {
             guard let cfg = queue.sync(execute: { config }),
-                  decoder.start(codec: VideoCodec.hevc, config: cfg, width: outW, height: outH) else {
+                  decoder.start(codec: codec, config: cfg, width: outW, height: outH) else {
                 throw BenchError("decoder failed to start")
             }
             decoderStarted = true

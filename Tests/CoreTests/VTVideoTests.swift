@@ -10,7 +10,7 @@ import GlassActTestSupport
 /// sync flags, dimensions) plus a PSNR floor, never byte equality — byte
 /// exactness is the dissolve repaint's job.
 @Suite struct VTVideoTests {
-    private func makeFrames(width: Int, height: Int, count: Int) -> [[UInt8]] {
+    static func makeFrames(width: Int, height: Int, count: Int) -> [[UInt8]] {
         var rng = SplitMix64(seed: 71)
         var frames: [[UInt8]] = []
         var frame = [UInt8](repeating: 0, count: width * height * 4)
@@ -44,7 +44,7 @@ import GlassActTestSupport
     /// noise is information-theoretically unreproducible at any sane bitrate
     /// and would dominate the metric — the quality bar belongs on the
     /// predictable content.
-    private func psnr(_ a: [UInt8], _ b: [UInt8], width: Int) -> Double {
+    static func psnr(_ a: [UInt8], _ b: [UInt8], width: Int) -> Double {
         precondition(a.count == b.count)
         var sumSq = 0.0
         var n = 0
@@ -89,7 +89,7 @@ import GlassActTestSupport
         #expect(ok, "VT HEVC session must start on Apple Silicon")
         guard ok else { return }
 
-        let frames = makeFrames(width: width, height: height, count: frameCount)
+        let frames = Self.makeFrames(width: width, height: height, count: frameCount)
         for (i, frame) in frames.enumerated() {
             frame.withUnsafeBytes { encoder.encode(bgra: $0, forceSync: i == 0, timeUS: UInt64(i) * 16_667) }
         }
@@ -116,7 +116,7 @@ import GlassActTestSupport
         for (i, d) in out.enumerated() {
             decoder.decode(d.data, sync: d.sync) { pixels, bytesPerRow in
                 decodedCount += 1
-                lastPSNR = psnr(frames[i], tightPixels(pixels, bytesPerRow: bytesPerRow,
+                lastPSNR = Self.psnr(frames[i], tightPixels(pixels, bytesPerRow: bytesPerRow,
                                                        width: width, height: height), width: width)
             }
         }

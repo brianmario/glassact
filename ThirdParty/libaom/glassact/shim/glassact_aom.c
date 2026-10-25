@@ -21,6 +21,12 @@ struct glassact_aom_enc {
 };
 
 glassact_aom_enc *glassact_aom_enc_create(int width, int height, int threads, int bitrate_kbps) {
+    glassact_aom_enc_options options = { .speed = 9, .vbr = 0 };
+    return glassact_aom_enc_create_with(width, height, threads, bitrate_kbps, &options);
+}
+
+glassact_aom_enc *glassact_aom_enc_create_with(int width, int height, int threads, int bitrate_kbps,
+                                               const glassact_aom_enc_options *options) {
     if (width < 16 || height < 16 || (width & 1) || (height & 1)) return NULL;
     glassact_aom_enc *enc = calloc(1, sizeof(*enc));
     if (!enc) return NULL;
@@ -36,21 +42,36 @@ glassact_aom_enc *glassact_aom_enc_create(int width, int height, int threads, in
     cfg->g_threads = (unsigned int)threads;
     cfg->g_lag_in_frames = 0;
     cfg->g_pass = AOM_RC_ONE_PASS;
-    cfg->rc_end_usage = AOM_CBR;
+    cfg->rc_end_usage = options->vbr ? AOM_VBR : AOM_CBR;
     cfg->rc_target_bitrate = (unsigned int)bitrate_kbps;
+    // A short rate buffer, as for a video call (WebRTC's libaom settings):
+    // a one-second budget, so a detailed frame can't spend seconds of link
+    // time. Never drop frames: the engine's send gate decides which frames
+    // go, and every submit must produce one frame.
+    cfg->rc_buf_sz = 1000;
+    cfg->rc_buf_initial_sz = 600;
+    cfg->rc_buf_optimal_sz = 600;
+    cfg->rc_undershoot_pct = 50;
+    cfg->rc_overshoot_pct = 50;
+    cfg->rc_dropframe_thresh = 0;
     cfg->kf_mode = AOM_KF_DISABLED; // key frames only on request
     if (aom_codec_enc_init(&enc->ctx, aom_codec_av1_cx(), cfg, 0) != AOM_CODEC_OK) {
         free(enc);
         return NULL;
     }
     enc->initialized = 1;
-    // The speed the old engine shipped and BENCHMARKS measured (realtime
-    // speed 10), screen tools, and as many tile columns as the width allows
+    // Realtime speed 9: 2–3 SSIMULACRA2 points over 10 at the same encode
+    // time; slower gains nothing (BENCHMARKS "AV1 back, as a Viewer
+    // opt-in"). Screen tools, and as many tile columns as the width allows
     // up to 8, for row-MT.
-    aom_codec_control(&enc->ctx, AOME_SET_CPUUSED, 10);
+    aom_codec_control(&enc->ctx, AOME_SET_CPUUSED, options->speed);
     aom_codec_control(&enc->ctx, AV1E_SET_TUNE_CONTENT, AOM_CONTENT_SCREEN);
     aom_codec_control(&enc->ctx, AV1E_SET_ROW_MT, 1);
     aom_codec_control(&enc->ctx, AV1E_SET_TILE_COLUMNS, width >= 2048 ? 3 : width >= 1024 ? 2 : 1);
+    // Key frames may take 15 average frames (a quarter second at 60 fps):
+    // WebRTC's 3× left a region's first frame unreadably soft
+    // (SSIMULACRA2 30 → 56, BENCHMARKS "AV1 back, as a Viewer opt-in").
+    aom_codec_control(&enc->ctx, AOME_SET_MAX_INTRA_BITRATE_PCT, 1500);
     return enc;
 }
 
@@ -174,6 +195,11 @@ void glassact_aom_dec_destroy(glassact_aom_dec *dec) {
 int glassact_aom_available(void) { return 0; }
 glassact_aom_enc *glassact_aom_enc_create(int width, int height, int threads, int bitrate_kbps) {
     (void)width; (void)height; (void)threads; (void)bitrate_kbps;
+    return NULL;
+}
+glassact_aom_enc *glassact_aom_enc_create_with(int width, int height, int threads, int bitrate_kbps,
+                                               const glassact_aom_enc_options *options) {
+    (void)width; (void)height; (void)threads; (void)bitrate_kbps; (void)options;
     return NULL;
 }
 int glassact_aom_enc_set_bitrate(glassact_aom_enc *enc, int bitrate_kbps) { (void)enc; (void)bitrate_kbps; return -1; }

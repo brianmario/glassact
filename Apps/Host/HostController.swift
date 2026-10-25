@@ -2312,14 +2312,21 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private func makeEngine(on transport: QUICTransport, width: Int, height: Int,
                             startFrameSeq: UInt32) -> HostEngine {
         let encodeQueue = self.encodeQueue
-        // Video (§4.6): pinned full-screen hardware HEVC.
+        // Video (§4.6): pinned full-screen hardware HEVC, or software AV1
+        // when the Viewer opted in (it advertises AV1 only then). AV1 comes
+        // first, so a Viewer that asks for it gets it; on Intel libaom isn't
+        // compiled in and only HEVC is offered.
         let video = Self.videoEnabled
         let engine = HostEngine(
             width: width, height: height, transport: transport,
             videoEncoderFactory: video ? { codec in
-                codec == VideoCodec.hevc ? VTHEVCRegionEncoder(callbackQueue: encodeQueue) : nil
+                switch codec {
+                case VideoCodec.hevc: VTHEVCRegionEncoder(callbackQueue: encodeQueue)
+                case VideoCodec.av1: AOMRegionEncoder(callbackQueue: encodeQueue)
+                default: nil
+                }
             } : nil,
-            videoCodecPreference: [VideoCodec.hevc],
+            videoCodecPreference: AOMRegionEncoder.isAvailable ? [VideoCodec.av1, VideoCodec.hevc] : [VideoCodec.hevc],
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
         // Always advertise single-window support (Screen Recording is a

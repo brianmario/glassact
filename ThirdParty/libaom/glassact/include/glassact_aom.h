@@ -33,6 +33,15 @@ typedef struct glassact_aom_enc glassact_aom_enc;
 // failure.
 glassact_aom_enc *glassact_aom_enc_create(int width, int height, int threads, int bitrate_kbps);
 
+// Experiments (the bench): realtime speed 0–12 (the product: 9), and VBR
+// instead of CBR.
+typedef struct {
+    int speed;
+    int vbr;
+} glassact_aom_enc_options;
+glassact_aom_enc *glassact_aom_enc_create_with(int width, int height, int threads, int bitrate_kbps,
+                                               const glassact_aom_enc_options *options);
+
 // Runtime rate control: the CBR target, and the coarsest quantizer the
 // encoder may use (0–63, libaom's scale).
 int glassact_aom_enc_set_bitrate(glassact_aom_enc *enc, int bitrate_kbps);
