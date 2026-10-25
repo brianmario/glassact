@@ -60,6 +60,10 @@ let package = Package(
             cSettings: [
                 .headerSearchPath("."),
                 .headerSearchPath("glassact"),
+                // Optimized in debug builds too: unoptimized, libaom is
+                // several times slower, and its tests then compete with the
+                // timing-sensitive QUIC tests for the CI machine.
+                .unsafeFlags(["-O2"], .when(configuration: .debug)),
             ]
         ),
         // Hot-path codec: xxh64, RAW/LZ4/LZBITMAP/WEBPL tile codecs, arenas.
