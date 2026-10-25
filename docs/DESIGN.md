@@ -150,6 +150,9 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 - `GlassActWire` (bytes) → `GlassActCodec` (tile codecs, hash) →
   `GlassActCore` (engines) → `GlassActTransport` (QUIC, identity) →
   `GlassActSession` (viewer session, agents).
+- `GlassActShare` (on `GlassActCore`) is the sharing side: capture and its
+  recovery so far (§4.1). The rest of what the Host app does to share
+  (geometry, input, session lifecycle) moves there in steps (#42).
 - The apps are thin shells over these modules.
 
 ---
@@ -406,6 +409,26 @@ A viewer the host hasn't approved can sign in with the host Mac's account
 - Frames with no content (`.idle`, `.complete`) are skipped. `dirtyRects` are
   treated as hints.
 - **`bytesPerRow` is padded, so every tile address is stride-aware.**
+
+**Lifecycle and recovery** (`GlassActShare.ScreenCapture`, over a
+`CaptureBackend`: ScreenCaptureKit in the Host, a scripted fake in
+`ShareTests`):
+- Every start, restart, recovery and stop bumps a generation. A task that
+  finds it moved on stops its own stream, so overlapping restarts never
+  leave one capturing untracked. A restart stops the old stream before the
+  new one starts.
+- The system stopping a stream (display sleep or disconnect, the lock
+  screen) keeps the share: capture is rebuilt from fresh content at the same
+  settings, and the session carries on as if frames had paused. So does a
+  stream that stalled without telling its delegate (macOS 27's
+  `isCapturing`, two 1 Hz checks in a row).
+- Retries back off (immediately, then 1 s, 2 s, … 5 s). With no display at
+  all, after 6 attempts capture waits for one: the screens waking, a display
+  change or a viewer connecting retries at once, and a 60 s poll is the
+  safety net.
+- Recovery ends on the menu-bar screen-recording control (the Host stops
+  sharing), a revoked Screen Recording grant, or the shared window closing
+  (§4.10: the session ends rather than show the whole display).
 
 ### 4.2 Tile bookkeeping (`TileLedger`)
 
@@ -997,10 +1020,11 @@ Sources/
   GlassActTransport/       transport protocol, QUICTransport, InProcTransport, identity,
                            known hosts, authorized viewers, AppPaths, crash reports
   GlassActSession/         ViewerSession, AgentDriver, HeadlessAgent, agent socket, MCP
+  GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
   glassact-trace/          .scap inspection and diff
-Tests/                     WireTests CodecTests CoreTests TransportTests SessionTests
+Tests/                     WireTests CodecTests CoreTests TransportTests SessionTests ShareTests
                            (+ GlassActTestSupport)
 ThirdParty/libwebp/        vendored, BSD-3 (VP8L encode/decode)
 Apps/GlassActApps.xcodeproj
