@@ -345,6 +345,18 @@ AV1 3.07 · 46.1 · 78.7 vs HEVC 3.67 · 43.5 · 78.2.
   dragging it is sharper for ~2.4× HEVC's bytes.
 - VBR overshoots on single frames when a window is dragged, the burst
   queues, and the gate drops frames (258 of 434). It stays CBR.
+- **VBR, second try** (asked in review). The loop now prints the gate's
+  skips: on cursor-drag, VBR at 40 % sends 247 frames with **219 backlog
+  skips** (CBR: 452 frames, 13 skips), none encoder-full, though VBR sends
+  only 3.1 MB to CBR's 10 MB. The token bucket refills at the measured
+  video rate, which settles at VBR's low average, so a drag's bursts find it
+  empty. libaom's frame-size clamps can't help: `AV1E_SET_MAX_INTER_BITRATE_PCT`
+  (150–300 %), `AOME_SET_MAX_INTRA_BITRATE_PCT` (300 %) and
+  `rc_overshoot_pct` (10 %) left the VBR output byte-identical, since
+  realtime libaom applies them only in CBR. On scroll-win VBR sent every
+  frame (482) with 3.9–4.2 MB to CBR's 9.6 MB, so it would pay off if the
+  gate tolerated its bursts; that's a gate change (it gates HEVC too), left
+  for later.
 - 40 % holds the frame rate as well as 60 % with more room, so the Host
   aims at 40 % of both the base bitrate and the link cap
   (`AOMRegionEncoder.targetPercent`). `vquality` and the loop default to it

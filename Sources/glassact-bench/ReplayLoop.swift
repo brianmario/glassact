@@ -314,7 +314,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       video: regions formed \(host.stats.videoRegionsFormed) dissolved \(host.stats.videoRegionsDissolved)  \
     frames \(host.stats.videoFramesSent)  video bytes \(formatBytes(host.stats.videoBytesSent))  \
     viewer applied \(viewer.stats.videoFramesApplied)  undecodable \(viewer.stats.videoDecodeFailures)  \
-    sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))
+    sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))  \
+    gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)
       video coverage: \(String(format: "%.1f", coverageSamples == 0 ? 0 : 100 * Double(coverageVideoTiles) / Double(coverageSamples * TileGrid(width: width, height: height).count)))% of screen-time on video  \
     handoffs: reveal \(host.stats.overlayHandoffReveals)  record \(host.stats.overlayHandoffRecords)  \
     re-sharpens \(host.stats.videoRefreshes)
