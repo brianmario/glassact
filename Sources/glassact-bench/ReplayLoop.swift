@@ -54,7 +54,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     case "av1":
         guard AOMRegionEncoder.isAvailable else { throw BenchError("--video av1 needs Apple silicon (libaom is arm64 only)") }
         encoderFactory = {
-            $0 == VideoCodec.av1 ? BenchPipelinedEncoder(AOMRegionEncoder(callbackQueue: .main), vtPipeline) : nil
+            guard $0 == VideoCodec.av1 else { return nil }
+            let aom = AOMRegionEncoder(callbackQueue: .main)
+            aom.vbr = opts.has("av1-vbr")
+            aom.targetPercent = opts.int("av1-target-pct", 40)
+            return BenchPipelinedEncoder(aom, vtPipeline)
         }
         // The Viewer's path, hardware decode, where this Mac has it.
         decoderFactory = { VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }

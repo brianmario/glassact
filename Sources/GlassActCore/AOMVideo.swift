@@ -50,6 +50,12 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     /// (the product: 9), and VBR instead of CBR.
     public var speed = 9
     public var vbr = false
+    /// The share of the target and the link cap CBR aims at. At 100 % it
+    /// spent the link exactly, so any burst queued and the send gate dropped
+    /// frames (live: 6–21 fps on a ~10 Mbit/s link; HEVC undershoots on its
+    /// own). At 40 % it delivers more frames than HEVC on a 10 Mbit/s link
+    /// (BENCHMARKS "AV1 back, as a Viewer opt-in"). A bench knob too.
+    public var targetPercent = 40
 
     /// libaom worker threads: most of the machine, leaving room for the tile
     /// path and capture. Measured at 8 (BENCHMARKS "AV2 on screen text").
@@ -70,7 +76,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         // The same budget as HEVC: at equal bytes AV1's screen tools buy
         // sharper text, not more bandwidth.
         baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
-        appliedBitrate = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap)
+        appliedBitrate = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap) * targetPercent / 100
         var options = glassact_aom_enc_options(speed: Int32(speed), vbr: vbr ? 1 : 0)
         guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
                                                      Int32(appliedBitrate / 1000), &options) else { return false }
@@ -171,7 +177,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     private func applyBitrate() {
         guard let handle else { return }
-        let target = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap)
+        let target = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap) * targetPercent / 100
         // As for HEVC: skip moves under 5 %, each one resets rate control.
         guard abs(target - appliedBitrate) * 20 > appliedBitrate else { return }
         appliedBitrate = target

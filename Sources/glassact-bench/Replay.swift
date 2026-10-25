@@ -5,7 +5,7 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden",
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct",
                              "link-mbit", "link-buffer-ms"]
 
 let replayCommand = Command(
@@ -23,6 +23,8 @@ let replayCommand = Command(
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
         .choice("video", ["mock", "vt", "av1"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
+        .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
+        .int("av1-target-pct", "<n>", 10...100, "loop experiment, --video av1: aim at n % of the target and the link cap (default 40, as in the product)"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
         .bool("timeline", "loop: print engine state once per virtual second (video coverage, handoffs, tiles, repaint debt)"),
         .int("handoff-ms", "<n>", 50...60_000, "loop experiment: how long a region tile must be still before it goes back to exact (default 1000)"),

@@ -573,8 +573,9 @@ first negotiated codec whose encoder starts; START carries its id.
 
 **AV1 encoder** (`AOMRegionEncoder`, vendored libaom): realtime speed 9
 with screen tools, CBR with a one-second rate buffer, no dropped frames, key
-frames on demand (up to 15 average frames each), at most 8 threads. It takes
-the same base bitrate, quality ladder and link cap as HEVC, and the
+frames on demand (up to 15 average frames each), at most 8 threads. It aims at
+40 % of the same base bitrate and link cap as HEVC (at 100 % CBR spent the link
+exactly and bursts made the send gate drop frames), the same quality ladder, and the
 frame-QP ceiling mapped to libaom's quantizer scale (34 → 42). BGRA → I420
 on the engine's queue, the encode on its own queue; one delivery per submit.
 It's a sharpness and latency choice, not a bandwidth saving: at equal bytes

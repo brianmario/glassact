@@ -176,7 +176,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
-| Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling (26 % fewer bytes) and reaches sharper text at higher rates; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
+| Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
@@ -318,6 +318,37 @@ each trace capped near HEVC's achieved rate:
 The first quick look (`aomenc` cq 30 against VideoToolbox at a fixed q75,
 "AV2 on screen text" above) overstated AV1: fixed-q75 HEVC is far less
 frugal than the product's average-bitrate HEVC.
+
+**Headroom: aim at 40 % of the link** (after the first live test,
+2026-10-25). Live on a ~10 Mbit/s, 70 ms link, AV1 felt less smooth than
+HEVC. The Host's log showed why: CBR spent the link cap exactly (video
+8.5 Mbit/s against an 8.6 Mbit/s measured link), so every burst queued and
+the send gate skipped frames (`vskips` 17–73 per 2 s, 6–21 fps); HEVC
+undershoots on its own and keeps headroom. Encode CPU wasn't the limit
+(engine encode 7–18 %, libaom 2–8 ms a frame).
+
+`replay --mode loop --link-mbit 10 --link-buffer-ms 500 --latency 30-40
+--video vt|av1 [--av1-target-pct n] [--av1-vbr]`, 5K:
+
+| trace | HEVC | AV1 at 100 % | AV1 at 60 % | AV1 at 40 % | AV1 VBR | AV1 VBR at 60 % |
+|---|---|---|---|---|---|---|
+| cursor-drag frames · video · queue p95 | 434 · 4.14 MB · 234 ms | 360 · 11.18 MB · 431 ms | 448 · 11.74 MB · 305 ms | **452** · 9.96 MB · 305 ms | 258 · 4.84 MB · 298 ms | 256 · 3.19 MB · 298 ms |
+| scroll-win frames · video · queue p95 | 444 · 9.75 MB · 195 ms | 374 · 12.37 MB · 289 ms | 455 · 10.71 MB · 225 ms | **479** · 9.64 MB · 209 ms | 482 · 7.14 MB · 209 ms | 482 · 5.25 MB · 199 ms |
+
+Quality at 40 % of a 10 Mbit/s cap (`vquality --mbit 4` at the time's
+100 %, against HEVC at `--mbit 10`; achieved · PSNR · SSIMULACRA2):
+cursor-drag AV1 1.32 · 49.0 · 82.2 vs HEVC 0.55 · 43.9 · 79.3; scroll-win
+AV1 3.07 · 46.1 · 78.7 vs HEVC 3.67 · 43.5 · 78.2.
+
+- With headroom AV1 delivers more frames than HEVC on both traces. On
+  scrolling it also uses 16 % less bandwidth at slightly better quality; on
+  dragging it is sharper for ~2.4× HEVC's bytes.
+- VBR overshoots on single frames when a window is dragged, the burst
+  queues, and the gate drops frames (258 of 434). It stays CBR.
+- 40 % holds the frame rate as well as 60 % with more room, so the Host
+  aims at 40 % of both the base bitrate and the link cap
+  (`AOMRegionEncoder.targetPercent`). `vquality` and the loop default to it
+  too; the tables above it ran at 100 %.
 
 **Key frames:** capped at WebRTC's 3× an average frame, a region's first
 frame came out unreadably soft (worst-frame SSIMULACRA2 30 on typing-cc and
