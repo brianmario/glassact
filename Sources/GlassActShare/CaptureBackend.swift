@@ -1,4 +1,5 @@
 public import CoreGraphics
+public import Foundation
 
 /// What `ScreenCapture` drives (§4.1): finding content to capture, and
 /// streams of it. `ScreenCaptureKitBackend` is the real one; tests use a
@@ -66,6 +67,15 @@ public enum CaptureError: Error, Equatable {
     case noDisplay
     /// The shared window was closed, or its app quit.
     case windowClosed
+}
+
+extension CaptureError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .noDisplay: "no display available"
+        case .windowClosed: "the shared window is gone"
+        }
+    }
 }
 
 /// Why the system stopped a stream.

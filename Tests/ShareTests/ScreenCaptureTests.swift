@@ -91,7 +91,8 @@ import GlassActShare
         #expect(rig.capture.awaitingDisplay)
         #expect(rig.status.filter { $0.hasPrefix("capture paused") }.count == 1)
         // Failed attempts are logged on the first and every 12th, not each.
-        #expect(rig.status.filter { $0.hasPrefix("capture recovery attempt") }.count == 1)
+        #expect(rig.status.filter { $0.hasPrefix("capture recovery attempt") }
+                == ["capture recovery attempt 1 failed: no display available — retrying"])
 
         // The screens wake: recovery tries at once, not at the next poll.
         rig.backend.content = { _ in CaptureContent(filter: "display 2", displayID: 2) }
