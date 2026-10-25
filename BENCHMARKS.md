@@ -176,7 +176,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
-| AV2 (AVM reference encoder) for video | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -321,6 +321,47 @@ Apple software HEVC used `hevc_videotoolbox` at q75, the latter with
   3.6–4× smaller than the hardware HEVC there, at 7–9 dB higher PSNR.
   That was the case for AV1 before it was retired on 2026-10-10 (the
   library-validation exemption, and software decode on M1/M2 Viewers).
+
+**Software AV1 decode keeps up.** dav1d 1.5.4, one frame at a time
+(`--framedelay 1`, as a live session decodes), on the libaom realtime
+streams above plus Photos.app browsing (photos, the heaviest content).
+Bitrates are the encoder's at cq 30, uncapped.
+
+| stream | Mbit/s at 60 fps | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| typing-cc 2900×1572 | 6.4 | 415 fps | 741 | 1185 | 1175 |
+| typing-cc 5K | 9.5 | 167 | 281 | 427 | 483 |
+| scroll-win 2900×1572 | 7.2 | 328 | 619 | 986 | 904 |
+| scroll-win 5K | 8.0 | 176 | 296 | 465 | 474 |
+| photos 2900×1572 | 26.4 | 101 | 196 | 372 | 567 |
+| photos 5K | 38.3 | 82 | 155 | 273 | 374 |
+
+The worst case, 5K photos at 4 threads, uses about a fifth of four M4 Pro
+cores at 60 fps. An AV1 Viewer wouldn't need AV1 hardware decode (M3 and
+later). dav1d's output is YUV, which the Viewer would convert to BGRA
+itself. Not measured on M1/M2 or Intel.
+
+**libaom 3.15.2 corrupts screen content at these sizes.** With
+`--tune-content=screen` in realtime mode (IntraBC on) and 2 or more
+threads:
+- **5K photos:** frames the decoders reject ("Invalid intrabc dv", in
+  both aomdec and dav1d). Since 2026-10-12 libaom's main explains it:
+  on frames wider or taller than 2048 pixels the nonrd IntraBC search
+  could read past the DV cost table and pick a DV the decoder rejects
+  (b57fd44).
+- **2900×1572 photos:** silent drift. `aomenc --test-decode` reports an
+  encode/decode mismatch from frame 2: with IntraBC and 2+ threads, the
+  reconstruction stops matching the decoder until the next keyframe
+  (3ca3bea).
+- fb357ae (2026-10-21) also removes a thread-timing dependence in the
+  same path.
+
+One thread, or `--enable-intrabc=0`, avoids it, at a cost in speed or
+in compression on text. 3.15.3-rc1 still corrupts 5K photos. libaom main
+at 9ace39e (2026-10-24) is clean on every clip here: no decode errors,
+and no `--test-decode` mismatch. A Host that ships AV1 needs a libaom
+with those commits (or a pinned main) and a regression test that
+round-trips 5K screen content.
 
 ### HEVC Main 4:4:4 for video regions: rejected (2026-10-25)
 
