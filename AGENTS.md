@@ -31,9 +31,9 @@ retransmission.
   sensible fallback; the CI build at the 15.5 target catches misses.
 - Perf work is measured on Apple silicon; check that big changes don't
   regress on Intel, where the Host's tile encoding costs more CPU.
-- System frameworks only. The exceptions are the vendored libwebp and, in
-  the apps only, Sparkle for updates (both in `ThirdParty/THIRD_PARTY.md`).
-  Add no dependencies.
+- System frameworks only. The exceptions are the vendored libwebp, the
+  vendored libaom (AV1, arm64 only), and, in the apps only, Sparkle for
+  updates (all in `ThirdParty/THIRD_PARTY.md`). Add no dependencies.
 - The apps (`Apps/Host`, `Apps/Viewer`) are thin: UI and wiring only. Logic
   lives in the package, where `swift test` covers it.
 

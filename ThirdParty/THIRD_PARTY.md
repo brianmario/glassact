@@ -36,6 +36,45 @@ the exception to the default no-dependencies posture.
   `Apps/Shared/Acknowledgements.txt` (Glass Act's MIT license, libwebp's
   `COPYING` and `PATENTS`) and show it in their About panel.
 
+## libaom, main at 9ace39e (`ThirdParty/libaom`, arm64 only)
+
+- **Upstream:** https://aomedia.googlesource.com/aom, commit
+  `9ace39e02a34992b83fc7f7f2bfbbd2e79348c74` (main, 2026-10-24; recorded
+  in `ThirdParty/libaom/glassact/COMMIT`). Main, not a release: the
+  latest release, 3.15.2, and 3.15.3-rc1 lack three realtime IntraBC fixes
+  (b57fd44, 3ca3bea, fb357ae). With screen content past 2048 px they
+  corrupted or drifted frames in Homebrew's 3.15.2 build (BENCHMARKS "AV2
+  on screen text"). Move to the first release that has them.
+- **License:** BSD-2-Clause (`LICENSE`), plus the Alliance for Open Media
+  Patent License 1.0 (`PATENTS`).
+- **Scope used:** the AV1 encoder in realtime mode, for video regions a
+  Viewer has opted in to (§4.6). The decoder is compiled too, for tests and
+  the bench. Swift calls only Glass Act's C API
+  (`glassact/include/glassact_aom.h`, `glassact/shim/glassact_aom.c`).
+- **Build:** a SwiftPM C target of the files `scripts/vendor-libaom`
+  copies: exactly the sources an arm64 build of `libaom.a` compiles
+  (realtime only, 8-bit, NEON without the dotprod/i8mm/SVE extensions, no
+  CRC32 instructions, no runtime CPU detection) and the files they include.
+  The script also generates the config and dispatch headers
+  (`glassact/config`), and one wrapper per source (`glassact/wrappers`)
+  that compiles it on arm64 only. On Intel the C API reports libaom
+  unavailable and the Host doesn't offer AV1: software AV1 at these sizes
+  is for Apple silicon.
+- **Why:** with screen tools, libaom's realtime AV1 at 5K is 3.6–4× smaller
+  than the hardware HEVC encoder at 7–9 dB higher PSNR, at 60 fps on an M4
+  Pro (BENCHMARKS "AV2 on screen text"). No Apple chip encodes AV1 in
+  hardware, and VideoToolbox has no software AV1 encoder. It's an opt-in
+  the Viewer chooses; hardware HEVC stays the default. Statically linked,
+  it needs no library-validation exemption (the reason AV1 was retired on
+  2026-10-10, when the Host loaded Homebrew's libaom at runtime).
+- **Update procedure:** check out the new commit or tag, run
+  `scripts/vendor-libaom <checkout>`, and record the commit here. Then run
+  `swift test` (`LibaomTests` round-trips screen content through the
+  encoder and decoder) and the same check on a real 5K recording:
+  `GLASSACT_AOM_Y4M=<file.y4m> swift test --filter LibaomTests`, with
+  the y4m from `glassact-bench y4m`. If `LICENSE` or `PATENTS` changed,
+  update `Apps/Shared/Acknowledgements.txt`.
+
 ## Sparkle 2.10.0 (apps only, through Swift Package Manager)
 
 - **Upstream:** https://github.com/sparkle-project/Sparkle, tag `2.10.0`

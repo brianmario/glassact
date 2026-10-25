@@ -1030,6 +1030,8 @@ Sources/
 Tests/                     WireTests CodecTests CoreTests TransportTests SessionTests ShareTests
                            (+ GlassActTestSupport)
 ThirdParty/libwebp/        vendored, BSD-3 (VP8L encode/decode)
+ThirdParty/libaom/         vendored, BSD-2, arm64 only (AV1 realtime encode; decode for tests)
+scripts/vendor-libaom      re-vendors libaom from a checkout
 Apps/GlassActApps.xcodeproj
   Host/                    menu-bar app: capture, input, approvals, agents policy
   Viewer/                  window app: connect, render, input, settings
