@@ -38,6 +38,9 @@ public struct HostStats: Sendable {
     /// `videoMaxPendingFrames` in flight: the encoder, not the link, is
     /// behind.
     public var videoEncoderFullSkips = 0
+    /// Regions formed on another codec because the link had no room for the
+    /// preferred AV1 (`AV1LinkPolicy`).
+    public var videoRegionsWithoutAV1 = 0
     /// Submit → delivery time of encoded frames, summed (with `clock`;
     /// virtual-time rigs record 0), and how many.
     public var videoEncodeUSSum: UInt64 = 0
@@ -296,6 +299,8 @@ public final class HostEngine: @unchecked Sendable {
     /// (deliveries come back in order). Fixed size: no allocation per frame.
     var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
     var regionSubmitHead = 0
+    /// Whether the link has room for AV1, judged once a second.
+    var av1Link = AV1LinkPolicy()
     // Re-sharpen (engine queue): VideoToolbox never re-codes content that
     // stops changing, so whatever a large change got coded at — the startup
     // cap, a thin moment, the frame after a blank first capture — is what
@@ -921,6 +926,10 @@ public final class HostEngine: @unchecked Sendable {
             sendControl(.ping(nonce: pingNonce, tUS: sendStampUS(nowUS)))
             lastPingUS = nowUS
             evaluateScalePressure()
+            // The next region forms on what this allows (`allowedVideoCodecs`).
+            _ = av1Link.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
+                                   recentCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
+                                   reports: linkReports)
         }
     }
 

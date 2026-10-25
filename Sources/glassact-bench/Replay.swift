@@ -5,7 +5,7 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports",
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax",
                              "link-mbit", "link-buffer-ms"]
 
 let replayCommand = Command(
@@ -21,11 +21,12 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
-        .choice("video", ["mock", "vt", "av1"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
+        .choice("video", ["mock", "vt", "av1", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
         .bool("no-fresh-queue", "loop: before 'Link estimate from the viewer': the video gate cuts on the smoothed RTT's queue alone"),
         .bool("no-link-reports", "loop: before 'Link estimate from the viewer': no RECEIVED reports, no capacity ceiling"),
+        .int("av1-qmax", "<0-63>", 0...63, "loop experiment, --video av1: libaom's quantizer ceiling (default: HEVC's frame-QP floor mapped, 42)"),
         .int("av1-target-pct", "<n>", 10...100, "loop experiment, --video av1: aim at n % of the target and the link cap (default 40, as in the product)"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
         .bool("timeline", "loop: print engine state once per virtual second (video coverage, handoffs, tiles, repaint debt)"),

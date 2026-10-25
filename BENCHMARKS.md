@@ -178,6 +178,11 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| AV1 only while the link has room (delivered ≥ 6 Mbit/s on, queued < 4 off; at the next region) | kept | 2–3 Mbit/s: HEVC's frames and latency (2M cursor-drag 326 · 641 ms vs AV1 alone 283 · 1183 ms); 10 Mbit/s: AV1 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
+| Switch a live region's codec in place | rejected | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
+| Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
+| Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
+| SVT-AV1 real-time at session size (2900 px) | rejected | fast now (157–204 fps) but ~10 dB worse than libaom at similar size | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -243,6 +248,150 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### AV1 only while the link has room (2026-10-25)
+
+With the Viewer's AV1 opt-in on, the Host now picks AV1 for a region only
+while the link has room (`AV1LinkPolicy`, DESIGN §4.6), judged on the
+Viewer's delivery reports ("Link estimate from the viewer" below):
+
+- A session starts on HEVC.
+- AV1 turns on once the link delivered ≥ 6 Mbit/s over a span in the
+  last 10 s. A delivered rate is a lower bound, so a thin link can't fake
+  it.
+- It turns off after 3 s of queued spans carrying < 4 Mbit/s.
+- A change applies when the next region forms.
+
+A first version judged the link on the tile governor's rate. It was
+unreliable near the crossover, and the delivered rate replaced it.
+
+`replay --mode loop`, the same links as the link-estimate entry plus 6M =
+`--link-mbit 6 --link-buffer-ms 500 --latency 30-40`. Video frames ·
+link queue p95. Every run settled byte-identical.
+
+| link | trace | HEVC (`--video vt`) | AV1 (`av1`) | fallback (`av1-hevc`) |
+|---|---|---|---|---|
+| 2M | cursor-drag | 326 · 641 ms | 283 · 1183 ms | 326 · 641 ms |
+| 2M | scroll-win | 208 · 736 ms | 315 · 1040 ms | 208 · 736 ms |
+| 2M | photos | 20 · 1732 ms | 10 · 1997 ms | 20 · 1732 ms |
+| 3M | cursor-drag | 413 · 469 ms | 369 · 746 ms | 413 · 469 ms |
+| 3M | scroll-win | 247 · 423 ms | 383 · 572 ms | 247 · 423 ms |
+| 3M | photos | 58 · 998 ms | 16 · 999 ms | 58 · 998 ms |
+| 6M | cursor-drag | 408 · 268 ms | 292 · 354 ms | 408 · 268 ms |
+| 6M | scroll-win | 238 · 224 ms | 458 · 301 ms | 238 · 224 ms |
+| 6M | photos | 165 · 498 ms | 141 · 499 ms | 141 · 499 ms |
+| 10M | cursor-drag | 442 · 238 ms | 447 · 308 ms | 447 · 282 ms |
+| 10M | scroll-win | 483 · 219 ms | 483 · 209 ms | 483 · 179 ms |
+| 10M | photos | 276 · 244 ms | 320 · 499 ms | 243 · 286 ms |
+
+typing-cc moves no more than 2 frames on any link; its queue p95 with AV1
+alone is 11–33 % above HEVC's (2M 598 vs 520 ms, 3M 496 vs 372 ms), and the
+fallback matches HEVC.
+
+- On 2 and 3 Mbit/s the fallback is HEVC exactly. AV1 alone costs latency
+  on every trace but 3M photos there (queue p95 +15 % to +85 %; 3M photos
+  even) and frames on dragging
+  and photos. It delivers more frames only on scrolling (2M scroll-win 315
+  vs 208), each later.
+- On 10 Mbit/s it runs AV1 and has the best queue p95 on scrolling.
+  Photos sits between the two codecs.
+- 6 Mbit/s is the threshold itself: scroll-win never proves 6 Mbit/s and
+  keeps HEVC (AV1 would deliver 458 frames to 238), and photos goes to AV1
+  and loses 24 frames to HEVC.
+- **Switching a live region in place, rejected.** A first version moved a
+  live region to the new codec at once: a new encoder, its first frame a
+  whole-screen sync frame, mid-motion. On 6M photos that delivered 68
+  frames (HEVC 165, AV1 141); 6M cursor-drag 337 (HEVC 408); 10M photos
+  238 at a 499 ms queue p95. Waiting for the next region costs nothing
+  measurable on these traces.
+- **A codec per area of the screen** (AV1 for scrolling everywhere) would
+  need cells; "Video cells" below rules that out.
+
+### Video cells instead of one full-screen region: rejected (2026-10-25)
+
+Would a fixed grid of video cells, each its own encoder started only when
+the cell changes, cost less than the pinned full-screen region? It avoids
+what sank the August partial regions (geometry churn, slivers, seams), and
+each key frame covers only a cell. `glassact-bench vcells` measures it: the
+same trace frames through one full-screen encoder and through a grid of
+encoders on 64-px tile boundaries, at one pinned quantizer (QP 30; AV1
+libaom quantizer 37), so bytes measure content and not a rate target.
+
+- Each area runs the region's lifecycle. A change after quiet starts a
+  session with a key frame; 2.1 s without one ends it with a re-sharpen key
+  frame. `--keep-sessions` keeps a quiet area's encoder, so its next change
+  is an inter frame.
+- Every change is encoded in both setups (the Host sends small changes as
+  lossless tiles; neither setup models that), and the cold start is left
+  out, since both pay it equally.
+- Canvas 2900×1630, M4 Pro. Quality is equal by construction (one
+  quantizer); pooled PSNR differs only because the full-screen setup also
+  counts static pixels.
+
+Cells' bytes as a share of the full-screen region's, 4×4 grid:
+
+| trace | HEVC | HEVC, sessions kept | AV1 | AV1, sessions kept |
+|---|---|---|---|---|
+| typing-cc | 69 % | 48 % | 71 % | 50 % |
+| cursor-drag | 123 % | 110 % | 152 % | 134 % |
+| scroll-win | 128 % | 123 % | 166 % | 157 % |
+| photos | 145 % | 143 % | 168 % | 164 % |
+
+Grid size (HEVC, sessions kept): typing-cc 129 % at 2×2, 48 % at 4×4,
+24 % at 8×8; scroll-win 106 %, 123 %, 274 %.
+
+- **Motion crosses cell edges.** A cell's encoder predicts only from its
+  own past pixels, so scrolled or dragged content entering a cell is coded
+  afresh. On scroll-win the cells' inter frames alone are 19 % larger
+  (HEVC 6.36 vs 5.34 MB); the finer the grid, the worse.
+- **Where cells win, tiles already do.** Sparse changes are cheaper in
+  cells: on typing-cc the full-screen HEVC inter frames cost 298 KB
+  (~1.1 KB each over 261 frames) against 50 KB of the cells' inter frames. But the Host sends
+  small changes like typing as lossless tiles, not video.
+- **Key frames aren't the cost on motion.** Start keys and re-sharpens are
+  3–7 % of the full-screen HEVC bytes on scroll-win and photos (AV1 7–12 %).
+- Sessions aren't a limit: 48 hardware HEVC sessions ran at once (8×8)
+  with none refused.
+- Aside: on typing-cc's near-static frames, full-screen AV1 inter frames
+  cost 36 KB against HEVC's 298 KB.
+
+### Real-time AV1: slower libaom speeds and SVT-AV1 at session size (2026-10-25)
+
+Could AV1 get the efficiency it shows in offline encoders (HandBrake,
+SVT-AV1) at a live session's size?
+
+**libaom speeds.** `vquality --codec av1 --av1-speed n --width 2900
+--frames 300`, the Host's settings otherwise (CBR aimed at 40 % of the cap,
+screen tools). SSIMULACRA2 mean · encode p95:
+
+| trace @ cap | speed 9 (shipped) | speed 8 | speed 7 |
+|---|---|---|---|
+| typing-cc @ 2M | 80.9 · 3.5 ms | 80.7 · 5.5 ms | 80.7 · 5.6 ms |
+| scroll-win @ 2M | 71.7 · 6.4 ms | 72.4 · 8.8 ms | 72.4 · 9.2 ms |
+| cursor-drag @ 2M | 79.0 · 3.3 ms | 78.1 · 4.7 ms | 78.2 · 5.2 ms |
+| photos @ 2M | 47.6 · 10.6 ms | 48.3 · 14.9 ms | 48.7 · 17.7 ms |
+| scroll-win @ 6M | 76.1 · 7.2 ms | 76.7 · 10.4 ms | 76.5 · 11.3 ms |
+
+Speeds 6 and 5 produce byte-identical output to 7 here (realtime libaom
+with screen tuning). Speed 8 gains at most 0.7 SSIMULACRA2 (and loses 0.9 on
+cursor-drag) for 38–57 % more p95 encode time, and photos at speed 7 passes a 60 fps frame's 16 ms. Speed 9
+stays. Where both codecs spent the same bytes (scroll-win at the 6M cap,
+2.03 Mbit/s each), AV1 scored 76.1 against HEVC's 71.7 at this size.
+
+**SVT-AV1 at 2900×1630.** The 2026-10-10 re-check found it capped near
+14 fps at 5K. At session size speed is no longer the problem; quality is.
+On the scroll-win clip at 2 Mbit/s:
+
+| encoder | speed | size | PSNR |
+|---|---|---|---|
+| SVT preset 10, `--rtc 1`, screen content on | 157 fps | 347 KB | 30.4 dB |
+| SVT preset 12 | 186 fps | 377 KB | 28.3 dB |
+| SVT preset 13 | 204 fps | 379 KB | 28.3 dB |
+| libaom realtime speed 9, CBR | 122 fps | 433 KB | 40.9 dB |
+
+About 10 dB worse at similar size. Its strengths (lookahead, frame
+reordering, slow search) are the offline tools a live share can't use. The
+cursor-drag half of this run didn't happen (its source clip was missing).
 
 ### Link estimate from the viewer: a fresh queue and a capacity ceiling (2026-10-25)
 

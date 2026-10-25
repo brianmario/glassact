@@ -67,6 +67,9 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// of an average + DataRateLimits.
     public var constantQualityFactor: Float?
     public var capWithVBV = false
+    /// Bench-only: every frame at this QP (min = max allowed frame QP) under
+    /// a bitrate that never binds, so bytes measure content, not a target.
+    public var pinnedFrameQP: Int?
     /// Experiment: kVTCompressionPropertyKey_RealTime (the product: true).
     public var realTime = true
     /// Experiment: full-resolution chroma. Apple silicon's hardware HEVC
@@ -142,6 +145,12 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             maxFrameQPAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
                                                       value: qp as CFNumber) == noErr
         }
+        if let qp = pinnedFrameQP {
+            maxFrameQPAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                                                      value: qp as CFNumber) == noErr
+                && VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MinAllowedFrameQP,
+                                        value: qp as CFNumber) == noErr
+        }
 
         let poolAttrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -193,6 +202,7 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         let factor = [1.0, 0.66, 0.45, 0.33][min(qualityLevel, 3)]
         var target = Int(Double(baseBitrate) * factor)
         if let cap = bitrateCap { target = max(300_000, min(target, cap)) }
+        if pinnedFrameQP != nil { target = 500_000_000 }
         // Re-setting VT's rate costs a rate-control reset; skip < 5% moves.
         guard appliedBitrate == 0 || abs(target - appliedBitrate) * 20 > appliedBitrate else { return }
         appliedBitrate = target

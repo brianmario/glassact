@@ -102,7 +102,7 @@ extension HostEngine {
         regionGeneration &+= 1
         let generation = regionGeneration
         var started: (encoder: any VideoRegionEncoder, codec: UInt8)?
-        for codec in negotiatedVideoCodecs {
+        for codec in allowedVideoCodecs {
             guard let encoder = factory(codec) else { continue }
             if encoder.start(width: w, height: h, onFrame: { [weak self] data, sync, config in
                 self?.videoEncoderDelivered(generation: generation, data: data, sync: sync, config: config)
@@ -112,6 +112,10 @@ extension HostEngine {
             }
         }
         guard let (encoder, startedCodec) = started else { return }
+        if startedCodec != negotiatedVideoCodecs.first, !av1Link.allowed,
+           negotiatedVideoCodecs.first.map(AV1LinkPolicy.governs) == true {
+            stats.videoRegionsWithoutAV1 += 1
+        }
         regionEncoder = encoder
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
@@ -724,6 +728,18 @@ extension HostEngine {
             let now = clock?() ?? lastEncodeNowUS
             onFirstVideoFrame(data.count, sync, now > firstVideoSubmitUS ? now - firstVideoSubmitUS : 0)
         }
+    }
+
+    /// The negotiated codecs this link allows, in preference order: AV1 only
+    /// while `av1Link` says there's room. Never empty while any is negotiated.
+    /// Read when a region forms, so a change waits for the next one: switching
+    /// a live region costs a whole-screen sync frame on the new encoder,
+    /// mid-motion (6 Mbit/s photos: 68 frames against HEVC's 165; BENCHMARKS
+    /// "AV1 only while the link has room").
+    var allowedVideoCodecs: [UInt8] {
+        guard !av1Link.allowed else { return negotiatedVideoCodecs }
+        let others = negotiatedVideoCodecs.filter { !AV1LinkPolicy.governs($0) }
+        return others.isEmpty ? negotiatedVideoCodecs : others
     }
 
     /// `revealUnchanged: false` repaints the whole region — for a lost video

@@ -331,8 +331,20 @@ public final class InProcLink: @unchecked Sendable {
     /// message is delivered once its last byte has left. Otherwise notes
     /// when the next packet will fit (`advance` pumps again then).
     private func pumpVideo() {
-        guard let b = bottleneck else { return }
         let latency = (faults.latencyMinUS + faults.latencyMaxUS) / 2
+        guard let b = bottleneck else {
+            // The bottleneck was lifted with video still waiting for it:
+            // all of it goes now (else `advance` waits forever for room).
+            for queued in videoSendQueue {
+                let deliver = max(nowUS &+ latency, lastVideoDeliverToB)
+                lastVideoDeliverToB = deliver
+                seqNo &+= 1
+                pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .video, toA: false, data: queued.data))
+            }
+            videoSendQueue.removeAll()
+            videoSendBufferBytes = 0
+            return
+        }
         while !videoSendQueue.isEmpty {
             let room = b.bufferBytes - bottleneckBacklogBytes(at: nowUS, b)
             let need = min(Self.videoPacketBytes, videoSendQueue[0].unadmitted)

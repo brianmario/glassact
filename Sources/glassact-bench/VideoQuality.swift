@@ -251,7 +251,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
 }
 
 /// High-quality resample (vImage Lanczos); a plain copy at equal size.
-private func resample(_ from: UnsafeMutableRawBufferPointer, _ fw: Int, _ fh: Int,
+func resample(_ from: UnsafeMutableRawBufferPointer, _ fw: Int, _ fh: Int,
                       into to: UnsafeMutableRawBufferPointer, _ tw: Int, _ th: Int) {
     if fw == tw && fh == th {
         to.baseAddress!.copyMemory(from: from.baseAddress!, byteCount: tw * th * 4)
@@ -263,7 +263,7 @@ private func resample(_ from: UnsafeMutableRawBufferPointer, _ fw: Int, _ fh: In
 }
 
 /// Luma (BT.601) SSIM averaged over non-overlapping 8×8 blocks, and PSNR.
-private func lumaQuality(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer, _ w: Int, _ h: Int) -> (Double, Double) {
+func lumaQuality(_ a: UnsafeRawBufferPointer, _ b: UnsafeRawBufferPointer, _ w: Int, _ h: Int) -> (Double, Double) {
     @inline(__always) func luma(_ p: UnsafeRawBufferPointer, _ i: Int) -> Double {
         // BGRA
         0.114 * Double(p[i]) + 0.587 * Double(p[i + 1]) + 0.299 * Double(p[i + 2])
