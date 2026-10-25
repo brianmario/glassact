@@ -7,6 +7,7 @@ import IOKit.pwr_mgt
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 import GlassActCore
+import GlassActShare
 import GlassActTransport
 import GlassActWire
 import os
@@ -19,66 +20,14 @@ struct UnsafeSendableBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
-/// One-deep latest-frame slot (§4.1): newest capture replaces an unprocessed
-/// older one — that drop is correct and desired.
-///
-/// OSAllocatedUnfairLock, not an os_unfair_lock stored in a class `var`:
-/// Swift may move stored properties, and an unfair lock must never move.
-/// `@unchecked`: the slot hands a CMSampleBuffer (not Sendable) from the
-/// capture queue to the encode queue — ownership passes, it's never shared.
-final class LatestFrameSlot: @unchecked Sendable {
-    /// A frame the encoder never saw still changed pixels, and SCK's dirty
-    /// rects are deltas against the previous frame: the newest frame's
-    /// rects don't cover what changed in the ones it replaced. Their
-    /// attachments ride along (the pixel buffer is released — SCK's pool is
-    /// only queueDepth deep) and drain() unions their rects in. Past
-    /// `maxSuperseded`, `overflowed` asks for a full scan instead.
-    struct Taken {
-        let buffer: CMSampleBuffer
-        let superseded: [[SCStreamFrameInfo: Any]]
-        let overflowed: Bool
-    }
-    static let maxSuperseded = 16
-    private struct State {
-        var buffer: CMSampleBuffer?
-        var superseded: [[SCStreamFrameInfo: Any]] = []
-        var overflowed = false
-    }
-    private let slot = OSAllocatedUnfairLock<State>(uncheckedState: State())
-
-    func publish(_ sampleBuffer: CMSampleBuffer) {
-        slot.withLockUnchecked { state in
-            if let old = state.buffer {
-                if state.superseded.count < Self.maxSuperseded,
-                   let oldAttachments = (CMSampleBufferGetSampleAttachmentsArray(old, createIfNecessary: false)
-                                         as? [[SCStreamFrameInfo: Any]])?.first {
-                    state.superseded.append(oldAttachments)
-                } else {
-                    state.overflowed = true
-                }
-            }
-            state.buffer = sampleBuffer
-        }
-    }
-
-    func take() -> Taken? {
-        slot.withLockUnchecked { state in
-            guard let buffer = state.buffer else { return nil }
-            let taken = Taken(buffer: buffer, superseded: state.superseded, overflowed: state.overflowed)
-            state = State()
-            return taken
-        }
-    }
-}
-
-/// Wires ScreenCaptureKit → HostEngine → QUICServer, plus the §7 recorder flag.
+/// Wires capture (`ScreenCapture`) → HostEngine → QUICServer, plus the §7
+/// recorder flag.
 ///
 /// Concurrency (§8): queue-confined, not actor-isolated. State is confined to
-/// the main thread, `encodeQueue`, or `captureQueue` as documented per
-/// property; hops are explicit `DispatchQueue.async`. `@unchecked Sendable`
+/// the main thread or `encodeQueue` as documented per property; hops are explicit `DispatchQueue.async`. `@unchecked Sendable`
 /// so those hops (and SCK/Network callbacks) compile under Swift 6 strict
 /// concurrency without introducing actors into the pixel path.
-final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCContentSharingPickerObserver,
+final class HostController: NSObject, SCContentSharingPickerObserver,
                             @unchecked Sendable {
     static let controlPort: UInt16 = 4433
 
@@ -112,10 +61,23 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private(set) var isRecording = false
 
     private let encodeQueue = DispatchQueue(label: "glassact.host.encode", qos: .userInteractive)
-    private let captureQueue = DispatchQueue(label: "glassact.host.capture", qos: .userInteractive)
     private let slot = LatestFrameSlot()
+    /// Main thread. Capture and its recovery (§4.1); frames land in `slot`
+    /// and are drained on `encodeQueue`.
+    private lazy var capture: ScreenCapture<ScreenCaptureKitBackend> = {
+        let capture = ScreenCapture(backend: ScreenCaptureKitBackend(), frames: slot, onFrame: { [weak self] in
+            self?.encodeQueue.async { [weak self] in self?.drain() }
+        })
+        capture.onStatus = { [weak self] in self?.onStatus($0) }
+        capture.onEvent = { [weak self] in self?.captureEvent($0) }
+        capture.target = { [weak self] in
+            guard let self else { return .display(CGMainDisplayID()) }
+            return self.singleWindowID != 0 ? .window(self.singleWindowID)
+                : .display(self.virtualDisplay?.displayID ?? self.physicalDisplay)
+        }
+        return capture
+    }()
     private var identity: SecIdentity?
-    private var stream: SCStream? // main-thread
     // Session lifecycle (main-thread): the server, the active transport, and
     // its tick timer are created, replaced, and torn down only on main;
     // transport callbacks hop here and are identity-checked, so a late
@@ -129,12 +91,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private var sessionTransport: QUICTransport?
     /// encodeQueue: a server bootstrap hop is outstanding / done.
     private var serverRequested = false
-    /// main-thread: bumped by every capture (re)start and by stop(). A
-    /// capture Task that finds the generation moved on abandons (and stops)
-    /// its stream, so overlapping restarts can't leave an SCStream untracked.
-    private var captureGeneration = 0
-    /// Consecutive health checks that found the stream not capturing.
-    private var captureMisses = 0
     private var pixelScale: CGFloat = 1
     private var contentOrigin: CGPoint = .zero
     /// main-thread: the physical display a full-display capture shows, set
@@ -208,11 +164,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     // restores on disconnect (via the captureModified restore path) or on
     // stop — never mid-session.
     private var autoScaledDown = false
-    // Capture-scoped App Nap exemption (see ViewerController's note): held
-    // from startCapture to stop so PING cadence and batch-timeout timers keep
-    // millisecond resolution; the idle menu-bar app naps normally.
-    private var captureActivity: NSObjectProtocol?
-    private var captureConfig: SCStreamConfiguration? // main-thread; for live rate changes
     private var recordingArmed = false // encodeQueue-confined
     // Video telemetry snapshot (encodeQueue-confined): transition lines fire
     // the moment a region forms or dissolves; rates ride the 2 s heartbeat.
@@ -474,8 +425,6 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private let logInbox = ViewerLogInbox()
 
     private var displayWatchRegistered = false
-    /// Capture is waiting for a display to wake (`recoverCapture`).
-    private var awaitingDisplay = false
 
     /// The physical display the Host shares: the one capture started on,
     /// or the main display before that (main-thread).
@@ -498,13 +447,13 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.displayMayBeBack() }
+            MainActor.assumeIsolated { self?.capture.displayMayBeBack() }
         }
     }
 
     /// Main thread. One display's reconfiguration finished.
     private func displayReconfigured(_ display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
-        displayMayBeBack()
+        capture.displayMayBeBack()
         if flags.contains(.unMirrorFlag) || flags.contains(.mirrorFlag) {
             // A virtual display's mirroring can be undone by the system.
             reapplyViewerModeIfReverted()
@@ -535,7 +484,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// `reapplyViewerModeIfReverted`'s, and a virtual display is the
     /// Host's own.
     private func reconcileSharedDisplay() {
-        guard isRunning, singleWindowID == 0, virtualDisplay == nil, stream != nil,
+        guard isRunning, singleWindowID == 0, virtualDisplay == nil, capture.isCapturing,
               pendingDisplayRestore == nil else { return }
         let display = physicalDisplay
         let bounds = CGDisplayBounds(display)
@@ -548,16 +497,16 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         if captureModified {
             // Scale: re-fit the downscaled capture to the display's new shape.
             guard let request = lastScaleRequest else { return }
-            let size = Self.scaledCaptureSize(of: bounds.size, toFit: request,
-                                              maxPixelsPerPoint: Self.pixelsPerPoint(display))
-            let clamped = Self.clampCapture(size.w, size.h)
+            let size = CaptureGeometry.scaledSize(of: bounds.size, toFit: request,
+                                                  maxPixelsPerPoint: Self.pixelsPerPoint(display))
+            let clamped = CaptureGeometry.clamp(size.w, size.h)
             guard clamped.w != captureWidth || clamped.h != captureHeight else { return }
             onStatus("display changed to \(Int(bounds.width))×\(Int(bounds.height)) — capture re-fit to \(size.w)×\(size.h) px")
             restartCapture(pixelWidth: size.w, pixelHeight: size.h, pointScale: CGFloat(size.w) / bounds.width,
                            origin: bounds.origin, inSession: true)
         } else {
             guard let mode = CGDisplayCopyDisplayMode(display) else { return }
-            let clamped = Self.clampCapture(mode.pixelWidth, mode.pixelHeight)
+            let clamped = CaptureGeometry.clamp(mode.pixelWidth, mode.pixelHeight)
             guard clamped.w != captureWidth || clamped.h != captureHeight else { return }
             onStatus("display changed to \(Int(bounds.width))×\(Int(bounds.height)) — capture follows "
                      + "(\(mode.pixelWidth)×\(mode.pixelHeight) px)")
@@ -736,66 +685,43 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         guard !isRunning, identity != nil else { return }
         isRunning = true
         phase = .starting
-        captureGeneration += 1
-        let generation = captureGeneration
-        let boxed = UnsafeSendableBox(filter)
-        // @MainActor: every field below is main-thread state.
-        Task { @MainActor in
-            do {
-                let filter = boxed.value
-                let scale = CGFloat(filter.pointPixelScale)
-                let configuration = SCStreamConfiguration()
-                let size = Self.clampCapture(Int(filter.contentRect.width * scale),
-                                             Int(filter.contentRect.height * scale))
-                configuration.width = size.w
-                configuration.height = size.h
-                configuration.pixelFormat = kCVPixelFormatType_32BGRA
-                configuration.colorSpaceName = CGColorSpace.sRGB
-                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-                configuration.queueDepth = 3
-                configuration.showsCursor = true // burned in until cursor metadata is negotiated
-                self.pixelScale = scale * size.factor
-                let shared = displayID ?? Self.display(containing: filter.contentRect)
-                self.sharedDisplayID = shared
-                self.contentOrigin = shared != 0 ? CGDisplayBounds(shared).origin : filter.contentRect.origin
-                self.lastFilter = filter
-                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
-                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.captureQueue)
-                try await stream.startCapture()
-                guard generation == self.captureGeneration, self.isRunning else {
-                    try? await stream.stopCapture() // stopped/restarted meanwhile
-                    return
-                }
-                self.stream = stream
-                self.captureConfig = configuration
-                if self.captureActivity == nil {
-                    self.captureActivity = ProcessInfo.processInfo.beginActivity(
-                        options: [.userInitiated, .latencyCritical],
-                        reason: "glassact capture active")
-                }
-                self.onStatus("capturing \(configuration.width)×\(configuration.height)")
-            } catch {
-                guard generation == self.captureGeneration else { return }
-                self.isRunning = false
-                self.phase = CGPreflightScreenCaptureAccess() ? .stopped : .needsScreenRecording
-                self.onStatus("capture failed: \(error.localizedDescription)")
-            }
-        }
+        let scale = CGFloat(filter.pointPixelScale)
+        let size = CaptureGeometry.clamp(Int(filter.contentRect.width * scale),
+                                         Int(filter.contentRect.height * scale))
+        pixelScale = scale * size.factor
+        let shared = displayID ?? Self.display(containing: filter.contentRect)
+        sharedDisplayID = shared
+        contentOrigin = shared != 0 ? CGDisplayBounds(shared).origin : filter.contentRect.origin
+        lastFilter = filter
+        capture.start(filter: filter, settings: CaptureSettings(width: size.w, height: size.h))
     }
 
-    /// "Scale": the capture size that aspect-fits a display of `size`
-    /// points into the viewer's request, never past the display's own
-    /// pixels (`maxPixelsPerPoint`): a viewer window bigger than this
-    /// display gets its native picture, not an upscaled one. Even dims for
-    /// 4:2:0 codecs; floored so a tiny (or hostile) request can't produce a
-    /// zero-sized capture.
-    private static func scaledCaptureSize(of size: CGSize,
-                                          toFit request: (widthPoints: Int, heightPoints: Int, scale: Int),
-                                          maxPixelsPerPoint: CGFloat) -> (w: Int, h: Int) {
-        let f = min(maxPixelsPerPoint,
-                    CGFloat(request.widthPoints * request.scale) / size.width,
-                    CGFloat(request.heightPoints * request.scale) / size.height)
-        return (max(64, Int(size.width * f)) & ~1, max(64, Int(size.height * f)) & ~1)
+    /// Main thread. What capture reports (`ScreenCapture.Event`).
+    private func captureEvent(_ event: ScreenCapture<ScreenCaptureKitBackend>.Event) {
+        switch event {
+        case .started:
+            break
+        case let .startFailed(reason):
+            isRunning = false
+            phase = CGPreflightScreenCaptureAccess() ? .stopped : .needsScreenRecording
+            onStatus("capture failed: \(reason)")
+        case .stoppedFromMenuBar:
+            stop()
+        case .screenRecordingRevoked:
+            phase = .needsScreenRecording
+            onPermissionProblem()
+        case let .recovered(_, filter, displayID):
+            lastFilter = filter
+            if virtualDisplay == nil, let displayID {
+                // The shared display may have gone (unplugged): follow the
+                // one capture fell back to.
+                sharedDisplayID = displayID
+                contentOrigin = CGDisplayBounds(displayID).origin
+            }
+            reconcileSharedDisplay()
+        case .sharedWindowClosed:
+            endSessionForClosedWindow()
+        }
     }
 
     /// The display's current mode, pixels per point (2 for a Retina mode).
@@ -813,209 +739,38 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         return display
     }
 
-    /// The wire's largest canvas (TileGrid.maxDimension per side — the
-    /// viewer rejects anything larger, and the engine refuses to build one).
-    /// Scales an oversize capture down, preserving aspect with even dims;
-    /// `factor` rescales the point→pixel mapping used for input and cursor.
-    private static func clampCapture(_ w: Int, _ h: Int) -> (w: Int, h: Int, factor: CGFloat) {
-        let m = TileGrid.maxDimension
-        guard w > m || h > m else { return (w, h, 1) }
-        let f = min(CGFloat(m) / CGFloat(w), CGFloat(m) / CGFloat(h))
-        return (max(2, Int(CGFloat(w) * f)) & ~1, max(2, Int(CGFloat(h) * f)) & ~1, f)
-    }
-
-    // MARK: - SCStreamDelegate
-
-    /// The system stopped the stream. Someone ending the share from the
-    /// menu-bar screen-recording control is a privacy decision made at the
-    /// Mac: honor it and stop sharing. Anything else — display sleep or
-    /// disconnect ("Failed to find any displays or windows to capture"),
-    /// the lock screen, a window gone — keeps the share (listener, session,
-    /// engine) and recovers capture: stopping would strand a remote user
-    /// with no way back in.
-    func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        let boxed = UnsafeSendableBox(stream)
-        let ns = error as NSError
-        DispatchQueue.main.async { [self] in
-            guard isRunning, boxed.value === self.stream else { return } // superseded restart
-            if ns.domain == SCStreamErrorDomain && ns.code == SCStreamError.Code.userStopped.rawValue {
-                onStatus("capture stopped from the menu-bar indicator — sharing ended")
-                stop()
-                return
-            }
-            onStatus("capture stopped by the system: \(error.localizedDescription) (\(ns.domain) \(ns.code)) — recovering")
-            self.stream = nil
-            if singleWindowID != 0 {
-                endSessionIfSharedWindowGone()
-            } else {
-                recoverCapture(attempt: 1)
-            }
+    /// Main thread. The shared window closed, or its app quit: end the
+    /// session. Falling back to the whole display would suddenly show the
+    /// viewer the entire desktop.
+    private func endSessionForClosedWindow() {
+        guard isRunning, singleWindowID != 0 else { return }
+        onStatus("shared window closed on the host — ending the session")
+        let engineQueue = encodeQueue
+        engineQueue.async { self.engine?.sendSharedWindowClosed() }
+        // Back to the full display for whoever connects next (not
+        // in-session: this session is over).
+        singleWindowID = 0
+        sharedAXWindow = nil
+        originalWindowFrame = nil
+        if let display = savedDisplayFilter {
+            savedDisplayFilter = nil
+            lastFilter = display
+            let scale = CGFloat(display.pointPixelScale)
+            let pw = max(2, Int(display.contentRect.width * scale)) & ~1
+            let ph = max(2, Int(display.contentRect.height * scale)) & ~1
+            restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: scale,
+                           origin: display.contentRect.origin)
         }
-    }
-
-    /// Main thread. Single-window capture stopped: if the window still exists
-    /// (minimized, other Space…) recover as usual. If it's gone — closed, or
-    /// its app quit — end the session: falling back to the whole display
-    /// would suddenly show the viewer the entire desktop.
-    private func endSessionIfSharedWindowGone() {
-        let windowID = singleWindowID
+        // Let the message reach the viewer, then close the connection.
         Task { @MainActor in
-            let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard self.isRunning, self.singleWindowID == windowID else { return }
-            if let content, content.windows.contains(where: { $0.windowID == CGWindowID(windowID) }) {
-                self.recoverCapture(attempt: 1)
-                return
-            }
-            if content == nil { // couldn't enumerate: keep trying the normal way
-                self.recoverCapture(attempt: 1)
-                return
-            }
-            self.onStatus("shared window closed on the host — ending the session")
-            let engineQueue = self.encodeQueue
-            engineQueue.async { self.engine?.sendSharedWindowClosed() }
-            // Back to the full display for whoever connects next (not
-            // in-session: this session is over).
-            self.singleWindowID = 0
-            self.sharedAXWindow = nil
-            self.originalWindowFrame = nil
-            if let display = self.savedDisplayFilter {
-                self.savedDisplayFilter = nil
-                self.lastFilter = display
-                let scale = CGFloat(display.pointPixelScale)
-                let pw = max(2, Int(display.contentRect.width * scale)) & ~1
-                let ph = max(2, Int(display.contentRect.height * scale)) & ~1
-                self.restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: scale,
-                                    origin: display.contentRect.origin)
-            }
-            // Let the message reach the viewer, then close the connection.
             try? await Task.sleep(for: .milliseconds(500))
             self.transport?.cancel()
         }
     }
 
-    // MARK: - Capture recovery
-
-    /// Main thread, 1 Hz. macOS 27's `SCStream.isCapturing` catches a stream
-    /// that stopped without telling its delegate: a frozen picture with
-    /// nothing in the log. `stream` is set only once a start has succeeded
-    /// and cleared during a restart, so a miss here is a real stall. Two in a
-    /// row, then the same recovery a reported stop gets.
+    /// Main thread, 1 Hz (`ScreenCapture.checkHealth`).
     func checkCaptureHealth() {
-        // Earlier systems have no `isCapturing`; there a silent stop shows
-        // only as a frozen picture.
-        guard #available(macOS 27, *), isRunning, let stream else { captureMisses = 0; return }
-        if stream.isCapturing { captureMisses = 0; return }
-        captureMisses += 1
-        guard captureMisses >= 2 else { return }
-        captureMisses = 0
-        onStatus("capture stalled — the stream stopped without reporting an error — recovering")
-        self.stream = nil
-        let stale = UnsafeSendableBox(stream)
-        Task { try? await stale.value.stopCapture() }
-        if singleWindowID != 0 {
-            endSessionIfSharedWindowGone()
-        } else {
-            recoverCapture(attempt: 1)
-        }
-    }
-
-    /// Main thread. Rebuild the capture from a freshly enumerated display (or
-    /// the shared window) at the SAME configured size — the live engine and
-    /// viewer session carry on as if frames had just paused. Retries with
-    /// backoff (1 s, 2 s, … 5 s) until it works or sharing stops. With no
-    /// display at all (asleep, nobody watching) it stops polling after
-    /// `recoveryQuickAttempts` and waits instead: the screens waking, a
-    /// display change, or a viewer connecting (which wakes the display)
-    /// each kick an immediate attempt, with a slow poll as a safety net. A
-    /// display that sleeps all night used to be enumerated every 5 s
-    /// (10,000+ attempts by morning).
-    private func recoverCapture(attempt: Int, after delay: Double? = nil) {
-        guard isRunning else { return }
-        captureGeneration += 1
-        let generation = captureGeneration
-        Task { @MainActor in
-            if let delay {
-                try? await Task.sleep(for: .seconds(delay))
-            } else if attempt > 1 {
-                try? await Task.sleep(for: .seconds(min(5, attempt - 1)))
-            }
-            guard generation == self.captureGeneration, self.isRunning else { return }
-            do {
-                let recovered = try await self.recoveryFilter(
-                    window: self.singleWindowID, display: self.virtualDisplay?.displayID ?? self.physicalDisplay)
-                let filter = recovered.filter
-                let configuration = self.captureConfig ?? SCStreamConfiguration()
-                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
-                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.captureQueue)
-                try await stream.startCapture()
-                guard generation == self.captureGeneration, self.isRunning else {
-                    try? await stream.stopCapture()
-                    return
-                }
-                self.stream = stream
-                self.lastFilter = filter
-                self.captureConfig = configuration
-                if self.virtualDisplay == nil, let id = recovered.displayID {
-                    // The shared display may have gone (unplugged): follow
-                    // the one capture fell back to.
-                    self.sharedDisplayID = id
-                    self.contentOrigin = CGDisplayBounds(id).origin
-                }
-                self.awaitingDisplay = false
-                self.onStatus("capture recovered (attempt \(attempt))")
-                self.reconcileSharedDisplay()
-            } catch {
-                guard generation == self.captureGeneration, self.isRunning else { return }
-                // Revoked, not flaky: retrying can't help until it's granted
-                // again (and macOS applies that to a fresh launch).
-                if !CGPreflightScreenCaptureAccess() {
-                    self.onStatus("capture stopped: Screen Recording was turned off")
-                    self.phase = .needsScreenRecording
-                    self.onPermissionProblem()
-                    return
-                }
-                let noDisplay = (error as NSError).domain == "glassact" && (error as NSError).code == 1
-                if noDisplay && attempt >= Self.recoveryQuickAttempts {
-                    if !self.awaitingDisplay {
-                        self.awaitingDisplay = true
-                        self.onStatus("capture paused: no display to capture (asleep?) — waiting for one to wake")
-                    }
-                    self.recoverCapture(attempt: attempt + 1, after: Self.recoverySlowPollS)
-                    return
-                }
-                if attempt == 1 || attempt % 12 == 0 {
-                    self.onStatus("capture recovery attempt \(attempt) failed: \(error.localizedDescription) — retrying")
-                }
-                self.recoverCapture(attempt: attempt + 1)
-            }
-        }
-    }
-
-    /// Quick retries before an absent display counts as asleep (about 15 s).
-    private static let recoveryQuickAttempts = 6
-    /// The safety-net poll while waiting for a display to wake.
-    private static let recoverySlowPollS = 60.0
-
-    /// Main thread. Something that can bring a display back happened: if
-    /// capture is waiting for one, try now.
-    private func displayMayBeBack() {
-        if isRunning && stream == nil && awaitingDisplay { recoverCapture(attempt: 1) }
-    }
-
-    /// The shared window if it still exists, else the display `wanted`
-    /// (or any display, if that one is gone), with the display's ID.
-    private func recoveryFilter(window windowID: UInt32, display wanted: CGDirectDisplayID) async throws
-        -> (filter: SCContentFilter, displayID: CGDirectDisplayID?) {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        if windowID != 0,
-           let window = content.windows.first(where: { $0.windowID == CGWindowID(windowID) }) {
-            return (SCContentFilter(desktopIndependentWindow: window), nil)
-        }
-        guard let display = content.displays.first(where: { $0.displayID == wanted })
-                ?? content.displays.first else {
-            throw NSError(domain: "glassact", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display available"])
-        }
-        return (SCContentFilter(display: display, excludingWindows: []), display.displayID)
+        capture.checkHealth()
     }
 
     // MARK: - Display awake while a viewer watches
@@ -1045,11 +800,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         viewerConnectedAt = nil
         pendingLock?.cancel() // stopped locally: someone is at the Mac
         pendingLock = nil
-        captureGeneration += 1 // abandons any capture Task still in flight
         pendingDisplayRestore?.cancel() // a queued restore would restart capture
         pendingDisplayRestore = nil
         lastFilter = nil
-        captureConfig = nil
         captureModified = false
         lastScaleRequest = nil
         autoScaledDown = false
@@ -1061,15 +814,9 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         sharedAXWindow = nil
         originalWindowFrame = nil
         restoreDisplayMode()
-        if let token = captureActivity {
-            ProcessInfo.processInfo.endActivity(token)
-            captureActivity = nil
-        }
         SCContentSharingPicker.shared.isActive = false
         SCContentSharingPicker.shared.remove(self)
-        let stream = self.stream
-        self.stream = nil
-        Task { try? await stream?.stopCapture() }
+        capture.stop()
         holdDisplayAwake(false)
         server?.cancel()
         server = nil
@@ -1440,8 +1187,8 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             // stretch (a 16:9 host into a 3:2 viewer request).
             let bounds = CGDisplayBounds(display)
             lastScaleRequest = (widthPoints, heightPoints, scale)
-            let (pw, ph) = Self.scaledCaptureSize(of: bounds.size, toFit: (widthPoints, heightPoints, scale),
-                                                  maxPixelsPerPoint: Self.pixelsPerPoint(display))
+            let (pw, ph) = CaptureGeometry.scaledSize(of: bounds.size, toFit: (widthPoints, heightPoints, scale),
+                                                      maxPixelsPerPoint: Self.pixelsPerPoint(display))
             if pw == captureWidth && ph == captureHeight {
                 // Still downscaled vs the display (a reconnect within the
                 // grace): restore must stay armed.
@@ -1462,57 +1209,13 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     private func restartCapture(pixelWidth: Int, pixelHeight: Int, pointScale: CGFloat,
                                 origin: CGPoint? = nil, inSession: Bool = false) {
         guard isRunning, let filter = lastFilter else { return }
-        captureGeneration += 1
-        let generation = captureGeneration
-        let old = stream
-        stream = nil
-        let size = Self.clampCapture(pixelWidth, pixelHeight)
+        let size = CaptureGeometry.clamp(pixelWidth, pixelHeight)
         let pixelWidth = size.w, pixelHeight = size.h
-        let configuration = SCStreamConfiguration()
-        configuration.width = pixelWidth
-        configuration.height = pixelHeight
-        configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.colorSpaceName = CGColorSpace.sRGB
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        configuration.queueDepth = 3
-        configuration.showsCursor = captureConfig?.showsCursor ?? true
         pixelScale = pointScale * size.factor
         contentOrigin = origin ?? CGDisplayBounds(physicalDisplay).origin
         captureWidth = pixelWidth
         captureHeight = pixelHeight
-        let newStream = SCStream(filter: filter, configuration: configuration, delegate: self)
-        do {
-            try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        } catch {
-            onStatus("resize: stream output failed: \(error)")
-            let stale = UnsafeSendableBox(old)
-            Task { try? await stale.value?.stopCapture() }
-            return
-        }
-        // Serialized by generation: the old stream is fully stopped before the
-        // new one starts, and a restart superseded mid-flight (a window pick
-        // followed by the viewer's fit-resize, auto-scale + resize, …) stops
-        // its own stream instead of leaving it capturing untracked.
-        let handoff = UnsafeSendableBox((old: old, new: newStream, config: configuration))
-        Task { @MainActor in
-            let (old, newStream, configuration) = handoff.value
-            try? await old?.stopCapture()
-            guard generation == self.captureGeneration, self.isRunning else { return }
-            do {
-                try await newStream.startCapture()
-            } catch {
-                guard generation == self.captureGeneration, self.isRunning else { return }
-                self.onStatus("capture restart failed: \(error.localizedDescription) — recovering")
-                self.recoverCapture(attempt: 2)
-                return
-            }
-            guard generation == self.captureGeneration, self.isRunning else {
-                try? await newStream.stopCapture()
-                return
-            }
-            self.stream = newStream
-            self.captureConfig = configuration
-        }
+        guard capture.restart(filter: filter, width: pixelWidth, height: pixelHeight) else { return }
         encodeQueue.async { [weak self] in
             guard let self else { return }
             self.lastFrame = nil
@@ -2055,19 +1758,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         return CGCompleteDisplayConfiguration(config, .forAppOnly) == .success
     }
 
-    /// Reconfigure the live SCK stream's frame interval to follow the
-    /// viewer's pause/resume hint (called on encodeQueue via the engine
-    /// hook): 1 fps while paused, 60 otherwise.
-    /// updateConfiguration REPLACES the configuration, so mutate the stored
-    /// original — a fresh SCStreamConfiguration would reset dimensions and
-    /// pixel format to defaults and break capture.
+    /// Follow the viewer's pause/resume hint (called on encodeQueue via the
+    /// engine hook): 1 fps while paused, 60 otherwise.
     private func applyCaptureRate(paused: Bool) {
-        let framesPerSecond: Int32 = paused ? 1 : 60
-        DispatchQueue.main.async { [weak self] in
-            guard let self, let stream = self.stream, let config = self.captureConfig else { return }
-            config.minimumFrameInterval = CMTime(value: 1, timescale: framesPerSecond)
-            Task { try? await stream.updateConfiguration(config) }
-        }
+        DispatchQueue.main.async { [weak self] in self?.capture.setFrameRate(paused ? 1 : 60) }
     }
 
     /// Clean-benchmark recording: arm after `delay` (menu closed, screen
@@ -2128,20 +1822,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         }
     }
 
-    // MARK: - SCStreamOutput (capture callback → latest slot → encodeQueue)
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid else { return }
-        guard let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-            as? [[SCStreamFrameInfo: Any]])?.first else { return }
-        if let statusRaw = attachments[.status] as? Int,
-           let status = SCFrameStatus(rawValue: statusRaw),
-           status != .complete {
-            return // .idle / no-content frames carry no pixels (§4.1)
-        }
-        slot.publish(sampleBuffer)
-        encodeQueue.async { [weak self] in self?.drain() }
-    }
+    // MARK: - Frames (capture's latest slot → encodeQueue)
 
     private func drain() {
         guard let taken = slot.take() else { return }
@@ -2211,7 +1892,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
         let x = Int((loc.x - contentOrigin.x) * scale)
         let y = Int((loc.y - contentOrigin.y) * scale)
         let visible = x >= 0 && y >= 0
-            && x < (captureConfig?.width ?? Int.max) && y < (captureConfig?.height ?? Int.max)
+            && x < frameWidth && y < frameHeight
         if x != lastCursorX || y != lastCursorY || visible != lastCursorVisible {
             lastCursorX = x
             lastCursorY = y
@@ -2231,10 +1912,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             onStatus("system cursor image unavailable — cursor stays in the pixels")
             return
         }
-        if let stream, let config = captureConfig {
-            config.showsCursor = false
-            Task { try? await stream.updateConfiguration(config) }
-        }
+        capture.setShowsCursor(false)
         onStatus("cursor-as-metadata active (showsCursor off)")
         // Fresh session: forget the last-sent shape so the initial publish
         // below actually ships (the hash dedupe is per-connection state).
@@ -2425,8 +2103,10 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
     /// Dirty rects are hints only (§4.3); on any parse doubt return nil (full
     /// scan — the hash gate keeps it correct either way).
     private func dirtyRects(from sampleBuffer: CMSampleBuffer, width: Int, height: Int) -> [DirtyRect]? {
-        guard let attachments = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-            as? [[SCStreamFrameInfo: Any]])?.first else { lastRectsVerdict = .noAttachments; return nil }
+        guard let attachments = FrameInfo.attachments(of: sampleBuffer) else {
+            lastRectsVerdict = .noAttachments
+            return nil
+        }
         return dirtyRects(attachments: attachments, width: width, height: height)
     }
 
@@ -2437,37 +2117,12 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             print("glassact-host: dirtyRects attachment type=\(value.map { String(describing: type(of: $0)) } ?? "ABSENT") "
                 + "value=\(String(describing: value).prefix(400))")
         }
-        guard let raw = attachments[.dirtyRects] as? [NSDictionary] else { lastRectsVerdict = .absent; return nil }
-        // SCK rects are in the SOURCE's backing pixels (DirtyRectMapping):
-        // source width = content width (points) × SCK's scaleFactor.
-        var rawRects: [(x: Double, y: Double, width: Double, height: Double)] = []
-        rawRects.reserveCapacity(raw.count)
-        for entry in raw {
-            guard let rect = CGRect(dictionaryRepresentation: entry) else { lastRectsVerdict = .badEntry; return nil }
-            rawRects.append((Double(rect.minX), Double(rect.minY), Double(rect.width), Double(rect.height)))
-        }
-        let scaleFactor = (attachments[.scaleFactor] as? NSNumber)?.doubleValue ?? 0
-        let contentWidth = (attachments[.contentRect] as? NSDictionary)
-            .flatMap { CGRect(dictionaryRepresentation: $0) }.map { Double($0.width) } ?? 0
-        switch DirtyRectMapping.map(raw: rawRects, frameWidth: width, frameHeight: height,
-                                    sourcePixelWidth: contentWidth * scaleFactor) {
-        case let .rects(rects):
-            lastRectsVerdict = .ok
-            return rects
-        case .empty:
-            lastRectsVerdict = .emptyList
-            return nil
-        case .unknown:
-            lastRectsVerdict = rawRects.contains { $0.width <= 0 || $0.height <= 0 } ? .zeroRect : .outOfFrame
-            return nil
-        }
+        let read = FrameInfo.dirtyRects(attachments, frameWidth: width, frameHeight: height)
+        lastRectsVerdict = read.verdict
+        return read.rects
     }
 
-    /// Why the last frame's dirty rects were (or weren't) usable — tallied
-    /// per status interval to find why SCK hints vanish in tile mode.
-    enum RectsVerdict: String { case ok, noAttachments = "no-attach", absent, badEntry = "bad-entry",
-                                     zeroRect = "zero-rect", emptyList = "empty-list", outOfFrame = "out-of-frame" }
-    private var lastRectsVerdict = RectsVerdict.ok
+    private var lastRectsVerdict = FrameInfo.DirtyRectVerdict.ok
 
     // MARK: - Transport wiring
 
@@ -2960,7 +2615,7 @@ final class HostController: NSObject, SCStreamOutput, SCStreamDelegate, SCConten
             holdDisplayAwake(true)
             // Capture died while nobody watched (display slept, screen
             // locked): the display is waking now — try again right away.
-            if isRunning && stream == nil { recoverCapture(attempt: 1) }
+            if isRunning { capture.retryNow() }
             let connectedUS = MonotonicClock.nowUS
             encodeQueue.async { [weak self] in
                 self?.viewerConnectedUS = connectedUS
@@ -3078,7 +2733,7 @@ struct ChangeHotspots {
     private var framesNoRects = 0
     private var verdicts: [String: Int] = [:]
 
-    mutating func note(_ rects: [DirtyRect]?, verdict: HostController.RectsVerdict) {
+    mutating func note(_ rects: [DirtyRect]?, verdict: FrameInfo.DirtyRectVerdict) {
         framesTotal += 1
         guard let rects else {
             framesNoRects += 1
