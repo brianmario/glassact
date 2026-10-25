@@ -1,4 +1,5 @@
 public import IOSurface
+import CoreGraphics
 import Dispatch
 
 /// §5 present path, blit half: two IOSurfaces as a flip pool. Each call
@@ -46,16 +47,28 @@ public final class SurfacePresenter: @unchecked Sendable {
     public init(grid: TileGrid) {
         self.grid = grid
         surfaces = (0..<2).map { _ in
-            IOSurface(properties: [
+            let surface = IOSurface(properties: [
                 .width: grid.width,
                 .height: grid.height,
                 .bytesPerElement: 4,
                 .pixelFormat: UInt32(0x4247_5241), // 'BGRA'
             ])!
+            Self.tagSRGB(surface)
+            return surface
         }
         unionMark = [Bool](repeating: false, count: grid.count)
         currentDirty.reserveCapacity(grid.count)
         previousDirty.reserveCapacity(grid.count)
+    }
+
+    /// The canvas is sRGB (§3.2), and the surface has to say so: Core
+    /// Animation doesn't colour-match an untagged surface, it shows the
+    /// values as the screen's own. On a P3 screen (every recent Mac) that
+    /// made every colour more saturated than on the host: sRGB red
+    /// (255, 0, 0) showed as P3 red instead of P3 (234, 51, 35).
+    static func tagSRGB(_ surface: IOSurface) {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB)?.copyPropertyList() else { return }
+        IOSurfaceSetValue(surface, kIOSurfaceColorSpace, space)
     }
 
     /// Engine queue. Nil when there is nothing new to show — or when the

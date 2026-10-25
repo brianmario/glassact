@@ -835,7 +835,10 @@ the bitmap ACK. That covers records that were:
 - Per tile it reads canvas or overlay, so video composites at present time
   (INV-8).
 - The main thread only flips `layer.contents` on the display link.
-- `magnificationFilter = .nearest` for 1:1.
+- The surfaces are tagged sRGB (§3.2). Core Animation shows an untagged
+  surface's values as the screen's own colours, which oversaturates sRGB
+  content on a P3 screen.
+- `magnificationFilter = .nearest` at whole-number zoom, linear otherwise.
 
 **Cursor:** with the `cursor` cap, the pointer is a separate layer positioned
 from CURSOR_POS and drawn from CURSOR_IMAGE. It never touches the canvas.
