@@ -293,6 +293,35 @@ with 14 threads).
   hardware encode (§3.8); AV2 would be another reserved id once hardware
   exists. Worth re-measuring when Apple ships AV1 or AV2 encode.
 
+**Realtime speed at the sizes the Host sends.** The same day: 60 frames
+of each trace at 5120×2880 and at 2900×1572 (a Scale/virtual-display
+session's size), realtime low-delay settings, on the M4 Pro with nothing
+else running. These timings come from command-line runs, file reading
+included, so treat them as approximate. x265 used `-tune zerolatency`,
+crf 20. libaom was the old engine's configuration: `--rt --cpu-used=10`,
+screen tune, 8 threads, row-mt, 8 tile columns, cq 30. The hardware and
+Apple software HEVC used `hevc_videotoolbox` at q75, the latter with
+`-require_sw 1`.
+
+| encoder | 2900×1572 fps | typing-cc | scroll-win | 5K fps | typing-cc | scroll-win |
+|---|---|---|---|---|---|---|
+| hardware HEVC (shipping) | ~79 | 2.17 MB · 46.2 dB | 2.16 MB · 47.5 dB | ~50 | 4.33 MB · 45.3 dB | 4.20 MB · 45.8 dB |
+| Apple software HEVC | 14–15 | 2.51 MB · 38.0 dB | 2.36 MB · 39.5 dB | 6 | 5.91 MB · 38.6 dB | 3.88 MB · 40.7 dB |
+| x265 ultrafast | 75–80 | 0.90 MB · 49.0 dB | 2.15 MB · 47.6 dB | 26–27 | 1.72 MB · 50.5 dB | 4.10 MB · 49.5 dB |
+| x265 superfast | 66–71 | 0.60 MB · 50.3 dB | 1.36 MB · 49.0 dB | 23–24 | 1.02 MB · 52.2 dB | 3.28 MB · 51.0 dB |
+| x265 medium | 32–35 | 0.63 MB · 50.8 dB | 1.00 MB · 50.9 dB | 11 | 1.10 MB · 53.1 dB | 1.87 MB · 54.2 dB |
+| libaom AV1 rt, speed 10 | 129–136 | 0.80 MB · 50.5 dB | 0.90 MB · 49.6 dB | 61–62 | 1.19 MB · 53.0 dB | 1.00 MB · 54.6 dB |
+
+- **x265 can't hold 60 fps at 5K.** Zero latency turns off frame
+  threading, so even superfast runs at about 24 fps on every core. It's
+  also GPL, which would change the licence of the Host binary.
+- **Apple's software HEVC is unusable:** slower than the hardware encoder
+  and worse.
+- **libaom realtime is the only software encoder fast enough at 5K.** It's
+  3.6–4× smaller than the hardware HEVC there, at 7–9 dB higher PSNR.
+  That was the case for AV1 before it was retired on 2026-10-10 (the
+  library-validation exemption, and software decode on M1/M2 Viewers).
+
 ### HEVC Main 4:4:4 for video regions: rejected (2026-10-25)
 
 VMPal Remote (VMPal 0.97, static analysis) sends its screen as HEVC Main
