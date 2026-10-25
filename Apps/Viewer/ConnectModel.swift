@@ -188,6 +188,15 @@ final class ViewerSettings {
         didSet { UserDefaults.standard.set(preferSharpness, forKey: Self.sharpnessKey) }
     }
 
+    private static let av1Key = "glassact.viewer.videoAV1"
+    /// Ask for AV1 video instead of hardware HEVC: sharper moving text and
+    /// lower encode latency, for more bandwidth and Host CPU; on a thin link
+    /// HEVC looks better (BENCHMARKS "AV1 back, as a Viewer opt-in"). Off by
+    /// default; needs hardware AV1 decode here.
+    var videoAV1: Bool = UserDefaults.standard.bool(forKey: ViewerSettings.av1Key) {
+        didSet { UserDefaults.standard.set(videoAV1, forKey: Self.av1Key) }
+    }
+
     private static let fullScreenReshapeKey = "glassact.viewer.fullScreenReshapesHost"
     /// In full screen, a picture of another shape (Scale Down, or Match This
     /// Mac when the host had no matching mode) asks the host to take this

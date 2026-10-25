@@ -77,6 +77,50 @@ struct AOMVideoTests {
         #expect(!AOMRegionDecoder().start(codec: VideoCodec.hevc, config: config, width: width, height: height))
     }
 
+    /// What the Viewer actually runs: libaom's stream through VideoToolbox's
+    /// hardware AV1 decoder (M3 and later), with the av1C record as the
+    /// format description, exactly as VIDEO_START carries it.
+    @Test(.enabled(if: VTRegionDecoder.canDecodeAV1, "needs hardware AV1 decode (M3 or later)"))
+    func hardwareDecodesTheEncodersStream() throws {
+        let width = 640, height = 384, count = 12
+        let frames = VTVideoTests.makeFrames(width: width, height: height, count: count)
+        let out = try encode(frames, width: width, height: height)
+        let decoder = VTRegionDecoder()
+        try #require(decoder.start(codec: VideoCodec.av1, config: try #require(out.first?.config),
+                                   width: width, height: height))
+        var decoded = 0
+        var lastPSNR = 0.0
+        for (i, d) in out.enumerated() {
+            decoder.decode(d.data, sync: d.sync) { pixels, bytesPerRow in
+                decoded += 1
+                lastPSNR = VTVideoTests.psnr(frames[i], tightPixels(pixels, bytesPerRow: bytesPerRow,
+                                                                    width: width, height: height), width: width)
+            }
+        }
+        decoder.stop()
+        #expect(decoded == count, "every frame decodes in hardware")
+        #expect(lastPSNR > 30, "PSNR \(lastPSNR)")
+        #expect(VTRegionDecoder.supportedCodecs(av1: true) == [VideoCodec.av1, VideoCodec.hevc])
+        #expect(VTRegionDecoder.supportedCodecs(av1: false) == [VideoCodec.hevc])
+    }
+
+    /// The probe's built-in av1C is what the vendored libaom writes for a
+    /// 64×64 stream, so it stays a stream this decoder would really get.
+    @Test func theDecodeProbeIsLibaomsRecord() throws {
+        let encoder = AOMRegionEncoder(callbackQueue: DispatchQueue(label: "test.av1.probe"))
+        var config: [UInt8]?
+        let arrived = DispatchSemaphore(value: 0)
+        try #require(encoder.start(width: 64, height: 64) { _, _, record in
+            if let record { config = record }
+            arrived.signal()
+        })
+        let frame = [UInt8](repeating: 128, count: 64 * 64 * 4)
+        frame.withUnsafeBytes { encoder.encode(bgra: $0, forceSync: true, timeUS: 0) }
+        #expect(arrived.wait(timeout: .now() + 30) == .success)
+        encoder.stop()
+        #expect(config == VTRegionDecoder.probeAV1C)
+    }
+
     /// The engine's pacing counts one delivery per submit, so a starved
     /// buffer pool still answers (with an empty frame).
     @Test func everySubmitIsAnswered() throws {

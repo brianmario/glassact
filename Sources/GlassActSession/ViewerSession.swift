@@ -23,14 +23,18 @@ public final class ViewerSession: @unchecked Sendable {
         /// Advertise hardware HEVC video regions. Off, the host sends only
         /// lossless tiles — every settled pixel is exact (what an agent wants).
         public var video: Bool
+        /// Also advertise AV1 (when this Mac decodes it in hardware): the
+        /// Viewer's opt-in. The Host prefers it whenever it's offered.
+        public var av1: Bool
         /// Sent to the host (VIEWER_INFO) so its approved-viewers list can
         /// name this computer. Empty = say nothing.
         public var deviceName: String
 
-        public init(cursorMetadata: Bool = true, video: Bool = true,
+        public init(cursorMetadata: Bool = true, video: Bool = true, av1: Bool = false,
                     deviceName: String = ViewerSession.computerName) {
             self.cursorMetadata = cursorMetadata
             self.video = video
+            self.av1 = av1
             self.deviceName = deviceName
         }
     }
@@ -106,7 +110,7 @@ public final class ViewerSession: @unchecked Sendable {
                                           datagramPort: datagramPort, identity: identity, queue: queue)
         engine = ViewerEngine(transport: transport,
                               videoDecoderFactory: options.video ? { VTRegionDecoder() } : nil,
-                              supportedVideoCodecs: options.video ? VTRegionDecoder.supportedCodecs : [],
+                              supportedVideoCodecs: options.video ? VTRegionDecoder.supportedCodecs(av1: options.av1) : [],
                               advertiseCursor: options.cursorMetadata)
         engine.deviceName = options.deviceName
     }
