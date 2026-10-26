@@ -328,6 +328,15 @@ public final class ViewerSession: @unchecked Sendable {
             DispatchQueue.main.async { MainActor.assumeIsolated { done(grid) } }
         }
     }
+
+    /// Main-thread poll: true once anything has reached the canvas (a tile, a
+    /// keyframe or a video frame), so a window shown now isn't black.
+    public func hasPicture(_ done: @escaping @MainActor (Bool) -> Void) {
+        queue.async { [engine] in
+            let ready = engine.milestones.firstContentUS != 0
+            DispatchQueue.main.async { MainActor.assumeIsolated { done(ready) } }
+        }
+    }
 }
 
 /// Carries a non-Sendable value across a queue hop the code has proven safe
