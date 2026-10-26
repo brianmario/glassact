@@ -456,7 +456,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 onHostNotice?(code)
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
-                 .viewerInfo, .syncRequest, .received:
+                 .viewerInfo, .syncRequest, .received, .viewerBye:
                 break // viewer-originated / not addressed to the viewer
             }
         }

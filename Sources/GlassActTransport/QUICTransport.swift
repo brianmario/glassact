@@ -116,6 +116,8 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     private let queue: DispatchQueue
     private var started = false
     private var finished = false
+    /// `close(after:)` ended the control stream: nothing more goes on it.
+    private var closing = false
 
     // Control tunnel
     private var controlGroup: NWConnectionGroup?
@@ -371,11 +373,28 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
         }
     }
 
+    /// Graceful local end: `last` goes out as the control stream's final
+    /// bytes, then the stream ends, and the peer gets `grace` to hang up
+    /// before the connection is torn down here — cancelling at once could
+    /// discard `last` before QUIC sent it. Ends like `cancel()`.
+    public func close(after last: Data, grace: TimeInterval = 1) {
+        queue.async { [self] in
+            guard !finished, !closing else { return }
+            guard controlReady, let control else { return cancel() }
+            closing = true
+            if lastFailReason.isEmpty { lastFailReason = "closed locally" }
+            control.send(content: last, contentContext: .finalMessage, isComplete: true,
+                         completion: .contentProcessed { _ in })
+            // Strong: the owner may drop this transport now; it lives out the grace.
+            queue.asyncAfter(deadline: .now() + grace) { [self] in teardown(.cancelled) }
+        }
+    }
+
     // MARK: - GlassActTransport
 
     public func sendControl(_ data: Data) {
         queue.async { [self] in
-            guard !finished else { return }
+            guard !finished, !closing else { return }
             if controlReady, let control {
                 control.send(content: data, completion: .contentProcessed { [weak self] error in
                     // The reliable stream failing is the session failing.

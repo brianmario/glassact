@@ -34,6 +34,7 @@ enum WireCompatSamples {
         .syncRequest(region: 1, generation: 9),
         .received(bytes: 1_000_000, tUS: 2_000_000),
         .hostNotice(code: HostNotice.sessionOffScreen),
+        .viewerBye(reason: ViewerBye.disconnected),
     ]
 
     static let video: [VideoMessage] = [
