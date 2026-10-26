@@ -576,6 +576,9 @@ public final class HostEngine: @unchecked Sendable {
     public var onAgentState: ((_ active: Bool, _ label: String) -> Void)?
     /// VIEWER_INFO: the computer the viewer runs on (display only).
     public var onViewerInfo: ((_ name: String) -> Void)?
+    /// What the viewer is told about the host (`HostNotice`), kept so a
+    /// viewer that connects while one is in force hears it too.
+    private var hostNotice = HostNotice.none
     /// Agents: UI_TREE_REQUEST — the app answers with `sendUITree`.
     public var onUITreeRequest: ((_ requestID: UInt32, _ windowID: UInt32, _ maxNodes: Int) -> Void)?
     /// Agents: answer a UI_TREE_REQUEST. A tree too big for one control
@@ -598,6 +601,15 @@ public final class HostEngine: @unchecked Sendable {
     /// under maxBodyLength — the app caps count and thumbnail size.
     /// Single-window mode, host → viewer: the shared window is gone, the session is over
     /// (WINDOW_CONTROL endSession, the viewer's own close message, reversed).
+    /// Tell the viewer (now, and any that connects later) a `HostNotice`.
+    /// Sent only on a change: an unchanged notice costs nothing (INV-10).
+    public func setHostNotice(_ code: UInt8) {
+        guard code != hostNotice else { return }
+        hostNotice = code
+        guard state == .running else { return }
+        sendControl(.hostNotice(code: code))
+    }
+
     public func sendSharedWindowClosed() {
         sendControl(.windowControl(action: WindowAction.endSession, width: 0, height: 0))
     }
@@ -819,6 +831,7 @@ public final class HostEngine: @unchecked Sendable {
                         governor.start(roundTripUS: nowUS - helloSentUS, nowUS: nowUS)
                     }
                     lastPingUS = nowUS
+                    if hostNotice != HostNotice.none { sendControl(.hostNotice(code: hostNotice)) }
                 }
             case let .ack(frameSeq, dgramCnt, bitmap):
                 lastControlNowUS = nowUS
@@ -879,7 +892,7 @@ public final class HostEngine: @unchecked Sendable {
                 linkEstimate.noteReceived(bytes: bytes, viewerTUS: tUS, nowUS: nowUS, queued: queued)
             case let .syncRequest(region, generation):
                 noteSyncRequest(region: region, generation: generation)
-            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope:
+            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice:
                 break // host-originated / not addressed to the host
             }
         }

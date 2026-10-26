@@ -425,6 +425,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private let logInbox = ViewerLogInbox()
 
     private var displayWatchRegistered = false
+    /// This login session is off the screen (fast user switching: another
+    /// user, or the login window for one, has it). Capture can't see the
+    /// screen meanwhile, so the viewer is told why its picture froze
+    /// (HOST_NOTICE). Main thread.
+    private var sessionOffScreen = false
 
     /// The physical display the Host shares: the one capture started on,
     /// or the main display before that (main-thread).
@@ -449,6 +454,24 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.capture.displayMayBeBack() }
         }
+        for (name, offScreen) in [(NSWorkspace.sessionDidResignActiveNotification, true),
+                                  (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.sessionOffScreenChanged(offScreen) }
+            }
+        }
+    }
+
+    /// Main thread. Fast user switching took this session off the screen, or
+    /// gave it back.
+    private func sessionOffScreenChanged(_ offScreen: Bool) {
+        guard offScreen != sessionOffScreen else { return }
+        sessionOffScreen = offScreen
+        onStatus(offScreen ? "this session went off the screen (another user) — telling the viewer"
+                           : "this session is back on the screen")
+        if !offScreen { capture.displayMayBeBack() }
+        let code = offScreen ? HostNotice.sessionOffScreen : HostNotice.none
+        encodeQueue.async { self.engine?.setHostNotice(code) }
     }
 
     /// Main thread. One display's reconfiguration finished.
@@ -2338,6 +2361,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             videoCodecPreference: AOMRegionEncoder.isAvailable ? [VideoCodec.av1, VideoCodec.hevc] : [VideoCodec.hevc],
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
+        if sessionOffScreen { engine.setHostNotice(HostNotice.sessionOffScreen) }
         // Always advertise single-window support (Screen Recording is a
         // runtime gate handled at enumeration — gating the cap would deadlock).
         // A settled geometry is only final while the display is still in the

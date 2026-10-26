@@ -445,6 +445,11 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             SessionLog.shared.text("status", text)
             Self.log.notice("\(text, privacy: .public)")
         }
+        hostNoticeText = nil
+        controller.onHostNotice = { [weak self, weak controller] code in
+            guard let self, let controller, self.controller === controller else { return }
+            self.hostNoticeChanged(code)
+        }
         // Identity-checked: a late failure from a controller we already
         // replaced must not tear down the new session.
         controller.onConnectionFailed = { [weak self, weak controller] in
@@ -1066,6 +1071,24 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
     }
 
+    /// What the host's HOST_NOTICE asks this window to show (nil: nothing).
+    private var hostNoticeText: String?
+
+    private func hostNoticeChanged(_ code: UInt8) {
+        switch code {
+        case HostNotice.sessionOffScreen:
+            note("the host's session went off the screen (another user)")
+            hostNoticeText = "This Mac switched to another user, so its screen can't be shared right now. "
+                + "Switch back at the Mac, or use Screen Sharing to reach its login window."
+        case HostNotice.none:
+            if hostNoticeText != nil { note("the host's session is back on the screen") }
+            hostNoticeText = nil
+        default:
+            return // a newer host's notice this viewer doesn't know
+        }
+        (canvasWindow?.contentView as? CanvasView)?.showNotice(hostNoticeText)
+    }
+
     private func agentActiveChanged(_ active: Bool) {
         guard agentActive != active else { return }
         agentActive = active
@@ -1186,6 +1209,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             canvas.onSizeSettled = { [weak self] _ in self?.scheduleScaleRefit() }
         }
         window.contentView = canvas
+        canvas.showNotice(hostNoticeText)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(canvas) // keyboard/mouse capture
         window.acceptsMouseMovedEvents = true
