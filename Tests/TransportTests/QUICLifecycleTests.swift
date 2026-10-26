@@ -50,6 +50,42 @@ import GlassActTestSupport
         #expect(clientLog.terminal.count == 1 && hostLog.terminal.count == 1, "exactly one terminal state each")
     }
 
+    /// close(after:) (the viewer's goodbye): the last message reaches the
+    /// peer ahead of a clean end of the stream, and each side ends once.
+    @Test func closeAfterDeliversTheLastMessage() throws {
+        let (identity, fingerprint) = try QUICLoopbackTests.makeTestIdentity()
+        let clientLog = StateLog(), hostLog = StateLog()
+        let gotControl = DispatchSemaphore(value: 0)
+        let received = NSMutableData()
+        let lock = NSLock()
+        guard let session = try QUICLoopbackTests.makeSession(
+            fingerprint: fingerprint, identity: identity,
+            configureHost: { host in
+                host.onState = { hostLog.append($0) }
+                host.onControl = { data in lock.lock(); received.append(data); lock.unlock() }
+            },
+            configureClient: { client in
+                client.onState = { clientLog.append($0) }
+                client.onControl = { _ in gotControl.signal() }
+            }
+        ) else {
+            Issue.record("session failed to become ready")
+            return
+        }
+        defer { session.server.cancel() }
+        session.host.sendControl(Data("hello".utf8)) // materializes the viewer's control stream
+        #expect(gotControl.wait(timeout: .now() + 5) == .success)
+        session.client.close(after: Data("bye".utf8))
+        session.client.sendControl(Data("late".utf8)) // after the end: dropped
+        #expect(waitUntil(5) { hostLog.terminal.count == 1 }, "the peer must observe the close")
+        lock.lock(); let bytes = received as Data; lock.unlock()
+        #expect(bytes == Data("bye".utf8))
+        #expect(session.host.peerClosedCleanly)
+        #expect(waitUntil(5) { clientLog.terminal.count == 1 })
+        usleep(1_200_000) // past the grace: still exactly one terminal state each
+        #expect(clientLog.terminal.count == 1 && hostLog.terminal.count == 1)
+    }
+
     /// Idle = zero bytes (INV-10) is safe only if QUIC's own keepalive holds
     /// both tunnels open: a session with no application traffic at all for
     /// longer than the idle timeout must still be alive and deliver on both

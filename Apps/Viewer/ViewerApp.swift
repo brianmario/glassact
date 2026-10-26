@@ -1147,11 +1147,13 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     /// Quit closes the session cleanly (the host otherwise waits out its
-    /// liveness timeout before accepting the next viewer).
+    /// liveness timeout before accepting the next viewer), saying why: the
+    /// wait (normally one round trip) lets the goodbye out before exit.
     func applicationWillTerminate(_ notification: Notification) {
         controller?.agentDriver?.endAgentSession()
         agentServer?.stop()
-        controller?.stop()
+        controller?.stop(bye: ViewerBye.quit)
+        controller?.waitUntilClosed(timeout: 1)
         SessionLog.shared.write("quit")
         SessionLog.shared.flush() // the session_end summary must reach disk
     }

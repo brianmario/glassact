@@ -434,7 +434,8 @@ final class ViewerController: @unchecked Sendable {
     }
 
     /// Main thread. Deliberate end of the session: no onConnectionFailed.
-    func stop() {
+    /// `bye`: why, for the host (`ViewerBye`).
+    func stop(bye: UInt8 = ViewerBye.disconnected) {
         stopTelemetry(reason: "stopped")
         clipboardTimer?.invalidate(); clipboardTimer = nil
         queue.async { [self] in
@@ -443,8 +444,12 @@ final class ViewerController: @unchecked Sendable {
                 sessionActivity = nil
             }
         }
-        session.stop()
+        session.stop(bye: bye)
     }
+
+    /// Blocks (at most `timeout` s) until the connection has closed: lets a
+    /// quitting Viewer's goodbye reach the host.
+    func waitUntilClosed(timeout: Double) { session.waitUntilClosed(timeout: timeout) }
 
     /// Main thread: the configured canvas grid, synchronously — waits for
     /// the apply queue, so only for one-off events (a geometry change), never

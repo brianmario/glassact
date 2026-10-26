@@ -284,6 +284,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x1B | SYNC_REQUEST | V→H | region u8, generation u32. The viewer can't decode that region and asks for a sync frame (§4.6, §5) |
 | 0x1C | RECEIVED | V→H | bytes u64, tUS u64: datagram and video-stream bytes received this session, at the viewer's clock. Sent only to a host advertising `deliveryReports` (§3.8), at most every 250 ms, and only when the count changed (§4.9) |
 | 0x1D | HOST_NOTICE | H→V | code u8 (`HostNotice`: 0 none, 1 the host's session is off the screen). Sent on a change, and at the handshake while one is in force. Viewers ignore codes they don't know |
+| 0x1E | VIEWER_BYE | V→H | reason u8 (`ViewerBye`: 1 its user disconnected or closed the window, 2 its user quit, 3 nothing from the host, redialing, 4 the session failed at the viewer, redialing). The control stream's last message: the viewer then ends the stream and gives the host 1 s to hang up before closing (a quitting Viewer waits that long). Hosts treat codes they don't know as no goodbye |
 
 **Cadence:**
 - **ACKs:**
@@ -1393,13 +1394,17 @@ automatic checks.
 - **When a viewer leaves**, the Host puts the Mac back the way it was:
   - The display comes back first: its own mode, the virtual display gone,
     or the shared window back in place. That happens at once when the
-    viewer left on purpose (it closed the control stream cleanly:
-    Disconnect, or quitting), or after 5 s when the connection dropped, in
-    case it comes back.
+    viewer left on purpose, or after 5 s when the connection dropped, in
+    case it comes back. On purpose means its VIEWER_BYE said its user
+    disconnected or quit; a goodbye from the viewer's watchdog or a failed
+    session is a drop, although that stream closes cleanly too. With no
+    goodbye (an older Viewer, or one lost on the way) a cleanly closed
+    control stream counts as on purpose. The Host logs the reason
+    ("viewer leaving — the user disconnected").
   - **Lock Screen When Viewer Leaves** then puts back a lock that was there:
     it locks only if the screen was locked when that run of sessions began
     (a reconnect within the grace keeps the first answer), so a Mac someone
-    left unlocked stays unlocked. It locks 1 s after a clean leave, once the
+    left unlocked stays unlocked. It locks 1 s after a leave on purpose, once the
     restore has settled (macOS refuses mode changes at the lock screen), or
     30 s after a dropped connection.
   - It posts ⌃⌘Q, the system's Lock Screen shortcut, and confirms the lock
