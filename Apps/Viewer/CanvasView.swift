@@ -164,6 +164,14 @@ final class CanvasView: NSView {
     /// mode the layer is an aspect-fit rect (canvas scaled to the window); in
     /// pan mode it's 1:1 with the viewport offset by the pan.
     private func layoutContent() {
+        // No implicit animations: the layer's actions turn off contents,
+        // frame, position and bounds, but not the fit transform, and on an
+        // in-session resize (auto-scale halving the capture) the new bounds
+        // applied at once while the doubled transform animated in, so the
+        // picture grew out of the lower-left corner for a quarter second.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         let cp = canvasPoints
         contentLayer.bounds = CGRect(origin: .zero, size: cp)
         contentLayer.contentsScale = backingScale

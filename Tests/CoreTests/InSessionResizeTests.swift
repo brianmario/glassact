@@ -114,4 +114,27 @@ import GlassActTestSupport
         #expect(h.settle())
         #expect(h.canvasMatchesFrame(), "the placeholder never survives the re-send")
     }
+
+    /// The same with video showing: a session that just connected shows the
+    /// pinned region's video while the canvas under it may still be black, so
+    /// the placeholder is what was on screen, video included.
+    @Test func thePlaceholderIncludesTheVideoThatWasShowing() {
+        let h = Harness(width: 512, height: 384, video: true)
+        for i in stride(from: 0, to: h.frame.bytes.count, by: 4) {
+            h.frame.bytes[i] = 0x60; h.frame.bytes[i + 1] = 0x80; h.frame.bytes[i + 2] = 0xA0; h.frame.bytes[i + 3] = 0xFF
+        }
+        h.encodeFrame() // pinned cold start: the region's first frame carries the picture
+        h.run(untilUS: h.now + 100_000)
+        #expect(h.viewer.tileShowsVideo(0), "setup: tile 0 shows video")
+        let canvasUnder = h.viewer.withCanvas { Int($0[0]) }
+        var seeded: (b: Int, g: Int, r: Int)?
+        h.viewer.onGeometryChanged = { [viewer = h.viewer] _, _ in
+            seeded = viewer.withCanvas { c in (Int(c[0]), Int(c[1]), Int(c[2])) }
+        }
+        h.reconfigure(width: 256, height: 192)
+        #expect(seeded.map { $0.b == 0x60 && $0.g == 0x80 && $0.r == 0xA0 } == true,
+                "what was on screen, scaled (canvas under the video: \(String(describing: canvasUnder))): \(String(describing: seeded))")
+        #expect(h.settle())
+        #expect(h.canvasMatchesFrame())
+    }
 }
