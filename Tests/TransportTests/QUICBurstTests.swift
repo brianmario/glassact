@@ -44,6 +44,12 @@ import GlassActTestSupport
         let got = received.load(ordering: .relaxed)
         let dropped = session.serverQueue.sync { session.host.pacingDroppedDatagrams }
         #expect(dropped == 0, "the pacing queue must hold a whole governor-sized batch")
-        #expect(got * 100 >= count * 99, "delivered \(got)/\(count)")
+        // Unpaced, about a third arrives (1347/4000, 4202/12000 on an M4 Pro,
+        // 2026-10-26). GitHub's macOS VMs lose a few percent of a
+        // paced burst now and then, with other QUIC suites running alongside
+        // (94.1–98.1 % in 3 of 100 CI runs, 2026-10-23..26; 100 % locally,
+        // even with every core busy), so the bar sits well above unpaced and
+        // below that noise.
+        #expect(got * 100 >= count * 90, "delivered \(got)/\(count)")
     }
 }
