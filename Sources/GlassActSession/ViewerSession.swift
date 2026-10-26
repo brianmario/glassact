@@ -95,6 +95,8 @@ public final class ViewerSession: @unchecked Sendable {
     private var stopped = false
     private var failureReported = false
     private var everReady = false
+    /// Signalled when the transport reaches its terminal state.
+    private let closed = DispatchSemaphore(value: 0)
 
     /// `identity`: this viewer's certificate (mutual TLS) — the host admits
     /// only fingerprints its user approved. `fingerprint` pins the host;
@@ -131,7 +133,7 @@ public final class ViewerSession: @unchecked Sendable {
             // Terminal engine failure (engine queue): tear the transport
             // down; its terminal state drives the owner's reconnect.
             self?.onStatus("session failed — \(reason)")
-            self?.transport.cancel()
+            self?.closeTransport(bye: ViewerBye.sessionFailed)
         }
         engine.onCursorPos = { [weak self] x, y, visible in
             DispatchQueue.main.async { self?.onCursorPos?(x, y, visible) }
@@ -194,6 +196,7 @@ public final class ViewerSession: @unchecked Sendable {
                 self.onTransportReady?()
                 self.onStatus("connected — waiting for HELLO")
             case .failed, .cancelled:
+                self.closed.signal()
                 self.tickTimer?.cancel()
                 self.tickTimer = nil
                 self.onTransportEnded?()
@@ -238,7 +241,7 @@ public final class ViewerSession: @unchecked Sendable {
             case .hostUnresponsive:
                 self.onStatus("host unresponsive (nothing for "
                               + "\(ViewerSessionWatchdog.livenessTimeoutUS / 1_000_000) s) — reconnecting")
-                self.transport.cancel()
+                self.closeTransport(bye: ViewerBye.hostUnresponsive)
             }
         }
         timer.resume()
@@ -246,7 +249,8 @@ public final class ViewerSession: @unchecked Sendable {
     }
 
     /// Deliberate end of the session: no onConnectionFailed. Any thread.
-    public func stop() {
+    /// `bye`: why, for the host (`ViewerBye`) — its user left, not a drop.
+    public func stop(bye: UInt8 = ViewerBye.disconnected) {
         queue.async { [self] in
             // Ordered ahead of the transport's teardown block (same queue),
             // so its .cancelled sees `stopped`.
@@ -254,7 +258,20 @@ public final class ViewerSession: @unchecked Sendable {
             tickTimer?.cancel()
             tickTimer = nil
         }
-        transport.cancel()
+        closeTransport(bye: bye)
+    }
+
+    /// Blocks until the connection has closed, at most `timeout` seconds:
+    /// lets a quitting app's VIEWER_BYE reach the host. Not on `queue`.
+    @discardableResult
+    public func waitUntilClosed(timeout: Double) -> Bool {
+        closed.wait(timeout: .now() + timeout) == .success
+    }
+
+    /// Tells the host why (VIEWER_BYE, the control stream's last message),
+    /// then closes, giving the host a moment to hang up first.
+    private func closeTransport(bye: UInt8) {
+        transport.close(after: Data(ControlMessage.viewerBye(reason: bye).encoded()))
     }
 
     // MARK: - Viewer → host (any thread → engine queue)

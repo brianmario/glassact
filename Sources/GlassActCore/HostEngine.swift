@@ -597,6 +597,8 @@ public final class HostEngine: @unchecked Sendable {
     public var onAgentState: ((_ active: Bool, _ label: String) -> Void)?
     /// VIEWER_INFO: the computer the viewer runs on (display only).
     public var onViewerInfo: ((_ name: String) -> Void)?
+    /// VIEWER_BYE: the viewer is closing the session, and why (`ViewerBye`).
+    public var onViewerBye: ((_ reason: UInt8) -> Void)?
     /// What the viewer is told about the host (`HostNotice`), kept so a
     /// viewer that connects while one is in force hears it too.
     private var hostNotice = HostNotice.none
@@ -912,6 +914,8 @@ public final class HostEngine: @unchecked Sendable {
                 onUITreeRequest?(requestID, windowID, Int(maxNodes))
             case let .viewerInfo(name):
                 onViewerInfo?(name)
+            case let .viewerBye(reason):
+                onViewerBye?(reason)
             case let .received(bytes, tUS):
                 // The smoothed reading: a PING between bursts reads empty
                 // while the link is full. Its lag after a burst only marks

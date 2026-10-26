@@ -96,6 +96,39 @@ public enum HostNotice {
     public static let sessionOffScreen: UInt8 = 1
 }
 
+/// VIEWER_BYE reasons (§3.5): why the viewer is closing the session.
+public enum ViewerBye {
+    /// Its user ended the session: Disconnect, or the session window closed.
+    public static let disconnected: UInt8 = 1
+    /// Its user quit the Viewer.
+    public static let quit: UInt8 = 2
+    /// Nothing arrived from the host for the liveness timeout; redialing.
+    public static let hostUnresponsive: UInt8 = 3
+    /// The session failed at the viewer (a protocol or decode error); redialing.
+    public static let sessionFailed: UInt8 = 4
+
+    /// Whether the viewer left on purpose: what its VIEWER_BYE said, else
+    /// (an older viewer, a code this build doesn't know, or the goodbye
+    /// lost) whether it closed the control stream cleanly.
+    public static func leftOnPurpose(bye: UInt8?, closedCleanly: Bool) -> Bool {
+        switch bye {
+        case disconnected?, quit?: true
+        case hostUnresponsive?, sessionFailed?: false
+        default: closedCleanly
+        }
+    }
+
+    public static func describe(_ reason: UInt8) -> String {
+        switch reason {
+        case disconnected: "the user disconnected"
+        case quit: "the user quit the Viewer"
+        case hostUnresponsive: "nothing from the host, reconnecting"
+        case sessionFailed: "the session failed at the viewer, reconnecting"
+        default: "reason \(reason)"
+        }
+    }
+}
+
 public enum ControlMessage: Equatable, Sendable {
     case hello(ver: UInt8, width: UInt16, height: UInt16, tileSize: UInt8, pixfmt: UInt8, caps: UInt32)
     /// geoMode 0 = no geometry request; 1 Client Resolution, 2 Scale,
@@ -285,6 +318,11 @@ public enum ControlMessage: Equatable, Sendable {
     /// user (`HostNotice`). Sent when it changes, and on connect while one is
     /// in force. Viewers ignore codes they don't know.
     case hostNotice(code: UInt8)
+    /// Viewer → host, last on the control stream before the viewer closes
+    /// it: why it's leaving (`ViewerBye`). Lets the host tell its user
+    /// leaving from a drop, which a closed stream alone can't (the viewer's
+    /// watchdog closes it cleanly too). Hosts ignore codes they don't know.
+    case viewerBye(reason: UInt8)
 
     public static let maxViewerLogChunk = 64 << 10
     public static let maxTextInputBytes = 4096
@@ -334,6 +372,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .syncRequest: 0x1B
         case .received: 0x1C
         case .hostNotice: 0x1D
+        case .viewerBye: 0x1E
         }
     }
 
@@ -513,6 +552,8 @@ public enum ControlMessage: Equatable, Sendable {
             body.writeU64(tUS)
         case let .hostNotice(code):
             body.writeU8(code)
+        case let .viewerBye(reason):
+            body.writeU8(reason)
         }
         return body.bytes
     }
@@ -691,6 +732,9 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x1D:
             guard let code = r.readU8() else { return nil }
             return .hostNotice(code: code)
+        case 0x1E:
+            guard let reason = r.readU8() else { return nil }
+            return .viewerBye(reason: reason)
         default:
             return nil
         }
@@ -699,7 +743,7 @@ public enum ControlMessage: Equatable, Sendable {
     /// Known TLV types. Everything beyond is skipped by the deframer
     /// using its declared length.
     public static func isKnownType(_ t: UInt8) -> Bool {
-        (0x01...0x1D).contains(t)
+        (0x01...0x1E).contains(t)
     }
 }
 

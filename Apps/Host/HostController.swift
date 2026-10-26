@@ -153,6 +153,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// is up right now.
     private var pendingLock: DispatchWorkItem?
     private var viewerSessionLive = false
+    /// main-thread: the current session's VIEWER_BYE reason, if it said one.
+    private var viewerBye: UInt8?
     /// main-thread: the screen was locked when the current run of viewer
     /// sessions began. Lock When Viewer Leaves only puts back a lock that
     /// was there: a Mac someone left unlocked stays unlocked. A reconnect
@@ -2462,6 +2464,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             let scope = self.agentAccess.scope()
             engine?.sendAgentScope(control: scope.control, reason: scope.reason)
         }
+        engine.onViewerBye = { [weak self] reason in
+            DispatchQueue.main.async {
+                self?.viewerBye = reason
+                self?.onStatus("viewer leaving — \(ViewerBye.describe(reason))")
+            }
+        }
         engine.onViewerInfo = { [weak self] name in
             guard let self, let peer = self.sessionTransport?.peerCertificate else { return }
             self.authorizedViewers.noteDevice(peer.fingerprint, device: name)
@@ -2702,6 +2710,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             pendingLock?.cancel()
             pendingLock = nil
             viewerSessionLive = true
+            viewerBye = nil
             holdDisplayAwake(true)
             // Capture died while nobody watched (display slept, screen
             // locked): the display is waking now — try again right away.
@@ -2724,7 +2733,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             onStatus(peer?.isAgent == true ? "agent connected" : "viewer connected")
         case .failed, .cancelled:
             let reason = transport?.lastFailReason ?? ""
-            let clean = transport?.peerClosedCleanly ?? false
+            let closedCleanly = transport?.peerClosedCleanly ?? false
             let hadSession = viewerSessionLive
             viewerSessionLive = false
             viewerConnectedAt = nil
@@ -2737,8 +2746,20 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             endSession()
             server?.resetSession()
             onStatus("viewer disconnected" + (reason.isEmpty ? "" : " — \(reason)"))
-            if isRunning { scheduleDisplayRestore(clean: clean) }
-            if isRunning && hadSession && !agentLeft { scheduleLockAfterDisconnect(clean: clean) }
+            // Decide after the engine has read everything that arrived: its
+            // VIEWER_BYE travels transport → encodeQueue → main, while this
+            // state came straight to main, so hop the same way to follow it.
+            encodeQueue.async { [weak self] in
+                DispatchQueue.main.async {
+                    // A viewer back meanwhile cancels both anyway.
+                    guard let self, !self.viewerSessionLive else { return }
+                    let bye = self.viewerBye
+                    self.viewerBye = nil
+                    let onPurpose = ViewerBye.leftOnPurpose(bye: bye, closedCleanly: closedCleanly)
+                    if self.isRunning { self.scheduleDisplayRestore(clean: onPurpose) }
+                    if self.isRunning && hadSession && !agentLeft { self.scheduleLockAfterDisconnect(clean: onPurpose) }
+                }
+            }
         case .connecting:
             break
         }

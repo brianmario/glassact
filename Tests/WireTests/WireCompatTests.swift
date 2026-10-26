@@ -39,6 +39,7 @@ import GlassActWire
         "1b050109000000",
         "1c1040420f000000000080841e0000000000",
         "1d0101",
+        "1e0101",
     ]
     static let video = [
         "01120102000000000000000005d0020103010203",
@@ -63,7 +64,7 @@ import GlassActWire
 
     @Test func everyTypeIsPinned() {
         #expect(WireCompatSamples.control.count == Self.control.count)
-        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1D)),
+        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1E)),
                 "a control type without a fixture; add one")
         #expect(WireCompatSamples.video.count == Self.video.count)
     }
