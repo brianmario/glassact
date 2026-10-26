@@ -182,6 +182,7 @@ the numbers and the reasoning.
 | Switch a live region's codec in place | rejected | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
 | Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
+| VP9 (libvpx real-time) instead of AV1 | rejected | ~2 dB worse on text at equal bytes, 2.5× the bytes on scrolling, frame sizes no steadier; no Apple hardware decode | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | SVT-AV1 real-time at session size (2900 px) | rejected | fast now (157–204 fps) but ~10 dB worse than libaom at similar size | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
@@ -392,6 +393,34 @@ On the scroll-win clip at 2 Mbit/s:
 About 10 dB worse at similar size. Its strengths (lookahead, frame
 reordering, slow search) are the offline tools a live share can't use. The
 cursor-drag half of this run didn't happen (its source clip was missing).
+
+**VP9 (libvpx 1.x through ffmpeg).** 266–300 frames of each trace at
+2900×1632, CBR at 0.8 Mbit/s (AV1's aim on a 2 Mbit/s link), every encoder
+real-time with no lag, a 1 s buffer, the key-frame cap at 1500 % and
+quantizer ceiling 42: libaom speed 9 with screen tuning (the Host's
+settings, via `aomenc`) against libvpx speed 7 with `-tune-content screen
+-aq-mode 3` (its real-time speeds stop at 8). The ceiling binds at these
+rates, so both overshoot on scrolling and photos: this compares them at
+the product's quality floor.
+
+| trace | AV1: total · PSNR | VP9: total · PSNR | inter p95 / max, AV1 vs VP9 |
+|---|---|---|---|
+| typing-cc | 594 KB · 41.5 dB | 617 KB · 39.2 dB | 4.1 / 12.3 vs 5.0 / 15.4 KB |
+| cursor-drag | 657 KB · 42.2 dB | 624 KB · 40.0 dB | 3.9 / 9.6 vs 4.9 / 14.5 KB |
+| scroll-win | 1.9 MB · 39.6 dB | 4.7 MB · 38.1 dB | 15.4 / 32.5 vs 44.5 / 51.7 KB |
+| photos | 5.8 MB · 34.1 dB | 6.2 MB · 34.0 dB | 47 / 172 vs 51 / 167 KB |
+
+VP9 is ~2 dB worse on text at about the same bytes, and on scrolling
+spends 2.5× the bytes for less. Its frame sizes aren't steadier either
+(larger p95 and largest inter frames on all three text traces), so it
+wouldn't help a thin link. It encodes 2–3× faster (228–455 fps against
+libaom's 137–190), which isn't the constraint, and its key frames are
+smaller: typing-cc 164 KB against AV1's 374 KB (hardware HEVC through
+ffmpeg: 140 KB). AV1's large key frames are what hurt it on thin links,
+but a tighter cap leaves the first frame unreadable ("AV1 back, as a
+Viewer opt-in": 3× gave worst-frame SSIMULACRA2 30). VP9 has no hardware
+decode on Apple silicon (`VTIsHardwareDecodeSupported('vp09')` is false
+on an M4 Pro), so it would be software on both ends.
 
 ### Link estimate from the viewer: a fresh queue and a capacity ceiling (2026-10-25)
 
