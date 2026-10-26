@@ -19,6 +19,13 @@ jobs:
     # availability mistakes fail the build here too.
     runs-on: xcode-27
     timeout-minutes: 30
+    env:
+      # The suites tagged `.quic`: real QUIC sessions on loopback, run in
+      # real time. SwiftPM runs test binaries in parallel, and alongside the
+      # heavy engine tests a hosted VM starves them (a burst arriving 94 %
+      # whole, a session not converging in 25 s), so they get a step of
+      # their own. A new real-network suite belongs here too.
+      QUIC_SUITES: AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
@@ -33,7 +40,9 @@ jobs:
         # of lag. Hosted VMs can't drive the relay hard enough for that
         # (byte-gate p95 ~400 ms instead of > 1 s), so it only runs locally
         # (`just test`).
-        run: swift test --skip VideoSendGateTests
+        run: swift test --skip "VideoSendGateTests|$QUIC_SUITES"
+      - name: Real-QUIC tests
+        run: swift test --filter "$QUIC_SUITES"
 
   apps:
     name: Apps
