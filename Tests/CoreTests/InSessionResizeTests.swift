@@ -91,4 +91,27 @@ import GlassActTestSupport
         #expect(h.settle(maxSimMS: 240_000))
         #expect(h.canvasMatchesFrame(), "byte-exact after a faulted in-session resize")
     }
+
+    /// Until the host's re-sent tiles land, the resized canvas shows the old
+    /// picture scaled to the new size, not black (auto-scale halves the
+    /// capture mid-session; on a thin link the re-send takes seconds). The
+    /// placeholder is display-only: it still settles byte-exact to the new
+    /// frame (black here, so every tile must have been replaced).
+    @Test func theResizedCanvasStartsFromTheOldPicture() {
+        let h = Harness(width: 512, height: 384)
+        for i in stride(from: 0, to: h.frame.bytes.count, by: 4) {
+            h.frame.bytes[i] = 0x60; h.frame.bytes[i + 1] = 0x80; h.frame.bytes[i + 2] = 0xA0; h.frame.bytes[i + 3] = 0xFF
+        }
+        h.encodeFrame()
+        #expect(h.settle())
+        var seeded: (b: Int, g: Int, r: Int)?
+        h.viewer.onGeometryChanged = { [viewer = h.viewer] _, _ in
+            seeded = viewer.withCanvas { c in (Int(c[0]), Int(c[1]), Int(c[2])) }
+        }
+        h.reconfigure(width: 256, height: 192)
+        #expect(seeded.map { $0.b == 0x60 && $0.g == 0x80 && $0.r == 0xA0 } == true,
+                "the old picture, scaled: \(String(describing: seeded))")
+        #expect(h.settle())
+        #expect(h.canvasMatchesFrame(), "the placeholder never survives the re-send")
+    }
 }

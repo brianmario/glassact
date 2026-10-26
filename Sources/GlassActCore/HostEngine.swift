@@ -947,7 +947,7 @@ public final class HostEngine: @unchecked Sendable {
             pingNonce &+= 1
             sendControl(.ping(nonce: pingNonce, tUS: sendStampUS(nowUS)))
             lastPingUS = nowUS
-            evaluateScalePressure()
+            evaluateScalePressure(nowUS: nowUS)
             // The next region forms on what this allows (`allowedVideoCodecs`).
             if linkRoom.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
                                    recentCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
@@ -976,12 +976,24 @@ public final class HostEngine: @unchecked Sendable {
     public static let autoScaleThinVideoSeconds = ScalePressure.thinVideoSeconds
     private var scalePressure = ScalePressure()
 
-    private func evaluateScalePressure() {
+    /// The viewer-reported link for the resolution rung: the recent queued
+    /// capacity, but never under what the link delivered in the last ~10 s
+    /// (a lower bound on it). A stall queues data while almost nothing
+    /// arrives, so on its own it reads as a very thin link: in the lounge, a
+    /// few seconds' stall right after 5.4 Mbit/s fired the rung. 0 without a
+    /// queued reading.
+    func thinLinkEvidence(nowUS: UInt64) -> Int {
+        let capacity = linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS)
+        return capacity == 0 ? 0 : max(capacity, linkEstimate.deliveredBytesPerSecond(nowUS: nowUS))
+    }
+
+    private func evaluateScalePressure(nowUS: UInt64) {
         if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
                                     severeAckDelayUS: Self.governorSevereAckDelayUS,
                                     videoLinkMeasurements: videoRate.linkMeasurements,
                                     videoRateBytesPerSecond: videoRate.rate,
                                     videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
+                                    linkCapacityBytesPerSecond: thinLinkEvidence(nowUS: nowUS),
                                     pixels: grid.width * grid.height) {
             onScalePressureConstrained?()
         }

@@ -816,6 +816,13 @@ capture for the rest of the session (`ScalePressure`) after either:
   keeps a 5K capture on ordinary home Wi-Fi at native resolution. Pinned video can carry a thin
   link's motion while the tile path stays quiet, so the ACK-delay rule
   alone can take tens of seconds (45 s on plane Wi-Fi).
+- 5 s of the viewer-reported link capacity (`LinkEstimate`, queued spans
+  in the last ~10 s) under the same two bars, counting only seconds with a
+  reading, and never under what the link delivered in the last ~10 s (a
+  stall queues data while almost nothing arrives, and alone reads as a
+  thin link). The video rule needs a window in which video stayed
+  backlogged, and a send gate that skips frames keeps it from backing up:
+  in an airport lounge at ~0.3 Mbit/s neither older rule fired.
 
 ### 4.10 Session, geometry and windows
 
@@ -833,7 +840,11 @@ session never redials.
   re-offers HELLO with `geometryFinal`. If the geometry already matches, it
   re-offers on the same connection.
 - In-session changes rebuild the host engine with seq continuity, and the
-  viewer reconfigures with `tileSeq` reset.
+  viewer reconfigures with `tileSeq` reset. Its new canvas starts as the old
+  one scaled to the new size, not black: the host re-sends every tile, which
+  on a thin link takes seconds (auto-scale, §4.9). Nothing references those
+  pixels (DELTA checks the base's hash, the tile cache resets, SCROLL needs
+  acked tiles), so the canvas still converges exactly.
 - **Virtual display** (mode 4):
   - Uses the CGVirtualDisplay SPI: HiDPI 2×, up to 3840×2400 pt, mirrored
     `.forAppOnly`, so macOS undoes it when the Host exits.
