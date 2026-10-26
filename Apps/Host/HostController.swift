@@ -2507,6 +2507,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         engine.onScalePressureConstrained = { [weak self] in
             DispatchQueue.main.async { self?.handleScalePressureConstrained() }
         }
+        engine.onVideoEncoderStalled = { [weak self] in
+            DispatchQueue.main.async {
+                self?.onStatus("video encoder stopped answering — lossless tiles for the rest of this session")
+            }
+        }
         // Terminal engine failure: end the transport; its terminal state
         // (identity-checked on main) tears the session down.
         engine.onFailed = { [weak self, weak transport] reason in

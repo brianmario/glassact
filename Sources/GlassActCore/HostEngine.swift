@@ -38,6 +38,9 @@ public struct HostStats: Sendable {
     /// `videoMaxPendingFrames` in flight: the encoder, not the link, is
     /// behind.
     public var videoEncoderFullSkips = 0
+    /// Sessions' video given up because a frame stayed in the encoder past
+    /// `HostEngine.videoEncoderStallUS` (0 or 1 per engine).
+    public var videoEncoderStalls = 0
     /// Regions formed on another codec because the link had no room for the
     /// preferred AV1 (`LinkRoomPolicy`).
     public var videoRegionsWithoutAV1 = 0
@@ -303,6 +306,14 @@ public final class HostEngine: @unchecked Sendable {
     var regionPixels: UnsafeMutableRawBufferPointer?
     var regionScratch: UnsafeMutableRawBufferPointer?
     var regionFramesPending = 0
+    /// When the oldest frame still in the encoder went in (engine time); 0
+    /// with none pending.
+    var regionPendingSinceUS: UInt64 = 0
+    /// The encoder stopped answering this session (`checkEncoderStall`):
+    /// no more regions form; lossless tiles carry everything.
+    var videoStalled = false
+    /// Video was given up for the session (engine queue).
+    public var onVideoEncoderStalled: (() -> Void)?
     /// Submit times of the frames in flight, oldest at `regionSubmitHead`
     /// (deliveries come back in order). Fixed size: no allocation per frame.
     var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
@@ -926,6 +937,7 @@ public final class HostEngine: @unchecked Sendable {
     /// Timeout resolution + PING cadence (1/s). Call regularly.
     public func tick(nowUS: UInt64) {
         resolveTimeouts(nowUS: nowUS)
+        checkEncoderStall(nowUS: nowUS)
         // Video: captures may stop entirely (video paused on an otherwise-static
         // screen) — quiescence dissolve must not depend on encode ticks.
         // Scaled by the same adaptive patience as the tick-based limit: an
