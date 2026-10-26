@@ -352,6 +352,14 @@ private struct ProgressPanel: View {
                                  : "The connection dropped. Trying again.")
                     .foregroundStyle(.secondary)
                 ProgressView().controlSize(.small).padding(.top, 4)
+            case .loadingPicture:
+                ProgressView().controlSize(.large)
+                    .padding(.bottom, 4)
+                Text("Loading “\(model.displayName)”’s screen…")
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                Text("Connected. The picture is on its way.")
+                    .foregroundStyle(.secondary)
             case .choosingWindow:
                 Image(systemName: "macwindow.on.rectangle")
                     .font(.system(size: 40))

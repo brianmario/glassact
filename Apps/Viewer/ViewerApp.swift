@@ -53,6 +53,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var canvasWindow: NSWindow?
     private var controller: ViewerController?
     private var configurePoll: Timer?
+    /// Connected, waiting for the first picture before showing the session
+    /// window (`presentOnFirstPicture`).
+    private var picturePoll: Timer?
+    private var picturePollInFlight = false
     /// The scheduled automatic redial, cancellable from the connect window.
     private var pendingRedial: DispatchWorkItem?
     /// When this run of approval-wait redials began (nil when not waiting).
@@ -550,8 +554,36 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                 openCanvasWindow(grid: grid, sharedWindow: false)
             }
         } else {
-            // Full display, or reconnecting after a pick → present the window.
-            openCanvasWindow(grid: grid, sharedWindow: singleWindowMode)
+            // Full display, or reconnecting after a pick → present the window
+            // once there's a picture to show.
+            presentOnFirstPicture(sharedWindow: singleWindowMode)
+        }
+    }
+
+    /// Show the session window only once the canvas has content: on a slow
+    /// link the first tiles or video frame can take seconds, and a window
+    /// shown at the handshake sat black meanwhile. The connect window says
+    /// what's happening until then. Uses the canvas as configured when the
+    /// picture arrives (an in-session resize before it only changes the size).
+    private func presentOnFirstPicture(sharedWindow: Bool) {
+        picturePoll?.invalidate()
+        model.phase = .loadingPicture
+        picturePoll = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.picturePollFired(sharedWindow: sharedWindow) }
+        }
+    }
+
+    private func picturePollFired(sharedWindow: Bool) {
+        guard !picturePollInFlight, let controller else { return }
+        picturePollInFlight = true
+        controller.hasPicture { [weak self] ready in
+            guard let self else { return }
+            self.picturePollInFlight = false
+            guard ready, self.controller === controller, self.picturePoll != nil,
+                  let grid = controller.configuredGrid() else { return }
+            self.picturePoll?.invalidate()
+            self.picturePoll = nil
+            self.openCanvasWindow(grid: grid, sharedWindow: sharedWindow)
         }
     }
 
@@ -659,6 +691,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private func endSession() {
         pendingRedial?.cancel(); pendingRedial = nil
         configurePoll?.invalidate(); configurePoll = nil
+        picturePoll?.invalidate(); picturePoll = nil
         windowPicker?.close(); windowPicker = nil
         teardownCanvasWindow()
         controller?.agentDriver?.endAgentSession()
@@ -712,6 +745,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard let grid = controller?.configuredGrid() else { return }
         note("geometry \(width)×\(height)")
         if canvasWindow == nil {
+            guard picturePoll == nil else { return } // opens at the first picture, at the size then
             openCanvasWindow(grid: grid, sharedWindow: singleWindowMode)
             if singleWindowMode { maybeRequestHostFit(grid: grid) }
         } else {
@@ -811,6 +845,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let reason = failed.lastFailureReason
         configurePoll?.invalidate()
         configurePoll = nil
+        picturePoll?.invalidate()
+        picturePoll = nil
         windowPicker?.close()
         windowPicker = nil
         teardownCanvasWindow()
