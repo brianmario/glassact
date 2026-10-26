@@ -198,6 +198,10 @@ the numbers and the reasoning.
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
 | CUBIC-style video cap recovery | kept | back to 70 % in 2.0 s instead of 9.25 s | [entry](#video-cap-cubic-style-recovery-after-a-hiccup-2026-09-29) |
 | 3 Mbit/s video cap until the link is measured | kept | p95 from connect 574–755 → 145–673 ms | [entry](#video-startup-3-mbits-cap-until-the-link-is-measured-2026-09-30) |
+| Video gate cuts on a fresh PING queue reading too (growth on the smoothed one) | kept | 3M photos 9 → 58 frames; typing unchanged | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
+| Viewer RECEIVED reports; video ≤ 0.9 × capacity from queued spans | kept | 10M photos 193 → 276 frames, queue p95 258 → 244 ms | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
+| Capacity ceiling from every span (not only queued ones) | rejected | best latency on 30 s traces, but ratchets video to the floor on long video-only stretches | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
+| Repaints yield to fresh tiles; cut video only for its own queue; bound by host-side delivery | rejected | little or no change; repaints yielding always raised typing-cc's q95 (3M 365 → 422 ms) | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
@@ -239,6 +243,89 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Link estimate from the viewer: a fresh queue and a capacity ceiling (2026-10-25)
+
+On a thin link the video gate starved video after every lossless burst
+(2 Mbit/s photos: 8 frames in 30 s, table below). `replay --timeline` shows two causes:
+
+- **A stale queue reading.** The gate's queue signal is the transport's
+  smoothed RTT − min RTT. Once video is cut to its floor few ACKs come
+  back, so a second of queue reads as present for ~20 s after it drained,
+  and the gate keeps cutting. Now a cut also needs the latest PING's RTT −
+  the minimum PING RTT (once a second, unsmoothed) over 60 ms. Growth keeps
+  the smoothed reading alone: on 10 Mbit/s scroll-win one PING per second
+  read 0 ms while the smoothed queue stood at 39–43 ms, and with growth on
+  the PING the startup ramp ran to a 17.9 Mbit/s cap (frames 444 → 389,
+  queue p95 195 → 265 ms). With fresh-for-cuts only it holds.
+- **The host can't see the link.** Its drain readings count bytes leaving
+  it, which on a deep buffer leave 2–3× faster than the link carries them.
+  The viewer now reports what it received (RECEIVED, 0x1C, every ≥ 250 ms
+  while pixels arrive, behind caps bit 2 `deliveryReports`), and
+  `LinkEstimate` makes a rate from it over ≥ 1 s of the viewer's clock (the
+  rig delivers whole video messages, and a 250 ms span read up to twice the
+  link). The capacity is the most delivered in the last 60 s over spans
+  where the smoothed queue stood ≥ 30 ms at both ends. The video rate and
+  the startup ramp's cap stay ≤ 0.9 × capacity.
+
+  The first version counted every span. That throttles video below the link
+  for good: video sent ≤ 0.9 × capacity arrives as ≤ 0.9 × capacity, so the
+  next minute's ceiling is lower, and the ratchet runs down to the floor on
+  any long video-only stretch. These traces are 30 s, too short to show it,
+  and it had the best latency for that reason (2M cursor-drag 374 frames,
+  q95 521 ms; 10M scroll-win 447, 181 ms). Spans with room read the
+  sender's rate back, so only queued spans count now. Which queue reading
+  marks them matters: with the fresh one, 10M scroll-win never marks a span
+  during the startup tile burst (it reads 0 throughout) and the ramp runs
+  away as above.
+
+HEVC (`--video vt`), `replay --mode loop`, three links: 2M = `--link-mbit 2
+--link-buffer-ms 2000 --latency 75-100 --drop 1`; 3M = `--link-mbit 3
+--link-buffer-ms 1000 --latency 30-50`; 10M = `--link-mbit 10
+--link-buffer-ms 500 --latency 30-40`. Before = `--no-fresh-queue
+--no-link-reports`. Video frames delivered · link queue p95 · last frame →
+exact. Every run settled byte-identical. M4 Pro, 5K traces.
+
+| link | trace | before | after |
+|---|---|---|---|
+| 2M | typing-cc | 11 · 520 ms · 22.6 s | 11 · 520 ms · 22.6 s |
+| 2M | cursor-drag | 321 · 532 ms · 44.3 s | 326 · 641 ms · 47.8 s |
+| 2M | scroll-win | 143 · 833 ms · 31.1 s | 208 · 736 ms · 30.3 s |
+| 2M | photos | 8 · 1345 ms · 55.2 s | 20 · 1732 ms · 58.5 s |
+| 3M | typing-cc | 12 · 365 ms · 0.05 s | 12 · 372 ms · 0.05 s |
+| 3M | cursor-drag | 278 · 403 ms · 24.4 s | 413 · 469 ms · 23.8 s |
+| 3M | scroll-win | 221 · 404 ms · 17.1 s | 247 · 423 ms · 17.1 s |
+| 3M | photos | 9 · 665 ms · 28.5 s | 58 · 998 ms · 28.5 s |
+| 10M | typing-cc | 17 · 184 ms · 0.05 s | 17 · 184 ms · 0.05 s |
+| 10M | cursor-drag | 434 · 234 ms · 8.0 s | 442 · 238 ms · 8.0 s |
+| 10M | scroll-win | 444 · 195 ms · 8.1 s | 483 · 219 ms · 8.1 s |
+| 10M | photos | 193 · 258 ms · 11.1 s | 276 · 244 ms · 11.1 s |
+
+Video delivers more frames on every trace with motion: 2–7× on photos at 2
+and 3 Mbit/s, where the old gate left the picture nearly frozen. Typing is
+unchanged on every link. **Regressions over 10 %, and why:** the link queue's
+p95 rises on 2M cursor-drag (+20 %), 2M photos (+29 %), 3M cursor-drag
+(+16 %), 3M photos (+50 %) and 10M scroll-win (+12 %). The queue carries the
+video the old gate refused, and the p95 is over the session's busiest
+traffic; on the trace where latency is what a person feels (typing-cc) it
+doesn't move. The 2M cells also settle 1–3 s later (more video bytes ahead
+of the final tiles).
+
+Also measured, not kept:
+- **Headroom 0.8** instead of 0.9: 2M cursor-drag 280 frames (fewer than
+  before), 3M photos 26; the q95s drop only 0–13 %.
+- **Fresh reading for probes too** (measured-mode growth): equal or worse,
+  10M photos 299 → 215 frames.
+- **Repaints yield to fresh tiles** (`owed-yield`): while a region is live,
+  identical on all 12 cells; always, 3M cursor-drag 278 → 352 frames but
+  typing-cc's q95 rises at 3M (365 → 422 ms) and 10M (184 → 201 ms).
+- **Cut video only for its own queue** (attribute the queue to video by its
+  share of bytes): byte-identical on every cell but 10M cursor-drag (434 →
+  452 frames, q95 234 → 258 ms).
+- **Bound the rate by the host's own delivered readings** (instead of the
+  viewer's): identical to before alone; with the fresh queue, 2M cursor-drag
+  391 → 436 frames but q95 1730 → 1232 ms, every other cell unchanged.
+  The viewer's reports do more (2M cursor-drag q95 641 ms).
 
 ### AV1 back, as a Viewer opt-in (2026-10-25)
 

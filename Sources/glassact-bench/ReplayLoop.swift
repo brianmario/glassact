@@ -71,6 +71,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                           videoEncoderFactory: encoderFactory,
                           videoCodecPreference: hostCodecs)
     if opts.has("no-handoff") { host.overlayHandoff = false }
+    if opts.has("no-fresh-queue") { host.freshQueueSignal = false }
+    if opts.has("no-link-reports") { host.requestDeliveryReports = false }
     if opts.has("handoff-ms") { host.handoffStillUS = UInt64(opts.int("handoff-ms", 1000)) * 1000 }
     if opts.has("limit-mbit") { host.rateLimit = .megabits(opts.int("limit-mbit", 25)) }
     if opts.has("vp8l-effort") { host.vp8lEffort = Int32(opts.int("vp8l-effort", 4)) }
@@ -320,6 +322,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     viewer applied \(viewer.stats.videoFramesApplied)  undecodable \(viewer.stats.videoDecodeFailures)  \
     sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))  \
     gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)  \
+    link: \(host.linkReports) reports, capacity \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6)) Mbit/s  \
     gate at end: rate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s, \
     \(host.videoRate.linkMeasurements) link measurements, \(host.videoRate.backoffs) backoffs, \
     startup cap \(host.videoRate.startupCap.map { String(format: "%.1f Mbit/s", Double($0) / 1e6) } ?? "none")

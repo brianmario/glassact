@@ -157,6 +157,23 @@ public final class HostEngine: @unchecked Sendable {
     public private(set) var state: EngineState = .idle
     public internal(set) var stats = HostStats()
     public internal(set) var srttUS: UInt64 = 0
+    /// The latest PING round trip, unsmoothed, when it came back, and the
+    /// best seen: a queueing reading that's at most a second old.
+    var pingRTTLatestUS: UInt64 = 0
+    var pingRTTAtUS: UInt64 = 0
+    var pingRTTMinUS: UInt64 = .max
+    /// The video gate also cuts on the latest PING's queue reading, not only
+    /// the transport's smoothed one (`videoPingQueueUS`). Off only to
+    /// measure against (the bench).
+    public var freshQueueSignal = true
+    /// What the link delivers, from the viewer's RECEIVED reports, which
+    /// this host asks for in HELLO (`WireCaps.deliveryReports`). Off only to
+    /// measure against (the bench).
+    public var requestDeliveryReports = true
+    var linkEstimate = LinkEstimate()
+    public var linkDeliveredBytesPerSecond: Int { linkEstimate.deliveredBytesPerSecond(nowUS: lastEncodeNowUS) }
+    public var linkCapacityBytesPerSecond: Int { linkEstimate.capacityBytesPerSecond(nowUS: lastEncodeNowUS) }
+    public var linkReports: Int { linkEstimate.reports }
 
     let transport: any GlassActTransport
     /// §4.2 per-tile bookkeeping + owed-send queues (TileLedger).
@@ -744,7 +761,7 @@ public final class HostEngine: @unchecked Sendable {
                            width: UInt16(grid.width), height: UInt16(grid.height),
                            tileSize: UInt8(TileGrid.tileSize),
                            pixfmt: PixelFormat.bgra8sRGB,
-                           caps: extraHelloCaps | videoCaps))
+                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps))
     }
 
     public func handleControl(_ data: Data, nowUS: UInt64) {
@@ -795,7 +812,12 @@ public final class HostEngine: @unchecked Sendable {
                 applyAck(frameSeq: frameSeq, dgramCnt: dgramCnt, bitmap: bitmap)
             case let .pong(_, tUS, _):
                 lastPongUS = nowUS
-                if nowUS > tUS { updateSRTT(sample: nowUS - tUS) }
+                if nowUS > tUS {
+                    updateSRTT(sample: nowUS - tUS)
+                    pingRTTLatestUS = nowUS - tUS
+                    pingRTTAtUS = nowUS
+                    pingRTTMinUS = min(pingRTTMinUS, pingRTTLatestUS)
+                }
             case let .ping(nonce, tUS):
                 sendControl(.pong(nonce: nonce, tUS: tUS, recvTUS: nowUS))
             case let .scrollAck(frameSeq, skipped, digest):
@@ -835,6 +857,12 @@ public final class HostEngine: @unchecked Sendable {
                 onUITreeRequest?(requestID, windowID, Int(maxNodes))
             case let .viewerInfo(name):
                 onViewerInfo?(name)
+            case let .received(bytes, tUS):
+                // The smoothed reading: a PING between bursts reads empty
+                // while the link is full. Its lag after a burst only marks
+                // slow spans, which the max filter passes over.
+                let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
+                linkEstimate.noteReceived(bytes: bytes, viewerTUS: tUS, nowUS: nowUS, queued: queued)
             case let .syncRequest(region, generation):
                 noteSyncRequest(region: region, generation: generation)
             case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope:
@@ -1470,8 +1498,10 @@ public final class HostEngine: @unchecked Sendable {
                            width: UInt16(grid.width), height: UInt16(grid.height),
                            tileSize: UInt8(TileGrid.tileSize),
                            pixfmt: PixelFormat.bgra8sRGB,
-                           caps: extraHelloCaps | videoCaps))
+                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps))
     }
+    private var deliveryReportsCaps: UInt32 { requestDeliveryReports ? WireCaps.deliveryReports : 0 }
+
     /// Video caps for HELLO: one bit per codec the encoder factory may be
     /// asked for (none without a factory — `GLASSACT_TILE_ONLY`, agents).
     private var videoCaps: UInt32 {

@@ -282,6 +282,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x19 | AGENT_SCOPE | H→V | control u8, len u8, reason |
 | 0x1A | VIEWER_INFO | V→H | UTF-8 machine name, 1–64 B |
 | 0x1B | SYNC_REQUEST | V→H | region u8, generation u32. The viewer can't decode that region and asks for a sync frame (§4.6, §5) |
+| 0x1C | RECEIVED | V→H | bytes u64, tUS u64: datagram and video-stream bytes received this session, at the viewer's clock. Sent only to a host advertising `deliveryReports` (§3.8), at most every 250 ms, and only when the count changed (§4.9) |
 
 **Cadence:**
 - **ACKs:**
@@ -342,7 +343,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 |---|---|---|
 | 0 | videoHEVC | HEVC video regions |
 | 1 | videoAV1 | AV1 regions: an Apple silicon Host (vendored libaom) offers it; a Viewer advertises it only when its user opts in. The test rig's alternate mock codec (0x7E) maps here too |
-| 2 | — | unassigned |
+| 2 | deliveryReports | the host asks for RECEIVED (§3.5) and bounds video by the link it reports (§4.9). Only the host's bit matters: a viewer sends RECEIVED when the host's HELLO carries it |
 | 3 | — | unassigned |
 | 4 | cursor | cursor as metadata (host stops burning it into pixels) |
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
@@ -753,10 +754,25 @@ ACK-bitmap loss:
 - Measures drain rate in 250 ms windows.
 - The send gate opens while the backlog is < rate × 60 ms. The encoder cap is
   0.85 × the estimate.
-- It backs off when queueing delay (SRTT − min RTT) is > 60 ms and probes when
-  it is < 30 ms, with CUBIC-style recovery.
+- It backs off when queueing delay is > 60 ms and probes when it is < 30 ms,
+  with CUBIC-style recovery. The delay is the transport's SRTT − min RTT.
+  A cut also needs the latest PING's RTT − the minimum PING RTT (when a
+  PONG came within 2 s) over 60 ms: SRTT stays high for ~20 s after a
+  burst drains and would keep cutting a starved stream. Growth doesn't use
+  the PING: one reading can land between bursts on a link that is filling.
 - It starts capped at 3 Mbit/s until the link is measured, then rises ×1.25
   per clean window. The range is 300 kbit/s–20 Mbit/s.
+- **Link ceiling:** the host's drain readings only see bytes leave it; on a
+  deep-buffered path they leave 2–3× faster than the link carries them. With
+  `deliveryReports`, `LinkEstimate` turns the viewer's RECEIVED reports into
+  a delivered rate (each over ≥ 1 s of the viewer's clock, since bytes land
+  in bursts). The capacity is the most delivered over the last 60 s in a
+  span queued (SRTT − min RTT ≥ 30 ms) at both ends: only then is the
+  bottleneck busy. A
+  span with room reads the sender's own rate back, and a ceiling built on
+  it would ratchet down by 0.9 a minute. The video rate and the startup cap
+  stay ≤ 0.9 × capacity. With no queued span, or no reports (an older
+  viewer), there's no ceiling.
 
 **Resolution rung:** `onScalePressureConstrained` asks the app to downscale
 capture for the rest of the session (`ScalePressure`) after either:
