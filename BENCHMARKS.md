@@ -211,6 +211,7 @@ the numbers and the reasoning.
 | Viewer RECEIVED reports; video ≤ 0.9 × capacity from queued spans | kept | 10M photos 193 → 276 frames, queue p95 258 → 244 ms | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
 | Capacity ceiling from every span (not only queued ones) | rejected | best latency on 30 s traces, but ratchets video to the floor on long video-only stretches | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
 | Repaints yield to fresh tiles; cut video only for its own queue; bound by host-side delivery | rejected | little or no change; repaints yielding always raised typing-cc's q95 (3M 365 → 422 ms) | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
+| Auto-scale on the viewer-reported link capacity | kept | lounge Wi-Fi at ~0.3 Mbit/s: neither older rule fired in 61 s; loop cursor-drag 17.2 → 7.2 s | [entry](#auto-scale-from-the-viewers-link-reports-2026-10-26) |
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
@@ -252,6 +253,58 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Auto-scale from the viewer's link reports (2026-10-26)
+
+Live, United lounge Wi-Fi, M4 Pro Host, MacBook Air Viewer over Tailscale,
+2900×1572 capture. One session at 09:30:03–09:31:04, HEVC:
+
+- The link carried ~0.3 Mbit/s (the video gate's `vlink 0.30` from its
+  one backlogged window), SRTT 1.4–5.6 s.
+- Video ran at 0–4 fps and 200–580 Kbit/s, more than the link: the QP 34
+  floor keeps frames large (first key frame 95 KB, ~2.5 s of link). The
+  network queue reached 4–5 s.
+- After 47 s the region dissolved; the lossless repaint couldn't get
+  through (0 Kbps for 13 s), and the Host reset the session on 10 s
+  without a PONG.
+
+In 61 s, at ~0.1 bit/s per captured pixel, **the resolution rung never
+fired**:
+- The ACK-delay rule had no samples (video only, no tiles).
+- The video rule counts only seconds with a fresh backlogged-window
+  measurement, and the send gate skipped frames (vskips ~65 per 2 s)
+  instead of letting video back up, so there was one measurement in the
+  whole session.
+
+The viewer's RECEIVED reports had the answer all along, so `ScalePressure`
+gains a third rule: 5 s in a row of `LinkEstimate`'s recent capacity
+(queued spans, last ~10 s) under the same bars (0.75 bit/s per pixel and
+4 Mbit/s), counting only seconds with a reading.
+
+Loop, `--video mock`, `--link-mbit 1 --link-buffer-ms 2000 --latency
+75-100`, the loop now reporting when the rung fires (before =
+`--no-link-reports`):
+
+| trace | before | after |
+|---|---|---|
+| cursor-drag | 17.2 s | 7.2 s |
+| scroll-win | 8.2 s | 8.2 s |
+| photos | 7.2 s | 7.2 s |
+
+None settled in the loop's 60 s budget either way; the mock codec's
+whole-region frames are slow on 1 Mbit/s.
+
+**A rig artifact found on the way.** On scroll-win and cursor-drag the
+estimate read a capacity of 20.4 and 16.8 Mbit/s on the 1 Mbit/s link
+(photos 0.97). The rig delivers each video message whole when its last
+byte clears the bottleneck, so a message longer than a second of link
+lands at once and a one-second span reads it as several times the link
+(the timeline, now with `ldeliv` and `lcap`: 3.31 Mbit/s at t=10 s on
+cursor-drag). QUIC hands stream bytes over as they arrive, so this exact
+case doesn't happen live. A lossy link's head-of-line blocking can release
+a burst the same way, though, and that could only push the estimate up:
+never a false downscale, but possibly an early "room" for AV1 and Smooth
+Motion. To measure next.
 
 ### How low can video go: rate–quality knees, looser floors, prefer smooth motion (2026-10-25)
 

@@ -947,7 +947,7 @@ public final class HostEngine: @unchecked Sendable {
             pingNonce &+= 1
             sendControl(.ping(nonce: pingNonce, tUS: sendStampUS(nowUS)))
             lastPingUS = nowUS
-            evaluateScalePressure()
+            evaluateScalePressure(nowUS: nowUS)
             // The next region forms on what this allows (`allowedVideoCodecs`).
             if linkRoom.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
                                    recentCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
@@ -976,12 +976,13 @@ public final class HostEngine: @unchecked Sendable {
     public static let autoScaleThinVideoSeconds = ScalePressure.thinVideoSeconds
     private var scalePressure = ScalePressure()
 
-    private func evaluateScalePressure() {
+    private func evaluateScalePressure(nowUS: UInt64) {
         if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
                                     severeAckDelayUS: Self.governorSevereAckDelayUS,
                                     videoLinkMeasurements: videoRate.linkMeasurements,
                                     videoRateBytesPerSecond: videoRate.rate,
                                     videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
+                                    linkCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
                                     pixels: grid.width * grid.height) {
             onScalePressureConstrained?()
         }

@@ -17,6 +17,13 @@
 ///   thin link the tile path can go quiet for long stretches: on plane
 ///   Wi-Fi the ACK-delay rule alone took 45 s to fire while video drained
 ///   at 0.3–2.3 Mbit/s for a 2900×1572 capture.
+/// - The link's capacity as the viewer reports it (`LinkEstimate`: what
+///   arrived while the path was queued, the last ~10 s) under the same bars
+///   for `thinVideoSeconds` in a row, counting only seconds with a reading.
+///   The video rule's evidence needs a window that stayed backlogged, and a
+///   send gate that skips frames keeps video from backing up: in an airport
+///   lounge at ~0.3 Mbit/s it never fired, while the viewer's reports said
+///   0.3 Mbit/s for a minute.
 ///
 /// Plain value type; latches once fired.
 struct ScalePressure {
@@ -35,16 +42,19 @@ struct ScalePressure {
     private(set) var constrained = false
     private var severeStreakS = 0
     private var thinVideoStreakS = 0
+    private var thinLinkStreakS = 0
     private var prevAckSampleUS: UInt64 = 0
     private var prevVideoMeasurements = 0
 
     /// One second's evidence; true the one time it decides the link is
     /// constrained. `ackSampleUS` changes whenever a new ACK delay was
     /// measured, and `videoLinkMeasurements` whenever a backlogged video
-    /// window measured the link.
+    /// window measured the link. `linkCapacityBytesPerSecond`: the viewer's
+    /// reading (0: none).
     mutating func noteSecond(ackSampleUS: UInt64, ackDelayUS: UInt64, severeAckDelayUS: UInt64,
                              videoLinkMeasurements: Int, videoRateBytesPerSecond: Int,
-                             videoLastDrainBytesPerSecond: Int, pixels: Int) -> Bool {
+                             videoLastDrainBytesPerSecond: Int, linkCapacityBytesPerSecond: Int = 0,
+                             pixels: Int) -> Bool {
         guard !constrained else { return false }
         if ackSampleUS != prevAckSampleUS {
             prevAckSampleUS = ackSampleUS
@@ -53,14 +63,21 @@ struct ScalePressure {
         if videoLinkMeasurements != prevVideoMeasurements {
             prevVideoMeasurements = videoLinkMeasurements
             let bits = max(videoRateBytesPerSecond, videoLastDrainBytesPerSecond) * 8
-            let thin = bits < Self.thinVideoMaxBitsPerSecond
-                && Double(bits) < Double(pixels) * Self.thinVideoBitsPerPixel
-            thinVideoStreakS = thin ? thinVideoStreakS + 1 : 0
+            thinVideoStreakS = Self.isThin(bitsPerSecond: bits, pixels: pixels) ? thinVideoStreakS + 1 : 0
         }
-        if severeStreakS >= Self.severeSeconds || thinVideoStreakS >= Self.thinVideoSeconds {
+        if linkCapacityBytesPerSecond > 0 {
+            let thin = Self.isThin(bitsPerSecond: linkCapacityBytesPerSecond * 8, pixels: pixels)
+            thinLinkStreakS = thin ? thinLinkStreakS + 1 : 0
+        }
+        if severeStreakS >= Self.severeSeconds || thinVideoStreakS >= Self.thinVideoSeconds
+            || thinLinkStreakS >= Self.thinVideoSeconds {
             constrained = true
             return true
         }
         return false
+    }
+
+    private static func isThin(bitsPerSecond bits: Int, pixels: Int) -> Bool {
+        bits < thinVideoMaxBitsPerSecond && Double(bits) < Double(pixels) * thinVideoBitsPerPixel
     }
 }

@@ -51,6 +51,48 @@ import Testing
         }
     }
 
+    /// The viewer's reports: a link whose queued spans carry 0.3 Mbit/s (an
+    /// airport lounge) fires after `thinVideoSeconds` of readings, even with
+    /// no video backlog measurement at all; seconds without a reading hold
+    /// the streak, and a roomy reading resets it.
+    @Test func aThinReportedLinkFires() {
+        func second(_ p: inout ScalePressure, capacity: Int) -> Bool {
+            p.noteSecond(ackSampleUS: 0, ackDelayUS: 0, severeAckDelayUS: Self.severe,
+                         videoLinkMeasurements: 0, videoRateBytesPerSecond: 0, videoLastDrainBytesPerSecond: 0,
+                         linkCapacityBytesPerSecond: capacity, pixels: Self.capture)
+        }
+        let thin = 300_000 / 8, roomy = 20_000_000 / 8
+        var p = ScalePressure()
+        let fired = (0..<ScalePressure.thinVideoSeconds).map { _ in second(&p, capacity: thin) }
+        #expect(fired == Array(repeating: false, count: ScalePressure.thinVideoSeconds - 1) + [true])
+
+        var q = ScalePressure()
+        for _ in 0..<(ScalePressure.thinVideoSeconds - 1) { _ = second(&q, capacity: thin) }
+        _ = second(&q, capacity: 0) // no reading: holds
+        let completed = second(&q, capacity: thin)
+        #expect(completed, "the held streak completes")
+
+        var r = ScalePressure()
+        for _ in 0..<(ScalePressure.thinVideoSeconds - 1) { _ = second(&r, capacity: thin) }
+        _ = second(&r, capacity: roomy) // resets
+        let afterReset = second(&r, capacity: thin)
+        #expect(!afterReset)
+    }
+
+    /// 4 Mbit/s and over is never thin, whatever the capture: halving a 5K
+    /// capture on ordinary home Wi-Fi is the person's call.
+    @Test func aReportedLinkAboveTheCeilingNeverFires() {
+        var p = ScalePressure()
+        var fired = false
+        for _ in 0..<30 {
+            fired = fired || p.noteSecond(ackSampleUS: 0, ackDelayUS: 0, severeAckDelayUS: Self.severe,
+                                          videoLinkMeasurements: 0, videoRateBytesPerSecond: 0,
+                                          videoLastDrainBytesPerSecond: 0, linkCapacityBytesPerSecond: 5_000_000 / 8,
+                                          pixels: 5120 * 2880)
+        }
+        #expect(!fired)
+    }
+
     /// Plane Wi-Fi: video backed up behind a 2 Mbit/s link fires within
     /// seconds, not 45 s later, and once.
     @Test func aThinVideoLinkFires() {

@@ -816,6 +816,11 @@ capture for the rest of the session (`ScalePressure`) after either:
   keeps a 5K capture on ordinary home Wi-Fi at native resolution. Pinned video can carry a thin
   link's motion while the tile path stays quiet, so the ACK-delay rule
   alone can take tens of seconds (45 s on plane Wi-Fi).
+- 5 s of the viewer-reported link capacity (`LinkEstimate`, queued spans
+  in the last ~10 s) under the same two bars, counting only seconds with a
+  reading. The video rule needs a window in which video stayed backlogged,
+  and a send gate that skips frames keeps it from backing up: in an airport
+  lounge at ~0.3 Mbit/s neither older rule fired.
 
 ### 4.10 Session, geometry and windows
 
