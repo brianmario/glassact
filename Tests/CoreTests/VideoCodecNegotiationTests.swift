@@ -31,8 +31,8 @@ import GlassActTestSupport
                         hostCodecs: hostCodecs, viewerCodecs: viewerCodecs,
                         encoderFactory: encoderFactory)
         // The alt codec stands in for AV1, which needs a link that has shown
-        // room (AV1LinkPolicy); this one already has.
-        _ = h.host.av1Link.noteSecond(deliveredBytesPerSecond: AV1LinkPolicy.roomyBitsPerSecond / 8,
+        // room (LinkRoomPolicy); this one already has.
+        _ = h.host.linkRoom.noteSecond(deliveredBytesPerSecond: LinkRoomPolicy.roomyBitsPerSecond / 8,
                                       recentCapacityBytesPerSecond: 0, reports: 1)
         h.frame.fillRandom(&rng)
         h.encodeFrame()

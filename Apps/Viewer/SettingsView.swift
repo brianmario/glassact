@@ -23,7 +23,11 @@ struct SettingsView: View {
                     Text("Keep Quality Medium").tag(2)
                     Text("Keep Quality Low").tag(3)
                 }
-                Toggle("Prefer sharpness over smooth motion", isOn: $settings.preferSharpness)
+                Picker("Moving content", selection: $settings.motionPreference) {
+                    Text("Balanced").tag(0)
+                    Text("Prefer Sharpness").tag(1)
+                    Text("Prefer Smooth Motion").tag(2)
+                }
                 Toggle("Fill the screen in full screen", isOn: $settings.fullScreenReshapesHost)
                 Toggle("Use AV1 video", isOn: $settings.videoAV1)
                     .disabled(!VTRegionDecoder.canDecodeAV1)
@@ -32,7 +36,9 @@ struct SettingsView: View {
             } footer: {
                 Text("Keeping quality high holds text crisp on a slow network, at the cost of fewer frames "
                      + "per second. Preferring sharpness also keeps moving content sharper whenever the "
-                     + "network has room to spare, using more bandwidth. Changes apply the next time you "
+                     + "network has room to spare, using more bandwidth. Preferring smooth motion lets "
+                     + "moving content get softer on a slow network so more frames get through; it needs "
+                     + "an up-to-date host. Changes apply the next time you "
                      + "connect. Filling the screen asks the host to take this screen's shape while you're in "
                      + "full screen with Scale Down or Match This Mac, instead of showing bars beside a "
                      + "differently shaped picture; it goes back when you leave full screen. "

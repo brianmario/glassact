@@ -112,14 +112,14 @@ extension HostEngine {
             }
         }
         guard let (encoder, startedCodec) = started else { return }
-        if startedCodec != negotiatedVideoCodecs.first, !av1Link.allowed,
-           negotiatedVideoCodecs.first.map(AV1LinkPolicy.governs) == true {
+        if startedCodec != negotiatedVideoCodecs.first, !linkRoom.hasRoom,
+           negotiatedVideoCodecs.first.map(LinkRoomPolicy.governs) == true {
             stats.videoRegionsWithoutAV1 += 1
         }
         regionEncoder = encoder
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
-        if sharpCeiling { encoder.setMaxFrameQP(Self.sharpMaxFrameQP) }
+        if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
         regionActive = true
         regionTileBox = (c0, r0, c1, r1)
         regionPixelRect = (x, y, w, h)
@@ -627,6 +627,23 @@ extension HostEngine {
         }
     }
 
+    /// The frame-QP ceiling the viewer's preference puts in force; nil = the
+    /// encoder's default.
+    var regionMaxFrameQP: Int? {
+        sharpCeiling ? Self.sharpMaxFrameQP : smoothFloor ? Self.smoothMaxFrameQP : nil
+    }
+
+    /// Prefer smooth motion (§4.6): the looser ceiling while the link has no
+    /// room, the default once it has. Follows `linkRoom`, a property of the
+    /// link, so the looser frames can't switch it off themselves.
+    func updateSmoothFloor() {
+        let want = policyPreferSmoothness && !linkRoom.hasRoom
+        guard want != smoothFloor else { return }
+        smoothFloor = want
+        if want { stats.smoothFloorOn += 1 } else { stats.smoothFloorOff += 1 }
+        regionEncoder?.setMaxFrameQP(regionMaxFrameQP)
+    }
+
     /// Effective level fed to the encoder: at least the presented-scale floor,
     /// at most the client's quality-floor cap.
     var effectiveQualityLevel: Int {
@@ -635,7 +652,7 @@ extension HostEngine {
 
     /// Apply a client QUALITY policy (§3.5 TLV): presented scale, quality
     /// floor, sharpness-vs-smoothness — bounds on the automatic loop.
-    func applyQualityPolicy(scalePct: Int, floor: UInt8, preferSharpness: Bool) {
+    func applyQualityPolicy(scalePct: Int, floor: UInt8, preferSharpness: Bool, preferSmoothness: Bool = false) {
         policyScaleLevel = scalePct == 0 ? 0
             : scalePct >= 88 ? 0 : scalePct >= 62 ? 1 : scalePct >= 38 ? 2 : 3
         // QualityFloor n (1–3) caps the loop at level n; automatic doesn't.
@@ -647,6 +664,8 @@ extension HostEngine {
             regionEncoder?.setMaxFrameQP(nil)
         }
         if !preferSharpness { sharpHealthyStreak = 0; sharpHealthyNeeded = Self.sharpHealthyWindowsMin }
+        policyPreferSmoothness = preferSmoothness && !preferSharpness
+        updateSmoothFloor()
         regionEncoder?.setQualityLevel(effectiveQualityLevel)
     }
 
@@ -731,14 +750,14 @@ extension HostEngine {
     }
 
     /// The negotiated codecs this link allows, in preference order: AV1 only
-    /// while `av1Link` says there's room. Never empty while any is negotiated.
+    /// while `linkRoom` says there's room. Never empty while any is negotiated.
     /// Read when a region forms, so a change waits for the next one: switching
     /// a live region costs a whole-screen sync frame on the new encoder,
     /// mid-motion (6 Mbit/s photos: 68 frames against HEVC's 165; BENCHMARKS
     /// "AV1 only while the link has room").
     var allowedVideoCodecs: [UInt8] {
-        guard !av1Link.allowed else { return negotiatedVideoCodecs }
-        let others = negotiatedVideoCodecs.filter { !AV1LinkPolicy.governs($0) }
+        guard !linkRoom.hasRoom else { return negotiatedVideoCodecs }
+        let others = negotiatedVideoCodecs.filter { !LinkRoomPolicy.governs($0) }
         return others.isEmpty ? negotiatedVideoCodecs : others
     }
 

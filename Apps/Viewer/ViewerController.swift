@@ -43,10 +43,10 @@ final class ViewerController: @unchecked Sendable {
     func verificationCode() -> String? { session.verificationCode() }
     // Client quality policy (QUALITY)
     private(set) var qualityFloor = 0        // QualityFloor: 0 = automatic
-    private(set) var qualityPreferSharpness = false
+    private(set) var qualityMotionPreference = 0 // ViewerSettings.motionPreference
     private var lastSentScalePct = -1
-    func setQualityPrefs(floor: Int, preferSharpness: Bool) {
-        qualityFloor = floor; qualityPreferSharpness = preferSharpness
+    func setQualityPrefs(floor: Int, motionPreference: Int) {
+        qualityFloor = floor; qualityMotionPreference = motionPreference
     }
     /// Send the policy (presented scale + stored floor/preference). Throttled
     /// on scale so a resize storm doesn't flood the control stream.
@@ -57,7 +57,8 @@ final class ViewerController: @unchecked Sendable {
             guard let self else { return }
             self.engine.sendQualityPolicy(presentedScalePct: pct,
                                           floor: self.qualityFloor,
-                                          preferSharpness: self.qualityPreferSharpness)
+                                          preferSharpness: self.qualityMotionPreference == 1,
+                                          preferSmoothness: self.qualityMotionPreference == 2)
         }
     }
     // Clipboard sync (main thread)

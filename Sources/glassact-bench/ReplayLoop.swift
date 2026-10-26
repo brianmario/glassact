@@ -36,6 +36,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var hostCodecs: [UInt8] = []
     var viewerCodecs: [UInt8] = []
     let vtPipeline = BenchVTPipeline()
+    if opts.has("max-qp") { vtPipeline.defaultMaxFrameQP = opts.int("max-qp", 34) }
+    if opts.has("min-encoder-cap") { vtPipeline.minEncoderCap = opts.int("min-encoder-cap", 2000) * 1000 }
     switch videoMode {
     case nil:
         break
@@ -247,7 +249,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var settled = false
     var sinceEncodeMS = 16
     var finalExactUS: UInt64?
-    for _ in 0..<60_000 {
+    for _ in 0..<(opts.int("settle-s", 60) * 1000) {
         if finalExactUS == nil && frames > 0 && (link.nowUS - lastFeedUS) % 50_000 < 1_000 && viewerExact() {
             finalExactUS = link.nowUS - lastFeedUS
         }
@@ -410,6 +412,12 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
 /// queue (a data race on both), and let encoder latency under load slide
 /// frames arbitrarily far along virtual time.
 final class BenchVTPipeline {
+    /// `--max-qp`: the frame-QP ceiling (HEVC scale) in place of the
+    /// default, for every encoder made after it's set.
+    var defaultMaxFrameQP: Int?
+    /// `--min-encoder-cap`: the encoder's bitrate cap never goes under this
+    /// (bits/s); the send gate still decides what goes.
+    var minEncoderCap: Int?
     /// Frames submitted to an encoder and not yet delivered.
     fileprivate(set) var outstanding = 0
     /// Drains that gave up on an encoder that never answered.
@@ -455,6 +463,7 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     init(_ inner: any VideoRegionEncoder, _ pipeline: BenchVTPipeline) {
         self.inner = inner
         self.pipeline = pipeline
+        if let qp = pipeline.defaultMaxFrameQP { inner.setMaxFrameQP(qp) }
     }
 
     var codecID: UInt8 { inner.codecID }
@@ -480,8 +489,10 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     }
 
     func setQualityLevel(_ level: Int) { inner.setQualityLevel(level) }
-    func setBitrateCap(_ bitsPerSecond: Int?) { inner.setBitrateCap(bitsPerSecond) }
-    func setMaxFrameQP(_ qp: Int?) { inner.setMaxFrameQP(qp) }
+    func setBitrateCap(_ bitsPerSecond: Int?) {
+        inner.setBitrateCap(bitsPerSecond.map { max($0, pipeline.minEncoderCap ?? 0) })
+    }
+    func setMaxFrameQP(_ qp: Int?) { inner.setMaxFrameQP(qp ?? pipeline.defaultMaxFrameQP) }
 
     /// The stopped encoder drops deliveries still queued.
     func stop() {

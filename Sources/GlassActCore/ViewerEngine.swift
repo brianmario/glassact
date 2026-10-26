@@ -195,11 +195,15 @@ public final class ViewerEngine: @unchecked Sendable {
     /// Client quality policy (viewer → host, QUALITY). Sent on connect and when
     /// the presented scale or the user's floor/preference changes. `floor`
     /// is a `QualityFloor` (0 = automatic, 1–3 = keep high/medium/low).
-    public func sendQualityPolicy(presentedScalePct: Int, floor: Int, preferSharpness: Bool) {
+    /// `preferSmoothness` goes only to a host that understands it
+    /// (`WireCaps.smoothnessPreference`); others reject it, and get 0.
+    public func sendQualityPolicy(presentedScalePct: Int, floor: Int, preferSharpness: Bool,
+                                  preferSmoothness: Bool = false) {
         guard state == .running else { return }
+        let smooth = preferSmoothness && hostCaps & WireCaps.smoothnessPreference != 0
         sendControl(.quality(presentedScalePct: UInt8(clamping: presentedScalePct),
                              floor: UInt8(clamping: min(max(floor, 0), Int(QualityFloor.maxKnown))),
-                             preferSharpness: preferSharpness ? 1 : 0))
+                             preferSharpness: preferSharpness ? 1 : smooth ? 2 : 0))
     }
     public private(set) var grid: TileGrid?
 

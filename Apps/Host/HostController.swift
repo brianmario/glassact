@@ -2060,6 +2060,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             let sharpOff = s.sharpCeilingOff - p.sharpCeilingOff
             if sharpOn > 0 { line += " · sharp on" }
             if sharpOff > 0 { line += " · sharp off (pressure)" }
+            if s.smoothFloorOn > p.smoothFloorOn { line += " · smooth on (thin link)" }
+            if s.smoothFloorOff > p.smoothFloorOff { line += " · smooth off (link has room)" }
             // Still region tiles handed back to exact pixels while video runs
             // (free reveals, lossless records) — soft text with neither
             // showing means the handoff isn't firing.

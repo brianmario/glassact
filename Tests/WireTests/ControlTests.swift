@@ -110,6 +110,10 @@ import GlassActTestSupport
         var d = ControlDeframer()
         d.append(ControlMessage.quality(presentedScalePct: 100, floor: 4, preferSharpness: 0).encoded())
         #expect(d.next() == nil && d.isMalformed, "floor is 0–3")
+        roundTrip(.quality(presentedScalePct: 100, floor: QualityFloor.automatic, preferSharpness: 2))
+        var e = ControlDeframer()
+        e.append(ControlMessage.quality(presentedScalePct: 100, floor: 0, preferSharpness: 3).encoded())
+        #expect(e.next() == nil && e.isMalformed, "the preference is 0–2")
     }
 
     @Test func windowListRoundTrip() {
