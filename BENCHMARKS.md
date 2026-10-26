@@ -306,6 +306,23 @@ never delivered more than ~0.6 Mbit/s and still fires, the stall doesn't
 (`ScalePressureTests.aStallAfterAFastStretchIsntThin`, which fails without
 the delivered bound).
 
+**Live on plane Wi-Fi** (same day, `7f3232a` Host, `d35406b` Viewer; 2900×1572
+virtual display, ~0.3 Mbit/s, SRTT ~0.6–1 s): the rung fired 7.4 s after
+connecting (the 2026-10-22 plane session took 45 s), and a second session 9 s
+after. Over the following 7 minutes at 1450×786, from the Host's 2 s status
+lines:
+
+| | p50 | p90 / p95 | max |
+|---|---|---|---|
+| video frames per second | 5 | 44 (p90) | |
+| video Kbit/s | 226 | 531 (p90) | |
+| network queue | 28 ms | 60 ms (p95) | 83 ms |
+| SRTT | 675 ms | 806 ms (p95) | |
+
+The same lounge link at full size had built 4–5 s of queue. The owner's
+verdict: "pretty responsive, considering". The capture then stayed halved
+for the session, which "Back up the rung" (DESIGN §4.9) addresses.
+
 **A rig artifact found on the way.** On scroll-win and cursor-drag the
 estimate read a capacity of 20.4 and 16.8 Mbit/s on the 1 Mbit/s link
 (photos 0.97). The rig delivers each video message whole when its last

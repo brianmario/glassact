@@ -80,6 +80,55 @@ struct ScalePressure {
     }
 
     private static func isThin(bitsPerSecond bits: Int, pixels: Int) -> Bool {
-        bits < thinVideoMaxBitsPerSecond && Double(bits) < Double(pixels) * thinVideoBitsPerPixel
+        bits < thinBitsPerSecond(pixels: pixels)
+    }
+
+    /// The bar a link must be under to be thin for `pixels` (bits/s).
+    static func thinBitsPerSecond(pixels: Int) -> Int {
+        min(thinVideoMaxBitsPerSecond, Int(Double(pixels) * thinVideoBitsPerPixel))
+    }
+}
+
+/// §4.9: back up the rung once the link has room again. Armed on the engine
+/// of a halved capture with the full capture's pixel count. Evaluated once
+/// a second; fires once, when:
+/// - the link delivered at least `roomFactor` × the thin bar for the full
+///   capture (`ScalePressure.thinBitsPerSecond`) in `roomySeconds` seconds,
+///   counting seconds with that reading (what the viewer received, the last
+///   ~10 s: a lower bound on the link) and the path not queued; a queued
+///   second starts the count over, and seconds without a reading (a quiet
+///   screen proves nothing) hold it; and
+/// - at least `holdUS` has passed since it was armed (the app doubles it
+///   each time the rung comes back down after a recovery, so a link near
+///   the line settles instead of flapping).
+///
+/// Plain value type; latches once fired.
+struct ScaleRecovery {
+    static let roomFactor = 2
+    static let roomySeconds = 30
+
+    let fullPixels: Int
+    let holdUS: UInt64
+    private var armedUS: UInt64 = 0
+    private var roomyStreakS = 0
+    private(set) var fired = false
+
+    init(fullPixels: Int, holdUS: UInt64) {
+        self.fullPixels = fullPixels
+        self.holdUS = holdUS
+    }
+
+    /// True the one time the link has shown room for the full capture.
+    mutating func noteSecond(nowUS: UInt64, deliveredBytesPerSecond: Int, queued: Bool) -> Bool {
+        guard !fired else { return false }
+        if armedUS == 0 { armedUS = max(nowUS, 1) }
+        if queued {
+            roomyStreakS = 0
+        } else if deliveredBytesPerSecond * 8 >= Self.roomFactor * ScalePressure.thinBitsPerSecond(pixels: fullPixels) {
+            roomyStreakS += 1
+        }
+        guard roomyStreakS >= Self.roomySeconds, nowUS &- armedUS >= holdUS else { return false }
+        fired = true
+        return true
     }
 }
