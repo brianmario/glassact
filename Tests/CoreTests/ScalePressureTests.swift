@@ -104,58 +104,74 @@ import Testing
     }
 
     /// Back up the rung (`ScaleRecovery`): after the hold, 30 seconds in
-    /// which the link delivered twice the full capture's thin bar, none of
-    /// them queued; quiet seconds hold the count, a queued one restarts it.
-    @Test func aRecoveredLinkComesBackUpAfterTheHold() {
+    /// which the path wasn't queued and the link's capacity was unmeasured
+    /// or room for the full capture. A queued second, or a capacity short
+    /// of room, restarts the count.
+    @Test func theFullCaptureIsTriedAgainAfterTheHold() {
         let full = Self.capture // 2900×1572: thin under 3.4 Mbit/s, room at 6.8
-        let roomy = 7_000_000 / 8, thin = 1_000_000 / 8
+        let roomy = 7_000_000 / 8, short = 2_000_000 / 8
+        // A quiet screen that never queued (no capacity reading): the hold
+        // sets the time.
         var r = ScaleRecovery(fullPixels: full, holdUS: 60_000_000)
         var fired: Int?
         for s in 1...90 where fired == nil {
-            if r.noteSecond(nowUS: UInt64(s) * 1_000_000, deliveredBytesPerSecond: roomy, queued: false) { fired = s }
+            if r.noteSecond(nowUS: UInt64(s) * 1_000_000, linkCapacityBytesPerSecond: 0, queued: false) { fired = s }
         }
-        #expect(fired == 61, "the hold, not the 30 s of room, set the time: \(String(describing: fired))")
+        #expect(fired == 61, "the hold, not the 30 s, set the time: \(String(describing: fired))")
 
-        var q = ScaleRecovery(fullPixels: full, holdUS: 0)
         var t: UInt64 = 0
-        func second(_ delivered: Int, queued: Bool = false) -> Bool {
+        func run(_ r: inout ScaleRecovery, _ capacity: Int, queued: Bool = false) -> Bool {
             t += 1_000_000
-            return q.noteSecond(nowUS: t, deliveredBytesPerSecond: delivered, queued: queued)
+            return r.noteSecond(nowUS: t, linkCapacityBytesPerSecond: capacity, queued: queued)
         }
-        for _ in 0..<29 { _ = second(roomy) }
-        for _ in 0..<10 { _ = second(thin) } // a quiet screen: holds
-        let afterQuiet = second(roomy)
-        #expect(afterQuiet, "29 roomy + quiet + 1 roomy")
+        for (name, capacity, queued) in [("queued", 0, true), ("short of room", short, false)] {
+            var q = ScaleRecovery(fullPixels: full, holdUS: 0)
+            for _ in 0..<29 { _ = run(&q, roomy) }
+            _ = run(&q, capacity, queued: queued) // starts over
+            var early = false
+            for _ in 0..<29 { early = early || run(&q, 0) }
+            #expect(!early, "a second \(name) restarts the 30")
+            #expect(run(&q, 0))
+        }
 
-        var u = ScaleRecovery(fullPixels: full, holdUS: 0)
-        t = 0
-        func secondU(_ delivered: Int, queued: Bool = false) -> Bool {
-            t += 1_000_000
-            return u.noteSecond(nowUS: t, deliveredBytesPerSecond: delivered, queued: queued)
-        }
-        for _ in 0..<29 { _ = secondU(roomy) }
-        _ = secondU(roomy, queued: true) // the path queued: start over
-        var firedAgain = false
-        for _ in 0..<29 { firedAgain = firedAgain || secondU(roomy) }
-        #expect(!firedAgain, "a queued second restarts the 30")
-        let thirtieth = secondU(roomy)
-        #expect(thirtieth)
+        // Plane Wi-Fi: every reading short of room, so it never tries.
+        var plane = ScaleRecovery(fullPixels: full, holdUS: 0)
+        var tried = false
+        for _ in 0..<300 { tried = tried || run(&plane, short) }
+        #expect(!tried)
     }
 
     /// The engine reports it once, from the viewer's reports.
-    @Test func theEngineReportsRoomForTheFullCapture() {
+    @Test func theEngineTriesTheFullCaptureAgain() {
         let (host, _) = makeRunningHost(width: 256, height: 192)
         var reports = 0
         host.onLinkRoomForFullResolution = { reports += 1 }
         host.armScaleRecovery(fullPixels: Self.capture, holdUS: 5_000_000)
         var bytes: UInt64 = 0, t: UInt64 = 1_000_000
-        for _ in 0..<(45 * 4) { // 45 s of 8 Mbit/s, 250 ms reports, no queue
+        for _ in 0..<(45 * 4) { // 45 s of a quiet 0.5 Mbit/s, 250 ms reports, no queue
             t += 250_000
-            bytes += 8_000_000 / 8 / 4
+            bytes += 500_000 / 8 / 4
             host.linkEstimate.noteReceived(bytes: bytes, viewerTUS: t, nowUS: t, queued: false)
             host.tick(nowUS: t)
         }
         #expect(reports == 1)
+    }
+
+    /// A link that queued at 2 Mbit/s in the last minute stays halved.
+    @Test func theEngineKeepsAThinLinkHalved() {
+        let (host, _) = makeRunningHost(width: 256, height: 192)
+        var reports = 0
+        host.onLinkRoomForFullResolution = { reports += 1 }
+        host.armScaleRecovery(fullPixels: Self.capture, holdUS: 5_000_000)
+        var bytes: UInt64 = 0, t: UInt64 = 1_000_000
+        for i in 0..<(90 * 4) { // a 2 s queued burst at 2 Mbit/s every 20 s
+            t += 250_000
+            let burst = i % 80 < 8
+            bytes += (burst ? 2_000_000 : 200_000) / 8 / 4
+            host.linkEstimate.noteReceived(bytes: bytes, viewerTUS: t, nowUS: t, queued: burst)
+            host.tick(nowUS: t)
+        }
+        #expect(reports == 0)
     }
 
     /// 4 Mbit/s and over is never thin, whatever the capture: halving a 5K

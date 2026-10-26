@@ -89,15 +89,18 @@ struct ScalePressure {
     }
 }
 
-/// §4.9: back up the rung once the link has room again. Armed on the engine
-/// of a halved capture with the full capture's pixel count. Evaluated once
-/// a second; fires once, when:
-/// - the link delivered at least `roomFactor` × the thin bar for the full
-///   capture (`ScalePressure.thinBitsPerSecond`) in `roomySeconds` seconds,
-///   counting seconds with that reading (what the viewer received, the last
-///   ~10 s: a lower bound on the link) and the path not queued; a queued
-///   second starts the count over, and seconds without a reading (a quiet
-///   screen proves nothing) hold it; and
+/// §4.9: back up the rung unless the link has shown it's too thin. Armed
+/// on the engine of a halved capture with the full capture's pixel count.
+/// Evaluated once a second; fires once, when:
+/// - in `roomySeconds` seconds the path wasn't queued and the link's
+///   capacity (`LinkEstimate`: what arrived while the path was queued, the
+///   last ~60 s) was either unmeasured or at least `roomFactor` × the thin
+///   bar for the full capture (`ScalePressure.thinBitsPerSecond`). A queued
+///   second, or a capacity under that, starts the count over. A half-size,
+///   mostly quiet screen never sends enough to prove the link has room
+///   (on a phone hotspot it peaked at 3 Mbit/s, never queued): absent
+///   evidence it's thin, the full capture is tried, and the thin-link rules
+///   bring it back down within seconds if it was wrong; and
 /// - at least `holdUS` has passed since it was armed (the app doubles it
 ///   each time the rung comes back down after a recovery, so a link near
 ///   the line settles instead of flapping).
@@ -118,15 +121,14 @@ struct ScaleRecovery {
         self.holdUS = holdUS
     }
 
-    /// True the one time the link has shown room for the full capture.
-    mutating func noteSecond(nowUS: UInt64, deliveredBytesPerSecond: Int, queued: Bool) -> Bool {
+    /// True the one time the full capture should be tried again.
+    /// `linkCapacityBytesPerSecond`: 0 with no reading.
+    mutating func noteSecond(nowUS: UInt64, linkCapacityBytesPerSecond: Int, queued: Bool) -> Bool {
         guard !fired else { return false }
         if armedUS == 0 { armedUS = max(nowUS, 1) }
-        if queued {
-            roomyStreakS = 0
-        } else if deliveredBytesPerSecond * 8 >= Self.roomFactor * ScalePressure.thinBitsPerSecond(pixels: fullPixels) {
-            roomyStreakS += 1
-        }
+        let room = Self.roomFactor * ScalePressure.thinBitsPerSecond(pixels: fullPixels)
+        let short = linkCapacityBytesPerSecond > 0 && linkCapacityBytesPerSecond * 8 < room
+        roomyStreakS = queued || short ? 0 : roomyStreakS + 1
         guard roomyStreakS >= Self.roomySeconds, nowUS &- armedUS >= holdUS else { return false }
         fired = true
         return true

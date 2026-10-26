@@ -836,9 +836,12 @@ capture (`ScalePressure`) after any of:
 **Back up the rung:** the app arms the halved capture's engine with the full
 capture's pixel count (`armScaleRecovery`), and `onLinkRoomForFullResolution`
 brings the full capture back in session (`ScaleRecovery`) once:
-- the link delivered at least twice the full capture's thin bar (6.8 Mbit/s
-  for 2900×1572) in 30 seconds, not queued in any of them (a queued second
-  starts the count over; seconds without such a reading hold it); and
+- in 30 seconds the path wasn't queued and the link's capacity (queued
+  spans, last ~60 s) was unmeasured or at least twice the full capture's
+  thin bar (6.8 Mbit/s for 2900×1572); a queued second, or a capacity short
+  of that, starts the count over. A half-size, quiet screen never sends
+  enough to prove room, so absent evidence the link is thin the full
+  capture is tried, and the rules above bring it back down if it was; and
 - the capture has been halved at least 60 s. The wait doubles, up to 16 min,
   each time the rung comes down again after a recovery, so a link near the
   line settles instead of flapping.

@@ -254,6 +254,27 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Back up the rung without proof of room (2026-10-26)
+
+On a phone hotspot after landing (`6f2d76f` Host; 2944×1600 capture) the
+rung fired 8 s after connecting. The first seconds read thin: SRTT 150–180 ms
+and capacity 0.2 → 1.6 → 2.1 Mbit/s while the radio woke and QUIC ramped
+under the cold start. From 10 s on the link was plainly fine: SRTT 35–45 ms,
+network queue ~10 ms, video never backed up (`vlink unmeasured`), and peaks
+of 3.2 Mbit/s with room to spare. The rung, as first merged, came back up
+only after the link *delivered* 2 × the full capture's thin bar (7 Mbit/s
+here) for 30 s. A half-size, mostly quiet screen never sends that, so it
+would have stayed halved all session.
+
+Now it comes back up unless the link shows it's too thin: 30 seconds with
+no queue and a capacity (queued spans, last ~60 s) unmeasured or at least
+2 × the bar, after the hold (60 s, doubling to 16 min each time it comes
+back down). The thin-link rules re-halve within seconds if that was wrong.
+On plane Wi-Fi every queued span read 0.3–2.3 Mbit/s, which keeps it down
+(`ScalePressureTests.theEngineKeepsAThinLinkHalved`). A quiet minute on a
+thin link does make it try again; the doubling hold bounds that cost. Not
+measured live yet.
+
 ### Auto-scale from the viewer's link reports (2026-10-26)
 
 Live, United lounge Wi-Fi, M4 Pro Host, MacBook Air Viewer over Tailscale,
