@@ -2087,6 +2087,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 line += " · vlink \(link) · vcap \(cap)"
                 line += String(format: " · netq %.0f ms · vskips %d",
                                Double(engine.videoNetworkQueueUS ?? 0) / 1000, skips)
+                // The encoder's side: frames skipped because it was still
+                // busy, and its mean submit → delivery time.
+                let encoded = s.videoEncodeCount - p.videoEncodeCount
+                let encodeMS = encoded > 0
+                    ? Double(s.videoEncodeUSSum &- p.videoEncodeUSSum) / Double(encoded) / 1000 : 0
+                line += String(format: " · vfull %d · venc %.1f ms",
+                               s.videoEncoderFullSkips - p.videoEncoderFullSkips, encodeMS)
             }
             line += " · " + changeHotspots.summaryAndReset()
             onStatus(line)

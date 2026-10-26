@@ -54,7 +54,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     case "av1":
         guard AOMRegionEncoder.isAvailable else { throw BenchError("--video av1 needs Apple silicon (libaom is arm64 only)") }
         encoderFactory = {
-            $0 == VideoCodec.av1 ? BenchPipelinedEncoder(AOMRegionEncoder(callbackQueue: .main), vtPipeline) : nil
+            guard $0 == VideoCodec.av1 else { return nil }
+            let aom = AOMRegionEncoder(callbackQueue: .main)
+            aom.vbr = opts.has("av1-vbr")
+            aom.targetPercent = opts.int("av1-target-pct", 40)
+            return BenchPipelinedEncoder(aom, vtPipeline)
         }
         // The Viewer's path, hardware decode, where this Mac has it.
         decoderFactory = { VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
@@ -129,7 +133,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                       + "formed \(host.stats.videoRegionsFormed) vframes \(host.stats.videoFramesSent) "
                       + "bytes \(host.stats.bytesOut / 1_000_000) MB gov \(host.stats.governorRate / 1000) KB/s "
                       + "duty \(host.stats.encodeDutyPercent)% ackDelay \(host.ackDelayUS / 1000) ms "
-                      + "viewer \(viewer.state) acks \(viewer.stats.acksSent) rx \(viewer.stats.datagramsReceived)")
+                      + "viewer \(viewer.state) acks \(viewer.stats.acksSent) rx \(viewer.stats.datagramsReceived) "
+                      + "vrate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s "
+                      + "vcap \(host.videoRate.bitrateCap.map { String(format: "%.2f", Double($0) / 1e6) } ?? "none") "
+                      + "backoffs \(host.videoRate.backoffs) vskips \(host.stats.videoBacklogSkips) "
+                      + "netq \((host.videoNetworkQueueUS ?? 0) / 1000) ms")
             }
             if link.bottleneck != nil && t >= nextBacklogSampleUS {
                 nextBacklogSampleUS = t + 10_000
@@ -310,7 +318,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       video: regions formed \(host.stats.videoRegionsFormed) dissolved \(host.stats.videoRegionsDissolved)  \
     frames \(host.stats.videoFramesSent)  video bytes \(formatBytes(host.stats.videoBytesSent))  \
     viewer applied \(viewer.stats.videoFramesApplied)  undecodable \(viewer.stats.videoDecodeFailures)  \
-    sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))
+    sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))  \
+    gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)  \
+    gate at end: rate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s, \
+    \(host.videoRate.linkMeasurements) link measurements, \(host.videoRate.backoffs) backoffs, \
+    startup cap \(host.videoRate.startupCap.map { String(format: "%.1f Mbit/s", Double($0) / 1e6) } ?? "none")
       video coverage: \(String(format: "%.1f", coverageSamples == 0 ? 0 : 100 * Double(coverageVideoTiles) / Double(coverageSamples * TileGrid(width: width, height: height).count)))% of screen-time on video  \
     handoffs: reveal \(host.stats.overlayHandoffReveals)  record \(host.stats.overlayHandoffRecords)  \
     re-sharpens \(host.stats.videoRefreshes)

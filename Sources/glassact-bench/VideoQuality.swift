@@ -18,6 +18,7 @@ let videoQualityCommand = Command(
         .choice("codec", ["hevc", "av1"], "video codec: hardware HEVC (default) or software AV1, as the Host runs them"),
         .int("av1-speed", "<n>", 0...12, "experiment: libaom realtime speed (default 9, as in the product)"),
         .bool("av1-vbr", "experiment: libaom VBR instead of CBR"),
+        .int("av1-target-pct", "<n>", 10...100, "AV1 aims at n % of the cap, as the Host does under a link cap (default 40, as in the product)"),
         .int("mbit", "<n>", 1...200, "target average bitrate in Mbit/s (default 3)"),
         .int("kbit", "<n>", 50...200_000, "target average bitrate in kbit/s (overrides --mbit; thin links)"),
         .int("submit-fps", "<n>", 1...60, "submit at most this many frames per second of trace time — what newest-wins pacing does on a thin link (default: every trace frame)"),
@@ -83,6 +84,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
         let aom = AOMRegionEncoder(callbackQueue: queue)
         aom.speed = opts.int("av1-speed", 9)
         aom.vbr = opts.has("av1-vbr")
+        aom.targetPercent = opts.int("av1-target-pct", 40)
         return aom
     }()
     if let hevc {
@@ -119,7 +121,8 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
               + (opts.has("cqf") ? ", cqf \(opts.int("cqf", 0)) \(hevc.constantQualityAccepted ? "accepted" : "REFUSED")"
                  + (hevc.capWithVBV ? " (VBV cap)" : "") : "")
               + (opts.has("chroma444") ? ", chroma 4:4:4 \(hevc.chroma444Accepted ? "accepted" : "REFUSED")" : "")
-          } ?? ", max-qp \(opts.int("max-qp", VTHEVCRegionEncoder.defaultMaxFrameQP)) (HEVC scale)")
+          } ?? ", max-qp \(opts.int("max-qp", VTHEVCRegionEncoder.defaultMaxFrameQP)) (HEVC scale)"
+               + ", aiming at \(opts.int("av1-target-pct", 40)) % of the cap")
           + (ssimu2.map { ", SSIMULACRA2 every \(ssimu2Every)th frame (\($0.binary.path))" } ?? ""))
 
     var rects: [DirtyRect] = []
