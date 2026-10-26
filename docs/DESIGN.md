@@ -283,6 +283,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x1A | VIEWER_INFO | V→H | UTF-8 machine name, 1–64 B |
 | 0x1B | SYNC_REQUEST | V→H | region u8, generation u32. The viewer can't decode that region and asks for a sync frame (§4.6, §5) |
 | 0x1C | RECEIVED | V→H | bytes u64, tUS u64: datagram and video-stream bytes received this session, at the viewer's clock. Sent only to a host advertising `deliveryReports` (§3.8), at most every 250 ms, and only when the count changed (§4.9) |
+| 0x1D | HOST_NOTICE | H→V | code u8 (`HostNotice`: 0 none, 1 the host's session is off the screen). Sent on a change, and at the handshake while one is in force. Viewers ignore codes they don't know |
 
 **Cadence:**
 - **ACKs:**
@@ -420,7 +421,15 @@ A viewer the host hasn't approved can sign in with the host Mac's account
   new one starts.
 - The system stopping a stream (display sleep or disconnect, the lock
   screen) keeps the share: capture is rebuilt from fresh content at the same
-  settings, and the session carries on as if frames had paused. So does a
+  settings, and the session carries on as if frames had paused.
+- **Fast user switching** takes the Host's login session off the screen
+  (another user, or a login window for one, has it), and macOS lets no app
+  capture another session's screen. The Host watches the workspace's
+  session notifications and tells the viewer (HOST_NOTICE 1), which shows
+  why its picture froze and how to get back: switch users at the Mac, or
+  use Screen Sharing, which can reach the login window. When the session
+  is back on the screen, HOST_NOTICE 0 clears it and capture retries at
+  once. So does a
   stream that stalled without telling its delegate (macOS 27's
   `isCapturing`, two 1 Hz checks in a row).
 - Retries back off (immediately, then 1 s, 2 s, … 5 s). With no display at

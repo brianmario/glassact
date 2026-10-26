@@ -86,6 +86,16 @@ public enum GeometryMode {
 
 /// §3.5 — control-stream messages (reliable, ordered). TLV framing:
 /// `{type u8, len varint, body}`.
+/// HOST_NOTICE codes (§3.5).
+public enum HostNotice {
+    /// Nothing in force: clear what was shown.
+    public static let none: UInt8 = 0
+    /// The host's login session is off the screen (another user, or the
+    /// login window, has it): the host can't capture, so the picture stays
+    /// frozen until it comes back.
+    public static let sessionOffScreen: UInt8 = 1
+}
+
 public enum ControlMessage: Equatable, Sendable {
     case hello(ver: UInt8, width: UInt16, height: UInt16, tileSize: UInt8, pixfmt: UInt8, caps: UInt32)
     /// geoMode 0 = no geometry request; 1 Client Resolution, 2 Scale,
@@ -271,6 +281,10 @@ public enum ControlMessage: Equatable, Sendable {
     /// reports, the rate the link actually delivered — what the host's own
     /// send-side readings can't see on a deep-buffered path.
     case received(bytes: UInt64, tUS: UInt64)
+    /// Host → viewer: something about the host the viewer should show its
+    /// user (`HostNotice`). Sent when it changes, and on connect while one is
+    /// in force. Viewers ignore codes they don't know.
+    case hostNotice(code: UInt8)
 
     public static let maxViewerLogChunk = 64 << 10
     public static let maxTextInputBytes = 4096
@@ -319,6 +333,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .viewerInfo: 0x1A
         case .syncRequest: 0x1B
         case .received: 0x1C
+        case .hostNotice: 0x1D
         }
     }
 
@@ -496,6 +511,8 @@ public enum ControlMessage: Equatable, Sendable {
         case let .received(bytes, tUS):
             body.writeU64(bytes)
             body.writeU64(tUS)
+        case let .hostNotice(code):
+            body.writeU8(code)
         }
         return body.bytes
     }
@@ -671,6 +688,9 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x1C:
             guard let bytes = r.readU64(), let tUS = r.readU64() else { return nil }
             return .received(bytes: bytes, tUS: tUS)
+        case 0x1D:
+            guard let code = r.readU8() else { return nil }
+            return .hostNotice(code: code)
         default:
             return nil
         }
@@ -679,7 +699,7 @@ public enum ControlMessage: Equatable, Sendable {
     /// Known TLV types. Everything beyond is skipped by the deframer
     /// using its declared length.
     public static func isKnownType(_ t: UInt8) -> Bool {
-        (0x01...0x1C).contains(t)
+        (0x01...0x1D).contains(t)
     }
 }
 

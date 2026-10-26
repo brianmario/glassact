@@ -249,6 +249,8 @@ public final class ViewerEngine: @unchecked Sendable {
     /// Fired on the engine queue when a video START lands (codec id) or the
     /// last region STOPs (nil) — status/log surface for the app.
     public var onVideoCodecChanged: ((UInt8?) -> Void)?
+    /// The host's `HostNotice` changed (`HostNotice.none`: nothing to show).
+    public var onHostNotice: ((UInt8) -> Void)?
     /// Connect milestones (see SessionMilestones). Engine-queue.
     public private(set) var milestones = SessionMilestones()
     /// `nowUS` of the datagram being applied (tile milestones).
@@ -449,6 +451,8 @@ public final class ViewerEngine: @unchecked Sendable {
                 onAgentScope?(control, reason)
             case let .uiTree(requestID, status, json):
                 onUITree?(requestID, status, json)
+            case let .hostNotice(code):
+                onHostNotice?(code)
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
                  .viewerInfo, .syncRequest, .received:

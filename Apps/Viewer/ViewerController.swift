@@ -156,10 +156,15 @@ final class ViewerController: @unchecked Sendable {
                 ?? "video off — lossless tiles"
             DispatchQueue.main.async { self?.onStatus(msg) }
         }
+        engine.onHostNotice = { [weak self] code in
+            DispatchQueue.main.async { self?.onHostNotice?(code) }
+        }
     }
 
     /// Auto-reconnect hook (main thread): fired when the transport dies.
     var onConnectionFailed: (() -> Void)?
+    /// The host's HOST_NOTICE changed (main thread).
+    var onHostNotice: ((UInt8) -> Void)?
 
     // MARK: - Clipboard sync (main thread)
 

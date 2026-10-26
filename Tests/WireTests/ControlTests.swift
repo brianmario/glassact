@@ -217,14 +217,14 @@ import GlassActTestSupport
 
     @Test func unknownTypesAreSkipped() {
         var unknown = ByteWriter()
-        unknown.writeU8(0x1D) // beyond the assigned range (deframer skips by length)
+        unknown.writeU8(0x1E) // beyond the assigned range (deframer skips by length)
         unknown.writeVarint(3)
         unknown.writeBytes([1, 2, 3] as [UInt8])
         var stream = unknown.bytes
         stream.append(contentsOf: ControlMessage.ping(nonce: 1, tUS: 2).encoded())
         var d = ControlDeframer()
         d.append(stream)
-        #expect(d.next() == .skippedUnknown(type: 0x1D))
+        #expect(d.next() == .skippedUnknown(type: 0x1E))
         #expect(d.next() == .message(.ping(nonce: 1, tUS: 2)))
         #expect(d.next() == nil)
         #expect(!d.isMalformed)

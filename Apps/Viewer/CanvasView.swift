@@ -88,6 +88,43 @@ final class CanvasView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    /// A message over the picture (the host's HOST_NOTICE); nil hides it.
+    private var noticeView: NSVisualEffectView?
+    func showNotice(_ text: String?) {
+        guard let text else {
+            noticeView?.removeFromSuperview()
+            noticeView = nil
+            return
+        }
+        if noticeView == nil {
+            let box = NSVisualEffectView()
+            box.material = .hudWindow
+            box.blendingMode = .withinWindow
+            box.state = .active
+            box.wantsLayer = true
+            box.layer?.cornerRadius = 12
+            box.translatesAutoresizingMaskIntoConstraints = false
+            let label = NSTextField(wrappingLabelWithString: "")
+            label.alignment = .center
+            label.font = .systemFont(ofSize: 14, weight: .medium)
+            label.preferredMaxLayoutWidth = 380
+            label.translatesAutoresizingMaskIntoConstraints = false
+            box.addSubview(label)
+            addSubview(box)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 20),
+                label.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -20),
+                label.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
+                label.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14),
+                box.centerXAnchor.constraint(equalTo: centerXAnchor),
+                box.centerYAnchor.constraint(equalTo: centerYAnchor),
+                box.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -32),
+            ])
+            noticeView = box
+        }
+        (noticeView?.subviews.first as? NSTextField)?.stringValue = text
+    }
+
     /// In-session resize (§4.10): adopt a new canvas grid IN PLACE — fresh flip
     /// surfaces, reset present state — without recreating the view. Swapping a
     /// window's contentView mid-transaction crashes AppKit's window animation
