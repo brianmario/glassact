@@ -487,8 +487,9 @@ extension HostEngine {
         // rate (VideoRateController). A byte limit (512 KB) would be 1.6 s of
         // lag at the 2.5 Mbps a remote Wi-Fi link carries.
         let backlog = transport.videoBacklogBytes
-        let networkQueueUS = videoNetworkQueueUS
-        if videoRate.observe(nowUS: lastEncodeNowUS, backlogBytes: backlog, networkQueueUS: networkQueueUS) {
+        if videoRate.observe(nowUS: lastEncodeNowUS, backlogBytes: backlog, networkQueueUS: videoSmoothedQueueUS,
+                             freshQueueUS: freshQueueSignal ? videoPingQueueUS : nil,
+                             linkCapacity: linkCapacityBytesPerSecond) {
             regionEncoder?.setBitrateCap(videoRate.bitrateCap)
         }
         let encoderFull = regionFramesPending >= Self.videoMaxPendingFrames
@@ -504,7 +505,7 @@ extension HostEngine {
         }
         // Queueing, not distance: a 250 ms path with an empty queue is not
         // pressure. Transports without an RTT view fall back to PING SRTT.
-        let queued = networkQueueUS.map { $0 > Self.videoQualityQueueUS } ?? (srttUS > Self.videoQualitySrttUS)
+        let queued = videoNetworkQueueUS.map { $0 > Self.videoQualityQueueUS } ?? (srttUS > Self.videoQualitySrttUS)
         notePressure(bandwidth: queued, cpu: encoderFull)
         evaluateQualityPressure()
         guard !encoderFull else {
@@ -542,8 +543,25 @@ extension HostEngine {
     static let videoQualityQueueUS: UInt64 = 45_000 // standing network queue above this = pressure
 
     /// Standing queue in the network: transport smoothed − minimum RTT.
-    public var videoNetworkQueueUS: UInt64? {
+    var videoSmoothedQueueUS: UInt64? {
         transport.transportRTT.map { $0.smoothedUS > $0.minUS ? $0.smoothedUS - $0.minUS : 0 }
+    }
+
+    /// The latest PING's round trip over the best one (nil without a PONG in
+    /// the last 2 s). A smoothed RTT only moves when ACKs come back: once
+    /// video is cut to its floor there are few, and a second of queue reads
+    /// as present for ~20 s after it drained. The PING, once a second, is
+    /// fresh — but one reading, which can land between bursts.
+    var videoPingQueueUS: UInt64? {
+        guard pingRTTAtUS != 0, lastEncodeNowUS &- pingRTTAtUS < 2_000_000 else { return nil }
+        return pingRTTLatestUS &- pingRTTMinUS
+    }
+
+    /// The smaller of the two: is a queue standing now?
+    public var videoNetworkQueueUS: UInt64? {
+        guard let smoothed = videoSmoothedQueueUS else { return nil }
+        guard freshQueueSignal, let ping = videoPingQueueUS else { return smoothed }
+        return min(smoothed, ping)
     }
 
     func notePressure(bandwidth: Bool, cpu: Bool) {

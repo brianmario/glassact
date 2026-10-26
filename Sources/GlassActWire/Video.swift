@@ -11,7 +11,10 @@ public enum WireCaps {
     /// user opts in and it can decode AV1. The rig's alternate mock codec
     /// (0x7E) maps here too, to test codec negotiation.
     public static let videoAV1: UInt32 = 1 << 1
-    // Bits 2 and 3 are unassigned.
+    /// Host → viewer in HELLO: send RECEIVED reports (bytes received, every
+    /// 250 ms), so the host can see the rate the link actually delivers.
+    public static let deliveryReports: UInt32 = 1 << 2
+    // Bit 3 is unassigned.
     /// Cursor as metadata (§5): the viewer composites the pointer
     /// at present time from CURSOR_POS/CURSOR_IMAGE control messages; a host
     /// seeing this bit stops burning the cursor into captured pixels.

@@ -86,6 +86,13 @@ public final class ViewerEngine: @unchecked Sendable {
     /// Host caps from the last HELLO (e.g. WireCaps.windowList gates
     /// single-window mode on the viewer UI).
     public private(set) var hostCaps: UInt32 = 0
+    /// When the last RECEIVED report went (`WireCaps.deliveryReports`), and
+    /// the byte count it carried.
+    private var lastReceivedReportUS: UInt64 = 0
+    private var lastReceivedReportBytes = -1
+    /// Datagram and video-stream bytes received, for RECEIVED (§3.5). Not
+    /// control: a PING alone mustn't make an idle session report (INV-10).
+    private var deliveredBytes = 0
     /// Cursor as metadata (§5): fired on the engine's confining queue; the app
     /// composites at present time (canvas untouched — INV-8).
     public var onCursorPos: ((Int, Int, Bool) -> Void)?
@@ -440,7 +447,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 onUITree?(requestID, status, json)
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
-                 .viewerInfo, .syncRequest:
+                 .viewerInfo, .syncRequest, .received:
                 break // viewer-originated / not addressed to the viewer
             }
         }
@@ -462,6 +469,7 @@ public final class ViewerEngine: @unchecked Sendable {
         // region cases check the factory themselves.
         guard state == .running else { return }
         stats.bytesIn += data.count
+        deliveredBytes += data.count
         videoDeframer.append(data)
         // `state` re-checked per message: a region escalating to .failed
         // mid-chunk must not let a later keyframe apply and ACK.
@@ -767,6 +775,7 @@ public final class ViewerEngine: @unchecked Sendable {
         defer { Signposts.viewer.endInterval("apply", signpostState) }
         stats.datagramsReceived += 1
         stats.bytesIn += data.count
+        deliveredBytes += data.count
         let ok = data.withUnsafeBytes { buf -> Bool in
             var headerReader = ByteReader(buf)
             guard let header = DatagramHeader.parse(&headerReader) else { return false }
@@ -784,6 +793,15 @@ public final class ViewerEngine: @unchecked Sendable {
     /// ACK cadence (§3.5) + reassembly expiry. Call regularly (~1 ms in tests).
     public func tick(nowUS: UInt64) {
         guard state == .running else { return }
+        // What the link delivered, for the host's link estimate (§4.9). Only
+        // when pixels arrived since the last report: idle sends nothing
+        // (INV-10).
+        if hostCaps & WireCaps.deliveryReports != 0, deliveredBytes != lastReceivedReportBytes,
+           nowUS &- lastReceivedReportUS >= 250_000 {
+            lastReceivedReportUS = nowUS
+            lastReceivedReportBytes = deliveredBytes
+            sendControl(.received(bytes: UInt64(deliveredBytes), tUS: nowUS))
+        }
         acks.tick(nowUS: nowUS) { sendAck(frameSeq: $0, dgramCnt: $1, bitmap: $2) }
         reassembler.expire(nowUS: nowUS) { tile, seq in
             stats.reasmExpired += 1

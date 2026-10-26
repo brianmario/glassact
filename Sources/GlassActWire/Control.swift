@@ -263,6 +263,12 @@ public enum ControlMessage: Equatable, Sendable {
     /// coalesce into the next allowed sync); the viewer re-asks at most
     /// every 500 ms while the region stays undecodable.
     case syncRequest(region: UInt8, generation: UInt32)
+    /// Viewer → host, every 250 ms while the host asks for it
+    /// (`WireCaps.deliveryReports`): the bytes received so far, tile
+    /// datagrams and video together, at the viewer's clock `tUS`. Between two
+    /// reports, the rate the link actually delivered — what the host's own
+    /// send-side readings can't see on a deep-buffered path.
+    case received(bytes: UInt64, tUS: UInt64)
 
     public static let maxViewerLogChunk = 64 << 10
     public static let maxTextInputBytes = 4096
@@ -310,6 +316,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .agentScope: 0x19
         case .viewerInfo: 0x1A
         case .syncRequest: 0x1B
+        case .received: 0x1C
         }
     }
 
@@ -484,6 +491,9 @@ public enum ControlMessage: Equatable, Sendable {
         case let .syncRequest(region, generation):
             body.writeU8(region)
             body.writeU32(generation)
+        case let .received(bytes, tUS):
+            body.writeU64(bytes)
+            body.writeU64(tUS)
         }
         return body.bytes
     }
@@ -656,6 +666,9 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x1B:
             guard let region = r.readU8(), let generation = r.readU32() else { return nil }
             return .syncRequest(region: region, generation: generation)
+        case 0x1C:
+            guard let bytes = r.readU64(), let tUS = r.readU64() else { return nil }
+            return .received(bytes: bytes, tUS: tUS)
         default:
             return nil
         }
@@ -664,7 +677,7 @@ public enum ControlMessage: Equatable, Sendable {
     /// Known TLV types. Everything beyond is skipped by the deframer
     /// using its declared length.
     public static func isKnownType(_ t: UInt8) -> Bool {
-        (0x01...0x1B).contains(t)
+        (0x01...0x1C).contains(t)
     }
 }
 

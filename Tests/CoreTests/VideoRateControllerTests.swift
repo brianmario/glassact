@@ -67,6 +67,48 @@ import GlassActCore
         #expect(c.backoffs <= 5, "backoffs \(c.backoffs) in 2 s (hold 500 ms)")
     }
 
+    /// The smoothed queue lags a burst that already drained: a fresh PING
+    /// reading of an empty queue stops the cuts it would keep making.
+    @Test func aFreshEmptyQueueStopsTheCuts() {
+        var (c, _) = simulate(offered: 1_250_000, link: 312_500, frameBytes: 20_000, seconds: 5)
+        let backoffs = c.backoffs
+        var now: UInt64 = 100_000_000
+        for _ in 0..<8 {
+            now += VideoRateController.windowUS
+            c.observe(nowUS: now, backlogBytes: 1000, networkQueueUS: 200_000, freshQueueUS: 5_000)
+        }
+        #expect(c.backoffs == backoffs)
+    }
+
+    /// …but never lets it grow: one PING can land between bursts while the
+    /// link fills, so growth waits for the smoothed queue to clear.
+    @Test func aFreshEmptyQueueDoesntGrowIt() {
+        var (c, _) = simulate(offered: 1_250_000, link: 312_500, frameBytes: 20_000, seconds: 5)
+        let before = c.rate
+        var now: UInt64 = 100_000_000
+        for _ in 0..<8 { // carrying all of the rate, smoothed queue 45 ms
+            now += VideoRateController.windowUS
+            c.noteHanded(before / 4)
+            c.observe(nowUS: now, backlogBytes: 0, networkQueueUS: 45_000, freshQueueUS: 0)
+        }
+        #expect(c.rate == before)
+    }
+
+    /// What the viewer received caps the estimate, and the startup ramp.
+    @Test func linkCapacityCapsTheRate() {
+        var (c, _) = simulate(offered: 1_250_000, link: 12_500_000, frameBytes: 20_000, seconds: 3)
+        var now: UInt64 = 100_000_000
+        for _ in 0..<4 {
+            now += VideoRateController.windowUS
+            c.observe(nowUS: now, backlogBytes: 0, networkQueueUS: 0, linkCapacity: 500_000)
+        }
+        if c.rate > 0 {
+            #expect(c.rate <= 450_000, "rate \(c.rate)")
+        } else {
+            #expect(c.startupCap ?? .max <= 3_600_000, "startup cap \(String(describing: c.startupCap))")
+        }
+    }
+
     @Test func idleScreenDoesNotInflateTheEstimate() {
         var (c, _) = simulate(offered: 1_250_000, link: 312_500, frameBytes: 20_000, seconds: 5)
         let measured = c.rate

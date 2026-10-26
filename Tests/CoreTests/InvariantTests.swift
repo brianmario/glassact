@@ -265,6 +265,25 @@ import GlassActTestSupport
         #expect(harness.host.stats.batchesDropped == 0)
     }
 
+    /// INV-10 for RECEIVED (§3.5): the viewer reports what the link delivered
+    /// while pixels arrive, and stops once they do. An idle session's PINGs
+    /// alone mustn't make it report.
+    @Test func INV_10_deliveryReportsStopAtIdle() {
+        var rng = SplitMix64(seed: 62)
+        let harness = Harness(width: 256, height: 192)
+        harness.frame.fillRandom(&rng)
+        harness.encodeFrame()
+        #expect(harness.settle())
+        #expect(harness.host.linkReports > 0, "a settle delivers pixels, so the viewer reports")
+        harness.run(untilUS: harness.now + 1_000_000) // the last report's 250 ms gap
+        let reports = harness.host.linkReports
+        for _ in 0..<20 {
+            harness.encodeFrame()
+            harness.run(untilUS: harness.now + 500_000)
+        }
+        #expect(harness.host.linkReports == reports, "idle must send no RECEIVED")
+    }
+
     /// INV-6 at engine level: malformed datagrams and control garbage must
     /// never crash the engines (wire-level fuzz lives in WireTests; payload
     /// decoders are reached by `EngineFuzzTests`, since random bytes almost

@@ -105,6 +105,13 @@ public struct VideoRateController: Sendable {
     /// ramp reaches the encoder's ceiling.
     public private(set) var startupCap: Int? = VideoRateController.startupCapBps
 
+    /// Over the link's proven capacity (`LinkEstimate`, what the viewer
+    /// received while the path was queued), the most the estimate may
+    /// reach. Under 1: the encoder aims at `capFraction` of it, and tiles
+    /// share the link (BENCHMARKS "Link estimate from the viewer: a fresh
+    /// queue and a capacity ceiling"; 0.8 cost frames for little latency).
+    public static let linkHeadroom = 0.9
+
     /// Bytes/s handed in each of the last 4 windows (~1 s).
     private var offeredRing = [Int](repeating: 0, count: 4)
     private var offeredRingNext = 0
@@ -136,10 +143,14 @@ public struct VideoRateController: Sendable {
     }
 
     /// Once per video tick. `networkQueueUS` = transport smoothed − min RTT
-    /// (nil if the transport has no RTT view). Returns true when `rate`
-    /// changed (the caller re-applies the encoder cap).
+    /// (nil if the transport has no RTT view); `freshQueueUS`, the latest
+    /// PING's reading, for cuts only (nil: none). `linkCapacity`: what the
+    /// link has proven it delivers (bytes/s, `LinkEstimate`; 0 unknown).
+    /// Returns true when `rate` changed (the caller re-applies the encoder
+    /// cap).
     @discardableResult
-    public mutating func observe(nowUS: UInt64, backlogBytes: Int, networkQueueUS: UInt64?) -> Bool {
+    public mutating func observe(nowUS: UInt64, backlogBytes: Int, networkQueueUS: UInt64?,
+                                 freshQueueUS: UInt64? = nil, linkCapacity: Int = 0) -> Bool {
         if rate > 0, nowUS > tokensAtUS {
             let burst = max(Self.minQueueBytes, rate * Self.burstUS / 1_000_000)
             tokens = min(burst, tokens + Int((nowUS - tokensAtUS) * UInt64(rate) / 1_000_000))
@@ -173,6 +184,12 @@ public struct VideoRateController: Sendable {
         let ramping = rate == 0 && startupCap.map { $0 > Self.startupCapBps } ?? true
         let queue = rate > 0 ? (networkQueueUS ?? 0)
             : standingQueueUS(nowUS: nowUS, window: ramping ? Self.rampQueueFilterUS : Self.queueFilterUS)
+        // Cuts on the fresher reading too: the smoothed one stays high for
+        // ~20 s after a burst drains and keeps cutting a starved stream.
+        // Growth keeps the smoothed one alone: a PING can land between
+        // bursts and read an empty queue the link is filling (10 Mbit/s
+        // scroll-win: the startup ramp ran to 17.9 Mbit/s on it).
+        let cutQueue = freshQueueUS.map { min(queue, $0) } ?? queue
         // A queue we aren't feeding isn't ours to drain: with nothing backed
         // up here and well under half the rate handed, cutting again only
         // walks the cap to the floor (measured: a 6 s queue at a quiet connect)
@@ -185,7 +202,7 @@ public struct VideoRateController: Sendable {
         offeredRing[offeredRingNext] = offered
         offeredRingNext = (offeredRingNext + 1) % offeredRing.count
         let notOurs = rate > 0 && !backlogged && offeredRing.max()! * 2 < rate
-        if queue > Self.queueHighUS, rate > 0 || sample > 0, !notOurs {
+        if cutQueue > Self.queueHighUS, rate > 0 || sample > 0, !notOurs {
             guard nowUS &- lastBackoffUS >= Self.backoffHoldUS else {
                 startWindow(nowUS, backlogBytes)
                 return false
@@ -196,7 +213,7 @@ public struct VideoRateController: Sendable {
             // queue never backed up — e.g. a 150 ms tether: `vlink
             // unmeasured`, queue standing at 80–100 ms): start from what is
             // being sent, so the encoder gets a cap at all.
-            let excess = Double(queue - Self.queueHighUS) / 1_000_000
+            let excess = Double(cutQueue - Self.queueHighUS) / 1_000_000
             // With a startup cap in force, cut from the cap: a quiet screen
             // sends far less than it allows, and cutting from that (~27 KB/s
             // at a connect with a 200 ms queue) would land on the 0.3 Mbit/s
@@ -234,6 +251,15 @@ public struct VideoRateController: Sendable {
                 rate = Int(Double(rate) * (recovering ? Self.recoveryProbeFactor : Self.probeFactor))
                 grewSinceBackoff = true
             }
+        }
+        // What the viewer has actually received bounds every reading taken
+        // here: on a deep buffer, bytes leave the host faster than the link
+        // carries them.
+        if rate > 0, linkCapacity > 0 { rate = min(rate, Int(Double(linkCapacity) * Self.linkHeadroom)) }
+        if rate == 0, linkCapacity > 0 {
+            // The startup ramp too: on clean readings it grows to uncapped,
+            // past a link that has shown its size.
+            startupCap = min(startupCap ?? Int.max, Int(Double(linkCapacity * 8) * Self.linkHeadroom))
         }
         if rate > 0 { rate = min(Self.maxRate, max(Self.minRate, rate)) }
         // Recovery mode: entered by a cut deep below the pushback rate (a
