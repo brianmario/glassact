@@ -663,6 +663,19 @@ public final class ViewerEngine: @unchecked Sendable {
         // Free everything configure() reallocates (else the pointers leak);
         // the old canvas first seeds the new one.
         let old = canvas, oldGrid = grid
+        if let old, let oldGrid, let overlay {
+            // Seed from what was on screen: video, where it showed. A session
+            // that just connected shows mostly the pinned region's video, and
+            // the canvas under it may still be black (live, 2026-10-26: the
+            // canvas-only seed still flashed black on plane Wi-Fi).
+            for t in 0..<oldGrid.count where overlayShows(t) {
+                let (x, y, tw, th) = oldGrid.rect(of: t)
+                for row in 0..<th {
+                    let o = ((y + row) * oldGrid.width + x) * 4
+                    old.baseAddress!.advanced(by: o).copyMemory(from: overlay.baseAddress!.advanced(by: o), byteCount: tw * 4)
+                }
+            }
+        }
         overlay?.deallocate()
         overlay = nil
         keyframes.releaseScratch()
