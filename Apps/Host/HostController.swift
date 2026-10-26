@@ -160,10 +160,19 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// user has unlocked it since).
     private var lockedWhenViewerArrived = false
     // Auto-scale (airplane story, main-thread): sustained severe link
-    // pressure halves the capture for the rest of the session; native
-    // restores on disconnect (via the captureModified restore path) or on
-    // stop — never mid-session.
+    // pressure halves the capture; once the link shows room for the full
+    // capture again it comes back (`ScaleRecovery`), and native also
+    // restores on disconnect (via the captureModified restore path) or stop.
     private var autoScaledDown = false
+    /// The capture the rung halved, to come back to (main thread).
+    private var autoScaleFull: (width: Int, height: Int, pointScale: CGFloat)?
+    /// How long a halved capture waits before it may come back; doubles each
+    /// time the rung comes down again after a recovery (main thread).
+    private var autoScaleRecoverHoldS: UInt64 = 60
+    private var autoScaleRecovered = false
+    /// encodeQueue copy of the above, for engines built in-session at the
+    /// halved size: (full pixel count, hold µs), nil at full size.
+    private var autoScaleRecovery: (pixels: Int, holdUS: UInt64)?
     private var recordingArmed = false // encodeQueue-confined
     // Video telemetry snapshot (encodeQueue-confined): transition lines fire
     // the moment a region forms or dissolves; rates ride the 2 s heartbeat.
@@ -829,6 +838,10 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         captureModified = false
         lastScaleRequest = nil
         autoScaledDown = false
+        autoScaleFull = nil
+        autoScaleRecoverHoldS = 60
+        autoScaleRecovered = false
+        encodeQueue.async { [weak self] in self?.autoScaleRecovery = nil }
         clipboardTimer?.invalidate(); clipboardTimer = nil
         cursorImageTimer?.invalidate(); cursorImageTimer = nil
         restoreSharedWindowFrame()
@@ -1625,6 +1638,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         captureModified = false
         lastScaleRequest = nil
         autoScaledDown = false    // native rebuild clears the rung
+        autoScaleFull = nil
+        encodeQueue.async { [weak self] in self?.autoScaleRecovery = nil }
         onStatus(status)
         // The physical display's mode and bounds settle a moment after a
         // virtual display goes away.
@@ -2507,6 +2522,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         engine.onScalePressureConstrained = { [weak self] in
             DispatchQueue.main.async { self?.handleScalePressureConstrained() }
         }
+        engine.onLinkRoomForFullResolution = { [weak self] in
+            DispatchQueue.main.async { self?.handleScaleRecovery() }
+        }
+        if let recovery = autoScaleRecovery {
+            engine.armScaleRecovery(fullPixels: recovery.pixels, holdUS: recovery.holdUS)
+        }
         engine.onVideoEncoderStalled = { [weak self] in
             DispatchQueue.main.async {
                 self?.onStatus("video encoder stopped answering — lossless tiles for the rest of this session")
@@ -2534,10 +2555,28 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         guard captureWidth >= 1920 else { return }     // too small to be worth halving
         autoScaledDown = true
         captureModified = true // disconnect grace restores to native
+        if autoScaleRecovered { autoScaleRecoverHoldS = min(autoScaleRecoverHoldS * 2, 960) } // it flapped
+        autoScaleFull = (captureWidth, captureHeight, pixelScale)
+        let recovery = (pixels: captureWidth * captureHeight, holdUS: autoScaleRecoverHoldS * 1_000_000)
+        encodeQueue.async { [weak self] in self?.autoScaleRecovery = recovery }
         let pw = (captureWidth / 2) & ~1
         let ph = (captureHeight / 2) & ~1
-        onStatus("link constrained — auto-scaling capture to \(pw)×\(ph) (restores on disconnect)")
+        onStatus("link constrained — auto-scaling capture to \(pw)×\(ph) (back up once the link has room, "
+                 + "after \(autoScaleRecoverHoldS) s at least)")
         restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: pixelScale / 2,
+                       origin: contentOrigin, inSession: true)
+    }
+
+    /// Main thread. The halved capture's engine saw the link carry room for
+    /// the full capture (§4.9, `ScaleRecovery`): back to it, in session.
+    private func handleScaleRecovery() {
+        guard isRunning, autoScaledDown, singleWindowID == 0, let full = autoScaleFull else { return }
+        autoScaledDown = false
+        autoScaleFull = nil
+        autoScaleRecovered = true
+        encodeQueue.async { [weak self] in self?.autoScaleRecovery = nil }
+        onStatus("link has room again — capture back to \(full.width)×\(full.height)")
+        restartCapture(pixelWidth: full.width, pixelHeight: full.height, pointScale: full.pointScale,
                        origin: contentOrigin, inSession: true)
     }
 
