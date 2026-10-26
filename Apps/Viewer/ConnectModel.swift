@@ -178,14 +178,19 @@ final class ViewerSettings {
     static let shared = ViewerSettings()
 
     private static let qualityKey = "glassact.viewer.qualityFloor"
+    /// Read once, to carry the old toggle into `motionPreference`.
     private static let sharpnessKey = "glassact.viewer.preferSharpness"
+    private static let motionKey = "glassact.viewer.motionPreference"
 
     /// 0 = automatic, 1…3 = keep quality high / medium / low.
     var qualityFloor: Int = UserDefaults.standard.integer(forKey: ViewerSettings.qualityKey) {
         didSet { UserDefaults.standard.set(qualityFloor, forKey: Self.qualityKey) }
     }
-    var preferSharpness: Bool = UserDefaults.standard.bool(forKey: ViewerSettings.sharpnessKey) {
-        didSet { UserDefaults.standard.set(preferSharpness, forKey: Self.sharpnessKey) }
+    /// Moving content: 0 = balanced, 1 = prefer sharpness, 2 = prefer smooth
+    /// motion on a slow network (QUALITY preference, §4.6).
+    var motionPreference: Int = UserDefaults.standard.object(forKey: ViewerSettings.motionKey) as? Int
+        ?? (UserDefaults.standard.bool(forKey: ViewerSettings.sharpnessKey) ? 1 : 0) {
+        didSet { UserDefaults.standard.set(motionPreference, forKey: Self.motionKey) }
     }
 
     private static let av1Key = "glassact.viewer.videoAV1"

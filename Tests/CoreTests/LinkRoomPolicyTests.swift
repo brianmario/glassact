@@ -7,60 +7,60 @@ import GlassActTestSupport
 /// AV1 only while the link has room (§4.6): the policy, judged on what the
 /// Viewer received, and the engine moving a live region to the other codec
 /// in place.
-@Suite struct AV1LinkPolicyTests {
-    static let thin = AV1LinkPolicy.thinBitsPerSecond / 8 - 1
-    static let roomy = AV1LinkPolicy.roomyBitsPerSecond / 8
+@Suite struct LinkRoomPolicyTests {
+    static let thin = LinkRoomPolicy.thinBitsPerSecond / 8 - 1
+    static let roomy = LinkRoomPolicy.roomyBitsPerSecond / 8
 
     @Test func startsOffAndTurnsOnOnceTheLinkDeliversRoom() {
-        var p = AV1LinkPolicy()
-        #expect(!p.allowed)
+        var p = LinkRoomPolicy()
+        #expect(!p.hasRoom)
         let short = p.noteSecond(deliveredBytesPerSecond: Self.roomy - 1, recentCapacityBytesPerSecond: 0, reports: 4)
         let room = p.noteSecond(deliveredBytesPerSecond: Self.roomy, recentCapacityBytesPerSecond: 0, reports: 8)
         #expect(!short)
         #expect(room)
-        #expect(p.allowed)
+        #expect(p.hasRoom)
     }
 
     @Test func offAfterThreeThinSecondsInARow() {
-        var p = AV1LinkPolicy()
+        var p = LinkRoomPolicy()
         _ = p.noteSecond(deliveredBytesPerSecond: Self.roomy, recentCapacityBytesPerSecond: 0, reports: 4)
         let changed = (0..<3).map { _ in
             p.noteSecond(deliveredBytesPerSecond: Self.thin, recentCapacityBytesPerSecond: Self.thin, reports: 8)
         }
         #expect(changed == [false, false, true])
-        #expect(!p.allowed)
+        #expect(!p.hasRoom)
     }
 
     /// A quiet screen delivers little and queues nothing: that says nothing
     /// about the link, so AV1 stays. A second that delivered room breaks a
     /// thin streak.
     @Test func aQuietScreenOrARoomySecondIsntThin() {
-        var p = AV1LinkPolicy()
+        var p = LinkRoomPolicy()
         _ = p.noteSecond(deliveredBytesPerSecond: Self.roomy, recentCapacityBytesPerSecond: 0, reports: 4)
         for _ in 0..<20 { _ = p.noteSecond(deliveredBytesPerSecond: 1_000, recentCapacityBytesPerSecond: 0, reports: 8) }
-        #expect(p.allowed)
+        #expect(p.hasRoom)
         for _ in 0..<2 { _ = p.noteSecond(deliveredBytesPerSecond: Self.thin, recentCapacityBytesPerSecond: Self.thin, reports: 8) }
         _ = p.noteSecond(deliveredBytesPerSecond: Self.roomy, recentCapacityBytesPerSecond: Self.thin, reports: 8)
         for _ in 0..<2 { _ = p.noteSecond(deliveredBytesPerSecond: Self.thin, recentCapacityBytesPerSecond: Self.thin, reports: 8) }
-        #expect(p.allowed)
+        #expect(p.hasRoom)
     }
 
     /// A Viewer from before RECEIVED reports gets AV1 as it did before the
     /// policy, after a few seconds.
     @Test func aViewerWithoutReportsGetsItAfterAFewSeconds() {
-        var p = AV1LinkPolicy()
-        let changed = (0..<AV1LinkPolicy.unreportedSeconds).map { _ in
+        var p = LinkRoomPolicy()
+        let changed = (0..<LinkRoomPolicy.unreportedSeconds).map { _ in
             p.noteSecond(deliveredBytesPerSecond: 0, recentCapacityBytesPerSecond: 0, reports: 0)
         }
-        #expect(changed == Array(repeating: false, count: AV1LinkPolicy.unreportedSeconds - 1) + [true])
-        #expect(p.allowed)
+        #expect(changed == Array(repeating: false, count: LinkRoomPolicy.unreportedSeconds - 1) + [true])
+        #expect(p.hasRoom)
     }
 
     @Test func governsAV1AndItsStandIn() {
-        #expect(AV1LinkPolicy.governs(VideoCodec.av1))
-        #expect(AV1LinkPolicy.governs(MockVideoEncoder.mockAltCodecID))
-        #expect(!AV1LinkPolicy.governs(VideoCodec.hevc))
-        #expect(!AV1LinkPolicy.governs(MockVideoEncoder.mockCodecID))
+        #expect(LinkRoomPolicy.governs(VideoCodec.av1))
+        #expect(LinkRoomPolicy.governs(MockVideoEncoder.mockAltCodecID))
+        #expect(!LinkRoomPolicy.governs(VideoCodec.hevc))
+        #expect(!LinkRoomPolicy.governs(MockVideoEncoder.mockCodecID))
     }
 
     /// A session asking for the AV1 stand-in starts on the other codec. Once
@@ -91,7 +91,7 @@ import GlassActTestSupport
         }
         move(seconds: 3)
         #expect(h.host.activeVideoCodec == MockVideoEncoder.mockCodecID, "starts off AV1, and a live region keeps its codec")
-        #expect(h.host.av1Link.allowed, "the link has delivered room")
+        #expect(h.host.linkRoom.hasRoom, "the link has delivered room")
         rest(seconds: 4)
         #expect(h.host.activeVideoRegionCount == 0)
         move(seconds: 1)
@@ -100,7 +100,7 @@ import GlassActTestSupport
 
         h.link.bottleneck = InProcLink.Bottleneck(bytesPerSecond: 250_000, bufferBytes: 250_000)
         move(seconds: 20)
-        #expect(!h.host.av1Link.allowed, "a thin link")
+        #expect(!h.host.linkRoom.hasRoom, "a thin link")
         #expect(h.host.activeVideoCodec == MockVideoEncoder.mockAltCodecID, "still the live region's codec")
         rest(seconds: 6)
         let withoutBefore = h.host.stats.videoRegionsWithoutAV1

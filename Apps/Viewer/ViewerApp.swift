@@ -153,7 +153,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // (exact transient shapes, e.g. drag badges, at frame latency).
         cursorMetadata = !args.contains("--burned-cursor")
         // Quality policy: floor + sharpness preference (presented-scale is
-        // automatic). --quality-floor auto|high|medium|low ; --prefer-sharpness
+        // automatic). --quality-floor auto|high|medium|low ; --prefer-sharpness ; --prefer-smoothness
         switch value(of: "--quality-floor") {
         case "auto": settings.qualityFloor = 0
         case "high": settings.qualityFloor = 1
@@ -161,7 +161,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         case "low": settings.qualityFloor = 3
         default: break
         }
-        if args.contains("--prefer-sharpness") { settings.preferSharpness = true }
+        if args.contains("--prefer-sharpness") { settings.motionPreference = 1 }
+        if args.contains("--prefer-smoothness") { settings.motionPreference = 2 }
         // Prefill from args, but only auto-dial when explicitly asked
         // (--auto-connect / --connect) — otherwise wait for the Connect button.
         if let host = value(of: "--host") { model.host = host }
@@ -469,7 +470,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
         controller.onGeometryChanged = { [weak self] w, h in self?.handleGeometryChanged(w, h) }
         singleWindowMode = model.shareMode == .window
-        controller.setQualityPrefs(floor: settings.qualityFloor, preferSharpness: settings.preferSharpness)
+        controller.setQualityPrefs(floor: settings.qualityFloor, motionPreference: settings.motionPreference)
         self.controller = controller
         updateAgentSharing() // a new dial gets a new driver; agents keep their socket
         if noPause {

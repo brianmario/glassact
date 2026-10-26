@@ -14,7 +14,10 @@ public enum WireCaps {
     /// Host → viewer in HELLO: send RECEIVED reports (bytes received, every
     /// 250 ms), so the host can see the rate the link actually delivers.
     public static let deliveryReports: UInt32 = 1 << 2
-    // Bit 3 is unassigned.
+    /// The host understands QUALITY preference 2, prefer smooth motion
+    /// (§3.5, §4.6). Hosts without it reject a 2 as malformed, so a viewer
+    /// sends it only when the host's HELLO carries this bit.
+    public static let smoothnessPreference: UInt32 = 1 << 3
     /// Cursor as metadata (§5): the viewer composites the pointer
     /// at present time from CURSOR_POS/CURSOR_IMAGE control messages; a host
     /// seeing this bit stops burning the cursor into captured pixels.

@@ -178,6 +178,9 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| Prefer smooth motion: frame-QP ceiling 38 while the link has no room (Viewer opt-in) | kept, opt-in | 2M photos 20 → 48 frames, 3M scroll-win queue p95 423 → 344 ms; text p5 SSIMULACRA2 −5 to −18 at caps ≤ 1 Mbit/s, about even above | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
+| Frame-QP ceiling 42 on thin links | rejected | photos frames 4–8× but SSIMULACRA2 near zero | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
+| A minimum encoder cap (2–3 Mbit/s) for sharper text on thin links | rejected | 1M scroll-win 98 → 51 frames; 2M cursor-drag 326 → 286 | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | AV1 only while the link has room (delivered ≥ 6 Mbit/s on, queued < 4 off; at the next region) | kept | 2–3 Mbit/s: HEVC's frames and latency (2M cursor-drag 326 · 641 ms vs AV1 alone 283 · 1183 ms); 10 Mbit/s: AV1 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Switch a live region's codec in place | rejected | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
@@ -249,6 +252,76 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### How low can video go: rate–quality knees, looser floors, prefer smooth motion (2026-10-25)
+
+How far can bitrates drop, and does that buy smoothness on a thin link?
+Three measurements; M4 Pro, the 5K traces resampled to 2900 px.
+
+**1. Where each codec reaches high quality.** `vquality --width 2900
+--frames 300 --codec hevc|av1 --kbit n --max-qp q`, caps 0.25–4 Mbit/s,
+floors 34 (the default), 38 and 42 (HEVC scale; AV1 maps them to
+quantizers 42, 47, 52). The lowest rate actually used where SSIMULACRA2's
+mean reaches 70, floor 34:
+
+| trace | HEVC | AV1 |
+|---|---|---|
+| typing-cc | 0.18 Mbit/s, but only under a cap ≥ 2 Mbit/s (63 at a 1 Mbit/s cap, same bytes) | 0.25 (75, at a 0.25 cap) |
+| cursor-drag | 0.43, cap ≥ 2 | 0.41 (72) |
+| scroll-win | 1.71, cap ≥ 2 | ~1.06 (70) |
+| photos | not reached by 4.5 Mbit/s (55.5) | not reached by 4 Mbit/s (49) |
+
+Text is already nearly free: HEVC spends 0.16–0.53 Mbit/s on typing and
+dragging whatever the cap or floor, so a looser floor saves nothing there
+and only loses the worst frames (typing at a 0.25 cap, p5 37 → 20 → −1 at
+floors 34, 38, 42). The bytes are in scrolling and photos, where the floor
+binds: at a 0.25 cap HEVC scroll-win uses 0.88 / 0.56 / 0.34 Mbit/s at
+SSIMULACRA2 47 / 28 / 10, photos 2.85 / 1.68 / 0.99 Mbit/s at 40 / 20 / −2.
+AV1 holds up better: scroll-win 1.06 / 0.75 / 0.57 Mbit/s at 70 / 62 / 53,
+so on scrolling AV1 at floor 42 beats HEVC at 34 on both bytes and
+quality.
+
+**2. Looser floors on thin links.** `replay --mode loop --max-qp q` (a new
+loop flag; the rest as in "Link estimate from the viewer"). Video frames ·
+queue p95:
+
+| link | trace | HEVC 34 → 38 → 42 | AV1 34 → 38 → 42 |
+|---|---|---|---|
+| 2M | cursor-drag | 336·641 → 412·585 → 385·587 | 283·1183 → 305·987 → 303·786 |
+| 2M | scroll-win | 210·728 → 205·526 → 206·428 | 315·1040 → 346·999 → 368·522 |
+| 2M | photos | 20 → 48 → 149 | 10 → 16 → 33 |
+| 3M | cursor-drag | 413·469 → 390·388 → 399·458 | 369·746 → 387·642 → 408·576 |
+| 3M | scroll-win | 247·423 → 285·344 → 304·349 | 383·572 → 400·452 → 406·414 |
+| 3M | photos | 58 → 110 → 210 | 16 → 41 → 124 |
+
+typing-cc moves by at most 5 frames from floor 34. Identical runs differ by about ±3 %.
+Every run settled byte-identical, but AV1 at 38 on 2M photos needed 60.45
+s, past the loop's 60 s budget (a new `--settle-s` raises it). Floor 42's
+photo frames are unreadable (SSIMULACRA2 near zero, above); floor 38 is
+the usable trade.
+
+**3. A minimum encoder cap, rejected.** HEVC's text quality follows its
+cap even at the same bytes, so would a cap that never drops below
+2–3 Mbit/s keep text sharper on a thin link? `--min-encoder-cap` (bench
+only; the send gate still decides what goes):
+
+| link | trace | base | min 2M | min 3M |
+|---|---|---|---|---|
+| 1M | scroll-win | 98 · 1238 ms | 51 · 1533 ms | 61 · 1513 ms |
+| 1M | typing-cc | 9 · 463 ms | 9 · 625 ms | 8 · 557 ms |
+| 2M | cursor-drag | 326 · 641 ms | 286 · 756 ms | 231 · 566 ms |
+| 2M | scroll-win | 208 · 736 ms | 155 · 692 ms | 179 · 726 ms |
+| 3M | cursor-drag | 413 · 469 ms | 375 · 469 ms | 352 · 471 ms |
+
+The higher target lets frames grow (typing at a 0.85 → 3 Mbit/s cap: mean
+frame 2.5 → 3.1 KB, largest 143 → 167 KB), and the gate skips more of
+them.
+
+**Kept: prefer smooth motion, an opt-in.** The Viewer's motion setting
+gains a third choice (QUALITY preference 2, behind caps bit 3): while the
+link has no room (`LinkRoomPolicy`, the AV1 fallback's judgement, renamed
+from `AV1LinkPolicy`), the frame-QP ceiling loosens from 34 to 38. The
+defaults don't change: balanced stays at 34 and prefer sharpness at 34/28.
 
 ### AV1 only while the link has room (2026-10-25)
 

@@ -270,7 +270,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x0D | RESIZE | V→H | mode u8 (1, 2, 4), w u16, h u16, scale u8 |
 | 0x0E | INPUT | V→H | kind u8, x u16, y u16, a i32, b i32 (§3.8) |
 | 0x0F | CLIPBOARD | both | format u8 (1 = UTF-8), data |
-| 0x10 | QUALITY | V→H | presentedScalePct u8, floor u8 (0 automatic, 1–3 keep high/medium/low), preferSharpness u8 (0–1) |
+| 0x10 | QUALITY | V→H | presentedScalePct u8, floor u8 (0 automatic, 1–3 keep high/medium/low), preferSharpness u8 (0 balanced, 1 prefer sharpness, 2 prefer smooth motion; 2 only to a host with caps bit 3) |
 | 0x11 | WINDOW_LIST | H→V | count u16, then per window: id u32, app, title, thumbFmt u8, thumbW, thumbH u16, thumb |
 | 0x12 | WINDOW_SELECT | V→H | windowID u32 (0 = full display) |
 | 0x13 | WINDOW_CONTROL | V→H | action u8 (1 fullscreen, 2 resize, 3 end), w u16, h u16 |
@@ -344,7 +344,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 0 | videoHEVC | HEVC video regions |
 | 1 | videoAV1 | AV1 regions: an Apple silicon Host (vendored libaom) offers it; a Viewer advertises it only when its user opts in. The test rig's alternate mock codec (0x7E) maps here too |
 | 2 | deliveryReports | the host asks for RECEIVED (§3.5) and bounds video by the link it reports (§4.9). Only the host's bit matters: a viewer sends RECEIVED when the host's HELLO carries it |
-| 3 | — | unassigned |
+| 3 | smoothnessPreference | the host understands QUALITY preference 2 (§4.6). Hosts without it reject a 2 as malformed, so only the host's bit matters: a viewer sends 2 only when the host's HELLO carries it |
 | 4 | cursor | cursor as metadata (host stops burning it into pixels) |
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
@@ -556,7 +556,7 @@ first negotiated codec whose encoder starts; START carries its id.
 - An Apple silicon Host prefers AV1 (codec 3, caps bit 1), then HEVC. A
   Viewer advertises AV1 only when its user opts in, so the choice is the
   Viewer's; every other session runs HEVC.
-- Even then AV1 runs only while the link has room (`AV1LinkPolicy`): its
+- Even then AV1 runs only while the link has room (`LinkRoomPolicy`): its
   quality floor keeps frames large, and on a thin link the send gate
   admits fewer of them than of HEVC's. Judged once a second on the link
   estimate (§4.9):
@@ -622,6 +622,14 @@ fewer than 2 frames pending and the rate gate passes.
     can't carry it settles at 34 instead of flapping.
   - A re-formed region starts under whichever ceiling is in effect, and
     turning the preference off restores 34 and the first wait.
+- **Prefer smooth motion** (QUALITY preference 2, to a host advertising
+  caps bit 3): while the link has no room (`LinkRoomPolicy`, the judgement
+  the AV1 choice uses), the frame-QP ceiling loosens from 34 to
+  `smoothMaxFrameQP` (38); once it has room, 34 again. On 2–3 Mbit/s links
+  that delivers about 2× the frames on photos and cuts scrolling's queue
+  delay, for softer moving content. It follows the link, not pressure, so
+  the smaller frames can't switch it off themselves. A session starts
+  without room, so the first second or two of a fast link runs at 38.
 
 **Overlay:**
 - The viewer decodes into an overlay buffer, never into the canvas.

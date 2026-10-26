@@ -172,7 +172,9 @@ public enum ControlMessage: Equatable, Sendable {
     /// <100 = downscaled → host may shed detail for free; 0 = unknown).
     /// floor: the lowest video quality the user accepts, a `QualityFloor`
     /// (0 = automatic, 1–3 = keep high / medium / low).
-    /// preferSharpness: 1 = under pressure drop FRAMERATE not quality.
+    /// preferSharpness: 1 = under pressure drop FRAMERATE not quality;
+    /// 2 = prefer smooth motion on a thin link (only to a host advertising
+    /// `WireCaps.smoothnessPreference`).
     case quality(presentedScalePct: UInt8, floor: UInt8, preferSharpness: UInt8)
     /// Remote input (viewer → host, reliable — a dropped keystroke is
     /// unacceptable). One TLV, internally discriminated by `kind`:
@@ -592,7 +594,7 @@ public enum ControlMessage: Equatable, Sendable {
             return .clipboard(format: format, data: bytes)
         case 0x10:
             guard let scale = r.readU8(), let floor = r.readU8(), floor <= QualityFloor.maxKnown,
-                  let pref = r.readU8(), pref <= 1 else { return nil }
+                  let pref = r.readU8(), pref <= 2 else { return nil }
             return .quality(presentedScalePct: scale, floor: floor, preferSharpness: pref)
         case 0x11:
             // Every window is ≥ 12 bytes (id 4, three empty varints 3, fmt 1,

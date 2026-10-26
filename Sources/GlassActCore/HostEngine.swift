@@ -39,7 +39,7 @@ public struct HostStats: Sendable {
     /// behind.
     public var videoEncoderFullSkips = 0
     /// Regions formed on another codec because the link had no room for the
-    /// preferred AV1 (`AV1LinkPolicy`).
+    /// preferred AV1 (`LinkRoomPolicy`).
     public var videoRegionsWithoutAV1 = 0
     /// Submit → delivery time of encoded frames, summed (with `clock`;
     /// virtual-time rigs record 0), and how many.
@@ -62,6 +62,8 @@ public struct HostStats: Sendable {
     /// times bandwidth pressure took it off again (§4.6).
     public var sharpCeilingOn = 0
     public var sharpCeilingOff = 0
+    public var smoothFloorOn = 0
+    public var smoothFloorOff = 0
     public var governorDeferredTiles = 0
     /// Cache slots dropped after a viewer REF miss (DELTA_NACK on a REF).
     public var cacheSlotsPoisoned = 0
@@ -266,6 +268,12 @@ public final class HostEngine: @unchecked Sendable {
     var sharpHealthyStreak = 0
     var sharpHealthyNeeded = HostEngine.sharpHealthyWindowsMin
     static let sharpMaxFrameQP = 28
+    /// Prefer smooth motion, on a thin link: the encoder runs under
+    /// `smoothMaxFrameQP` instead of the default ceiling while `linkRoom`
+    /// says there's no room (BENCHMARKS "Prefer smooth motion").
+    var policyPreferSmoothness = false
+    var smoothFloor = false
+    static let smoothMaxFrameQP = 38
     static let sharpHealthyWindowsMin = 4
     static let sharpHealthyWindowsMax = 64
     static let maxQualityLevel = 3
@@ -300,7 +308,7 @@ public final class HostEngine: @unchecked Sendable {
     var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
     var regionSubmitHead = 0
     /// Whether the link has room for AV1, judged once a second.
-    var av1Link = AV1LinkPolicy()
+    var linkRoom = LinkRoomPolicy()
     // Re-sharpen (engine queue): VideoToolbox never re-codes content that
     // stops changing, so whatever a large change got coded at — the startup
     // cap, a thin moment, the frame after a blank first capture — is what
@@ -766,7 +774,7 @@ public final class HostEngine: @unchecked Sendable {
                            width: UInt16(grid.width), height: UInt16(grid.height),
                            tileSize: UInt8(TileGrid.tileSize),
                            pixfmt: PixelFormat.bgra8sRGB,
-                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps))
+                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps | WireCaps.smoothnessPreference))
     }
 
     public func handleControl(_ data: Data, nowUS: UInt64) {
@@ -847,7 +855,8 @@ public final class HostEngine: @unchecked Sendable {
             case let .clipboard(format, data):
                 onClipboard?(format, data)
             case let .quality(scale, floor, pref):
-                applyQualityPolicy(scalePct: Int(scale), floor: floor, preferSharpness: pref == 1)
+                applyQualityPolicy(scalePct: Int(scale), floor: floor, preferSharpness: pref == 1,
+                                   preferSmoothness: pref == 2)
             case let .windowSelect(windowID):
                 onWindowSelect?(windowID)
             case let .windowControl(action, width, height):
@@ -927,9 +936,11 @@ public final class HostEngine: @unchecked Sendable {
             lastPingUS = nowUS
             evaluateScalePressure()
             // The next region forms on what this allows (`allowedVideoCodecs`).
-            _ = av1Link.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
+            if linkRoom.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
                                    recentCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
-                                   reports: linkReports)
+                                   reports: linkReports) {
+                updateSmoothFloor()
+            }
         }
     }
 
@@ -1507,7 +1518,7 @@ public final class HostEngine: @unchecked Sendable {
                            width: UInt16(grid.width), height: UInt16(grid.height),
                            tileSize: UInt8(TileGrid.tileSize),
                            pixfmt: PixelFormat.bgra8sRGB,
-                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps))
+                           caps: extraHelloCaps | videoCaps | deliveryReportsCaps | WireCaps.smoothnessPreference))
     }
     private var deliveryReportsCaps: UInt32 { requestDeliveryReports ? WireCaps.deliveryReports : 0 }
 

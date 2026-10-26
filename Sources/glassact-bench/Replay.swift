@@ -5,7 +5,7 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax",
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap",
                              "link-mbit", "link-buffer-ms"]
 
 let replayCommand = Command(
@@ -25,6 +25,9 @@ let replayCommand = Command(
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
         .bool("no-fresh-queue", "loop: before 'Link estimate from the viewer': the video gate cuts on the smoothed RTT's queue alone"),
+        .int("max-qp", "<n>", 1...51, "loop experiment, real codecs: the frame-QP ceiling (HEVC scale; AV1 maps it) in place of the default 34"),
+        .int("settle-s", "<n>", 1...3600, "loop: virtual seconds to settle after the last frame before giving up (default 60)"),
+        .int("min-encoder-cap", "<kbit>", 100...100_000, "loop experiment, real codecs: the encoder's bitrate cap never goes under this (the send gate still decides what goes)"),
         .bool("no-link-reports", "loop: before 'Link estimate from the viewer': no RECEIVED reports, no capacity ceiling"),
         .int("av1-qmax", "<0-63>", 0...63, "loop experiment, --video av1: libaom's quantizer ceiling (default: HEVC's frame-QP floor mapped, 42)"),
         .int("av1-target-pct", "<n>", 10...100, "loop experiment, --video av1: aim at n % of the target and the link cap (default 40, as in the product)"),
