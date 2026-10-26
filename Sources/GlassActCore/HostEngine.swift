@@ -979,6 +979,7 @@ public final class HostEngine: @unchecked Sendable {
             sendControl(.ping(nonce: pingNonce, tUS: sendStampUS(nowUS)))
             lastPingUS = nowUS
             evaluateScalePressure(nowUS: nowUS)
+            evaluateScaleRecovery(nowUS: nowUS)
             // The next region forms on what this allows (`allowedVideoCodecs`).
             if linkRoom.noteSecond(deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
                                    recentCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
@@ -1031,6 +1032,28 @@ public final class HostEngine: @unchecked Sendable {
     func thinLinkEvidence(nowUS: UInt64) -> Int {
         let capacity = linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS)
         return capacity == 0 ? 0 : max(capacity, linkEstimate.deliveredBytesPerSecond(nowUS: nowUS))
+    }
+
+    private var scaleRecovery: ScaleRecovery?
+    /// The link has shown room for the full capture again
+    /// (`armScaleRecovery`). Engine queue, once.
+    public var onLinkRoomForFullResolution: (() -> Void)?
+
+    /// This engine runs a capture the resolution rung halved: watch for the
+    /// link to show room for `fullPixels` again (§4.9, `ScaleRecovery`), no
+    /// sooner than `holdUS` from now.
+    public func armScaleRecovery(fullPixels: Int, holdUS: UInt64) {
+        scaleRecovery = ScaleRecovery(fullPixels: fullPixels, holdUS: holdUS)
+    }
+
+    private func evaluateScaleRecovery(nowUS: UInt64) {
+        guard var recovery = scaleRecovery else { return }
+        let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
+        if recovery.noteSecond(nowUS: nowUS, deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
+                               queued: queued) {
+            onLinkRoomForFullResolution?()
+        }
+        scaleRecovery = recovery
     }
 
     private func evaluateScalePressure(nowUS: UInt64) {
