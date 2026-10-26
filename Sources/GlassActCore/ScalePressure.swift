@@ -23,7 +23,9 @@
 ///   The video rule's evidence needs a window that stayed backlogged, and a
 ///   send gate that skips frames keeps video from backing up: in an airport
 ///   lounge at ~0.3 Mbit/s it never fired, while the viewer's reports said
-///   0.3 Mbit/s for a minute.
+///   0.3 Mbit/s for a minute. The engine passes the larger of that and what
+///   the link delivered in the last ~10 s, so a stall right after a fast
+///   stretch doesn't read as a thin link (`HostEngine.thinLinkEvidence`).
 ///
 /// Plain value type; latches once fired.
 struct ScalePressure {

@@ -294,6 +294,18 @@ Loop, `--video mock`, `--link-mbit 1 --link-buffer-ms 2000 --latency
 None settled in the loop's 60 s budget either way; the mock codec's
 whole-region frames are slow on 1 Mbit/s.
 
+**A stall isn't a thin link.** Live on this build (same lounge, 09:44:46),
+the link carried 2–5.4 Mbit/s with AV1 at 20–31 fps until 09:45:34. Then
+the Wi-Fi stalled for a few seconds, and the rung fired at 09:45:38,
+halving the capture for the rest of the session. A stall queues data while
+almost nothing arrives, so its queued spans read as a very thin link, and
+the fast stretch before it had no queued spans to say otherwise. The rule
+now judges by the larger of the queued capacity and what the link
+delivered in the last ~10 s, a lower bound on it: the 0.3 Mbit/s session
+never delivered more than ~0.6 Mbit/s and still fires, the stall doesn't
+(`ScalePressureTests.aStallAfterAFastStretchIsntThin`, which fails without
+the delivered bound).
+
 **A rig artifact found on the way.** On scroll-win and cursor-drag the
 estimate read a capacity of 20.4 and 16.8 Mbit/s on the 1 Mbit/s link
 (photos 0.97). The rig delivers each video message whole when its last

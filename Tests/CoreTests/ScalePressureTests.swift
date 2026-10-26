@@ -79,6 +79,30 @@ import Testing
         #expect(!afterReset)
     }
 
+    /// What the engine hands the rule: a stall right after a fast stretch
+    /// (data queued, almost nothing arriving) isn't a thin link, because the
+    /// link just delivered more; a link that stays thin still reads thin.
+    @Test func aStallAfterAFastStretchIsntThin() {
+        func evidence(fast: Bool) -> Int {
+            let (host, _) = makeRunningHost(width: 256, height: 192)
+            var bytes: UInt64 = 0, t: UInt64 = 0
+            func report(_ add: UInt64, queued: Bool) {
+                t += 250_000
+                bytes += add
+                host.linkEstimate.noteReceived(bytes: bytes, viewerTUS: t, nowUS: t, queued: queued)
+            }
+            if fast {
+                for _ in 0..<32 { report(5_400_000 / 8 / 4, queued: false) } // 8 s at 5.4 Mbit/s
+                for _ in 0..<20 { report(100, queued: true) }                // a 5 s stall
+            } else {
+                for _ in 0..<52 { report(300_000 / 8 / 4, queued: true) }    // 13 s at 0.3 Mbit/s
+            }
+            return host.thinLinkEvidence(nowUS: t)
+        }
+        #expect(evidence(fast: true) * 8 >= 5_000_000, "the link just delivered 5.4 Mbit/s")
+        #expect(evidence(fast: false) * 8 < 400_000, "a link that stays thin")
+    }
+
     /// 4 Mbit/s and over is never thin, whatever the capture: halving a 5K
     /// capture on ordinary home Wi-Fi is the person's call.
     @Test func aReportedLinkAboveTheCeilingNeverFires() {

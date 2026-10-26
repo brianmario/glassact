@@ -976,13 +976,24 @@ public final class HostEngine: @unchecked Sendable {
     public static let autoScaleThinVideoSeconds = ScalePressure.thinVideoSeconds
     private var scalePressure = ScalePressure()
 
+    /// The viewer-reported link for the resolution rung: the recent queued
+    /// capacity, but never under what the link delivered in the last ~10 s
+    /// (a lower bound on it). A stall queues data while almost nothing
+    /// arrives, so on its own it reads as a very thin link: in the lounge, a
+    /// few seconds' stall right after 5.4 Mbit/s fired the rung. 0 without a
+    /// queued reading.
+    func thinLinkEvidence(nowUS: UInt64) -> Int {
+        let capacity = linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS)
+        return capacity == 0 ? 0 : max(capacity, linkEstimate.deliveredBytesPerSecond(nowUS: nowUS))
+    }
+
     private func evaluateScalePressure(nowUS: UInt64) {
         if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
                                     severeAckDelayUS: Self.governorSevereAckDelayUS,
                                     videoLinkMeasurements: videoRate.linkMeasurements,
                                     videoRateBytesPerSecond: videoRate.rate,
                                     videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
-                                    linkCapacityBytesPerSecond: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
+                                    linkCapacityBytesPerSecond: thinLinkEvidence(nowUS: nowUS),
                                     pixels: grid.width * grid.height) {
             onScalePressureConstrained?()
         }

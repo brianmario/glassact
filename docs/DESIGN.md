@@ -818,9 +818,11 @@ capture for the rest of the session (`ScalePressure`) after either:
   alone can take tens of seconds (45 s on plane Wi-Fi).
 - 5 s of the viewer-reported link capacity (`LinkEstimate`, queued spans
   in the last ~10 s) under the same two bars, counting only seconds with a
-  reading. The video rule needs a window in which video stayed backlogged,
-  and a send gate that skips frames keeps it from backing up: in an airport
-  lounge at ~0.3 Mbit/s neither older rule fired.
+  reading, and never under what the link delivered in the last ~10 s (a
+  stall queues data while almost nothing arrives, and alone reads as a
+  thin link). The video rule needs a window in which video stayed
+  backlogged, and a send gate that skips frames keeps it from backing up:
+  in an airport lounge at ~0.3 Mbit/s neither older rule fired.
 
 ### 4.10 Session, geometry and windows
 
