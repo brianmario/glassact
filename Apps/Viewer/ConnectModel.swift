@@ -45,6 +45,9 @@ final class ConnectModel {
         case signingIn
         case reconnecting(attempt: Int)
         case choosingWindow
+        /// Connected; the session window opens once the first picture has
+        /// arrived, so it never shows black.
+        case loadingPicture
         case inSession
     }
 
