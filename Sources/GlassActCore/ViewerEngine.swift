@@ -1,3 +1,4 @@
+import Accelerate
 public import Foundation
 public import GlassActWire
 import GlassActCodec
@@ -659,12 +660,29 @@ public final class ViewerEngine: @unchecked Sendable {
     private func reconfigure(width: Int, height: Int) {
         // Live video regions are old-canvas scoped — stop their decoders.
         video.stopAll()
-        // Free everything configure() reallocates (else the pointers leak).
-        canvas?.deallocate()
+        // Free everything configure() reallocates (else the pointers leak);
+        // the old canvas first seeds the new one.
+        let old = canvas, oldGrid = grid
         overlay?.deallocate()
         overlay = nil
         keyframes.releaseScratch()
         configure(width: width, height: height)
+        if let old, let oldGrid, let canvas, let grid {
+            // Until the host's re-sent tiles land, show the old picture scaled
+            // to the new size rather than black: on a thin link the re-send
+            // takes seconds (auto-scale halves the capture mid-session). The
+            // host rebuilt its engine and re-sends every tile, and nothing
+            // references these pixels: DELTA checks the base's hash, the tile
+            // cache is reset, and SCROLL needs acked tiles.
+            var src = vImage_Buffer(data: old.baseAddress!, height: vImagePixelCount(oldGrid.height),
+                                    width: vImagePixelCount(oldGrid.width), rowBytes: oldGrid.width * 4)
+            var dst = vImage_Buffer(data: canvas.baseAddress!, height: vImagePixelCount(grid.height),
+                                    width: vImagePixelCount(grid.width), rowBytes: grid.width * 4)
+            if vImageScale_ARGB8888(&src, &dst, nil, vImage_Flags(kvImageNoFlags)) == kvImageNoError {
+                for t in 0..<grid.count { dirty.mark(t) }
+            }
+        }
+        old?.deallocate()
         appliedCaptureTS.removeAll(keepingCapacity: true)
         acks.reset()
         // NB: the video stream is reliable + ordered and spans the engine swap

@@ -95,6 +95,10 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                           videoEncoderFactory: encoderFactory,
                           videoCodecPreference: hostCodecs)
     if opts.has("no-handoff") { host.overlayHandoff = false }
+    // The resolution rung (§4.9): the app would halve the capture here; the
+    // loop only reports when it would have.
+    nonisolated(unsafe) var autoScaleUS: UInt64?
+    host.onScalePressureConstrained = { if autoScaleUS == nil { autoScaleUS = link.nowUS } }
     if opts.has("no-fresh-queue") { host.freshQueueSignal = false }
     if opts.has("no-link-reports") { host.requestDeliveryReports = false }
     if opts.has("handoff-ms") { host.handoffStillUS = UInt64(opts.int("handoff-ms", 1000)) * 1000 }
@@ -163,7 +167,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                       + "vrate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s "
                       + "vcap \(host.videoRate.bitrateCap.map { String(format: "%.2f", Double($0) / 1e6) } ?? "none") "
                       + "backoffs \(host.videoRate.backoffs) vskips \(host.stats.videoBacklogSkips) "
-                      + "netq \((host.videoNetworkQueueUS ?? 0) / 1000) ms")
+                      + "netq \((host.videoNetworkQueueUS ?? 0) / 1000) ms "
+                      + "ldeliv \(String(format: "%.2f", Double(host.linkDeliveredBytesPerSecond * 8) / 1e6)) lcap \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6))")
             }
             if link.bottleneck != nil && t >= nextBacklogSampleUS {
                 nextBacklogSampleUS = t + 10_000
@@ -348,6 +353,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)  \
     link: \(host.linkReports) reports, capacity \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6)) Mbit/s  \
     regions without AV1 (thin link) \(host.stats.videoRegionsWithoutAV1)  \
+    auto-scale \(autoScaleUS.map { String(format: "at %.1f s", Double($0) / 1e6) } ?? "never")  \
     gate at end: rate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s, \
     \(host.videoRate.linkMeasurements) link measurements, \(host.videoRate.backoffs) backoffs, \
     startup cap \(host.videoRate.startupCap.map { String(format: "%.1f Mbit/s", Double($0) / 1e6) } ?? "none")
