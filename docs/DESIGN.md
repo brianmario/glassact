@@ -816,8 +816,8 @@ ACK-bitmap loss:
   stay ≤ 0.9 × capacity. With no queued span, or no reports (an older
   viewer), there's no ceiling.
 
-**Resolution rung:** `onScalePressureConstrained` asks the app to downscale
-capture for the rest of the session (`ScalePressure`) after either:
+**Resolution rung:** `onScalePressureConstrained` asks the app to halve the
+capture (`ScalePressure`) after any of:
 - 6 s of severe ACK delay, counting only seconds with a fresh ACK-delay
   sample; or
 - 5 s of measured video drain under 0.75 bit/s per captured pixel and under
@@ -833,6 +833,16 @@ capture for the rest of the session (`ScalePressure`) after either:
   thin link). The video rule needs a window in which video stayed
   backlogged, and a send gate that skips frames keeps it from backing up:
   in an airport lounge at ~0.3 Mbit/s neither older rule fired.
+
+**Back up the rung:** the app arms the halved capture's engine with the full
+capture's pixel count (`armScaleRecovery`), and `onLinkRoomForFullResolution`
+brings the full capture back in session (`ScaleRecovery`) once:
+- the link delivered at least twice the full capture's thin bar (6.8 Mbit/s
+  for 2900×1572) in 30 seconds, not queued in any of them (a queued second
+  starts the count over; seconds without such a reading hold it); and
+- the capture has been halved at least 60 s. The wait doubles, up to 16 min,
+  each time the rung comes down again after a recovery, so a link near the
+  line settles instead of flapping.
 
 ### 4.10 Session, geometry and windows
 

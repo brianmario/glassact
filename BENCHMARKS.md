@@ -306,6 +306,36 @@ never delivered more than ~0.6 Mbit/s and still fires, the stall doesn't
 (`ScalePressureTests.aStallAfterAFastStretchIsntThin`, which fails without
 the delivered bound).
 
+**Live on plane Wi-Fi** (same day, `7f3232a` Host, `d35406b` Viewer; 2900×1572
+virtual display, ~0.3 Mbit/s, SRTT ~0.6–1 s): the rung fired 7.4 s after
+connecting (the 2026-10-22 plane session took 45 s), and a second session 9 s
+after. Over the following 7 minutes at 1450×786, from the Host's 2 s status
+lines:
+
+| | p50 | p90 / p95 | max |
+|---|---|---|---|
+| video frames per second | 5 | 44 (p90) | |
+| video Kbit/s | 226 | 531 (p90) | |
+| network queue | 28 ms | 60 ms (p95) | 83 ms |
+| SRTT | 675 ms | 806 ms (p95) | |
+
+The same lounge link at full size had built 4–5 s of queue. The owner's
+verdict: "pretty responsive, considering". The capture then stayed halved
+for the session, which "Back up the rung" (DESIGN §4.9) addresses.
+
+**Against Apple's Screen Sharing, same flight** (one session each, minutes
+apart; per-process bytes handed to the Tailscale tunnel, `nettop`, 5 s
+windows). Screen Sharing (`screensharingd`, the standard mode as far as the
+process shows) sent 0.57–2.9 Mbit/s, about 1.5 on average, for its ~2 minutes,
+2–10× what the link carried, and almost nothing came back (0–19 kbit/s).
+Glass Act sent 0.23–0.41 Mbit/s. The owner: Screen Sharing was "pretty
+stuttery", about as responsive or slightly less. Not like for like: Screen
+Sharing sent the full 2900×1572 throughout (it doesn't scale on the host),
+while Glass Act had halved to 1450×786. At full size Glass Act also overran
+a 0.3 Mbit/s link (the lounge's 4–5 s queues), so the halving is much of
+the difference, and Screen Sharing has nothing like it. An impression from
+two short sessions on a link that changes by the minute, not a benchmark.
+
 **A rig artifact found on the way.** On scroll-win and cursor-drag the
 estimate read a capacity of 20.4 and 16.8 Mbit/s on the 1 Mbit/s link
 (photos 0.97). The rig delivers each video message whole when its last
