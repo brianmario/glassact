@@ -42,7 +42,11 @@ jobs:
         # (`just test`).
         run: swift test --skip "VideoSendGateTests|$QUIC_SUITES"
       - name: Real-QUIC tests
-        run: swift test --filter "$QUIC_SUITES"
+        # One suite at a time: run side by side, the suites still starved each
+        # other on a hosted VM (QUICSustainedSessionTests' 2048×2048 session
+        # missing its 25 s round with its control path alive, 2026-10-26).
+        # ~100 s instead of ~45 s.
+        run: swift test --filter "$QUIC_SUITES" --no-parallel
 
   apps:
     name: Apps
