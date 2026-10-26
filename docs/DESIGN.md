@@ -585,6 +585,15 @@ first negotiated codec whose encoder starts; START carries its id.
 **Lifecycle:**
 - Each region is a *generation*. The viewer drops stragglers from older
   generations.
+- **A stalled encoder ends video for the session.** VideoToolbox's calls are
+  XPC to the system's encoder service, so `VTHEVCRegionEncoder` makes all of
+  them on its own queue: one that never answers can't hold the engine's
+  queue. `start` waits for the service at most 2 s. A frame still in the
+  encoder after `videoEncoderStallUS` (3 s) means it stopped answering: the
+  region dissolves with a full repaint, no region forms again in that
+  session, and lossless tiles carry the screen. (Live, 2026-10-26: the
+  service went silent for minutes right after a virtual display came up,
+  and the session went black, then stopped answering PINGs.)
 - A region dissolves:
   - after `regionQuietLimit` quiet ticks: 90, or 270 when it re-formed within
     120 ticks of the last dissolve (paging workloads). The wall-time limit

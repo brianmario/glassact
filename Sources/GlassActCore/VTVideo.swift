@@ -20,6 +20,16 @@ import VideoToolbox
 /// thread and touches only `configClaimed` (a Mutex) and `callbackQueue`
 /// (immutable); `onFrame` is read only on `callbackQueue` (the engine's
 /// queue, where it's set).
+///
+/// Every VideoToolbox call (create, encode, set a property, invalidate) runs
+/// on `vtQueue`, never the caller's: they're XPC calls to the system's
+/// encoder service, and one that never answers would otherwise hold the
+/// engine's queue (live in an airport lounge, 2026-10-26: the first encode
+/// after a virtual display came up blocked in
+/// `RemoteVideoEncoder_CopySupportedPropertyDictionary` for minutes, and the
+/// session went black, then silent). `start` waits for the service at most
+/// `startTimeout`; frames that never come back are the engine's to notice
+/// (`HostEngine.videoEncoderStallUS`).
 public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     public var codecID: UInt8 { VideoCodec.hevc }
 
@@ -39,6 +49,10 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// and written on callbackQueue would be a data race.
     private let configClaimed = Mutex(false)
     private var onFrame: (([UInt8], Bool, [UInt8]?) -> Void)?
+    private let vtQueue = DispatchQueue(label: "glassact.vt.encode")
+    /// How long `start` waits for the encoder service before reporting
+    /// failure (creating a 5K session takes ~50 ms).
+    static let startTimeout: DispatchTimeInterval = .seconds(2)
 
     /// Ask VideoToolbox for its low-latency rate control (the video-call
     /// mode). Falls back to the normal session if refused; `lowLatencyActive`
@@ -91,6 +105,22 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
 
     public func start(width: Int, height: Int,
                       onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        let started = Mutex(false)
+        nonisolated(unsafe) let onFrame = onFrame
+        vtQueue.async { [self] in
+            let ok = startOnVTQueue(width: width, height: height, onFrame: onFrame)
+            started.withLock { $0 = ok }
+            done.signal()
+        }
+        // Abandoned on a timeout: the engine drops this encoder, and deinit
+        // invalidates whatever session the late call leaves behind.
+        guard done.wait(timeout: .now() + Self.startTimeout) == .success else { return false }
+        return started.withLock { $0 }
+    }
+
+    private func startOnVTQueue(width: Int, height: Int,
+                                onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
         self.width = width
         self.height = height
         self.onFrame = onFrame
@@ -190,8 +220,10 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         guard ceiling != maxFrameQP else { return }
         maxFrameQP = ceiling
         guard let session else { return }
-        maxFrameQPAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
-                                                  value: ceiling as CFNumber) == noErr
+        nonisolated(unsafe) let s = session
+        vtQueue.async {
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxAllowedFrameQP, value: ceiling as CFNumber)
+        }
     }
 
     /// Quality level's share of the base, under the link cap. The cap also
@@ -206,17 +238,20 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         // Re-setting VT's rate costs a rate-control reset; skip < 5% moves.
         guard appliedBitrate == 0 || abs(target - appliedBitrate) * 20 > appliedBitrate else { return }
         appliedBitrate = target
-        // Bench-only knob; the VBV keys exist from macOS 26.
-        if #available(macOS 26, *), capWithVBV {
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_VBVMaxBitRate, value: target as CFNumber)
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_VBVBufferDuration, value: 1.0 as CFNumber)
-            return
-        }
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: target as CFNumber)
-        if bitrateCap != nil {
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
-                                 value: [Double(target) * 1.5 / 8, 1.0] as CFArray)
+        let vbv = capWithVBV, limits = bitrateCap != nil, rate = target
+        nonisolated(unsafe) let s = session
+        vtQueue.async {
+            // Bench-only knob; the VBV keys exist from macOS 26.
+            if #available(macOS 26, *), vbv {
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_VBVMaxBitRate, value: rate as CFNumber)
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_VBVBufferDuration, value: 1.0 as CFNumber)
+                return
+            }
+            VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: rate as CFNumber)
+            if limits {
+                VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits,
+                                     value: [Double(rate) * 1.5 / 8, 1.0] as CFArray)
+            }
         }
     }
 
@@ -244,25 +279,29 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         let us = max(Int64(clamping: timeUS), lastPTSUS + 1)
         lastPTSUS = us
         let pts = CMTime(value: us, timescale: 1_000_000)
-        let frameProps: CFDictionary? = forceSync
-            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
-            : nil
-        let status = VTCompressionSessionEncodeFrame(
-            session, imageBuffer: pixelBuffer, presentationTimeStamp: pts,
-            duration: .invalid,
-            frameProperties: frameProps,
-            infoFlagsOut: nil
-        ) { [weak self] status, _, sampleBuffer in
-            // VT's own callback thread → hop to the engine queue.
-            guard let self else { return }
-            guard status == noErr, let sampleBuffer else {
-                self.deliverNothing()
-                return
+        nonisolated(unsafe) let frame = pixelBuffer
+        nonisolated(unsafe) let s = session
+        vtQueue.async { [weak self] in
+            let frameProps: CFDictionary? = forceSync
+                ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
+                : nil
+            let status = VTCompressionSessionEncodeFrame(
+                s, imageBuffer: frame, presentationTimeStamp: pts,
+                duration: .invalid,
+                frameProperties: frameProps,
+                infoFlagsOut: nil
+            ) { [weak self] status, _, sampleBuffer in
+                // VT's own callback thread → hop to the engine queue.
+                guard let self else { return }
+                guard status == noErr, let sampleBuffer else {
+                    self.deliverNothing()
+                    return
+                }
+                self.emit(sampleBuffer)
             }
-            self.emit(sampleBuffer)
-        }
-        if status != noErr {
-            deliverNothing()
+            if status != noErr {
+                self?.deliverNothing()
+            }
         }
     }
 
@@ -358,7 +397,8 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
 
     private func teardown() {
         if let session {
-            VTCompressionSessionInvalidate(session)
+            nonisolated(unsafe) let s = session
+            vtQueue.async { VTCompressionSessionInvalidate(s) }
         }
         session = nil
         pool = nil

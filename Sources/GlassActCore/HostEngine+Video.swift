@@ -79,7 +79,7 @@ extension HostEngine {
     /// Forms the full-screen region (trimmed to even pixel dimensions —
     /// HEVC 4:2:0 needs them) and submits its first frame as a sync frame.
     func formRegion(frame: UnsafeRawBufferPointer, bytesPerRow: Int, nowUS: UInt64) {
-        guard let factory = videoEncoderFactory else { return }
+        guard let factory = videoEncoderFactory, !videoStalled else { return }
         let c0 = 0, r0 = 0
         var c1 = grid.cols - 1
         var r1 = grid.rows - 1
@@ -126,6 +126,7 @@ extension HostEngine {
         regionStartSent = false
         regionFrameSeq = 0
         regionFramesPending = 0
+        regionPendingSinceUS = 0
         regionSubmitHead = 0
         regionEmptyDeliveries = 0
         regionQuietTicks = 0
@@ -517,6 +518,7 @@ extension HostEngine {
             return false
         }
         regionSubmitUS[(regionSubmitHead + regionFramesPending) % Self.videoMaxPendingFrames] = clock?() ?? 0
+        if regionFramesPending == 0 { regionPendingSinceUS = max(lastEncodeNowUS, 1) }
         regionFramesPending += 1
         if stats.videoFramesSent == 0 && firstVideoSubmitUS == 0 {
             firstVideoSubmitUS = clock?() ?? lastEncodeNowUS
@@ -680,6 +682,7 @@ extension HostEngine {
                 stats.videoEncodeCount += 1
             }
             regionSubmitHead = (regionSubmitHead + 1) % Self.videoMaxPendingFrames
+            regionPendingSinceUS = regionFramesPending == 0 ? 0 : max(lastEncodeNowUS, 1)
         }
         // This delivery's claims (one entry per submit, in order).
         let claimed: ContiguousArray<Int32>? = handoffActive && !claimsInFlight.isEmpty
@@ -759,6 +762,25 @@ extension HostEngine {
         guard !linkRoom.hasRoom else { return negotiatedVideoCodecs }
         let others = negotiatedVideoCodecs.filter { !LinkRoomPolicy.governs($0) }
         return others.isEmpty ? negotiatedVideoCodecs : others
+    }
+
+    /// A frame in the encoder longer than this means the encoder stopped
+    /// answering (a hardware encode takes ~15 ms; libaom at 5K under 50).
+    static let videoEncoderStallUS: UInt64 = 3_000_000
+
+    /// The encoder stopped answering: give video up for this session and let
+    /// lossless tiles carry the screen. Live (2026-10-26) the system's
+    /// encoder service went silent for minutes right after a virtual display
+    /// came up; with VideoToolbox's calls off the engine's queue the session
+    /// keeps running, and this keeps it from waiting on frames that never
+    /// come (`VTHEVCRegionEncoder`'s concurrency note).
+    func checkEncoderStall(nowUS: UInt64) {
+        guard regionActive, regionFramesPending > 0, regionPendingSinceUS != 0,
+              nowUS &- regionPendingSinceUS > Self.videoEncoderStallUS else { return }
+        videoStalled = true
+        stats.videoEncoderStalls += 1
+        onVideoEncoderStalled?()
+        dissolveRegion(revealUnchanged: false)
     }
 
     /// `revealUnchanged: false` repaints the whole region — for a lost video
