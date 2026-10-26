@@ -58,14 +58,36 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             let aom = AOMRegionEncoder(callbackQueue: .main)
             aom.vbr = opts.has("av1-vbr")
             aom.targetPercent = opts.int("av1-target-pct", 40)
+            if opts.has("av1-qmax") { aom.quantizerCeiling = opts.int("av1-qmax", 42) }
             return BenchPipelinedEncoder(aom, vtPipeline)
         }
         // The Viewer's path, hardware decode, where this Mac has it.
         decoderFactory = { VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
         hostCodecs = [VideoCodec.av1]
         viewerCodecs = [VideoCodec.av1]
+    case "av1-hevc":
+        // The product's pair: the Host prefers AV1 and falls back to HEVC on a
+        // thin link (AV1LinkPolicy); the Viewer decodes both in hardware.
+        guard AOMRegionEncoder.isAvailable, VTRegionDecoder.canDecodeAV1 else {
+            throw BenchError("--video av1-hevc needs Apple silicon with hardware AV1 decode")
+        }
+        encoderFactory = {
+            switch $0 {
+            case VideoCodec.av1:
+                let aom = AOMRegionEncoder(callbackQueue: .main)
+                aom.targetPercent = opts.int("av1-target-pct", 40)
+                return BenchPipelinedEncoder(aom, vtPipeline)
+            case VideoCodec.hevc:
+                return BenchPipelinedEncoder(VTHEVCRegionEncoder(callbackQueue: .main), vtPipeline)
+            default:
+                return nil
+            }
+        }
+        decoderFactory = { VTRegionDecoder() }
+        hostCodecs = [VideoCodec.av1, VideoCodec.hevc]
+        viewerCodecs = [VideoCodec.av1, VideoCodec.hevc]
     default:
-        throw BenchError("--video expects mock, vt or av1")
+        throw BenchError("--video expects mock, vt, av1 or av1-hevc")
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -106,7 +128,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // onto the main queue (this rig's engine queue). Every submitted frame is
     // delivered before virtual time moves on (BenchVTPipeline).
     func drainVTOutput() {
-        if videoMode == "vt" || videoMode == "av1" { vtPipeline.drain() }
+        if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" { vtPipeline.drain() }
     }
 
     // Video coverage: how much of the replay's screen-time the viewer
@@ -323,6 +345,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))  \
     gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)  \
     link: \(host.linkReports) reports, capacity \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6)) Mbit/s  \
+    regions without AV1 (thin link) \(host.stats.videoRegionsWithoutAV1)  \
     gate at end: rate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s, \
     \(host.videoRate.linkMeasurements) link measurements, \(host.videoRate.backoffs) backoffs, \
     startup cap \(host.videoRate.startupCap.map { String(format: "%.1f Mbit/s", Double($0) / 1e6) } ?? "none")
@@ -363,7 +386,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       cpu viewer: datagrams \(ms(timings.viewerDatagram))  video \(ms(timings.viewerVideo))  \
     control \(ms(timings.viewerControl))  tick \(ms(timings.viewerTick))
     """)
-    if videoMode == "vt" || videoMode == "av1" {
+    if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" {
         print("  \(videoMode!): \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
               + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "
               + "stalls \(vtPipeline.stalls)")

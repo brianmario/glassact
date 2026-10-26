@@ -556,6 +556,21 @@ first negotiated codec whose encoder starts; START carries its id.
 - An Apple silicon Host prefers AV1 (codec 3, caps bit 1), then HEVC. A
   Viewer advertises AV1 only when its user opts in, so the choice is the
   Viewer's; every other session runs HEVC.
+- Even then AV1 runs only while the link has room (`AV1LinkPolicy`): its
+  quality floor keeps frames large, and on a thin link the send gate
+  admits fewer of them than of HEVC's. Judged once a second on the link
+  estimate (§4.9):
+  - A session starts on HEVC.
+  - AV1 turns on once the link delivered ≥ 6 Mbit/s over a span in the
+    last 10 s.
+  - It turns off after 3 s in a row in which queued spans of the last 10 s
+    carried < 4 Mbit/s and nothing delivered 6.
+  - A Viewer that sends no RECEIVED gets AV1 after 3 s, as before the
+    policy.
+- A change applies when the next region forms; a live region keeps its
+  codec. Switching mid-motion would cost a whole-screen sync frame on the
+  new encoder, which on a link near the threshold costs more than either
+  codec alone.
 - On Intel, libaom isn't compiled in and the Host offers HEVC only.
 
 **Lifecycle:**

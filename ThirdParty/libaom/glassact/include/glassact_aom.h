@@ -46,6 +46,9 @@ glassact_aom_enc *glassact_aom_enc_create_with(int width, int height, int thread
 // encoder may use (0–63, libaom's scale).
 int glassact_aom_enc_set_bitrate(glassact_aom_enc *enc, int bitrate_kbps);
 int glassact_aom_enc_set_max_quantizer(glassact_aom_enc *enc, int quantizer);
+// The finest quantizer (0–63). With it equal to the max, every frame is coded
+// at one quantizer: the bench's constant-quality measurements.
+int glassact_aom_enc_set_min_quantizer(glassact_aom_enc *enc, int quantizer);
 
 // Encode one frame shown at pts_us for duration_us. 0 on success; then read
 // the output with glassact_aom_enc_next_packet.

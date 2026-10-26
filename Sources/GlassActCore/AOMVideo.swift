@@ -56,6 +56,12 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     /// own). At 40 % it delivers more frames than HEVC on a 10 Mbit/s link
     /// (BENCHMARKS "AV1 back, as a Viewer opt-in"). A bench knob too.
     public var targetPercent = 40
+    /// Experiment: libaom's quantizer ceiling (0–63) instead of the HEVC
+    /// frame-QP mapping; nil = the mapping.
+    public var quantizerCeiling: Int?
+    /// Bench-only: every frame at this quantizer (0–63), under a bitrate
+    /// that never binds, so bytes measure content, not a target.
+    public var fixedQuantizer: Int?
 
     /// libaom worker threads: most of the machine, leaving room for the tile
     /// path and capture. Measured at 8 (BENCHMARKS "AV2 on screen text").
@@ -81,7 +87,8 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
                                                      Int32(appliedBitrate / 1000), &options) else { return false }
         handle = Handle(raw: raw)
-        glassact_aom_enc_set_max_quantizer(raw, Int32(Self.quantizer(forFrameQP: maxFrameQP)))
+        glassact_aom_enc_set_max_quantizer(raw, Int32(fixedQuantizer ?? quantizerCeiling ?? Self.quantizer(forFrameQP: maxFrameQP)))
+        if let q = fixedQuantizer { glassact_aom_enc_set_min_quantizer(raw, Int32(q)) }
         var header = [UInt8](repeating: 0, count: 256)
         let length = glassact_aom_enc_sequence_header(raw, &header, header.count)
         guard length > 0, let record = AV1Config.build(sequenceHeaderOBU: Array(header.prefix(Int(length)))),
@@ -142,10 +149,10 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     public func setMaxFrameQP(_ qp: Int?) {
         let ceiling = qp ?? VTHEVCRegionEncoder.defaultMaxFrameQP
-        guard ceiling != maxFrameQP else { return }
+        guard ceiling != maxFrameQP, fixedQuantizer == nil else { return }
         maxFrameQP = ceiling
         guard let handle else { return }
-        let quantizer = Int32(Self.quantizer(forFrameQP: ceiling))
+        let quantizer = Int32(quantizerCeiling ?? Self.quantizer(forFrameQP: ceiling))
         encodeQueue.async { glassact_aom_enc_set_max_quantizer(handle.raw, quantizer) }
     }
 

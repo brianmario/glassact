@@ -88,6 +88,13 @@ int glassact_aom_enc_set_max_quantizer(glassact_aom_enc *enc, int quantizer) {
     return aom_codec_enc_config_set(&enc->ctx, &enc->cfg) == AOM_CODEC_OK ? 0 : -1;
 }
 
+int glassact_aom_enc_set_min_quantizer(glassact_aom_enc *enc, int quantizer) {
+    if (!enc || quantizer < 0 || quantizer > 63) return -1;
+    enc->cfg.rc_min_quantizer = (unsigned int)quantizer;
+    if (enc->cfg.rc_max_quantizer < enc->cfg.rc_min_quantizer) enc->cfg.rc_max_quantizer = enc->cfg.rc_min_quantizer;
+    return aom_codec_enc_config_set(&enc->ctx, &enc->cfg) == AOM_CODEC_OK ? 0 : -1;
+}
+
 int glassact_aom_enc_encode(glassact_aom_enc *enc, const glassact_aom_frame *frame,
                             int64_t pts_us, uint32_t duration_us, int force_key) {
     if (!enc || !frame) return -1;
@@ -204,6 +211,7 @@ glassact_aom_enc *glassact_aom_enc_create_with(int width, int height, int thread
 }
 int glassact_aom_enc_set_bitrate(glassact_aom_enc *enc, int bitrate_kbps) { (void)enc; (void)bitrate_kbps; return -1; }
 int glassact_aom_enc_set_max_quantizer(glassact_aom_enc *enc, int quantizer) { (void)enc; (void)quantizer; return -1; }
+int glassact_aom_enc_set_min_quantizer(glassact_aom_enc *enc, int quantizer) { (void)enc; (void)quantizer; return -1; }
 int glassact_aom_enc_encode(glassact_aom_enc *enc, const glassact_aom_frame *frame,
                             int64_t pts_us, uint32_t duration_us, int force_key) {
     (void)enc; (void)frame; (void)pts_us; (void)duration_us; (void)force_key;

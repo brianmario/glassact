@@ -16,6 +16,7 @@ let allCommands: [Command] = [
     dumpTilesCommand,
     y4mCommand,
     videoQualityCommand,
+    videoCellsCommand,
 ]
 
 // MARK: - Errors

@@ -13,6 +13,8 @@
 ///   would read its own rate back, and a ceiling built on them ratchets down
 ///   (video under 0.9 × the ceiling, so the next minute's ceiling under
 ///   that). 0 with no queued span: no ceiling.
+/// - `recentCapacityBytesPerSecond`: the capacity over the last ~10 s, for
+///   noticing a link that just got thinner (AV1 → HEVC).
 ///
 /// Plain value type; the engine feeds it from the control queue.
 struct LinkEstimate {
@@ -62,6 +64,9 @@ struct LinkEstimate {
     }
     func capacityBytesPerSecond(nowUS: UInt64) -> Int {
         maxRate(nowUS: nowUS, window: Self.longWindowUS, queuedOnly: true)
+    }
+    func recentCapacityBytesPerSecond(nowUS: UInt64) -> Int {
+        maxRate(nowUS: nowUS, window: Self.shortWindowUS, queuedOnly: true)
     }
 
     private func maxRate(nowUS: UInt64, window: UInt64, queuedOnly: Bool) -> Int {
