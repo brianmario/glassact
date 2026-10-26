@@ -41,6 +41,13 @@ public struct HostStats: Sendable {
     /// Sessions' video given up because a frame stayed in the encoder past
     /// `HostEngine.videoEncoderStallUS` (0 or 1 per engine).
     public var videoEncoderStalls = 0
+    /// Input → update latency (`noteUpdateSent`): from a viewer's key,
+    /// click, scroll or text arriving to the first update that leaves after
+    /// it (tile datagrams or a video frame). The host's share of
+    /// responsiveness; the round trip is the rest. Sum, count, session max.
+    public var inputUpdateUSSum: UInt64 = 0
+    public var inputUpdateCount = 0
+    public var inputUpdateMaxUS: UInt64 = 0
     /// Regions formed on another codec because the link had no room for the
     /// preferred AV1 (`LinkRoomPolicy`).
     public var videoRegionsWithoutAV1 = 0
@@ -306,6 +313,9 @@ public final class HostEngine: @unchecked Sendable {
     var regionPixels: UnsafeMutableRawBufferPointer?
     var regionScratch: UnsafeMutableRawBufferPointer?
     var regionFramesPending = 0
+    /// When the oldest input not yet followed by an update arrived; 0 none.
+    var inputPendingSinceUS: UInt64 = 0
+    static let inputUpdateGiveUpUS: UInt64 = 5_000_000
     /// When the oldest frame still in the encoder went in (engine time); 0
     /// with none pending.
     var regionPendingSinceUS: UInt64 = 0
@@ -875,6 +885,12 @@ public final class HostEngine: @unchecked Sendable {
             case let .resize(mode, width, height, scale):
                 onResizeRequested?(Int(mode), Int(width), Int(height), Int(scale))
             case let .input(kind, x, y, a, b):
+                // Moves don't count: the viewer draws the pointer itself.
+                // Downs, scrolls and key-downs are what change the screen.
+                switch kind & 0x7F {
+                case 2, 4, 5, 7: noteInputArrived(nowUS: nowUS)
+                default: break
+                }
                 onInput?(Int(kind), Int(x), Int(y), Int(a), Int(b))
             case let .clipboard(format, data):
                 onClipboard?(format, data)
@@ -888,6 +904,7 @@ public final class HostEngine: @unchecked Sendable {
             case let .viewerLog(name, offset, total, data):
                 onViewerLog?(name, offset, total, data)
             case let .textInput(text):
+                noteInputArrived(nowUS: nowUS)
                 onTextInput?(text)
             case let .agentState(active, label):
                 onAgentState?(active, label)
@@ -937,6 +954,8 @@ public final class HostEngine: @unchecked Sendable {
     /// Timeout resolution + PING cadence (1/s). Call regularly.
     public func tick(nowUS: UInt64) {
         resolveTimeouts(nowUS: nowUS)
+        // An input nothing followed (it changed nothing on screen).
+        if inputPendingSinceUS != 0, nowUS &- inputPendingSinceUS > Self.inputUpdateGiveUpUS { inputPendingSinceUS = 0 }
         checkEncoderStall(nowUS: nowUS)
         // Video: captures may stop entirely (video paused on an otherwise-static
         // screen) — quiescence dissolve must not depend on encode ticks.
@@ -987,6 +1006,21 @@ public final class HostEngine: @unchecked Sendable {
     public static let autoScaleSevereSeconds = ScalePressure.severeSeconds
     public static let autoScaleThinVideoSeconds = ScalePressure.thinVideoSeconds
     private var scalePressure = ScalePressure()
+
+    func noteInputArrived(nowUS: UInt64) {
+        if inputPendingSinceUS == 0 { inputPendingSinceUS = max(nowUS, 1) }
+    }
+
+    /// An update left: close the input → update measurement, if one is open.
+    func noteUpdateSent(nowUS: UInt64) {
+        guard inputPendingSinceUS != 0 else { return }
+        let latency = nowUS &- inputPendingSinceUS
+        inputPendingSinceUS = 0
+        guard latency < Self.inputUpdateGiveUpUS else { return }
+        stats.inputUpdateUSSum &+= latency
+        stats.inputUpdateCount += 1
+        stats.inputUpdateMaxUS = max(stats.inputUpdateMaxUS, latency)
+    }
 
     /// The viewer-reported link for the resolution rung: the recent queued
     /// capacity, but never under what the link delivered in the last ~10 s
@@ -1445,6 +1479,7 @@ public final class HostEngine: @unchecked Sendable {
             let size = datagram.count
             outgoingDatagrams.append(Data(datagram))
             stats.datagramsSent += 1
+            if i == 0 { noteUpdateSent(nowUS: lastEncodeNowUS) }
             stats.bytesOut += size
             stats.tileBytesOut += size
             batchBytes += size
