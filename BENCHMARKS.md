@@ -211,6 +211,7 @@ the numbers and the reasoning.
 | Viewer RECEIVED reports; video ≤ 0.9 × capacity from queued spans | kept | 10M photos 193 → 276 frames, queue p95 258 → 244 ms | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
 | Capacity ceiling from every span (not only queued ones) | rejected | best latency on 30 s traces, but ratchets video to the floor on long video-only stretches | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
 | Repaints yield to fresh tiles; cut video only for its own queue; bound by host-side delivery | rejected | little or no change; repaints yielding always raised typing-cc's q95 (3M 365 → 422 ms) | [entry](#link-estimate-from-the-viewer-a-fresh-queue-and-a-capacity-ceiling-2026-10-25) |
+| Input → update latency measured on the Host | kept (diagnostic) | plane Wi-Fi: 11–94 ms per window against a 632–821 ms round trip | [entry](#input--update-latency-on-plane-wi-fi-the-link-not-the-host-2026-10-26) |
 | Auto-scale on the viewer-reported link capacity | kept | lounge Wi-Fi at ~0.3 Mbit/s: neither older rule fired in 61 s; loop cursor-drag 17.2 → 7.2 s | [entry](#auto-scale-from-the-viewers-link-reports-2026-10-26) |
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
@@ -253,6 +254,25 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Input → update latency on plane Wi-Fi: the link, not the Host (2026-10-26)
+
+Typing and scrolling over plane Wi-Fi felt about as quick as Apple's Screen
+Sharing. The Host now times each key-down, click, scroll or text input from
+arrival to the first update that leaves after it (`HostStats.inputUpdate*`,
+in the status line per 2 s window). Live, `6f2d76f` Host, 1450×786 after
+auto-scale, ~40 s of typing and scrolling:
+
+| | per-window averages |
+|---|---|
+| input → update (the Host's share) | 11, 14, 15, 15, 41, 43, 44, 47, 61, 94 ms (1–43 inputs each); outliers 368 ms (2 inputs) and 835 ms (the auto-scale engine rebuild) |
+| SRTT (the link) | 632–821 ms |
+
+The Host adds a frame or two to a round trip of ~0.7 s, so about 95 % of the
+lag is the link, and both apps sit on the same floor. Only local prediction
+(the Viewer moving the picture on a scroll before the Mac answers) could
+feel faster on such a link. The measure is a lower bound: an unrelated
+update that leaves right after an input ends it early.
 
 ### Auto-scale from the viewer's link reports (2026-10-26)
 
