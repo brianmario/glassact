@@ -2099,6 +2099,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             let sharpOn = s.sharpCeilingOn - p.sharpCeilingOn
             let sharpOff = s.sharpCeilingOff - p.sharpCeilingOff
             if sharpOn > 0 { line += " · sharp on" }
+            let inputs = s.inputUpdateCount - p.inputUpdateCount
+            if inputs > 0 {
+                let avgMS = Double(s.inputUpdateUSSum &- p.inputUpdateUSSum) / Double(inputs) / 1000
+                line += String(format: " · input→update %.0f ms (%d)", avgMS, inputs)
+            }
             if sharpOff > 0 { line += " · sharp off (pressure)" }
             if s.smoothFloorOn > p.smoothFloorOn { line += " · smooth on (thin link)" }
             if s.smoothFloorOff > p.smoothFloorOff { line += " · smooth off (link has room)" }
