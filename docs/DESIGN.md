@@ -849,8 +849,9 @@ session never redials.
   re-offers HELLO with `geometryFinal`. If the geometry already matches, it
   re-offers on the same connection.
 - In-session changes rebuild the host engine with seq continuity, and the
-  viewer reconfigures with `tileSeq` reset. Its new canvas starts as the old
-  one scaled to the new size, not black: the host re-sends every tile, which
+  viewer reconfigures with `tileSeq` reset. Its new canvas starts as what was
+  on screen scaled to the new size (the canvas, with the video overlay where
+  it showed), not black: the host re-sends every tile, which
   on a thin link takes seconds (auto-scale, §4.9). Nothing references those
   pixels (DELTA checks the base's hash, the tile cache resets, SCROLL needs
   acked tiles), so the canvas still converges exactly.
