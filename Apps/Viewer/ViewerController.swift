@@ -454,6 +454,9 @@ final class ViewerController: @unchecked Sendable {
     /// Main-thread poll: non-nil once the HELLO has configured the canvas.
     func configuredGrid(_ done: @escaping @MainActor (TileGrid?) -> Void) { session.configuredGrid(done) }
 
+    /// Main-thread poll: true once the canvas has any content.
+    func hasPicture(_ done: @escaping @MainActor (Bool) -> Void) { session.hasPicture(done) }
+
     /// Main-thread cache of the engine's PING-derived clock offset (the
     /// engine is queue-confined; the present path must not hop queues).
     private(set) var hostClockOffsetUS: Int64 = 0
