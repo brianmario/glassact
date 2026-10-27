@@ -155,6 +155,18 @@ import Testing
             host.tick(nowUS: t)
         }
         #expect(reports == 1)
+        #expect(host.scaleReason.contains("capacity unmeasured"), "\(host.scaleReason)")
+    }
+
+    /// The log says which evidence moved the rung.
+    @Test func itSaysWhichRuleFired() {
+        var p = ScalePressure()
+        for _ in 0..<ScalePressure.thinVideoSeconds {
+            _ = p.noteSecond(ackSampleUS: 0, ackDelayUS: 0, severeAckDelayUS: Self.severe,
+                             videoLinkMeasurements: 0, videoRateBytesPerSecond: 0, videoLastDrainBytesPerSecond: 0,
+                             linkCapacityBytesPerSecond: 300_000 / 8, pixels: Self.capture)
+        }
+        #expect(p.constrained && p.firedBy == .thinLink)
     }
 
     /// A link that queued at 2 Mbit/s in the last minute stays halved.

@@ -2122,6 +2122,15 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             line += String(format: " · srtt %.1f ms · path %.0f ms · pace %.0f MB/s · rate %.1f MB/s · encode %d%%",
                            Double(engine.srttUS) / 1000, Double(engine.ackDelayUS) / 1000,
                            Double(s.datagramPaceRate) / 1e6, Double(s.governorRate) / 1e6, s.encodeDutyPercent)
+            // The link as the viewer reports it (RECEIVED, §4.9): the most
+            // it delivered in ~10 s (a lower bound: a quiet screen sends
+            // little), and its capacity, what arrived while the path was
+            // queued in ~10 s / ~60 s ("—" until a span queues).
+            let reading = engine.linkReading(nowUS: nowUS)
+            if reading.reports > 0 {
+                func mbps(_ v: Int) -> String { v == 0 ? "—" : String(format: "%.2f", Double(v) * 8 / 1e6) }
+                line += " · link rx \(mbps(reading.delivered)) cap \(mbps(reading.recentCapacity))/\(mbps(reading.capacity)) Mbps"
+            }
             if engine.activeVideoRegionCount > 0 {
                 // Video send control (VideoRateController): link estimate,
                 // encoder cap, network queue, frames skipped by the gate.
@@ -2532,11 +2541,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 self?.onStatus(text)
             }
         }
-        engine.onScalePressureConstrained = { [weak self] in
-            DispatchQueue.main.async { self?.handleScalePressureConstrained() }
+        engine.onScalePressureConstrained = { [weak self, weak engine] in
+            let why = engine?.scaleReason ?? ""
+            DispatchQueue.main.async { self?.handleScalePressureConstrained(why: why) }
         }
-        engine.onLinkRoomForFullResolution = { [weak self] in
-            DispatchQueue.main.async { self?.handleScaleRecovery() }
+        engine.onLinkRoomForFullResolution = { [weak self, weak engine] in
+            let why = engine?.scaleReason ?? ""
+            DispatchQueue.main.async { self?.handleScaleRecovery(why: why) }
         }
         if let recovery = autoScaleRecovery {
             engine.armScaleRecovery(fullPixels: recovery.pixels, holdUS: recovery.holdUS)
@@ -2562,7 +2573,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// mid-session. Uses the in-session renegotiation (re-HELLO, no
     /// reconnect). Full-display sessions only (window sessions are already
     /// small and host-authoritative over their geometry).
-    private func handleScalePressureConstrained() {
+    private func handleScalePressureConstrained(why: String) {
         guard isRunning, singleWindowID == 0 else { return }
         guard !autoScaledDown else { return }          // already down a rung
         guard captureWidth >= 1920 else { return }     // too small to be worth halving
@@ -2574,8 +2585,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         encodeQueue.async { [weak self] in self?.autoScaleRecovery = recovery }
         let pw = (captureWidth / 2) & ~1
         let ph = (captureHeight / 2) & ~1
-        onStatus("link constrained — auto-scaling capture to \(pw)×\(ph) (back up once the link has room, "
-                 + "after \(autoScaleRecoverHoldS) s at least)")
+        onStatus("link constrained (\(why)) — auto-scaling capture to \(pw)×\(ph) (back up unless the link "
+                 + "shows it's thin, after \(autoScaleRecoverHoldS) s at least)")
         restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: pixelScale / 2,
                        origin: contentOrigin, inSession: true)
     }
@@ -2583,13 +2594,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// Main thread. The halved capture's engine saw nothing saying the link
     /// is too thin for the full capture (§4.9, `ScaleRecovery`): back to
     /// it, in session. If it is, the rung comes down again, held longer.
-    private func handleScaleRecovery() {
+    private func handleScaleRecovery(why: String) {
         guard isRunning, autoScaledDown, singleWindowID == 0, let full = autoScaleFull else { return }
         autoScaledDown = false
         autoScaleFull = nil
         autoScaleRecovered = true
         encodeQueue.async { [weak self] in self?.autoScaleRecovery = nil }
-        onStatus("no sign of a thin link — capture back to \(full.width)×\(full.height)")
+        onStatus("no sign of a thin link (\(why)) — capture back to \(full.width)×\(full.height)")
         restartCapture(pixelWidth: full.width, pixelHeight: full.height, pointScale: full.pointScale,
                        origin: contentOrigin, inSession: true)
     }

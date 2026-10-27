@@ -41,7 +41,11 @@ struct ScalePressure {
     /// person's to make.
     static let thinVideoMaxBitsPerSecond = 4_000_000
 
+    /// Which kind of evidence fired it.
+    enum Rule { case slowAcks, thinVideo, thinLink }
+
     private(set) var constrained = false
+    private(set) var firedBy: Rule?
     private var severeStreakS = 0
     private var thinVideoStreakS = 0
     private var thinLinkStreakS = 0
@@ -71,12 +75,17 @@ struct ScalePressure {
             let thin = Self.isThin(bitsPerSecond: linkCapacityBytesPerSecond * 8, pixels: pixels)
             thinLinkStreakS = thin ? thinLinkStreakS + 1 : 0
         }
-        if severeStreakS >= Self.severeSeconds || thinVideoStreakS >= Self.thinVideoSeconds
-            || thinLinkStreakS >= Self.thinVideoSeconds {
-            constrained = true
-            return true
+        if thinLinkStreakS >= Self.thinVideoSeconds {
+            firedBy = .thinLink
+        } else if thinVideoStreakS >= Self.thinVideoSeconds {
+            firedBy = .thinVideo
+        } else if severeStreakS >= Self.severeSeconds {
+            firedBy = .slowAcks
+        } else {
+            return false
         }
-        return false
+        constrained = true
+        return true
     }
 
     private static func isThin(bitsPerSecond bits: Int, pixels: Int) -> Bool {
