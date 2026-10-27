@@ -1039,13 +1039,13 @@ public final class HostEngine: @unchecked Sendable {
     }
 
     private var scaleRecovery: ScaleRecovery?
-    /// The link has shown room for the full capture again
-    /// (`armScaleRecovery`). Engine queue, once.
+    /// Time to try the full capture again: the link hasn't shown it's too
+    /// thin (`armScaleRecovery`). Engine queue, once.
     public var onLinkRoomForFullResolution: (() -> Void)?
 
-    /// This engine runs a capture the resolution rung halved: watch for the
-    /// link to show room for `fullPixels` again (§4.9, `ScaleRecovery`), no
-    /// sooner than `holdUS` from now.
+    /// This engine runs a capture the resolution rung halved: try
+    /// `fullPixels` again unless the link shows it's too thin (§4.9,
+    /// `ScaleRecovery`), no sooner than `holdUS` from now.
     public func armScaleRecovery(fullPixels: Int, holdUS: UInt64) {
         scaleRecovery = ScaleRecovery(fullPixels: fullPixels, holdUS: holdUS)
     }
@@ -1053,7 +1053,7 @@ public final class HostEngine: @unchecked Sendable {
     private func evaluateScaleRecovery(nowUS: UInt64) {
         guard var recovery = scaleRecovery else { return }
         let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
-        if recovery.noteSecond(nowUS: nowUS, deliveredBytesPerSecond: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
+        if recovery.noteSecond(nowUS: nowUS, linkCapacityBytesPerSecond: linkEstimate.capacityBytesPerSecond(nowUS: nowUS),
                                queued: queued) {
             onLinkRoomForFullResolution?()
         }

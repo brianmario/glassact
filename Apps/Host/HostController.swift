@@ -2580,15 +2580,16 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                        origin: contentOrigin, inSession: true)
     }
 
-    /// Main thread. The halved capture's engine saw the link carry room for
-    /// the full capture (§4.9, `ScaleRecovery`): back to it, in session.
+    /// Main thread. The halved capture's engine saw nothing saying the link
+    /// is too thin for the full capture (§4.9, `ScaleRecovery`): back to
+    /// it, in session. If it is, the rung comes down again, held longer.
     private func handleScaleRecovery() {
         guard isRunning, autoScaledDown, singleWindowID == 0, let full = autoScaleFull else { return }
         autoScaledDown = false
         autoScaleFull = nil
         autoScaleRecovered = true
         encodeQueue.async { [weak self] in self?.autoScaleRecovery = nil }
-        onStatus("link has room again — capture back to \(full.width)×\(full.height)")
+        onStatus("no sign of a thin link — capture back to \(full.width)×\(full.height)")
         restartCapture(pixelWidth: full.width, pixelHeight: full.height, pointScale: full.pointScale,
                        origin: contentOrigin, inSession: true)
     }
