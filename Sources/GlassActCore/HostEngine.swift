@@ -1038,6 +1038,32 @@ public final class HostEngine: @unchecked Sendable {
         return capacity == 0 ? 0 : max(capacity, linkEstimate.deliveredBytesPerSecond(nowUS: nowUS))
     }
 
+    /// Why the resolution rung last moved, with the numbers behind it, for
+    /// the app's log. Set just before `onScalePressureConstrained` or
+    /// `onLinkRoomForFullResolution` fires (engine queue).
+    public private(set) var scaleReason = ""
+
+    /// The viewer-reported link (`LinkEstimate`, bytes/s; 0 = no reading):
+    /// the most it delivered in ~10 s (a lower bound), and what arrived
+    /// while the path was queued in ~10 s and ~60 s (its capacity).
+    public struct LinkReading: Sendable {
+        public var reports: Int
+        public var delivered: Int
+        public var recentCapacity: Int
+        public var capacity: Int
+    }
+
+    public func linkReading(nowUS: UInt64) -> LinkReading {
+        LinkReading(reports: linkEstimate.reports,
+                    delivered: linkEstimate.deliveredBytesPerSecond(nowUS: nowUS),
+                    recentCapacity: linkEstimate.recentCapacityBytesPerSecond(nowUS: nowUS),
+                    capacity: linkEstimate.capacityBytesPerSecond(nowUS: nowUS))
+    }
+
+    private static func mbit(_ bytesPerSecond: Int) -> String {
+        String(format: "%.1f Mbit/s", Double(bytesPerSecond) * 8 / 1e6)
+    }
+
     private var scaleRecovery: ScaleRecovery?
     /// Time to try the full capture again: the link hasn't shown it's too
     /// thin (`armScaleRecovery`). Engine queue, once.
@@ -1053,23 +1079,40 @@ public final class HostEngine: @unchecked Sendable {
     private func evaluateScaleRecovery(nowUS: UInt64) {
         guard var recovery = scaleRecovery else { return }
         let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
-        if recovery.noteSecond(nowUS: nowUS, linkCapacityBytesPerSecond: linkEstimate.capacityBytesPerSecond(nowUS: nowUS),
-                               queued: queued) {
+        let capacity = linkEstimate.capacityBytesPerSecond(nowUS: nowUS)
+        if recovery.noteSecond(nowUS: nowUS, linkCapacityBytesPerSecond: capacity, queued: queued) {
+            let room = ScaleRecovery.roomFactor * ScalePressure.thinBitsPerSecond(pixels: recovery.fullPixels) / 8
+            scaleReason = "\(ScaleRecovery.roomySeconds) s without a queue after a \(recovery.holdUS / 1_000_000) s hold; "
+                + "capacity " + (capacity == 0 ? "unmeasured" : Self.mbit(capacity))
+                + " (room for the full capture: \(Self.mbit(room)))"
             onLinkRoomForFullResolution?()
         }
         scaleRecovery = recovery
     }
 
     private func evaluateScalePressure(nowUS: UInt64) {
-        if scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
-                                    severeAckDelayUS: Self.governorSevereAckDelayUS,
-                                    videoLinkMeasurements: videoRate.linkMeasurements,
-                                    videoRateBytesPerSecond: videoRate.rate,
-                                    videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
-                                    linkCapacityBytesPerSecond: thinLinkEvidence(nowUS: nowUS),
-                                    pixels: grid.width * grid.height) {
-            onScalePressureConstrained?()
+        let evidence = thinLinkEvidence(nowUS: nowUS)
+        let pixels = grid.width * grid.height
+        guard scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
+                                       severeAckDelayUS: Self.governorSevereAckDelayUS,
+                                       videoLinkMeasurements: videoRate.linkMeasurements,
+                                       videoRateBytesPerSecond: videoRate.rate,
+                                       videoLastDrainBytesPerSecond: videoRate.lastLinkDrain,
+                                       linkCapacityBytesPerSecond: evidence, pixels: pixels)
+        else { return }
+        let bar = Self.mbit(ScalePressure.thinBitsPerSecond(pixels: pixels) / 8)
+        switch scalePressure.firedBy {
+        case .thinLink?:
+            scaleReason = "the viewer received \(Self.mbit(evidence)) while the path was queued, "
+                + "under the \(bar) bar, \(ScalePressure.thinVideoSeconds) s in a row"
+        case .thinVideo?:
+            scaleReason = "video drained \(Self.mbit(max(videoRate.rate, videoRate.lastLinkDrain))), "
+                + "under the \(bar) bar, \(ScalePressure.thinVideoSeconds) s in a row"
+        case .slowAcks?, nil:
+            scaleReason = "tile ACK delay \(ackDelayUS / 1000) ms, over \(Self.governorSevereAckDelayUS / 1000) ms, "
+                + "\(ScalePressure.severeSeconds) s in a row"
         }
+        onScalePressureConstrained?()
     }
 
     // MARK: - Encode tick (§4.3)
