@@ -2105,7 +2105,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 line += String(format: " · input→update %.0f ms (%d)", avgMS, inputs)
             }
             if sharpOff > 0 { line += " · sharp off (pressure)" }
-            if s.smoothFloorOn > p.smoothFloorOn { line += " · smooth on (thin link)" }
+            if s.smoothFloorOn > p.smoothFloorOn { line += " · smooth on (no room shown yet)" }
             if s.smoothFloorOff > p.smoothFloorOff { line += " · smooth off (link has room)" }
             // Still region tiles handed back to exact pixels while video runs
             // (free reveals, lossless records) — soft text with neither
