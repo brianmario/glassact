@@ -187,6 +187,8 @@ the numbers and the reasoning.
 | Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | VP9 (libvpx real-time) instead of AV1 | rejected | ~2 dB worse on text at equal bytes, 2.5× the bytes on scrolling, frame sizes no steadier; no Apple hardware decode | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | SVT-AV1 real-time at session size (2900 px) | rejected | fast now (157–204 fps) but ~10 dB worse than libaom at similar size | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
+| SVT-AV1 4.2 and rav1e 0.8 as live encoders, quality allowed to drop | rejected | at 2900 px 24–60 fps (SVT preset 7–13) and 24–32 fps (rav1e) on 14 cores, against libaom's 2.4–7 ms per frame; libaom speed 9 needs the fewest bytes too (0.40–0.84 of HEVC's for its quality) | [entry](#live-av1-encoders-and-a-looser-av1-ceiling-on-thin-links-2026-10-27) |
+| AV1 quantizer ceiling 60 on thin links | measured, not acted on | 2M scroll-win 408 frames · 369 ms queue p95 vs HEVC's 170 · 651, but motion SSIMULACRA2 56 vs 72 (photos −1 vs 42) | [entry](#live-av1-encoders-and-a-looser-av1-ceiling-on-thin-links-2026-10-27) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -254,6 +256,103 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Live AV1 encoders, and a looser AV1 ceiling on thin links (2026-10-27)
+
+Could another AV1 encoder, or AV1 allowed to look worse, buy frames on a
+thin link? Response time comes first; motion only needs to look about as
+good as HEVC, since lossless tiles settle the picture anyway.
+
+**Encoders at equal quality.** The four reference traces, 300 frames each
+(typing-cc 266) at 2900×1632 on a 60 fps timeline, exported with `y4m` and
+scaled with lanczos. Every encoder low-delay (no lookahead, no
+reordering), CBR, no quality ceiling, 5 targets from 0.25 to 4 Mbit/s,
+decoded by ffmpeg, SSIMULACRA2 on every 20th frame. Encoders:
+
+- hardware HEVC through ffmpeg: `hevc_videotoolbox -realtime 1 -bf 0`;
+- libaom 3.15.2 `aomenc --rt` with the Host's settings: screen tuning,
+  8 threads, row-MT, 3 tile columns, a 1 s buffer, ±50 % shoot;
+- SVT-AV1 4.2.0 `--rtc 1 --scm 1 --rc 2 --lookahead 0`;
+- rav1e 0.8.1 `--speed 10 --low-latency --rdo-lookahead-frames 1
+  --threads 8 --tiles 8`.
+
+Below, the bitrate each needs to match HEVC's quality at HEVC's 1 and
+2 Mbit/s settings, as a fraction of HEVC's (under 1 = fewer bytes), and
+its speed:
+
+| encoder | bytes for HEVC's quality | speed |
+|---|---|---|
+| libaom speed 9 (shipped) | 0.40–0.84 (median ~0.7) | 2.4–7 ms per frame p50, 3.4–10.4 p95 (`vquality`) |
+| libaom speed 10 / 11 | 0.46–0.97 | the same as speed 9 |
+| SVT-AV1 preset 7 | 0.41–0.84 | 24–48 fps |
+| SVT-AV1 preset 8 | 0.48–0.99 | 32–72 fps |
+| SVT-AV1 preset 10 | 0.57–1.03 | 41–87 fps |
+| SVT-AV1 presets 12–13 | 1.17–1.45, or never reaches HEVC's quality | 41–98 fps |
+| rav1e speed 10 | 0.54–0.90 | 24–32 fps |
+| hardware HEVC | 1 | 12.9 ms per frame p50, 13.1–16.3 p95 (`vquality`) |
+
+- SVT-AV1 and rav1e are too slow for a live session at this size on a
+  14-core M4 Pro, whatever they save. SVT-AV1 switches its screen-content
+  tools off in real-time mode at preset 9 and faster, so its fast presets
+  also lose on text. SVT itself reports 58–60 fps on scroll-win today; the
+  157–204 fps in "Real-time AV1" below doesn't reproduce at 300 frames.
+- libaom at speed 9 is both the smallest and the fastest live encoder
+  here, faster per frame than the hardware HEVC encoder. Speeds 10 and 11
+  encode no faster in the product's libaom.
+- Fed every frame, hardware HEVC doesn't go below ~1 Mbit/s on typing,
+  3 on scrolling or 6.6 on photos whatever the target, and with no QP cap
+  its quality collapses mid-scroll (luma PSNR 36.6 → 23–25 dB at
+  2 Mbit/s). The Host's QP 34 cap and send gate drop frames instead.
+
+**A looser AV1 ceiling on thin links.** `replay --mode loop` on the
+link-estimate entry's 2M and 3M links plus 6M (`--link-mbit 6
+--link-buffer-ms 500 --latency 30-40`). HEVC at its frame-QP ceiling (34,
+38 = the smooth-motion floor, 42) against AV1 at libaom quantizer ceilings
+42 (the product's), 48, 54 and 60 (`--av1-qmax`). Video frames · link queue
+p95:
+
+| link · trace | HEVC 34 | HEVC 38 | HEVC 42 | AV1 42 | AV1 48 | AV1 54 | AV1 60 |
+|---|---|---|---|---|---|---|---|
+| 2M cursor-drag | 281 · 664 | 323 · 574 | 330 · 611 | 283 · 1183 | 307 · 905 | 222 · 480 | 406 · 423 |
+| 2M scroll-win | 170 · 651 | 192 · 650 | 208 · 670 | 315 · 1040 | 342 · 697 | 381 · 489 | 408 · 369 |
+| 2M photos | 20 · 1732 | 65 · 1894 | 71 · 1997 | 10 · 1997 | 13 · 1782 | 28 · 1810 † | 208 · 711 |
+| 2M typing-cc | 14 · 470 | 13 · 456 | 14 · 481 | 13 · 598 | 16 · 743 | 16 · 510 | 16 · 399 |
+| 3M cursor-drag | 346 · 435 | 355 · 541 | 396 · 458 | 369 · 746 | 398 · 626 | 417 · 548 | 447 · 443 |
+| 3M scroll-win | 218 · 414 | 255 · 364 | 260 · 358 | 383 · 572 | 407 · 460 | 463 · 438 | 454 · 348 |
+| 3M photos | 56 · 998 | 49 · 997 | 57 · 867 | 16 · 999 | 112 · 998 | 153 · 997 | 304 · 564 |
+| 3M typing-cc | 11 · 386 | 12 · 344 | 15 · 364 | 11 · 496 | 15 · 474 | 16 · 422 | 16 · 362 |
+| 6M cursor-drag | 408 · 276 | 406 · 283 | 411 · 286 | 292 · 354 | 315 · 324 | 343 · 296 | 454 · 278 |
+| 6M scroll-win | 354 · 319 | 349 · 323 | 319 · 225 | 458 · 301 | 483 · 269 | 483 · 254 | 483 · 209 |
+| 6M photos | 81 · 498 | 69 · 499 | 200 · 498 | 141 · 499 | 224 · 499 | 297 · 498 | 422 · 297 |
+| 6M typing-cc | 17 · 263 | 17 · 259 | 17 · 259 | 17 · 295 | 17 · 286 | 17 · 279 | 17 · 263 |
+
+† didn't settle within the 60 s budget; every other run settled
+byte-identical.
+
+At ceiling 60 AV1 delivers the most frames on every run, or within 2 %
+of the most, and the shortest queue p95 on most; where it isn't the
+shortest it's within 5 % (3M cursor-drag 443 vs 435 ms, 3M typing-cc 362
+vs 344, 6M cursor-drag 278 vs 276). 2M scroll-win gets 2.4× HEVC's frames
+with 57 % of its queue p95, 2M photos 10× the frames. Its sync frames shrink to HEVC's size (3M:
+0.27–0.72 MB against 0.6–2.0 MB at 42). Loosening HEVC's ceiling buys
+little (2M scroll-win 170 → 208 frames at 42).
+
+What the frames look like: `vquality` at 2 Mbit/s, 15 fps submitted,
+SSIMULACRA2 mean · worst sampled frame (`--max-qp` 39 / 44 / 49 map to
+libaom 48 / 54 / 61):
+
+| trace | HEVC 34 | AV1 42 | AV1 48 | AV1 54 | AV1 61 |
+|---|---|---|---|---|---|
+| scroll-win | 72 · 56 | 68 · 61 | 62 · 47 | 58 · 35 | 56 · 28 |
+| cursor-drag | 73 · 46 | 77 · 52 | 74 · 39 | 71 · 30 | 70 · 30 |
+| photos | 42 · 39 | 46 · 41 | 31 · 25 | 15 · 5 | −1 · −26 |
+
+The frames ceiling 60 buys are softer than HEVC's on scrolling (56 vs 72)
+and poor on photos; dragging stays close (70 vs 73). The middle ceilings
+cost quality without a clear win on frames or queue. AV1 here also aims at
+40 % of the cap, so part of its softness may be the aim rather than the
+ceiling. Not acted on yet: a candidate for the smooth-motion opt-in on
+Viewers that decode AV1.
 
 ### Back up the rung without proof of room (2026-10-26)
 
