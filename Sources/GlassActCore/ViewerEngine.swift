@@ -198,6 +198,14 @@ public final class ViewerEngine: @unchecked Sendable {
     /// is a `QualityFloor` (0 = automatic, 1–3 = keep high/medium/low).
     /// `preferSmoothness` goes only to a host that understands it
     /// (`WireCaps.smoothnessPreference`); others reject it, and get 0.
+    /// Sent as QUALITY the moment the session runs, right behind HELLO_OK, so
+    /// the host has the viewer's floor and motion preference before its first
+    /// video region forms: a region keeps its codec until it dissolves, and
+    /// Prefer Smooth Motion's AV1 on a thin link needs it (§4.6). The scale
+    /// isn't known until the window lays out, so 100 until the app's own
+    /// `sendQualityPolicy`. nil = wait for the app.
+    public var initialQualityPolicy: (floor: Int, preferSharpness: Bool, preferSmoothness: Bool)?
+
     public func sendQualityPolicy(presentedScalePct: Int, floor: Int, preferSharpness: Bool,
                                   preferSmoothness: Bool = false) {
         guard state == .running else { return }
@@ -423,6 +431,11 @@ public final class ViewerEngine: @unchecked Sendable {
                 configure(width: Int(width), height: Int(height))
                 state = .running
                 milestones.runningUS = max(nowUS, 1)
+                if let policy = initialQualityPolicy {
+                    sendQualityPolicy(presentedScalePct: 100, floor: policy.floor,
+                                      preferSharpness: policy.preferSharpness,
+                                      preferSmoothness: policy.preferSmoothness)
+                }
             case let .ping(nonce, tUS):
                 // Cross-machine clock offset estimate for glass-to-glass
                 // telemetry: (viewer now − host send time) = offset + one-way

@@ -47,6 +47,9 @@ final class ViewerController: @unchecked Sendable {
     private var lastSentScalePct = -1
     func setQualityPrefs(floor: Int, motionPreference: Int) {
         qualityFloor = floor; qualityMotionPreference = motionPreference
+        queue.async { [engine] in
+            engine.initialQualityPolicy = (floor, motionPreference == 1, motionPreference == 2)
+        }
     }
     /// Send the policy (presented scale + stored floor/preference). Throttled
     /// on scale so a resize storm doesn't flood the control stream.

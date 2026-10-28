@@ -65,12 +65,14 @@ import GlassActTestSupport
 
     /// A viewer that prefers smooth motion gets the AV1 stand-in on a link
     /// without room: under smooth motion's trade AV1 beats HEVC there too.
+    /// The viewer sends its preference right behind HELLO_OK, so even the
+    /// session's first region (which keeps its codec) forms on it.
     @Test func smoothMotionGetsAV1WithoutRoom() {
         var rng = SplitMix64(seed: 910)
         let both = [MockVideoEncoder.mockAltCodecID, MockVideoEncoder.mockCodecID]
-        let h = Harness(width: 640, height: 384, video: true, hostCodecs: both, viewerCodecs: both)
-        h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false,
-                                  preferSmoothness: true)
+        let h = Harness(width: 640, height: 384, video: true, hostCodecs: both, viewerCodecs: both,
+                        viewerQualityPolicy: (Int(QualityFloor.automatic), false, true))
+        #expect(h.host.policyPreferSmoothness, "the preference arrived with the handshake")
         h.frame.fillRandom(&rng)
         h.encodeFrame() // pinned cold start: the region forms on the first frame
         h.run(untilUS: h.now + 100_000)

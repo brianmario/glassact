@@ -658,7 +658,9 @@ fewer than 2 frames pending and the rate gate passes.
     shrinks frames so more get through, and the higher aim buys back most
     of the sharpness that costs.
   - With AV1 negotiated, the session runs AV1 on a thin link too (above).
-    A region already formed on HEVC keeps it until it dissolves.
+    A region already formed on HEVC keeps it until it dissolves, so the
+    viewer sends its stored QUALITY right behind HELLO_OK, before the
+    first region forms, with scale 100 until its window lays out.
 
 **Overlay:**
 - The viewer decodes into an overlay buffer, never into the canvas.
