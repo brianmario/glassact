@@ -5,8 +5,9 @@ import GlassActTestSupport
 import GlassActWire
 
 /// Prefer smooth motion on a thin link (§4.6): QUALITY preference 2 loosens
-/// the encoder's frame-QP ceiling to `smoothMaxFrameQP` while the link has
-/// no room (`LinkRoomPolicy`), and restores the default once it has.
+/// the encoder's frame-QP ceiling to `smoothMaxFrameQP`, and turns on the
+/// encoder's own smooth trade (`setSmoothMotion`), while the link has no room
+/// (`LinkRoomPolicy`); both come off once it has.
 @Suite struct SmoothFloorTests {
     typealias Encoder = SharpCeilingTests.CeilingRecordingEncoder
 
@@ -28,6 +29,7 @@ import GlassActWire
         h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false,
                                   preferSmoothness: true)
         #expect(encoder.ceilings == [HostEngine.smoothMaxFrameQP])
+        #expect(encoder.smooth == [true], "the live encoder makes its own trade too")
         #expect(h.host.regionMaxFrameQP == HostEngine.smoothMaxFrameQP, "a region that forms now starts under it")
         #expect(h.host.stats.smoothFloorOn == 1)
 
@@ -41,6 +43,7 @@ import GlassActWire
         }
         #expect(h.host.linkRoom.hasRoom)
         #expect(encoder.ceilings.last == .some(nil), "the default ceiling once the link has room")
+        #expect(encoder.smooth == [true, false])
         #expect(h.host.stats.smoothFloorOff == 1)
     }
 
@@ -51,6 +54,7 @@ import GlassActWire
         h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false)
         h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: true)
         #expect(!encoder.ceilings.contains(.some(HostEngine.smoothMaxFrameQP)))
+        #expect(encoder.smooth.isEmpty)
         #expect(h.host.stats.smoothFloorOn == 0)
     }
 
@@ -62,7 +66,24 @@ import GlassActWire
                                   preferSmoothness: true)
         h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false)
         #expect(encoder.ceilings == [HostEngine.smoothMaxFrameQP, nil])
+        #expect(encoder.smooth == [true, false])
         #expect(h.host.regionMaxFrameQP == nil)
+    }
+
+    /// A region that forms while the floor is on starts under the encoder's
+    /// smooth trade as well as the looser ceiling.
+    @Test func aRegionFormedUnderItStartsSmooth() {
+        let encoder = Encoder()
+        var rng = SplitMix64(seed: 4404)
+        let h = Harness(width: 640, height: 384, video: true, encoderFactory: { _ in encoder })
+        h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false,
+                                  preferSmoothness: true)
+        h.frame.fillRandom(&rng)
+        h.encodeFrame() // pinned cold start: the region forms on the first frame
+        h.run(untilUS: h.now + 100_000)
+        #expect(h.host.activeVideoRegionCount == 1)
+        #expect(encoder.ceilings == [HostEngine.smoothMaxFrameQP])
+        #expect(encoder.smooth == [true])
     }
 
     /// The viewer asks for smooth motion only from a host that understands

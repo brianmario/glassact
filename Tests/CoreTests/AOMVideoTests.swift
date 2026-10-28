@@ -146,6 +146,23 @@ struct AOMVideoTests {
         #expect(lowest < base, "level 3 \(lowest) vs \(base)")
     }
 
+    /// Smooth motion replaces the frame-QP mapping with its own looser
+    /// ceiling and aims higher; off, both come back, under whatever ceiling
+    /// the engine set meanwhile.
+    @Test func smoothMotionLoosensTheCeilingAndAimsHigher() {
+        let encoder = AOMRegionEncoder(callbackQueue: DispatchQueue(label: "test.av1.callback"))
+        let target = AOMRegionEncoder.target(base: 20_000_000, level: 0, cap: nil) // the unstarted base
+        #expect(encoder.maxQuantizer == 42)
+        #expect(encoder.aimedBitrate == target * encoder.targetPercent / 100)
+        encoder.setSmoothMotion(true)
+        encoder.setMaxFrameQP(HostEngine.smoothMaxFrameQP)
+        #expect(encoder.maxQuantizer == encoder.smoothQuantizerCeiling)
+        #expect(encoder.aimedBitrate == target * encoder.smoothTargetPercent / 100)
+        encoder.setSmoothMotion(false)
+        #expect(encoder.maxQuantizer == AOMRegionEncoder.quantizer(forFrameQP: HostEngine.smoothMaxFrameQP))
+        #expect(encoder.aimedBitrate == target * encoder.targetPercent / 100)
+    }
+
     @Test func frameQPMapsOntoLibaomsScale() {
         #expect(AOMRegionEncoder.quantizer(forFrameQP: 34) == 42)
         #expect(AOMRegionEncoder.quantizer(forFrameQP: 28) == 35)

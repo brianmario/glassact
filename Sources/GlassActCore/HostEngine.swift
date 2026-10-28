@@ -280,7 +280,9 @@ public final class HostEngine: @unchecked Sendable {
     static let sharpMaxFrameQP = 28
     /// Prefer smooth motion, on a thin link: the encoder runs under
     /// `smoothMaxFrameQP` instead of the default ceiling while `linkRoom`
-    /// says there's no room (BENCHMARKS "Prefer smooth motion").
+    /// says there's no room (BENCHMARKS "Prefer smooth motion"), with its own
+    /// smooth trade on top (`setSmoothMotion`); AV1 is allowed on a thin link
+    /// too (`allowedVideoCodecs`).
     var policyPreferSmoothness = false
     var smoothFloor = false
     static let smoothMaxFrameQP = 38

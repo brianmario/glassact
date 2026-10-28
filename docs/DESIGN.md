@@ -577,6 +577,9 @@ first negotiated codec whose encoder starts; START carries its id.
     carried < 4 Mbit/s and nothing delivered 6.
   - A Viewer that sends no RECEIVED gets AV1 after 3 s, as before the
     policy.
+  - A Viewer that prefers smooth motion gets AV1 with or without room.
+    Under smooth motion's trade (below) AV1 delivers more frames on a thin
+    link than HEVC does under its own.
 - A change applies when the next region forms; a live region keeps its
   codec. Switching mid-motion would cost a whole-screen sync frame on the
   new encoder, which on a link near the threshold costs more than either
@@ -649,6 +652,13 @@ fewer than 2 frames pending and the rate gate passes.
   delay, for softer moving content. It follows the link, not pressure, so
   the smaller frames can't switch it off themselves. A session starts
   without room, so the first second or two of a fast link runs at 38.
+  - The encoder makes its own trade on top (`setSmoothMotion`). HEVC's is
+    the ceiling alone. AV1 swaps the mapped ceiling for libaom quantizer 60
+    and aims at 60 % of the target instead of 40 %: the looser ceiling
+    shrinks frames so more get through, and the higher aim buys back most
+    of the sharpness that costs.
+  - With AV1 negotiated, the session runs AV1 on a thin link too (above).
+    A region already formed on HEVC keeps it until it dissolves.
 
 **Overlay:**
 - The viewer decodes into an overlay buffer, never into the canvas.

@@ -63,6 +63,23 @@ import GlassActTestSupport
         #expect(!LinkRoomPolicy.governs(MockVideoEncoder.mockCodecID))
     }
 
+    /// A viewer that prefers smooth motion gets the AV1 stand-in on a link
+    /// without room: under smooth motion's trade AV1 beats HEVC there too.
+    @Test func smoothMotionGetsAV1WithoutRoom() {
+        var rng = SplitMix64(seed: 910)
+        let both = [MockVideoEncoder.mockAltCodecID, MockVideoEncoder.mockCodecID]
+        let h = Harness(width: 640, height: 384, video: true, hostCodecs: both, viewerCodecs: both)
+        h.host.applyQualityPolicy(scalePct: 100, floor: QualityFloor.automatic, preferSharpness: false,
+                                  preferSmoothness: true)
+        h.frame.fillRandom(&rng)
+        h.encodeFrame() // pinned cold start: the region forms on the first frame
+        h.run(untilUS: h.now + 100_000)
+        #expect(!h.host.linkRoom.hasRoom, "no room proven yet")
+        #expect(h.host.activeVideoCodec == MockVideoEncoder.mockAltCodecID)
+        #expect(h.viewer.activeVideoCodec == MockVideoEncoder.mockAltCodecID)
+        #expect(h.host.stats.videoRegionsWithoutAV1 == 0)
+    }
+
     /// A session asking for the AV1 stand-in starts on the other codec. Once
     /// the link has delivered room, the next region forms on AV1; once a
     /// bottleneck makes it thin, the region after that is back on the other
