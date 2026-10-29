@@ -48,8 +48,17 @@ final class AppUpdater: NSObject, SPUUpdaterDelegate {
 
     // MARK: - SPUUpdaterDelegate
 
+    /// `GLASSACT_UPDATE_FEED`, for testing an update from a local server:
+    /// Debug builds only. In a release, any process of this user could set
+    /// it (`launchctl setenv`) and put its own release notes and links in
+    /// the trusted update dialog, even though the archive still needs the
+    /// release key's signature.
     nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
+        #if DEBUG
         ProcessInfo.processInfo.environment["GLASSACT_UPDATE_FEED"]
+        #else
+        nil
+        #endif
     }
 
     /// Sparkle relaunches only when someone chose Install and Relaunch

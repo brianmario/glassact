@@ -1355,8 +1355,10 @@ its container.
   another wire version stops redialing, says which side is behind, and,
   when the Host is newer, offers Check for Updates… (`onIncompatibleHost`).
   The `glassact` CLI says the same and stops.
-- `GLASSACT_UPDATE_FEED` overrides the feed, for testing an update from a
-  local server; the update still has to be signed with the release key.
+- `GLASSACT_UPDATE_FEED` overrides the feed in Debug builds, for testing an
+  update from a local server; the update still has to be signed with the
+  release key. A release ignores it: any process of the user's could set
+  it and fill the update dialog with its own notes and links.
 
 **No telemetry; crash reports stay on the Mac** (`CrashReportStore`,
 `Apps/Shared/CrashReporter.swift`). Neither app sends anything anywhere on
@@ -1389,8 +1391,10 @@ automatic checks.
 - The Objective-C exception *message* (`composedMessage`) is left out of the
   issue, since it can carry whatever the app had in hand; it stays in the
   file, which the person can read before attaching.
-- **Help › Send Logs to Host** (Viewer) includes the crash reports, over the
-  session, like the logs (§3.5 VIEWER_LOG). They land in the Host's
+- **Help › Send Logs to Host** (Viewer) sends this launch's log, earlier
+  logs from the last 24 h whose sessions were all with this host (another
+  host's address, key and details stay off it), and the crash reports, over
+  the session (§3.5 VIEWER_LOG). They land in the Host's
   `from-viewer` folder, on a Mac the same person chose to connect to.
 - `scripts/symbolicate-crash` turns a report's stacks into function names
   with a release's dSYMs.
@@ -1449,6 +1453,9 @@ automatic checks.
   `--size`, a virtual display makes agent coordinates equal host points.
 - A screenshot waits for the screen to settle, tolerating 0.5 % of tiles still
   changing.
+- Every operation but `status` marks the agent active, watching included
+  (screenshots, the clipboard, the window list): the Viewer shows Agent
+  active and the host hears AGENT_STATE, as for input.
 
 **Socket protocol** (`AgentSocket`):
 - Newline-delimited JSON, `{id, op, args}` → `{id, ok, result|error}`.
