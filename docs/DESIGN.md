@@ -1501,7 +1501,11 @@ hand-rolled JSON-RPC 2.0 over stdio) whose tools mirror computer use.
 - Time limit: none, 15 min, 1 h (the default) or 4 h. When it runs out, agent
   input pauses until the user resumes it.
 - **The human wins:** agent input is refused for 2 s after local HID input.
-  Releases always pass, so keys never stick.
+  Releasing a key or button the session holds always passes, so nothing
+  sticks; a release of something it doesn't hold is input like any other
+  (it would end the person's own drag). When a session ends, the Host lets
+  go of every key and button it left held: a dropped connection never sends
+  the ups.
 - An audit log (`agent-audit.log`, 0600, rotated at 4 MB) records every action.
   Typed text is counted, not recorded, and so are key presses: only a
   shortcut (⌘, ⌃ or ⌥ held) is logged by key code. The agent's label has
