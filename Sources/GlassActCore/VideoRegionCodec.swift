@@ -37,6 +37,11 @@ public protocol VideoRegionEncoder: AnyObject {
     /// (a quality floor that overrides the bitrate target); nil = the
     /// encoder's own default. Runtime. Default no-op (the mock rig ignores it).
     func setMaxFrameQP(_ qp: Int?)
+    /// Prefer smooth motion on a thin link (§4.6): the encoder's own trade
+    /// of quality for frames, on top of the frame-QP ceiling the engine
+    /// already set. Runtime. Default no-op: HEVC's trade is that ceiling
+    /// alone (`smoothMaxFrameQP`); AV1 uses its own (`AOMRegionEncoder`).
+    func setSmoothMotion(_ on: Bool)
     func stop()
 }
 
@@ -44,6 +49,7 @@ public extension VideoRegionEncoder {
     func setQualityLevel(_ level: Int) {}
     func setBitrateCap(_ bitsPerSecond: Int?) {}
     func setMaxFrameQP(_ qp: Int?) {}
+    func setSmoothMotion(_ on: Bool) {}
 }
 
 /// Video regions — viewer-side per-region decoder session. Same threading contract:

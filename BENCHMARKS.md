@@ -189,6 +189,8 @@ the numbers and the reasoning.
 | SVT-AV1 real-time at session size (2900 px) | rejected | fast now (157–204 fps) but ~10 dB worse than libaom at similar size | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | SVT-AV1 4.2 and rav1e 0.8 as live encoders, quality allowed to drop | rejected | at 2900 px 24–60 fps (SVT preset 7–13) and 24–32 fps (rav1e) on 14 cores, against libaom's 2.4–7 ms per frame; libaom speed 9 needs the fewest bytes too (0.40–0.84 of HEVC's for its quality) | [entry](#live-av1-encoders-and-a-looser-av1-ceiling-on-thin-links-2026-10-27) |
 | AV1 quantizer ceiling 60 on thin links | measured, not acted on | 2M scroll-win 408 frames · 369 ms queue p95 vs HEVC's 170 · 651, but motion SSIMULACRA2 56 vs 72 (photos −1 vs 42) | [entry](#live-av1-encoders-and-a-looser-av1-ceiling-on-thin-links-2026-10-27) |
+| AV1 ceiling 60 with a higher rate aim (60–100 % of the cap) | aim 60 kept for smooth motion; 80 and 100 rejected | aim 100 matches HEVC 34 on scrolling (74 vs 72) but delivers fewer frames than HEVC 38; aim 60 keeps more frames than HEVC 38 on all but one run, with motion 64 / 75 / 10 (scroll / drag / photos) against HEVC 38's 70 / 72 / 32 | [entry](#av1-at-ceiling-60-a-higher-rate-aim-2026-10-28) |
+| Prefer smooth motion on AV1 (opt-in): AV1 allowed on a thin link, at quantizer ceiling 60 aiming at 60 % | kept, opt-in | against HEVC 38: 2M scroll-win 227 → 358 frames, 3M photos 60 → 271; 6M cursor-drag 411 → 382 | [entry](#prefer-smooth-motion-runs-av1-on-a-thin-link-2026-10-28) |
 | VT low-latency rate control | rejected | overshoots 20–100 % (9× on photos), no latency gain | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
@@ -256,6 +258,109 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Prefer smooth motion runs AV1 on a thin link (2026-10-28)
+
+The next entry's candidate, in the product. With the Viewer's AV1 opt-in
+and Prefer Smooth Motion, the Host now allows AV1 without room
+(`allowedVideoCodecs`), and while the link has none the AV1 encoder runs at
+quantizer ceiling 60 aiming at 60 % (`setSmoothMotion`). HEVC still gets
+ceiling 38 alone.
+
+`replay --mode loop` with the product's pair (`--video av1-hevc`: AV1 and
+HEVC negotiated, hardware decode), on the same three links. `--prefer-smoothness`
+(new) has the Viewer send QUALITY preference 2 before the first region
+forms. Video frames · link queue p95 (ms):
+
+| link · trace | AV1 opt-in today | smooth today (HEVC 38) | smooth on AV1 |
+|---|---|---|---|
+| 2M cursor-drag | 281 · 652 | 329 · 569 | **396** · 446 |
+| 2M scroll-win | 170 · 651 | 227 · 620 | **358** · 449 |
+| 2M photos | 20 · 1732 | 45 · 1676 | **180** · 993 |
+| 2M typing-cc | 14 · 470 | 13 · 417 | 15 · 485 |
+| 3M cursor-drag | 346 · 435 | 373 · 477 | **385** · 435 |
+| 3M scroll-win | 218 · 414 | 239 · 358 | **443** · 377 |
+| 3M photos | 56 · 998 | 60 · 997 | **271** · 761 |
+| 3M typing-cc | 11 · 386 | 12 · 416 | 17 · 394 |
+| 6M cursor-drag | 408 · 276 | **411** · 284 | 382 · 324 |
+| 6M scroll-win | 413 · 332 | 300 · 210 | **417** · 253 |
+| 6M photos | 62 · 499 | 124 · 499 | **402** · 359 |
+| 6M typing-cc | 17 · 263 | 17 · 259 | 17 · 275 |
+
+Every run settled byte-identical. "AV1 opt-in today" fell back to HEVC on
+every run (1–2 regions without AV1 each).
+
+- Against today's smooth motion: 1.2× the frames on 2M dragging, 1.4–1.9×
+  on scrolling, 3–4.5× on photos, with a shorter queue p95 on 7 of 12 runs.
+- Three queue p95s rise by more than 10 %. Two come with more frames:
+  6M scroll-win 210 → 253 ms with 1.4× the frames, and 2M typing-cc
+  417 → 485 ms with 15 frames against 13. Accepted: response comes first,
+  and the frames are the response.
+- One run loses outright: 6M cursor-drag, 411 → 382 frames (−7 %) and
+  284 → 324 ms (+14 %). Accepted for the gains everywhere else; 6 Mbit/s
+  is the edge of "thin", where both codecs deliver about the same.
+- What the frames look like is the next entry's `vquality`: against HEVC
+  38, sharper dragging (75 · 43 vs 72 · 26), a little softer scrolling
+  (64 · 37 vs 70 · 39), and poor photos (10 vs 32) until they settle to
+  lossless tiles.
+
+### AV1 at ceiling 60: a higher rate aim (2026-10-28)
+
+Follow-up to the next entry, which left open whether AV1's softness at
+quantizer ceiling 60 came from the ceiling or from aiming at only 40 % of
+the cap. Same `glassact-bench` build, traces and links as that entry;
+`--av1-target-pct` 60 / 80 / 100 at ceiling 60, and 80 at ceiling 54.
+HEVC 38 is what Prefer Smooth Motion runs on a thin link today.
+
+Motion quality: `vquality` at 2 Mbit/s, 15 fps submitted, SSIMULACRA2
+mean · worst sampled frame (Mbit/s achieved):
+
+| trace | HEVC 34 | HEVC 38 | AV1 60 aim 40 | aim 60 | aim 80 | aim 100 | AV1 54 aim 80 |
+|---|---|---|---|---|---|---|---|
+| scroll-win | 72 · 56 (1.55) | 70 · 39 (1.55) | 56 · 28 (0.69) | 64 · 37 (0.99) | 69 · 49 (1.25) | 74 · 65 (1.54) | 70 · 50 (1.25) |
+| cursor-drag | 73 · 46 (0.34) | 72 · 26 (0.35) | 70 · 30 (0.84) | 75 · 43 (1.08) | 77 · 47 (1.06) | 78 · 51 (1.07) | 78 · 51 (1.07) |
+| photos | 42 · 39 (3.39) | 32 · 21 (2.55) | −1 · −26 (1.14) | 10 · −22 (1.50) | 20 · −21 (1.88) | 25 · −22 (2.24) | 27 · 6 (2.13) |
+
+Thin-link loop, video frames · link queue p95 (ms):
+
+| link · trace | HEVC 38 | AV1 60 aim 40 | aim 60 | aim 80 | aim 100 | AV1 54 aim 80 |
+|---|---|---|---|---|---|---|
+| 2M cursor-drag | 323 · 574 | 406 · 423 | 305 · 480 | 361 · 514 | 301 · 538 | 184 · 733 |
+| 2M scroll-win | 192 · 650 | 408 · 369 | 346 · 570 | 244 · 496 | 176 · 673 | 263 · 662 |
+| 2M photos | 65 · 1894 | 208 · 711 | 162 · 1030 | 54 · 918 | 59 · 1288 | 28 · 1517 |
+| 2M typing-cc | 13 · 456 | 16 · 399 | 15 · 430 | 15 · 491 | 16 · 510 | 15 · 613 |
+| 3M cursor-drag | 355 · 541 | 447 · 443 | 432 · 488 | 398 · 472 | 287 · 506 | 350 · 554 |
+| 3M scroll-win | 255 · 364 | 454 · 348 | 415 · 344 | 329 · 399 | 208 · 460 | 324 · 404 |
+| 3M photos | 49 · 997 | 304 · 564 | 284 · 753 | 239 · 962 | 97 · 986 | 124 · 997 |
+| 3M typing-cc | 12 · 344 | 16 · 362 | 16 · 394 | 15 · 420 | 16 · 465 | 15 · 444 |
+| 6M cursor-drag | 406 · 283 | 454 · 278 | 423 · 265 | 366 · 275 | 331 · 286 | 333 · 299 |
+| 6M scroll-win | 349 · 323 | 483 · 209 | 431 · 221 | 319 · 224 | 189 · 260 | 381 · 283 |
+| 6M photos | 69 · 499 | 422 · 297 | 420 · 389 | 382 · 498 | 322 · 498 | 221 · 499 |
+| 6M typing-cc | 17 · 259 | 17 · 263 | 17 · 276 | 17 · 281 | 17 · 283 | 17 · 283 |
+
+Every run settled byte-identical.
+
+- **The softness was the aim.** At aim 100 ceiling 60 matches or beats
+  HEVC 34 on scrolling (74 · 65 vs 72 · 56, at the same 1.54 Mbit/s) and
+  dragging (78 · 51 vs 73 · 46, though HEVC needs only 0.34 Mbit/s there).
+  Once the aim is that high, ceiling 54 looks the same as 60 on scrolling
+  and dragging. Photos stay well below HEVC at every aim.
+- **Every step up in aim costs frames:** bigger frames queue, and the send
+  gate skips them. Aim 100 delivers fewer frames than HEVC 38 on scrolling
+  and dragging on every link. Aim 80 falls below it on 6M scrolling and
+  dragging and on 2M photos. Ceiling 54 at aim 80 delivers fewer frames
+  than ceiling 60 at aim 80 on most runs.
+- **Aim 60 is the middle that keeps the frames.** It delivers at least
+  HEVC 38's frames on every run but 2M cursor-drag (305 vs 323): 1.2–1.8×
+  on scrolling, 2.5–6× on photos. Its queue p95 is shorter or within 15 %.
+  Against HEVC 38 its motion is sharper on dragging (75 · 43 vs 72 · 26),
+  a little softer on scrolling (64 · 37 vs 70 · 39), and poor on photos
+  (10 vs 32).
+- **Against aim 40** (the previous entry), aim 60 gives up 0–25 % of the
+  frames for +8 SSIMULACRA2 on scrolling, +5 on dragging and +11 on photos.
+
+Ceiling 60 at aim 60 became Prefer Smooth Motion's AV1 trade, on Viewers
+that opt in to AV1 ("Prefer smooth motion runs AV1 on a thin link", above).
 
 ### Live AV1 encoders, and a looser AV1 ceiling on thin links (2026-10-27)
 
