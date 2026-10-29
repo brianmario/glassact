@@ -204,6 +204,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private var lastCursorX = Int.min
     private var lastCursorY = Int.min
     private var lastCursorVisible = false
+    /// A UI tree read is running (encode queue).
+    private var uiTreeBusy = false
     private var cursorMetadataActive = false // showsCursor turned off + image timer running
     private var cursorImageTimer: Timer? // main-thread
     private var lastCursorImageHash = 0 // main-thread
@@ -950,7 +952,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             return
         }
         if agentInput, kind == 2 || kind == 4 || kind == 5 || kind == 7 {
-            agentAudit.log("\(agentTag) \(Self.inputName(kind)) \(kind == 5 ? "key \(canvasX) flags \(String(UInt32(bitPattern: Int32(truncatingIfNeeded: a)), radix: 16))" : "at \(canvasX),\(canvasY)")"
+            agentAudit.log("\(agentTag) \(Self.inputName(kind)) \(kind == 5 ? Self.auditKey(code: canvasX, flags: a) : "at \(canvasX),\(canvasY)")"
                            + (kind == 2 ? " button \(b) count \(max(1, a))" : "") + (kind == 4 || kind == 7 ? " by \(a),\(b)" : ""))
         }
         guard ensureAccessibility() else { return }
@@ -1102,6 +1104,15 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                                mouseCursorPosition: pt, mouseButton: button) else { return }
         if clickState > 0 { ev.setIntegerValueField(.mouseEventClickState, value: clickState) }
         ev.post(tap: .cghidEventTap)
+    }
+
+    /// A key-down for the audit log: shortcuts (⌘, ⌃ or ⌥ held) by key code;
+    /// anything else typed is only counted, since the codes in order spell
+    /// out what was typed, which may be a password (§14).
+    static func auditKey(code: Int, flags: Int) -> String {
+        let raw = CGEventFlags(rawValue: UInt64(UInt32(bitPattern: Int32(truncatingIfNeeded: flags))))
+        guard !raw.isDisjoint(with: [.maskCommand, .maskControl, .maskAlternate]) else { return "(typing: key not recorded)" }
+        return "key \(code) flags \(String(raw.rawValue, radix: 16))"
     }
 
     /// Accessibility (TCC) is required for CGEventPost. Checked SILENTLY
@@ -2447,11 +2458,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
         engine.onClipboard = { [weak self] format, data in
             guard let self else { return }
-            if let denial = self.agentAccess.admit(agentInput: self.agentAccess.sessionIsAgent) {
+            let agent = self.agentAccess.agentDriving
+            if let denial = self.agentAccess.admit(agentInput: agent) {
                 self.agentAudit.denied("clipboard", denial.reason)
                 return
             }
-            if self.agentAccess.sessionIsAgent { self.agentAudit.log("\(self.agentTag) set the clipboard (\(data.count) bytes)") }
+            if agent { self.agentAudit.log("\(self.agentTag) set the clipboard (\(data.count) bytes)") }
             DispatchQueue.main.async { self.applyInboundClipboard(format, data) }
         }
         engine.onTextInput = { [weak self] text in
@@ -2463,8 +2475,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             self.agentAudit.log("\(self.agentTag) typed \(text.count) characters")
             self.injectText(text)
         }
-        engine.onAgentState = { [weak self, weak engine] active, label in
+        engine.onAgentState = { [weak self, weak engine] active, rawLabel in
             guard let self else { return }
+            // The label goes into status and audit lines: no line breaks or
+            // direction overrides to forge one with.
+            let label = String(String.UnicodeScalarView(rawLabel.unicodeScalars.filter {
+                !CharacterSet.controlCharacters.contains($0)
+            }))
             // A headless agent's name goes on its approval (a person's viewer
             // keeps its own identity even while an agent borrows it).
             if let peer = self.sessionTransport?.peerCertificate, peer.isAgent {
@@ -2490,8 +2507,22 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             self.authorizedViewers.noteDevice(peer.fingerprint, device: name)
             self.approvalsChanged()
         }
-        engine.onUITreeRequest = { [weak self] requestID, windowID, maxNodes in
+        engine.onUITreeRequest = { [weak self, weak engine] requestID, windowID, maxNodes in
             guard let self else { return }
+            if let denial = self.agentAccess.admitRead() {
+                self.agentAudit.denied("UI tree", denial.reason)
+                engine?.sendUITree(requestID: requestID, status: UITreeStatus.refused, json: [])
+                return
+            }
+            // One read at a time: each walks another app's accessibility
+            // tree, which blocks that app while it answers. A viewer asks
+            // once and waits for the answer, so another while one runs is
+            // dropped (its asker times out).
+            guard !self.uiTreeBusy else {
+                self.agentAudit.denied("UI tree", "another read is still running")
+                return
+            }
+            self.uiTreeBusy = true
             self.agentAudit.log("\(self.agentTag) read the UI tree\(windowID == 0 ? "" : " of window \(windowID)")")
             let scale = self.mappingScale, origin = self.contentOrigin
             let engineQueue = self.encodeQueue
@@ -2502,12 +2533,23 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 }
                 // The live engine (an in-session geometry rebuild may have replaced it).
                 engineQueue.async { [weak self] in
+                    self?.uiTreeBusy = false
                     self?.engine?.sendUITree(requestID: requestID, status: answer.status, json: answer.json)
                 }
             }
         }
-        engine.onResizeRequested = { [weak self] mode, w, h, scale in
+        engine.onResizeRequested = { [weak self] requested, w, h, scale in
             guard let self else { return }
+            // Switching this Mac's display, or adding a virtual one, changes
+            // it for the person here: not for a View Only key, nor an agent
+            // whose control is off. They get native; scaling the capture
+            // changes only what they're sent.
+            var mode = requested
+            if mode == Int(GeometryMode.clientResolution) || mode == Int(GeometryMode.virtualDisplay),
+               let denial = self.agentAccess.admitShare() {
+                self.onStatus("geometry mode \(mode) refused (\(denial.reason)) — native instead")
+                mode = Int(GeometryMode.native)
+            }
             self.onStatus("geometry requested: mode \(mode) \(w)×\(h) @\(scale)x")
             DispatchQueue.main.async {
                 if mode == 3 && !self.captureModified {
@@ -2525,9 +2567,16 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
         engine.onWindowSelect = { [weak self] windowID in
             guard let self else { return }
-            // Listing windows (id 0 when not sharing one) only reads; picking one
-            // changes what's shared — not for a view-only key.
-            if windowID != 0, let denial = self.agentAccess.admit(agentInput: self.agentAccess.sessionIsAgent) {
+            // Listing windows (id 0) shows every window, hidden ones too, so
+            // only a session that could pick one gets the list (an empty one
+            // otherwise, so the picker doesn't wait); picking changes what's
+            // shared.
+            if windowID == 0, let denial = self.agentAccess.admitShare() {
+                self.agentAudit.denied("window list", denial.reason)
+                self.engine?.sendWindowList([])
+                return
+            }
+            if windowID != 0, let denial = self.agentAccess.admit(agentInput: self.agentAccess.agentDriving) {
                 self.agentAudit.denied("window select", denial.reason)
                 return
             }
@@ -2536,7 +2585,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         engine.onWindowControl = { [weak self] action, width, height in
             guard let self else { return }
             if action != WindowAction.endSession,
-               let denial = self.agentAccess.admit(agentInput: self.agentAccess.sessionIsAgent) {
+               let denial = self.agentAccess.admit(agentInput: self.agentAccess.agentDriving) {
                 self.agentAudit.denied("window control", denial.reason)
                 return
             }
@@ -2620,6 +2669,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         guard let transport = sessionTransport else { return }
         let seed = engine?.currentFrameSeq ?? 1
         let newEngine = makeEngine(on: transport, width: width, height: height, startFrameSeq: seed)
+        newEngine.sessionOpen = engine?.sessionOpen ?? false
         engine = newEngine
         DispatchQueue.main.async { [weak self] in
             self?.captureWidth = width
@@ -2653,6 +2703,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         // Clipboard sync is session-scoped (one timer), not per engine rebuild.
         startClipboardSync { [weak self] fmt, data in
             guard let self else { return }
+            // Not to a View Only key, nor an agent whose control is off.
+            guard self.agentAccess.admitShare() == nil else { return }
             self.encodeQueue.async { self.engine?.sendClipboard(format: fmt, data: data) }
         }
         // Route control through self.engine (not a captured engine) so an
@@ -2732,6 +2784,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             // Capture died while nobody watched (display slept, screen
             // locked): the display is waking now — try again right away.
             if isRunning { capture.retryNow() }
+            // The session's policy is in place before the engine starts: the
+            // engine acts on input only after the HELLO it is about to send
+            // is answered, and finds the policy loaded.
+            let peer = transport?.peerCertificate
+            agentAccess.beginSession(peer: peer, viewOnly: peer.map { authorizedViewers.isViewOnly($0.fingerprint) } ?? false)
             let connectedUS = MonotonicClock.nowUS
             encodeQueue.async { [weak self] in
                 self?.viewerConnectedUS = connectedUS
@@ -2739,8 +2796,6 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             }
             viewerConnectedAt = Date()
             phase = .viewerConnected
-            let peer = transport?.peerCertificate
-            agentAccess.beginSession(peer: peer, viewOnly: peer.map { authorizedViewers.isViewOnly($0.fingerprint) } ?? false)
             if let peer {
                 authorizedViewers.noteSeen(peer.fingerprint, kind: peer.isAgent ? .agent : .viewer,
                                            address: transport?.remoteAddress ?? "")
