@@ -203,6 +203,38 @@ import GlassActWire
         #expect(node["frame"] as? [Int] == [50, 100, 20, 10])
         #expect(log.treeRequests.withLock { $0.first?.2 } == 50)
 
+        // An answer the agent never asked for isn't kept: a host can't plant
+        // the reply to the next request (or fill the viewer's memory).
+        let planted = #"{"app":"Planted","nodes":[{"i":0,"p":-1,"role":"AXPlanted"}]}"#
+        rig.serverQueue.sync {
+            rig.hostBox.engine?.sendUITree(requestID: 2, status: UITreeStatus.ok, json: Array(planted.utf8))
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+        log.treeRequests.withLock { $0.removeAll() }
+        DispatchQueue.global().async(execute: DispatchWorkItem {
+            _ = Self.waitUntil(5) { log.treeRequests.withLock { !$0.isEmpty } }
+            let req = log.treeRequests.withLock { $0[0] }
+            let json = #"{"app":"Test","nodes":[{"i":0,"p":-1,"role":"AXButton"}]}"#
+            hostQueue.async {
+                hostBox.engine?.sendUITree(requestID: req.0, status: UITreeStatus.ok, json: Array(json.utf8))
+            }
+        })
+        let second = try rig.driver.perform("ui_tree", [:])
+        #expect((second["nodes"] as? [[String: Any]])?.first?["role"] as? String == "AXButton")
+
+        // Numbers an agent sends are bounded: a huge one is an error, not a
+        // trap that takes the session down, and a drag can't run for days.
+        #expect(throws: AgentDriver.Failure.self) { _ = try rig.driver.perform("click", ["x": 1e300, "y": 0]) }
+        #expect(throws: AgentDriver.Failure.self) { _ = try rig.driver.perform("move", ["x": Double.nan, "y": 0]) }
+        #expect(throws: AgentDriver.Failure.self) {
+            _ = try rig.driver.perform("drag", ["from": [0, 0], "to": [1e12, 0]])
+        }
+        let longPath = (0...AgentDriver.maxDragPoints).map { [$0 % 100, 0] }
+        #expect(throws: AgentDriver.Failure.self) { _ = try rig.driver.perform("drag", ["path": longPath]) }
+        #expect(throws: AgentDriver.Failure.self) {
+            _ = try rig.driver.perform("wait", ["seconds": Double.infinity])
+        }
+
         // When the host says no, input fails with its reason.
         rig.serverQueue.sync { rig.hostBox.engine?.sendAgentScope(control: false, reason: "view-only approval") }
         #expect(Self.waitUntil(5) {
