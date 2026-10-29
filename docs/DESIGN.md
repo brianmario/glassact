@@ -1392,6 +1392,10 @@ automatic checks.
 - **Help › Send Logs to Host** (Viewer) includes the crash reports, over the
   session, like the logs (§3.5 VIEWER_LOG). They land in the Host's
   `from-viewer` folder, on a Mac the same person chose to connect to.
+- That folder is bounded, since any approved viewer can send to it
+  (`ViewerLogInbox`): the newest 100 files and 128 MB are kept, one upload
+  is open at a time (starting another closes it), a failed write drops the
+  file, and a session's end closes what it left open.
 - `scripts/symbolicate-crash` turns a report's stacks into function names
   with a release's dSYMs.
 
@@ -1401,8 +1405,11 @@ automatic checks.
   keys can't be read; code signed by another team can't use them either.
 - Agent status is self-declared, by certificate name or the input flag, so a
   modified client can avoid agent policy.
-- Under "Ask", nothing rate-limits approval prompts from new keys. (Under
-  "Sign in", new keys cause no prompts.)
+- Prompts are bounded, not prevented: any new key can ask under "Ask", and
+  an agent's key under "Sign in" too. One is on screen at a time, and after
+  a Don't Allow none goes up for 10 s, doubling with each further denial up
+  to 10 min (an Allow resets it; `ApprovalPromptGate`). A key turned away
+  meanwhile is refused as usual and asks again on its next retry.
 - First contact is only as safe as the person comparing codes.
 - The Host is unsandboxed and uses one private API, CGVirtualDisplay.
   Remote input needs Accessibility, which no sandboxed app can have.
