@@ -819,6 +819,11 @@ public final class HostEngine: @unchecked Sendable {
         deframer.append(data)
         while let event = deframer.next() {
             guard case let .message(message) = event else { continue }
+            // Input and the changes like it wait for the handshake (§13):
+            // the app loads this session's policy (View Only, agent access)
+            // as the session comes up, and a viewer sends none of these
+            // before its HELLO_OK.
+            if !sessionOpen && Self.waitsForHandshake(message) { continue }
             switch message {
             case let .helloOK(ver, caps, geoMode, geoWidth, geoHeight, geoScale):
                 guard WireVersion.isCompatible(ver) else {
@@ -842,6 +847,7 @@ public final class HostEngine: @unchecked Sendable {
                 }
                 if state == .helloSent {
                     state = .running
+                    sessionOpen = true
                     negotiatedVideoCodecs = videoEncoderFactory == nil ? []
                         : videoCodecPreference.filter { caps & WireCaps.bit(forVideoCodec: $0) != 0 }
                     videoNegotiated = !negotiatedVideoCodecs.isEmpty
@@ -932,6 +938,28 @@ public final class HostEngine: @unchecked Sendable {
         }
         if deframer.isMalformed {
             enterFailed("malformed control stream")
+        }
+    }
+
+    /// True once this session's handshake completed: only then are input
+    /// and the changes like it acted on. An in-session rebuild (§4.10)
+    /// carries it over from the engine it replaces, so input keeps flowing
+    /// through the re-HELLO.
+    public var sessionOpen = false
+
+    /// Messages that act on this Mac, held back until `sessionOpen`.
+    /// Releases pass, so nothing held down stays down.
+    static func waitsForHandshake(_ message: ControlMessage) -> Bool {
+        switch message {
+        case let .input(kind, _, _, _, _):
+            let k = kind & 0x7F
+            return k != 3 && k != 6 // mouse-up, key-up
+        case let .windowControl(action, _, _):
+            return action != WindowAction.endSession
+        case .clipboard, .textInput, .windowSelect, .uiTreeRequest, .agentState, .resize:
+            return true
+        default:
+            return false
         }
     }
 
