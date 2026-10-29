@@ -1469,14 +1469,28 @@ hand-rolled JSON-RPC 2.0 over stdio) whose tools mirror computer use.
 **Host policy** (`AgentAccess`):
 - A connection is an agent if its certificate name is `glassact-agent`, or if
   its input carries the agent flag.
-- View Only blocks input, the clipboard and window control.
+- View Only blocks input, the clipboard (both ways), window control and the
+  window list, and switching this Mac's display (Client Resolution or a
+  virtual display; it gets native instead, or a scaled capture). It may read
+  the UI tree.
+- An agent whose control is off, paused or out of time is held the same way,
+  and may not read the UI tree either (`refused`). That covers a person's
+  viewer while its agent drives (AGENT_STATE active).
+- **Nothing before the handshake:** the session's policy is loaded before
+  the Host's HELLO goes out, and the engine acts on input, clipboard, text,
+  window, UI tree, AGENT_STATE and RESIZE messages only once HELLO_OK has
+  answered it (`HostEngine.sessionOpen`; releases and ending a shared window
+  always pass). With no session loaded, `AgentAccess` admits nothing.
+- One UI tree read runs at a time; a request while one runs is dropped.
 - "Allow Agents to Control This Mac" is a global switch.
 - Time limit: none, 15 min, 1 h (the default) or 4 h. When it runs out, agent
   input pauses until the user resumes it.
 - **The human wins:** agent input is refused for 2 s after local HID input.
   Releases always pass, so keys never stick.
 - An audit log (`agent-audit.log`, 0600, rotated at 4 MB) records every action.
-  Typed text is counted, not recorded.
+  Typed text is counted, not recorded, and so are key presses: only a
+  shortcut (⌘, ⌃ or ⌥ held) is logged by key code. The agent's label has
+  its control characters removed, so it can't forge a line.
 - A headless agent leaving doesn't trigger the lock-on-leave.
 
 A private display for agents is deferred (issue #7).
