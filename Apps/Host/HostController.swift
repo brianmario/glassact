@@ -121,6 +121,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private var geometrySettled = false // one handshake geometry cycle per arm
     private var captureModified = false // display switched OR capture downscaled — restore on disconnect
     private var mouseButtonsDown = 0 // bitmask (bit 0 L, 1 R, 2 other) — drag vs move
+    /// Keys this session pressed and hasn't released (encode queue).
+    private var keysDown: Set<Int> = []
     /// The held press's click count: a double-click-drag selects by word.
     private var heldClickState: Int64 = 1
     private var warnedNoAccessibility = false
@@ -946,9 +948,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         let raw = UInt8(truncatingIfNeeded: rawKind)
         let kind = Int(raw & InputFlags.kindMask)
         let agentInput = raw & InputFlags.agent != 0 || agentAccess.sessionIsAgent
-        // Releases always go through (a denied mouse-up would leave a button
-        // stuck down), except for a key that may only watch.
-        let release = kind == 3 || kind == 6
+        // Releasing what this session holds always goes through (a denied
+        // mouse-up would leave a button stuck down), except for a key that
+        // may only watch. A release of something it doesn't hold is input
+        // like any other: it would end the person's own drag, or lift
+        // their modifier.
+        let release = (kind == 3 && mouseButtonsDown & (1 << b) != 0) || (kind == 6 && keysDown.contains(canvasX))
         if let denial = agentAccess.admit(agentInput: agentInput && !release) {
             if kind != 1 { agentAudit.denied(Self.inputName(kind), denial.reason) }
             return
@@ -999,6 +1004,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 ev.post(tap: .cghidEventTap)
             }
         case 5, 6: // key down / up
+            if kind == 5 { keysDown.insert(canvasX) } else { keysDown.remove(canvasX) }
             if let ev = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(canvasX),
                                 keyDown: kind == 5) {
                 // Keep the flags a key carries itself (numeric pad and
@@ -1092,6 +1098,30 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             run = run[run.index(after: idx)...]
         }
         type(run)
+    }
+
+    /// Encode queue. The session ended: let go of every key and button it
+    /// still held (a dropped connection never sends the ups), so nothing,
+    /// a ⌘ above all, stays down for the person here or the next session.
+    private func releaseHeldInput() {
+        defer {
+            keysDown.removeAll()
+            mouseButtonsDown = 0
+        }
+        guard (!keysDown.isEmpty || mouseButtonsDown != 0), AXIsProcessTrusted() else { return }
+        for code in keysDown {
+            guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: false) else { continue }
+            ev.flags = []
+            ev.post(tap: .cghidEventTap)
+        }
+        let at = CGEvent(source: nil)?.location ?? .zero
+        for (bit, type, button) in [(0, CGEventType.leftMouseUp, CGMouseButton.left),
+                                    (1, .rightMouseUp, .right), (2, .otherMouseUp, .center)]
+        where mouseButtonsDown & (1 << bit) != 0 {
+            post(mouse: type, at: at, button: button)
+        }
+        onStatus("session ended with input held — released \(keysDown.count) key(s)"
+                 + (mouseButtonsDown != 0 ? " and the mouse" : ""))
     }
 
     private func draggedTypeForHeldButton() -> (CGEventType, CGMouseButton) {
@@ -2848,6 +2878,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         transport = nil
         ending?.cancel() // no-op if it already ended
         encodeQueue.async { [weak self] in
+            self?.releaseHeldInput()
             self?.engine = nil
             self?.sessionTransport = nil
         }
