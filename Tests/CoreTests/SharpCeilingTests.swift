@@ -12,6 +12,7 @@ import GlassActWire
     final class CeilingRecordingEncoder: VideoRegionEncoder {
         let inner = MockVideoEncoder(codecID: MockVideoEncoder.mockCodecID)
         var ceilings: [Int?] = []
+        var smooth: [Bool] = []
         var codecID: UInt8 { inner.codecID }
         func start(width: Int, height: Int,
                    onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
@@ -21,6 +22,7 @@ import GlassActWire
             inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
         }
         func setMaxFrameQP(_ qp: Int?) { ceilings.append(qp) }
+        func setSmoothMotion(_ on: Bool) { smooth.append(on) }
         func stop() { inner.stop() }
     }
 

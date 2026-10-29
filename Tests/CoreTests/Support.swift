@@ -258,7 +258,8 @@ final class Harness {
          decoderFactory: (() -> any VideoRegionDecoder)? = nil,
          fastLink: Bool = false,
          sendClock: Bool = false,
-         encodeTimer: (@Sendable () -> UInt64)? = nil) {
+         encodeTimer: (@Sendable () -> UInt64)? = nil,
+         viewerQualityPolicy: (floor: Int, preferSharpness: Bool, preferSmoothness: Bool)? = nil) {
         frame = TestFrame(width: width, height: height)
         let link = InProcLink(faults: faults)
         self.link = link
@@ -281,6 +282,7 @@ final class Harness {
         viewer = ViewerEngine(transport: link.b,
                               videoDecoderFactory: video ? (decoderFactory ?? { MockVideoDecoder() }) : nil,
                               supportedVideoCodecs: viewerCodecs)
+        viewer.initialQualityPolicy = viewerQualityPolicy
         link.a.onControl = { [weak self] data in
             guard let self else { return }
             self.host.handleControl(data, nowUS: self.link.nowUS)

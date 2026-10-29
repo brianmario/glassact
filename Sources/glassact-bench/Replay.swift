@@ -5,7 +5,7 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap",
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
                              "link-mbit", "link-buffer-ms"]
 
 let replayCommand = Command(
@@ -31,6 +31,7 @@ let replayCommand = Command(
         .bool("no-link-reports", "loop: before 'Link estimate from the viewer': no RECEIVED reports, no capacity ceiling"),
         .int("av1-qmax", "<0-63>", 0...63, "loop experiment, --video av1: libaom's quantizer ceiling (default: HEVC's frame-QP floor mapped, 42)"),
         .int("av1-target-pct", "<n>", 10...100, "loop experiment, --video av1: aim at n % of the target and the link cap (default 40, as in the product)"),
+        .bool("prefer-smoothness", "loop: the Viewer prefers smooth motion (QUALITY preference 2), as its Moving content setting sends it"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
         .bool("timeline", "loop: print engine state once per virtual second (video coverage, handoffs, tiles, repaint debt)"),
         .int("handoff-ms", "<n>", 50...60_000, "loop experiment: how long a region tile must be still before it goes back to exact (default 1000)"),

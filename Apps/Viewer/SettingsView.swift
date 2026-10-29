@@ -44,8 +44,9 @@ struct SettingsView: View {
                      + "differently shaped picture; it goes back when you leave full screen. "
                      + (VTRegionDecoder.canDecodeAV1
                         ? "AV1 video keeps moving text sharper than the default HEVC and reaches you a little "
-                            + "sooner, but it uses more bandwidth and more of the host's processor; on a slow "
-                            + "network, HEVC looks better. It needs an up-to-date host with Apple silicon; other "
+                            + "sooner, but it uses more bandwidth and more of the host's processor. On a slow "
+                            + "network the host uses HEVC instead, unless you prefer smooth motion: then AV1 "
+                            + "gets more frames through. It needs an up-to-date host with Apple silicon; other "
                             + "hosts use HEVC."
                         : "AV1 video needs a Mac with an M3 chip or later to decode it."))
                     .settingsFooter()

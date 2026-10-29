@@ -45,6 +45,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     private var bitrateCap: Int?
     private var appliedBitrate = 0
     private var maxFrameQP = VTHEVCRegionEncoder.defaultMaxFrameQP
+    private var smoothMotion = false
 
     /// Experiments (the bench), applied at `start`: libaom's realtime speed
     /// (the product: 9), and VBR instead of CBR.
@@ -56,6 +57,15 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     /// own). At 40 % it delivers more frames than HEVC on a 10 Mbit/s link
     /// (BENCHMARKS "AV1 back, as a Viewer opt-in"). A bench knob too.
     public var targetPercent = 40
+    /// Prefer smooth motion on a thin link (`setSmoothMotion`): a looser
+    /// quantizer ceiling, so frames shrink and more get through, and a higher
+    /// aim, which buys back most of the sharpness that costs. On 2–3 Mbit/s
+    /// links ceiling 60 at 60 % delivers 1.2–1.8× HEVC 38's frames on
+    /// scrolling and 2.5–6× on photos, sharper on dragging and a little softer
+    /// on scrolling; aims of 80 and 100 % give the frames back (BENCHMARKS
+    /// "AV1 at ceiling 60: a higher rate aim"). Bench knobs too.
+    public var smoothQuantizerCeiling = 60
+    public var smoothTargetPercent = 60
     /// Experiment: libaom's quantizer ceiling (0–63) instead of the HEVC
     /// frame-QP mapping; nil = the mapping.
     public var quantizerCeiling: Int?
@@ -82,12 +92,12 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         // The same budget as HEVC: at equal bytes AV1's screen tools buy
         // sharper text, not more bandwidth.
         baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
-        appliedBitrate = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap) * targetPercent / 100
+        appliedBitrate = aimedBitrate
         var options = glassact_aom_enc_options(speed: Int32(speed), vbr: vbr ? 1 : 0)
         guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
                                                      Int32(appliedBitrate / 1000), &options) else { return false }
         handle = Handle(raw: raw)
-        glassact_aom_enc_set_max_quantizer(raw, Int32(fixedQuantizer ?? quantizerCeiling ?? Self.quantizer(forFrameQP: maxFrameQP)))
+        glassact_aom_enc_set_max_quantizer(raw, Int32(maxQuantizer))
         if let q = fixedQuantizer { glassact_aom_enc_set_min_quantizer(raw, Int32(q)) }
         var header = [UInt8](repeating: 0, count: 256)
         let length = glassact_aom_enc_sequence_header(raw, &header, header.count)
@@ -151,9 +161,16 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         let ceiling = qp ?? VTHEVCRegionEncoder.defaultMaxFrameQP
         guard ceiling != maxFrameQP, fixedQuantizer == nil else { return }
         maxFrameQP = ceiling
-        guard let handle else { return }
-        let quantizer = Int32(quantizerCeiling ?? Self.quantizer(forFrameQP: ceiling))
-        encodeQueue.async { glassact_aom_enc_set_max_quantizer(handle.raw, quantizer) }
+        applyMaxQuantizer()
+    }
+
+    /// While on, the smooth ceiling and aim replace the frame-QP mapping and
+    /// `targetPercent`; off, they come back.
+    public func setSmoothMotion(_ on: Bool) {
+        guard on != smoothMotion else { return }
+        smoothMotion = on
+        applyMaxQuantizer()
+        applyBitrate()
     }
 
     public func stop() {
@@ -182,9 +199,29 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         min(63, max(0, Int((Double(qp) * 63 / 51).rounded())))
     }
 
+    /// libaom's quantizer ceiling: an experiment's fixed value, else the
+    /// smooth ceiling while that's on, else the frame-QP ceiling mapped.
+    var maxQuantizer: Int {
+        fixedQuantizer ?? quantizerCeiling
+            ?? (smoothMotion ? smoothQuantizerCeiling : Self.quantizer(forFrameQP: maxFrameQP))
+    }
+
+    /// What CBR aims at: the target's share (`targetPercent`, or
+    /// `smoothTargetPercent` while smooth motion is on).
+    var aimedBitrate: Int {
+        Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap)
+            * (smoothMotion ? smoothTargetPercent : targetPercent) / 100
+    }
+
+    private func applyMaxQuantizer() {
+        guard let handle else { return }
+        let quantizer = Int32(maxQuantizer)
+        encodeQueue.async { glassact_aom_enc_set_max_quantizer(handle.raw, quantizer) }
+    }
+
     private func applyBitrate() {
         guard let handle else { return }
-        let target = Self.target(base: baseBitrate, level: qualityLevel, cap: bitrateCap) * targetPercent / 100
+        let target = aimedBitrate
         // As for HEVC: skip moves under 5 %, each one resets rate control.
         guard abs(target - appliedBitrate) * 20 > appliedBitrate else { return }
         appliedBitrate = target
