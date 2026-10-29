@@ -45,6 +45,11 @@ function run(argv) {
 	const payload = JSON.parse(text.js)
 	const all = argv[1] === '1'
 	const out = []
+	// A report can come from anyone (an issue attachment), and the shell
+	// below does arithmetic on these fields: numbers must be plain integers,
+	// and text can't carry a tab or newline that would forge a line.
+	const int = v => Number.isSafeInteger(v) && v >= 0 ? v : 0
+	const text1 = v => String(v).replace(/[\u0000-\u001f\u007f]/g, ' ')
 	const kinds = [['crashDiagnostics', 'Crash'], ['hangDiagnostics', 'Hang'],
 		['cpuExceptionDiagnostics', 'CPU exception'], ['diskWriteExceptionDiagnostics', 'Disk-write exception'],
 		['appLaunchDiagnostics', 'Launch']]
@@ -59,10 +64,10 @@ function run(argv) {
 				m.signal !== undefined && ('signal ' + m.signal),
 				m.hangDuration && ('hang ' + m.hangDuration),
 			].filter(Boolean)
-			out.push('H\t' + label + ': ' + facts.join(' · '))
-			if (m.terminationReason) out.push('H\t  termination reason: ' + m.terminationReason)
-			if (m.exceptionReason) out.push('H\t  exception: ' + (m.exceptionReason.exceptionName || '') + ' '
-				+ (m.exceptionReason.composedMessage || ''))
+			out.push('H\t' + text1(label + ': ' + facts.join(' · ')))
+			if (m.terminationReason) out.push('H\t  termination reason: ' + text1(m.terminationReason))
+			if (m.exceptionReason) out.push('H\t  exception: ' + text1((m.exceptionReason.exceptionName || '') + ' '
+				+ (m.exceptionReason.composedMessage || '')))
 			const tree = d.callStackTree || {}
 			const stacks = tree.callStacks || []
 			const perThread = tree.callStackPerThread !== false
@@ -72,8 +77,9 @@ function run(argv) {
 				let index = 0
 				const walk = (frames, depth) => {
 					for (const f of frames || []) {
-						out.push([perThread ? 'F' : 'T', perThread ? index++ : depth, f.sampleCount || 0, f.binaryName || '???',
-							(f.binaryUUID || '').toUpperCase(), f.offsetIntoBinaryTextSegment || 0].join('\t'))
+						out.push([perThread ? 'F' : 'T', perThread ? index++ : depth, int(f.sampleCount), text1(f.binaryName || '???'),
+							String(f.binaryUUID || '').toUpperCase().replace(/[^0-9A-F-]/g, ''),
+							int(f.offsetIntoBinaryTextSegment)].join('\t'))
 						walk(f.subFrames, depth + 1)
 					}
 				}
@@ -95,6 +101,7 @@ for line in $flat; do
 	[[ $line == [FT]$'\t'* ]] || continue
 	f=("${(@ps:\t:)line}")
 	uuid=$f[5] off=$f[6]
+	[[ $off == <-> ]] || continue # zsh arithmetic runs $(…) inside a subscript
 	[[ -n ${dwarf[$uuid]:-} ]] && offsets[$uuid]+=" $off"
 done
 for uuid in ${(k)offsets}; do
@@ -112,6 +119,7 @@ for line in $flat; do
 	fi
 	f=("${(@ps:\t:)line}")
 	depth=$f[2] samples=$f[3] name=$f[4] uuid=$f[5] off=$f[6]
+	[[ $depth == <-> && $samples == <-> && $off == <-> ]] || { print -u2 "! skipped a malformed frame"; continue }
 	where=${symbol[$uuid:$off]:-$(printf '+ 0x%x' $off)}
 	if [[ $where == 0x* ]]; then where=$(printf '+ 0x%x' $off); fi # atos found no symbol
 	if [[ $line == T* ]]; then
