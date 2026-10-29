@@ -248,6 +248,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     }
     private var approvalsPending: Set<String> = [] // main-thread
     private var deniedThisRun: Set<String> = []   // main-thread
+    /// One prompt at a time, quiet after a denial (§13). Main thread.
+    private var promptGate = ApprovalPromptGate()
 
     /// Listener queue (TLS verify block): must answer immediately. Unknown
     /// keys are refused now. Under "Ask Me" (and always for agents, unless
@@ -332,6 +334,9 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         let fingerprint = peer.fingerprint
         guard isRunning, !approvalsPending.contains(fingerprint),
               !deniedThisRun.contains(fingerprint), !authorizedViewers.contains(fingerprint) else { return }
+        // A prompt is up, or one was just denied: this key is refused like
+        // any other for now, and its dialer's next retry asks again.
+        guard promptGate.begin(now: ProcessInfo.processInfo.systemUptime) else { return }
         approvalsPending.insert(fingerprint)
         defer { approvalsPending.remove(fingerprint) }
         let code = QUICIdentity.verificationCode(hostFingerprint: self.fingerprint,
@@ -341,6 +346,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         let decision = MainActor.assumeIsolated {
             ApprovalAlert.run(code: code, viewerFingerprint: fingerprint, isAgent: peer.isAgent)
         }
+        promptGate.end(allowed: decision != .deny, now: ProcessInfo.processInfo.systemUptime)
         guard decision != .deny else {
             deniedThisRun.insert(fingerprint)
             onStatus("\(who) \(QUICIdentity.abbreviatedKeyString(fingerprint)) denied")
@@ -433,7 +439,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     // MARK: - Capture lifecycle
 
     /// Viewer logs sent over the session (Session › Send Logs to Host).
-    private let logInbox = ViewerLogInbox()
+    private let logInbox = ViewerLogInbox(directory: AppPaths.logsDirectory.appendingPathComponent("from-viewer"))
 
     private var displayWatchRegistered = false
     /// This login session is off the screen (fast user switching: another
@@ -2780,6 +2786,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private func endSession() {
         tickTimer?.cancel()
         tickTimer = nil
+        logInbox.endSession()
         let ending = transport
         transport = nil
         ending?.cancel() // no-op if it already ended
@@ -2894,50 +2901,5 @@ struct ChangeHotspots {
             return "\(n)× \((c1 - c0 + 1) * ts)×\((r1 - r0 + 1) * ts)@\(c0 * ts),\(r0 * ts)"
         }
         return "changes \(framesChanged)/\(framesTotal) frames: " + top.joined(separator: " · ") + noRects
-    }
-}
-
-/// Stores VIEWER_LOG uploads in ~/Library/Logs/Glass Act/from-viewer/<name>.
-/// Chunks must arrive in order (the stream is reliable and ordered); a gap
-/// or overrun drops the rest of that file. Names are already validated by
-/// the parser (bare, safe characters). Own queue: file I/O stays off the
-/// engine's.
-final class ViewerLogInbox: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "glassact.host.viewer-logs")
-    private var written: [String: Int] = [:]
-    private var handles: [String: FileHandle] = [:]
-    let directory = AppPaths.logsDirectory.appendingPathComponent("from-viewer")
-
-    func receive(name: String, offset: Int, total: Int, data: [UInt8], status: @escaping @Sendable (String) -> Void) {
-        queue.async { [self] in
-            let url = directory.appendingPathComponent(name)
-            if offset == 0 {
-                try? handles[name]?.close()
-                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                guard FileManager.default.createFile(atPath: url.path, contents: nil),
-                      let h = try? FileHandle(forWritingTo: url) else {
-                    status("viewer log \(name): can't write \(url.path)")
-                    return
-                }
-                handles[name] = h
-                written[name] = 0
-            }
-            guard let h = handles[name], written[name] == offset else {
-                if handles[name] != nil { status("viewer log \(name): out-of-order chunk at \(offset) — dropped") }
-                try? handles[name]?.close()
-                handles[name] = nil
-                written[name] = nil
-                return
-            }
-            h.write(Data(data))
-            let now = offset + data.count
-            written[name] = now
-            if now >= total {
-                try? h.close()
-                handles[name] = nil
-                written[name] = nil
-                status("received viewer log \(name) (\(total / 1024) KB) → \(url.path)")
-            }
-        }
     }
 }
