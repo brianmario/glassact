@@ -46,6 +46,8 @@ public final class AgentDriver: @unchecked Sendable {
         var hostClipboard: String?
         var windows: [WireWindow]?
         var trees: [UInt32: (status: UInt8, json: [UInt8])] = [:]
+        /// UI tree requests still waiting: only their answers are kept.
+        var treesAsked: Set<UInt32> = []
         var nextTreeID: UInt32 = 1
         var humanInputUS: UInt64 = 0
         var active = false
@@ -67,7 +69,11 @@ public final class AgentDriver: @unchecked Sendable {
                 self?.shared.withLock { $0.control = control; $0.controlReason = reason }
             }
             engine.onUITree = { requestID, status, json in
-                self?.shared.withLock { $0.trees[requestID] = (status, json) }
+                self?.shared.withLock { s in
+                    // An answer nobody asked for (or gave up on) isn't kept.
+                    guard s.treesAsked.remove(requestID) != nil else { return }
+                    s.trees[requestID] = (status, json)
+                }
             }
         }
     }
@@ -133,21 +139,21 @@ public final class AgentDriver: @unchecked Sendable {
             return status()
         case "screenshot":
             return try screenshot(settled: args.bool("settled") ?? true,
-                                  timeout: args.optionalDouble("timeout") ?? 3,
+                                  timeout: try args.optionalDouble("timeout") ?? 3,
                                   region: try args.rect("region"))
         case "zoom":
             guard let region = try args.rect("region") else { throw Failure("zoom needs region [x, y, width, height]") }
-            return try screenshot(settled: args.bool("settled") ?? true, timeout: args.optionalDouble("timeout") ?? 3,
+            return try screenshot(settled: args.bool("settled") ?? true, timeout: try args.optionalDouble("timeout") ?? 3,
                                   region: region)
         case "wait":
-            let seconds = min(60, max(0, args.optionalDouble("seconds") ?? 1))
+            let seconds = min(60, max(0, try args.optionalDouble("seconds") ?? 1))
             Thread.sleep(forTimeInterval: seconds)
             return ["waited": seconds]
         case "wait_for_settle":
-            let result = try waitSettled(timeout: args.optionalDouble("timeout") ?? 5)
+            let result = try waitSettled(timeout: try args.optionalDouble("timeout") ?? 5)
             return ["settled": result.settled, "moving_tiles": result.moving]
         case "wait_for_change":
-            return try waitForChange(region: try args.rect("region"), timeout: args.optionalDouble("timeout") ?? 10)
+            return try waitForChange(region: try args.rect("region"), timeout: try args.optionalDouble("timeout") ?? 10)
         case "cursor_position":
             let (cw, ch) = try canvasSize()
             let s = scale(cw, ch)
@@ -246,7 +252,7 @@ public final class AgentDriver: @unchecked Sendable {
             return [:]
         case "hold_key":
             let combo = try parseCombo(try args.string("key"))
-            let seconds = min(10, max(0, args.optionalDouble("seconds") ?? 0.5))
+            let seconds = min(10, max(0, try args.optionalDouble("seconds") ?? 0.5))
             try pressCombo(combo, action: "down")
             Thread.sleep(forTimeInterval: seconds)
             try pressCombo(combo, action: "up")
@@ -327,6 +333,8 @@ public final class AgentDriver: @unchecked Sendable {
         return p
     }
 
+    public static let maxDragPoints = 1000
+
     private func dragPath(_ args: Args) throws -> [(x: Int, y: Int)] {
         let (cw, ch) = try canvasSize()
         let s = scale(cw, ch)
@@ -335,10 +343,11 @@ public final class AgentDriver: @unchecked Sendable {
         }
         var points: [(x: Double, y: Double)] = []
         if let path = args.raw["path"] as? [[Any]] {
+            // Each point is a move ~12 ms apart: a few thousand is minutes.
+            guard path.count <= Self.maxDragPoints else { throw Failure("a path has at most \(Self.maxDragPoints) points") }
             for p in path {
-                guard p.count == 2, let x = (p[0] as? NSNumber)?.doubleValue, let y = (p[1] as? NSNumber)?.doubleValue
-                else { throw Failure("path is [[x, y], …]") }
-                points.append((x, y))
+                guard p.count == 2 else { throw Failure("path is [[x, y], …]") }
+                points.append((try Args.number(p[0], "path"), try Args.number(p[1], "path")))
             }
         } else {
             let from = try args.pair("from"), to = try args.pair("to")
@@ -348,7 +357,7 @@ public final class AgentDriver: @unchecked Sendable {
         // Two-point drags get intermediate steps, so apps see a drag.
         if points.count == 2 {
             let (a, b) = (points[0], points[1])
-            let steps = max(8, Int(hypot(b.x - a.x, b.y - a.y) / 24))
+            let steps = min(Self.maxDragPoints - 1, max(8, Int(hypot(b.x - a.x, b.y - a.y) / 24)))
             points = (0...steps).map { i in
                 let t = Double(i) / Double(steps)
                 return (a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
@@ -560,6 +569,7 @@ public final class AgentDriver: @unchecked Sendable {
         setActive(true)
         let id = shared.withLock { s -> UInt32 in
             defer { s.nextTreeID &+= 1 }
+            s.treesAsked.insert(s.nextTreeID)
             return s.nextTreeID
         }
         session.queue.async { [session] in
@@ -573,6 +583,7 @@ public final class AgentDriver: @unchecked Sendable {
             }
             Thread.sleep(forTimeInterval: 0.03)
         }
+        shared.withLock { _ = $0.treesAsked.remove(id) }
         throw Failure("the host didn't answer with the UI tree")
     }
 
@@ -617,11 +628,22 @@ struct Args {
     }
     func optionalString(_ key: String) -> String? { raw[key] as? String }
 
-    func double(_ key: String) throws -> Double {
-        guard let n = raw[key] as? NSNumber else { throw AgentDriver.Failure("“\(key)” must be a number") }
-        return n.doubleValue
+    /// Agent numbers are coordinates (≤ the agent space's long edge) and
+    /// durations: anything past a million, or not finite, is a mistake, and
+    /// converting it to an integer would trap.
+    static let maxMagnitude = 1_000_000.0
+
+    static func number(_ value: Any?, _ key: String) throws -> Double {
+        guard let n = value as? NSNumber else { throw AgentDriver.Failure("“\(key)” must be a number") }
+        let v = n.doubleValue
+        guard v.isFinite, abs(v) <= maxMagnitude else {
+            throw AgentDriver.Failure("“\(key)” must be a number from -1000000 to 1000000")
+        }
+        return v
     }
-    func optionalDouble(_ key: String) -> Double? { (raw[key] as? NSNumber)?.doubleValue }
+
+    func double(_ key: String) throws -> Double { try Self.number(raw[key], key) }
+    func optionalDouble(_ key: String) throws -> Double? { has(key) ? try Self.number(raw[key], key) : nil }
 
     func int(_ key: String) throws -> Int {
         guard let n = raw[key] as? NSNumber else { throw AgentDriver.Failure("“\(key)” must be a number") }
@@ -633,14 +655,16 @@ struct Args {
 
     func pair(_ key: String) throws -> (x: Double, y: Double) {
         guard let a = raw[key] as? [NSNumber], a.count == 2 else { throw AgentDriver.Failure("“\(key)” must be [x, y]") }
-        return (a[0].doubleValue, a[1].doubleValue)
+        return (try Self.number(a[0], key), try Self.number(a[1], key))
     }
 
     func rect(_ key: String) throws -> CGRect? {
         guard has(key) else { return nil }
-        guard let a = raw[key] as? [NSNumber], a.count == 4, a[2].doubleValue > 0, a[3].doubleValue > 0 else {
+        guard let a = raw[key] as? [NSNumber], a.count == 4 else {
             throw AgentDriver.Failure("“\(key)” must be [x, y, width, height]")
         }
-        return CGRect(x: a[0].doubleValue, y: a[1].doubleValue, width: a[2].doubleValue, height: a[3].doubleValue)
+        let v = try a.map { try Self.number($0, key) }
+        guard v[2] > 0, v[3] > 0 else { throw AgentDriver.Failure("“\(key)” must be [x, y, width, height]") }
+        return CGRect(x: v[0], y: v[1], width: v[2], height: v[3])
     }
 }
