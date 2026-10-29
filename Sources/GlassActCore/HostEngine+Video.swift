@@ -120,6 +120,7 @@ extension HostEngine {
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
         if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
+        if smoothFloor { encoder.setSmoothMotion(true) }
         regionActive = true
         regionTileBox = (c0, r0, c1, r1)
         regionPixelRect = (x, y, w, h)
@@ -637,13 +638,16 @@ extension HostEngine {
 
     /// Prefer smooth motion (§4.6): the looser ceiling while the link has no
     /// room, the default once it has. Follows `linkRoom`, a property of the
-    /// link, so the looser frames can't switch it off themselves.
+    /// link, so the looser frames can't switch it off themselves. The live
+    /// encoder also gets its own trade (`setSmoothMotion`: AV1's looser
+    /// quantizer and higher aim).
     func updateSmoothFloor() {
         let want = policyPreferSmoothness && !linkRoom.hasRoom
         guard want != smoothFloor else { return }
         smoothFloor = want
         if want { stats.smoothFloorOn += 1 } else { stats.smoothFloorOff += 1 }
         regionEncoder?.setMaxFrameQP(regionMaxFrameQP)
+        regionEncoder?.setSmoothMotion(want)
     }
 
     /// Effective level fed to the encoder: at least the presented-scale floor,
@@ -754,13 +758,17 @@ extension HostEngine {
     }
 
     /// The negotiated codecs this link allows, in preference order: AV1 only
-    /// while `linkRoom` says there's room. Never empty while any is negotiated.
+    /// while `linkRoom` says there's room, or always when the viewer prefers
+    /// smooth motion. On a thin link AV1 at its default ceiling loses frames
+    /// to HEVC, but under smooth motion's ceiling and aim it delivers more
+    /// than HEVC under its smooth ceiling (BENCHMARKS "AV1 at ceiling 60: a
+    /// higher rate aim"). Never empty while any is negotiated.
     /// Read when a region forms, so a change waits for the next one: switching
     /// a live region costs a whole-screen sync frame on the new encoder,
     /// mid-motion (6 Mbit/s photos: 68 frames against HEVC's 165; BENCHMARKS
     /// "AV1 only while the link has room").
     var allowedVideoCodecs: [UInt8] {
-        guard !linkRoom.hasRoom else { return negotiatedVideoCodecs }
+        guard !linkRoom.hasRoom && !policyPreferSmoothness else { return negotiatedVideoCodecs }
         let others = negotiatedVideoCodecs.filter { !LinkRoomPolicy.governs($0) }
         return others.isEmpty ? negotiatedVideoCodecs : others
     }

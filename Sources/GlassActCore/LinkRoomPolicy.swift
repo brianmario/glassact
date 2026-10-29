@@ -7,9 +7,12 @@ import GlassActWire
 ///   floor keeps frames large, so the send gate admits fewer of them
 ///   (cursor-drag on 3 Mbit/s: 120 frames against HEVC's 278; BENCHMARKS
 ///   "AV1 back, as a Viewer opt-in"). Applied when the next region forms
-///   (`allowedVideoCodecs`), not to a live one.
+///   (`allowedVideoCodecs`), not to a live one. A viewer that prefers smooth
+///   motion gets AV1 either way: under smooth motion's trade it beats HEVC
+///   on a thin link too.
 /// - **Prefer smooth motion** (QUALITY preference 2): the looser frame-QP
-///   ceiling while there isn't (`updateSmoothFloor`).
+///   ceiling, and AV1's looser quantizer and higher aim, while there isn't
+///   (`updateSmoothFloor`).
 ///
 /// - **Room** once the link has delivered `roomyBitsPerSecond` over any span
 ///   in the last 10 s. A delivered rate is a lower bound on the link, so a

@@ -69,7 +69,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         viewerCodecs = [VideoCodec.av1]
     case "av1-hevc":
         // The product's pair: the Host prefers AV1 and falls back to HEVC on a
-        // thin link (AV1LinkPolicy); the Viewer decodes both in hardware.
+        // thin link (LinkRoomPolicy), or keeps AV1 under --prefer-smoothness; the
+        // Viewer decodes both in hardware.
         guard AOMRegionEncoder.isAvailable, VTRegionDecoder.canDecodeAV1 else {
             throw BenchError("--video av1-hevc needs Apple silicon with hardware AV1 decode")
         }
@@ -185,6 +186,12 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     host.start(nowUS: 0)
     drive(untilUS: 300_000)
     guard host.state == .running && viewer.state == .running else { throw BenchError("handshake failed") }
+    if opts.has("prefer-smoothness") {
+        // The Viewer's Prefer Smooth Motion: QUALITY preference 2, over the
+        // link, before the first region forms.
+        viewer.sendQualityPolicy(presentedScalePct: 100, floor: 0, preferSharpness: false, preferSmoothness: true)
+        drive(untilUS: link.nowUS + 300_000)
+    }
 
     let frameBuf = UnsafeMutableRawBufferPointer.allocate(byteCount: width * height * 4, alignment: 64)
     defer { frameBuf.deallocate() }
@@ -499,6 +506,7 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
         inner.setBitrateCap(bitsPerSecond.map { max($0, pipeline.minEncoderCap ?? 0) })
     }
     func setMaxFrameQP(_ qp: Int?) { inner.setMaxFrameQP(qp ?? pipeline.defaultMaxFrameQP) }
+    func setSmoothMotion(_ on: Bool) { inner.setSmoothMotion(on) }
 
     /// The stopped encoder drops deliveries still queued.
     func stop() {
