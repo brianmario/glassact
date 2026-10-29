@@ -1455,6 +1455,11 @@ automatic checks.
 - Sockets live in `…/Glass Act/agent/`: directory 0700, sockets 0600, with a
   `getpeereid` uid check.
 - A request buffer over 8 MB drops the client.
+- Numbers must be finite and within ±1,000,000 (coordinates, regions,
+  durations); a drag has at most 1000 points (`maxDragPoints`), its own
+  steps included. Anything else is an error, not a trap.
+- A UI tree answer is kept only for a request still waiting for it, so a
+  host can't plant the answer to the next one or fill the viewer's memory.
 
 **Front ends:** the `glassact` CLI, and an MCP server (`glassact mcp`,
 hand-rolled JSON-RPC 2.0 over stdio) whose tools mirror computer use.
