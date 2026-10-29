@@ -1,11 +1,14 @@
 import AppKit
 import GlassActWire
+import ImageIO
+import UniformTypeIdentifiers
 import SwiftUI
 
 /// Single-window mode — the picker: a grid of the host's shareable
 /// windows (thumbnail + app + title), à la FaceTime/Zoom window sharing. Pick
 /// one → `onPick(windowID)`; close or Cancel → `onCancel`. Thumbnails are
-/// small WebP/AVIF stills the host sent inline; NSImage decodes both natively.
+/// small WebP/AVIF stills the host sent inline, decoded only as the format
+/// they claim (`thumbnail(_:)`).
 @MainActor final class WindowPicker: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var onPick: ((UInt32) -> Void)?
@@ -78,7 +81,28 @@ private struct PickerItem: Identifiable {
         id = w.windowID
         app = w.appName.isEmpty ? "Window" : w.appName
         title = w.title
-        image = w.thumb.isEmpty ? nil : NSImage(data: Data(w.thumb))
+        image = Self.thumbnail(w)
+    }
+
+    /// Thumbnails come from the host, so they go only through the decoder for
+    /// the format they claim (WebP or AVIF), not every format ImageIO knows
+    /// (PDF, TIFF, …), and at thumbnail size.
+    static func thumbnail(_ w: WireWindow) -> NSImage? {
+        let expected: UTType
+        switch w.thumbFormat {
+        case WindowThumbFormat.webpLossy: expected = .webP
+        case WindowThumbFormat.avif: expected = UTType("public.avif") ?? .heif
+        default: return nil
+        }
+        guard !w.thumb.isEmpty,
+              let source = CGImageSourceCreateWithData(Data(w.thumb) as CFData,
+                                                       [kCGImageSourceTypeIdentifierHint: expected.identifier] as CFDictionary),
+              let type = CGImageSourceGetType(source) as String?, type == expected.identifier,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int, let height = props[kCGImagePropertyPixelHeight] as? Int,
+              (1...1024).contains(width), (1...1024).contains(height),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: width, height: height))
     }
 }
 
