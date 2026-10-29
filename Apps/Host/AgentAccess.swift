@@ -11,7 +11,9 @@ import GlassActWire
 /// - agent input needs Allow Agent Control on (Options › Agents), the
 ///   session not paused, and the agent time limit not reached;
 /// - the person at this Mac always wins: agent input waits while they're
-///   using the mouse or keyboard.
+///   using the mouse or keyboard;
+/// - with no session loaded (before `beginSession`, after `endSession`)
+///   nothing is admitted.
 ///
 /// Thread-safe (NSLock): decisions run on the engine queue; the menu reads
 /// and changes it on main.
@@ -24,10 +26,11 @@ final class AgentAccess: @unchecked Sendable {
     static let humanGraceSeconds = 2.0
 
     enum Denial: Equatable {
-        case viewOnly, controlOff, paused(String), humanActive
+        case noSession, viewOnly, controlOff, paused(String), humanActive
 
         var reason: String {
             switch self {
+            case .noSession: "the session isn't set up yet"
             case .viewOnly: "approved to watch only"
             case .controlOff: "agent control is switched off on this Mac"
             case let .paused(why): why
@@ -49,6 +52,7 @@ final class AgentAccess: @unchecked Sendable {
     var onChange: (() -> Void)?
 
     private let lock = NSLock()
+    private var loaded = false
     private var peer: QUICTransport.PeerCertificate?
     private var viewOnly = false
     private var agentActive = false
@@ -82,6 +86,7 @@ final class AgentAccess: @unchecked Sendable {
     /// A viewer's session went live. A headless agent is active from the start.
     func beginSession(peer: QUICTransport.PeerCertificate?, viewOnly: Bool) {
         lock.withLock {
+            loaded = true
             self.peer = peer
             self.viewOnly = viewOnly
             agentActive = peer?.isAgent == true
@@ -95,6 +100,7 @@ final class AgentAccess: @unchecked Sendable {
 
     func endSession() {
         lock.withLock {
+            loaded = false
             peer = nil
             viewOnly = false
             agentActive = false
@@ -105,6 +111,9 @@ final class AgentAccess: @unchecked Sendable {
     }
 
     var sessionIsAgent: Bool { lock.withLock { peer?.isAgent == true } }
+
+    /// A headless agent, or a person's viewer while its agent drives.
+    var agentDriving: Bool { lock.withLock { agentActive } }
 
     /// AGENT_STATE from the viewer. Returns true when it changed.
     @discardableResult
@@ -130,13 +139,34 @@ final class AgentAccess: @unchecked Sendable {
 
     /// Admit one input. `agentInput`: flagged, or from an agent's key. Nil = go.
     func admit(agentInput: Bool) -> Denial? {
-        let vo = lock.withLock { viewOnly }
+        let (isLoaded, vo) = lock.withLock { (loaded, viewOnly) }
+        guard isLoaded else { return .noSession }
         if vo { return .viewOnly }
         guard agentInput else { return nil }
         if let denial = standingDenial() { return denial }
         if localHumanActive() { return .humanActive }
         lock.withLock { lastInjectUptime = ProcessInfo.processInfo.systemUptime }
         return nil
+    }
+
+    /// Whether this session may have this Mac's clipboard, or the list of
+    /// its windows: not a View Only key, nor an agent whose control is off,
+    /// paused or out of time. No human check: neither moves the pointer.
+    func admitShare() -> Denial? {
+        let (isLoaded, agent) = lock.withLock { (loaded, agentActive) }
+        guard isLoaded else { return .noSession }
+        if let denial = standingDenial(), denial == .viewOnly || agent { return denial }
+        return nil
+    }
+
+    /// Reading the accessibility tree (UI_TREE_REQUEST): a View Only key may
+    /// (it watches this screen already); an agent may not while its control
+    /// is off, paused or out of time.
+    func admitRead() -> Denial? {
+        let (isLoaded, agent) = lock.withLock { (loaded, agentActive) }
+        guard isLoaded else { return .noSession }
+        guard agent, let denial = standingDenial(), denial != .viewOnly else { return nil }
+        return denial
     }
 
     /// Denials that hold until something changes (not the moment-to-moment
