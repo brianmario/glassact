@@ -179,7 +179,9 @@ final class ViewerController: @unchecked Sendable {
             let pb = NSPasteboard.general
             guard pb.changeCount != self.clipboardChangeCount else { return }
             self.clipboardChangeCount = pb.changeCount
-            guard let str = pb.string(forType: .string) else { return }
+            // Not a password manager's concealed or one-time item (§13).
+            guard ClipboardSync.mayShare(types: pb.types?.map(\.rawValue) ?? []),
+                  let str = pb.string(forType: .string) else { return }
             let bytes = Array(str.utf8)
             var h = Hasher(); h.combine(bytes); let hash = h.finalize()
             guard hash != self.lastClipboardHash else { return }

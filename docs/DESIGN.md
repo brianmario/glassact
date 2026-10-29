@@ -1335,6 +1335,11 @@ the keychain. It uses no private API. Its session log is mirrored to the
 unified log (subsystem `app.glassact.viewer`), since other apps can't read
 its container.
 
+**Clipboard** (CLIPBOARD, §3.5): each app polls its pasteboard and sends a
+text change to the other side while a session runs. An item a password
+manager marks as concealed, transient or generated (the nspasteboard.org
+markers, `ClipboardSync`) stays on its own Mac in either direction.
+
 **Updates** (Sparkle 2.10.0, `Apps/Shared/AppUpdater.swift`; RELEASING.md):
 - Each app reads its own appcast from the newest published GitHub release:
   `…/releases/latest/download/host-appcast.xml` or `viewer-appcast.xml`
