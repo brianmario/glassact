@@ -564,7 +564,9 @@ public final class ViewerEngine: @unchecked Sendable {
     private func applyVideoStart(region: Int, generation: UInt32,
                                  x: Int, y: Int, w: Int, h: Int,
                                  codec: UInt8, config: [UInt8]) {
-        guard let grid,
+        // Only a codec this viewer offered in HELLO_OK: a host can't wake a
+        // decoder (hardware AV1, say) the person never opted into.
+        guard let grid, videoCaps & WireCaps.bit(forVideoCodec: codec) != 0,
               video.start(region: region, generation: generation, x: x, y: y, w: w, h: h,
                           codec: codec, config: config, grid: grid) else {
             stats.videoDropped += 1

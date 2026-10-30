@@ -61,6 +61,27 @@ import GlassActTestSupport
         #expect(h.viewer.stats.videoStarts == 1)
     }
 
+    /// A host that starts a region on a codec the viewer never offered gets
+    /// nothing decoded: the viewer drops the START (and the frames after it).
+    @Test func viewerDropsAStartForACodecItDidntOffer() {
+        let capture = CaptureTransport()
+        let viewer = ViewerEngine(transport: capture, videoDecoderFactory: { MockVideoDecoder() },
+                                  supportedVideoCodecs: [MockVideoEncoder.mockCodecID])
+        let hello = ControlMessage.hello(ver: WireVersion.current, width: 128, height: 64,
+                                         tileSize: 64, pixfmt: PixelFormat.bgra8sRGB, caps: 0)
+        viewer.handleControl(Data(hello.encoded()), nowUS: 0)
+        func start(_ codec: UInt8, generation: UInt32) {
+            let message = VideoMessage.start(region: 0, generation: generation, x: 0, y: 0, width: 128, height: 64,
+                                             codec: codec, config: MockVideoEncoder.config(codecID: codec, width: 128, height: 64))
+            viewer.handleVideo(Data(message.encoded()), nowUS: 0)
+        }
+        start(MockVideoEncoder.mockAltCodecID, generation: 1) // stands in for AV1, not offered
+        #expect(viewer.stats.videoStarts == 0)
+        #expect(viewer.stats.videoDropped == 1)
+        start(MockVideoEncoder.mockCodecID, generation: 2)
+        #expect(viewer.stats.videoStarts == 1, "an offered codec still starts")
+    }
+
     /// A negotiated codec whose encoder won't start yields to the next one.
     @Test func firstNegotiatedCodecThatStartsCarriesTheRegion() {
         let h = coldStart(hostCodecs: Self.both, viewerCodecs: Self.both,
