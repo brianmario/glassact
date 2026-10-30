@@ -1324,7 +1324,12 @@ What an observer still sees:
 
 **The Viewer is sandboxed** (App Sandbox, outgoing network only). It's the
 app that decodes untrusted data from any Host it connects to (tile codecs,
-video, the wire), so a flaw there stays inside its container. Its data
+video, the wire), so a flaw in its own code stays inside its container.
+Video is the exception: VideoToolbox decodes it in a system service outside
+the sandbox. So the Viewer decodes only what it offered: a VIDEO_START for
+a codec it didn't advertise in HELLO_OK is dropped (hardware AV1 stays off
+unless the person opted in), and window thumbnails go only through the
+WebP or AVIF decoder they claim, at most 1024 px a side. Its data
 (known hosts, logs, the agent socket) lives in its container; its key is in
 the keychain. It uses no private API. Its session log is mirrored to the
 unified log (subsystem `app.glassact.viewer`), since other apps can't read
