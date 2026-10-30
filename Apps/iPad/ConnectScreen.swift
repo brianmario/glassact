@@ -40,6 +40,7 @@ struct ConnectScreen: View {
             }
             .sheet(isPresented: $showingSettings) { SettingsSheet(model: model) }
         }
+        .accessibilityHidden(model.phase.isBusy) // the card is modal
         .overlay {
             if model.phase.isBusy {
                 ProgressCard(model: model)
@@ -153,7 +154,8 @@ struct ConnectScreen: View {
                     Button("Connect") { model.connect() }
                         .buttonStyle(.glassProminent)
                         .disabled(model.trimmedHost.isEmpty)
-                        .keyboardShortcut(.defaultAction)
+                        // Return belongs to the card while one is up (Sign In).
+                        .keyboardShortcut(model.phase.isBusy ? nil : .defaultAction)
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
@@ -287,16 +289,24 @@ private struct ProgressCard: View {
     private enum Field { case name, password }
 
     var body: some View {
-        ZStack {
-            Rectangle().fill(.black.opacity(0.25)).ignoresSafeArea()
-            VStack(spacing: 22) {
-                content
-            }
-            .padding(32)
-            .frame(maxWidth: 440)
-            .glassEffect(.regular, in: .rect(cornerRadius: 36))
-            .padding(24)
+        // Centered when it fits; scrolling when large text or the keyboard
+        // leaves too little room, so its buttons stay reachable.
+        ViewThatFits(in: .vertical) {
+            card
+            ScrollView { card }.scrollBounceBehavior(.basedOnSize)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background { Rectangle().fill(.black.opacity(0.25)).ignoresSafeArea() }
+    }
+
+    private var card: some View {
+        VStack(spacing: 22) {
+            content
+        }
+        .padding(32)
+        .frame(maxWidth: 440)
+        .glassEffect(.regular, in: .rect(cornerRadius: 36))
+        .padding(24)
     }
 
     @ViewBuilder private var content: some View {
@@ -405,6 +415,7 @@ private struct ProgressCard: View {
 struct SettingsSheet: View {
     @Bindable var model: SessionModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         NavigationStack {
@@ -423,10 +434,20 @@ struct SettingsSheet: View {
                     Text(model.resolution.explanation)
                 }
                 Section {
-                    Picker("Picture", selection: $model.motion) {
-                        ForEach(SessionModel.MotionPreference.allCases) { m in Text(m.title).tag(m) }
+                    // Segments don't grow with the text size, so the
+                    // largest sizes get a list.
+                    if typeSize.isAccessibilitySize {
+                        Picker("Picture", selection: $model.motion) {
+                            ForEach(SessionModel.MotionPreference.allCases) { m in Text(m.title).tag(m) }
+                        }
+                        .pickerStyle(.inline)
+                        .labelsHidden()
+                    } else {
+                        Picker("Picture", selection: $model.motion) {
+                            ForEach(SessionModel.MotionPreference.allCases) { m in Text(m.title).tag(m) }
+                        }
+                        .pickerStyle(.segmented)
                     }
-                    .pickerStyle(.segmented)
                     Toggle("Use AV1 Video", isOn: $model.av1)
                         .disabled(!VTRegionDecoder.canDecodeAV1)
                 } header: {

@@ -73,6 +73,10 @@ struct SessionScreen: View {
                 .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
                 .font(.title3)
+                // A bar, like the system's: it stops growing at the largest
+                // text sizes, and a long press shows each button enlarged.
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .accessibilityShowsLargeContentViewer()
                 .frame(minHeight: 44)
                 .padding(.horizontal, 14)
                 .glassEffect(.regular.interactive(), in: .capsule)

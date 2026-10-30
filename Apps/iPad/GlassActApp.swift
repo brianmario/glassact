@@ -35,23 +35,30 @@ struct RootView: View {
     @Environment(\.displayScale) private var displayScale
 
     var body: some View {
-        GeometryReader { proxy in
-            Group {
-                if model.phase == .inSession, let controller = model.controller, let grid = model.grid {
-                    SessionScreen(model: model, controller: controller, grid: grid)
-                        .transition(.opacity.combined(with: .scale(scale: 1.02)))
-                } else {
-                    ConnectScreen(model: model)
-                        .transition(.opacity)
-                }
+        Group {
+            if model.phase == .inSession, let controller = model.controller, let grid = model.grid {
+                SessionScreen(model: model, controller: controller, grid: grid)
+                    .ignoresSafeArea()
+                    .transition(.opacity.combined(with: .scale(scale: 1.02)))
+            } else {
+                // Keeps the keyboard's safe area, so its cards and fields
+                // move out of the keyboard's way.
+                ConnectScreen(model: model)
+                    .transition(.opacity)
             }
-            .onAppear {
-                noteViewport(proxy.size)
-                model.applyLaunchArguments(CommandLine.arguments)
-            }
-            .onChange(of: proxy.size) { _, size in noteViewport(size) }
         }
-        .ignoresSafeArea()
+        .background {
+            // The whole window, keyboard or not.
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        noteViewport(proxy.size)
+                        model.applyLaunchArguments(CommandLine.arguments)
+                    }
+                    .onChange(of: proxy.size) { _, size in noteViewport(size) }
+            }
+            .ignoresSafeArea()
+        }
         .animation(.smooth(duration: 0.4), value: model.phase == .inSession)
     }
 
