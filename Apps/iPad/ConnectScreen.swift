@@ -14,6 +14,8 @@ struct ConnectScreen: View {
     @FocusState private var addressFocused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 16)]
+    /// The Mac side, for anyone who doesn't have it yet.
+    private static let hostDownload = URL(string: "https://github.com/brianmario/glassact/releases/latest")!
 
     var body: some View {
         NavigationStack {
@@ -89,6 +91,9 @@ struct ConnectScreen: View {
                         Text("Open Glass Act Host on a Mac on this network, or type its address below.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        Link("Get Glass Act Host for Mac", destination: Self.hostDownload)
+                            .font(.subheadline.weight(.medium))
+                            .padding(.top, 4)
                     }
                 }
                 .padding(20)
