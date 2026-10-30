@@ -881,6 +881,12 @@ session never redials.
   on a thin link takes seconds (auto-scale, §4.9). Nothing references those
   pixels (DELTA checks the base's hash, the tile cache resets, SCROLL needs
   acked tiles), so the canvas still converges exactly.
+- The rebuilt engine keeps what the session already settled
+  (`HostEngine.continueSession`): that it's open (§14), and the viewer's
+  last QUALITY (§3.5). The viewer sends QUALITY on connect and when its
+  scale or preferences change, not on a re-HELLO, so a rebuild that
+  dropped it lost the floor and the motion preference for the rest of the
+  session.
 - **Virtual display** (mode 4):
   - Uses the CGVirtualDisplay SPI: HiDPI 2×, up to 3840×2400 pt, mirrored
     `.forAppOnly`, so macOS undoes it when the Host exits.

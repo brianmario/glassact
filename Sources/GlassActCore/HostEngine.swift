@@ -270,6 +270,10 @@ public final class HostEngine: @unchecked Sendable {
     var policyScaleLevel = 0      // floor from presented scale (<100% → shed detail)
     var policyMaxLevel = 3        // cap from the client's quality floor (QualityFloor)
     var policyPreferSharpness = false // freeze quality, let framerate absorb pressure
+    /// The QUALITY the policy came from, for an in-session rebuild to hand
+    /// on (`continueSession`): the viewer sends it on connect and when its
+    /// scale or preferences change, never on a re-HELLO.
+    var clientQuality: (scalePct: Int, floor: UInt8, preferSharpness: Bool, preferSmoothness: Bool)?
     /// Prefer sharpness, on a link with headroom: the encoder runs under
     /// `sharpMaxFrameQP` instead of the default ceiling. Earned by
     /// `sharpHealthyNeeded` pressure-free quality windows in a row; any
@@ -943,9 +947,24 @@ public final class HostEngine: @unchecked Sendable {
 
     /// True once this session's handshake completed: only then are input
     /// and the changes like it acted on. An in-session rebuild (§4.10)
-    /// carries it over from the engine it replaces, so input keeps flowing
-    /// through the re-HELLO.
+    /// carries it over from the engine it replaces (`continueSession`), so
+    /// input keeps flowing through the re-HELLO.
     public var sessionOpen = false
+
+    /// An in-session rebuild (§4.10): this engine replaces `previous` on the
+    /// same connection, before `start`. It keeps what the session already
+    /// settled: that it's open, and the viewer's quality policy, which the
+    /// viewer won't send again. Live 2026-10-29 on a plane, a rebuild for
+    /// auto-scale dropped Prefer Smooth Motion for the rest of the session:
+    /// the next region formed on HEVC, and the one after on AV1 at its
+    /// default ceiling, on a 0.3–0.8 Mbit/s link.
+    public func continueSession(from previous: HostEngine) {
+        sessionOpen = previous.sessionOpen
+        if let q = previous.clientQuality {
+            applyQualityPolicy(scalePct: q.scalePct, floor: q.floor, preferSharpness: q.preferSharpness,
+                               preferSmoothness: q.preferSmoothness)
+        }
+    }
 
     /// Messages that act on this Mac, held back until `sessionOpen`.
     /// Releases pass, so nothing held down stays down.

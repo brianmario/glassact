@@ -659,6 +659,7 @@ extension HostEngine {
     /// Apply a client QUALITY policy (§3.5 TLV): presented scale, quality
     /// floor, sharpness-vs-smoothness — bounds on the automatic loop.
     func applyQualityPolicy(scalePct: Int, floor: UInt8, preferSharpness: Bool, preferSmoothness: Bool = false) {
+        clientQuality = (scalePct, floor, preferSharpness, preferSmoothness)
         policyScaleLevel = scalePct == 0 ? 0
             : scalePct >= 88 ? 0 : scalePct >= 62 ? 1 : scalePct >= 38 ? 2 : 3
         // QualityFloor n (1–3) caps the loop at level n; automatic doesn't.
