@@ -45,12 +45,14 @@ the viewer sends, clicks as dots, drags as trails, keys and scrolls in a
 panel.
 
 ```sh
-swift run glassact-testhost --port 4533   # --tiles-only, --still, --sign-in-password P
+swift run glassact-testhost --port 4533   # --tiles-only, --still, --sign-in-password P, --ask-after S
 ```
 
 It admits any viewer key, since it shows nothing real and injects nothing.
-`--sign-in-password P` makes new keys sign in as `test` instead, to try the
-sign-in flow. In the Simulator, the iPad reaches it at `127.0.0.1`, and
+To try the other ways in: `--sign-in-password P` makes new keys sign in as
+`test`, and `--ask-after S` asks for them as a Host's user would, printing
+the code the viewer should show, then approves each key S seconds after its
+first dial (a large S never does, to try waiting and Cancel). In the Simulator, the iPad reaches it at `127.0.0.1`, and
 launch arguments connect straight away:
 
 ```sh

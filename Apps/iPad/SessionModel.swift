@@ -78,6 +78,10 @@ final class SessionModel {
         case inSession
 
         var isBusy: Bool { self != .idle && self != .inSession }
+
+        var approvalCode: String? {
+            if case let .awaitingApproval(code) = self { code } else { nil }
+        }
     }
 
     struct Notice: Equatable {
@@ -472,7 +476,9 @@ final class SessionModel {
         guard let failed = controller else { return }
         let wasInSession = phase == .inSession
         let awaitingApproval = failed.lastFailureAwaitsApproval && !wasInSession
-        let code = awaitingApproval ? failed.verificationCode() : nil
+        // A redial can fail before the host's key is seen, without a code;
+        // while its user is still deciding, the code is the one shown.
+        let code = awaitingApproval ? failed.verificationCode() : phase.approvalCode
         let presentedKey = failed.observedHostFingerprint
         let reason = failed.lastFailureReason
         stopPolling()

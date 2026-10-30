@@ -320,10 +320,15 @@ private struct ProgressCard: View {
             Text("On the Mac, click Allow. Check that it shows this code:")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-            Text(code)
-                .font(.system(size: 44, weight: .semibold, design: .monospaced))
-                .tracking(6)
-                .accessibilityLabel("Code \(code.map(String.init).joined(separator: " "))")
+            // One line when it fits, else two groups a line: never broken
+            // inside a group, so it reads like the Mac's.
+            ViewThatFits(in: .horizontal) {
+                Text(code)
+                Text(Self.halves(of: code)).multilineTextAlignment(.center)
+            }
+            .font(.system(size: 44, weight: .semibold, design: .monospaced))
+            .tracking(6)
+            .accessibilityLabel("Code \(code.map(String.init).joined(separator: " "))")
             cancelButton
         case .signingIn:
             Image(systemName: "lock.laptopcomputer")
@@ -402,6 +407,14 @@ private struct ProgressCard: View {
             }
             cancelButton
         }
+    }
+
+    /// "ABCD-EFGH-IJKL-MNOP" → "ABCD-EFGH\nIJKL-MNOP".
+    static func halves(of code: String) -> String {
+        let groups = code.split(separator: "-")
+        guard groups.count > 1 else { return code }
+        let mid = (groups.count + 1) / 2
+        return groups[..<mid].joined(separator: "-") + "\n" + groups[mid...].joined(separator: "-")
     }
 
     private var cancelButton: some View {
