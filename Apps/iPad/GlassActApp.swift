@@ -6,28 +6,70 @@ import SwiftUI
 /// touch, pointer and keyboard input around them.
 @main
 struct GlassActApp: App {
+    var body: some Scene {
+        WindowGroup {
+            SessionWindow()
+        }
+        .commands { SessionCommands() }
+    }
+}
+
+/// One window, one session: each window connects on its own, so two Macs
+/// can sit side by side in Split View or Stage Manager.
+struct SessionWindow: View {
     @State private var model = SessionModel()
     @Environment(\.scenePhase) private var scenePhase
 
-    var body: some Scene {
-        WindowGroup {
-            RootView(model: model)
-                .tint(.green)
-        }
-        .onChange(of: scenePhase) { old, new in
-            switch new {
-            case .background: model.didEnterBackground()
-            case .active where old == .background || old == .inactive: model.willEnterForeground()
-            default: break
+    var body: some View {
+        RootView(model: model)
+            .tint(.green)
+            .focusedSceneValue(\.sessionModel, model)
+            .background(SceneTitle(title: model.phase == .inSession ? model.sessionName : nil))
+            .onChange(of: scenePhase) { old, new in
+                switch new {
+                case .background: model.didEnterBackground()
+                case .active where old == .background || old == .inactive: model.willEnterForeground()
+                default: break
+                }
             }
-        }
-        .commands {
-            CommandMenu("Session") {
-                Button("Disconnect") { model.disconnect() }
-                    .disabled(model.controller == nil)
-            }
+            .onDisappear { model.windowClosed() }
+    }
+}
+
+/// The menu bar's Session menu acts on the window in front.
+struct SessionCommands: Commands {
+    @FocusedValue(\.sessionModel) private var model
+
+    var body: some Commands {
+        CommandMenu("Session") {
+            Button("Disconnect") { model?.disconnect() }
+                .disabled(model?.controller == nil)
         }
     }
+}
+
+extension FocusedValues {
+    @Entry var sessionModel: SessionModel?
+}
+
+/// Names the window after its Mac, in the app switcher and Stage Manager.
+private struct SceneTitle: UIViewRepresentable {
+    let title: String?
+
+    final class Probe: UIView {
+        var title: String? { didSet { apply() } }
+        override func didMoveToWindow() { apply() }
+        private func apply() { window?.windowScene?.title = title }
+    }
+
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.isUserInteractionEnabled = false
+        probe.isAccessibilityElement = false
+        return probe
+    }
+
+    func updateUIView(_ probe: Probe, context: Context) { probe.title = title }
 }
 
 struct RootView: View {
