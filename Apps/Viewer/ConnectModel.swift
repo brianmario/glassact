@@ -49,6 +49,10 @@ final class ConnectModel {
         /// arrived, so it never shows black.
         case loadingPicture
         case inSession
+
+        var approvalCode: String? {
+            if case let .awaitingApproval(code) = self { code } else { nil }
+        }
     }
 
     struct Notice: Equatable {

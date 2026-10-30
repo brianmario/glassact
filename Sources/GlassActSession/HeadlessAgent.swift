@@ -37,6 +37,10 @@ public final class HeadlessAgent {
         case awaitingApproval(code: String)
         case connected
         case failed(String)
+
+        var approvalCode: String? {
+            if case let .awaitingApproval(code) = self { code } else { nil }
+        }
     }
 
     public let config: Config
@@ -167,8 +171,11 @@ public final class HeadlessAgent {
         guard !stopped, let session else { return }
         driver?.endAgentSession()
         driverBox.set(nil, phase: phase)
-        let awaiting = session.lastFailureAwaitsApproval
-        if awaiting, let code = session.verificationCode() {
+        // A refused redial usually fails before the host's key is seen, so
+        // without a code: while its user is still deciding, it's the same
+        // code (same host, same key).
+        let code = session.lastFailureAwaitsApproval ? session.verificationCode() : phase.approvalCode
+        if let code {
             if approvalStarted == nil {
                 approvalStarted = Date()
                 onStatus("waiting for approval on \(config.host): its user should see the code \(code)")
