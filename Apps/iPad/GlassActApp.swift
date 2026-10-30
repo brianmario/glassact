@@ -36,13 +36,26 @@ struct SessionWindow: View {
     }
 }
 
-/// The menu bar's Session menu acts on the window in front.
+/// The menu bar's Session menu acts on the window in front. Its shortcuts
+/// are ⌃⌘ ones: plain ⌘ shortcuts belong to the Mac.
 struct SessionCommands: Commands {
     @FocusedValue(\.sessionModel) private var model
+    @FocusedValue(\.sessionActions) private var actions
 
     var body: some Commands {
         CommandMenu("Session") {
-            Button("Disconnect") { model?.disconnect() }
+            Button("Show Keyboard", systemImage: "keyboard") { actions?.showKeyboard() }
+                .keyboardShortcut("k", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Button("Actual Size", systemImage: "arrow.down.right.and.arrow.up.left") { actions?.actualSize() }
+                .keyboardShortcut("0", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Button("Connection", systemImage: "antenna.radiowaves.left.and.right") { actions?.showInfo() }
+                .keyboardShortcut("i", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Divider()
+            Button("Disconnect", systemImage: "xmark") { model?.disconnect() }
+                .keyboardShortcut("w", modifiers: [.command, .control])
                 .disabled(model?.controller == nil)
         }
     }
