@@ -54,15 +54,9 @@ struct SessionScreen: View {
                         scheduleHide()
                     }
                     .keyboardShortcut("k", modifiers: [.command, .control])
-                    PasteButton(payloadType: String.self) { strings in
-                        guard let text = strings.first else { return }
-                        model.sendClipboard(text)
-                    }
-                    .labelStyle(.iconOnly)
-                    .buttonBorderShape(.circle)
-                    .tint(.primary)
-                    .accessibilityLabel("Paste to Mac")
-                    .help("Paste to Mac: copies this iPad’s clipboard to the Mac, ready for ⌘V")
+                    PasteToMac { text in model.sendClipboard(text) }
+                        .frame(width: 44, height: 44)
+                        .help("Paste to Mac: copies this iPad’s clipboard to the Mac, ready for ⌘V")
                     Button("Actual Size", systemImage: "arrow.down.right.and.arrow.up.left") {
                         canvas.view?.resetZoom()
                         scheduleHide()
@@ -122,13 +116,17 @@ struct SessionScreen: View {
         .frame(minWidth: 260, alignment: .leading)
     }
 
+    /// `--keep-controls`: leave them up (screenshots, demos, UI tests).
+    private static let keepControls = CommandLine.arguments.contains("--keep-controls")
+
     private func scheduleHide() {
         hideWork?.cancel()
+        guard !Self.keepControls else { return }
         let work = DispatchWorkItem {
             MainActor.assumeIsolated { if !showingInfo { controlsShown = false } }
         }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
     }
 }
 
@@ -169,4 +167,62 @@ struct CanvasRepresentable: UIViewRepresentable {
         view.releaseHeldKeys()
         view.stopPresenting()
     }
+}
+
+/// Paste to Mac: this iPad's clipboard text, sent to the Mac's clipboard
+/// for ⌘V there. A system paste control, so reading the clipboard needs
+/// no permission prompt (the person's tap is the permission), drawn to
+/// match the glass bar around it.
+struct PasteToMac: UIViewRepresentable {
+    let send: (String) -> Void
+
+    final class Target: UIView {
+        var send: (String) -> Void = { _ in }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            pasteConfiguration = UIPasteConfiguration(forAccepting: NSString.self)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        override func paste(itemProviders: [NSItemProvider]) {
+            guard let provider = itemProviders.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return }
+            _ = provider.loadObject(ofClass: NSString.self) { [weak self] object, _ in
+                guard let text = object as? String else { return }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self?.send(text)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    }
+                }
+            }
+        }
+    }
+
+    func makeUIView(context: Context) -> Target {
+        let target = Target()
+        let config = UIPasteControl.Configuration()
+        config.displayMode = .iconOnly
+        config.cornerStyle = .capsule
+        // The system keeps a paste control opaque: the app's green, the one
+        // accent in the bar.
+        config.baseBackgroundColor = .systemGreen
+        config.baseForegroundColor = .white
+        let control = UIPasteControl(configuration: config)
+        control.target = target
+        control.translatesAutoresizingMaskIntoConstraints = false
+        target.addSubview(control)
+        NSLayoutConstraint.activate([
+            control.centerXAnchor.constraint(equalTo: target.centerXAnchor),
+            control.centerYAnchor.constraint(equalTo: target.centerYAnchor),
+            control.widthAnchor.constraint(equalTo: target.widthAnchor),
+            control.heightAnchor.constraint(equalTo: target.heightAnchor),
+        ])
+        target.send = send
+        return target
+    }
+
+    func updateUIView(_ target: Target, context: Context) { target.send = send }
 }

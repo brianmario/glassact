@@ -126,14 +126,16 @@ final class KeyBar: UIInputView {
         case dismiss
     }
 
+    static let height: CGFloat = 52
     private let act: (Action) -> Void
     private var modifierButtons: [(KeyMap.Modifier, UIButton)] = []
     private static let fn: UInt32 = 1 << 23, numericPad: UInt32 = 1 << 21
 
     init(act: @escaping (Action) -> Void) {
         self.act = act
-        super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 52), inputViewStyle: .keyboard)
+        super.init(frame: CGRect(x: 0, y: 0, width: 0, height: Self.height), inputViewStyle: .default)
         allowsSelfSizing = true
+        backgroundColor = .clear
         let stack = UIStackView()
         stack.axis = .horizontal
         stack.spacing = 8

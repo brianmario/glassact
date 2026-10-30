@@ -32,6 +32,10 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
     /// in view points.
     private var zoom: CGFloat = 1
     private var pan = CGPoint.zero
+    /// How much of the view's bottom the on-screen keyboard covers, and how
+    /// far the picture is lifted so the pointer stays above it.
+    private var keyboardInset: CGFloat = 0
+    private var keyboardLift: CGFloat = 0
     private static let maxZoom: CGFloat = 6
 
     /// The pointer as this device last put it (canvas px): drawn at once,
@@ -72,6 +76,10 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         keyboard.onPresses = { [weak self] presses, down in self?.handle(presses, down: down) ?? false }
         addSubview(keyboard)
         installGestures()
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
+                                               name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
+                                               name: UIResponder.keyboardWillHideNotification, object: nil)
         addInteraction(UIPointerInteraction(delegate: self))
     }
 
@@ -148,7 +156,7 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         let w = CGFloat(grid.width) * fit * zoom, h = CGFloat(grid.height) * fit * zoom
         // Whole device pixels, so a 1:1 picture lands on pixels.
         let s = screenScale
-        let x = ((bounds.width - w) / 2 + pan.x) * s, y = ((bounds.height - h) / 2 + pan.y) * s
+        let x = ((bounds.width - w) / 2 + pan.x) * s, y = ((bounds.height - h) / 2 + pan.y - keyboardLift) * s
         return CGRect(x: x.rounded() / s, y: y.rounded() / s, width: w, height: h)
     }
 
@@ -205,6 +213,50 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         controller.updatePresentedScale(max(1, pct))
     }
 
+    // MARK: - On-screen keyboard
+
+    @objc private func keyboardFrameChanged(_ note: Notification) {
+        var inset: CGFloat = 0
+        if note.name != UIResponder.keyboardWillHideNotification,
+           let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect, let window {
+            let frame = convert(window.convert(end, from: window.screen.coordinateSpace), from: window)
+            inset = max(0, bounds.maxY - max(frame.minY, bounds.minY))
+            if frame.width < bounds.width / 2 { inset = 0 } // a floating keyboard covers little
+        }
+        let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+        keyboardInset = inset
+        updateKeyboardLift(animated: duration)
+    }
+
+    /// Lift the picture just enough that the pointer sits above the
+    /// keyboard, and never more than the keyboard is tall.
+    private func updateKeyboardLift(animated duration: Double = 0.2) {
+        var lift: CGFloat = 0
+        if keyboardInset > 0, grid.height > 0 {
+            let saved = keyboardLift
+            keyboardLift = 0
+            let frame = pictureFrame
+            keyboardLift = saved
+            let y = CGFloat(localCursorActive ? localCursor?.y ?? controller.cursorY : controller.cursorY)
+            let pointerY = frame.minY + y / CGFloat(grid.height) * frame.height
+            let visibleBottom = bounds.height - keyboardInset - 56
+            // The key bar's glass keys float over the picture: it runs
+            // under them rather than ending in a black band.
+            lift = min(max(0, keyboardInset - KeyBar.height), max(0, pointerY - visibleBottom))
+        }
+        guard lift != keyboardLift else { return }
+        keyboardLift = lift
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(duration)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        let frame = pictureFrame
+        contentLayer.actions = ["contents": NSNull()] // animate this one move
+        contentLayer.frame = frame
+        CATransaction.commit()
+        contentLayer.actions = ["contents": NSNull(), "frame": NSNull(), "position": NSNull(),
+                                "bounds": NSNull(), "transform": NSNull()]
+    }
+
     func resetZoom() {
         zoom = 1
         pan = .zero
@@ -224,6 +276,7 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         let at = CACurrentMediaTime()
         localCursorAt = at
         updateCursorLayer()
+        if keyboardInset > 0 { updateKeyboardLift() }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.localCursorHold) { [weak self] in
             guard let self, self.localCursorAt == at else { return }
             self.updateCursorLayer()

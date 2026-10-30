@@ -113,7 +113,7 @@ final class Scene {
             let down = kind == 5
             let name = Self.keyName(x)
             if down, name.count == 1 {
-                typed += (a & (1 << 17)) != 0 ? name.uppercased() : name
+                typed += (a & (1 << 17)) != 0 ? Self.shifted(name) : name
                 if typed.count > 60 { typed.removeFirst(typed.count - 60) }
             }
             note("key \(name) (0x\(String(x, radix: 16))) \(down ? "down" : "up") · flags 0x\(String(UInt32(truncatingIfNeeded: a), radix: 16))")
@@ -129,6 +129,14 @@ final class Scene {
         note("text input: \(text.prefix(60))")
     }
 
+    /// What a key types with shift on a US layout.
+    static func shifted(_ key: String) -> String {
+        let pairs: [String: String] = ["1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*",
+                                       "9": "(", "0": ")", ",": "<", ".": ">", "/": "?", ";": ":", "'": "\"",
+                                       "[": "{", "]": "}", "\\": "|", "-": "_", "=": "+", "`": "~"]
+        return pairs[key] ?? key.uppercased()
+    }
+
     /// macOS virtual key codes (kVK_*) for the keys worth naming.
     static func keyName(_ code: Int) -> String {
         let letters: [Int: String] = [
@@ -136,7 +144,8 @@ final class Scene {
             0x26: "j", 0x28: "k", 0x25: "l", 0x2E: "m", 0x2D: "n", 0x1F: "o", 0x23: "p", 0x0C: "q", 0x0F: "r",
             0x01: "s", 0x11: "t", 0x20: "u", 0x09: "v", 0x0D: "w", 0x07: "x", 0x10: "y", 0x06: "z",
             0x1D: "0", 0x12: "1", 0x13: "2", 0x14: "3", 0x15: "4", 0x17: "5", 0x16: "6", 0x1A: "7", 0x1C: "8",
-            0x19: "9", 0x31: " ",
+            0x19: "9", 0x31: " ", 0x2B: ",", 0x2F: ".", 0x2C: "/", 0x29: ";", 0x27: "'", 0x21: "[", 0x1E: "]",
+            0x2A: "\\", 0x1B: "-", 0x18: "=", 0x32: "`",
             0x24: "return", 0x30: "tab", 0x33: "delete", 0x35: "escape", 0x37: "command", 0x38: "shift",
             0x3A: "option", 0x3B: "control", 0x39: "caps lock", 0x7B: "left", 0x7C: "right", 0x7D: "down",
             0x7E: "up", 0x36: "right command", 0x3C: "right shift", 0x3D: "right option", 0x3E: "right control",
