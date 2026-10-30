@@ -1,6 +1,7 @@
 import AppKit
 import IOSurface
 import GlassActCore
+import GlassActSession
 import GlassActTransport
 
 /// §5 present path: display link via `NSView.displayLink(target:selector:)`.

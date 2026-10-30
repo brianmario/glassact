@@ -1,24 +1,25 @@
-import AppKit
 import CryptoKit
+public import Foundation
 import GlassActCore
 import GlassActTransport
 import os
 
-/// One plain-text log per Viewer launch in ~/Library/Logs/Glass Act, written off
+/// One plain-text log per Viewer launch in ~/Library/Logs/Glass Act (on an
+/// iPad, the same folder in the app's container), written off
 /// the main thread: a header (build, machine, displays, flags), timestamped
 /// events, a `key=value` stats line every 5 s, and an end-of-session summary.
 /// It's the file to share after a real-network test ("Show Logs" in the
 /// connect window).
-final class SessionLog: @unchecked Sendable {
-    static let shared = SessionLog()
+public final class SessionLog: @unchecked Sendable {
+    public static let shared = SessionLog()
 
-    let url: URL
+    public let url: URL
     private static let unified = Logger(subsystem: "app.glassact.viewer", category: "session")
     private let queue = DispatchQueue(label: "glassact.viewer.sessionlog", qos: .utility)
     private let handle: FileHandle?
     private let startUptimeUS = SurfacePresenter.uptimeUS()
 
-    static var directory: URL { AppPaths.logsDirectory }
+    public static var directory: URL { AppPaths.logsDirectory }
 
     private init() {
         let dir = Self.directory
@@ -36,7 +37,7 @@ final class SessionLog: @unchecked Sendable {
     /// Also mirrored to the unified log (subsystem `app.glassact.viewer`):
     /// the sandboxed Viewer's log file sits in its container, which other
     /// apps — a terminal, a coding agent — can't read without asking.
-    func write(_ kind: String, _ fields: String = "") {
+    public func write(_ kind: String, _ fields: String = "") {
         let t = Double(SurfacePresenter.uptimeUS() - startUptimeUS) / 1_000_000
         let wall = ISO8601DateFormatter().string(from: Date())
         let entry = "\(kind)" + (fields.isEmpty ? "" : " \(fields)")
@@ -48,16 +49,17 @@ final class SessionLog: @unchecked Sendable {
     }
 
     /// Blocks until every queued line is on disk (app termination).
-    func flush() {
+    public func flush() {
         queue.sync { try? handle?.synchronize() }
     }
 
-    func text(_ kind: String, _ message: String) {
+    public func text(_ kind: String, _ message: String) {
         write(kind, "text=\"\(message.replacingOccurrences(of: "\"", with: "'"))\"")
     }
 
-    /// Main thread, at launch.
-    @MainActor func writeHeader(arguments: [String]) {
+    /// At launch. `displays`: this device's screens, `<w>x<h>@<scale>x` in
+    /// points.
+    public func writeHeader(arguments: [String], displays: [String]) {
         var fields: [String] = []
         if let exe = Bundle.main.executableURL {
             let attrs = try? FileManager.default.attributesOfItem(atPath: exe.path)
@@ -72,10 +74,7 @@ final class SessionLog: @unchecked Sendable {
         fields.append("os=\"\(ProcessInfo.processInfo.operatingSystemVersionString)\"")
         fields.append("cores=\(ProcessInfo.processInfo.activeProcessorCount)")
         fields.append("mem_gb=\(ProcessInfo.processInfo.physicalMemory >> 30)")
-        let screens = NSScreen.screens.map { s in
-            "\(Int(s.frame.width))x\(Int(s.frame.height))@\(Int(s.backingScaleFactor))x"
-        }
-        fields.append("displays=\(screens.joined(separator: ","))")
+        fields.append("displays=\(displays.joined(separator: ","))")
         fields.append("args=\"\(arguments.dropFirst().joined(separator: " "))\"")
         write("launch", fields.joined(separator: " "))
     }

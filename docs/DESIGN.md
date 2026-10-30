@@ -1137,8 +1137,9 @@ Sources/
                            TileLedger, governor/pacing/video rate, VT HEVC, presenter, .scap
   GlassActTransport/       transport protocol, QUICTransport, InProcTransport, identity,
                            known hosts, authorized viewers, AppPaths, crash reports
-  GlassActSession/         ViewerSession, AgentDriver, HeadlessAgent, agent socket, MCP
-                           (the socket, MCP and headless daemon are macOS only)
+  GlassActSession/         ViewerSession, ViewerController (an app's session: telemetry,
+                           clipboard, log upload), SessionLog, AgentDriver, HeadlessAgent,
+                           agent socket, MCP (the socket, MCP and daemon are macOS only)
   GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
