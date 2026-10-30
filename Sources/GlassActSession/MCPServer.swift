@@ -1,3 +1,6 @@
+// The local agent socket, the MCP server and the headless daemon are the
+// Mac's: an iPad has no other processes to drive a session from.
+#if os(macOS)
 import Foundation
 
 /// `glassact mcp`: a Model Context Protocol server on stdin/stdout (newline-
@@ -238,3 +241,4 @@ public final class MCPServer {
          "inputSchema": schema(["window_id": int, "max_nodes": int])],
     ] }
 }
+#endif

@@ -29,6 +29,11 @@ retransmission.
   Built with Xcode 27 / Swift 6.4, Swift 6 strict concurrency, warnings as
   errors. Anything newer than macOS 15.5 goes behind `#available` with a
   sensible fallback; the CI build at the 15.5 target catches misses.
+- The `GlassActViewer` product (everything but GlassActShare) also builds
+  for iPadOS 27+ (the latest only: the older macOS floor is for Intel Macs,
+  which iPads don't need). Mac-only APIs in it go behind `#if os(macOS)`,
+  and `#available` checks name iOS as well as macOS. CI builds it for
+  iPadOS.
 - Perf work is measured on Apple silicon; check that big changes don't
   regress on Intel, where the Host's tile encoding costs more CPU.
 - System frameworks only. The exceptions are the vendored libwebp, the

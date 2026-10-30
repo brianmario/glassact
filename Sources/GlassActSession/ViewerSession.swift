@@ -1,6 +1,8 @@
 public import CoreGraphics
 import Foundation
+#if os(macOS)
 import SystemConfiguration
+#endif
 public import GlassActCore
 import GlassActTransport
 public import Security
@@ -39,9 +41,14 @@ public final class ViewerSession: @unchecked Sendable {
         }
     }
 
-    /// "Alex’s MacBook Air" — this Mac's name from Sharing settings.
+    /// "Alex’s MacBook Air" — this Mac's name from Sharing settings. Empty
+    /// on iPadOS, where the device's name is UIKit's (the app passes it).
     public static var computerName: String {
+        #if os(macOS)
         (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? Host.current().localizedName ?? ""
+        #else
+        ""
+        #endif
     }
 
     public let queue = DispatchQueue(label: "glassact.viewer.apply", qos: .userInteractive)

@@ -19,9 +19,12 @@ let strictLibrary: [SwiftSetting] = strict + [
 
 let package = Package(
     name: "glassact",
-    platforms: [.macOS("15.5")],
+    platforms: [.macOS("15.5"), .iOS("27")],
     products: [
         .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession", "GlassActShare"]),
+        // What a viewer needs, without the Host's screen capture
+        // (GlassActShare, macOS only): the iPad Viewer links this.
+        .library(name: "GlassActViewer", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession"]),
         .executable(name: "glassact", targets: ["glassact"]),
         .executable(name: "glassact-bench", targets: ["glassact-bench"]),
         .executable(name: "glassact-trace", targets: ["glassact-trace"]),

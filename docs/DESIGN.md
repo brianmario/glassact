@@ -1128,7 +1128,8 @@ These apply to the hot paths: diff, encode, parse, apply and blit.
 ## 9. Repository layout
 
 ```
-Package.swift              tools 6.4, macOS 15.5, warnings as errors
+Package.swift              tools 6.4, macOS 15.5 (+ iPadOS 27: the GlassActViewer product),
+                           warnings as errors
 Sources/
   GlassActWire/            bytes: varint, TLV, datagrams, control, video, serial (checked)
   GlassActCodec/           xxh64, RAW/LZ4/LZBITMAP/VP8L tile codecs, arenas
@@ -1137,6 +1138,7 @@ Sources/
   GlassActTransport/       transport protocol, QUICTransport, InProcTransport, identity,
                            known hosts, authorized viewers, AppPaths, crash reports
   GlassActSession/         ViewerSession, AgentDriver, HeadlessAgent, agent socket, MCP
+                           (the socket, MCP and headless daemon are macOS only)
   GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
@@ -1160,6 +1162,13 @@ AGENTS.md, CONTRIBUTING.md working guide and contributor setup
 
 The apps stay thin, with UI and wiring only. Logic lives in the package, so
 `swift test` covers it.
+
+Two library products: `GlassAct` (everything, for the Mac apps) and
+`GlassActViewer` (Wire, Codec, Core, Transport and Session: what a viewer
+needs). The second also builds for iPadOS 27, for an iPad Viewer: Mac-only
+code there (sign-in's password check, the agent socket and MCP server, the
+Mac's computer name) sits behind `#if os(macOS)`, and CI builds the product
+for iPadOS so nothing slips past it.
 
 ---
 

@@ -1,3 +1,6 @@
+// The local agent socket, the MCP server and the headless daemon are the
+// Mac's: an iPad has no other processes to drive a session from.
+#if os(macOS)
 import Darwin
 import GlassActTransport
 public import Foundation
@@ -306,3 +309,4 @@ public final class AgentSocketClient {
         }
     }
 }
+#endif
