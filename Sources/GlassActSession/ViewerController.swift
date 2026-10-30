@@ -1,51 +1,52 @@
-import AppKit
-import CoreGraphics
-import Foundation
-import GlassActCore
-import GlassActSession
+public import CoreGraphics
+public import Foundation
+public import GlassActCore
 import GlassActTransport
-import GlassActWire
+public import GlassActWire
 import os
+public import Security
 
-/// The app's side of a viewer session: presenting telemetry, clipboard sync,
-/// pausing while occluded, and log upload around a package `ViewerSession`
+/// An app's side of a viewer session: presenting telemetry, clipboard sync,
+/// pausing while occluded, and log upload around a `ViewerSession`
 /// (transport → engine, tick, watchdog — shared with the headless agent).
-/// The engine is confined to `queue` (the session's apply queue).
+/// The engine is confined to `queue` (the session's apply queue). Shared by
+/// the Mac and iPad Viewers; each brings its own pasteboard
+/// (`ViewerPasteboard`) and presenting view.
 ///
 /// Concurrency (§8): queue-confined, not actor-isolated — state lives on
 /// `queue` or the main thread as documented per property; hops are explicit
 /// `DispatchQueue.async`. `@unchecked Sendable` so those hops compile under
 /// Swift 6 strict concurrency without actors in the apply/present path.
-final class ViewerController: @unchecked Sendable {
+public final class ViewerController: @unchecked Sendable {
     static let log = Logger(subsystem: "app.glassact.viewer", category: "diag")
     /// Transport → engine, tick and watchdog (package; also drives agents).
-    let session: ViewerSession
-    var queue: DispatchQueue { session.queue }
-    var engine: ViewerEngine { session.engine }
-    var onStatus: (String) -> Void = { _ in }
+    public let session: ViewerSession
+    public var queue: DispatchQueue { session.queue }
+    public var engine: ViewerEngine { session.engine }
+    public var onStatus: (String) -> Void = { _ in }
 
     /// The host key this dial saw (for trust-on-first-use and for reporting
     /// a changed key). Any thread.
-    var observedHostFingerprint: String? { session.observedHostFingerprint }
+    public var observedHostFingerprint: String? { session.observedHostFingerprint }
 
     /// Main thread: a pinned host presented a different key. The session is
     /// over; onConnectionFailed does NOT fire (redialing can't help).
-    var onHostKeyChanged: ((_ expected: String, _ presented: String) -> Void)?
+    public var onHostKeyChanged: ((_ expected: String, _ presented: String) -> Void)?
 
     /// Main thread, valid inside onConnectionFailed: why the dial ended, and
     /// whether it looked like a host waiting on its user to approve this
     /// viewer (it refuses the handshake until then).
-    var lastFailureReason: String { session.lastFailureReason }
-    var lastFailureAwaitsApproval: Bool { session.lastFailureAwaitsApproval }
+    public var lastFailureReason: String { session.lastFailureReason }
+    public var lastFailureAwaitsApproval: Bool { session.lastFailureAwaitsApproval }
 
     /// The short code both screens show for this host/viewer pair, once the
     /// host's key is known.
-    func verificationCode() -> String? { session.verificationCode() }
+    public func verificationCode() -> String? { session.verificationCode() }
     // Client quality policy (QUALITY)
-    private(set) var qualityFloor = 0        // QualityFloor: 0 = automatic
-    private(set) var qualityMotionPreference = 0 // ViewerSettings.motionPreference
+    public private(set) var qualityFloor = 0        // QualityFloor: 0 = automatic
+    public private(set) var qualityMotionPreference = 0 // ViewerSettings.motionPreference
     private var lastSentScalePct = -1
-    func setQualityPrefs(floor: Int, motionPreference: Int) {
+    public func setQualityPrefs(floor: Int, motionPreference: Int) {
         qualityFloor = floor; qualityMotionPreference = motionPreference
         queue.async { [engine] in
             engine.initialQualityPolicy = (floor, motionPreference == 1, motionPreference == 2)
@@ -53,7 +54,7 @@ final class ViewerController: @unchecked Sendable {
     }
     /// Send the policy (presented scale + stored floor/preference). Throttled
     /// on scale so a resize storm doesn't flood the control stream.
-    func updatePresentedScale(_ pct: Int) {
+    public func updatePresentedScale(_ pct: Int) {
         guard pct != lastSentScalePct else { return }
         lastSentScalePct = pct
         queue.async { [weak self] in
@@ -73,7 +74,7 @@ final class ViewerController: @unchecked Sendable {
     // a hidden viewer's timers runs SRTT up to seconds). Outside a session
     // the app naps normally. Deliberately no display/system-sleep
     // assertions.
-    private var sessionActivity: NSObjectProtocol?
+    private var sessionActivity: (any NSObjectProtocol)?
     // Occlusion-aware pausing. Hidden/occluded ≥ 3 s → ask the host to
     // pause content and release the activity assertion (App Nap becomes
     // safe: only keep-alives flow). Visible → resume + assertion,
@@ -83,7 +84,7 @@ final class ViewerController: @unchecked Sendable {
     private var occluded = false
     private var pausePending: DispatchWorkItem?
     private var pausedNow = false
-    static let occlusionDebounceS = 3.0
+    public static let occlusionDebounceS = 3.0
 
     // Glass-to-glass (capture_ts → present) sliding window. Same-machine
     // loopback only — the timestamps are the host's monotonic clock (§10.1).
@@ -105,12 +106,12 @@ final class ViewerController: @unchecked Sendable {
     private var g2gLock = NSLock()
     private var lastG2GPrint = Date()
 
-    func setPauseEnabled(_ enabled: Bool) {
+    public func setPauseEnabled(_ enabled: Bool) {
         queue.async { self.pauseEnabled = enabled }
     }
 
     /// Main thread (AppKit) → engine queue. Debounced on hide, instant on show.
-    func windowVisibilityChanged(visible: Bool) {
+    public func windowVisibilityChanged(visible: Bool) {
         queue.async { [self] in
             let newOccluded = !visible
             guard pauseEnabled, occluded != newOccluded else { return }
@@ -148,7 +149,7 @@ final class ViewerController: @unchecked Sendable {
     /// `identity`: this viewer's certificate, presented to the host (mutual
     /// TLS). The host admits only viewer fingerprints its user approved.
     /// `fingerprint` pins the host; empty = trust on first use.
-    init(host: String, port: UInt16, fingerprint: String, identity: SecIdentity?,
+    public init(host: String, port: UInt16, fingerprint: String, identity: SecIdentity?,
          cursorMetadata: Bool = true, av1: Bool = false) {
         session = ViewerSession(host: host, port: port, fingerprint: fingerprint, identity: identity,
                                 options: .init(cursorMetadata: cursorMetadata, video: true, av1: av1))
@@ -165,23 +166,25 @@ final class ViewerController: @unchecked Sendable {
     }
 
     /// Auto-reconnect hook (main thread): fired when the transport dies.
-    var onConnectionFailed: (() -> Void)?
+    public var onConnectionFailed: (() -> Void)?
     /// The host's HOST_NOTICE changed (main thread).
-    var onHostNotice: ((UInt8) -> Void)?
+    public var onHostNotice: ((UInt8) -> Void)?
 
     // MARK: - Clipboard sync (main thread)
 
+    /// This device's clipboard, synced with the host's while a session
+    /// runs (main thread). Set before `start`; nil syncs nothing.
+    public var pasteboard: (any ViewerPasteboard)?
+
     private func startClipboardSync(_ send: @escaping @Sendable (UInt8, [UInt8]) -> Void) {
-        clipboardChangeCount = NSPasteboard.general.changeCount
+        guard let pasteboard else { return }
+        clipboardChangeCount = pasteboard.changeCount
         clipboardTimer?.invalidate()
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let pb = NSPasteboard.general
-            guard pb.changeCount != self.clipboardChangeCount else { return }
-            self.clipboardChangeCount = pb.changeCount
-            // Not a password manager's concealed or one-time item (§13).
-            guard ClipboardSync.mayShare(types: pb.types?.map(\.rawValue) ?? []),
-                  let str = pb.string(forType: .string) else { return }
+            guard let self, let pasteboard = self.pasteboard else { return }
+            guard pasteboard.changeCount != self.clipboardChangeCount else { return }
+            self.clipboardChangeCount = pasteboard.changeCount
+            guard let str = pasteboard.shareableText() else { return }
             let bytes = Array(str.utf8)
             var h = Hasher(); h.combine(bytes); let hash = h.finalize()
             guard hash != self.lastClipboardHash else { return }
@@ -193,49 +196,47 @@ final class ViewerController: @unchecked Sendable {
     private func applyInboundClipboard(_ format: UInt8, _ data: [UInt8]) {
         guard format == 1, let str = String(bytes: data, encoding: .utf8) else { return }
         var h = Hasher(); h.combine(data); let hash = h.finalize()
-        guard hash != lastClipboardHash else { return }
+        guard hash != lastClipboardHash, let pasteboard else { return }
         lastClipboardHash = hash
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(str, forType: .string)
-        clipboardChangeCount = pb.changeCount
+        pasteboard.setText(str)
+        clipboardChangeCount = pasteboard.changeCount
     }
 
     /// Remote input (main thread → engine queue, reliable). Also the person
     /// at this viewer touching the session — an attached agent yields.
-    func sendInput(kind: UInt8, x: Int, y: Int, a: Int, b: Int) {
+    public func sendInput(kind: UInt8, x: Int, y: Int, a: Int, b: Int) {
         agentDriver?.noteHumanInput()
         session.sendInput(kind: kind, x: x, y: y, a: a, b: b)
     }
     /// An agent using this session (Settings › Agents), if any. It sends
     /// through `session` directly, so its input never counts as the person's.
-    var agentDriver: AgentDriver?
+    public var agentDriver: AgentDriver?
 
     /// Handshake geometry (main thread → engine queue, BEFORE HELLO lands).
-    func setRequestedGeometry(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
+    public func setRequestedGeometry(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
         session.setRequestedGeometry(mode: mode, widthPoints: widthPoints, heightPoints: heightPoints, scale: scale)
     }
 
     /// RESIZE request (main thread → engine queue).
-    func requestResize(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
+    public func requestResize(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
         session.requestResize(mode: mode, widthPoints: widthPoints, heightPoints: heightPoints, scale: scale)
     }
 
     // MARK: - Single-window mode (main thread → engine queue)
 
     /// Fired when the host's pickable-window snapshot arrives.
-    var onWindowList: (([WireWindow]) -> Void)?
+    public var onWindowList: (([WireWindow]) -> Void)?
     /// Main thread: the host ended the session on purpose (shared window
     /// closed) — show why, don't redial.
-    var onHostEndedSession: ((String) -> Void)?
+    public var onHostEndedSession: ((String) -> Void)?
     /// Main thread: the host runs a different build; don't redial.
-    var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
+    public var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
     /// Host advertised single-window support (has Screen Recording).
     /// Which host the upload ledger is kept for (the pinned or observed key).
     /// How `session_start` names this session's host in the log.
-    var logTarget: String { sessionTarget }
+    public var logTarget: String { sessionTarget }
 
-    var uploadHostKey: String {
+    public var uploadHostKey: String {
         String((observedHostFingerprint ?? session.pinnedHostFingerprint).prefix(16))
     }
 
@@ -246,7 +247,7 @@ final class ViewerController: @unchecked Sendable {
     /// → 320 ms, tile and video rates to their floors, viewer g2g p50 3 s).
     /// `onFileSent` (main) fires per completed file; `onProgress` runs on
     /// main.
-    func sendLogs(_ files: [URL], onFileSent: @escaping @Sendable (_ name: String, _ size: Int) -> Void = { _, _ in },
+    public func sendLogs(_ files: [URL], onFileSent: @escaping @Sendable (_ name: String, _ size: Int) -> Void = { _, _ in },
                   onProgress: @escaping @Sendable (String) -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -331,31 +332,31 @@ final class ViewerController: @unchecked Sendable {
         }
     }
 
-    func hostSupportsVirtualDisplay() -> Bool { session.hostSupportsVirtualDisplay() }
+    public func hostSupportsVirtualDisplay() -> Bool { session.hostSupportsVirtualDisplay() }
 
-    func hostSupportsWindowList() -> Bool { session.hostSupportsWindowList() }
+    public func hostSupportsWindowList() -> Bool { session.hostSupportsWindowList() }
     /// Ask the host to enumerate + send its window list.
-    func requestWindowList() { session.requestWindowList() }
+    public func requestWindowList() { session.requestWindowList() }
     /// Pick a window (the host swaps its capture filter and re-HELLOs in
     /// place — see onGeometryChanged).
-    func selectWindow(_ id: UInt32) { session.selectWindow(id) }
+    public func selectWindow(_ id: UInt32) { session.selectWindow(id) }
     /// A window-chrome action (fullscreen / resize / endSession).
-    func windowControl(action: UInt8, width: Int = 0, height: Int = 0) {
+    public func windowControl(action: UInt8, width: Int = 0, height: Int = 0) {
         session.windowControl(action: action, width: width, height: height)
     }
 
     /// In-session geometry change (re-HELLO on the live connection): the canvas
     /// was reconfigured to new dims without a reconnect. Fired on the main
     /// thread; the app opens or rebuilds the present surfaces to the new grid.
-    var onGeometryChanged: ((_ width: Int, _ height: Int) -> Void)?
+    public var onGeometryChanged: ((_ width: Int, _ height: Int) -> Void)?
 
     /// Cursor as metadata: cursor state for the present-time composite (main thread).
-    var onCursorUpdate: (() -> Void)? // main thread
-    private(set) var cursorX = 0
-    private(set) var cursorY = 0
-    private(set) var cursorVisible = false
-    private(set) var cursorImage: CGImage?
-    private(set) var cursorHotspot = CGPoint.zero // image pixels
+    public var onCursorUpdate: (() -> Void)? // main thread
+    public private(set) var cursorX = 0
+    public private(set) var cursorY = 0
+    public private(set) var cursorVisible = false
+    public private(set) var cursorImage: CGImage?
+    public private(set) var cursorHotspot = CGPoint.zero // image pixels
 
     /// First-picture timing (see SessionMilestones): session start and
     /// transport-ready times (MonotonicClock µs), and whether the one-time
@@ -366,7 +367,7 @@ final class ViewerController: @unchecked Sendable {
 
     /// Queue only (the present path's blit hop). The engine's milestones the
     /// first time a blit carries content; nil afterwards.
-    func takeFirstPicture() -> SessionMilestones? {
+    public func takeFirstPicture() -> SessionMilestones? {
         guard !firstPictureTaken, engine.milestones.firstContentUS != 0 else { return nil }
         firstPictureTaken = true
         return engine.milestones
@@ -374,7 +375,7 @@ final class ViewerController: @unchecked Sendable {
 
     /// Main thread: that blit is on glass. One line per session, every time
     /// in ms after session_start ("-" = never happened).
-    func logFirstPicture(_ m: SessionMilestones, presentedUS: UInt64) {
+    public func logFirstPicture(_ m: SessionMilestones, presentedUS: UInt64) {
         let t0 = sessionStartUS
         func ms(_ us: UInt64) -> String { us == 0 || us < t0 ? "-" : String((us - t0) / 1000) }
         SessionLog.shared.write("first_picture",
@@ -384,7 +385,7 @@ final class ViewerController: @unchecked Sendable {
             + " video_decoded_ms=\(ms(m.firstVideoAppliedUS)) tile_ms=\(ms(m.firstTileUS)) keyframe_ms=\(ms(m.firstKeyframeUS))")
     }
 
-    func start() {
+    public func start() {
         sessionStartUS = MonotonicClock.nowUS
         SessionLog.shared.write("session_start", "\(sessionTarget)"
             + " host_fp=\(session.pinnedHostFingerprint.isEmpty ? "tofu" : String(session.pinnedHostFingerprint.prefix(16)))"
@@ -443,7 +444,7 @@ final class ViewerController: @unchecked Sendable {
 
     /// Main thread. Deliberate end of the session: no onConnectionFailed.
     /// `bye`: why, for the host (`ViewerBye`).
-    func stop(bye: UInt8 = ViewerBye.disconnected) {
+    public func stop(bye: UInt8 = ViewerBye.disconnected) {
         stopTelemetry(reason: "stopped")
         clipboardTimer?.invalidate(); clipboardTimer = nil
         queue.async { [self] in
@@ -457,25 +458,25 @@ final class ViewerController: @unchecked Sendable {
 
     /// Blocks (at most `timeout` s) until the connection has closed: lets a
     /// quitting Viewer's goodbye reach the host.
-    func waitUntilClosed(timeout: Double) { session.waitUntilClosed(timeout: timeout) }
+    public func waitUntilClosed(timeout: Double) { session.waitUntilClosed(timeout: timeout) }
 
     /// Main thread: the configured canvas grid, synchronously — waits for
     /// the apply queue, so only for one-off events (a geometry change), never
     /// for polling (use the async form).
-    func configuredGrid() -> TileGrid? { session.configuredGrid() }
+    public func configuredGrid() -> TileGrid? { session.configuredGrid() }
 
     /// Main-thread poll: non-nil once the HELLO has configured the canvas.
-    func configuredGrid(_ done: @escaping @MainActor (TileGrid?) -> Void) { session.configuredGrid(done) }
+    public func configuredGrid(_ done: @escaping @MainActor (TileGrid?) -> Void) { session.configuredGrid(done) }
 
     /// Main-thread poll: true once the canvas has any content.
-    func hasPicture(_ done: @escaping @MainActor (Bool) -> Void) { session.hasPicture(done) }
+    public func hasPicture(_ done: @escaping @MainActor (Bool) -> Void) { session.hasPicture(done) }
 
     /// Main-thread cache of the engine's PING-derived clock offset (the
     /// engine is queue-confined; the present path must not hop queues).
-    private(set) var hostClockOffsetUS: Int64 = 0
+    public private(set) var hostClockOffsetUS: Int64 = 0
 
     /// Called by the present path with capture→present latency samples.
-    func recordGlassToGlass(_ samples: [UInt64]) {
+    public func recordGlassToGlass(_ samples: [UInt64]) {
         telemetryG2G.append(contentsOf: samples)
         g2gLock.lock()
         g2gSamplesUS.append(contentsOf: samples)
@@ -518,7 +519,7 @@ final class ViewerController: @unchecked Sendable {
     /// "623 KB/s · 42 fps (HEVC)". Computed on the apply queue, delivered on
     /// main: a `queue.sync` from the 1 s title poll would block the main
     /// thread on apply work up to 33 % of the time.
-    func bandwidthSummary(_ done: @escaping @MainActor (String?) -> Void) {
+    public func bandwidthSummary(_ done: @escaping @MainActor (String?) -> Void) {
         queue.async { [self] in
             let line = bandwidthSummaryOnQueue()
             DispatchQueue.main.async { MainActor.assumeIsolated { done(line) } }
@@ -546,7 +547,7 @@ final class ViewerController: @unchecked Sendable {
     }
 
     /// Median glass-to-glass latency, once there are enough samples.
-    func glassToGlassMedianMS() -> Double? {
+    public func glassToGlassMedianMS() -> Double? {
         g2gLock.lock()
         let sorted = g2gSamplesUS.sorted()
         g2gLock.unlock()
@@ -554,7 +555,7 @@ final class ViewerController: @unchecked Sendable {
         return Double(sorted[sorted.count / 2]) / 1000.0
     }
 
-    func glassToGlassSummary() -> String? {
+    public func glassToGlassSummary() -> String? {
         g2gLock.lock()
         let sorted = g2gSamplesUS.sorted()
         g2gLock.unlock()
@@ -568,7 +569,7 @@ final class ViewerController: @unchecked Sendable {
     // MARK: - Session log telemetry (main thread)
 
     /// Main thread: a landed present — its blit cost and blit→flip delay.
-    func recordPresent(blitUS: UInt64, flipDelayUS: UInt64) {
+    public func recordPresent(blitUS: UInt64, flipDelayUS: UInt64) {
         telemetryBlits.append(blitUS)
         telemetryFlipDelays.append(flipDelayUS)
     }
@@ -641,4 +642,17 @@ final class ViewerController: @unchecked Sendable {
             }
         }
     }
+}
+
+/// A device's clipboard as the session syncs it (main thread). The Mac's
+/// leaves a password manager's concealed items out (§13); an iPad's shares
+/// nothing outward, since reading the clipboard there asks the person
+/// each time.
+public protocol ViewerPasteboard: AnyObject {
+    /// Bumped by every change, this app's own writes included.
+    var changeCount: Int { get }
+    /// The text to send the host, or nil: none, or not to be shared.
+    func shareableText() -> String?
+    /// The host's clipboard text, replacing this device's.
+    func setText(_ text: String)
 }

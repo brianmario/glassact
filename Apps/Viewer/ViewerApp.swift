@@ -117,7 +117,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         } catch {
             print("glassact-viewer: identity error: \(error)")
         }
-        SessionLog.shared.writeHeader(arguments: CommandLine.arguments)
+        SessionLog.shared.writeHeader(arguments: CommandLine.arguments, displays: NSScreen.screens.map { s in
+            "\(Int(s.frame.width))x\(Int(s.frame.height))@\(Int(s.backingScaleFactor))x"
+        })
         SessionLog.shared.write("identity", "viewer_fp=\(viewerFingerprint) source=\(viewerIdentitySource)")
         print("glassact-viewer: session log \(SessionLog.shared.url.path)")
         crashReporter = CrashReporter(appName: "Glass Act Viewer", prefix: "viewer") { [weak self] text in
@@ -464,6 +466,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let controller = ViewerController(host: host, port: port, fingerprint: fingerprint,
                                           identity: viewerIdentity, cursorMetadata: cursorMetadata,
                                           av1: settings.videoAV1)
+        controller.pasteboard = MacPasteboard()
         controller.onStatus = { text in
             print("glassact-viewer: \(text)")
             SessionLog.shared.text("status", text)
