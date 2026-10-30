@@ -1,6 +1,7 @@
 public import Foundation
 
-/// Where Glass Act keeps things on this Mac:
+/// Where Glass Act keeps things on this Mac (on an iPad, the same paths
+/// inside the app's container):
 /// - data in `~/Library/Application Support/Glass Act`: identities,
 ///   approvals, known hosts, traces, the agent sockets and the audit log;
 /// - logs in `~/Library/Logs/Glass Act`.
@@ -10,8 +11,7 @@ public enum AppPaths {
         URL.applicationSupportDirectory.appendingPathComponent("Glass Act", isDirectory: true))
 
     public static let logsDirectory: URL = ensure(
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/Glass Act", isDirectory: true))
+        URL.libraryDirectory.appendingPathComponent("Logs/Glass Act", isDirectory: true))
 
     private static func ensure(_ url: URL) -> URL {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,

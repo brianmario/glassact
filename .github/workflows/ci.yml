@@ -64,6 +64,13 @@ jobs:
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer
           -configuration Debug -destination 'generic/platform=macOS'
           CODE_SIGNING_ALLOWED=NO build
+      - name: Build the viewer package for iPadOS
+        # The package targets iPadOS 27 too (the iPad Viewer), so
+        # availability mistakes and Mac-only APIs outside `#if os(macOS)`
+        # fail here.
+        run: >
+          xcodebuild -scheme GlassActViewer -destination 'generic/platform=iOS'
+          CODE_SIGNING_ALLOWED=NO build
 
   intel:
     name: Intel

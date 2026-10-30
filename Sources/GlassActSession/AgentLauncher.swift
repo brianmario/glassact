@@ -1,3 +1,6 @@
+// The local agent socket, the MCP server and the headless daemon are the
+// Mac's: an iPad has no other processes to drive a session from.
+#if os(macOS)
 public import Foundation
 
 /// Finding and starting agent sessions — shared by the CLI and the MCP server.
@@ -106,3 +109,4 @@ public enum AgentLauncher {
         return text.split(separator: "\n").suffix(count).joined(separator: " / ")
     }
 }
+#endif

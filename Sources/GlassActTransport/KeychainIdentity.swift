@@ -37,11 +37,35 @@ public enum KeychainIdentity {
     /// The app's keychain access group: the first entry of its
     /// `keychain-access-groups` entitlement, or nil when it has none.
     public static var appAccessGroup: String? {
+        #if os(macOS)
         guard let task = SecTaskCreateFromSelf(nil),
               let value = SecTaskCopyValueForEntitlement(task, "keychain-access-groups" as CFString, nil),
               let groups = value as? [String] else { return nil }
         return groups.first
+        #else
+        defaultAccessGroup
+        #endif
     }
+
+    #if !os(macOS)
+    /// iPadOS can't read its own entitlements, but every app has a keychain
+    /// group of its own (team ID + bundle ID), where an item lands when it
+    /// names none: add one and read back where it went.
+    private static var defaultAccessGroup: String? {
+        let probe: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: "Glass Act access group probe",
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        SecItemDelete(probe as CFDictionary)
+        var result: CFTypeRef?
+        var add = probe
+        add[kSecReturnAttributes as String] = true
+        guard SecItemAdd(add as CFDictionary, &result) == errSecSuccess else { return nil }
+        SecItemDelete(probe as CFDictionary)
+        return (result as? [String: Any])?[kSecAttrAccessGroup as String] as? String
+    }
+    #endif
 
     /// This device's identity for `name` in `accessGroup`, made on first use.
     /// The key's storage tells where it ended up.

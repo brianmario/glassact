@@ -7,7 +7,7 @@ public import MetricKit
 /// shape `MXDiagnosticPayload.jsonRepresentation()` writes, so everything
 /// after delivery — the saved file, `CrashReportSummary.parse`, the issue
 /// link, Send Logs and `scripts/symbolicate-crash` — reads one format.
-@available(macOS 27, *)
+@available(macOS 27, iOS 27, *)
 public enum MetricKitReports {
     /// The payload JSON for `report`, and when it ended; nil for kinds Glass
     /// Act doesn't save.

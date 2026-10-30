@@ -1,7 +1,9 @@
 public import Foundation
 public import GlassActWire
 import Network
+#if os(macOS)
 import OpenDirectory
+#endif
 public import Security
 import Synchronization
 
@@ -30,6 +32,7 @@ public protocol PasswordVerifier: Sendable {
     func verify(user: String, password: String) -> Bool
 }
 
+#if os(macOS)
 /// The account running this process — the one whose screen is shared — and
 /// no other. `user` may be its short name or its full name (any case).
 /// A name that doesn't match is refused without asking OpenDirectory, so it
@@ -54,6 +57,7 @@ public struct LocalAccountVerifier: PasswordVerifier {
         }
     }
 }
+#endif
 
 // MARK: - Throttle
 

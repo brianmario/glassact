@@ -165,7 +165,7 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         // in family with Apple's high-performance screen-sharing budget.
         baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
         // Bench-only knob; the key exists from macOS 27.
-        if #available(macOS 27, *), let cqf = constantQualityFactor {
+        if #available(macOS 27, iOS 27, *), let cqf = constantQualityFactor {
             constantQualityAccepted = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ConstantQualityFactor,
                                                            value: cqf as CFNumber) == noErr
         }
@@ -242,7 +242,7 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         nonisolated(unsafe) let s = session
         vtQueue.async {
             // Bench-only knob; the VBV keys exist from macOS 26.
-            if #available(macOS 26, *), vbv {
+            if #available(macOS 26, iOS 26, *), vbv {
                 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_VBVMaxBitRate, value: rate as CFNumber)
                 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_VBVBufferDuration, value: 1.0 as CFNumber)
                 return
