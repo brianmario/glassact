@@ -280,7 +280,11 @@ private struct NoticeBanner: View {
 /// Over the connect screen while a connection is on its way.
 private struct ProgressCard: View {
     @Bindable var model: SessionModel
-    @FocusState private var passwordFocused: Bool
+    @FocusState private var focus: Field?
+    @State private var shakes = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private enum Field { case name, password }
 
     var body: some View {
         ZStack {
@@ -325,14 +329,34 @@ private struct ProgressCard: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .submitLabel(.next)
-                    .onSubmit { passwordFocused = true }
+                    .focused($focus, equals: .name)
+                    .onSubmit { focus = .password }
                 SecureField("Password", text: $model.signInPassword)
                     .textContentType(.password)
                     .submitLabel(.go)
-                    .focused($passwordFocused)
+                    .focused($focus, equals: .password)
                     .onSubmit { model.signIn() }
             }
             .textFieldStyle(.roundedBorder)
+            // A wrong password shakes the fields, as the Mac's login window
+            // does, and puts the cursor back in the password.
+            .keyframeAnimator(initialValue: 0.0, trigger: shakes) { fields, x in
+                fields.offset(x: reduceMotion ? 0 : x)
+            } keyframes: { _ in
+                KeyframeTrack {
+                    SpringKeyframe(-12.0, duration: 0.06)
+                    SpringKeyframe(10.0, duration: 0.06)
+                    SpringKeyframe(-7.0, duration: 0.06)
+                    SpringKeyframe(4.0, duration: 0.06)
+                    SpringKeyframe(0.0, duration: 0.08)
+                }
+            }
+            .onAppear { focus = model.signInUser.isEmpty ? .name : .password }
+            .onChange(of: model.signInError) { _, error in
+                guard error != nil else { return }
+                shakes += 1
+                focus = .password
+            }
             if let error = model.signInError {
                 Label(error, systemImage: "exclamationmark.circle.fill")
                     .font(.callout)
