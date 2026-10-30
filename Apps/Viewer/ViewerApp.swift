@@ -204,8 +204,26 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     /// Help › Send Logs to Host: this launch's log, the crash and hang
-    /// reports (§13), and other logs from the last 24 h, over the live
-    /// session.
+    /// reports (§13), and other logs from the last 24 h of sessions with
+    /// this host only, over the live session.
+    /// Whether an earlier launch's log was only about this host: it has a
+    /// session, and every session in it was with this host (by address, or
+    /// by its key when the address differs). Another host's address, key
+    /// and session details stay off this one.
+    nonisolated static func logIsOnlyAbout(_ url: URL, target: String, hostKey: String) -> Bool {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        var sessions = 0
+        for line in text.split(separator: "\n") {
+            guard let range = line.range(of: " session_start ") else { continue }
+            sessions += 1
+            let fields = line[range.upperBound...]
+            let sameHost = fields.hasPrefix(target + " ")
+                || (!hostKey.isEmpty && fields.contains(" host_fp=\(hostKey) "))
+            if !sameHost { return false }
+        }
+        return sessions > 0
+    }
+
     @objc private func sendLogsToHost() {
         guard let controller else {
             model.notice = .init(kind: .info, text: "Connect to a host first, then send it your logs.")
@@ -215,12 +233,15 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         SessionLog.shared.flush()
         let dir = SessionLog.shared.url.deletingLastPathComponent()
         let cutoff = Date().addingTimeInterval(-24 * 3600)
+        let (target, hostKey) = (controller.logTarget, controller.uploadHostKey)
         let files = ((try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])) ?? [])
             .filter { $0.lastPathComponent.hasPrefix("viewer-") && $0.pathExtension == "log" }
             .compactMap { url -> (URL, Date, Int)? in
                 let v = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-                guard let date = v?.contentModificationDate, date >= cutoff else { return nil }
+                guard let date = v?.contentModificationDate, date >= cutoff,
+                      url == SessionLog.shared.url || Self.logIsOnlyAbout(url, target: target, hostKey: hostKey)
+                else { return nil }
                 return (url, date, v?.fileSize ?? 0)
             }
             .sorted { $0.1 > $1.1 }
@@ -235,7 +256,6 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // Only what this host doesn't have yet: a file goes again only if it
         // grew since it was sent (the current log always has). Re-sending the
         // whole day each time would cost ~2.7 MB on a tether.
-        let hostKey = controller.uploadHostKey
         let sentSizes = Self.uploadedLogs(for: hostKey)
         // ≤ 512 KB per upload, newest first (~30 s at the paced 16 KB/s);
         // anything older still unsent goes on a later upload.

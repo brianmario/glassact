@@ -232,6 +232,9 @@ final class ViewerController: @unchecked Sendable {
     var onIncompatibleHost: ((_ hostVersion: UInt8) -> Void)?
     /// Host advertised single-window support (has Screen Recording).
     /// Which host the upload ledger is kept for (the pinned or observed key).
+    /// How `session_start` names this session's host in the log.
+    var logTarget: String { sessionTarget }
+
     var uploadHostKey: String {
         String((observedHostFingerprint ?? session.pinnedHostFingerprint).prefix(16))
     }

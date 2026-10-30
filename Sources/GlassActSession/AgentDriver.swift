@@ -130,6 +130,10 @@ public final class AgentDriver: @unchecked Sendable {
 
     private func performOnOps(_ op: String, _ args: Args) throws -> [String: Any] {
         shared.withLock { $0.lastOpUS = MonotonicClock.nowUS }
+        // Watching counts as driving: a screenshot, the clipboard or the
+        // window list shows "Agent active" here and tells the host, like
+        // input does. Only asking for status doesn't.
+        if op != "status" && Self.operations.contains(op) { setActive(true) }
         switch op {
         case "status":
             return status()
