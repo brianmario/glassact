@@ -23,6 +23,11 @@ struct SessionScreen: View {
                                 generation: model.gridGeneration, handle: canvas)
                 .ignoresSafeArea()
                 .accessibilityLabel("Screen of \(model.sessionName)")
+                // The Mac's screen is pixels, not elements: with VoiceOver on,
+                // touches go straight to it (the Mac's own VoiceOver can read
+                // it), while the controls stay VoiceOver elements.
+                .accessibilityAddTraits(.allowsDirectInteraction)
+                .accessibilityHint("Touches go to the Mac.")
             if let notice = model.hostNotice {
                 Label(notice, systemImage: "person.2.slash")
                     .font(.headline)
