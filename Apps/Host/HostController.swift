@@ -2701,7 +2701,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         guard let transport = sessionTransport else { return }
         let seed = engine?.currentFrameSeq ?? 1
         let newEngine = makeEngine(on: transport, width: width, height: height, startFrameSeq: seed)
-        newEngine.sessionOpen = engine?.sessionOpen ?? false
+        if let engine { newEngine.continueSession(from: engine) }
         engine = newEngine
         DispatchQueue.main.async { [weak self] in
             self?.captureWidth = width

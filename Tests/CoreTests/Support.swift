@@ -310,11 +310,13 @@ final class Harness {
     /// HostController.reconfigureEngineInSession — no reconnect.
     func reconfigure(width: Int, height: Int) {
         let seed = host.currentFrameSeq
+        let previous = host
         host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: hostVideo ? (hostEncoderFactory ?? { MockVideoEncoder(codecID: $0) }) : nil,
                           videoCodecPreference: hostCodecPref,
                           startFrameSeq: seed,
                           clock: hostClock)
+        host.continueSession(from: previous)
         link.a.onControl = { [weak self] data in
             guard let self else { return }
             self.host.handleControl(data, nowUS: self.link.nowUS)

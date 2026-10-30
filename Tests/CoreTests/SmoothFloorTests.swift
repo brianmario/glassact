@@ -86,6 +86,31 @@ import GlassActWire
         #expect(encoder.smooth == [true])
     }
 
+    /// An in-session rebuild (§4.10: auto-scale, a resize) keeps the viewer's
+    /// QUALITY, which it won't send again: the rebuilt engine's first region
+    /// still forms under the smooth trade. Live (2026-10-29, a plane) one
+    /// didn't, and the session lost Prefer Smooth Motion for good.
+    @Test func anInSessionRebuildKeepsIt() {
+        let encoder = Encoder()
+        var rng = SplitMix64(seed: 4405)
+        let h = Harness(width: 640, height: 384, video: true, encoderFactory: { _ in encoder })
+        h.viewer.sendQualityPolicy(presentedScalePct: 100, floor: Int(QualityFloor.automatic),
+                                   preferSharpness: false, preferSmoothness: true)
+        h.run(untilUS: h.now + 50_000)
+        #expect(h.host.policyPreferSmoothness, "setup: the preference arrived over the wire")
+
+        h.reconfigure(width: 320, height: 192)
+        #expect(h.host.sessionOpen, "the rebuilt engine keeps the session open")
+        #expect(h.host.policyPreferSmoothness, "and the viewer's preference")
+        #expect(h.host.smoothFloor && h.host.stats.smoothFloorOn == 1, "on at once: no room proven on the new engine")
+        h.frame.fillRandom(&rng)
+        h.encodeFrame()
+        h.run(untilUS: h.now + 100_000)
+        #expect(h.host.activeVideoRegionCount == 1)
+        #expect(encoder.smooth.last == true, "the new region starts smooth")
+        #expect(encoder.ceilings.last == .some(HostEngine.smoothMaxFrameQP))
+    }
+
     /// The viewer asks for smooth motion only from a host that understands
     /// it: older hosts reject preference 2 as malformed (§3.8).
     @Test func theViewerSendsItOnlyToAHostThatUnderstandsIt() {
