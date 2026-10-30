@@ -28,6 +28,7 @@ let package = Package(
         .executable(name: "glassact", targets: ["glassact"]),
         .executable(name: "glassact-bench", targets: ["glassact-bench"]),
         .executable(name: "glassact-trace", targets: ["glassact-trace"]),
+        .executable(name: "glassact-testhost", targets: ["glassact-testhost"]),
     ],
     targets: [
         // Wire format: varint, TLV, records, serial arithmetic, checked parser.
@@ -101,6 +102,13 @@ let package = Package(
         .executableTarget(
             name: "glassact-bench",
             dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport"],
+            swiftSettings: strict
+        ),
+        // A Host with a synthetic screen, for developing a viewer (the iPad
+        // Viewer in the Simulator) without sharing a real one. Mac only.
+        .executableTarget(
+            name: "glassact-testhost",
+            dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport"],
             swiftSettings: strict
         ),
         .executableTarget(
