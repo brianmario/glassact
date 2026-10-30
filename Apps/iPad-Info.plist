@@ -4,6 +4,10 @@
 <dict>
 	<key>GlassActCommit</key>
 	<string>$(GLASSACT_COMMIT)</string>
+	<!-- Encryption: only the system's (TLS 1.3 in Network.framework,
+	     CryptoKit signatures), which is exempt from export documentation. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_glassact._udp</string>
