@@ -15,19 +15,10 @@ import Testing
 struct DSPEquivalenceTests {
     @available(macOS 27, *)
     @Test func gpuMatchesCPU() throws {
-        let device = try #require(MTLCreateSystemDefaultDevice())
-        let main = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "Shaders/dsp_test.metal")
-        let library: any MTLLibrary
-        do {
-            library = try AV1ShaderSource.library(main, device: device, includeDirectories: Self.includes)
-        } catch {
-            Issue.record("\(error)")
-            return
-        }
+        guard let gpu = try MetalTestGPU.make(shader: "dsp_test.metal") else { return }
         let set = try #require(av1t_dsp_set_make(0))
         defer { av1t_dsp_set_free(set) }
         let s = set.pointee
-        let gpu = try GPU(device: device, library: library)
 
         // 1. dequant + inverse transforms
         let itxCount = Int(s.itx_count)
@@ -79,52 +70,5 @@ struct DSPEquivalenceTests {
             return n != Int(s.ec_sizes[i]) || memcmp(coded.contents() + i * capacity, s.ec_bytes + i * capacity, n) != 0
         }
         #expect(ecBad == 0, "range coder: \(ecBad) of \(ecCount) streams differ")
-    }
-
-    static let includes = AV1ShaderSource.defaultIncludeDirectories + [
-        URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appending(path: "Sources/AV1CoreTestSupport/include"),
-    ]
-
-    /// Just enough Metal to run one kernel over a grid and wait for it.
-    struct GPU {
-        let device: any MTLDevice
-        let library: any MTLLibrary
-        let queue: any MTLCommandQueue
-
-        init(device: any MTLDevice, library: any MTLLibrary) throws {
-            self.device = device
-            self.library = library
-            queue = try #require(device.makeCommandQueue())
-        }
-
-        func buffer<T>(_: T.Type, count: Int) throws -> any MTLBuffer {
-            try #require(device.makeBuffer(length: max(1, count * MemoryLayout<T>.stride), options: .storageModeShared))
-        }
-
-        func copy(_ pointer: UnsafeRawPointer?, bytes: Int) throws -> any MTLBuffer {
-            let p = try #require(pointer)
-            return try #require(device.makeBuffer(bytes: p, length: max(1, bytes), options: .storageModeShared))
-        }
-
-        /// `buffers` at indices 0…, then each constant at the next index.
-        func run(_ name: String, threads: Int, buffers: [any MTLBuffer], constants: [UInt32]) throws {
-            let function = try #require(library.makeFunction(name: name))
-            let pipeline = try device.makeComputePipelineState(function: function)
-            let commands = try #require(queue.makeCommandBuffer())
-            let encoder = try #require(commands.makeComputeCommandEncoder())
-            encoder.setComputePipelineState(pipeline)
-            for (i, b) in buffers.enumerated() { encoder.setBuffer(b, offset: 0, index: i) }
-            for (i, var c) in constants.enumerated() {
-                encoder.setBytes(&c, length: 4, index: buffers.count + i)
-            }
-            let width = min(64, pipeline.maxTotalThreadsPerThreadgroup)
-            encoder.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
-            encoder.endEncoding()
-            commands.commit()
-            commands.waitUntilCompleted()
-            #expect(commands.status == .completed, "\(name): \(commands.error.map { "\($0)" } ?? "status \(commands.status.rawValue)")")
-        }
     }
 }
