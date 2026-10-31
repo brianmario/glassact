@@ -32,11 +32,12 @@ pub(crate) mod tests;
 pub(crate) use decide::{DecOpts, Decider, Src, pad_source};
 pub(crate) use quant::{HookOpts, QuantHook};
 
-use crate::blockinfo::{bh4, bw4, for_each_txb, has_chroma, max_tx_depth, mi_cols, mi_rows};
+use crate::blockinfo::{bh4, bw4, for_each_txb_ex, has_chroma, max_tx_depth, mi_cols, mi_rows};
 use crate::tables::{BLOCK_SIZES, DC_PRED, DCT_DCT};
 use crate::types::*;
 use crate::writer::{
-    Error, Extras, LayoutCounts, NoHook, Output, Record, TileSkip, Writer, layout_counts, tile_layout,
+    Error, Extras, LayoutCounts, NoHook, Output, Record, RefPicture, RefSlots, TileSkip, Writer, layout_counts_ex,
+    tile_layout,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,6 +62,19 @@ pub(crate) fn fmacf(a: f32, b: f32, c: f32) -> f32 {
 /// [`Hybrid::closed_loop`] flags (AV1ENC_HYBRID_GIVEN_CHROMA): the blocks' uv_mode /
 /// angle_delta_uv / cfl_alpha_* are decided already.
 pub const GIVEN_CHROMA: i32 = 1;
+
+/// A frame of a stream for [`Hybrid::closed_loop_ex`] (av1enc_hybrid_closed_loop_ex).
+#[derive(Clone, Copy, Debug)]
+pub struct Video<'a> {
+    /// the frame's video fields: video, frame_type, ref_slot, refresh_frame_flags,
+    /// error_resilient_mode, lf_inter_off, allow_screen_content_tools (the rest is ignored)
+    pub fp: FrameParams,
+    /// inter frames: one per block (empty: every block intra). Inter blocks are skip blocks
+    /// (tx_depth 0, intra fields 0): they copy LAST_FRAME at their motion vector.
+    pub inter: &'a [BlockInter],
+    /// inter frames: LAST_FRAME's picture (the decoder's output of the frame in fp.ref_slot)
+    pub reference: Option<RefPicture<'a>>,
+}
 
 /// The Metal encoder's dead zone (GpParams rnd, zbin).
 const QUANT_RND: f64 = 0.375;
@@ -129,6 +143,8 @@ pub struct Hybrid {
     threads: usize,
     src_changed: Vec<bool>,
     keep_chroma: Vec<bool>,
+    /// the last closed loop coded an inter frame (its tiles aren't kept)
+    last_inter: bool,
 }
 
 impl Default for Hybrid {
@@ -179,6 +195,7 @@ impl Hybrid {
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             src_changed: Vec::new(),
             keep_chroma: Vec::new(),
+            last_inter: false,
         }
     }
 
@@ -202,6 +219,39 @@ impl Hybrid {
         tile_cols_log2: i32,
         tile_rows_log2: i32,
     ) -> Result<(), Error> {
+        self.closed_loop_ex(
+            y,
+            u,
+            v,
+            width,
+            height,
+            blocks,
+            luma_tx,
+            flags,
+            qindex,
+            tile_cols_log2,
+            tile_rows_log2,
+            None,
+        )
+    }
+
+    /// av1enc_hybrid_closed_loop_ex: [`Hybrid::closed_loop`] for a frame of a stream. An inter
+    /// frame's tiles are coded afresh, and the next picture's aren't kept from it.
+    pub fn closed_loop_ex(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: u32,
+        height: u32,
+        blocks: &[Block],
+        luma_tx: Option<&[u8]>,
+        flags: i32,
+        qindex: i32,
+        tile_cols_log2: i32,
+        tile_rows_log2: i32,
+        video: Option<&Video>,
+    ) -> Result<(), Error> {
         let (w, h) = (width as usize, height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let n = blocks.len();
@@ -214,6 +264,7 @@ impl Hybrid {
             || u.len() < cw * ch
             || v.len() < cw * ch
             || luma_tx.is_some_and(|l| l.len() < n)
+            || video.is_some_and(|v| !v.inter.is_empty() && v.inter.len() != n)
         {
             return Err(error(ERR_INVALID, "bad arguments"));
         }
@@ -227,6 +278,7 @@ impl Hybrid {
             qindex,
             tile_cols_log2,
             tile_rows_log2,
+            video,
         );
         if r.is_err() {
             // the source and the records were overwritten: nothing is kept
@@ -249,9 +301,20 @@ impl Hybrid {
         qindex: i32,
         tile_cols_log2: i32,
         tile_rows_log2: i32,
+        video: Option<&Video>,
     ) -> Result<(), Error> {
         let t0 = Instant::now();
         let given_chroma = flags & GIVEN_CHROMA != 0;
+        let inter_frame = video.is_some_and(|v| v.fp.frame_type == FRAME_INTER);
+        if inter_frame || self.last_inter {
+            // tiles are kept by their decisions and source, which an inter block's reference
+            // isn't part of
+            for m in &mut self.mem {
+                m.valid = false;
+                m.payload_valid = false;
+            }
+        }
+        self.last_inter = inter_frame;
         self.cur ^= 1;
         let cur = self.cur;
         let Hybrid {
@@ -273,6 +336,8 @@ impl Hybrid {
             keep_chroma,
             ..
         } = self;
+        let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
+        let is_inter = |b: usize| inter.get(b).is_some_and(|i| i.is_inter != 0);
         let reuse = *reuse;
         let [r0, r1] = recs;
         let (rec, prev) = if cur == 0 { (r0, &*r1) } else { (r1, &*r0) };
@@ -289,6 +354,14 @@ impl Hybrid {
             tile_rows_log2: tile_rows_log2 as i8,
             ..FrameParams::default()
         };
+        if let Some(v) = video {
+            let f = &mut rec.fp;
+            (f.video, f.frame_type, f.ref_slot) = (v.fp.video, v.fp.frame_type, v.fp.ref_slot);
+            (f.refresh_frame_flags, f.error_resilient_mode) = (v.fp.refresh_frame_flags, v.fp.error_resilient_mode);
+            (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
+        }
+        rec.inter.clear();
+        rec.inter.extend_from_slice(inter);
         let (mc, mr) = (mi_cols(width as i32), mi_rows(height as i32));
         let (sb_cols, sb_rows) = (((mc + 15) >> 4) as usize, ((mr + 15) >> 4) as usize);
         let (mcu, mru) = (mc as usize, mr as usize);
@@ -324,6 +397,10 @@ impl Hybrid {
         rec.blocks.clear();
         rec.blocks.extend_from_slice(given);
         let n = given.len();
+        // inter blocks are skip blocks; elsewhere skip is the closed loop's
+        for (i, b) in rec.blocks.iter_mut().enumerate() {
+            b.skip = is_inter(i) as u8;
+        }
         if !given_chroma {
             // the chroma decisions read the blocks' areas: no block outside the padded source
             for b in &rec.blocks {
@@ -370,8 +447,8 @@ impl Hybrid {
         let qi = qindex as u8;
         if given_chroma {
             // the GPU decided chroma: only the fields the closed loop sets
-            for b in &mut rec.blocks {
-                (b.skip, b.tx_depth, b.sb_qindex) = (0, 0, qi);
+            for (i, b) in rec.blocks.iter_mut().enumerate() {
+                (b.skip, b.tx_depth, b.sb_qindex) = (is_inter(i) as u8, 0, qi);
             }
         } else {
             // A tile whose source and block positions are unchanged keeps its chroma decisions:
@@ -428,10 +505,11 @@ impl Hybrid {
                         }
                         d.tx0 = tiles.mi_col_starts[tc] as i32 * 4;
                         d.ty0 = tiles.mi_row_starts[tr] as i32 * 4;
-                        (b.skip, b.tx_depth, b.sb_qindex) = (0, 0, qi);
+                        let copy = b.skip != 0; // an inter block (given as skip)
+                        (b.skip, b.tx_depth, b.sb_qindex) = (copy as u8, 0, qi);
                         (b.uv_mode, b.angle_delta_uv, b.cfl_alpha_u, b.cfl_alpha_v) = (DC_PRED as u8, 0, 0, 0);
                         let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
-                        if has_chroma(bs, r, c, false) {
+                        if !copy && has_chroma(bs, r, c, false) {
                             d.best_chroma(c * 4, r * 4, bs, b);
                         }
                     }
@@ -533,10 +611,16 @@ impl Hybrid {
             flags: ENC_FIX_RANGE | ENC_PREFILTER_RECON,
             seq_level_idx: -1,
         };
+        let mut slots: RefSlots = [None; 8];
+        if let Some(v) = video
+            && inter_frame
+        {
+            slots[(v.fp.ref_slot & 7) as usize] = v.reference;
+        }
         let extras = Extras {
             tile_skip: Some(&skips),
             record_syms: false,
-            refs: None,
+            refs: inter_frame.then_some(&slots),
         };
         writer.encode_with_hook(rec.as_mut(), &opts, Some(&hook), &extras, out)?;
         if *reused_count > 0 {
@@ -854,6 +938,8 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
         return rec.layout().map(drop);
     }
     let fp = rec.fp;
+    let inter = &rec.inter;
+    let tile_inter = |b0: usize, b1: usize| if inter.is_empty() { &inter[..] } else { &inter[b0..b1] };
     let mut counts: Vec<(usize, usize, Result<LayoutCounts, i32>)> = (0..ntiles)
         .map(|i| {
             (
@@ -868,7 +954,7 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
         threads,
         &mut counts,
         || (),
-        |_, (b0, b1, c)| *c = layout_counts(&fp, &blocks[*b0..*b1]),
+        |_, (b0, b1, c)| *c = layout_counts_ex(&fp, &blocks[*b0..*b1], tile_inter(*b0, *b1)),
     );
     let mut base = Vec::with_capacity(ntiles);
     let (mut nt, mut nc) = (0u32, 0u64);
@@ -884,6 +970,7 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
     rec.block_txb[n] = nt;
     struct Fill<'a> {
         blocks: &'a [Block],
+        inter: &'a [BlockInter],
         block_txb: &'a mut [u32],
         txb: &'a mut [Txb],
         t0: u32,
@@ -899,6 +986,7 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
             let t1 = if i + 1 < ntiles { base[i + 1].0 } else { nt };
             Fill {
                 blocks: &blocks[b0..b1],
+                inter: tile_inter(b0, b1),
                 block_txb: take_range(&mut bt, &mut bat, b0, b1),
                 txb: take_range(&mut tx, &mut tat, t0 as usize, t1 as usize),
                 t0,
@@ -917,11 +1005,12 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
                 f.block_txb[j] = f.t0 + k as u32;
                 let bs = b.bsize as i32;
                 let depth = (b.tx_depth as i32).min(max_tx_depth(bs));
-                for_each_txb(
+                for_each_txb_ex(
                     bs,
                     b.mi_row as i32,
                     b.mi_col as i32,
                     depth,
+                    f.inter.get(j).is_some_and(|i| i.is_inter != 0),
                     mono,
                     mi_r,
                     mi_c,

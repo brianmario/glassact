@@ -158,8 +158,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
 
         /// Sets `keep` from the new source against the previous one, and remembers the new one.
+        /// `skip` (per SB, raster): SBs the caller won't use the analysis of (an inter frame's
+        /// copies), kept without analysis; one whose source changed keeps the source its analysis
+        /// is of, so that a later picture analyzes it.
         func markUnchanged(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-                           width: Int, height: Int, sbCols: Int, sbRows: Int) {
+                           width: Int, height: Int, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil) {
             let cw = (width + 1) / 2, ch = (height + 1) / 2
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
             let k = keep.contents().assumingMemoryBound(to: UInt8.self)
@@ -194,8 +197,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             staleCount = 0
             for r in 0..<sbRows {
                 for c in 0..<sbCols {
-                    let isStale = changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
-                        || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1)
+                    let skipped = skip.map { $0[r * sbCols + c] != 0 } ?? false
+                    let isStale = !skipped && (changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
+                        || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1))
                     k[r * sbCols + c] = isStale ? 0 : 1
                     if isStale {
                         list[staleCount] = UInt32(r * sbCols + c)
@@ -210,7 +214,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 let side = p == 0 ? 64 : 32
                 previous![p].withUnsafeMutableBufferPointer { old in
                     for sr in 0..<sbRows {
-                        for sc in 0..<sbCols where changed[sr * sbCols + sc] {
+                        for sc in 0..<sbCols where changed[sr * sbCols + sc] && skip.map({ $0[sr * sbCols + sc] == 0 }) ?? true {
                             let x0 = sc * side, y0 = sr * side
                             guard x0 < w, y0 < h else { continue }
                             let n = min(side, w - x0)
@@ -455,9 +459,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     /// Starts `partition` without waiting for it. (With `profilesStages` on,
     /// the stages run to completion first.)
+    /// `skip` (per 64×64, raster; with `reusesAnalysis`): superblocks whose analysis
+    /// the caller doesn't need, which keep the previous picture's where it has one.
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-                               width: Int, height: Int, qindex: Int) throws -> PendingPartition {
-        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false)
+                               width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil) throws -> PendingPartition {
+        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
+                          skip: skip)
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
 
@@ -501,7 +508,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// With `closedLoop` false the closed loop's buffers (reconstruction,
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-             width: Int, height: Int, qindex: Int, closedLoop: Bool = true) throws {
+             width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil) throws {
             self.encoder = encoder
             self.width = width
             self.height = height
@@ -623,7 +630,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var sbKeep: (any MTLBuffer)?, sbList: (any MTLBuffer)?
             if let cache {
                 cache.markUnchanged(y: y, u: u, v: v, width: width, height: height,
-                                    sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4)
+                                    sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4,
+                                    skip: skip?.count == ((miCols + 15) >> 4) * ((miRows + 15) >> 4) ? skip : nil)
                 sbKeep = keep(cache.keep)
                 sbList = keep(cache.stale)
             }

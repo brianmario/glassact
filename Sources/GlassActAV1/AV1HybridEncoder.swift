@@ -60,6 +60,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var keptTiles = 0.0
         /// The share of 64×64s filtered anew.
         public var filtered = 1.0
+        /// Inter frames: the share of 64×64s copied from the previous picture (unchanged or
+        /// shifted), and of those at a shift; the time deciding them.
+        public var copied = 0.0, shifted = 0.0, motion = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -78,6 +81,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     let metal: AV1MetalEncoder
     let postfilter: AV1MetalPostfilter
     let cpu: OpaquePointer
+    let motion: OpaquePointer
 
     /// The analysis's search effort; `turbo` by default.
     public var preset: AV1MetalEncoder.Preset {
@@ -140,6 +144,18 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.leafChromaAngledModes = newValue }
     }
 
+    /// Code every picture after the first as an inter frame of one stream
+    /// (off: each picture is a still key frame). A 64×64 whose source equals
+    /// the previous picture's, unchanged or at a whole-sample shift (scrolling,
+    /// a dragged window), becomes skip inter blocks that copy the previous
+    /// decoded picture, which the deblocking leaves alone; the rest is coded as
+    /// before, as intra blocks. Each inter frame references the one before it.
+    public var interFrames = false
+
+    /// The last picture, for the next inter frame: its source, decoded
+    /// output and per-64×64 decisions (copy, dx, dy).
+    private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
+
     /// Deblocking and CDEF (on). Off, the picture is the closed loop's
     /// reconstruction as is, and a tile decodes to the same samples alone
     /// as in its frame (the filters cross tile edges).
@@ -163,11 +179,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.leafTxSearchPixels = 128
         metal.leafChromaAngledModes = false
         postfilter = try AV1MetalPostfilter(device: device)
-        guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
+        guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
+        self.motion = motion
     }
 
-    deinit { av1enc_hybrid_destroy(cpu) }
+    deinit {
+        av1enc_hybrid_destroy(cpu)
+        av1enc_motion_destroy(motion)
+    }
 
     /// One picture.
     public func encode(_ picture: Picture, qindex: Int) throws -> Frame {
@@ -177,58 +197,129 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         return frame
     }
 
-    /// Pictures 0..<count, each an intra frame: picture i + 1's analysis runs
-    /// on the GPU while picture i is finished on the CPU. `output` gets them
-    /// in order.
+    /// Pictures 0..<count: picture i + 1's analysis runs on the GPU while
+    /// picture i is finished on the CPU. `output` gets them in order. With
+    /// `interFrames`, they're one stream: the first a key frame and the rest
+    /// inter frames.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
+        previous = nil
         var current = try picture(0)
-        var pending = try begin(current, qindex: qindex)
+        var pending = try begin(current, after: nil, qindex: qindex)
         for i in 0..<count {
-            let partition = try pending.wait()
+            let partition = try pending.partition.wait()
             let t0 = CACurrentMediaTime()
             var timing = Timing()
             timing.analysis = metal.lastGPUSeconds
             let sbs = ((2 * ((current.width + 7) >> 3) + 15) >> 4) * ((2 * ((current.height + 7) >> 3) + 15) >> 4)
-            timing.kept = Double(pending.keptSuperblocks) / Double(max(1, sbs))
+            timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
+            timing.motion = pending.motionSeconds
+            let motion = pending.motion
             var next: Picture?
             if i + 1 < count {
                 let n = try picture(i + 1)
-                pending = try begin(n, qindex: qindex)
+                pending = try begin(n, after: current, qindex: qindex)
                 next = n
             }
-            let frame = try finish(current, partition: partition, qindex: qindex, timing: timing, started: t0)
+            let frame = try finish(current, partition: partition, motion: motion, qindex: qindex, timing: timing, started: t0)
             try output(i, frame)
             if let next { current = next }
         }
     }
 
-    private func begin(_ p: Picture, qindex: Int) throws -> AV1MetalEncoder.PendingPartition {
-        try p.y.withUnsafeBufferPointer { y in
+    /// A picture's analysis under way, and its copies (an inter frame's).
+    private struct Pending {
+        var partition: AV1MetalEncoder.PendingPartition
+        /// Per 64×64: copy, dx, dy (nil: a key frame or a still picture).
+        var motion: [Int32]?
+        var motionSeconds = 0.0
+    }
+
+    /// Starts picture `p`'s analysis. With `interFrames` and the picture before it (`prev`, of the
+    /// same size), its 64×64s that copy that picture are decided first and not analyzed.
+    private func begin(_ p: Picture, after prev: Picture?, qindex: Int) throws -> Pending {
+        var sbMotion: [Int32]?
+        var skip: [UInt8]?
+        let tm = CACurrentMediaTime()
+        if interFrames, let prev, prev.width == p.width, prev.height == p.height {
+            let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
+            var m = [Int32](repeating: 0, count: 3 * nsb)
+            Self.planes(p) { cur in
+                Self.planes(prev) { before in
+                    let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
+                    _ = av1enc_motion_classify(motion, cur, strides, before, strides, Int32(p.width), Int32(p.height), 3, 8, &m)
+                }
+            }
+            sbMotion = m
+            skip = (0..<nsb).map { UInt8(m[3 * $0]) }
+        }
+        let seconds = CACurrentMediaTime() - tm
+        let partition = try p.y.withUnsafeBufferPointer { y in
             try p.u.withUnsafeBufferPointer { u in
                 try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
-                                             width: p.width, height: p.height, qindex: qindex)
+                                             width: p.width, height: p.height, qindex: qindex, skip: skip)
                 }
             }
         }
+        return Pending(partition: partition, motion: sbMotion, motionSeconds: seconds)
     }
 
-    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, qindex: Int, timing: Timing,
-                        started t0: Double) throws -> Frame {
+    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,
+                        timing: Timing, started t0: Double) throws -> Frame {
         var timing = timing
         var message = [CChar](repeating: 0, count: 256)
+        let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
+        // an inter frame: the copies, and the blocks with them
+        var video = av1g_frame_params()
+        var blocks = partition.blocks, lumaTx = partition.lumaTxTypes, inter: [av1g_block_inter] = []
+        var sbMotion: [Int32] = []
+        let reference = sbMotionIn != nil ? previous : nil
+        if interFrames {
+            video.video = 1
+            if reference != nil, let sbMotionIn {
+                video.frame_type = UInt8(AV1G_FRAME_INTER)
+                video.refresh_frame_flags = 1  // slot 0: always the previous picture
+                video.lf_inter_off = 1
+                video.allow_screen_content_tools = 1
+                sbMotion = sbMotionIn
+                let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count
+                var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?
+                let n = partition.blocks.withUnsafeBufferPointer { b in
+                    partition.lumaTxTypes.withUnsafeBufferPointer { t in
+                        av1enc_motion_apply(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
+                                            Int32(p.width), Int32(p.height), &outBlocks, &outInter, &outTx)
+                    }
+                }
+                guard n > 0, let outBlocks, let outInter, let outTx else { throw Failure.encode("motion: no blocks") }
+                blocks = Array(UnsafeBufferPointer(start: outBlocks, count: Int(n)))
+                inter = Array(UnsafeBufferPointer(start: outInter, count: Int(n)))
+                lumaTx = Array(UnsafeBufferPointer(start: outTx, count: Int(n)))
+                let nsb = sbCols0 * sbRows0
+                timing.copied = Double(copies) / Double(nsb)
+                timing.shifted = Double((0..<nsb).filter { sbMotion[3 * $0] != 0 && (sbMotion[3 * $0 + 1] != 0 || sbMotion[3 * $0 + 2] != 0) }.count) / Double(nsb)
+            }
+        }
+        let refPlanes = reference?.planes ?? []
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
-                    partition.blocks.withUnsafeBufferPointer { blocks in
-                        partition.lumaTxTypes.withUnsafeBufferPointer { types in
-                            av1enc_hybrid_closed_loop(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
-                                                      UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
-                                                      gpuDecides ? types.baseAddress : nil,
-                                                      gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
-                                                      Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &message, 256)
+                    blocks.withUnsafeBufferPointer { blocks in
+                        lumaTx.withUnsafeBufferPointer { types in
+                            inter.withUnsafeBufferPointer { inter in
+                                Self.reference(refPlanes, width: p.width) { ref in
+                                    withUnsafePointer(to: video) { vp in
+                                    av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
+                                                                 UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
+                                                                 gpuDecides ? types.baseAddress : nil,
+                                                                 gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
+                                                                 Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2),
+                                                                 interFrames ? vp : nil, inter.isEmpty ? nil : inter.baseAddress,
+                                                                 ref, &message, 256)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -253,15 +344,25 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(Int(stride))
         }
         let n = Int(record.pointee.n_blocks)
-        guard postfilters else { return try write(p, record: record, recon: recon, timing: timing, t0: t0, t1: t1) }
-        let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
+        guard postfilters else {
+            let frame = try write(p, record: record, recon: recon, timing: timing, t0: t0, t1: t1)
+            remember(p, frame, sbMotion)
+            return frame
+        }
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
-        let known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
+        let known: Bool
+        if reference != nil {
+            known = reusesAnalysis && Self.unchangedForFilters(now: sbMotion, before: previous?.motion ?? [], sbCols: sbCols0,
+                                                               sbRows: sbRows0, into: &changed)
+        } else {
+            known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
+        }
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
-                                           changed: known ? changed : nil)
-        let sbCols = (2 * ((p.width + 7) >> 3) + 15) >> 4
+                                           changed: known ? changed : nil,
+                                           lfZero: inter.isEmpty ? nil : inter.map(\.is_inter))
+        let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
         timing.filtered = postfilter.lastFilteredShare
@@ -280,7 +381,63 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let t3 = CACurrentMediaTime()
         timing.writer = t3 - t2
         timing.wall = t3 - t0
-        return Frame(obu: obu, planes: search.planes, params: search.params, timing: timing)
+        let frame = Frame(obu: obu, planes: search.planes, params: search.params, timing: timing)
+        remember(p, frame, sbMotion)
+        return frame
+    }
+
+    /// The picture the next inter frame references.
+    private func remember(_ p: Picture, _ frame: Frame, _ sbMotion: [Int32]) {
+        previous = interFrames ? (p, frame.planes, sbMotion) : nil
+    }
+
+    /// Per 64×64 of an inter frame, nonzero (into `changed`) unless its reconstruction before the
+    /// filters, its blocks and its source are the previous picture's: a copy at no motion now,
+    /// that was a copy in the previous picture (an inter frame's `now`, `before` its decisions),
+    /// where no 64×64 around it was coded then (deblocking an edge with an intra block changes
+    /// both sides, and the copy now holds that). False when the previous picture wasn't an
+    /// inter frame.
+    static func unchangedForFilters(now: [Int32], before: [Int32], sbCols: Int, sbRows: Int,
+                                    into changed: inout [UInt8]) -> Bool {
+        let nsb = sbCols * sbRows
+        guard now.count == 3 * nsb, before.count == 3 * nsb else { return false }
+        for r in 0..<sbRows {
+            for c in 0..<sbCols {
+                let s = r * sbCols + c
+                var same = now[3 * s] != 0 && now[3 * s + 1] == 0 && now[3 * s + 2] == 0
+                for dr in -1...1 where same {
+                    for dc in -1...1 where r + dr >= 0 && r + dr < sbRows && c + dc >= 0 && c + dc < sbCols {
+                        if before[3 * ((r + dr) * sbCols + c + dc)] == 0 { same = false }
+                    }
+                }
+                changed[s] = same ? 0 : 1
+            }
+        }
+        return true
+    }
+
+    /// A picture's planes as C pointers.
+    static func planes<R>(_ p: Picture, _ body: ([UnsafePointer<UInt8>?]) throws -> R) rethrows -> R {
+        try p.y.withUnsafeBufferPointer { y in
+            try p.u.withUnsafeBufferPointer { u in
+                try p.v.withUnsafeBufferPointer { v in try body([y.baseAddress, u.baseAddress, v.baseAddress]) }
+            }
+        }
+    }
+
+    /// The reference picture (cropped planes, tight) as av1g_ref_planes; nil when there's none.
+    static func reference<R>(_ planes: [[UInt8]], width: Int, _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+        guard planes.count == 3 else { return body(nil) }
+        return planes[0].withUnsafeBufferPointer { y in
+            planes[1].withUnsafeBufferPointer { u in
+                planes[2].withUnsafeBufferPointer { v in
+                    var r = av1g_ref_planes()
+                    r.plane = (y.baseAddress, u.baseAddress, v.baseAddress)
+                    r.stride = (Int32(width), Int32((width + 1) / 2), Int32((width + 1) / 2))
+                    return body(&r)
+                }
+            }
+        }
     }
 
     /// The picture without post-filters: the record's parameters (no deblocking, no CDEF) and the

@@ -664,6 +664,95 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
+    h: *mut HybridHandle,
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    w: u32,
+    hgt: u32,
+    blocks: *const Block,
+    n: u32,
+    luma_tx: *const u8,
+    flags: c_int,
+    qindex: c_int,
+    tile_cols_log2: c_int,
+    tile_rows_log2: c_int,
+    video: *const FrameParams,
+    inter: *const BlockInter,
+    reference: *const RefPlanesC,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || y.is_null() || u.is_null() || v.is_null() || blocks.is_null() || n == 0 || w < 1 || hgt < 1 {
+        unsafe { set_error_raw(err, errlen, "bad arguments") };
+        return ERR_INVALID;
+    }
+    // SAFETY: tight 4:2:0 planes, n blocks, n luma tx types and n inter entries when given, and
+    // the reference's planes of the picture's size at their strides (av1enc.h).
+    let hh = unsafe { &mut *h };
+    let (cw, ch) = (w.div_ceil(2) as usize, hgt.div_ceil(2) as usize);
+    let (y, u, v, blocks) = unsafe {
+        (
+            slice::from_raw_parts(y, w as usize * hgt as usize),
+            slice::from_raw_parts(u, cw * ch),
+            slice::from_raw_parts(v, cw * ch),
+            slice::from_raw_parts(blocks, n as usize),
+        )
+    };
+    let luma_tx = (!luma_tx.is_null()).then(|| unsafe { slice::from_raw_parts(luma_tx, n as usize) });
+    let inter: &[BlockInter] = if inter.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(inter, n as usize) }
+    };
+    let mut pic = None;
+    if !reference.is_null() {
+        let r = unsafe { &*reference };
+        let mut p = writer::RefPicture::default();
+        for k in 0..3 {
+            let sub = (k != 0) as u32;
+            let (pw, ph) = ((w + sub) >> sub, (hgt + sub) >> sub);
+            let stride = r.stride[k].max(0) as usize;
+            if r.plane[k].is_null() || stride < pw as usize {
+                unsafe { set_error_raw(err, errlen, "reference: a plane is missing or its stride too small") };
+                return ERR_INVALID;
+            }
+            p.plane[k] = unsafe { slice::from_raw_parts(r.plane[k], (ph as usize - 1) * stride + pw as usize) };
+            p.stride[k] = stride;
+        }
+        pic = Some(p);
+    }
+    let vid = (!video.is_null()).then(|| crate::hybrid::Video {
+        fp: unsafe { *video },
+        inter,
+        reference: pic,
+    });
+    let r = hh.h.closed_loop_ex(
+        y,
+        u,
+        v,
+        w,
+        hgt,
+        blocks,
+        luma_tx,
+        flags,
+        qindex,
+        tile_cols_log2,
+        tile_rows_log2,
+        vid.as_ref(),
+    );
+    hh.rec = hh.h.record_c();
+    match r {
+        Ok(()) => OK,
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_record(h: *mut HybridHandle) -> *mut DecisionRecord {
     // SAFETY: h came from av1enc_hybrid_create; the view stays valid until the next call.
     unsafe { &mut (*h).rec }
@@ -927,51 +1016,50 @@ pub extern "C" fn av1t_tx_type_allowed(tx_sz: i32, tx_type: i32) -> i32 {
 // ---- av1enc.h: motion for screen content (crate::motion) ----
 
 #[unsafe(no_mangle)]
-pub extern "C" fn av1enc_motion_create() -> *mut crate::motion::ShiftFinder {
-    Box::into_raw(Box::new(crate::motion::ShiftFinder::new()))
+pub extern "C" fn av1enc_motion_create() -> *mut crate::motion::Motion {
+    Box::into_raw(Box::new(crate::motion::Motion::new()))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn av1enc_motion_destroy(m: *mut crate::motion::ShiftFinder) {
+pub unsafe extern "C" fn av1enc_motion_destroy(m: *mut crate::motion::Motion) {
     if !m.is_null() {
         // SAFETY: m came from av1enc_motion_create
         drop(unsafe { Box::from_raw(m) });
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn av1enc_motion_candidates(
-    m: *mut crate::motion::ShiftFinder,
-    y: *const u8,
-    stride: c_int,
+/// `planes` planes (Y w x h, chroma half, rounded up) at their strides.
+unsafe fn motion_planes<'a>(
+    p: *const *const u8,
+    s: *const c_int,
     width: c_int,
     height: c_int,
-    changed: *const u8,
-    sb_cols: c_int,
-    sb_rows: c_int,
-    max: c_int,
-    out: *mut i32,
-) -> c_int {
-    // SAFETY: the finder; a luma plane of height rows `stride` apart; sb_cols x sb_rows flags; 2 * max ints.
-    let (w, h, s) = (width as usize, height as usize, stride as usize);
-    let plane = crate::motion::Plane {
-        data: unsafe { slice::from_raw_parts(y, s * (h - 1) + w) },
-        stride: s,
-        width: w,
-        height: h,
+    planes: c_int,
+) -> [crate::motion::Plane<'a>; 3] {
+    let mk = |i: usize| {
+        let (w, h) = if i == 0 {
+            (width as usize, height as usize)
+        } else {
+            ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
+        };
+        // SAFETY: the caller's planes
+        unsafe {
+            let st = *s.add(i) as usize;
+            crate::motion::Plane {
+                data: slice::from_raw_parts(*p.add(i), st * (h - 1) + w),
+                stride: st,
+                width: w,
+                height: h,
+            }
+        }
     };
-    let changed = unsafe { slice::from_raw_parts(changed, (sb_cols * sb_rows) as usize) };
-    let c = unsafe { (*m).candidates(&plane, changed, sb_cols as usize, max as usize) };
-    let out = unsafe { slice::from_raw_parts_mut(out, 2 * max as usize) };
-    for (i, s) in c.iter().enumerate() {
-        out[2 * i] = s.dx;
-        out[2 * i + 1] = s.dy;
-    }
-    c.len() as c_int
+    let three = planes == 3;
+    [mk(0), mk(if three { 1 } else { 0 }), mk(if three { 2 } else { 0 })]
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn av1enc_motion_sb_matches(
+pub unsafe extern "C" fn av1enc_motion_classify(
+    m: *mut crate::motion::Motion,
     cur: *const *const u8,
     cur_stride: *const c_int,
     prev: *const *const u8,
@@ -979,36 +1067,78 @@ pub unsafe extern "C" fn av1enc_motion_sb_matches(
     width: c_int,
     height: c_int,
     planes: c_int,
-    sb_x: c_int,
-    sb_y: c_int,
-    dx: c_int,
-    dy: c_int,
+    max_candidates: c_int,
+    out: *mut i32,
 ) -> c_int {
-    // SAFETY: `planes` planes each (Y w x h, chroma half, rounded up) at their strides.
-    let mk = |p: *const *const u8, s: *const c_int, i: usize| unsafe {
-        let (w, h) = if i == 0 {
-            (width as usize, height as usize)
-        } else {
-            ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
-        };
-        let st = *s.add(i) as usize;
-        crate::motion::Plane {
-            data: slice::from_raw_parts(*p.add(i), st * (h - 1) + w),
-            stride: st,
-            width: w,
-            height: h,
-        }
+    if m.is_null() || width < 1 || height < 1 || (planes != 1 && planes != 3) {
+        return -1;
+    }
+    // SAFETY: the handle; both pictures' planes; out holds 3 ints per 64x64 (av1enc.h)
+    let (c, q) = unsafe {
+        (
+            motion_planes(cur, cur_stride, width, height, planes),
+            motion_planes(prev, prev_stride, width, height, planes),
+        )
     };
-    let n = planes as usize;
-    let c = [
-        mk(cur, cur_stride, 0),
-        mk(cur, cur_stride, if n == 3 { 1 } else { 0 }),
-        mk(cur, cur_stride, if n == 3 { 2 } else { 0 }),
-    ];
-    let q = [
-        mk(prev, prev_stride, 0),
-        mk(prev, prev_stride, if n == 3 { 1 } else { 0 }),
-        mk(prev, prev_stride, if n == 3 { 2 } else { 0 }),
-    ];
-    crate::motion::sb_matches(&c, &q, n, sb_x as usize, sb_y as usize, crate::motion::Shift { dx, dy }) as c_int
+    let m = unsafe { &mut *m };
+    let n = m.classify(&c, &q, planes as usize, max_candidates.max(0) as usize);
+    if !out.is_null() {
+        let o = unsafe { slice::from_raw_parts_mut(out, 3 * m.sbs.len()) };
+        for (k, s) in m.sbs.iter().enumerate() {
+            o[3 * k..3 * k + 3].copy_from_slice(&[s.copy as i32, s.shift.dx, s.shift.dy]);
+        }
+    }
+    n as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_apply(
+    m: *mut crate::motion::Motion,
+    sb_motion: *const i32,
+    blocks: *const Block,
+    n: u32,
+    luma_tx: *const u8,
+    width: c_int,
+    height: c_int,
+    out_blocks: *mut *const Block,
+    out_inter: *mut *const BlockInter,
+    out_luma_tx: *mut *const u8,
+) -> c_int {
+    if m.is_null() || blocks.is_null() || width < 1 || height < 1 {
+        return -1;
+    }
+    // SAFETY: the handle; 3 ints per 64x64 when given; n blocks and n luma tx types when given;
+    // the outputs point into the handle until its next call (av1enc.h)
+    let m = unsafe { &mut *m };
+    let b = unsafe { slice::from_raw_parts(blocks, n as usize) };
+    let l = (!luma_tx.is_null()).then(|| unsafe { slice::from_raw_parts(luma_tx, n as usize) });
+    let sb_cols = (width as usize).div_ceil(64);
+    let nsb = sb_cols * (height as usize).div_ceil(64);
+    let sbs: Vec<crate::motion::SbMotion> = if sb_motion.is_null() {
+        Vec::new()
+    } else {
+        let t = unsafe { slice::from_raw_parts(sb_motion, 3 * nsb) };
+        t.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| crate::motion::SbMotion {
+                copy: c[0] != 0,
+                shift: crate::motion::Shift { dx: c[1], dy: c[2] },
+            })
+            .collect()
+    };
+    m.apply(
+        &sbs,
+        sb_cols,
+        b,
+        l,
+        crate::blockinfo::mi_rows(height),
+        crate::blockinfo::mi_cols(width),
+    );
+    unsafe {
+        *out_blocks = m.blocks.as_ptr();
+        *out_inter = m.inter.as_ptr();
+        *out_luma_tx = m.luma_tx.as_ptr();
+    }
+    m.blocks.len() as c_int
 }

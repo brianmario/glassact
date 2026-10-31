@@ -260,6 +260,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames from exact copies (2026-10-31)
+
+**What changed:** `AV1HybridEncoder.interFrames` (`av1seq --inter`) codes a sequence as one stream: a key frame, then inter frames that each reference the frame before.
+- **Writer** (Rust): inter frames in video mode, with one reference (LAST_FRAME), whole-sample motion vectors, EIGHTTAP, and `primary_ref_frame` NONE. Each frame needs only its reference picture. Random inter sequences decode exactly in libaom, dav1d and aomdec.
+- **Copies:** per 64×64, before the GPU analysis (`rust/av1/src/motion.rs`):
+  - A 64×64 whose source equals the previous picture's, unchanged or at a whole-sample shift (candidates from row and column hashes, and the left and upper neighbours' shifts), becomes skip inter blocks at that shift.
+  - The GPU doesn't analyze copied 64×64s.
+  - The rest is coded intra, as before.
+- **Filters:** `lf_inter_off` codes loop filter ref deltas (INTRA_FRAME 0, LAST_FRAME −63), so inter blocks are at level 0. A copy of already-filtered content stays as it was, and only edges next to intra blocks are deblocked. Both post-filters (Rust and Metal) apply it; the region filtering treats a copy as unchanged when it was a copy, with no coded 64×64 around it, in the previous picture too.
+
+**Results:** 5120×2880, 4×4 tiles, q20, turbo, M4 Pro, the first 100 frames of each trace. Every frame decoded by libaom in order, equal to the encoder's picture.
+
+| Trace | fps | Key frame | Inter frames, mean | Copied (at a shift) | Mbit/s at the trace's timing: all / inter frames only | Key frames only (before) | PSNR-Y |
+|---|---|---|---|---|---|---|---|
+| typing-cc | 92 | 551 KB | 2.4 KB | 99.9 % (0 %) | 0.6 / 0.17 | 38.7 | 47.3 |
+| scroll-win | 59 | 473 KB | 10.1 KB | 98.7 % (4.9 %) | 2.4 / 1.6 | 79 | 48.8 |
+| photos | 22 | 1.08 MB | 108 KB | 87.1 % (52.3 %) | 21.0 / 18.6 | 190 | 42.7 |
+| cursor-drag | 85 | 510 KB | 2.8 KB | 99.9 % (0 %) | 1.2 / 0.42 | 84 | 47.6 |
+
+- **Against the pinned HEVC loop** (2.4 / 5.0 / 10.9 / 4.4 Mbit/s, measured over the whole traces earlier, with rate control): typing, scrolling and dragging come in under it, and photos at about twice it.
+  - The spans differ, so the comparison is rough: here the first 100 frames (4.6–11.6 s), where the key frame is most of the bytes for typing and drag.
+  - Quality isn't matched either: these are q20 throughout, and a copy keeps the quality its content was coded at.
+  - Not re-measured against HEVC: no hardware-encoder benches while the owner is connected.
+- **Photos' 13 % of 64×64s that aren't exact copies cost almost a key frame's share each.** That's the photos app's animated transitions (scaling, fading). This needs real motion search: inexact matches with a residual.
+- **Analysis skipped for copies:** same bytes, and speed went from 36.6 to 59.1 fps (scroll-win) and from 6.9 to 22.2 fps (photos).
+- **Deciding the copies** costs 1.0–1.2 ms a frame on typing and drag, 3.3 ms on scroll and 14.8 ms on photos. It runs on the CPU before the GPU starts, mostly in one thread: it's the next thing to speed up.
+
+**Not done yet:**
+- The analysis, rate estimates and CDFs still assume key-frame syntax for intra blocks in inter frames.
+- Tiles aren't kept across inter frames: every inter frame runs the closed loop and the writer over every tile.
+- References the Viewer has acknowledged (loss recovery): every frame references the one before.
+
 ### Tiles as AV1: lossless and lossy AVIF, and the Metal encoder, against VP8L (2026-10-31)
 
 **What was compared:** changed 64×64 tiles, measured per tile.

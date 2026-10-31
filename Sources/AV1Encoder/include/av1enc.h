@@ -90,6 +90,17 @@ void av1enc_hybrid_destroy(av1enc_hybrid *h);
 int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
                               uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
                               int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
+// av1enc_hybrid_closed_loop for a frame of a stream: video (null: a still picture) supplies the
+// frame's video fields (video, frame_type, ref_slot, refresh_frame_flags, error_resilient_mode,
+// lf_inter_off, allow_screen_content_tools; the rest is ignored). An inter frame takes inter (one
+// per block, or null: all intra) and ref, LAST_FRAME's picture (the decoder's output of the frame
+// in ref_slot: planes of the picture's size at their strides). Inter blocks are skip blocks
+// (tx_depth 0, intra fields 0) and copy the reference at their motion vector. An inter frame's
+// tiles are coded afresh, and the next picture's aren't kept from it.
+int av1enc_hybrid_closed_loop_ex(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
+                                 uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
+                                 int qindex, int tile_cols_log2, int tile_rows_log2, const av1g_frame_params *video,
+                                 const av1g_block_inter *inter, const av1g_ref_planes *ref, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
 // The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp) and
 // every 64x64's cdef_idx (raster, sb_cols wide; -1 as 0): [TD,] sequence header and frame. A tile
@@ -111,21 +122,27 @@ const uint8_t *av1enc_hybrid_source(const av1enc_hybrid *h, int plane, int *stri
 // the last call's seconds: 0 chroma decisions, 1 closed loop
 double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 
-// Motion for screen content (rust/av1/src/motion.rs): candidate whole-pixel shifts between pictures,
-// from per-band row and column hashes of the luma plane, and exact superblock copies.
+// Motion for screen content (rust/av1/src/motion.rs): superblocks that are exact copies of the
+// previous picture's source, unchanged or at a whole-pixel shift, made inter blocks.
 typedef struct av1enc_motion av1enc_motion;
 av1enc_motion *av1enc_motion_create(void);
 void av1enc_motion_destroy(av1enc_motion *m);
-// Up to max (dx, dy) pairs into out, best supported first, excluding (0, 0), for this picture's luma
-// against the previous call's; changed: per 64x64 (raster, sb_cols x sb_rows), nonzero where the
-// picture changed. Returns the count (0 on a first picture or a new size).
-int av1enc_motion_candidates(av1enc_motion *m, const uint8_t *y, int stride, int width, int height,
-                             const uint8_t *changed, int sb_cols, int sb_rows, int max, int32_t *out);
-// 1 if superblock (sb_x, sb_y) of cur (planes: 1 = Y, 3 = Y, U, V of 4:2:0) equals prev at (dx, dy)
-// over its part of the picture, the displaced area inside prev.
-int av1enc_motion_sb_matches(const uint8_t *const cur[3], const int cur_stride[3], const uint8_t *const prev[3],
-                             const int prev_stride[3], int width, int height, int planes, int sb_x, int sb_y,
-                             int dx, int dy);
+// Per 64x64 (raster) of cur: whether it equals prev unchanged, or else at a candidate shift (the
+// left or upper neighbour's, or up to max_candidates from row and column hashes; even and at most
+// 1000 samples each way). `planes` planes (1 or 3: Y w x h, chroma half that, rounded up) at their
+// strides. out (optional): 3 ints per 64x64, copy (0/1), dx, dy (it copies prev at x + dx,
+// y + dy). Returns the copies' count.
+int av1enc_motion_classify(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
+                           const uint8_t *const prev[3], const int prev_stride[3], int width, int height, int planes,
+                           int max_candidates, int32_t *out);
+// A classify's decisions (sb_motion, as its out) applied to a partition in coding order (and its
+// luma tx types, if given): every copied 64x64's blocks replaced by the largest legal blocks, skip
+// inter blocks at its shift. *out_blocks / *out_inter / *out_luma_tx (one each per block) live in
+// m until its next apply. Returns the block count.
+int av1enc_motion_apply(av1enc_motion *m, const int32_t *sb_motion, const av1g_block *blocks, uint32_t n,
+                        const uint8_t *luma_tx, int width,
+                        int height, const av1g_block **out_blocks, const av1g_block_inter **out_inter,
+                        const uint8_t **out_luma_tx);
 
 #ifdef __cplusplus
 }

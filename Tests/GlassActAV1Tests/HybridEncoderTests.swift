@@ -135,3 +135,64 @@ extension HybridEncoderTests {
         #expect(kept > 0.5, "\(width)×\(height): almost nothing was kept (\(kept) pictures' worth)")
     }
 }
+
+extension HybridEncoderTests {
+    /// Inter frames: a window scrolling over a page of glyphs, words typed elsewhere, pictures
+    /// that don't change; one stream that libaom decodes in order to exactly the pictures the
+    /// encoder reports (each of which the next frame references), with scrolled 64×64s copied at
+    /// their shift and unchanged ones copied as they are.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(1280, 720, 80, 2), (333, 201, 120, -1)])
+    func interStreamsDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interFrames = true
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x5c01)
+        let cw = (width + 1) / 2
+        // the page: glyph-like luma, tinted chroma
+        let (pw, ph) = (width / 2, height * 3)
+        var page = [UInt8](repeating: 230, count: pw * ph), pageU = [UInt8](repeating: 120, count: (pw / 2) * (ph / 2))
+        for k in page.indices where rng.int(0..<4) == 0 { page[k] = UInt8(rng.int(20..<90)) }
+        for k in pageU.indices { pageU[k] = UInt8(100 + (k / 37) % 40) }
+        let (wx, wy) = ((width / 4) & ~1, (height / 6) & ~1)
+        let wh = min(ph - 2 * height, height - wy - 8) & ~1
+        var pictures: [AV1HybridEncoder.Picture] = []
+        var y = base.y, u = base.u
+        var top = 0
+        for i in 0..<12 {
+            if i % 4 != 3 { top += 2 * rng.int(1..<12) }  // every fourth picture, no scroll
+            for r in 0..<wh {
+                for c in 0..<pw where wx + c < width { y[(wy + r) * width + wx + c] = page[(top + r) * pw + c] }
+            }
+            for r in 0..<wh / 2 {
+                for c in 0..<pw / 2 where (wx / 2) + c < cw { u[(wy / 2 + r) * cw + wx / 2 + c] = pageU[(top / 2 + r) * (pw / 2) + c] }
+            }
+            if i % 3 == 1 {  // a word typed at the top left
+                let x0 = rng.int(0..<max(1, wx - 24)), y0 = rng.int(0..<max(1, wy - 12))
+                for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { y[r * width + c] = 40 } }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: u, v: base.v, width: width, height: height))
+        }
+        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2)"
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var copied = 0.0, shifted = 0.0
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            copied += f.timing.copied
+            shifted += f.timing.shifted
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        #expect(copied > 0 && shifted > 0, "\(label): copied \(copied), shifted \(shifted): the copies weren't exercised")
+    }
+}

@@ -353,6 +353,11 @@ struct YUV420 {
     static func decode(_ stream: [UInt8], width: Int, height: Int) throws -> YUV420 {
         guard let dec = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
         defer { glassact_aom_dec_destroy(dec) }
+        return try decode(stream, width: width, height: height, with: dec)
+    }
+
+    /// The next frame of a stream `dec` is decoding.
+    static func decode(_ stream: [UInt8], width: Int, height: Int, with dec: OpaquePointer) throws -> YUV420 {
         var f = glassact_aom_frame()
         guard glassact_aom_dec_decode(dec, stream, stream.count, &f) == 0 else { throw BenchError("libaom couldn't decode the stream") }
         guard Int(f.width) == width, Int(f.height) == height else { throw BenchError("libaom decoded \(f.width)×\(f.height)") }

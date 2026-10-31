@@ -10,7 +10,7 @@
 //! - [`ShiftFinder`] proposes candidate offsets from per-band row and column hashes.
 //! - [`sb_matches`] checks that a superblock is an exact copy at an offset.
 //! - [`inter_sb_cover`] covers a superblock with the largest legal blocks.
-use crate::types::Block;
+use crate::types::{Block, BlockInter};
 
 /// A whole-pixel offset into the previous picture: the superblock at (x, y) copies (x + dx, y + dy).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -116,17 +116,15 @@ pub fn inter_sb_cover(mi_rows: i32, mi_cols: i32, sb_row: i32, sb_col: i32, temp
 /// Candidate shifts from the previous picture to this one, from 64-sample bands: per band of
 /// columns, row hashes (vertical motion), and per band of rows, column hashes (horizontal motion).
 /// Each band votes for the offsets at which its rows (columns) reappear; offsets that enough rows
-/// agree on, in some band, are proposed. Keeps the previous picture's hashes between calls.
+/// agree on, in some band, are proposed. Only bands with a changed superblock are hashed, in both
+/// pictures.
 #[derive(Default)]
 pub struct ShiftFinder {
-    rows: Vec<u64>,
-    cols: Vec<u64>,
-    prev_rows: Vec<u64>,
-    prev_cols: Vec<u64>,
-    width: usize,
-    height: usize,
+    now: Vec<u64>,
+    before: Vec<u64>,
     index: Vec<(u64, u32)>,
     votes: Vec<(i32, u32)>,
+    col_hash: Vec<u32>,
 }
 
 impl ShiftFinder {
@@ -134,56 +132,45 @@ impl ShiftFinder {
         ShiftFinder::default()
     }
 
-    /// Hashes `y` (the luma plane) and returns up to `max` candidate shifts, best supported first,
-    /// excluding no motion. Bands where `changed` (per 64x64, raster, `sb_cols` wide) is all zero
-    /// are skipped. The first call, or one with a new size, returns none.
-    pub fn candidates(&mut self, y: &Plane, changed: &[u8], sb_cols: usize, max: usize) -> Vec<Shift> {
-        let (w, h) = (y.width, y.height);
-        let bands_x = w.div_ceil(64);
-        let bands_y = h.div_ceil(64);
-        std::mem::swap(&mut self.rows, &mut self.prev_rows);
-        std::mem::swap(&mut self.cols, &mut self.prev_cols);
-        self.rows.resize(bands_x * h, 0);
-        self.cols.resize(bands_y * w, 0);
-        // row hashes per band of columns, column hashes per band of rows
-        for row in 0..h {
-            let line = &y.data[row * y.stride..][..w];
-            for b in 0..bands_x {
-                self.rows[b * h + row] = hash(&line[b * 64..w.min(b * 64 + 64)]);
-            }
-        }
-        for b in 0..bands_y {
-            let r1 = h.min(b * 64 + 64);
-            for col in 0..w {
-                let mut k = 0xcbf2_9ce4_8422_2325u64;
-                for row in b * 64..r1 {
-                    k = (k ^ y.data[row * y.stride + col] as u64).wrapping_mul(0x100_0000_01b3);
-                }
-                self.cols[b * w + col] = k;
-            }
-        }
-        let fresh = self.width != w || self.height != h;
-        self.width = w;
-        self.height = h;
-        if fresh {
+    /// Up to `max` candidate shifts from `prev` to `cur` (luma planes of one size), best supported
+    /// first, excluding no motion. Bands where `changed` (per 64x64, raster, `sb_cols` wide) is all
+    /// zero are skipped.
+    pub fn candidates(&mut self, cur: &Plane, prev: &Plane, changed: &[u8], sb_cols: usize, max: usize) -> Vec<Shift> {
+        let (w, h) = (cur.width, cur.height);
+        if prev.width != w || prev.height != h {
             return Vec::new();
         }
         let sb_rows = changed.len() / sb_cols.max(1);
         let mut found: Vec<(Shift, u32)> = Vec::new();
-        // vertical: band of columns b, its rows now against before
-        for b in 0..bands_x {
+        // vertical: per band of columns, its rows now against before
+        for b in 0..w.div_ceil(64) {
             if !(0..sb_rows).any(|r| changed.get(r * sb_cols + b).copied().unwrap_or(0) != 0) {
                 continue;
             }
-            for (s, n) in self.vote(b * h, h, true) {
+            let (x0, x1) = (b * 64, w.min(b * 64 + 64));
+            self.now.clear();
+            self.now
+                .extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
+            self.before.clear();
+            self.before
+                .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
+            for (s, n) in self.vote() {
                 found.push((Shift { dx: 0, dy: s }, n));
             }
         }
-        for b in 0..bands_y {
+        // horizontal: per band of rows, its columns
+        for b in 0..h.div_ceil(64) {
             if !(0..sb_cols).any(|c| changed.get(b * sb_cols + c).copied().unwrap_or(0) != 0) {
                 continue;
             }
-            for (s, n) in self.vote(b * w, w, false) {
+            let (y0, y1) = (b * 64, h.min(b * 64 + 64));
+            self.col_hashes(cur, y0, y1);
+            self.now.clear();
+            self.now.extend(self.col_hash.iter().map(|&k| k as u64));
+            self.col_hashes(prev, y0, y1);
+            self.before.clear();
+            self.before.extend(self.col_hash.iter().map(|&k| k as u64));
+            for (s, n) in self.vote() {
                 found.push((Shift { dx: s, dy: 0 }, n));
             }
         }
@@ -200,14 +187,23 @@ impl ShiftFinder {
         merged.into_iter().take(max).map(|(s, _)| s).collect()
     }
 
-    /// For one band (`n` hashes at `base`): offsets d (now[i] == before[i + d], d != 0) supported by
-    /// at least 8 lines, each with its count. Lines that repeat (blank rows) don't vote.
-    fn vote(&mut self, base: usize, n: usize, rows: bool) -> Vec<(i32, u32)> {
-        let (now, before) = if rows {
-            (&self.rows[base..base + n], &self.prev_rows[base..base + n])
-        } else {
-            (&self.cols[base..base + n], &self.prev_cols[base..base + n])
-        };
+    /// FNV-1a (32-bit) down each column of rows y0..y1, all columns at once (it vectorizes).
+    fn col_hashes(&mut self, y: &Plane, y0: usize, y1: usize) {
+        let w = y.width;
+        self.col_hash.clear();
+        self.col_hash.resize(w, 0x811c_9dc5);
+        for row in y0..y1 {
+            let line = &y.data[row * y.stride..][..w];
+            for (k, &v) in self.col_hash.iter_mut().zip(line) {
+                *k = (*k ^ v as u32).wrapping_mul(0x0100_0193);
+            }
+        }
+    }
+
+    /// Offsets d (now[i] == before[i + d], d != 0) supported by at least 8 lines, each with its
+    /// count. Lines that repeat (blank rows) don't vote.
+    fn vote(&mut self) -> Vec<(i32, u32)> {
+        let (now, before) = (&self.now, &self.before);
         self.index.clear();
         self.index
             .extend(before.iter().enumerate().map(|(i, &k)| (k, i as u32)));
@@ -232,15 +228,170 @@ impl ShiftFinder {
     }
 }
 
+/// The largest shift (each way, in luma samples) a copy uses: every motion vector, and its
+/// difference from any candidate the writer codes it against, stays in AV1's range.
+pub const MAX_SHIFT: i32 = 1000;
+
+/// A superblock's decision: copied from the previous picture at `shift` (no motion: unchanged), or
+/// coded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SbMotion {
+    pub copy: bool,
+    pub shift: Shift,
+}
+
+/// Exact copies for a picture (av1enc_motion): which superblocks equal the previous source,
+/// unchanged or at a shift ([`Motion::classify`]), and the picture's blocks with those superblocks
+/// made inter blocks ([`Motion::apply`]).
+pub struct Motion {
+    finder: ShiftFinder,
+    /// per 64x64, raster: the last [`Motion::classify`]'s
+    pub sbs: Vec<SbMotion>,
+    pub sb_cols: usize,
+    pub sb_rows: usize,
+    pub blocks: Vec<Block>,
+    pub inter: Vec<BlockInter>,
+    pub luma_tx: Vec<u8>,
+    threads: usize,
+}
+
+impl Default for Motion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Motion {
+    pub fn new() -> Motion {
+        Motion {
+            finder: ShiftFinder::new(),
+            sbs: Vec::new(),
+            sb_cols: 0,
+            sb_rows: 0,
+            blocks: Vec::new(),
+            inter: Vec::new(),
+            luma_tx: Vec::new(),
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+        }
+    }
+
+    /// Per 64x64 of `cur`: whether it equals `prev` ([`sb_matches`]) unchanged, or else at a
+    /// candidate shift: its left or upper neighbour's, or one of up to `max_candidates` from
+    /// [`ShiftFinder`]. Returns how many are copies.
+    pub fn classify(&mut self, cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
+        let (sb_cols, sb_rows) = (cur[0].width.div_ceil(64), cur[0].height.div_ceil(64));
+        (self.sb_cols, self.sb_rows) = (sb_cols, sb_rows);
+        self.sbs.clear();
+        self.sbs.resize(sb_cols * sb_rows, SbMotion::default());
+        let same = cur[0].width == prev[0].width && cur[0].height == prev[0].height;
+        if !same {
+            return 0;
+        }
+        // unchanged, rows of superblocks on several threads
+        let rows_per = sb_rows.div_ceil(self.threads.max(1)).max(1);
+        std::thread::scope(|sc| {
+            for (k, part) in self.sbs.chunks_mut(rows_per * sb_cols).enumerate() {
+                sc.spawn(move || {
+                    for (i, m) in part.iter_mut().enumerate() {
+                        let s = k * rows_per * sb_cols + i;
+                        m.copy = sb_matches(cur, prev, planes, s % sb_cols, s / sb_cols, Shift::default());
+                    }
+                });
+            }
+        });
+        let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
+        if changed.iter().all(|&c| c == 0) {
+            return self.sbs.len();
+        }
+        let usable = |s: &Shift| {
+            s.dx.abs() <= MAX_SHIFT && s.dy.abs() <= MAX_SHIFT && (planes == 1 || (s.dx & 1 == 0 && s.dy & 1 == 0))
+        };
+        let cands: Vec<Shift> = self
+            .finder
+            .candidates(&cur[0], &prev[0], &changed, sb_cols, max_candidates)
+            .into_iter()
+            .filter(usable)
+            .collect();
+        for s in 0..self.sbs.len() {
+            if self.sbs[s].copy {
+                continue;
+            }
+            let (x, y) = (s % sb_cols, s / sb_cols);
+            let moved = |m: SbMotion| (m.copy && m.shift != Shift::default()).then_some(m.shift);
+            let left = if x > 0 { moved(self.sbs[s - 1]) } else { None };
+            let up = if y > 0 { moved(self.sbs[s - sb_cols]) } else { None };
+            let found = up
+                .into_iter()
+                .chain(left)
+                .chain(cands.iter().copied())
+                .find(|&d| sb_matches(cur, prev, planes, x, y, d));
+            if let Some(d) = found {
+                self.sbs[s] = SbMotion { copy: true, shift: d };
+            }
+        }
+        self.sbs.iter().filter(|m| m.copy).count()
+    }
+
+    /// `blocks` (a partition in coding order; with `luma_tx`, their luma tx types) with every
+    /// superblock `sbs` copies (per 64x64, raster, `sb_cols` wide) replaced by its
+    /// [`inter_sb_cover`]: skip inter blocks at its shift, intra fields 0, luma tx type 0. Into
+    /// [`Motion::blocks`], [`Motion::inter`] (one per block) and [`Motion::luma_tx`].
+    pub fn apply(
+        &mut self,
+        sbs: &[SbMotion],
+        sb_cols: usize,
+        blocks: &[Block],
+        luma_tx: Option<&[u8]>,
+        mi_rows: i32,
+        mi_cols: i32,
+    ) {
+        self.blocks.clear();
+        self.inter.clear();
+        self.luma_tx.clear();
+        let template = Block {
+            skip: 1,
+            ..Default::default()
+        };
+        let mut last = usize::MAX;
+        for (i, b) in blocks.iter().enumerate() {
+            let (sr, sc) = (b.mi_row as usize >> 4, b.mi_col as usize >> 4);
+            let s = sr * sb_cols + sc;
+            match sbs.get(s) {
+                Some(m) if m.copy => {
+                    if s != last {
+                        let n0 = self.blocks.len();
+                        inter_sb_cover(mi_rows, mi_cols, sr as i32, sc as i32, &template, &mut self.blocks);
+                        let mv = BlockInter {
+                            mv_row: (m.shift.dy * 8) as i16,
+                            mv_col: (m.shift.dx * 8) as i16,
+                            is_inter: 1,
+                            ..Default::default()
+                        };
+                        self.inter.resize(self.blocks.len(), mv);
+                        self.luma_tx.resize(self.blocks.len(), 0);
+                        debug_assert!(self.blocks.len() > n0);
+                    }
+                }
+                _ => {
+                    self.blocks.push(*b);
+                    self.inter.push(BlockInter::default());
+                    self.luma_tx.push(luma_tx.map_or(0, |l| l[i]));
+                }
+            }
+            last = s;
+        }
+    }
+}
+
 #[inline]
 fn hash(b: &[u8]) -> u64 {
     let mut k = 0x9e37_79b9_7f4a_7c15u64 ^ b.len() as u64;
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rest) = b.as_chunks::<8>();
+    for c in chunks {
+        let v = u64::from_le_bytes(*c);
         k = (k ^ v).wrapping_mul(0xff51_afd7_ed55_8ccd).rotate_left(29);
     }
-    for &v in chunks.remainder() {
+    for &v in rest {
         k = (k ^ v as u64).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     }
     k ^ (k >> 32)
@@ -319,8 +470,7 @@ mod tests {
         let (a, b) = (frame(0), frame(37 * 2)); // scrolled down by 74 rows
         let changed = vec![1u8; w.div_ceil(64) * h.div_ceil(64)];
         let mut f = ShiftFinder::new();
-        assert!(f.candidates(&plane(&a, w, h), &changed, w.div_ceil(64), 4).is_empty());
-        let c = f.candidates(&plane(&b, w, h), &changed, w.div_ceil(64), 4);
+        let c = f.candidates(&plane(&b, w, h), &plane(&a, w, h), &changed, w.div_ceil(64), 4);
         assert_eq!(c.first(), Some(&Shift { dx: 0, dy: 74 }), "{c:?}");
         let (pa, pb) = (plane(&a, w, h), plane(&b, w, h));
         let y = [pb, pb, pb];
