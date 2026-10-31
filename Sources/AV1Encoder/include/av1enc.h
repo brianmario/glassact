@@ -91,6 +91,16 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
                               uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
                               int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
+// The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp) and
+// every 64x64's cdef_idx (raster, sb_cols wide; -1 as 0): [TD,] sequence header and frame. A tile
+// whose closed loop was kept, and whose cdef_idx values and cdef_bits are as last written, keeps
+// its bytes. *obu is malloc'd (free it).
+int av1enc_hybrid_write(av1enc_hybrid *h, const av1g_frame_params *fp, const int8_t *sb_cdef, int sb_cols,
+                        uint8_t **obu, size_t *size, char *err, size_t errlen);
+// Keep unchanged tiles' closed loop and bitstream from picture to picture (on by default).
+void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
+// Tiles the last closed loop kept.
+uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h);
 const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane);
 // the source the last call coded, padded by edge replication to whole superblocks (at least the
 // post-filters' MiCols*4 x MiRows*4, chroma half): rows *stride apart

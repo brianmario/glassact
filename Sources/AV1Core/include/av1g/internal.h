@@ -78,8 +78,18 @@ struct ParseStore {
 };
 int parse_obus(const uint8_t *obus, size_t n, ParseStore &ps, std::string &err);
 
+// Glass Act: a tile the caller already has (its blocks unchanged since it was coded): skip walking
+// it, and take its payload as given (an empty payload if null). Its blocks' outputs (txb eob,
+// reconstruction) are the caller's to fill.
+struct TileSkip {
+    bool skip = false;
+    const std::vector<uint8_t> *payload = nullptr;
+};
+
 int encode_with_hook(av1g_decision_record *rec, const av1g_encode_opts *opts, av1g_output *out, TxbHook *hook,
-                     std::vector<std::vector<uint32_t>> *tileSyms = nullptr);
+                     std::vector<std::vector<uint32_t>> *tileSyms = nullptr,
+                     const std::vector<TileSkip> *skip = nullptr,
+                     std::vector<std::vector<uint8_t>> *tilePayloads = nullptr);
 
 }  // namespace av1g
 #endif

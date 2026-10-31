@@ -304,6 +304,26 @@ kept, the frame is the CPU's again. At 5K the closed loop takes 60 ms,
 filters 19, chroma bookkeeping 8 and the writer 6. Next: unchanged tiles
 could keep their closed loop and bitstream too.
 
+**Tiles kept across pictures (kept).** Prediction never crosses a tile and its
+CDFs start afresh. So a tile whose blocks' decisions and source are unchanged
+keeps its coefficients and reconstruction (av1core's `TileSkip`, the hybrid's
+`TileMem`). It keeps its bytes too while its cdef_idx values and cdef_bits
+are as last written (`av1enc_hybrid_write`). The bytes are still identical to
+fresh encoding (HybridEncoderTests).
+
+| trace, size | analysis kept only | + tiles kept | tiles kept |
+|---|---|---|---|
+| typing-cc 720p | 83.6 fps | **90.9 fps** (closed loop 6.2 → 3.2 ms, writer 1.3 → 0.7) | 94 % |
+| scroll-win 720p | 61.0 fps | 60.4 fps | 49 % |
+| typing-cc 1080p | 39.9 fps | **52.8 fps** | 94 % |
+| typing-cc 5K, 3×3 | 9.6 fps | **19.7 fps** (closed loop 60 → 9.7 ms, writer 5.8 → 0.6) | 99 % |
+
+What's left:
+- At 720p, the GPU's 9 ms with 97 % kept: every block's thread still
+  launches to find its SB kept.
+- At 5K, the filters (19 ms, whole frame) and the CPU's fixed costs: source
+  padding and recon copies of the whole frame, and per-block bookkeeping.
+
 ### AV1HybridEncoder: sustained speed on frame sequences (2026-10-30)
 
 The hybrid is now a product class, `GlassActAV1.AV1HybridEncoder`. Its CPU

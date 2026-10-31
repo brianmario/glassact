@@ -97,9 +97,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
-    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · analysis kept %.0f %%",
+    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %%",
                  mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },
-                 mean { $0.kept } / 10))
+                 mean { $0.kept } / 10, mean { $0.keptTiles } / 10))
 
     if opts.has("aom-speed") {
         let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8)

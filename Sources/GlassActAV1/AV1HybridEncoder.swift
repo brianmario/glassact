@@ -56,6 +56,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var analysis = 0.0, chroma = 0.0, closedLoop = 0.0, filters = 0.0, writer = 0.0
         /// The share of superblocks whose analysis was kept from the previous picture.
         public var kept = 0.0
+        /// The share of tiles whose closed loop (and, mostly, bytes) were kept.
+        public var keptTiles = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -103,7 +105,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// default.
     public var reusesAnalysis: Bool {
         get { metal.reusesAnalysis }
-        set { metal.reusesAnalysis = newValue }
+        set {
+            metal.reusesAnalysis = newValue
+            av1enc_hybrid_set_reuse(cpu, newValue ? 1 : 0)
+        }
     }
 
     public init(device: any MTLDevice) throws {
@@ -188,6 +193,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         timing.chroma = av1enc_hybrid_seconds(cpu, 0)
         timing.closedLoop = av1enc_hybrid_seconds(cpu, 1)
+        let tileCount = (1 << max(0, tiling.columnsLog2)) * (1 << max(0, tiling.rowsLog2))
+        timing.keptTiles = Double(av1enc_hybrid_reused_tiles(cpu)) / Double(tileCount)
 
         let t1 = CACurrentMediaTime()
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
@@ -204,22 +211,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides)
         let sbCols = (2 * ((p.width + 7) >> 3) + 15) >> 4
-        for i in 0..<n {
-            let b = record.pointee.blocks[i]
-            record.pointee.blocks[i].cdef_idx = max(0, search.superblockCDEF[(Int(b.mi_row) >> 4) * sbCols + (Int(b.mi_col) >> 4)])
-        }
-        record.pointee.fp = search.params
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
 
-        var output = av1g_output()
-        defer { av1g_output_free(&output) }
-        var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_TD) | UInt32(AV1G_ENC_BITSTREAM_ONLY), seq_level_idx: -1)
-        let wrc = av1g_encode(record, &options, &output)
-        guard wrc == AV1G_OK else {
-            throw Failure.encode("writer (\(wrc)): \(withUnsafeBytes(of: &output.error) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) })")
+        var params = search.params
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var size = 0
+        let wrc = search.superblockCDEF.withUnsafeBufferPointer { cdef in
+            av1enc_hybrid_write(cpu, &params, cdef.baseAddress, Int32(sbCols), &bytes, &size, &message, 256)
         }
-        let obu = Array(UnsafeBufferPointer(start: output.obu, count: output.obu_size))
+        guard wrc == AV1G_OK, let bytes else {
+            throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
+        }
+        defer { free(bytes) }
+        let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
         let t3 = CACurrentMediaTime()
         timing.writer = t3 - t2
         timing.wall = t3 - t0

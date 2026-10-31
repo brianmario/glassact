@@ -536,8 +536,33 @@ struct QuantHook : TxbHook {
 }  // namespace
 }  // namespace av1g
 
+// Glass Act: what a tile was last coded from and to. Prediction never crosses a tile and its CDFs
+// start afresh, so a tile whose blocks' decisions and source are unchanged codes to the same
+// coefficients and reconstruction; and to the same bytes while its cdef_idx values and cdef_bits
+// are unchanged too.
+struct TileMem {
+    bool valid = false, payloadValid = false;
+    std::vector<av1g_block> blocks;  // decisions as given (skip and cdef_idx 0)
+    std::vector<uint8_t> lumaTx;
+    std::vector<uint8_t> skip;       // the closed loop's skip flags
+    std::vector<av1g_txb> txb;       // coeff_off relative to the tile's first
+    std::vector<int16_t> coeffs;
+    std::vector<uint8_t> src[3], recon[3];  // the tile's area (coded area only)
+    std::vector<uint8_t> payload;
+    std::vector<int8_t> cdef;        // its blocks' cdef_idx when payload was written
+    int cdefBits = -1;
+};
+
 struct av1enc_hybrid {
     av1g::Src src;
+    // Glass Act: per-tile reuse (TileMem), for one geometry and quantizer
+    std::vector<TileMem> mem;
+    std::vector<uint8_t> reused;     // this picture's tiles taken from mem
+    std::vector<uint32_t> tileFirst;  // block ranges, tile raster order
+    av1g_tiles tiles;
+    uint64_t key[4] = {0, 0, 0, 0};
+    int reuse = 1;
+    uint32_t reusedCount = 0;
     av1g_decision_record rec;
     std::vector<av1g_block> blocks;
     std::vector<uint32_t> block_txb;
@@ -646,20 +671,189 @@ extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, con
             for (uint32_t t = h->block_txb[b]; t < h->block_txb[b + 1]; t++)
                 if (h->txb[t].plane == 0) h->txb[t].tx_type = luma_tx[b];
     const auto t1 = clk::now();
+    // ---- Glass Act: tiles unchanged since they were last coded keep their closed loop ----
+    const uint32_t ntiles = tiles.rows * tiles.cols;
+    const uint64_t key[4] = {W, H, (uint64_t)(uint32_t)tile_cols_log2 << 32 | (uint32_t)tile_rows_log2, (uint64_t)qindex};
+    if (memcmp(key, h->key, sizeof key) != 0 || h->mem.size() != ntiles) {
+        h->mem.assign(ntiles, TileMem());
+        memcpy(h->key, key, sizeof key);
+    }
+    h->tiles = tiles;
+    h->tileFirst.assign(ntiles + 1, 0);
+    {
+        uint32_t cur = 0;
+        for (uint32_t tr = 0; tr < tiles.rows; tr++)
+            for (uint32_t tc = 0; tc < tiles.cols; tc++) {
+                h->tileFirst[tr * tiles.cols + tc] = cur;
+                while (cur < n) {
+                    const av1g_block &b = h->blocks[cur];
+                    if (b.mi_row < tiles.mi_row_starts[tr] || b.mi_row >= tiles.mi_row_starts[tr + 1] ||
+                        b.mi_col < tiles.mi_col_starts[tc] || b.mi_col >= tiles.mi_col_starts[tc + 1]) break;
+                    cur++;
+                }
+            }
+        h->tileFirst[ntiles] = cur;
+    }
+    // a tile's coded area (luma pixels), and its rows of one plane in a padded plane
+    auto area = [&](uint32_t i, int &x0, int &y0, int &x1, int &y1) {
+        const uint32_t tr = i / tiles.cols, tc = i % tiles.cols;
+        x0 = (int)tiles.mi_col_starts[tc] * 4; x1 = std::min((int)tiles.mi_col_starts[tc + 1], MiCols) * 4;
+        y0 = (int)tiles.mi_row_starts[tr] * 4; y1 = std::min((int)tiles.mi_row_starts[tr + 1], MiRows) * 4;
+    };
+    auto gather = [&](const uint8_t *plane, int stride, int p, uint32_t i, std::vector<uint8_t> &out) {
+        int x0, y0, x1, y1;
+        area(i, x0, y0, x1, y1);
+        const int sub = p ? 1 : 0;
+        x0 >>= sub; y0 >>= sub; x1 >>= sub; y1 >>= sub;
+        out.resize((size_t)(x1 - x0) * (y1 - y0));
+        for (int yy = y0; yy < y1; yy++) memcpy(out.data() + (size_t)(yy - y0) * (x1 - x0), plane + (size_t)yy * stride + x0, x1 - x0);
+    };
+    auto same = [&](const uint8_t *plane, int stride, int p, uint32_t i, const std::vector<uint8_t> &old) {
+        int x0, y0, x1, y1;
+        area(i, x0, y0, x1, y1);
+        const int sub = p ? 1 : 0;
+        x0 >>= sub; y0 >>= sub; x1 >>= sub; y1 >>= sub;
+        if (old.size() != (size_t)(x1 - x0) * (y1 - y0)) return false;
+        for (int yy = y0; yy < y1; yy++)
+            if (memcmp(old.data() + (size_t)(yy - y0) * (x1 - x0), plane + (size_t)yy * stride + x0, x1 - x0)) return false;
+        return true;
+    };
+    auto decisions = [&](uint32_t i, std::vector<av1g_block> &out) {
+        out.assign(h->blocks.begin() + h->tileFirst[i], h->blocks.begin() + h->tileFirst[i + 1]);
+        for (auto &b : out) { b.skip = 0; b.cdef_idx = 0; }
+    };
+    h->reused.assign(ntiles, 0);
+    h->reusedCount = 0;
+    std::vector<TileSkip> skip(ntiles);
+    std::vector<av1g_block> given_;
+    for (uint32_t i = 0; i < ntiles && h->reuse; i++) {
+        TileMem &m = h->mem[i];
+        if (!m.valid) continue;
+        decisions(i, given_);
+        const uint32_t b0 = h->tileFirst[i], nb = h->tileFirst[i + 1] - b0;
+        if (given_.size() != m.blocks.size() || memcmp(given_.data(), m.blocks.data(), sizeof(av1g_block) * nb)) continue;
+        if (luma_tx && memcmp(luma_tx + b0, m.lumaTx.data(), nb)) continue;
+        bool ok = true;
+        for (int p = 0; p < 3 && ok; p++) ok = same(h->src.p[p].data(), h->src.stride[p], p, i, m.src[p]);
+        if (!ok) continue;
+        // the tile's coefficients, tx types and skip flags as they were
+        const uint32_t t0 = h->block_txb[b0], t1 = h->block_txb[b0 + nb];
+        if (t1 - t0 != m.txb.size()) continue;
+        const uint64_t c0 = h->txb[t0].coeff_off;
+        for (uint32_t t = t0; t < t1; t++) {
+            h->txb[t].tx_type = m.txb[t - t0].tx_type;
+            h->txb[t].eob = m.txb[t - t0].eob;
+        }
+        memcpy(h->coeffs.data() + c0, m.coeffs.data(), m.coeffs.size() * sizeof(int16_t));
+        for (uint32_t b = 0; b < nb; b++) h->blocks[b0 + b].skip = m.skip[b];
+        h->reused[i] = 1;
+        skip[i].skip = true;
+        h->reusedCount++;
+    }
     QuantHook hook(h->src, o, 0.12 * step * step, 0.12 * step * step);
     av1g_encode_opts eo = {AV1G_ENC_FIX_RANGE | AV1G_ENC_PREFILTER_RECON, -1};
-    const int rc = encode_with_hook(&h->rec, &eo, &h->out, &hook);
+    const int rc = encode_with_hook(&h->rec, &eo, &h->out, &hook, nullptr, &skip);
     if (rc != AV1G_OK) return fail(rc, h->out.error);
-    for (uint32_t b = 0; b < h->rec.n_blocks; b++) {  // skip flags change no reconstruction before the filters
-        bool zero = true;
-        for (uint32_t t = h->block_txb[b]; t < h->block_txb[b + 1]; t++) zero &= h->txb[t].eob == 0;
-        if (zero) h->blocks[b].skip = 1;
+    for (uint32_t i = 0; i < ntiles; i++) {
+        const uint32_t b0 = h->tileFirst[i], b1 = h->tileFirst[i + 1];
+        if (h->reused[i]) {  // its reconstruction, into the picture's
+            int x0, y0, x1, y1;
+            area(i, x0, y0, x1, y1);
+            for (int p = 0; p < 3; p++) {
+                const int sub = p ? 1 : 0, stride = (int)h->out.recon_w[p];
+                const int px0 = x0 >> sub, py0 = y0 >> sub, w = (x1 - x0) >> sub, hh = (y1 - y0) >> sub;
+                for (int yy = 0; yy < hh; yy++)
+                    memcpy(h->out.recon[p] + (size_t)(py0 + yy) * stride + px0, h->mem[i].recon[p].data() + (size_t)yy * w, w);
+            }
+            continue;
+        }
+        for (uint32_t b = b0; b < b1; b++) {  // skip flags change no reconstruction before the filters
+            bool zero = true;
+            for (uint32_t t = h->block_txb[b]; t < h->block_txb[b + 1]; t++) zero &= h->txb[t].eob == 0;
+            if (zero) h->blocks[b].skip = 1;
+        }
+        // remember it
+        TileMem &m = h->mem[i];
+        decisions(i, m.blocks);
+        m.lumaTx.assign(luma_tx ? luma_tx + b0 : nullptr, luma_tx ? luma_tx + b1 : nullptr);
+        if (!luma_tx) m.lumaTx.clear();
+        m.skip.resize(b1 - b0);
+        for (uint32_t b = b0; b < b1; b++) m.skip[b - b0] = h->blocks[b].skip;
+        const uint32_t t0 = h->block_txb[b0], t1 = h->block_txb[b1];
+        m.txb.assign(h->txb.begin() + t0, h->txb.begin() + t1);
+        const uint64_t c0 = t0 < t1 ? h->txb[t0].coeff_off : 0;
+        const uint64_t c1 = t1 < h->rec.n_txb ? h->txb[t1].coeff_off : h->rec.n_coeffs;
+        for (auto &t : m.txb) t.coeff_off -= (uint32_t)c0;
+        m.coeffs.assign(h->coeffs.begin() + c0, h->coeffs.begin() + c1);
+        for (int p = 0; p < 3; p++) {
+            gather(h->src.p[p].data(), h->src.stride[p], p, i, m.src[p]);
+            gather(h->out.recon[p], (int)h->out.recon_w[p], p, i, m.recon[p]);
+        }
+        m.valid = true;
+        m.payloadValid = false;
     }
     const auto t2 = clk::now();
     h->seconds[0] = std::chrono::duration<double>(t1 - t0).count();
     h->seconds[1] = std::chrono::duration<double>(t2 - t1).count();
     return AV1G_OK;
 }
+
+extern "C" int av1enc_hybrid_write(av1enc_hybrid *h, const av1g_frame_params *fp, const int8_t *sb_cdef, int sb_cols,
+                                   uint8_t **obu, size_t *size, char *err, size_t errlen) {
+    using namespace av1g;
+    if (!h || !fp || !obu || !size) return AV1G_ERR_INVALID;
+    h->rec.fp = *fp;
+    for (uint32_t b = 0; b < h->rec.n_blocks; b++) {
+        av1g_block &k = h->blocks[b];
+        const int8_t c = sb_cdef ? sb_cdef[(k.mi_row >> 4) * sb_cols + (k.mi_col >> 4)] : 0;
+        k.cdef_idx = (uint8_t)(c < 0 ? 0 : c);
+    }
+    // a reused tile keeps its bytes while its cdef_idx values and cdef_bits are as they were coded
+    const uint32_t ntiles = (uint32_t)h->mem.size();
+    std::vector<TileSkip> skip(ntiles);
+    const int cdefBits = fp->enable_cdef ? fp->cdef_bits : -1;
+    for (uint32_t i = 0; i < ntiles && h->reuse; i++) {
+        TileMem &m = h->mem[i];
+        if (!h->reused[i] || !m.payloadValid || m.cdefBits != cdefBits) continue;
+        const uint32_t b0 = h->tileFirst[i], nb = h->tileFirst[i + 1] - b0;
+        if (m.cdef.size() != nb) continue;
+        bool ok = true;
+        for (uint32_t b = 0; b < nb && ok; b++) ok = (int8_t)h->blocks[b0 + b].cdef_idx == m.cdef[b];
+        if (!ok) continue;
+        skip[i].skip = true;
+        skip[i].payload = &m.payload;
+    }
+    av1g_output out;
+    av1g_encode_opts eo = {AV1G_ENC_TD | AV1G_ENC_BITSTREAM_ONLY, -1};
+    std::vector<std::vector<uint8_t>> payloads;
+    const int rc = encode_with_hook(&h->rec, &eo, &out, nullptr, nullptr, &skip, &payloads);
+    if (rc != AV1G_OK) {
+        if (err && errlen) snprintf(err, errlen, "%s", out.error);
+        return rc;
+    }
+    for (uint32_t i = 0; i < ntiles && i < payloads.size(); i++) {
+        if (skip[i].skip) continue;
+        TileMem &m = h->mem[i];
+        if (!m.valid) continue;
+        const uint32_t b0 = h->tileFirst[i], nb = h->tileFirst[i + 1] - b0;
+        m.payload = payloads[i];
+        m.cdef.resize(nb);
+        for (uint32_t b = 0; b < nb; b++) m.cdef[b] = (int8_t)h->blocks[b0 + b].cdef_idx;
+        m.cdefBits = cdefBits;
+        m.payloadValid = true;
+    }
+    *obu = out.obu;
+    *size = out.obu_size;
+    out.obu = nullptr;
+    av1g_output_free(&out);
+    return AV1G_OK;
+}
+
+extern "C" void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on) {
+    h->reuse = on;
+    if (!on) h->mem.clear();
+}
+extern "C" uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h) { return h->reusedCount; }
 
 extern "C" av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h) { return &h->rec; }
 extern "C" const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane) {

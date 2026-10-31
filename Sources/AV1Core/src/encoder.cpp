@@ -226,6 +226,8 @@ public:
     void run(av1g_output *out);
     void parse(const uint8_t *obus, size_t n);
     std::vector<std::vector<uint32_t>> *tileSyms = nullptr;  // if set, record per-tile symbol streams
+    const std::vector<TileSkip> *skipTiles = nullptr;         // Glass Act: tiles not to walk
+    std::vector<std::vector<uint8_t>> *tilePayloadsOut = nullptr;  // Glass Act: if set, every tile's payload
 
 private:
     av1g_decision_record *R;
@@ -1277,8 +1279,13 @@ void Encoder::run(av1g_output *out) {
     std::vector<std::vector<uint8_t>> tileData(ntilesAll);
     std::vector<uint64_t> tileSymbols(ntilesAll, 0), tileFixed(ntilesAll, 0);
     // Glass Act: one tile's coding, by a copy of this encoder (its own tile state, the shared frame)
+    if (skipTiles && skipTiles->size() != ntilesAll) throw Error(AV1G_ERR_INVALID, "tile skip list of %zu for %u tiles", skipTiles->size(), ntilesAll);
     auto codeTile = [&](Encoder &e, uint32_t i) {
         const uint32_t tr = i / tiles.cols, tc = i % tiles.cols;
+        if (skipTiles && (*skipTiles)[i].skip) {  // the caller has this tile
+            if ((*skipTiles)[i].payload) tileData[i] = *(*skipTiles)[i].payload;
+            return;
+        }
         e.cursor = tileFirst[i];
         e.tileEnd = tileFirst[i + 1];
         e.nFixed = 0;
@@ -1330,6 +1337,7 @@ void Encoder::run(av1g_output *out) {
         for (uint32_t w = 0; w < nworkers; w++)
             if (codes[w]) throw Error(codes[w], "%s", errors[w].c_str());
     }
+    if (tilePayloadsOut) *tilePayloadsOut = tileData;
     uint64_t nsym = 0;
     nFixed = 0;
     for (uint32_t i = 0; i < ntilesAll; i++) { nsym += tileSymbols[i]; nFixed += tileFixed[i]; }
@@ -1785,13 +1793,16 @@ extern "C" int av1g_layout(av1g_decision_record *rec, uint32_t txb_cap, uint64_t
 }
 
 int av1g::encode_with_hook(av1g_decision_record *rec, const av1g_encode_opts *opts, av1g_output *out, TxbHook *hook,
-                           std::vector<std::vector<uint32_t>> *tileSyms) {
+                           std::vector<std::vector<uint32_t>> *tileSyms, const std::vector<TileSkip> *skip,
+                           std::vector<std::vector<uint8_t>> *tilePayloads) {
     memset(out, 0, sizeof *out);
     av1g_encode_opts o = {0, -1};
     if (opts) o = *opts;
     try {
         Encoder enc(rec, o, hook);
         enc.tileSyms = tileSyms;
+        enc.skipTiles = skip;
+        enc.tilePayloadsOut = tilePayloads;
         enc.run(out);
         return AV1G_OK;
     } catch (const Error &e) {
