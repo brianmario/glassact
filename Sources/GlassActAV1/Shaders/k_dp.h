@@ -22,6 +22,7 @@ struct DpNode { float J; int8_t p; };
 
 kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]], uint sb [[thread_position_in_grid]]) {
     if (sb >= B.nSb) return;
+    if (B.sbKeep && B.sbKeep[sb]) return;  // Glass Act: unchanged source, so unchanged leaves
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
     const int sbx = (int)(local % I.sbCols) * 64, sby = (int)(local / I.sbCols) * 64;

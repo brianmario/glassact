@@ -89,6 +89,101 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     static let smallMaxPixels = 128
     let dp: any MTLComputePipelineState
     let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
+    /// Keep each superblock's analysis, partition and leaf decisions from the
+    /// previous picture when the source they read hasn't changed (the
+    /// superblock itself and the left, above, above-left, above-right and
+    /// below-left ones, whose edge pixels it predicts from). Screen content
+    /// mostly stands still, so a sequence analyzes only what moved. The
+    /// results are the same as analyzing everything.
+    public var reusesAnalysis = false
+    /// Superblocks kept from the previous picture in the last one.
+    public private(set) var lastKeptSuperblocks = 0
+    var cache: AnalysisCache?
+
+    /// The buffers a picture's analysis leaves behind, and the source it read.
+    final class AnalysisCache {
+        let key: [UInt8]
+        let blockResults: any MTLBuffer, leaves: any MTLBuffer, leafCount: any MTLBuffer
+        let leafDecisions: any MTLBuffer, sbJ: any MTLBuffer, keep: any MTLBuffer
+        var previous: [[UInt8]]? = nil
+        var keptCount = 0
+
+        init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
+            self.key = key
+            func make(_ n: Int) throws -> any MTLBuffer {
+                guard let b = device.makeBuffer(length: max(16, n), options: .storageModeShared)
+                else { throw Failure.metal("no buffer of \(n) bytes") }
+                memset(b.contents(), 0, b.length)
+                return b
+            }
+            blockResults = try make(blocks * MemoryLayout<GpBlockRes>.stride)
+            leaves = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
+            leafCount = try make(nSb * 2)
+            leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
+            sbJ = try make(nSb * 4)
+            keep = try make(nSb)
+        }
+
+        /// Sets `keep` from the new source against the previous one, and remembers the new one.
+        func markUnchanged(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
+                           width: Int, height: Int, sbCols: Int, sbRows: Int) {
+            let cw = (width + 1) / 2, ch = (height + 1) / 2
+            let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
+            let k = keep.contents().assumingMemoryBound(to: UInt8.self)
+            guard let prev = previous else {
+                memset(k, 0, sbCols * sbRows)
+                keptCount = 0
+                previous = planes.map { Array(UnsafeBufferPointer(start: $0.0, count: $0.1 * $0.2)) }
+                return
+            }
+            var changed = [Bool](repeating: false, count: sbCols * sbRows)
+            for (p, (pixels, w, h)) in planes.enumerated() {
+                let side = p == 0 ? 64 : 32
+                prev[p].withUnsafeBufferPointer { old in
+                    for sr in 0..<sbRows {
+                        for sc in 0..<sbCols where !changed[sr * sbCols + sc] {
+                            let x0 = sc * side, y0 = sr * side
+                            guard x0 < w, y0 < h else { continue }
+                            let n = min(side, w - x0)
+                            for row in y0..<min(y0 + side, h) where memcmp(pixels + row * w + x0, old.baseAddress! + row * w + x0, n) != 0 {
+                                changed[sr * sbCols + sc] = true
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+            func changedAt(_ r: Int, _ c: Int) -> Bool { r >= 0 && c >= 0 && r < sbRows && c < sbCols && changed[r * sbCols + c] }
+            keptCount = 0
+            for r in 0..<sbRows {
+                for c in 0..<sbCols {
+                    let stale = changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
+                        || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1)
+                    k[r * sbCols + c] = stale ? 0 : 1
+                    if !stale { keptCount += 1 }
+                }
+            }
+            for (p, (pixels, w, h)) in planes.enumerated() {
+                previous![p].withUnsafeMutableBufferPointer { $0.baseAddress!.update(from: pixels, count: w * h) }
+            }
+        }
+    }
+
+    /// The cache for a picture of this geometry and these settings (made anew
+    /// when they change, so its first picture keeps nothing); nil unless
+    /// `reusesAnalysis`.
+    func analysisCache(width: Int, height: Int, qindex: Int, blocks: Int, superblocks: Int) throws -> AnalysisCache? {
+        guard reusesAnalysis else { cache = nil; return nil }
+        var p = params
+        var key = withUnsafeBytes(of: &p) { Array($0) }
+        for v in [width, height, qindex, tiling.columnsLog2, tiling.rowsLog2, decidesLeaves ? 1 : 0] {
+            withUnsafeBytes(of: v) { key += $0 }
+        }
+        if let cache, cache.key == key { return cache }
+        cache = try AnalysisCache(key: key, device: device, blocks: blocks, superblocks: superblocks)
+        return cache
+    }
+
     /// k_leaf's threadgroup: LEAF_NW SIMD-groups, one leaf each at a time.
     static let leafThreads = 128
     /// After the partition, also decide every leaf's chroma mode and CfL and
@@ -261,6 +356,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// overlaps other work with it, then waits.
     public final class PendingPartition: @unchecked Sendable {
         let run: Run
+        /// Superblocks whose analysis the previous picture's stands for.
+        public var keptSuperblocks: Int { run.keptSuperblocks }
         let commands: (any MTLCommandBuffer)?
 
         init(run: Run, commands: (any MTLCommandBuffer)?) {
@@ -315,6 +412,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The analysis's result per (shape, position), and each shape's grid.
         let blockResults: any MTLBuffer
         let leafDecisions: any MTLBuffer
+        /// Superblocks whose analysis the previous picture's stands for (`reusesAnalysis`).
+        let keptSuperblocks: Int
         /// k_leaf's list of every SB's leaves, and its indirect dispatch.
         let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer
         let decidesLeaves: Bool
@@ -420,7 +519,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let nSb = sbCols * sbRows
             let imageBuffer = try make(MemoryLayout<GpImage>.stride)
             imageBuffer.contents().storeBytes(of: image, as: GpImage.self)
-            let blk = try make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)
+            // the analysis's results: the previous picture's, kept where its source is unchanged
+            let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, blocks: Int(blkTotal),
+                                                  superblocks: sbCols * sbRows)
+            func keep(_ b: any MTLBuffer) -> any MTLBuffer { made.append(b); return b }
+            let blk = try cache.map { keep($0.blockResults) } ?? make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)
             blockResults = blk
             shapeOffset = shOff
             shapeColumns = nbx
@@ -429,13 +532,22 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 starts.contents().storeBytes(of: shTotal[s], toByteOffset: s * 8 + 4, as: UInt32.self)
             }
             let sbImg = try make(nSb * 4)
-            leaves = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
-            leafCount = try make(nSb * 2)
-            leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
+            leaves = try cache.map { keep($0.leaves) } ?? make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
+            leafCount = try cache.map { keep($0.leafCount) } ?? make(nSb * 2)
+            leafDecisions = try cache.map { keep($0.leafDecisions) }
+                ?? make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
             decidesLeaves = encoder.decidesLeaves
             leafOffsets = try make(4 * (nSb + 1))
             leafDispatch = try make(MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
-            let sbJ = try make(nSb * 4)
+            let sbJ = try cache.map { keep($0.sbJ) } ?? make(nSb * 4)
+            var sbKeep: (any MTLBuffer)?
+            if let cache {
+                cache.markUnchanged(y: y, u: u, v: v, width: width, height: height,
+                                    sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4)
+                sbKeep = keep(cache.keep)
+            }
+            keptSuperblocks = cache?.keptCount ?? 0
+            encoder.lastKeptSuperblocks = keptSuperblocks
             sbOut = try make(nSb * MemoryLayout<GpSbOut>.stride)
             oBlocks = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<av1g_block>.stride)
             oBlockTxb = try make(nSb * Int(GP_MAX_LEAVES) * 2)
@@ -477,6 +589,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.stats = AV1MetalEncoder.address(stats)
             batch.bigScratch = UnsafeMutableRawPointer(bitPattern: UInt(scratch.gpuAddress))
             batch.leafDec = AV1MetalEncoder.address(leafDecisions)
+            batch.sbKeep = sbKeep.flatMap { AV1MetalEncoder.address($0) }
             tiles = tl
             buffers = made
         }

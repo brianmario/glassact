@@ -229,6 +229,7 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
         if (leafOff[mid] <= g) lo = mid; else hi = mid;
     }
     const uint32_t sb = lo, k = g - leafOff[sb];
+    if (B.sbKeep && B.sbKeep[sb]) return;  // unchanged source: the previous picture's decisions stand
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
     {

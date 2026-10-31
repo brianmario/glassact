@@ -188,6 +188,9 @@ struct GpBatch {
     GP_DEV uint32_t *sbCyc;           // [nSb] k_recon cycles per SB (profile only, may be null)
     GP_DEV void *bigScratch;          // [max CTAs per wavefront step] x GP_RC_BIG_BYTES (k_recon)
     GP_DEV GpLeafDecision *leafDec;   // Glass Act: [nSb][GP_MAX_LEAVES] (k_leaf), may be null
+    // Glass Act: per SB (raster), 1 = keep the previous picture's analysis, DP and leaf decisions
+    // (the source it reads is unchanged); may be null (compute every SB)
+    GP_DEV const uint8_t *sbKeep;
 };
 
 #endif

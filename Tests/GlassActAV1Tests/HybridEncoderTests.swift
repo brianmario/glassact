@@ -44,3 +44,33 @@ struct HybridEncoderTests {
         }
     }
 }
+
+extension HybridEncoderTests {
+    /// Kept analysis is the analysis: a sequence where only a little moves
+    /// (a caret blinking, a word typed, a region scrolled) codes every picture
+    /// exactly as an encoder that analyzes everything does.
+    @available(macOS 27, *)
+    @Test(arguments: [(1280, 720, 2), (333, 201, -1)])
+    func reusedAnalysisCodesAsFreshAnalysis(width: Int, height: Int, tilesLog2: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let reusing = try AV1HybridEncoder(device: device), fresh = try AV1HybridEncoder(device: device)
+        fresh.reusesAnalysis = false
+        for e in [reusing, fresh] { e.tiling = (tilesLog2, tilesLog2) }
+        let base = PartitionTests.Picture(width: width, height: height)
+        let edits: [(x: Int, y: Int, w: Int, h: Int)] = [(0, 0, 0, 0), (40, 40, 3, 12), (40, 40, 3, 12), (100, 60, 60, 8),
+                                                        (0, 150, width, 20), (width - 5, height - 5, 5, 5)]
+        var pictures: [AV1HybridEncoder.Picture] = []
+        var y = base.y
+        for (i, e) in edits.enumerated() {
+            for r in e.y..<min(height, e.y + e.h) { for c in e.x..<min(width, e.x + e.w) { y[r * width + c] = UInt8(truncatingIfNeeded: 37 * i + r + c) } }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        var kept = 0.0
+        try reusing.encode(count: pictures.count, qindex: 120, picture: { pictures[$0] }, output: { i, frame in
+            kept += frame.timing.kept
+            let alone = try fresh.encode(pictures[i], qindex: 120)
+            #expect(frame.obu == alone.obu, "\(width)×\(height): picture \(i) codes differently with kept analysis")
+        })
+        #expect(kept > 0.5, "\(width)×\(height): almost nothing was kept (\(kept) pictures' worth)")
+    }
+}

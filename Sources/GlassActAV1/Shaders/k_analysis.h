@@ -145,6 +145,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             if (lane == 0) { out.J = GP_INF; out.ncand = 0; }
             continue;
         }
+        if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) continue;  // Glass Act: unchanged source
         const TileBox tb = tile_of(I, x, y);
         const int haveLeft = x > tb.x0, haveAbove = y > tb.y0;
         const int haveAR = ol_decoded(x + W, y - 1, x, y, 0, tb);

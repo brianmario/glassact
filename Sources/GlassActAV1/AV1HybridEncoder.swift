@@ -54,6 +54,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// for the rest, in seconds.
     public struct Timing: Sendable {
         public var analysis = 0.0, chroma = 0.0, closedLoop = 0.0, filters = 0.0, writer = 0.0
+        /// The share of superblocks whose analysis was kept from the previous picture.
+        public var kept = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -95,10 +97,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.decidesLeaves = newValue }
     }
 
+    /// Keep each superblock's analysis from the previous picture when the
+    /// source it reads is unchanged (`AV1MetalEncoder.reusesAnalysis`): the
+    /// same bytes, for a fraction of the GPU's work on screen content. On by
+    /// default.
+    public var reusesAnalysis: Bool {
+        get { metal.reusesAnalysis }
+        set { metal.reusesAnalysis = newValue }
+    }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
         metal.decidesLeaves = true
+        metal.reusesAnalysis = true
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
@@ -127,6 +139,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let t0 = CACurrentMediaTime()
             var timing = Timing()
             timing.analysis = metal.lastGPUSeconds
+            let sbs = ((2 * ((current.width + 7) >> 3) + 15) >> 4) * ((2 * ((current.height + 7) >> 3) + 15) >> 4)
+            timing.kept = Double(pending.keptSuperblocks) / Double(max(1, sbs))
             var next: Picture?
             if i + 1 < count {
                 let n = try picture(i + 1)

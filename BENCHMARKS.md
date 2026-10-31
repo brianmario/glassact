@@ -259,6 +259,51 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: decisions up front on the GPU, and analysis kept across pictures (2026-10-30)
+
+`av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to
+the encoder's picture exactly.
+
+**Leaf decisions on the GPU (`k_leaf`, kept).** After the partition DP, each
+leaf's chroma mode and CfL and its luma tx type are decided from the source
+on the GPU, so the CPU closed loop only quantizes and reconstructs.
+typing-cc 100–139 at 720p, 2×2 tiles:
+
+| | CPU decides | GPU decides |
+|---|---|---|
+| size | 108.9 KB | 108.1 KB |
+| CPU closed loop / chroma | 14.6 / 3.7 ms | 6.9 / 0.8 ms |
+| GPU analysis incl. leaves | 18.2 ms | 24.9 ms |
+| fps | 36.0 | 32.6 (GPU-bound until the next change) |
+
+- A first version took 12 ms of GPU at 720p: one threadgroup per SB served
+  text SBs' ~200 leaves four at a time, and 4×4 chroma left 31 lanes idle.
+  `k_leaf_scan` now lays all leaves out as one list behind an indirect
+  dispatch, and lanes take (mode, plane, 4×4) items. That brought it to
+  ~4.5 ms.
+- Measured without the full GPU pass: transform types alone save 6 % (117.8
+  → 110.9 KB); chroma alone 2.4 %; both together match the CPU's choices.
+
+**Analysis kept across pictures (`reusesAnalysis`, kept, on in the
+hybrid).** The analysis reads only source pixels. An SB whose pixels, and
+those of the left, above, above-left, above-right and below-left SBs its
+edges read, haven't changed keeps the previous picture's block results,
+DP leaves and leaf decisions. HybridEncoderTests check that those code the
+same bytes as fresh analysis.
+
+| trace, frames | size, tiles | no reuse | reuse | kept |
+|---|---|---|---|---|
+| typing-cc 100–139 | 1280×720, 2×2 | 40.4 fps | **83.6 fps** | 97 % |
+| scroll-win 100–139 | 1280×720, 2×2 | 41.4 fps | **61.0 fps** | 59 % |
+| photos 100–139 | 1280×720, 2×2 | 38.2 fps | 39.7 fps | 5 % |
+| typing-cc 100–129 | 1920×1080, 2×2 | 21.1 fps | **39.9 fps** | 99 % |
+| typing-cc 100–109 | 5120×2880, 3×3 | 3.7 fps | **9.6 fps** | 100 % |
+
+The bytes are identical with and without reuse. With most of the analysis
+kept, the frame is the CPU's again. At 5K the closed loop takes 60 ms,
+filters 19, chroma bookkeeping 8 and the writer 6. Next: unchanged tiles
+could keep their closed loop and bitstream too.
+
 ### AV1HybridEncoder: sustained speed on frame sequences (2026-10-30)
 
 The hybrid is now a product class, `GlassActAV1.AV1HybridEncoder`. Its CPU

@@ -22,6 +22,7 @@ let av1SeqCommand = Command(
         .string("preset", "<name>", "analysis preset: slow, base, fast, faster, turbo (default), turbo2, turbo3"),
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
+        .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
         .int("aom-threads", "<n>", 1...64, "libaom worker threads (default 8)"),
@@ -70,6 +71,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.preset = preset
     encoder.tiling = (tileParts[0], tileParts[1])
     encoder.gpuDecides = !opts.has("cpu-decides")
+    encoder.reusesAnalysis = !opts.has("no-reuse")
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
 
     var frames: [AV1HybridEncoder.Frame] = []
@@ -95,8 +97,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
-    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms)",
-                 mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer }))
+    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · analysis kept %.0f %%",
+                 mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },
+                 mean { $0.kept } / 10))
 
     if opts.has("aom-speed") {
         let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8)
