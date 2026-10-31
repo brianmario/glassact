@@ -260,6 +260,21 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter tx blocks code nothing where that's cheaper (2026-10-31)
+
+**What changed:** the closed loop's quantization hook drops an inter tx block's coefficients when coding nothing costs less: SSE + λ against the coded residual's D + λR (`HookOpts.inter_rd_skip`, on in the hybrid). This is libaom realtime's "skip when coding costs more than the distortion" (nonrd_pickmode.c), here per tx block. Before, every inter residual that survived the dead zone was coded.
+
+**BD-rate**, on against off, by PSNR-Y over q 12 / 20 / 28 (first 100 frames, every frame exact):
+
+| Trace | Whole stream | Inter frames |
+|---|---|---|
+| photos 720p | −6.9 % | −7.9 % |
+| scroll-win 720p | −3.3 % | −4.8 % |
+| photos 5K | −2.7 % | −4.2 % |
+
+- **At q20 it trades PSNR for bytes:** 720p photos goes 14.3 → 12.3 KB at 41.29 → 40.81 dB. Equal-quality comparisons need the sweep.
+- **Static content gains a little:** 5K typing 665 → 663 B, drag 856 → 838 B, 720p typing 149 → 136 B, drag 187 → 161 B.
+
 ### Metal AV1: long-range motion per superblock, from projections (2026-10-31)
 
 **Why:** libaom realtime's screen path (read in the vendored source) finds each superblock's motion from 1-D row and column projections over a long range (`av1_int_pro_motion_estimation`, mcomp.c; called from var_based_part.c). Our search looked ±8 around no motion and ±4 around the frame's hashed shifts, and those need exact line matches. So a photo sliding tens of samples a frame, or fading, was never found.

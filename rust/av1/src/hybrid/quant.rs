@@ -29,6 +29,9 @@ pub(crate) struct HookOpts {
     pub zbin: f64,
     /// the reference engine's double forward transform (else the hybrid's float one)
     pub double_fwd: bool,
+    /// an inter block's tx block codes no coefficients where that costs less (D + lambda R) than
+    /// its quantized residual: libaom realtime's skip when coding costs more than the distortion
+    pub inter_rd_skip: bool,
 }
 
 /// One tx block's working buffers.
@@ -264,6 +267,42 @@ impl QuantHook<'_> {
     }
 }
 
+impl QuantHook<'_> {
+    /// Zeroes `q` where coding nothing (the prediction's error, and a txb_skip bit) costs less than
+    /// `j`, the coded residual's cost from [`QuantHook::trial`].
+    fn skip_if_cheaper(
+        &self,
+        j: f64,
+        q: &mut [i16],
+        pred: &[u8],
+        ps: usize,
+        s: &[u8],
+        ss: usize,
+        tw: usize,
+        th: usize,
+        ac_q: i32,
+    ) {
+        if q.iter().all(|&c| c == 0) {
+            return;
+        }
+        let lambda = 0.12 * (ac_q as f64 / 8.0) * (ac_q as f64 / 8.0);
+        let mut sse = 0u64;
+        for i in 0..th {
+            sse += pred[i * ps..][..tw]
+                .iter()
+                .zip(&s[i * ss..][..tw])
+                .map(|(&p, &v)| {
+                    let d = v as i32 - p as i32;
+                    (d * d) as u64
+                })
+                .sum::<u64>();
+        }
+        if fmac(lambda, 1.0, sse as f64) <= j {
+            q.fill(0);
+        }
+    }
+}
+
 impl TxbHook for QuantHook<'_> {
     type Scratch = Option<Box<Scratch>>;
 
@@ -295,9 +334,10 @@ impl TxbHook for QuantHook<'_> {
         }
         let n = tx_coeffs(tx_sz);
         let coeffs = &mut coeffs[..n];
+        let rd_skip = ctx.is_inter && self.o.inter_rd_skip;
         if plane > 0 {
             let ty = ctx.derived_tx_type;
-            self.trial(
+            let j = self.trial(
                 w,
                 tx_sz,
                 ty,
@@ -310,16 +350,22 @@ impl TxbHook for QuantHook<'_> {
                 ss,
                 plane as i32,
                 qm_level,
-                false,
+                rd_skip,
             );
+            if rd_skip {
+                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+            }
             return;
         }
         if ctx.is_inter {
             // inter blocks: DCT_DCT (in every inter set), for now
             t.tx_type = DCT_DCT as u8;
-            self.trial(
-                w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, false,
+            let j = self.trial(
+                w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, rd_skip,
             );
+            if rd_skip {
+                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+            }
             return;
         }
         let set = get_tx_set_intra(tx_sz, self.o.reduced_tx_set);

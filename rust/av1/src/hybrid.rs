@@ -615,6 +615,7 @@ impl Hybrid {
                 rnd: QUANT_RND,
                 zbin: QUANT_ZBIN,
                 double_fwd: false,
+                inter_rd_skip: true,
             },
         );
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();

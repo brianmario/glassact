@@ -338,6 +338,7 @@ pub fn ref_engine_encode(
             rnd: 0.5,
             zbin: 0.0,
             double_fwd: true,
+            inter_rd_skip: false,
         },
     );
     // pre-filter (padded) recon in both passes: skip flags legitimately change CDEF's output
