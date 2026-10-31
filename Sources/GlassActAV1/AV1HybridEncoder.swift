@@ -111,11 +111,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
     }
 
+    /// Try the angle deltas of directional modes (on). Off is faster on
+    /// moving content for a little more bytes.
+    public var searchesAngleDeltas: Bool {
+        get { metal.searchesAngleDeltas }
+        set { metal.searchesAngleDeltas = newValue }
+    }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
+        metal.prunesBusyLargeBlocks = true
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu

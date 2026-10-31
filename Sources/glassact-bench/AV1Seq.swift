@@ -23,6 +23,7 @@ let av1SeqCommand = Command(
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .int("repeat", "<n>", 1...1000, "encode the sequence n times over (for profiling; default 1)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
+        .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
@@ -73,6 +74,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.tiling = (tileParts[0], tileParts[1])
     encoder.gpuDecides = !opts.has("cpu-decides")
     encoder.reusesAnalysis = !opts.has("no-reuse")
+    encoder.searchesAngleDeltas = !opts.has("no-deltas")
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
 
     var frames: [AV1HybridEncoder.Frame] = []
