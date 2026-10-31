@@ -1,5 +1,6 @@
 import AppKit
 import GlassActCore
+import GlassActSession
 import GlassActTransport
 import SwiftUI
 

@@ -149,10 +149,12 @@ public final class ViewerController: @unchecked Sendable {
     /// `identity`: this viewer's certificate, presented to the host (mutual
     /// TLS). The host admits only viewer fingerprints its user approved.
     /// `fingerprint` pins the host; empty = trust on first use.
+    /// `deviceName`: what the host's approved-viewers list calls this device.
     public init(host: String, port: UInt16, fingerprint: String, identity: SecIdentity?,
-         cursorMetadata: Bool = true, av1: Bool = false) {
+                cursorMetadata: Bool = true, av1: Bool = false, deviceName: String = ViewerSession.computerName) {
         session = ViewerSession(host: host, port: port, fingerprint: fingerprint, identity: identity,
-                                options: .init(cursorMetadata: cursorMetadata, video: true, av1: av1))
+                                options: .init(cursorMetadata: cursorMetadata, video: true, av1: av1,
+                                               deviceName: deviceName))
         sessionTarget = session.target
         cursorMode = cursorMetadata ? "metadata" : "burned"
         engine.onVideoCodecChanged = { [weak self] codec in

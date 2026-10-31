@@ -12,6 +12,7 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
   Viewer both need it. One Mac is enough to start: the Viewer can connect
   to a Host on the same machine. Release builds are universal; Debug builds
   are for the Mac you build on.
+- The iPad Viewer: iPadOS 27 or later.
 - [`just`](https://github.com/casey/just).
 
 The package uses system frameworks only, plus the vendored libwebp and
@@ -26,12 +27,42 @@ just test-fast      # the quick test lane, ~40 s
 just install-cli    # the glassact CLI → ~/.local/bin
 xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build
 xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer build
+xcodebuild -project Apps/GlassActApps.xcodeproj -scheme iPad -destination 'generic/platform=iOS Simulator' build
 ```
 
 You can also open `Apps/GlassActApps.xcodeproj` in Xcode. The "(Release)"
 schemes are for anything performance-related. `just bench <args>` runs the
 release `glassact-bench`; see [BENCHMARKS.md](BENCHMARKS.md#reference-traces)
 for recording and replaying traces.
+
+### The iPad Viewer and the test host
+
+The iPad Viewer (`Apps/iPad`, the iPad scheme) shares the package with
+the Mac apps and adds only its screens and input. To work on it without
+sharing a real Mac, run the test host: a Host with a synthetic screen
+(text to judge sharpness, a bouncing box for video) that draws whatever
+the viewer sends, clicks as dots, drags as trails, keys and scrolls in a
+panel.
+
+```sh
+swift run glassact-testhost --port 4533   # --tiles-only, --still, --sign-in-password P, --ask-after S
+```
+
+It admits any viewer key, since it shows nothing real and injects nothing.
+To try the other ways in: `--sign-in-password P` makes new keys sign in as
+`test`, and `--ask-after S` asks for them as a Host's user would, printing
+the code the viewer should show, then approves each key S seconds after its
+first dial (a large S never does, to try waiting and Cancel). In the Simulator, the iPad reaches it at `127.0.0.1`, and
+launch arguments connect straight away:
+
+```sh
+xcrun simctl launch --terminate-running-process booted app.glassact.viewer \
+  --host 127.0.0.1 --port 4533 --connect --keep-controls
+```
+
+`--keep-controls` keeps the session controls on screen, for screenshots
+and UI tests. To run it on your own iPad, pick the iPad scheme and your
+device in Xcode, with your team set as below.
 
 ## Signing
 
