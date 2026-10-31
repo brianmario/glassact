@@ -264,6 +264,86 @@ pub fn for_each_txb(
     n
 }
 
+/// The luma tx blocks of an inter block whose tx size is `tx_sz` everywhere (a uniform var-tx
+/// tree: at most 2 splits, so at most 16 leaves), in the spec's transform_tree order: (x, y) in
+/// 4x4 units within the block, into `out`. Returns the count.
+pub fn tx_tree_order(bsize: i32, tx_sz: i32, out: &mut [(i32, i32); 16]) -> usize {
+    let (tw, th) = (
+        Tx_Width[tx_sz as usize] as i32 >> 2,
+        Tx_Height[tx_sz as usize] as i32 >> 2,
+    );
+    fn tree(x: i32, y: i32, w: i32, h: i32, tw: i32, th: i32, out: &mut [(i32, i32); 16], n: &mut usize) {
+        if w <= tw && h <= th {
+            out[*n] = (x, y);
+            *n += 1;
+        } else if w > h {
+            tree(x, y, w / 2, h, tw, th, out, n);
+            tree(x + w / 2, y, w / 2, h, tw, th, out, n);
+        } else if w < h {
+            tree(x, y, w, h / 2, tw, th, out, n);
+            tree(x, y + h / 2, w, h / 2, tw, th, out, n);
+        } else {
+            tree(x, y, w / 2, h / 2, tw, th, out, n);
+            tree(x + w / 2, y, w / 2, h / 2, tw, th, out, n);
+            tree(x, y + h / 2, w / 2, h / 2, tw, th, out, n);
+            tree(x + w / 2, y + h / 2, w / 2, h / 2, tw, th, out, n);
+        }
+    }
+    let mut n = 0;
+    tree(0, 0, bw4(bsize), bh4(bsize), tw, th, out, &mut n);
+    n
+}
+
+/// [`for_each_txb`] for a block that may be inter: an inter block's luma tx blocks (one uniform
+/// size, `tx_depth` splits of Max_Tx_Size_Rect) come in the spec's transform_tree order (halves
+/// of the longer side, quadrants of squares, recursively), which differs from raster order when
+/// a quadrant is split again. Chroma is as for intra blocks.
+pub fn for_each_txb_ex(
+    bsize: i32,
+    mi_row: i32,
+    mi_col: i32,
+    tx_depth: i32,
+    inter: bool,
+    mono: bool,
+    mi_rows: i32,
+    mi_cols: i32,
+    mut f: impl FnMut(i32, i32, i32, i32, i32, i32),
+) -> i32 {
+    if !inter {
+        return for_each_txb(bsize, mi_row, mi_col, tx_depth, mono, mi_rows, mi_cols, f);
+    }
+    let tx_sz = luma_tx_size(bsize, tx_depth);
+    let mut order = [(0, 0); 16];
+    let mut n = 0;
+    let leaves = tx_tree_order(bsize, tx_sz, &mut order);
+    for &(x, y) in &order[..leaves] {
+        if mi_col + x < mi_cols && mi_row + y < mi_rows {
+            f(0, tx_sz, mi_col + x, mi_row + y, x, y);
+            n += 1;
+        }
+    }
+    if has_chroma(bsize, mi_row, mi_col, mono) {
+        let tx_sz = uv_tx_size(bsize);
+        let step_x = Tx_Width[tx_sz as usize] as usize >> 2;
+        let step_y = Tx_Height[tx_sz as usize] as usize >> 2;
+        let plane_sz = uv_bsize(bsize);
+        let (base_x4, base_y4) = (mi_col >> 1, mi_row >> 1);
+        for plane in 1..3 {
+            for y in (0..bh4(plane_sz)).step_by(step_y) {
+                for x in (0..bw4(plane_sz)).step_by(step_x) {
+                    let (x4, y4) = (base_x4 + x, base_y4 + y);
+                    if x4 >= mi_cols >> 1 || y4 >= mi_rows >> 1 {
+                        continue;
+                    }
+                    f(plane, tx_sz, x4, y4, x, y);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
 #[cfg(all(test, feature = "oracle"))]
 mod tests {
     use super::*;

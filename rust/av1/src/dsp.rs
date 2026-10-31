@@ -9,7 +9,9 @@
 //! - [`build_edges`]: spec 7.11.2 AboveRow / LeftCol;
 //! - [`predict_intra`]: DC, directional, smooth*, paeth (edge filter off);
 //! - [`predict_intra_ex`]: with the intra edge filter / upsampling, and filter intra;
-//! - [`cfl_predict`]: spec 7.11.5.
+//! - [`cfl_predict`]: spec 7.11.5;
+//! - [`predict_inter`]: spec 7.11.3.3 / 7.11.3.4, block inter prediction from one unscaled
+//!   reference (NEON filters; [`predict_inter_ref`] is the spec's loops).
 //!
 //! Edge arrays are [`Edge`]s: `AboveRow[k]` / `LeftCol[k]` live at index `EDGE_OFF + k` (k >= -2).
 //!
@@ -28,6 +30,7 @@ mod itx;
 mod itx_neon;
 #[cfg(target_arch = "x86_64")]
 mod itx_sse;
+mod mc;
 mod pred;
 #[cfg(target_arch = "aarch64")]
 mod pred_neon;
@@ -35,6 +38,7 @@ mod pred_neon;
 mod tests;
 
 pub use itx::*;
+pub use mc::*;
 pub use pred::*;
 
 /// Butterfly output outside r bits (7.13.2.1).
@@ -104,6 +108,40 @@ pub fn get_tx_set_intra(tx_sz: i32, reduced_tx_set: bool) -> i32 {
 #[inline]
 pub fn tx_type_in_set_intra(set: i32, tx_type: i32) -> bool {
     Tx_Type_In_Set_Intra[set as usize][tx_type as usize] != 0
+}
+
+/// get_tx_set() for inter blocks (spec 5.11.48).
+pub fn get_tx_set_inter(tx_sz: i32, reduced_tx_set: bool) -> i32 {
+    let sqr = Tx_Size_Sqr[tx_sz as usize] as i32;
+    let sqr_up = Tx_Size_Sqr_Up[tx_sz as usize] as i32;
+    if sqr_up > TX_32X32 {
+        return TX_SET_DCTONLY;
+    }
+    if reduced_tx_set || sqr_up == TX_32X32 {
+        return TX_SET_INTER_3;
+    }
+    if sqr == TX_16X16 {
+        return TX_SET_INTER_2;
+    }
+    TX_SET_INTER_1
+}
+#[inline]
+pub fn tx_type_in_set_inter(set: i32, tx_type: i32) -> bool {
+    Tx_Type_In_Set_Inter[set as usize][tx_type as usize] != 0
+}
+
+/// compute_tx_type() for an inter chroma tx block (spec 5.11.40, lossless excluded): the luma
+/// type `luma_tx_type` at its co-located 4x4 if it is in the chroma size's inter set, else DCT_DCT.
+pub fn chroma_tx_type_inter(uv_tx_sz: i32, luma_tx_type: i32, reduced_tx_set: bool) -> i32 {
+    if Tx_Size_Sqr_Up[uv_tx_sz as usize] as i32 > TX_32X32 {
+        return DCT_DCT;
+    }
+    let set = get_tx_set_inter(uv_tx_sz, reduced_tx_set);
+    if tx_type_in_set_inter(set, luma_tx_type) {
+        luma_tx_type
+    } else {
+        DCT_DCT
+    }
 }
 
 /// compute_tx_type() for an intra chroma tx block (spec 5.11.40, lossless excluded).

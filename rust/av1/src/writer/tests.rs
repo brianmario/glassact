@@ -78,6 +78,7 @@ fn case(seed: u64, maxdim: i32, big_pct: i32) -> Option<Record> {
             block_txb: sl(r.block_txb as *const u32, r.n_blocks as usize + 1),
             txb: sl(r.txb as *const Txb, r.n_txb as usize),
             coeffs: sl(r.coeffs as *const i16, r.n_coeffs as usize),
+            inter: Vec::new(),
         };
         av1t_case_free(c);
         Some(rec)
@@ -263,6 +264,7 @@ fn r_encode(
     let extras = Extras {
         tile_skip: sk.as_deref(),
         record_syms: syms,
+        refs: None,
     };
     let mut out = Output::default();
     let r = if hook != 0 {
@@ -651,7 +653,7 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
             }
         }
         19 => *rec.block_txb.last_mut().unwrap() += 1,
-        20 => fp.version = 2,
+        20 => fp.version = 3,
         21 => {
             fp.width = [0, 65536, fp.width + 8, fp.width.saturating_sub(9)][r.below(4) as usize];
         }
@@ -682,7 +684,7 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
             2 => fp.qm_v = 16,
             _ => fp.using_qmatrix = 2,
         },
-        28 => fp.reserved[r.below(15) as usize] = 1,
+        28 => fp.reserved[r.below(10) as usize] = 1,
         29 => fp.allow_screen_content_tools = 2,
         30 => {
             fp.tile_cols_log2 = r.below(8) as i8 - 1;
@@ -922,6 +924,7 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
                 } else {
                     core::slice::from_raw_parts(r.coeffs, r.n_coeffs as usize).to_vec()
                 },
+                inter: Vec::new(),
             };
             out.seq_level_idx = q.seq_level_idx;
             out.tile_bytes = core::slice::from_raw_parts(q.tile_bytes, q.n_tiles as usize).to_vec();
@@ -936,9 +939,16 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
 fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
     let (crc, c) = c_parse(obus);
     match parse(obus) {
+        Ok(r) if r.rec.fp.frame_type == FRAME_INTER && crc != OK => {
+            // an inter frame (a damaged frame_type): the C++ has no inter frames
+            Some(r)
+        }
         Ok(r) => {
             assert_eq!(crc, OK, "{what}: rust parsed what the C++ rejects");
-            assert_eq!(c.rec.fp, r.rec.fp, "{what}: frame params");
+            // the C++ has no video mode: a stream that isn't a still picture parses as one
+            let mut fp = r.rec.fp;
+            fp.video = 0;
+            assert_eq!(c.rec.fp, fp, "{what}: frame params");
             assert!(
                 c.rec.blocks == r.rec.blocks,
                 "{what}: blocks differ at {:?}",

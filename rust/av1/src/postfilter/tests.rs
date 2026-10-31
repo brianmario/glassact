@@ -610,6 +610,7 @@ mod oracle {
                 block_txb: core::ptr::null_mut(),
                 txb: core::ptr::null_mut(),
                 coeffs: core::ptr::null_mut(),
+                inter: core::ptr::null_mut(),
             };
             let st = c.stride.map(|s| s as c_int);
             // SAFETY: the record's blocks and the planes outlive the call.

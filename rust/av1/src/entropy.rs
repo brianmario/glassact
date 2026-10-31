@@ -8,7 +8,7 @@ mod cdfs;
 mod ec;
 pub mod symstream;
 
-pub use cdfs::{Cdfs, NCDF, coeff_cdf_q_ctx};
+pub use cdfs::{Cdfs, InterCdfs, NCDF, coeff_cdf_q_ctx};
 pub use ec::{Ec, update_cdf, update_cdf_n, update_cdf_scalar};
 pub use symstream::{SYM_ADAPT, SYM_BOOL, SYM_SPLIT_OR_HORZ, SYM_SPLIT_OR_VERT, code_symbols, split_or_psum, sym_pack};
 

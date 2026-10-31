@@ -7,14 +7,14 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 
 | Module | What |
 |---|---|
-| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; tiles on threads; the closed-loop hook; the parser |
-| `dsp`, `blockinfo` | the decoder-mirroring DSP: prediction, inverse transforms, dequantization, block geometry |
+| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); tiles on threads; the closed-loop hook; the parser |
+| `dsp`, `blockinfo` | the decoder-mirroring DSP: intra and inter prediction (motion compensation), inverse transforms, dequantization, block geometry |
 | `postfilter` | deblocking and CDEF, exactly as the decoder applies them |
 | `entropy` | the range encoder, CDF contexts, symbol streams |
 | `avif` | the AVIF muxer |
 | `enc` | the Metal encoder's host half: derived tables as MSL, the GPU entropy plan, the post-filter frame, tune=iq and the CDEF search's host half |
 | `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided |
-| `testsupport` | random legal records, the reference engine, the GPU's DSP cases (tests only) |
+| `testsupport` | random legal records and inter sequences, the reference engine, the GPU's DSP cases (tests only) |
 | `capi` | the C API Swift links (`Sources/AV1Core/include/av1g/av1g.h`, `Sources/AV1Encoder/include/av1enc.h`, `Sources/AV1CoreTestSupport/include/av1core_test.h`) |
 
 The Metal kernels keep their own copy of the DSP. MSL is a C++ dialect, so they compile the C
@@ -35,7 +35,12 @@ feature compiles it, together with the shims in `oracle/*.cpp`, and the tests co
 output for output. It's never linked into the product.
 
 `src/tables` is generated from the C table headers (`scripts/gen-av1-rust-tables`) so that the CPU
-and the GPU use the same values. Never edit it by hand.
+and the GPU use the same values. Never edit it by hand. The inter frames' tables
+(`av1g/inter_tables.h`) come from the AV1 spec's markdown (`scripts/gen-av1-inter-tables`).
+
+Inter frames are checked against real decoders: the Swift `InterDecoderGateTests` (the vendored
+libaom), and `cargo test --release -- --ignored --nocapture decoders` (dav1d and aomdec in
+/opt/homebrew/bin, when installed).
 
 ## Rules
 

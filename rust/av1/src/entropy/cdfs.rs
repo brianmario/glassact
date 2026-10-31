@@ -157,3 +157,59 @@ impl Cdfs {
         ((cdf.as_ptr() as usize - base) / 2) as u32
     }
 }
+
+/// The CDFs inter frames add (spec init_non_coeff_cdfs; MvCtx 0 only: no intra block copy). Not
+/// part of [`Cdfs`], whose layout the GPU entropy kernels share: inter frames aren't coded there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterCdfs {
+    /// YModeCdf (intra blocks of inter frames), by Size_Group
+    pub y_mode: [[u16; 14]; 4],
+    pub is_inter: [[u16; 3]; 4],
+    /// SingleRefCdf[ctx][p - 1]
+    pub single_ref: [[[u16; 3]; 6]; 3],
+    pub new_mv: [[u16; 3]; 6],
+    pub zero_mv: [[u16; 3]; 2],
+    pub ref_mv: [[u16; 3]; 6],
+    pub drl_mode: [[u16; 3]; 3],
+    pub txfm_split: [[u16; 3]; 21],
+    pub mv_joint: [u16; 5],
+    /// per component (0: row, 1: col)
+    pub mv_class: [[u16; 12]; 2],
+    pub mv_class0_bit: [[u16; 3]; 2],
+    pub mv_sign: [[u16; 3]; 2],
+    pub mv_bit: [[[u16; 3]; 10]; 2],
+    /// InterTxTypeSet1Cdf[Tx_Size_Sqr], Set2, Set3Cdf[Tx_Size_Sqr]
+    pub inter_tx_set1: [[u16; 17]; 2],
+    pub inter_tx_set2: [u16; 13],
+    pub inter_tx_set3: [[u16; 3]; 4],
+}
+
+impl Default for InterCdfs {
+    fn default() -> Self {
+        InterCdfs {
+            y_mode: Default_Y_Mode_Cdf,
+            is_inter: Default_Is_Inter_Cdf,
+            single_ref: Default_Single_Ref_Cdf,
+            new_mv: Default_New_Mv_Cdf,
+            zero_mv: Default_Zero_Mv_Cdf,
+            ref_mv: Default_Ref_Mv_Cdf,
+            drl_mode: Default_Drl_Mode_Cdf,
+            txfm_split: Default_Txfm_Split_Cdf,
+            mv_joint: Default_Mv_Joint_Cdf,
+            mv_class: Default_Mv_Class_Cdf,
+            mv_class0_bit: [Default_Mv_Class0_Bit_Cdf; 2],
+            mv_sign: [Default_Mv_Sign_Cdf; 2],
+            mv_bit: [Default_Mv_Bit_Cdf; 2],
+            inter_tx_set1: Default_Inter_Tx_Type_Set1_Cdf,
+            inter_tx_set2: Default_Inter_Tx_Type_Set2_Cdf,
+            inter_tx_set3: Default_Inter_Tx_Type_Set3_Cdf,
+        }
+    }
+}
+
+impl InterCdfs {
+    /// The defaults, in place.
+    pub fn init(&mut self) {
+        *self = Self::default();
+    }
+}

@@ -3,6 +3,7 @@
  *   av1g_layout()        fill the deterministic tx-block layout of a record
  *   av1g_tile_layout()   tile boundaries for a picture size / tiling choice
  *   av1g_encode()        DecisionRecord -> OBUs (+AVIF) + exact reconstruction
+ *   av1g_encode_ex()     the same with reference pictures (inter frames)
  *
  * All pointers are host pointers.  Thread-safe (no global state).
  */
@@ -104,11 +105,27 @@ int av1g_validate(const av1g_decision_record *rec, char *err, size_t errlen);
 int av1g_encode(av1g_decision_record *rec, const av1g_encode_opts *opts, av1g_output *out);
 void av1g_output_free(av1g_output *out);
 
-/* Parse an AV1 OBU stream (sequence header + one intra OBU_FRAME using only the
- * Wave-1 toolset: no deblocking/CDEF/LR/QM/delta-q/segmentation/filter-intra/
- * edge filter/palette/intrabc, 64x64 superblocks, uniform tiles) back into a
- * DecisionRecord with all decisions and quantized coefficients.  Used for libaom
- * decision replay.  Free with av1g_parsed_free(). */
+/* A reference slot: the decoder's output of the frame that last refreshed it, i.e. that
+ * frame's av1g_output.recon planes (post-filter, cropped: Y width x height, U/V
+ * ((width+1)/2) x ((height+1)/2); the stream's size), at the given strides.  Only what
+ * the picture's size covers is read.  plane[0] == NULL: an empty slot. */
+typedef struct av1g_ref_planes {
+    const uint8_t *plane[3];  /* Y, U, V (U, V unused for monochrome) */
+    int32_t stride[3];
+} av1g_ref_planes;
+
+/* av1g_encode with the reference pictures, by slot (video mode, decisions.h): an inter
+ * frame predicts from refs[fp.ref_slot], which must be present; other slots are not read.
+ * refs may be NULL for key frames and still pictures.  Exactly av1g_encode otherwise. */
+int av1g_encode_ex(av1g_decision_record *rec, const av1g_encode_opts *opts, const av1g_ref_planes refs[8],
+                   av1g_output *out);
+
+/* Parse an AV1 OBU stream (sequence header + one OBU_FRAME of the toolset av1g_encode
+ * writes: a still picture, or a key or inter frame of a video stream; 64x64
+ * superblocks, uniform tiles) back into a DecisionRecord with all decisions and
+ * quantized coefficients (rec.inter is set for inter frames).  Parsing needs no
+ * reference pictures.  Used for libaom decision replay and round trips.  Free with
+ * av1g_parsed_free(). */
 typedef struct av1g_parsed {
     av1g_decision_record rec;   /* points into storage owned by this object */
     uint32_t seq_level_idx;

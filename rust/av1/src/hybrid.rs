@@ -536,6 +536,7 @@ impl Hybrid {
         let extras = Extras {
             tile_skip: Some(&skips),
             record_syms: false,
+            refs: None,
         };
         writer.encode_with_hook(rec.as_mut(), &opts, Some(&hook), &extras, out)?;
         if *reused_count > 0 {
@@ -665,6 +666,7 @@ impl Hybrid {
         let extras = Extras {
             tile_skip: Some(&skips),
             record_syms: false,
+            refs: None,
         };
         writer.encode_with_hook::<NoHook>(rec.as_mut(), &opts, None, &extras, obu)?;
         let skipped: Vec<bool> = skips.iter().map(|s| s.skip).collect();

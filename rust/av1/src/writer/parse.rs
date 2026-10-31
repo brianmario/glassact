@@ -1,10 +1,14 @@
-//! Parsing: OBUs -> DecisionRecord (the intra toolset the writer produces: one key frame of a
-//! still picture, 64x64 superblocks, uniform tiles), the walk with the spec's symbol decoder.
+//! Parsing: OBUs -> DecisionRecord (the toolset the writer produces: a still picture, or a key or
+//! inter frame of a video stream, 64x64 superblocks, uniform tiles), the walk with the spec's
+//! symbol decoder. Inter frames parse without their reference pictures.
 use super::sink::DecSink;
 use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, Walk};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::clip3;
+use crate::tables::{
+    ALTREF_FRAME, EIGHTTAP, INTER_FRAME, KEY_FRAME, LAST_FRAME, NUM_REF_FRAMES, PRIMARY_REF_NONE, REFS_PER_FRAME,
+};
 
 /// av1g_parsed: the record with all decisions and quantized coefficients, and where the tiles were.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,7 +62,11 @@ impl BitReader<'_> {
 #[derive(Default)]
 struct Seq {
     seen: bool,
+    still: bool,
     reduced: bool,
+    interintra: bool,
+    warped: bool,
+    ref_frame_mvs: bool,
     level: i32,
     wbits: i32,
     hbits: i32,
@@ -87,7 +95,7 @@ pub fn parse(obus: &[u8]) -> Result<Parsed, Error> {
 
 fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     let profile = br.f(3)?;
-    br.f(1)?; // still_picture
+    sq.still = br.b()?;
     sq.reduced = br.b()?;
     need!(profile == 0, "only Main profile (got {profile})");
     if sq.reduced {
@@ -138,13 +146,14 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     sq.filter_intra = br.f(1)? as u8;
     sq.edge_filter = br.f(1)? as u8;
     if !sq.reduced {
-        for _ in 0..4 {
-            br.f(1)?; // interintra, masked, warped, dual filter
-        }
+        sq.interintra = br.b()?;
+        br.f(1)?; // enable_masked_compound (compound prediction is never selected)
+        sq.warped = br.b()?;
+        br.f(1)?; // enable_dual_filter (the filter is never switchable)
         let oh = br.b()?;
         if oh {
-            br.f(1)?;
-            br.f(1)?;
+            br.f(1)?; // enable_jnt_comp
+            sq.ref_frame_mvs = br.b()?;
         }
         sq.force_sct = if br.b()? { 2 } else { br.f(1)? };
         sq.force_int_mv = if sq.force_sct > 0 {
@@ -242,20 +251,70 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
     fp.enable_filter_intra = sq.filter_intra;
     need!(!sq.superres && !sq.film_grain, "superres / film grain not supported");
     let mut br = BitReader { d: p, pos: 0 };
+    let mut inter = false;
+    let mut err_res = false;
     if !sq.reduced {
         need!(br.f(1)? == 0, "show_existing_frame");
-        need!(br.f(2)? == 0, "only KEY_FRAME supported");
+        let ft = br.f(2)?;
+        need!(
+            ft == KEY_FRAME as u32 || ft == INTER_FRAME as u32,
+            "only KEY_FRAME and INTER_FRAME supported"
+        );
+        inter = ft == INTER_FRAME as u32;
         need!(br.f(1)? == 1, "show_frame must be 1");
+        if inter {
+            err_res = br.b()?;
+        }
+    }
+    if !sq.still {
+        fp.video = 1;
+    }
+    if inter {
+        fp.frame_type = FRAME_INTER;
+        fp.error_resilient_mode = err_res as u8;
     }
     need!(br.f(1)? == 0, "disable_cdf_update=1 not supported");
     let sct = if sq.force_sct == 2 { br.f(1)? } else { sq.force_sct };
     fp.allow_screen_content_tools = (sct != 0) as u8;
-    if sct != 0 && sq.force_int_mv == 2 {
-        br.f(1)?; // force_integer_mv
+    let mut force_integer_mv = 0;
+    if sct != 0 {
+        force_integer_mv = if sq.force_int_mv == 2 {
+            br.f(1)?
+        } else {
+            sq.force_int_mv
+        };
     }
+    need!(
+        !inter || force_integer_mv == 1,
+        "inter frames without force_integer_mv not supported"
+    );
     let override_ = if !sq.reduced { br.b()? } else { false };
     if sq.order_hint_bits != 0 {
         br.f(sq.order_hint_bits)?;
+    }
+    if inter {
+        if !err_res {
+            need!(
+                br.f(3)? == PRIMARY_REF_NONE as u32,
+                "primary_ref_frame other than NONE not supported"
+            );
+        }
+        fp.refresh_frame_flags = br.f(8)? as u8;
+        if err_res && sq.order_hint_bits != 0 {
+            for _ in 0..NUM_REF_FRAMES {
+                br.f(sq.order_hint_bits)?; // ref_order_hint
+            }
+        }
+        if sq.order_hint_bits != 0 {
+            need!(br.f(1)? == 0, "frame_refs_short_signaling not supported");
+        }
+        for i in 0..REFS_PER_FRAME {
+            let idx = br.f(3)? as u8;
+            if i == 0 {
+                fp.ref_slot = idx; // LAST_FRAME's; the only reference blocks may use
+            }
+        }
+        need!(!override_ || err_res, "frame_size_with_refs not supported");
     }
     let (mut fw, mut fh) = (sq.max_w, sq.max_h);
     if override_ {
@@ -267,7 +326,22 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         br.f(16)?;
         br.f(16)?;
     }
-    if sct != 0 {
+    if inter {
+        // force_integer_mv: no allow_high_precision_mv
+        need!(br.f(1)? == 0, "switchable interpolation filters not supported");
+        need!(
+            br.f(2)? == EIGHTTAP as u32,
+            "interpolation filters other than EIGHTTAP not supported"
+        );
+        need!(br.f(1)? == 0, "motion modes (is_motion_mode_switchable) not supported");
+        if !err_res && sq.ref_frame_mvs {
+            need!(br.f(1)? == 0, "use_ref_frame_mvs not supported");
+        }
+        need!(
+            !sq.interintra,
+            "inter-intra prediction (enable_interintra_compound) not supported"
+        );
+    } else if sct != 0 {
         need!(br.f(1)? == 0, "allow_intrabc=1 not supported");
     }
     if !sq.reduced {
@@ -347,6 +421,10 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
     fp.loop_filter_sharpness = br.f(3)? as u8;
     let mut ref_delta_intra = 1; // setup_past_independence default
     let delta_enabled = br.b()?;
+    need!(
+        !(inter && delta_enabled),
+        "loop filter deltas in inter frames not supported"
+    );
     if delta_enabled && br.b()? {
         for i in 0..8 {
             if br.b()? {
@@ -399,7 +477,18 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         }
     }
     fp.tx_mode_select = br.f(1)? as u8;
+    if inter {
+        need!(br.f(1)? == 0, "reference_select (compound prediction) not supported");
+        if !err_res && sq.warped {
+            need!(br.f(1)? == 0, "warped motion not supported");
+        }
+    }
     fp.reduced_tx_set = br.f(1)? as u8;
+    if inter {
+        for _ in LAST_FRAME..=ALTREF_FRAME {
+            need!(br.f(1)? == 0, "global motion not supported");
+        }
+    }
     br.byte_align();
 
     // setup_frame
@@ -437,6 +526,8 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         fix_range: false,
         check_edges: false,
         ordmap: &ordmap,
+        inter,
+        refs: None,
     };
     // tile group
     let ntiles = (tiles.cols * tiles.rows) as usize;
@@ -486,6 +577,7 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         block_txb: pr.block_txb,
         txb: pr.txb,
         coeffs: pr.coeffs,
+        inter: pr.inter,
     };
     Ok(())
 }

@@ -82,7 +82,12 @@ pub unsafe extern "C" fn av1g_layout(rec: *mut DecisionRecord, txb_cap: u32, coe
     // SAFETY: rec is the caller's record, its arrays valid for n_blocks (+ 1) and the capacities.
     let rec = unsafe { &mut *rec };
     let blocks = unsafe { opt_slice(rec.blocks, rec.n_blocks as usize) };
-    let counts = match writer::layout_counts(&rec.fp, blocks) {
+    let inter = if rec.fp.version >= 2 {
+        unsafe { opt_slice(rec.inter, rec.n_blocks as usize) }
+    } else {
+        &[]
+    };
+    let counts = match writer::layout_counts_ex(&rec.fp, blocks, inter) {
         Ok(c) => c,
         Err(e) => return e,
     };
@@ -93,7 +98,7 @@ pub unsafe extern "C" fn av1g_layout(rec: *mut DecisionRecord, txb_cap: u32, coe
     }
     let block_txb = unsafe { slice::from_raw_parts_mut(rec.block_txb, rec.n_blocks as usize + 1) };
     let txb = unsafe { slice::from_raw_parts_mut(rec.txb, counts.n_txb as usize) };
-    match writer::layout(&rec.fp, blocks, block_txb, txb) {
+    match writer::layout_ex(&rec.fp, blocks, inter, block_txb, txb) {
         Ok(_) => OK,
         Err(e) => e,
     }
@@ -217,6 +222,69 @@ pub unsafe extern "C" fn av1g_encode(rec: *mut DecisionRecord, opts: *const Enco
             to_c_output(&o, out);
             OK
         }
+        Err(e) => {
+            set_error(&mut out.error, &e.msg);
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_encode_ex(
+    rec: *mut DecisionRecord,
+    opts: *const EncodeOpts,
+    refs: *const RefPlanesC,
+    out: *mut Output,
+) -> c_int {
+    // SAFETY: out is the caller's av1g_output; rec's arrays are valid for its counts; refs, if not
+    // null, holds 8 slots whose non-null planes hold the picture's size at their strides.
+    let out = unsafe { &mut *out };
+    *out = zero_output();
+    let opts = if opts.is_null() {
+        EncodeOpts {
+            flags: 0,
+            seq_level_idx: -1,
+        }
+    } else {
+        unsafe { *opts }
+    };
+    let fp = unsafe { (*rec).fp };
+    let mut slots: writer::RefSlots = [None; 8];
+    if !refs.is_null() {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let r = unsafe { &*refs.add(i) };
+            if r.plane[0].is_null() {
+                continue;
+            }
+            let mut pic = writer::RefPicture::default();
+            for p in 0..if fp.monochrome != 0 { 1 } else { 3 } {
+                let sub = (p != 0) as u32;
+                let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
+                let stride = r.stride[p].max(0) as usize;
+                if r.plane[p].is_null() || h == 0 || stride < w as usize {
+                    set_error(
+                        &mut out.error,
+                        &format!("reference slot {i} plane {p}: missing or stride too small"),
+                    );
+                    return ERR_INVALID;
+                }
+                pic.plane[p] = unsafe { slice::from_raw_parts(r.plane[p], (h as usize - 1) * stride + w as usize) };
+                pic.stride[p] = stride;
+            }
+            *slot = Some(pic);
+        }
+    }
+    let res: Result<(), Error> = match unsafe { RecordMut::from_c(&mut *rec) } {
+        Ok(view) => {
+            let mut o = writer::Output::default();
+            writer::Writer::new()
+                .encode_ex(view, &opts, &slots, &mut o)
+                .map(|_| to_c_output(&o, out))
+        }
+        Err(e) => Err(e),
+    };
+    match res {
+        Ok(()) => OK,
         Err(e) => {
             set_error(&mut out.error, &e.msg);
             e.code
@@ -731,6 +799,48 @@ pub unsafe extern "C" fn av1t_case_record(c: *mut CaseHandle) -> *mut DecisionRe
 pub unsafe extern "C" fn av1t_case_free(c: *mut CaseHandle) {
     if !c.is_null() {
         // SAFETY: c came from av1t_case_make
+        drop(unsafe { Box::from_raw(c) });
+    }
+}
+
+/// av1t_inter_case: a random legal inter sequence and the C views of its frames' records.
+pub struct InterCaseHandle {
+    #[allow(dead_code)] // owns the vectors the views point into
+    seq: crate::testsupport::InterSeq,
+    recs: Vec<DecisionRecord>,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_inter_case_make(seed: u64, maxdim: c_int, nframes: c_int) -> *mut InterCaseHandle {
+    match crate::testsupport::inter_seq_make(seed, maxdim, nframes.max(1) as usize) {
+        Some(mut seq) => {
+            let recs = seq.frames.iter_mut().map(|r| r.as_c()).collect();
+            Box::into_raw(Box::new(InterCaseHandle { seq, recs }))
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_inter_case_frames(c: *const InterCaseHandle) -> c_int {
+    // SAFETY: c came from av1t_inter_case_make
+    unsafe { (*c).recs.len() as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_inter_case_record(c: *mut InterCaseHandle, frame: c_int) -> *mut DecisionRecord {
+    // SAFETY: c came from av1t_inter_case_make; the records point into its vectors.
+    let c = unsafe { &mut *c };
+    match c.recs.get_mut(frame.max(0) as usize) {
+        Some(r) => r,
+        None => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_inter_case_free(c: *mut InterCaseHandle) {
+    if !c.is_null() {
+        // SAFETY: c came from av1t_inter_case_make
         drop(unsafe { Box::from_raw(c) });
     }
 }
