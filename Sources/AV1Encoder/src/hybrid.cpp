@@ -186,14 +186,25 @@ void pad_source(const uint8_t *const planes[3], int W, int H, int sbCols, int sb
         s.stride[pl] = (sbCols * 64) >> sub;
         s.height[pl] = (sbRows * 64) >> sub;
         s.p[pl].resize((size_t)s.stride[pl] * s.height[pl]);
-        const int w = pl ? (W + 1) >> 1 : W, h = pl ? (H + 1) >> 1 : H;
-        for (int y = 0; y < s.height[pl]; y++) {
-            const uint8_t *srow = planes[pl] + (size_t)(y < h ? y : h - 1) * w;
-            uint8_t *d = s.p[pl].data() + (size_t)y * s.stride[pl];
-            memcpy(d, srow, w);
-            memset(d + w, srow[w - 1], s.stride[pl] - w);
-        }
     }
+    // rows on every core: a 5K picture is 22 MB
+    const int nthreads = std::max(1, std::min(8, (int)std::thread::hardware_concurrency()));
+    auto rows = [&](int part) {
+        for (int pl = 0; pl < 3; pl++) {
+            const int w = pl ? (W + 1) >> 1 : W, h = pl ? (H + 1) >> 1 : H;
+            const int y0 = s.height[pl] * part / nthreads, y1 = s.height[pl] * (part + 1) / nthreads;
+            for (int y = y0; y < y1; y++) {
+                const uint8_t *srow = planes[pl] + (size_t)(y < h ? y : h - 1) * w;
+                uint8_t *d = s.p[pl].data() + (size_t)y * s.stride[pl];
+                memcpy(d, srow, w);
+                memset(d + w, srow[w - 1], s.stride[pl] - w);
+            }
+        }
+    };
+    std::vector<std::thread> th;
+    for (int i = 1; i < nthreads; i++) th.emplace_back(rows, i);
+    rows(0);
+    for (auto &t : th) t.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +599,9 @@ struct av1enc_hybrid {
         rec.txb = nullptr;
         av1g_layout(&rec, 0, 0);
         txb.assign(rec.n_txb, av1g_txb());
-        coeffs.assign(rec.n_coeffs + 1, 0);
+        // no zero fill: the hook writes every coefficient of every tx block it's given, and kept
+        // tiles copy theirs in
+        if (coeffs.size() != rec.n_coeffs + 1) coeffs.resize(rec.n_coeffs + 1);
         bind();
         return av1g_layout(&rec, rec.n_txb, rec.n_coeffs);
     }
@@ -649,7 +662,6 @@ extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, con
                     b.skip = 0;
                     b.tx_depth = 0;
                     b.sb_qindex = (uint8_t)qindex;
-                    if (givenChroma) continue;
                     b.uv_mode = AV1G_DC_PRED;
                     b.angle_delta_uv = 0;
                     b.cfl_alpha_u = b.cfl_alpha_v = 0;
@@ -657,9 +669,14 @@ extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, con
                 }
             }
         };
-        const int nthreads = givenChroma ? 1 : std::max(1, (int)std::thread::hardware_concurrency());
-        if (nthreads == 1) work();
-        else {
+        if (givenChroma) {  // the GPU decided chroma: only the fields the closed loop sets
+            for (av1g_block &b : h->blocks) {
+                b.skip = 0;
+                b.tx_depth = 0;
+                b.sb_qindex = (uint8_t)qindex;
+            }
+        } else {
+            const int nthreads = std::max(1, (int)std::thread::hardware_concurrency());
             std::vector<std::thread> th;
             for (int i = 0; i < nthreads; i++) th.emplace_back(work);
             for (auto &t : th) t.join();

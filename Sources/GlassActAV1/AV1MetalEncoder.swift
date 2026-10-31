@@ -359,7 +359,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// tightly packed: Y width × height, U and V half that, rounded up).
     public func partition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                           width: Int, height: Int, qindex: Int) throws -> Partition {
-        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex)
+        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false)
         try run.execute(closedLoop: false)
         let (blocks, types) = run.leafBlocks()
         return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
@@ -397,7 +397,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the stages run to completion first.)
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int) throws -> PendingPartition {
-        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex)
+        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false)
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
 
@@ -436,8 +436,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
 
+        /// With `closedLoop` false the closed loop's buffers (reconstruction,
+        /// maps, contexts, outputs, scratch) are left out: a partition needs none.
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-             width: Int, height: Int, qindex: Int) throws {
+             width: Int, height: Int, qindex: Int, closedLoop: Bool = true) throws {
             self.encoder = encoder
             self.width = width
             self.height = height
@@ -472,7 +474,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
                 }
                 src.append(b)
-                recPlanes.append(try make(pw * ph))
+                recPlanes.append(try make(closedLoop ? pw * ph : 16))
             }
             rec = recPlanes
             var tl = av1g_tiles()
@@ -503,13 +505,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             // closed-loop context maps: 5 per-4x4 maps, and per plane the coefficient contexts
             let mi = miCols * miRows, mi1 = (miCols >> 1) * (miRows >> 1)
-            let maps = try make(mi * 5)
+            let maps = try make(closedLoop ? mi * 5 : 16)
             func at(_ b: any MTLBuffer, _ offset: Int) -> UnsafeMutablePointer<UInt8>? {
                 UnsafeMutablePointer(bitPattern: UInt(b.gpuAddress) + UInt(offset))
             }
             image.mYMode = at(maps, 0); image.mUVMode = at(maps, mi); image.mSkip = at(maps, 2 * mi)
             image.mMiSize = at(maps, 3 * mi); image.mTx = at(maps, 4 * mi)
-            let ctx = try make((mi + 2 * mi1) * 2)
+            let ctx = try make(closedLoop ? (mi + 2 * mi1) * 2 : 16)
             let ctxTotal = mi + 2 * mi1
             image.cLvl = (at(ctx, 0), at(ctx, mi), at(ctx, mi + mi1))
             image.cDc = (at(ctx, ctxTotal), at(ctx, ctxTotal + mi), at(ctx, ctxTotal + mi + mi1))
@@ -565,11 +567,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             staleSuperblocks = cache?.staleCount
             keptSuperblocks = cache?.keptCount ?? 0
             encoder.lastKeptSuperblocks = keptSuperblocks
-            sbOut = try make(nSb * MemoryLayout<GpSbOut>.stride)
-            oBlocks = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<av1g_block>.stride)
-            oBlockTxb = try make(nSb * Int(GP_MAX_LEAVES) * 2)
-            oTxb = try make(nSb * Int(GP_MAX_TXB) * MemoryLayout<av1g_txb>.stride)
-            oCoeffs = try make(nSb * Int(GP_SB_COEFFS) * 2)
+            let out = closedLoop ? nSb : 0
+            sbOut = try make(out * MemoryLayout<GpSbOut>.stride)
+            oBlocks = try make(out * Int(GP_MAX_LEAVES) * MemoryLayout<av1g_block>.stride)
+            oBlockTxb = try make(out * Int(GP_MAX_LEAVES) * 2)
+            oTxb = try make(out * Int(GP_MAX_TXB) * MemoryLayout<av1g_txb>.stride)
+            oCoeffs = try make(out * Int(GP_SB_COEFFS) * 2)
             let stats = try make(16 * 4)
 
             // wavefront per tile: step = column + 2 * row from the tile's origin
@@ -587,7 +590,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 }
             }
             let widest = steps.map(\.count).max() ?? 1
-            let scratch = try make(widest * AV1MetalEncoder.reconScratchBytes)
+            let scratch = try make(closedLoop ? widest * AV1MetalEncoder.reconScratchBytes : 16)
 
             batch.nimg = 1
             batch.img = AV1MetalEncoder.address(imageBuffer)

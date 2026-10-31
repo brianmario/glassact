@@ -346,6 +346,24 @@ follow, because whole-frame work leads there: the filters (~19 ms wall,
 ~12 of it GPU) and the CPU's per-frame bookkeeping (~8 ms: padding the
 source, layout, block fields).
 
+**Fixed per-picture costs out (kept).** Each cut keeps the bytes:
+- Partition-only jobs leave the GPU closed loop's buffers out. They were
+  ~100 MB allocated and zeroed per 5K picture, on the CPU's path.
+- The hybrid stops zero-filling its coefficient array (the hook writes every
+  coefficient), pads the source on several threads, and skips its per-block
+  pass when the GPU decided chroma.
+- The filters keep their job's buffers across pictures of one geometry.
+
+| typing-cc | before | after (tiles) |
+|---|---|---|
+| 720p | 174.0 fps | **231.7 fps** (3×3) |
+| 1080p | 96.6 fps | **128.7 fps** (3×3) |
+| 5K | 20.5 fps | **29.7 fps** (4×4) |
+
+At 720p a frame is now 4.3 ms: GPU analysis 3.2 (overlapped), filters 1.8,
+closed loop 1.3, chroma 0.5, writer 0.3. At 5K the filters take 15.7 ms;
+their GPU work covers the whole frame (~12 ms) however little changed.
+
 What's left:
 - At 720p, the GPU's 9 ms with 97 % kept: every block's thread still
   launches to find its SB kept (since fixed above).

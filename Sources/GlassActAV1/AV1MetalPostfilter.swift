@@ -87,7 +87,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// only for a monochrome picture).
     public func filter(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>]) throws -> [[UInt8]] {
-        let job = try Job(self, params: fp, blocks: blocks, planes: planes)
+        let job = try self.job(params: fp, blocks: blocks, planes: planes)
         lastGPUSeconds = 0
         try run { compute in
             job.mark(compute)
@@ -121,7 +121,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         fp.cdef_y_sec = (0, 0, 0, 0, 0, 0, 0, 0)
         fp.cdef_uv_pri = (0, 0, 0, 0, 0, 0, 0, 0)
         fp.cdef_uv_sec = (0, 0, 0, 0, 0, 0, 0, 0)
-        let job = try Job(self, params: fp, blocks: blocks, planes: planes)
+        let job = try self.job(params: fp, blocks: blocks, planes: planes)
         let nsb = job.sbCols * job.sbRows
         let nc = Int(Self.candidates.npri * Self.candidates.nsec)
         lastGPUSeconds = 0
@@ -137,15 +137,15 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
 
         let target = try (0..<3).map { p -> any MTLBuffer in
-            let b = try job.make(job.pw[p] * job.ph[p])
+            let b = try job.scratch("target\(p)", job.pw[p] * job.ph[p])
             if p < job.nPlanes { Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: b, width: job.pw[p], height: job.ph[p]) }
             return b
         }
-        let lumaSSE = try job.make(4 * nsb * nc), chromaSSE = try job.make(4 * nsb * nc)
-        memset(chromaSSE.contents(), 0, 4 * nsb * nc)  // stays 0 for a monochrome picture
-        let current = try job.make(8 * nsb)
+        let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
+        if job.nPlanes == 1 { memset(chromaSSE.contents(), 0, 4 * nsb * nc) }  // stays 0 for a monochrome picture
+        let current = try job.scratch("current", 8 * nsb)
         let bitsCount = Self.maxCDEFBits + 1
-        let levels = try job.make(4 * 16 * bitsCount), totals = try job.make(8 * bitsCount)
+        let levels = try job.scratch("levels", 4 * 16 * bitsCount), totals = try job.scratch("totals", 8 * bitsCount)
         var candidates = Self.candidates
         try run { compute in
             job.mark(compute)
@@ -211,6 +211,22 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
     }
 
+    /// The job for this picture: the last one's buffers when the geometry is
+    /// the same (nothing allocated or cleared per picture), loaded with its inputs.
+    private var lastJob: Job?
+    private func job(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
+                     planes: [UnsafePointer<UInt8>]) throws -> Job {
+        let job: Job
+        if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3) {
+            job = j
+        } else {
+            job = try Job(self, params: fp)
+            lastJob = job
+        }
+        try job.load(params: fp, blocks: blocks, planes: planes)
+        return job
+    }
+
     private func run(_ body: (any MTLComputeCommandEncoder) -> Void) throws {
         guard let commands = queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
         else { throw Failure.metal("no command encoder") }
@@ -233,10 +249,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         var addrs = GaPfAddrs()
         var frame: [UInt8] = []
         var params: av1g_frame_params
-        let blockCount: Int
+        var blockCount = 0
+        var scratchBuffers: [String: any MTLBuffer] = [:]
 
-        init(_ filter: AV1MetalPostfilter, params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
-             planes: [UnsafePointer<UInt8>]) throws {
+        /// The buffers of a picture of fp's geometry; `load` fills them.
+        init(_ filter: AV1MetalPostfilter, params fp: av1g_frame_params) throws {
             self.filter = filter
             params = fp
             width = Int(fp.width)
@@ -248,30 +265,43 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             nPlanes = fp.monochrome != 0 ? 1 : 3
             pw = [miCols * 4, miCols * 2, miCols * 2]
             ph = [miRows * 4, miRows * 2, miRows * 2]
-            blockCount = blocks.count
-            guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
-            source = try (0..<3).map { p -> any MTLBuffer in
-                let b = try make(pw[p] * ph[p])
-                if p < nPlanes { b.contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p]) }
-                return b
-            }
+            source = try (0..<3).map { try make(pw[$0] * ph[$0]) }
             output = try (0..<3).map { try make(pw[$0] * ph[$0]) }
             let nmi = miRows * miCols, nuv = (miRows / 2) * (miCols / 2)
             let skip = try make(nmi), txY = try make(nmi), txU = try make(nuv), txV = try make(nuv)
             cdefIdx = try make(sbCols * sbRows)
-            memset(cdefIdx.contents(), 0xFF, sbCols * sbRows)
             let dirVar = try make(4 * nuv)
-            blockBuffer = try make(blocks.count * MemoryLayout<av1g_block>.stride)
-            if let base = blocks.baseAddress {
-                blockBuffer.contents().copyMemory(from: base, byteCount: blocks.count * MemoryLayout<av1g_block>.stride)
-            }
+            blockBuffer = try make(16)
             addrs.plane = (source[0].gpuAddress, source[1].gpuAddress, source[2].gpuAddress)
             addrs.stride = (Int32(pw[0]), Int32(pw[1]), Int32(pw[2]))
             addrs.skip = skip.gpuAddress
             addrs.lfTx = (txY.gpuAddress, txU.gpuAddress, txV.gpuAddress)
             addrs.cdefIdx = cdefIdx.gpuAddress
             addrs.cdefDirVar = dirVar.gpuAddress
+        }
+
+        /// A picture's reconstruction before the filters, blocks and parameters.
+        func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>]) throws {
+            guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
+            for p in 0..<nPlanes { source[p].contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p]) }
+            memset(cdefIdx.contents(), 0xFF, sbCols * sbRows)
+            let bytes = blocks.count * MemoryLayout<av1g_block>.stride
+            if blockBuffer.length < bytes {
+                made.removeAll { $0 === blockBuffer }
+                blockBuffer = try make(bytes + bytes / 4)
+            }
+            if let base = blocks.baseAddress { blockBuffer.contents().copyMemory(from: base, byteCount: bytes) }
+            blockCount = blocks.count
             setParams(fp)
+        }
+
+        /// A buffer of at least `length` bytes kept for the next picture.
+        func scratch(_ name: String, _ length: Int) throws -> any MTLBuffer {
+            if let b = scratchBuffers[name], b.length >= length { return b }
+            if let old = scratchBuffers[name] { made.removeAll { $0 === old } }
+            let b = try make(length)
+            scratchBuffers[name] = b
+            return b
         }
 
         func make(_ length: Int) throws -> any MTLBuffer {
