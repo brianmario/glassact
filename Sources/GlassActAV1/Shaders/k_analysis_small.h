@@ -148,6 +148,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         return b;
     };
     auto satd_of = [&](int c) -> float {
+        const PredCand pc = pred_cand(c, T::lw, T::lh);
         float t = 0.f;
         for (int sy = 0; sy < H; sy += 4)
             for (int sx = 0; sx < W; sx += 4) {
@@ -156,7 +157,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
                 for (int i = 0; i < 4; i++)
 #pragma unroll
                     for (int j = 0; j < 4; j++)
-                        d[i * 4 + j] = (int)s[(sy + i) * W + sx + j] - pred_px(c, sy + i, sx + j, T::lw, T::lh, A, L, dcv);
+                        d[i * 4 + j] = (int)s[(sy + i) * W + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv);
                 t += hadamard4_abs(d);
             }
         return t;
@@ -227,13 +228,14 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
             av1g_edge_prepare(pangle_of(m, cand_delta(c)), T::lw, T::lh, 0, haveLeft, haveAbove, x, y, maxX, maxY,
                               pa + AV1G_EDGE_OFF, pl + AV1G_EDGE_OFF, &upA, &upL);
         }
+        const PredCand pc = pred_cand(c, T::lw, T::lh);
 #pragma unroll
         for (int i = 0; i < H; i++)
 #pragma unroll
             for (int j = 0; j < W; j++) {
                 const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
                                                        pl + AV1G_EDGE_OFF, upA, upL)
-                                  : pred_px(c, i, j, T::lw, T::lh, A, L, dcv);
+                                  : pred_fast(pc, i, j, A, L, dcv);
                 res[i * W + j] = (int16_t)((int)s[i * W + j] - pr);
             }
     };

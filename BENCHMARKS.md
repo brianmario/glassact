@@ -259,6 +259,49 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: why moving content is GPU-bound, and two exact speedups (2026-10-31)
+
+`av1seq`, turbo, q20, 60 frames, M4 Pro. Every superblock is analyzed (`--no-reuse`), which is the moving-content case. Every decode is exact.
+
+**Where photos 720p goes.** On an otherwise idle GPU (`--serial`), the analysis takes 16.6 ms a frame and the filters 2.4 ms. Overlapped, those 19 ms are the frame time (51 fps). Two encoders running at once reach 58.6 fps between them, so the GPU is ~87 % busy. The cost is the volume of search, not latency or serial work.
+
+Stage shares, from ablations (each stage replaced by a stub):
+
+| Stage | Share |
+|---|---|
+| Prediction in mode screening | ~5 ms |
+| The shapes' exact-rate RD (K = 1) | ~1.5 ms |
+| Leaf decisions | ~4.5 ms |
+| The rest: edges, SATD, setup, the partition DP | |
+
+turbo screens 13–25 candidates per block over 11 block shapes, about 175 predicted pixels per source pixel. libaom's realtime path tries a few modes at a few sizes. The difference is what buys the 30–48 % smaller files.
+
+`av1seq --profile` now reports each stage's best of 10 runs. Single isolated dispatches varied 2× from run to run.
+
+**Kept (exact, same decisions):**
+- *Hoisted prediction (`pred_cand` / `pred_fast`).* `av1g_pred_pixel` derived each candidate's angle zone and derivatives at every pixel. These are now derived once per candidate, in the shapes' screening and RD, and in the leaf pass.
+- *Leaf tx search across the SIMD-group.* Before, each of the ≤7 intra tx types ran its scalar evaluation on one lane, so 25 of 32 lanes idled. Now the types run one after another, each evaluated by the whole SIMD-group (`warp_eval`). Leaves 4.5 → 2.7 ms.
+
+Interleaved A/B against the previous commit, every SB analyzed:
+
+| Sequence | Before | After | Bytes |
+|---|---|---|---|
+| photos 720p | 51.6 fps | **67.4 fps** | 134.4 KB (±0) |
+| typing-cc 720p | 49.4 | **65.9** | 108.5 KB (±0) |
+| scroll-win 720p | 50.2 | **67.7** | 88.4 KB (±0) |
+| typing-cc 1080p | 25.0 | **33.5** | 199.6 KB (±0) |
+| typing-cc 5K, 4×4 | 4.0 | **5.6** | 550.4 → 550.5 KB (+0.02 %: float near-ties in the tx search) |
+| photos 5K, 4×4 | 3.9 | **5.4** | 1.16 MB (±0) |
+
+With reuse, photos 720p went 60.1 → 75.2 fps. The other reuse runs were too noisy to compare: another process was taking ~2 CPU cores, which shows up in the CPU closed loop.
+
+**Measured, not kept:**
+- *Edges in threadgroup memory* for the thread-per-block kernel (in case the thread arrays spilled): the 8×8 shape went from 6.9 to 8.9 ms.
+- *Checkerboard SATD screening for the 64–128-pixel shapes:* +2 fps for +0.1–0.2 % bytes.
+- *turbo2* (no 4×4 / 4×8 / 8×4): photos +11 % fps, but +3.6 % bytes and −0.18 dB.
+
+**What this means at 5K.** With every superblock changing, intra-only analysis is ~16× the work of 720p: 5.4 fps on photos. Reaching 60 fps there would take ~11× less work per pixel. That has to come from inter prediction (unchanged and moved blocks cost nothing to analyze) or from a codec designed for the GPU, not from trimming this search.
+
 ### Metal AV1: filtering only around changes; a large-block prune (2026-10-31)
 
 `av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to

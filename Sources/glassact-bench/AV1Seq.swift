@@ -122,8 +122,17 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     if opts.has("profile") {
         encoder.reusesAnalysis = false
         encoder.profilesStages = true
-        _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
-        let st = encoder.lastStages
+        // isolated dispatches run at whatever clock the GPU is at, so take each stage's best of 10
+        var st = AV1MetalEncoder.StageTimes()
+        for run in 0..<10 {
+            _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
+            let s = encoder.lastStages
+            if run == 0 { st = s; continue }
+            st.analysis = min(st.analysis, s.analysis)
+            st.partition = min(st.partition, s.partition)
+            st.leaves = min(st.leaves, s.leaves)
+            st.shapes.merge(s.shapes, uniquingKeysWith: min)
+        }
         let names = ["4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32",
                      "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
         let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.1f", names[$0.key], $0.value * 1000) }

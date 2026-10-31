@@ -236,6 +236,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// When profiling: each block shape's analysis (by bsize) and the leaf decisions, in seconds.
         public var shapes: [Int: Double] = [:]
         public var leaves = 0.0
+        public init() {}
     }
     /// Runs each stage in its own command buffer so it can be timed, which
     /// adds a little latency between stages. For measurement.

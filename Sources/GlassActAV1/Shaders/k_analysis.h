@@ -53,6 +53,64 @@ __device__ __forceinline__ int pred_px(int c, int i, int j, int lw, int lh, cons
     return av1g_pred_pixel(m, pangle_of(m, cand_delta(c)), i, j, lw, lh, A, L);
 }
 
+// Glass Act: pred_px with the per-candidate work hoisted. av1g_pred_pixel derives the angle's zone
+// and derivatives for every pixel. Screening predicts each candidate over a whole block, so they are
+// derived once here, and a pixel costs a few integer ops. Identical to pred_px (edges unfiltered,
+// not upsampled).
+struct PredCand {
+    int mode, zone, dx, dy, w, h;  // zone: 0 DC, 1 <90, 2 90..180, 3 >180, 4 90, 5 180, 6 non-directional
+    AV1G_CONST const uint8_t *wx, *wy;
+};
+__device__ __forceinline__ PredCand pred_cand(int c, int lw, int lh) {
+    PredCand p;
+    p.mode = cand_mode(c);
+    p.w = 1 << lw; p.h = 1 << lh;
+    p.dx = 0; p.dy = 0;
+    p.wx = av1g_sm_weights(lw); p.wy = av1g_sm_weights(lh);
+    if (p.mode == AV1G_DC_PRED) { p.zone = 0; return p; }
+    if (!av1g_is_directional(p.mode)) { p.zone = 6; return p; }
+    const int a = pangle_of(p.mode, cand_delta(c));
+    if (a == 90) p.zone = 4;
+    else if (a == 180) p.zone = 5;
+    else if (a < 90) { p.zone = 1; p.dx = AV1G_T(Dr_Intra_Derivative)[a]; }
+    else if (a < 180) { p.zone = 2; p.dx = AV1G_T(Dr_Intra_Derivative)[180 - a]; p.dy = AV1G_T(Dr_Intra_Derivative)[a - 90]; }
+    else { p.zone = 3; p.dy = AV1G_T(Dr_Intra_Derivative)[270 - a]; }
+    return p;
+}
+__device__ __forceinline__ int pred_fast(thread const PredCand &p, int i, int j, const uint8_t *A, const uint8_t *L, int dcv) {
+    switch (p.zone) {
+    case 0: return dcv;
+    case 4: return A[j];
+    case 5: return L[i];
+    case 1: {
+        const int idx = (i + 1) * p.dx, base = (idx >> 6) + j, shift = (idx >> 1) & 0x1F, maxBase = p.w + p.h - 1;
+        return base < maxBase ? (A[base] * (32 - shift) + A[base + 1] * shift + 16) >> 5 : A[maxBase];
+    }
+    case 2: {
+        int idx = (j << 6) - (i + 1) * p.dx, base = idx >> 6;
+        if (base >= -1) {
+            const int shift = (idx >> 1) & 0x1F;
+            return (A[base] * (32 - shift) + A[base + 1] * shift + 16) >> 5;
+        }
+        idx = (i << 6) - (j + 1) * p.dy; base = idx >> 6;
+        const int shift = (idx >> 1) & 0x1F;
+        return (L[base] * (32 - shift) + L[base + 1] * shift + 16) >> 5;
+    }
+    case 3: {
+        const int idx = (j + 1) * p.dy, base = (idx >> 6) + i, shift = (idx >> 1) & 0x1F;
+        return (L[base] * (32 - shift) + L[base + 1] * shift + 16) >> 5;
+    }
+    default: break;
+    }
+    if (p.mode == AV1G_SMOOTH_PRED)
+        return (p.wy[i] * A[j] + (256 - p.wy[i]) * L[p.h - 1] + p.wx[j] * L[i] + (256 - p.wx[j]) * A[p.w - 1] + 256) >> 9;
+    if (p.mode == AV1G_SMOOTH_V_PRED) return (p.wy[i] * A[j] + (256 - p.wy[i]) * L[p.h - 1] + 128) >> 8;
+    if (p.mode == AV1G_SMOOTH_H_PRED) return (p.wx[j] * L[i] + (256 - p.wx[j]) * A[p.w - 1] + 128) >> 8;
+    const int base = A[j] + L[i] - A[-1];  // PAETH
+    const int pL = abs(base - L[i]), pT = abs(base - A[j]), pTL = abs(base - A[-1]);
+    return (pL <= pT && pL <= pTL) ? L[i] : pT <= pTL ? A[j] : A[-1];
+}
+
 // SATD of candidates cands[c0..c1) (all 4x4 sub-blocks), accumulated into satd[]
 template <int W, int H>
 __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const int *cands, int c0, int c1, threadgroup float *satd,
@@ -67,13 +125,13 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
         int sb = it % nsub;
         if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
         const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
-        const int c = cands[ci];
+        const PredCand pc = pred_cand(cands[ci], T::lw, T::lh);
         int d[16];
 #pragma unroll
         for (int i = 0; i < 4; i++)
 #pragma unroll
             for (int j = 0; j < 4; j++)
-                d[i * 4 + j] = (int)src[(sy + i) * sp + sx + j] - pred_px(c, sy + i, sx + j, T::lw, T::lh, A, L, dcv);
+                d[i * 4 + j] = (int)src[(sy + i) * sp + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv);
         atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], hadamard4_abs(d), memory_order_relaxed);
     }
     __syncwarp();
@@ -97,12 +155,13 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
         }
         __syncwarp();
     }
+    const PredCand pc = pred_cand(c, T::lw, T::lh);
     float e = 0.f;
     for (int p = lane; p < W * H; p += 32) {
         const int i = p / W, j = p % W;
         const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
                                                pl + AV1G_EDGE_OFF, up[0], up[1])
-                          : pred_px(c, i, j, T::lw, T::lh, A, L, dcv);
+                          : pred_fast(pc, i, j, A, L, dcv);
         const int r = (int)src[i * sp + j] - pr;
         res[p] = (int16_t)r;
         e += (float)(r * r);

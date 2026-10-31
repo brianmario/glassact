@@ -12,9 +12,14 @@
 #include "k_analysis_small.h"
 
 #define LEAF_NW 4  // SIMD-groups per threadgroup
+#ifndef LEAF_WARP_TX
+#define LEAF_WARP_TX 1
+#endif
 
 struct LeafSmem {
     int16_t res[16 * 16];
+    float tmp[16 * 17];  // the warp-parallel tx evaluation's scratch
+    int16_t q[16 * 16];
     uint8_t ea[3][AV1G_EDGE_LEN], el[3][AV1G_EDGE_LEN];  // luma, U, V
 };
 
@@ -61,11 +66,37 @@ static uint8_t leaf_luma_tx(device const GpImage &I, constant GpParams &P, int x
     build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, (int)lane, 32);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     const int dcv = av1g_dc_value(A, L, haveLeft, haveAbove, T::lw, T::lh);
+    const PredCand pc = pred_cand(c, T::lw, T::lh);
     for (int p = (int)lane; p < W * H; p += 32) {
         const int i = p / W, j = p % W;
-        S.res[p] = (int16_t)((int)src[i * sp + j] - pred_px(c, i, j, T::lw, T::lh, A, L, dcv));
+        S.res[p] = (int16_t)((int)src[i * sp + j] - pred_fast(pc, i, j, A, L, dcv));
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
+#if LEAF_WARP_TX
+    // the set's types one after another, each evaluated by the whole SIMD-group
+    const int qidx = sb_qindex(I, x, y);
+    const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
+    EvalIn e;
+    e.txSz = txSz; e.plane = 0;
+    e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
+    e.rnd = P.rnd; e.zbin = P.zbin;
+    e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = g_cost[I.qctx];
+    e.qmDist = P.qmDist; e.qmRnd = P.qmRnd; e.resEnergy = 0;
+    e.intraDir = cand_mode(c);
+    float bestJ = GP_INF;
+    int bt = AV1G_DCT_DCT;
+    for (int t = 0; t < 16; t++) {
+        if (!av1g_tx_type_in_set_intra(set, t)) continue;
+        e.txType = t;
+        e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, t);
+        EvalOut o;
+        warp_eval<W, H>(S.res, S.tmp, S.q, e, o, (int)lane);
+        const float J = o.D + lambda * o.R;
+        if (J < bestJ) { bestJ = J; bt = t; }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    return (uint8_t)bt;
+#else
     // lane l evaluates the l-th tx type of the set
     int t = -1, n = 0;
     for (int k = 0; k < 16; k++)
@@ -93,6 +124,7 @@ static uint8_t leaf_luma_tx(device const GpImage &I, constant GpParams &P, int x
     const int bt = simd_shuffle(t, (ushort)win);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     return (uint8_t)(bt >= 0 ? bt : AV1G_DCT_DCT);
+#endif
 }
 
 // Decider::best_chroma, lanes over 4x4 sub-blocks
@@ -128,11 +160,11 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
         const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
         device const uint8_t *s = I.src[pl] + (size_t)cy * I.spitch[pl] + cx;
         threadgroup uint8_t *A = S.ea[pl] + AV1G_EDGE_OFF, *L = S.el[pl] + AV1G_EDGE_OFF;
-        const int c = cand_pack(m, 0);
+        const PredCand pc = pred_cand(cand_pack(m, 0), lw, lh);
         int r[16];
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
-                r[i * 4 + j] = (int)s[(sy + i) * I.spitch[pl] + sx + j] - pred_px(c, sy + i, sx + j, lw, lh, A, L, dcv[pl]);
+                r[i * 4 + j] = (int)s[(sy + i) * I.spitch[pl] + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv[pl]);
         part[m] += leaf_proxy4(r, step, lambda);
     }
     float best = GP_INF;
