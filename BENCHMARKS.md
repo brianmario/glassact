@@ -260,6 +260,50 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: 128×128 superblocks, no sequence header on inter frames, fewer tiles; equal quality again (2026-10-31)
+
+**What changed:**
+- **Writer** (subagent):
+  - `fp.sb128`: 128×128 superblocks, every partition at the 128 level, the deblocking rule for skipped inter blocks wider than 64.
+  - `ENC_NO_SEQ_HEADER`: a frame without the sequence header; `parse_with` keeps the stream's.
+  - Tested exact: 20,000 random frames (6,944 sb128, 8,608 header-less) in dav1d and aomdec, plus the Swift libaom gates.
+- **Hybrid** (`largeSuperblocks`, `omitsSequenceHeaders`, both on with `interFrames`):
+  - The stream is sb128.
+  - `av1enc_motion_apply_ex` puts the GPU's 64×64 partition into the 128×128 decode order; a 128×128 whose four 64×64s are copies at one shift becomes one skip block.
+  - Inter frames go out without the sequence header.
+  - The GPU analysis stays 64×64, on the 128-unit tile layout.
+- **Tiling:** the comparison now uses libaom's own (log2 3 columns × 0 rows at 5K, 2 × 0 at 720p).
+  - Each tile costs a size field and a range-coder flush. At log2 4 × 4 an sb128 5K frame has ~170 tiles: most of a near-static inter frame's bytes.
+
+**Inter frame mean at q20** (first 100 frames, every frame exact):
+
+| | before (64×64 SBs, 4×4 / 2×2 tiles) | sb128, 4×4 / 2×2 tiles | sb128, libaom's tiling | libaom s9 |
+|---|---|---|---|---|
+| 5K typing-cc | 663 B | 486 B | **152 B** | 324 B |
+| 5K cursor-drag | 838 B | 644 B | **276 B** | 486 B |
+| 5K scroll-win | 4.2 KB | 4.0 KB | **3.4 KB** | 4.0 KB |
+| 5K photos | 27.9 KB | 27.5 KB | **26.5 KB** | 37.2 KB |
+| 720p typing-cc | 136 B | 108 B | **90 B** | 123 B |
+| 720p cursor-drag | 161 B | 134 B | **114 B** | 125 B |
+| 720p scroll-win | 2.1 KB | 2.0 KB | 2.0 KB | 2.0 KB |
+| 720p photos | 12.3 KB | 12.3 KB | 12.2 KB | 14.4 KB |
+
+- **Key frames** get 2–3 % smaller with these tilings as well.
+- **Inter frames a second** (5K, libaom's tiling): typing 134, drag 129, scroll 85, photos 28. Unchanged within noise.
+
+**Equal quality** (BD-rate by `vquality`'s RGB-luma PSNR, as in "against hardware HEVC and libaom" below; q 8–32; the hardware HEVC points from that entry):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K: hybrid vs libaom | −46 % (was −27) | −24 % (was −1) | −34 % (was −27) | −46 % (was −26) |
+| 5K: hybrid vs HEVC | −60 % | −74 % by SSIM (no PSNR overlap) | −83 % | −60 % |
+| 720p: hybrid vs libaom | −30 % (was −23) | −1 % (was +91) | −12 % (was +255) | −30 % (was −21) |
+| 720p: hybrid vs HEVC | −45 % | −39 % | −3 % | −42 % |
+
+By SSIM instead, two cells turn: 720p scroll-win vs libaom is +15 %, and 720p photos vs HEVC is +14 %.
+
+**Speed is still libaom's:** 2–5× our inter frame rate, and 5K photos is 28 against 92 inter frames a second. That's next.
+
 ### Metal AV1: inter tx blocks code nothing where that's cheaper (2026-10-31)
 
 **What changed:** the closed loop's quantization hook drops an inter tx block's coefficients when coding nothing costs less: SSE + λ against the coded residual's D + λR (`HookOpts.inter_rd_skip`, on in the hybrid). This is libaom realtime's "skip when coding costs more than the distortion" (nonrd_pickmode.c), here per tx block. Before, every inter residual that survived the dead zone was coded.
