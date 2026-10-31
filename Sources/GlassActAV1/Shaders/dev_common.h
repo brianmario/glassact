@@ -165,7 +165,7 @@ __device__ __forceinline__ float ssim_scale(const GpImage &I, int x, int y, int 
 }
 
 // flat-area pruning of shapes below 16x16 (GpParams::pruneFlat)
-__device__ __forceinline__ bool prune_flat(const GpImage &I, const GpParams &P, int x, int y, int W, int H, int qidx) {
+__device__ __forceinline__ bool prune_flat(const GpImage &I, constant GpParams &P, int x, int y, int W, int H, int qidx) {
     if (P.pruneFlat <= 0.f || !I.var16 || W * H >= 256) return false;
     const int cx = x >> 4, cy = y >> 4;
     if ((cx + 1) * 16 > I.MiCols * 4 || (cy + 1) * 16 > I.MiRows * 4) return false;   // incomplete region: keep

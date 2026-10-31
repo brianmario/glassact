@@ -42,6 +42,9 @@ public enum AV1ShaderSource {
         return ["av1enc_tables.h": String(cString: text)]
     }()
 
+    /// `Sources/`, for tests that compile a shader of the package.
+    public static var sourceRootForTests: URL { sourceRoot }
+
     /// `Sources/`.
     static let sourceRoot = URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
 
