@@ -259,6 +259,29 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### av1core codes tiles in parallel (2026-10-30)
+
+av1core's encoder now codes each tile on a worker thread. A copy of the
+encoder holds the tile's state (contexts, CDFs, cursor); the frame's
+buffers, which tiles write in disjoint parts, are shared. The output is
+unchanged, and every gate holds: the decoder gate's random multi-tile
+records, GPU entropy against the writer, the post-filters, and the Metal
+encoder's tiled pictures through libaom. typing-cc frame 200, 5K, turbo,
+3×3 tiles (64), M4 Pro (14 cores):
+
+| | one thread | tile threads |
+|---|---|---|
+| writer (symbols only) | 65 ms | 6.5 ms |
+| writer with reconstruction | 184 ms | 18 ms |
+| hybrid CPU closed loop | ~1000 ms | 97 ms |
+
+The previous entry's projection holds. The hybrid now takes ~440 ms a frame,
+wall: GPU analysis 245, CPU chroma decisions 41, CPU closed loop 97,
+filters and search 29, writer 7. All-GPU takes ~515–540 ms (closed loop
+250–270), and the hybrid is 3–4 % larger. Overlapping frame N+1's GPU analysis
+with frame N's CPU work would make it ~245 ms a frame, analysis-bound
+(not built).
+
 ### Metal AV1: small-shape kernel, and a first CPU closed loop (2026-10-30)
 
 The previous entries' frames and machine. `av1still --hybrid` (new).

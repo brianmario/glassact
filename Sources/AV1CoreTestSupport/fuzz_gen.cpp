@@ -64,7 +64,7 @@ struct Coverage {
     uint64_t golomb = 0, maxMag = 0, skip = 0, mono = 0, deltaq = 0, sepuv = 0, multiTile = 0, edgeForced = 0;
     uint32_t maxTileCols = 0, maxTileRows = 0;
 };
-static Coverage cov;
+static thread_local Coverage cov;  // Glass Act: thread_local, as test cases generate records in parallel
 
 struct Gen {
     Rng &rng;

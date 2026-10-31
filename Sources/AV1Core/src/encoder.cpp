@@ -20,11 +20,14 @@
 #include "av1g/internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <memory>
+#include <thread>
 #include <vector>
 
 namespace av1g {
@@ -248,19 +251,31 @@ private:
         for (int i = n - 1; i >= 0; i--) v = (v << 1) | sk.bit((vW >> i) & 1);
         return v;
     }
+    // Glass Act: the frame's buffers live in one shared struct, so that a copy of this
+    // encoder codes one tile on its own thread (tiles write disjoint parts of them) while
+    // its tile state (contexts, CDFs, cursor, current block) is its own.
+    struct FrameBufs {
+        std::vector<uint8_t> plane[3];
+        std::vector<uint8_t> mapMiSize, mapYMode, mapSkip, mapTxSize, mapUVMode;
+        std::vector<uint8_t> lfTxUV[2];
+        std::vector<int8_t> sbCdef;
+        std::vector<uint32_t> ordMap[3];
+    };
+    std::shared_ptr<FrameBufs> frameBufs = std::make_shared<FrameBufs>();
     // recon planes (cover all superblocks)
     int pstride[3] = {0, 0, 0}, pheight[3] = {0, 0, 0};
-    std::vector<uint8_t> plane[3];
+    std::vector<uint8_t> (&plane)[3] = frameBufs->plane;
     // 4x4-granular mode info maps
-    std::vector<uint8_t> mapMiSize, mapYMode, mapSkip, mapTxSize, mapUVMode;
-    std::vector<uint8_t> lfTxUV[2];   // LoopfilterTxSizes for U, V (chroma 4x4 units)
-    std::vector<int8_t> sbCdef;       // cdef_idx per 64x64 SB (-1: no non-skip block)
+    std::vector<uint8_t> &mapMiSize = frameBufs->mapMiSize, &mapYMode = frameBufs->mapYMode, &mapSkip = frameBufs->mapSkip,
+                         &mapTxSize = frameBufs->mapTxSize, &mapUVMode = frameBufs->mapUVMode;
+    std::vector<uint8_t> (&lfTxUV)[2] = frameBufs->lfTxUV;  // LoopfilterTxSizes for U, V (chroma 4x4 units)
+    std::vector<int8_t> &sbCdef = frameBufs->sbCdef;        // cdef_idx per 64x64 SB (-1: no non-skip block)
     int sbIndex = 0;                  // current SB (raster)
     void postfilter();
     // coefficient contexts
     std::vector<uint8_t> aboveLevel[3], aboveDc[3], leftLevel[3], leftDc[3];
     // AV1G_ENC_CHECK_EDGES: per-plane map of the covering tx block index
-    std::vector<uint32_t> ordMap[3];
+    std::vector<uint32_t> (&ordMap)[3] = frameBufs->ordMap;
     uint32_t curTxb = 0;
     // tile bounds
     int miRowStart = 0, miRowEnd = 0, miColStart = 0, miColEnd = 0;
@@ -1243,35 +1258,81 @@ void Encoder::run(av1g_output *out) {
     }
 
     // ---- tiles ----
-    std::vector<std::vector<uint8_t>> tileData;
-    uint64_t nsym = 0;
+    // Every tile's blocks: all blocks whose position is inside it, contiguous in tile order.
+    const uint32_t ntilesAll = tiles.rows * tiles.cols;
+    std::vector<uint32_t> tileFirst(ntilesAll + 1, 0);
     cursor = 0;
     for (uint32_t tr = 0; tr < tiles.rows; tr++)
         for (uint32_t tc = 0; tc < tiles.cols; tc++) {
-            // blocks of this tile: all blocks whose position is inside the tile, contiguous from cursor
-            tileEnd = cursor;
-            while (tileEnd < R->n_blocks) {
-                const av1g_block &b = R->blocks[tileEnd];
+            tileFirst[tr * tiles.cols + tc] = cursor;
+            while (cursor < R->n_blocks) {
+                const av1g_block &b = R->blocks[cursor];
                 if (b.mi_row < tiles.miRowStarts[tr] || b.mi_row >= tiles.miRowStarts[tr + 1] ||
                     b.mi_col < tiles.miColStarts[tc] || b.mi_col >= tiles.miColStarts[tc + 1]) break;
-                tileEnd++;
+                cursor++;
             }
-            if (tileSyms) {
-                tileSyms->emplace_back();
-                TeeSink sk((const uint16_t *)&cdf, &tileSyms->back());
-                encode_tile(sk, tr, tc);
-                nsym += sk.nsym;
-                tileData.push_back(sk.finish());
-            } else {
-                EcSink sk;
-                encode_tile(sk, tr, tc);
-                nsym += sk.nsym;
-                tileData.push_back(sk.finish());
-            }
-            if (cursor != tileEnd)
-                throw Error(AV1G_ERR_INVALID, "tile %u,%u: block %u not consumed by the partition walk", tr, tc, cursor);
         }
+    tileFirst[ntilesAll] = cursor;
     if (cursor != R->n_blocks) throw Error(AV1G_ERR_INVALID, "block %u is outside the expected tile order", cursor);
+    std::vector<std::vector<uint8_t>> tileData(ntilesAll);
+    std::vector<uint64_t> tileSymbols(ntilesAll, 0), tileFixed(ntilesAll, 0);
+    // Glass Act: one tile's coding, by a copy of this encoder (its own tile state, the shared frame)
+    auto codeTile = [&](Encoder &e, uint32_t i) {
+        const uint32_t tr = i / tiles.cols, tc = i % tiles.cols;
+        e.cursor = tileFirst[i];
+        e.tileEnd = tileFirst[i + 1];
+        e.nFixed = 0;
+        if (tileSyms) {
+            TeeSink sk((const uint16_t *)&e.cdf, &(*tileSyms)[i]);
+            e.encode_tile(sk, tr, tc);
+            tileSymbols[i] = sk.nsym;
+            tileData[i] = sk.finish();
+        } else {
+            EcSink sk;
+            e.encode_tile(sk, tr, tc);
+            tileSymbols[i] = sk.nsym;
+            tileData[i] = sk.finish();
+        }
+        tileFixed[i] = e.nFixed;
+        if (e.cursor != e.tileEnd)
+            throw Error(AV1G_ERR_INVALID, "tile %u,%u: block %u not consumed by the partition walk", tr, tc, e.cursor);
+    };
+    if (tileSyms) tileSyms->assign(ntilesAll, {});
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint32_t nworkers = ntilesAll > 1 ? std::min<uint32_t>(ntilesAll, hw) : 1;
+    if (nworkers == 1) {
+        for (uint32_t i = 0; i < ntilesAll; i++) codeTile(*this, i);
+    } else {
+        std::atomic<uint32_t> next{0};
+        std::vector<std::string> errors(nworkers);
+        std::vector<int> codes(nworkers, 0);
+        std::vector<std::thread> workers;
+        for (uint32_t w = 0; w < nworkers; w++)
+            workers.emplace_back([&, w]() {
+                Encoder e(*this);  // shares frameBufs, R and the hook; owns its tile state
+                try {
+                    for (;;) {
+                        const uint32_t i = next.fetch_add(1);
+                        if (i >= ntilesAll) break;
+                        codeTile(e, i);
+                    }
+                } catch (const Error &x) {
+                    codes[w] = x.code;
+                    errors[w] = x.what();
+                    next = ntilesAll;
+                } catch (const std::exception &x) {
+                    codes[w] = AV1G_ERR_INTERNAL;
+                    errors[w] = x.what();
+                    next = ntilesAll;
+                }
+            });
+        for (auto &t : workers) t.join();
+        for (uint32_t w = 0; w < nworkers; w++)
+            if (codes[w]) throw Error(codes[w], "%s", errors[w].c_str());
+    }
+    uint64_t nsym = 0;
+    nFixed = 0;
+    for (uint32_t i = 0; i < ntilesAll; i++) { nsym += tileSymbols[i]; nFixed += tileFixed[i]; }
 
     const int ntiles = (int)tileData.size();
     // TileSizeBytes: smallest that holds every tile_size_minus_1 except the last tile's

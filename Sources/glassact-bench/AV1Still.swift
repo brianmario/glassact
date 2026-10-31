@@ -237,7 +237,7 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
             for p in 0..<3 where hd.planes[p] != hs.planes[p] {
                 throw BenchError("hybrid q\(q): libaom's decode differs from the filtered picture in plane \(p)")
             }
-            let ht = String(format: "GPU analysis %.1f · CPU chroma %.1f + closed loop %.1f (1 thread) · filters %.1f wall · writer %.1f · wall %.0f",
+            let ht = String(format: "GPU analysis %.1f · CPU chroma %.1f + closed loop %.1f (tile threads) · filters %.1f wall · writer %.1f · wall %.0f",
                             (gpuStages.analysis + gpuStages.partition) * 1000, av1t_hybrid_seconds(hybrid, 0) * 1000,
                             av1t_hybrid_seconds(hybrid, 1) * 1000, (tD - tC) * 1000, (tE - tD) * 1000, (tE - tA) * 1000)
             _ = tB
