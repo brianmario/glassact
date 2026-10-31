@@ -39,6 +39,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// Whether `blocks` carry chroma decisions too (`decidesLeaves`).
         public var hasChroma: Bool
         public var tiles: av1g_tiles
+        /// An inter frame's (`beginPartition(motion:)`): every block's motion, parallel to
+        /// `blocks` (an inter block's intra fields are 0); empty otherwise.
+        public var inter: [av1g_block_inter] = []
     }
 
     /// An encoded picture: the decisions, ready for av1core's writer, and the
@@ -89,6 +92,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     static let smallMaxPixels = 128
     let dp: any MTLComputePipelineState
     let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
+    /// Inter frames' motion search: k_me, and per block size of 8×8 and up k_inter and its warps.
+    let motionSearch: any MTLComputePipelineState
+    let inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int)]
     /// Keep each superblock's analysis, partition and leaf decisions from the
     /// previous picture when the source they read hasn't changed (the
     /// superblock itself and the left, above, above-left, above-right and
@@ -127,18 +133,34 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         if sourcePool.count < 2 { sourcePool.append(planes) }
     }
 
+    /// The padded source of the last partition waited on: the next inter frame's motion search
+    /// predicts from it. The one before goes back to the pool (its partitions are done).
+    var lastSource: [any MTLBuffer]?
+    func keepSource(_ planes: [any MTLBuffer]) {
+        if let old = lastSource { recycleSource(old) }
+        lastSource = planes
+    }
+
+    /// Analyze every superblock of the next picture (keeping nothing from the ones before), as a
+    /// stream's first picture must when the cache holds an earlier stream's inter frames.
+    public func forgetAnalysis() {
+        cache?.previous = nil
+    }
+
     /// The buffers a picture's analysis leaves behind, and the source it read.
     final class AnalysisCache {
         let key: [UInt8]
         let blockResults: any MTLBuffer, leaves: any MTLBuffer, leafCount: any MTLBuffer
         let leafDecisions: any MTLBuffer, sbJ: any MTLBuffer, keep: any MTLBuffer
+        /// An inter frame's analysis (GpInterRes, parallel to blockResults).
+        let interResults: any MTLBuffer
         /// The SBs to analyze (raster), staleCount of them.
         let stale: any MTLBuffer
         var staleCount = 0
         var previous: [[UInt8]]? = nil
         var keptCount = 0
-        /// Each SB's blocks and luma tx types as the last partition read them, for SBs kept since.
-        var sbBlocks: [[av1g_block]] = [], sbTypes: [[UInt8]] = []
+        /// Each SB's blocks, luma tx types and motion as the last partition read them, for SBs kept since.
+        var sbBlocks: [[av1g_block]] = [], sbTypes: [[UInt8]] = [], sbInter: [[av1g_block_inter]] = []
 
         init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
             self.key = key
@@ -149,6 +171,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 return b
             }
             blockResults = try make(blocks * MemoryLayout<GpBlockRes>.stride)
+            interResults = try make(blocks * MemoryLayout<GpInterRes>.stride)
             leaves = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
             leafCount = try make(nSb * 2)
             leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
@@ -197,9 +220,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             staleCount = 0
             for r in 0..<sbRows {
                 for c in 0..<sbCols {
-                    let skipped = skip.map { $0[r * sbCols + c] != 0 } ?? false
-                    let isStale = !skipped && (changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
-                        || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1))
+                    // with `skip` (an inter frame), every SB not skipped is analyzed: its kept
+                    // analysis could hold motion against an older picture
+                    let isStale = skip.map { $0[r * sbCols + c] == 0 }
+                        ?? (changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
+                            || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1))
                     k[r * sbCols + c] = isStale ? 0 : 1
                     if isStale {
                         list[staleCount] = UInt32(r * sbCols + c)
@@ -300,6 +325,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             analysis[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
         }
         self.analysis = analysis
+        var inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int)] = [:]
+        for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
+            let prefix = "k_inter_\(size.w)x\(size.h)_w"
+            guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }),
+                  let warps = Int(name.dropFirst(prefix.count)),
+                  let function = library.makeFunction(name: name)
+            else { throw Failure.metal("no \(prefix)…") }
+            inter[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
+        }
+        self.inter = inter
+        guard let meFunction = library.makeFunction(name: "k_me") else { throw Failure.metal("no k_me") }
+        motionSearch = try Self.pipeline(meFunction, threads: 128, device: device)
         var small: [Int: any MTLComputePipelineState] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
             guard let function = library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)")
@@ -421,8 +458,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                           width: Int, height: Int, qindex: Int) throws -> Partition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false)
         try run.execute(closedLoop: false)
-        let (blocks, types) = run.leafBlocks()
-        return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
+        let (blocks, types, inter) = run.leafBlocks()
+        return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
     }
 
     /// A picture's analysis and partition DP, running on the GPU: the caller
@@ -448,12 +485,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 run.encoder.lastStages = stages
                 run.encoder.lastGPUSeconds = stages.analysis
             }
-            let (blocks, types) = run.leafBlocks()
+            let (blocks, types, inter) = run.leafBlocks()
             if !run.source.isEmpty {  // the GPU is done with it (or never used it)
-                run.encoder.recycleSource(run.source)
+                run.encoder.keepSource(run.source)
                 run.source = []
             }
-            return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
+            return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
         }
     }
 
@@ -461,10 +498,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the stages run to completion first.)
     /// `skip` (per 64×64, raster; with `reusesAnalysis`): superblocks whose analysis
     /// the caller doesn't need, which keep the previous picture's where it has one.
+    /// `motion` (an inter frame's shift candidates, (dx, dy) pairs): search for motion
+    /// from the last picture waited on, of the same size (its source); the partition
+    /// then mixes inter blocks with intra ones (`Partition.inter`).
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-                               width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil) throws -> PendingPartition {
+                               width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
+                               motion: [Int32]? = nil) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
-                          skip: skip)
+                          skip: skip, motion: motion)
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
 
@@ -494,6 +535,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The analysis's result per (shape, position), and each shape's grid.
         let blockResults: any MTLBuffer
         let leafDecisions: any MTLBuffer
+        /// An inter frame's: the motion search's result per (shape, position), and k_me's per 16×16.
+        let interResults: any MTLBuffer
+        let meBest: (any MTLBuffer)?
+        var isInter: Bool { meBest != nil }
         /// Superblocks whose analysis the previous picture's stands for (`reusesAnalysis`).
         let keptSuperblocks: Int
         /// With `reusesAnalysis`, the superblocks to analyze (the rest are kept).
@@ -508,7 +553,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// With `closedLoop` false the closed loop's buffers (reconstruction,
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-             width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil) throws {
+             width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
+             motion: [Int32]? = nil) throws {
             self.encoder = encoder
             self.width = width
             self.height = height
@@ -599,6 +645,21 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 shTotal[s] = UInt32(nbx[s] * nby[s])
                 blkTotal += shTotal[s]
             }
+            // an inter frame: motion from the last picture's source (padded the same way)
+            if let motion, let last = encoder.lastSource, last.map(\.length) == src.map(\.length), last[0] !== src[0] {
+                made.append(last[0])
+                image.ref = AV1MetalEncoder.address(last[0])
+                let n = min(motion.count / 2, Int(GP_ME_CANDS))
+                image.nMeCand = Int32(n)
+                withUnsafeMutableBytes(of: &image.meCand) { d in
+                    for k in 0..<(2 * n) { d.storeBytes(of: Int16(clamping: motion[k]), toByteOffset: 2 * k, as: Int16.self) }
+                }
+                let me = try make((aw / 16) * (ah / 16) * 2 * Int(GP_ME_KEEP) * 2)
+                image.meBest = AV1MetalEncoder.address(me)
+                meBest = me
+            } else {
+                meBest = nil
+            }
             shOff.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shOff) { $0.copyMemory(from: src) } }
             nbx.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shNbx) { $0.copyMemory(from: src) } }
             nby.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shNby) { $0.copyMemory(from: src) } }
@@ -623,6 +684,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             leafCount = try cache.map { keep($0.leafCount) } ?? make(nSb * 2)
             leafDecisions = try cache.map { keep($0.leafDecisions) }
                 ?? make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
+            interResults = try cache.map { keep($0.interResults) } ?? make(meBest != nil ? Int(blkTotal) * MemoryLayout<GpInterRes>.stride : 16)
             decidesLeaves = encoder.decidesLeaves
             leafOffsets = try make(4 * (nSb + 1))
             leafDispatch = try make(MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
@@ -683,6 +745,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.sbKeep = sbKeep.flatMap { AV1MetalEncoder.address($0) }
             batch.sbList = sbList.flatMap { AV1MetalEncoder.address($0) }
             batch.nSbList = UInt32(staleSuperblocks ?? 0)
+            batch.inter = meBest != nil ? AV1MetalEncoder.address(interResults) : nil
             tiles = tl
             buffers = made
         }
@@ -731,6 +794,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             let t0 = CACurrentMediaTime()
             var e = try open()
+            let analyzed = staleSuperblocks ?? (sbCols * sbRows)
+            if isInter, analyzed > 0 {  // motion per 16x16, alongside the analysis
+                var cells = UInt32(analyzed * 16)
+                e.setComputePipelineState(encoder.motionSearch)
+                e.setBytes(&cells, length: 4, index: 2)
+                e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            }
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
                 var n = shTotal[s]
                 if let stale = staleSuperblocks {  // only the listed SBs' blocks
@@ -761,6 +832,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     stages.shapes[s] = t
                     stages.analysis += t
                     e = try open()
+                }
+            }
+            if isInter, analyzed > 0 {  // inter candidates against the analysis's intra costs
+                e.memoryBarrier(scope: .buffers)
+                for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
+                    guard let (pipeline, warps) = encoder.inter[s] else { continue }
+                    let size = AV1MetalEncoder.blockSizes[s]
+                    var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
+                    e.setComputePipelineState(pipeline)
+                    e.setBytes(&n, length: 4, index: 2)
+                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
                 }
             }
             if profiling { stages.analysis += try close() }
@@ -833,8 +916,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             return order
         }
 
-        func leafBlocks() -> ([av1g_block], [UInt8]) {
-            var blocks: [av1g_block] = [], types: [UInt8] = []
+        func leafBlocks() -> ([av1g_block], [UInt8], [av1g_block_inter]) {
+            var blocks: [av1g_block] = [], types: [UInt8] = [], inter: [av1g_block_inter] = []
+            let interRes = interResults.contents().assumingMemoryBound(to: GpInterRes.self)
             let leafPtr = leaves.contents().assumingMemoryBound(to: GpLeaf.self)
             let results = blockResults.contents().assumingMemoryBound(to: GpBlockRes.self)
             let decisions = leafDecisions.contents().assumingMemoryBound(to: GpLeafDecision.self)
@@ -845,11 +929,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             if let cache, cache.sbBlocks.count != sbCols * sbRows {
                 cache.sbBlocks = Array(repeating: [], count: sbCols * sbRows)
                 cache.sbTypes = Array(repeating: [], count: sbCols * sbRows)
+                cache.sbInter = Array(repeating: [], count: sbCols * sbRows)
             }
             for sb in decodeOrder() {
                 if let cache, let kept, kept[sb] != 0, !cache.sbBlocks[sb].isEmpty {
                     blocks += cache.sbBlocks[sb]
                     types += cache.sbTypes[sb]
+                    if isInter {
+                        let i = cache.sbInter[sb]
+                        inter += i.count == cache.sbBlocks[sb].count ? i : Array(repeating: av1g_block_inter(), count: cache.sbBlocks[sb].count)
+                    }
                     continue
                 }
                 let first = blocks.count
@@ -864,7 +953,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     let s = Int(leaf.bsize), size = AV1MetalEncoder.blockSizes[s]
                     let li = (Int(b.mi_row) * 4 / size.h) * Int(shapeColumns[s]) + Int(b.mi_col) * 4 / size.w
                     let res = results[Int(shapeOffset[s]) + li]
-                    if res.ncand > 0 {
+                    var bi = av1g_block_inter()
+                    if isInter, size.w >= 8, size.h >= 8, interRes[Int(shapeOffset[s]) + li].isInter != 0 {
+                        let m = interRes[Int(shapeOffset[s]) + li]
+                        bi.is_inter = 1
+                        bi.mv_row = m.dy * 8
+                        bi.mv_col = m.dx * 8
+                    } else if res.ncand > 0 {
                         let cand = Int(res.cand.0)
                         b.y_mode = UInt8(cand >> 3)
                         b.angle_delta_y = Int8((cand & 7) - 3)
@@ -877,14 +972,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                         b.cfl_alpha_v = d.cflV
                     }
                     blocks.append(b)
-                    types.append(decidesLeaves ? decisions[sb * Int(GP_MAX_LEAVES) + k].lumaTx : (res.ncand > 0 ? res.tx : 0))
+                    types.append(bi.is_inter != 0 ? 0 : decidesLeaves ? decisions[sb * Int(GP_MAX_LEAVES) + k].lumaTx : (res.ncand > 0 ? res.tx : 0))
+                    if isInter { inter.append(bi) }
                 }
                 if let cache {
                     cache.sbBlocks[sb] = Array(blocks[first...])
                     cache.sbTypes[sb] = Array(types[first...])
+                    cache.sbInter[sb] = isInter ? Array(inter[first...]) : []
                 }
             }
-            return (blocks, types)
+            return (blocks, types, inter)
         }
 
         /// k_pack's work on the CPU: the per-superblock slots into one record, in decode order.

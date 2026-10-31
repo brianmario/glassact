@@ -29,7 +29,8 @@ let av1SeqCommand = Command(
         .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
         .bool("chroma-angles", "screen the six angled chroma modes too (13 instead of 7)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
-        .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra"),
+        .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
+        .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
@@ -87,6 +88,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.postfilters = !opts.has("no-filters")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     encoder.interFrames = inter
+    encoder.searchesMotion = !opts.has("no-motion-search")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
@@ -141,9 +143,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let rest = frames.dropFirst()
         let m = Double(rest.count)
         func avg(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { rest.map { f($0.timing) }.reduce(0, +) / m }
-        print(String(format: "             key frame %@ · inter frames %@ on average · copied %.1f %% of 64x64s (%.1f %% at a shift) · deciding them %.2f ms",
+        print(String(format: "             key frame %@ · inter frames %@ on average · copied %.1f %% of 64x64s (%.1f %% at a shift) · deciding them %.2f ms · motion-searched blocks %.1f %% of the picture",
                      formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count),
-                     avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.motion } * 1000))
+                     avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.motion } * 1000, avg { $0.searched } * 100))
     }
 
     if opts.has("profile") {

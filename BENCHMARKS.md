@@ -260,6 +260,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: motion search in inter frames (2026-10-31)
+
+**What changed:** the 64×64s that aren't exact copies now search for motion on the GPU, inside the analysis (`AV1HybridEncoder.searchesMotion`, on with `interFrames`; `av1seq --no-motion-search` turns it off).
+- **`k_me`**, per 16×16, searches by SAD on every other row:
+  - whole-sample vectors within ±8 of no motion;
+  - ±4 around each of the frame's shift candidates (from the copy decisions);
+  - it keeps the best two.
+- **`k_inter`**, per block shape of 8×8 and up, runs after the intra analysis:
+  - it screens no motion and the vectors of the 16×16s the block covers;
+  - the best is costed with the analysis's own exact-rate RD (DCT_DCT, with rough motion-vector bits);
+  - where that's below the intra J, it takes its place. The partition DP then mixes inter and intra blocks as it would two intra modes.
+- **Prediction source:** the search predicts from the previous picture's *source*, which the GPU already holds. Picture i + 1's analysis doesn't wait for picture i's reconstruction, so the CPU/GPU overlap stays. The closed loop predicts exactly from the decoded picture and codes the residual (DCT_DCT for inter blocks, for now).
+
+**Results:** same setup as below (5K, 4×4 tiles, q20, turbo, first 100 frames; every frame decoded by libaom in order, exactly):
+
+| Trace | Inter frames: copies only → with search | Mbit/s at the trace's timing | Searched blocks, share of the picture | PSNR-Y |
+|---|---|---|---|---|
+| typing-cc | 2.4 → 2.0 KB | 0.6 → 0.5 | 0.0 % | 47.34 → 47.34 |
+| scroll-win | 10.1 → 5.8 KB | 2.4 → 1.7 | 0.7 % | 48.83 → 48.83 |
+| photos | 108 → 30.5 KB | 21.0 → 7.3 | 7.9 % | 42.74 → 42.86 |
+| cursor-drag | 2.8 → 2.2 KB | 1.2 → 1.1 | 0.1 % | 47.56 → 47.56 |
+
+- **Photos now comes in under the pinned HEVC loop** (10.9 Mbit/s over the whole trace), as typing, scroll and drag already did (2.4 / 5.0 / 4.4). Caveats as below: different spans, quality not matched.
+- **Speed:** photos 30.9 → 29.5 fps, with the GPU analysis at 21.3 → 24.9 ms a frame.
+  - The machine was loaded during these runs (other processes at ~130 % CPU), so speeds moved by up to 25 % run to run. For example, copies-only typing ran at 80–85 fps here, against 94 in the entry below.
+  - Typing and drag measured 63–80 fps with the search on; that needs re-measuring on a quiet machine before calling it a regression.
+
+**Limitations:**
+- Inter blocks are at loop filter level 0 (`lf_inter_off`), searched ones included, so their residual's block edges aren't deblocked. A per-superblock `delta_lf` would deblock the coded 64×64s and leave copies alone.
+- Whole-sample vectors only (`force_integer_mv`). DCT_DCT only. No chroma in the inter cost.
+- The motion-vector bits are a rough estimate, not the reference MV stack's.
+
 ### Metal AV1: inter frames from exact copies (2026-10-31)
 
 **What changed:** `AV1HybridEncoder.interFrames` (`av1seq --inter`) codes a sequence as one stream: a key frame, then inter frames that each reference the frame before.

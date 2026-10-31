@@ -1092,12 +1092,28 @@ pub unsafe extern "C" fn av1enc_motion_classify(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_candidates(m: *const crate::motion::Motion, out: *mut i32, max: c_int) -> c_int {
+    if m.is_null() || out.is_null() || max <= 0 {
+        return 0;
+    }
+    // SAFETY: the handle; out holds 2 * max ints
+    let m = unsafe { &*m };
+    let o = unsafe { slice::from_raw_parts_mut(out, 2 * max as usize) };
+    let n = m.candidates.len().min(max as usize);
+    for (k, c) in m.candidates[..n].iter().enumerate() {
+        (o[2 * k], o[2 * k + 1]) = (c.dx, c.dy);
+    }
+    n as c_int
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_motion_apply(
     m: *mut crate::motion::Motion,
     sb_motion: *const i32,
     blocks: *const Block,
     n: u32,
     luma_tx: *const u8,
+    inter: *const BlockInter,
     width: c_int,
     height: c_int,
     out_blocks: *mut *const Block,
@@ -1112,6 +1128,7 @@ pub unsafe extern "C" fn av1enc_motion_apply(
     let m = unsafe { &mut *m };
     let b = unsafe { slice::from_raw_parts(blocks, n as usize) };
     let l = (!luma_tx.is_null()).then(|| unsafe { slice::from_raw_parts(luma_tx, n as usize) });
+    let iv = (!inter.is_null()).then(|| unsafe { slice::from_raw_parts(inter, n as usize) });
     let sb_cols = (width as usize).div_ceil(64);
     let nsb = sb_cols * (height as usize).div_ceil(64);
     let sbs: Vec<crate::motion::SbMotion> = if sb_motion.is_null() {
@@ -1132,6 +1149,7 @@ pub unsafe extern "C" fn av1enc_motion_apply(
         sb_cols,
         b,
         l,
+        iv,
         crate::blockinfo::mi_rows(height),
         crate::blockinfo::mi_cols(width),
     );

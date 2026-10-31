@@ -314,6 +314,14 @@ impl TxbHook for QuantHook<'_> {
             );
             return;
         }
+        if ctx.is_inter {
+            // inter blocks: DCT_DCT (in every inter set), for now
+            t.tx_type = DCT_DCT as u8;
+            self.trial(
+                w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, false,
+            );
+            return;
+        }
         let set = get_tx_set_intra(tx_sz, self.o.reduced_tx_set);
         let in_set = |ty: i32| ty < TX_TYPES && tx_type_in_set_intra(set, ty);
         if self.o.given_luma_tx != 0 {

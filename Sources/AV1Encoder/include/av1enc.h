@@ -135,12 +135,14 @@ void av1enc_motion_destroy(av1enc_motion *m);
 int av1enc_motion_classify(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
                            const uint8_t *const prev[3], const int prev_stride[3], int width, int height, int planes,
                            int max_candidates, int32_t *out);
+// The last classify's shift candidates (dx, dy pairs, best first), up to max; returns the count.
+int av1enc_motion_candidates(const av1enc_motion *m, int32_t *out, int max);
 // A classify's decisions (sb_motion, as its out) applied to a partition in coding order (and its
-// luma tx types, if given): every copied 64x64's blocks replaced by the largest legal blocks, skip
-// inter blocks at its shift. *out_blocks / *out_inter / *out_luma_tx (one each per block) live in
-// m until its next apply. Returns the block count.
+// luma tx types and inter blocks, if given): every copied 64x64's blocks replaced by the largest
+// legal blocks, skip inter blocks at its shift. *out_blocks / *out_inter / *out_luma_tx (one each
+// per block) live in m until its next apply. Returns the block count.
 int av1enc_motion_apply(av1enc_motion *m, const int32_t *sb_motion, const av1g_block *blocks, uint32_t n,
-                        const uint8_t *luma_tx, int width,
+                        const uint8_t *luma_tx, const av1g_block_inter *inter, int width,
                         int height, const av1g_block **out_blocks, const av1g_block_inter **out_inter,
                         const uint8_t **out_luma_tx);
 

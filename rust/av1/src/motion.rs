@@ -279,6 +279,8 @@ pub struct Motion {
     pub blocks: Vec<Block>,
     pub inter: Vec<BlockInter>,
     pub luma_tx: Vec<u8>,
+    /// the last [`Motion::classify`]'s shift candidates (usable ones, best first)
+    pub candidates: Vec<Shift>,
     threads: usize,
 }
 
@@ -298,6 +300,7 @@ impl Motion {
             blocks: Vec::new(),
             inter: Vec::new(),
             luma_tx: Vec::new(),
+            candidates: Vec::new(),
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
         }
     }
@@ -310,6 +313,7 @@ impl Motion {
         (self.sb_cols, self.sb_rows) = (sb_cols, sb_rows);
         self.sbs.clear();
         self.sbs.resize(sb_cols * sb_rows, SbMotion::default());
+        self.candidates.clear();
         let same = cur[0].width == prev[0].width && cur[0].height == prev[0].height;
         if !same {
             return 0;
@@ -339,6 +343,7 @@ impl Motion {
             .into_iter()
             .filter(usable)
             .collect();
+        self.candidates.clone_from(&cands);
         for s in 0..self.sbs.len() {
             if self.sbs[s].copy {
                 continue;
@@ -359,16 +364,19 @@ impl Motion {
         self.sbs.iter().filter(|m| m.copy).count()
     }
 
-    /// `blocks` (a partition in coding order; with `luma_tx`, their luma tx types) with every
-    /// superblock `sbs` copies (per 64x64, raster, `sb_cols` wide) replaced by its
-    /// [`inter_sb_cover`]: skip inter blocks at its shift, intra fields 0, luma tx type 0. Into
-    /// [`Motion::blocks`], [`Motion::inter`] (one per block) and [`Motion::luma_tx`].
+    /// `blocks` (a partition in coding order; with `luma_tx`, their luma tx types, and with
+    /// `inter`, their motion) with every superblock `sbs` copies (per 64x64, raster, `sb_cols`
+    /// wide) replaced by its [`inter_sb_cover`]: skip inter blocks at its shift, intra fields 0,
+    /// luma tx type 0. Into [`Motion::blocks`], [`Motion::inter`] (one per block) and
+    /// [`Motion::luma_tx`].
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
         sbs: &[SbMotion],
         sb_cols: usize,
         blocks: &[Block],
         luma_tx: Option<&[u8]>,
+        inter: Option<&[BlockInter]>,
         mi_rows: i32,
         mi_cols: i32,
     ) {
@@ -401,7 +409,7 @@ impl Motion {
                 }
                 _ => {
                     self.blocks.push(*b);
-                    self.inter.push(BlockInter::default());
+                    self.inter.push(inter.map_or(BlockInter::default(), |v| v[i]));
                     self.luma_tx.push(luma_tx.map_or(0, |l| l[i]));
                 }
             }

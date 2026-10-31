@@ -137,10 +137,11 @@ extension HybridEncoderTests {
 }
 
 extension HybridEncoderTests {
-    /// Inter frames: a window scrolling over a page of glyphs, words typed elsewhere, pictures
-    /// that don't change; one stream that libaom decodes in order to exactly the pictures the
-    /// encoder reports (each of which the next frame references), with scrolled 64×64s copied at
-    /// their shift and unchanged ones copied as they are.
+    /// Inter frames: a window scrolling over a page of glyphs, words typed elsewhere, a photo
+    /// that drifts and brightens (never an exact copy, so motion search's), pictures that don't
+    /// change; one stream that libaom decodes in order to exactly the pictures the encoder reports
+    /// (each of which the next frame references), with scrolled 64×64s copied at their shift,
+    /// unchanged ones copied as they are, and searched blocks predicted with a residual.
     @available(macOS 27, *)
     @Test(.serialized, arguments: [(1280, 720, 80, 2), (333, 201, 120, -1)])
     func interStreamsDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int) throws {
@@ -169,6 +170,14 @@ extension HybridEncoderTests {
             for r in 0..<wh / 2 {
                 for c in 0..<pw / 2 where (wx / 2) + c < cw { u[(wy / 2 + r) * cw + wx / 2 + c] = pageU[(top / 2 + r) * (pw / 2) + c] }
             }
+            // the photo: a smooth texture, moved (3, 1) and brightened by 2 a picture, bottom left
+            let (px0, py0) = (8, height - min(120, height / 3))
+            for r in py0..<min(height, py0 + 96) {
+                for c in px0..<min(width / 3, px0 + 160) {
+                    let (u0, v0) = (c - px0 + 3 * i, r - py0 + i)
+                    y[r * width + c] = UInt8(clamping: 60 + 2 * i + (u0 * 7 + v0 * 3) % 50 + ((u0 / 9 + v0 / 7) % 3) * 20)
+                }
+            }
             if i % 3 == 1 {  // a word typed at the top left
                 let x0 = rng.int(0..<max(1, wx - 24)), y0 = rng.int(0..<max(1, wy - 12))
                 for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { y[r * width + c] = 40 } }
@@ -178,10 +187,11 @@ extension HybridEncoderTests {
         let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2)"
         let decoder = try #require(glassact_aom_dec_create(1))
         defer { glassact_aom_dec_destroy(decoder) }
-        var copied = 0.0, shifted = 0.0
+        var copied = 0.0, shifted = 0.0, searched = 0.0
         try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
             copied += f.timing.copied
             shifted += f.timing.shifted
+            searched += f.timing.searched
             var frame = glassact_aom_frame()
             try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
             let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
@@ -194,5 +204,6 @@ extension HybridEncoderTests {
             }
         })
         #expect(copied > 0 && shifted > 0, "\(label): copied \(copied), shifted \(shifted): the copies weren't exercised")
+        #expect(searched > 0, "\(label): no block was motion-searched")
     }
 }

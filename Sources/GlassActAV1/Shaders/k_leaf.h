@@ -279,7 +279,12 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
         d.pad[0] = d.pad[1] = d.pad[2] = 0;
         // the analysis's result for this shape and position
         const int W = 4 * av1g_bw4(bs), H = 4 * av1g_bh4(bs);
-        device const GpBlockRes &r = B.blk[I.shOff[bs] + (y / H) * I.shNbx[bs] + x / W];
+        const uint32_t bi = I.shOff[bs] + (y / H) * I.shNbx[bs] + x / W;
+        device const GpBlockRes &r = B.blk[bi];
+        if (B.inter && B.inter[bi].isInter) {  // an inter block: no intra decisions (fields 0, DCT_DCT)
+            if (lane == 0) B.leafDec[sb * GP_MAX_LEAVES + k] = d;
+            return;
+        }
         if (r.ncand > 0) {
             const int c = r.cand[0];
             switch (bs) {

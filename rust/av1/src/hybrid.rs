@@ -397,9 +397,9 @@ impl Hybrid {
         rec.blocks.clear();
         rec.blocks.extend_from_slice(given);
         let n = given.len();
-        // inter blocks are skip blocks; elsewhere skip is the closed loop's
+        // an inter block's skip is given (a copy: no residual); elsewhere it's the closed loop's
         for (i, b) in rec.blocks.iter_mut().enumerate() {
-            b.skip = is_inter(i) as u8;
+            b.skip = if is_inter(i) { b.skip.min(1) } else { 0 };
         }
         if !given_chroma {
             // the chroma decisions read the blocks' areas: no block outside the padded source
@@ -447,8 +447,8 @@ impl Hybrid {
         let qi = qindex as u8;
         if given_chroma {
             // the GPU decided chroma: only the fields the closed loop sets
-            for (i, b) in rec.blocks.iter_mut().enumerate() {
-                (b.skip, b.tx_depth, b.sb_qindex) = (is_inter(i) as u8, 0, qi);
+            for b in rec.blocks.iter_mut() {
+                (b.tx_depth, b.sb_qindex) = (0, qi);
             }
         } else {
             // A tile whose source and block positions are unchanged keeps its chroma decisions:
@@ -478,6 +478,8 @@ impl Hybrid {
             }
             // the others from the source, on every core (each block's decision is its own), 64
             // blocks at a time
+            // a block's index from its address (inter blocks get no chroma decision)
+            let (base, size) = (rec.blocks.as_ptr() as usize, size_of::<Block>());
             let mut chunks: Vec<&mut [Block]> = Vec::new();
             let mut rest: &mut [Block] = &mut rec.blocks;
             let mut at = 0usize;
@@ -505,11 +507,11 @@ impl Hybrid {
                         }
                         d.tx0 = tiles.mi_col_starts[tc] as i32 * 4;
                         d.ty0 = tiles.mi_row_starts[tr] as i32 * 4;
-                        let copy = b.skip != 0; // an inter block (given as skip)
-                        (b.skip, b.tx_depth, b.sb_qindex) = (copy as u8, 0, qi);
+                        let inter_block = is_inter((b as *const Block as usize - base) / size);
+                        (b.tx_depth, b.sb_qindex) = (0, qi);
                         (b.uv_mode, b.angle_delta_uv, b.cfl_alpha_u, b.cfl_alpha_v) = (DC_PRED as u8, 0, 0, 0);
                         let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
-                        if !copy && has_chroma(bs, r, c, false) {
+                        if !inter_block && has_chroma(bs, r, c, false) {
                             d.best_chroma(c * 4, r * 4, bs, b);
                         }
                     }

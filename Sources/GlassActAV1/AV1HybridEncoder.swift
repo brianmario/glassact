@@ -63,6 +63,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// Inter frames: the share of 64×64s copied from the previous picture (unchanged or
         /// shifted), and of those at a shift; the time deciding them.
         public var copied = 0.0, shifted = 0.0, motion = 0.0
+        /// Inter frames: the share of the picture in blocks the motion search predicts (with a residual).
+        public var searched = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -152,6 +154,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// before, as intra blocks. Each inter frame references the one before it.
     public var interFrames = false
 
+    /// With `interFrames`: search the coded 64×64s for motion too (on). A block
+    /// predicted from the previous picture at a vector, with a residual, takes the
+    /// place of an intra one where it costs less. Off: copies only.
+    public var searchesMotion = true
+
     /// The last picture, for the next inter frame: its source, decoded
     /// output and per-64×64 decisions (copy, dx, dy).
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
@@ -205,6 +212,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
+        if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
         var current = try picture(0)
         var pending = try begin(current, after: nil, qindex: qindex)
         for i in 0..<count {
@@ -241,6 +249,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     private func begin(_ p: Picture, after prev: Picture?, qindex: Int) throws -> Pending {
         var sbMotion: [Int32]?
         var skip: [UInt8]?
+        var candidates: [Int32]?
         let tm = CACurrentMediaTime()
         if interFrames, let prev, prev.width == p.width, prev.height == p.height {
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
@@ -253,13 +262,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
             sbMotion = m
             skip = (0..<nsb).map { UInt8(m[3 * $0]) }
+            if searchesMotion {
+                var c = [Int32](repeating: 0, count: 2 * Int(GP_ME_CANDS))
+                c.removeLast(c.count - 2 * Int(av1enc_motion_candidates(motion, &c, GP_ME_CANDS)))
+                candidates = c
+            }
         }
         let seconds = CACurrentMediaTime() - tm
         let partition = try p.y.withUnsafeBufferPointer { y in
             try p.u.withUnsafeBufferPointer { u in
                 try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
-                                             width: p.width, height: p.height, qindex: qindex, skip: skip)
+                                             width: p.width, height: p.height, qindex: qindex, skip: skip,
+                                             motion: candidates)
                 }
             }
         }
@@ -288,13 +303,22 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?
                 let n = partition.blocks.withUnsafeBufferPointer { b in
                     partition.lumaTxTypes.withUnsafeBufferPointer { t in
-                        av1enc_motion_apply(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
-                                            Int32(p.width), Int32(p.height), &outBlocks, &outInter, &outTx)
+                        partition.inter.withUnsafeBufferPointer { searched in
+                            av1enc_motion_apply(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
+                                                searched.count == b.count ? searched.baseAddress : nil,
+                                                Int32(p.width), Int32(p.height), &outBlocks, &outInter, &outTx)
+                        }
                     }
                 }
                 guard n > 0, let outBlocks, let outInter, let outTx else { throw Failure.encode("motion: no blocks") }
                 blocks = Array(UnsafeBufferPointer(start: outBlocks, count: Int(n)))
                 inter = Array(UnsafeBufferPointer(start: outInter, count: Int(n)))
+                var area = 0
+                for (b, i) in zip(blocks, inter) where i.is_inter != 0 && b.skip == 0 {
+                    let size = AV1MetalEncoder.blockSizes[Int(b.bsize)]
+                    area += size.w * size.h
+                }
+                timing.searched = Double(area) / Double(p.width * p.height)
                 lumaTx = Array(UnsafeBufferPointer(start: outTx, count: Int(n)))
                 let nsb = sbCols0 * sbRows0
                 timing.copied = Double(copies) / Double(nsb)

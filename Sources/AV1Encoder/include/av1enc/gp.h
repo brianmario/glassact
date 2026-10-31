@@ -39,6 +39,7 @@ typedef struct GpSbOut GpSbOut;
 typedef struct GpExtCand GpExtCand;
 typedef struct GpBatch GpBatch;
 typedef struct GpLeafDecision GpLeafDecision;
+typedef struct GpInterRes GpInterRes;
 
 #define GP_MAXK 6            // max top-K luma candidates kept per block by the analysis
 #define GP_NSHAPES 22        // indexed by AV1 bsize (13..15 = 128-sizes, unused)
@@ -47,6 +48,8 @@ typedef struct GpLeafDecision GpLeafDecision;
 #define GP_SB_COEFFS 6144    // per SB: 64*64 + 2*32*32 (64-point tx store 32x32 only)
 #define GP_RC_BIG_BYTES 18560  // per-CTA global scratch of k_recon for 32/64-point evaluations
 #define GP_NCDF (sizeof(av1g_cdfs) / 2)
+#define GP_ME_CANDS 8        // Glass Act: shift candidates per inter frame (GpImage.meCand)
+#define GP_ME_KEEP 2         // Glass Act: motion vectors k_me keeps per 16x16
 
 // Tunables (host -> kernels by value).
 struct GpParams {
@@ -121,6 +124,14 @@ struct GpImage {
     GP_DEV uint8_t *mYMode, *mUVMode, *mSkip, *mMiSize, *mTx;
     // per-plane 4x4 coefficient-context maps (culLevel, dcCategory); chroma (MiRows/2)x(MiCols/2)
     GP_DEV uint8_t *cLvl[3], *cDc[3];
+    // Glass Act: an inter frame's motion search (k_me, k_inter). ref: the previous picture's luma
+    // source, padded like src[0] (pitch spitch[0]); NULL: not an inter frame. meCand: the frame's
+    // shift candidates (dx, dy: the block at (x, y) predicts from (x + dx, y + dy)).
+    GP_DEV const uint8_t *ref;
+    int nMeCand;
+    int16_t meCand[2 * GP_ME_CANDS];
+    // per 16x16 of the padded picture (aw / 16 x ah / 16, raster): k_me's best GP_ME_KEEP (dx, dy)
+    GP_DEV int16_t *meBest;
 };
 
 // Analysis result per (shape, position).
@@ -129,6 +140,14 @@ struct GpBlockRes {
     uint8_t cand[GP_MAXK];     // candidates (mode << 3 | (delta + 3)), best first
     uint8_t ncand;
     uint8_t tx;                // best tx type for cand[0]
+};
+
+// Glass Act: the inter analysis per (shape, position), parallel to GpBlockRes (inter frames): when
+// isInter, the block's J is its prediction from the previous picture at (dx, dy) whole samples.
+struct GpInterRes {
+    int16_t dx, dy;
+    uint8_t isInter;
+    uint8_t pad[3];
 };
 
 // DP output: leaf blocks of one SB in decode order.
@@ -196,6 +215,8 @@ struct GpBatch {
     // nSbList of them: per shape the grid is nSbList x the shape's blocks per SB
     GP_DEV const uint32_t *sbList;
     uint32_t nSbList;
+    // Glass Act: inter frames: per (shape, position), parallel to blk (NULL: an intra picture)
+    GP_DEV GpInterRes *inter;
 };
 
 #endif
