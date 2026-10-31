@@ -459,11 +459,18 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     static func copy(_ plane: UnsafePointer<UInt8>, stride: Int, into buffer: any MTLBuffer, width: Int, height: Int,
                      superblocks: [UInt32], side: Int, sbCols: Int) {
         let d = buffer.contents().assumingMemoryBound(to: UInt8.self)
-        for sb in superblocks {
-            let x0 = Int(sb) % sbCols * side, y0 = Int(sb) / sbCols * side
-            guard x0 < width, y0 < height else { continue }
-            let w = min(side, width - x0)
-            for row in y0..<min(y0 + side, height) { (d + row * width + x0).update(from: plane + row * stride + x0, count: w) }
+        // many 64×64s (a moving 5K picture's copies are tens of MB): in parallel
+        let chunks = superblocks.count * side * side >= 1 << 20 ? min(8, superblocks.count / 64) : 1
+        superblocks.withUnsafeBufferPointer { list in
+            DispatchQueue.concurrentPerform(iterations: chunks) { c in
+                for i in Swift.stride(from: c, to: list.count, by: chunks) {
+                    let sb = Int(list[i])
+                    let x0 = sb % sbCols * side, y0 = sb / sbCols * side
+                    guard x0 < width, y0 < height else { continue }
+                    let w = min(side, width - x0)
+                    for row in y0..<min(y0 + side, height) { (d + row * width + x0).update(from: plane + row * stride + x0, count: w) }
+                }
+            }
         }
     }
 

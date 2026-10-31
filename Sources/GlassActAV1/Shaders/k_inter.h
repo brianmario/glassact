@@ -280,9 +280,12 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         const int qidx = sb_qindex(I, x, y);
         const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
         const float lamS = P.satdLambda * sqrtf(lambda);
-        // candidates: no motion, and k_me's vectors of the 16x16s covered (duplicates cost a little time)
+        // candidates: no motion, and k_me's vectors of the 16x16s covered, each once
         const int c0x = x >> 4, c0y = y >> 4, c1x = (x + W - 1) >> 4, c1y = (y + H - 1) >> 4;
         const int nc = 1 + (c1x - c0x + 1) * (c1y - c0y + 1) * GP_ME_KEEP;
+        constexpr int kMaxC = 1 + (W < 16 ? 1 : W / 16) * (H < 16 ? 1 : H / 16) * GP_ME_KEEP;
+        int2 tried[kMaxC];
+        int nTried = 0;
         float bestS = GP_INF;
         int2 best = int2(0, 0);
         for (int c = 0; c < nc; c++) {
@@ -293,6 +296,10 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
                 device const int16_t *m = I.meBest + ((size_t)cy * (I.aw >> 4) + cx) * 2 * GP_ME_KEEP + 2 * kk;
                 v = int2(m[0], m[1]);
             }
+            bool seen = false;
+            for (int t = 0; t < nTried; t++) seen = seen || all(tried[t] == v);
+            if (seen) continue;
+            if (nTried < kMaxC) tried[nTried++] = v;
             if (!ga_ref_inside(I, x, y, v, W, H)) continue;
             float sad = 0.f;
             for (int p = lane; p < W * H; p += 32)

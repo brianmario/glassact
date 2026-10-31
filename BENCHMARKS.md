@@ -260,6 +260,45 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: each inter candidate once; parallel post-filter copies; interPreset's shapes (2026-10-31)
+
+**What changed:**
+- **k_inter tries each candidate vector once.** A block's candidates are no motion plus k_me's best two in every 16×16 it covers: 33 for a 64×64. On moving content they mostly repeat, and each repeat cost a full bilinear SAD. Same output.
+- **The post-filters copy 64×64s on several threads.** A moving 5K inter frame copies its directly-filtered 64×64s (~2,500 of 3,600 on photos) into two buffers. With the rest that's 30+ MB, which took 2.9 ms on one thread; it's now 1.1 ms, and loading the region is 1.3 → 0.7 ms.
+- **`interPreset`'s block shapes now apply.**
+  - The analysis grids were built from the key frame's shape mask, so `turbo2` (no 4×4, 4×8 or 8×4) changed nothing for inter frames.
+  - The analysis cache's key now includes the mask.
+  - `HybridEncoderTests` codes a stream with it.
+
+**Results** (first 100 frames, libaom's tiling, `--no-planes`, three runs each):
+
+| Trace | GPU analysis a frame | Inter frames a second |
+|---|---|---|
+| photos 5K | 15.7 → 14.8 ms | 44 → 45 |
+| photos 720p | 7.2 → 6.9 ms | 113 → 118 |
+| scroll-win 720p | 2.8 → 2.4 ms | ~298 → ~334 (noisy) |
+
+These are the candidate dedupe alone; the parallel copies add ~1 more frame a second at 5K photos.
+
+**`interPreset` now that it applies** (same runs, PSNR-Y / inter frame bytes / inter frames a second):
+
+| Trace | default | `turbo2` | `turbo3` |
+|---|---|---|---|
+| photos 5K | 42.72 / 26.4 KB / 43 | 42.66 / 26.5 KB / 46 | 42.66 / 26.8 KB / 48 |
+| photos 720p | 40.75 / 12.1 KB / 111 | 40.70 / 12.2 KB / 118 | 40.71 / 12.2 KB / 139 |
+| scroll-win 720p | 43.02 / 2.0 KB / 286 | 42.98 / 2.1 KB / 310 | 42.98 / 2.1 KB / 338 |
+
+Both stay opt-in: each costs ~0.05 dB at equal or larger size.
+
+**Rejected:** inter frames without the small shapes as a default (4×4, 4×8 and 8×4, and also 8×8). libaom's realtime mode uses no 8×8 or smaller blocks above 480p. Here it's 4–9 % faster for 0.04–0.06 dB less at 0.4–2 % more bytes, so ~+1–1.5 % BD. That's what `turbo2` does, for whoever wants the trade.
+
+**Where a 5K photos inter frame's time goes:** the hybrid's CPU thread is the limit, at ~21 ms a frame:
+- the closed loop, 5.3 ms;
+- deciding the copies, 3.8 ms;
+- the filters, 8–12 ms.
+
+The post-filters' own GPU work is ~1.3 ms of that, but their command buffers wait 1–6 ms behind the next frame's analysis on the GPU.
+
 ### Metal AV1: the closed loop's reconstruction assembled on several threads (2026-10-31)
 
 **What changed:** the writer's pre-filter reconstruction (tiles → one frame-sized picture, which the post-filters read) is now copied in bands of rows on several threads.

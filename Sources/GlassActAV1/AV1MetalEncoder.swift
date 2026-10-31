@@ -261,13 +261,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// The cache for a picture of this geometry and these settings (made anew
     /// when they change, so its first picture keeps nothing); nil unless
     /// `reusesAnalysis`.
-    func analysisCache(width: Int, height: Int, qindex: Int, blocks: Int, superblocks: Int) throws -> AnalysisCache? {
+    func analysisCache(width: Int, height: Int, qindex: Int, shapeMask: Int32, blocks: Int, superblocks: Int) throws -> AnalysisCache? {
         guard reusesAnalysis else { cache = nil; return nil }
         var p = params
         var key = withUnsafeBytes(of: &p) { Array($0) }
         for v in [width, height, qindex, tiling.columnsLog2, tiling.rowsLog2, decidesLeaves ? 1 : 0,
                   Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0, leafTxSearchPixels,
-                  leafChromaAngledModes ? 1 : 0] {
+                  leafChromaAngledModes ? 1 : 0, Int(shapeMask)] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -654,21 +654,26 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             image.cLvl = (at(ctx, 0), at(ctx, mi), at(ctx, mi + mi1))
             image.cDc = (at(ctx, ctxTotal), at(ctx, ctxTotal + mi), at(ctx, ctxTotal + mi + mi1))
 
-            // analysis grids: every enabled shape over the coded area
+            // an inter frame: motion from the last picture's source (padded the same way)
+            let last = motion == nil ? nil : encoder.lastSource.flatMap { last in
+                last.map(\.length) == src.map(\.length) && last[0] !== src[0] ? last : nil
+            }
+            // analysis grids: every enabled shape over the coded area (inter frames': interPreset's)
+            let shapeMask = last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
+                                        : encoder.params.shapeMask
             var nbx = [Int32](repeating: 0, count: Int(GP_NSHAPES)), nby = nbx
             var shOff = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
             var blkTotal: UInt32 = 0
             for s in 0..<Int(GP_NSHAPES) {
                 shOff[s] = blkTotal
                 let size = AV1MetalEncoder.blockSizes[s]
-                guard size.w > 0, (encoder.params.shapeMask >> s) & 1 != 0 else { continue }
+                guard size.w > 0, (shapeMask >> s) & 1 != 0 else { continue }
                 nbx[s] = Int32((miCols * 4 + size.w - 1) / size.w)
                 nby[s] = Int32((miRows * 4 + size.h - 1) / size.h)
                 shTotal[s] = UInt32(nbx[s] * nby[s])
                 blkTotal += shTotal[s]
             }
-            // an inter frame: motion from the last picture's source (padded the same way)
-            if let motion, let last = encoder.lastSource, last.map(\.length) == src.map(\.length), last[0] !== src[0] {
+            if let motion, let last {
                 made.append(last[0])
                 image.ref = AV1MetalEncoder.address(last[0])
                 let n = min(motion.count / 2, Int(GP_ME_CANDS))
@@ -691,7 +696,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let imageBuffer = try make(MemoryLayout<GpImage>.stride)
             imageBuffer.contents().storeBytes(of: image, as: GpImage.self)
             // the analysis's results: the previous picture's, kept where its source is unchanged
-            let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, blocks: Int(blkTotal),
+            let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, shapeMask: shapeMask, blocks: Int(blkTotal),
                                                   superblocks: sbCols * sbRows)
             func keep(_ b: any MTLBuffer) -> any MTLBuffer { made.append(b); return b }
             let blk = try cache.map { keep($0.blockResults) } ?? make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)

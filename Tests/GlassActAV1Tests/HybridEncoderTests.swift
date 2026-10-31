@@ -141,13 +141,16 @@ extension HybridEncoderTests {
     /// that drifts and brightens (never an exact copy, so motion search's), pictures that don't
     /// change; one stream that libaom decodes in order to exactly the pictures the encoder reports
     /// (each of which the next frame references), with scrolled 64×64s copied at their shift,
-    /// unchanged ones copied as they are, and searched blocks predicted with a residual.
+    /// unchanged ones copied as they are, and searched blocks predicted with a residual. With an
+    /// `interPreset`, inter frames analyze fewer block shapes than the key frame.
     @available(macOS 27, *)
-    @Test(.serialized, arguments: [(1280, 720, 80, 2), (333, 201, 120, -1)])
-    func interStreamsDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int) throws {
+    @Test(.serialized, arguments: [(1280, 720, 80, 2, nil), (333, 201, 120, -1, AV1MetalEncoder.Preset.turbo2)])
+    func interStreamsDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int,
+                                           interPreset: AV1MetalEncoder.Preset?) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let encoder = try AV1HybridEncoder(device: device)
         encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interPreset = interPreset
         encoder.interFrames = true
         let base = PartitionTests.Picture(width: width, height: height)
         var rng = SplitMix64(seed: 0x5c01)
@@ -184,7 +187,7 @@ extension HybridEncoderTests {
             }
             pictures.append(AV1HybridEncoder.Picture(y: y, u: u, v: base.v, width: width, height: height))
         }
-        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2)"
+        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2) \(interPreset.map { "inter \($0.rawValue)" } ?? "")"
         let decoder = try #require(glassact_aom_dec_create(1))
         defer { glassact_aom_dec_destroy(decoder) }
         var copied = 0.0, shifted = 0.0, searched = 0.0
