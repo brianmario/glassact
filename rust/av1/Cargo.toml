@@ -1,0 +1,32 @@
+[package]
+name = "glassact-av1"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# A port of av1gpu's CPU code (BSD-2, LICENSE), with Glass Act's additions.
+license = "BSD-2-Clause"
+description = "Glass Act's AV1 CPU code: the DecisionRecord writer with exact reconstruction, post-filters, the hybrid encoder's closed loop, and the host half of the Metal encoder"
+
+[lib]
+name = "glassact_av1"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["capi"]
+# The C API Swift links (#[no_mangle] exports, include/glassact_av1.h).
+capi = []
+# Tests only: build the C++ original (Sources/AV1Core, AV1Encoder, AV1CoreTestSupport) and link
+# it, so tests can compare the port with it output for output. Use without capi (same symbols):
+#   cargo test --release --no-default-features --features oracle
+oracle = []
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.test]
+opt-level = 3

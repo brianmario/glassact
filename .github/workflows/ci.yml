@@ -32,6 +32,12 @@ jobs:
         run: xcodebuild -version && swift --version
       - name: Version
         run: scripts/check-version
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
+      - name: Rust tests
+        run: cargo test --release --manifest-path rust/av1/Cargo.toml
       - name: Build
         run: swift build --build-tests
       - name: Test
@@ -86,6 +92,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
       - name: Build package and tests (x86_64)
         run: swift build --arch x86_64 --build-tests
       - name: Build Host (universal Release)
@@ -109,5 +119,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
       - name: Allocation-count tests (release)
         run: swift test -c release --filter ScrollAllocationTests

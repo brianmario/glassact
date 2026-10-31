@@ -20,6 +20,10 @@ retransmission.
 - **[RELEASING.md](RELEASING.md)** is versions, tagging a release, and the
   release workflow's one-time setup.
 - **GitHub issues** hold the open work.
+- **[rust/av1](rust/av1)** is the AV1 encoder's CPU code in Rust (the bitstream
+  writer, post-filters, the hybrid encoder's closed loop). Swift reaches it
+  through the C API in `Sources/AV1Core`, `AV1Encoder` and
+  `AV1CoreTestSupport`; the Metal kernels are in `Sources/GlassActAV1`.
 - `## Deviations` notes at the top of a file (e.g. `QUICTransport.swift`)
   explain where the code departs from the SDK docs or the design.
 
@@ -39,6 +43,11 @@ retransmission.
 - System frameworks only. The exceptions are the vendored libwebp, the
   vendored libaom (AV1, arm64 only), and, in the apps only, Sparkle for
   updates (all in `ThirdParty/THIRD_PARTY.md`). Add no dependencies.
+- New CPU code for the AV1 encoder is Rust, in `rust/av1`: std only, no crates.
+  Building the package needs a Rust toolchain (rustup); `scripts/build-rust`
+  makes the static library the package links, and `just` runs it first.
+  Its rules (bit-exact, SIMD with a scalar reference, safe by default) are in
+  `rust/av1/README.md`.
 - The apps (`Apps/Host`, `Apps/Viewer`) are thin: UI and wiring only. Logic
   lives in the package, where `swift test` covers it.
 
@@ -75,6 +84,7 @@ retransmission.
 
 ```sh
 just test-fast        # skips real-QUIC and slow tests (~40 s); run this while iterating
+just test-rust        # the Rust AV1 crate's tests, including the ones against the C++ it was ported from
 just test             # everything; must be green before landing
 just test-asan        # AddressSanitizer
 just bench <args>     # release glassact-bench (replay, synth, goldens)

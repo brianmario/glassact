@@ -1,0 +1,99 @@
+#!/usr/bin/env python3 -I
+"""Per-tile codec probe on `glassact-bench dumptiles` corpora (BENCHMARKS, 2026-10-31).
+
+AVIF (avifenc, libaom all-intra) lossless and lossy, WebP lossy (cwebp), and the Metal AV1
+encoder's decoded tiles (written by `glassact-bench av1tiles --out <dir>/<name>`), each lossy tile
+scored with ssimulacra2 against its source. Measurement only: needs avifenc, avifdec, cwebp, dwebp
+and ssimulacra2 on PATH (Homebrew).
+
+  scripts/tile-codec-probe <dir> typing,scroll,photos,drag
+"""
+import os, sys, zlib, struct, subprocess, statistics, time
+from concurrent.futures import ThreadPoolExecutor
+
+D = sys.argv[1]            # directory with <name>.raw and <name>-q<q>.raw
+NAMES = sys.argv[2].split(",")
+SIDE, TB = 64, 64 * 64 * 4
+
+def png(path, bgra):
+    rows = b"".join(b"\x00" + bytes(bgra[(y * SIDE + x) * 4 + c] for x in range(SIDE) for c in (2, 1, 0)) for y in range(SIDE))
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", SIDE, SIDE, 8, 2, 0, 0, 0))
+                           + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+def run(cmd):
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return time.perf_counter() - t0
+
+def score(ref, dist):
+    out = subprocess.run(["ssimulacra2", ref, dist], check=True, capture_output=True, text=True).stdout.split()
+    return float(out[-1])
+
+CONFIGS = [  # name, encoder command (in, out), extension, lossless
+    ("AVIF lossless s6", lambda i, o: ["avifenc", "--lossless", "-s", "6", "-j", "1", i, o], "avif", True),
+    ("AVIF lossless s10", lambda i, o: ["avifenc", "--lossless", "-s", "10", "-j", "1", i, o], "avif", True),
+    ("AVIF 444 q90 s6", lambda i, o: ["avifenc", "-q", "90", "-y", "444", "-s", "6", "-j", "1", i, o], "avif", False),
+    ("AVIF 444 q75 s6", lambda i, o: ["avifenc", "-q", "75", "-y", "444", "-s", "6", "-j", "1", i, o], "avif", False),
+    ("AVIF 444 q60 s6", lambda i, o: ["avifenc", "-q", "60", "-y", "444", "-s", "6", "-j", "1", i, o], "avif", False),
+    ("AVIF 420 q75 s6", lambda i, o: ["avifenc", "-q", "75", "-y", "420", "-s", "6", "-j", "1", i, o], "avif", False),
+    ("AVIF 444 q75 s10", lambda i, o: ["avifenc", "-q", "75", "-y", "444", "-s", "10", "-j", "1", i, o], "avif", False),
+    ("WebP lossy q90", lambda i, o: ["cwebp", "-q", "90", "-m", "4", i, "-o", o], "webp", False),
+    ("WebP lossy q75", lambda i, o: ["cwebp", "-q", "75", "-m", "4", i, "-o", o], "webp", False),
+]
+
+def mdat(path):
+    d = open(path, "rb").read(); i = 0
+    while i + 8 <= len(d):
+        size, typ = struct.unpack(">I4s", d[i:i + 8])
+        if typ == b"mdat": return size - 8
+        i += size if size else len(d)
+    return None
+
+def decode(path, ext, out):
+    if ext == "avif": subprocess.run(["avifdec", path, out], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else: subprocess.run(["dwebp", path, "-o", out], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def main():
+    pool = ThreadPoolExecutor(max_workers=os.cpu_count())
+    only_metal = os.environ.get("ONLY_METAL") is not None
+    for name in NAMES:
+        raw = open(f"{D}/{name}.raw", "rb").read()
+        n = len(raw) // TB
+        work = f"{D}/{name}-png"; os.makedirs(work, exist_ok=True)
+        refs = [f"{work}/t{i:04d}.png" for i in range(n)]
+        list(pool.map(lambda i: png(refs[i], raw[i * TB:(i + 1) * TB]), range(n)))
+        print(f"== {name}: {n} tiles")
+        for cname, cmd, ext, lossless in ([] if only_metal else CONFIGS):
+            tag = cname.replace(" ", "_")
+            def one(i):
+                out = f"{work}/{tag}-{i:04d}.{ext}"
+                t = run(cmd(refs[i], out))
+                size = os.path.getsize(out)
+                payload = mdat(out) if ext == "avif" else size
+                s = None
+                if not lossless:
+                    dec = f"{work}/{tag}-{i:04d}.dec.png"
+                    decode(out, ext, dec)
+                    s = score(refs[i], dec)
+                return size, t, s, payload
+            res = list(pool.map(one, range(n)))
+            sizes = [r[0] for r in res]; times = [r[1] for r in res]
+            line = f"  {cname:18s} {statistics.mean(sizes):8.1f} B a tile (AV1 data {statistics.mean(r[3] for r in res):7.1f} B) · {statistics.median(times)*1000:6.1f} ms a process"
+            if not lossless:
+                sc = sorted(r[2] for r in res)
+                line += f" · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}"
+            print(line, flush=True)
+        for q in ("conv", 8, 20, 32, 44):
+            path = f"{D}/{name}-q{q}.raw" if q != "conv" else f"{D}/{name}-conv.raw"
+            if not os.path.exists(path): continue
+            dec = open(path, "rb").read()
+            def one(i):
+                p = f"{work}/metal-q{q}-{i:04d}.png"
+                png(p, dec[i * TB:(i + 1) * TB])
+                return score(refs[i], p)
+            sc = sorted(pool.map(one, range(n)))
+            label = "4:2:0 conversion only" if q == "conv" else f"Metal AV1 420 q{q:<2d}   "
+            print(f"  {label} (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}", flush=True)
+
+main()

@@ -17,3 +17,4 @@ Apps/Signing.local.xcconfig
 # Recorded traces and release archives
 *.scap
 *.xcarchive
+rust/av1/target/

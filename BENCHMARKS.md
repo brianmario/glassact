@@ -132,6 +132,7 @@ the numbers and the reasoning.
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
+| AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31) | AV1 data alone 1.26–2.6× VP8L z4's bytes | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31) |
 | Lossy WebP / AVIF tiles | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
 | VP8L positional routing memory | kept | 96 % of probes avoided on churn, 0 % on text (zero regret) | [entry](#vp8l-routing-memory-positional-outcome-memory-2026-08-05) |
@@ -258,6 +259,840 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: quarter-sample motion vectors (2026-10-31)
+
+**What changed:**
+- **Writer** (subagent): `fp.mv_precision` (0 whole, 1 quarter, 2 eighth samples). The sequence header now selects force_integer_mv per frame. The MV stack lowers candidates to the frame's precision, and the fr/hp bits and their CDFs (carried with `cdf_from_ref`) are coded.
+  - **Exact:** 3200 random frames decode exactly in dav1d and aomdec, and the Swift libaom gate passes. Every filter phase is covered.
+  - **Whole-sample tile data is byte-identical** to before.
+  - **Writer cost:** a sub-sample frame costs the writer +13–16 % (both filter passes on every block).
+- **GPU search:**
+  - `k_me` refines each 16×16's best vector to half and then quarter samples.
+  - `k_inter` screens and costs fractional candidates.
+  - The GPU predicts fractional positions bilinearly; the closed loop is exact.
+  - On by default (`AV1HybridEncoder.searchesSubpelMotion`, `av1seq --no-subpel`); those frames code `mv_precision` 1.
+
+**Results** (first 100 frames, q20, every frame exact in libaom; inter frame mean, steady-state inter frames a second):
+
+| Trace | 720p whole → quarter | 5K whole → quarter |
+|---|---|---|
+| scroll-win | 4.9 → 4.5 KB (−8 %) · 209 → 218 fps | 4.5 → 4.5 KB · 92 → 94 fps |
+| photos | 55.7 → 44.2 KB (−21 %), PSNR-Y 40.97 → 41.12 · 91 → 88 fps | 29.5 → 29.5 KB · 30 → 30 fps |
+| typing-cc | 148 → 149 B | 691 → 692 B |
+| cursor-drag | 187 → 187 B | 864 → 865 B |
+
+- **Downscaled content gains** (the 720p traces are resampled from 5K, so their motion is fractional); the native 5K captures move by whole samples.
+- **libaom is still ahead at 720p:** 2.0 KB (scroll) and 14.4 KB (photos).
+- **Few vectors go fractional:** only ~2–3 % of the searched blocks choose one.
+- **Rejected: the exact 8-tap filter in the GPU's estimates** in place of bilinear. Photos 720p came out 43.6 KB against bilinear's 44.2 (−1 %), but at 49 against 88 inter frames a second (5K photos 21 against 30). At 64 multiply-adds per fractional sample it isn't worth it.
+
+### Metal AV1: inter frames' fixed costs; steady-state frame rates (2026-10-31)
+
+**What changed** (same bytes everywhere):
+- **Placeholders for copies:** a superblock the caller replaces (an inter frame's copy) comes back from the partition as one placeholder block, not its cached block list (~3,600 lists rebuilt a 5K frame).
+- **No comparison under a skip mask:** with the mask, the analysis cache doesn't compare the whole source; the mask decides.
+- **`k_leaf` visits only analyzed superblocks' leaves:** its prefix scan counts no leaves for kept ones.
+- **SIMD-group analysis for small inter workloads:** an inter frame analyzing fewer than 4,096 blocks of a shape uses the SIMD-group-per-block analysis for the small shapes, not thread-per-block.
+  - The thread-per-block kernel's single-thread chain takes ~1.5 ms for an 8×16, so a few blocks cost the GPU 5.4 ms; now 1.6 ms (5K typing, stages timed one by one).
+  - Its float sums may order differently, so key frames keep the thread kernel, and kept analysis there still codes as fresh analysis.
+
+**Measured** (5K typing-cc, inter frames, the overlapped pipeline):
+
+| | Before | After |
+|---|---|---|
+| Starting a picture (copy decisions, source padding and comparison) | 4.0 ms | 1.4 ms |
+| fps, the whole run with its key frame | 68.5 | 107–110 |
+
+**`av1seq` now prints steady-state inter frames a second,** from the first frame's output to the last, for both encoders.
+- The whole-run fps above includes the key frame's ~300 ms full analysis at 5K. An earlier "3.3 ms wait for the partition" on every inter frame was just that, averaged over 100 frames.
+
+| inter frames a second (ours / libaom s9, 8 threads) | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K | 134 / 225 | 89 / 169 | 30 / 87 | 132 / 227 |
+| 720p | 474 / 2006 | 227 / 974 | 87 / 481 | 493 / 2012 |
+
+### Metal AV1: inter frames start from their reference's CDFs (2026-10-31)
+
+**What changed:** an inter frame (`fp.cdf_from_ref`, on in `AV1HybridEncoder.carriesCDFs`; `av1seq --no-cdf-carry` turns it off) codes primary_ref_frame = LAST, and starts from the CDFs its reference saved instead of the defaults.
+- **Saving:** every video frame saves the CDFs of one tile (disable_frame_end_update_cdf = 0, counters cleared).
+- **Wire-up:** the writer returns them (`Output.saved_cdfs`, `av1g_output.cdfs`) and takes them per reference slot (`RefPicture.cdfs`, `av1g_ref_planes.cdfs`). The hybrid keeps a slot's from the write that refreshed it. `writer::parse_with` follows them over a stream.
+- **Loss:** this stays loss-safe while the reference is a frame the decoder has, which the acknowledged-reference scheme guarantees.
+- **Exact:** random sequences with it decode exactly in libaom (the Swift gate), dav1d and aomdec. Clearing the counters wrongly fails both.
+
+**Which tile's CDFs to save** (context_update_tile_id). Inter frame mean, 5K, 4×4 tiles:
+
+| Tile | typing-cc | cursor-drag | scroll-win | photos |
+|---|---|---|---|---|
+| the most blocks (libaom: the largest) | 884 B | 1.0 KB | 4.6 KB | 29.8 KB |
+| the fewest blocks | 691 B | 864 B | 4.6 KB | 30.3 KB |
+| **the median by blocks (kept)** | **691 B** | **864 B** | **4.5 KB** | **29.5 KB** |
+
+At 720p (2×2 tiles), median and most are within 2 % of each other.
+
+**Results:** first 100 frames, q20, every frame decoded by libaom in order, exactly. Inter frame mean:
+
+| Trace | 5K: default CDFs → carried | libaom s9 inter | 720p: default → carried | libaom s9 inter |
+|---|---|---|---|---|
+| typing-cc | 2.0 KB → 691 B | 324 B | 238 → 147 B | 123 B |
+| cursor-drag | 2.2 KB → 864 B | 486 B | 279 → 186 B | 125 B |
+| scroll-win | 5.8 → 4.5 KB | 4.0 KB | 5.0 → 4.9 KB | 2.0 KB |
+| photos | 30.5 → 29.5 KB | 37.2 KB | 56.1 → 55.7 KB | 14.4 KB |
+
+- **Static content's floor falls by 58–66 % at 5K.**
+- **Still about 2× libaom's on static content.** The rest is per-superblock symbols on 64×64 superblocks (libaom uses 128×128 at this size), tile overhead, and a sequence header on every frame.
+- **Moving content barely changes.** Its gap is the coding itself; the entry below has the measurements.
+- **Speed:** unchanged within noise (5K: typing 72, scroll 65, photos 27, drag 74 fps).
+
+### Metal AV1 against hardware HEVC and libaom, at equal quality (2026-10-31)
+
+**Setup:** first 100 frames of each trace, at the trace's timing. One quality metric for all three: `vquality`'s, BT.601 luma of the decoded picture in RGB against the trace frame (PSNR, and SSIM on 8×8 blocks).
+- **AV1:** `av1seq --score-rgb` (new) scores both AV1 encoders that way:
+  - the hybrid: inter frames, motion search, q 8–32;
+  - libaom realtime speed 9, 8 threads, inter frames (`--aom-inter`, new) at the same q.
+- **HEVC:** `vquality` runs the VideoToolbox HEVC encoder as the Host configures it (max frame QP 34, realtime, average-bitrate targets), at five targets per trace.
+- **Comparison:** BD-rate, i.e. bytes at equal quality, piecewise-linear in PSNR (or SSIM). Negative: smaller.
+- **Conditions:** M4 Pro, the owner's session disconnected; Spotlight and Time Machine were active, so speeds are approximate.
+
+**BD-rate by PSNR (by SSIM where PSNR ranges don't overlap):**
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K: hybrid vs HEVC | −40 % | −65 % (SSIM; by PSNR HEVC tops out below the hybrid's lowest point) | −81 % | −40 % |
+| 5K: hybrid vs libaom | −27 % | −1 % | −27 % | −26 % |
+| 720p: hybrid vs HEVC | −36 % | +28 % | +278 % | −33 % |
+| 720p: hybrid vs libaom | −23 % | +91 % | +255 % | −21 % |
+| 720p: libaom vs HEVC | (no overlap) | −38 % | +12 % | −15 % |
+
+**Split by frame type**, hybrid vs libaom by PSNR-Y, from the same sweep (before the CDF carry-over in the entry above):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K, key frames only | −44 % | −29 % | −44 % | −44 % |
+| 5K, inter frames only | +512 % | +43 % | −17 % | +340 % |
+| 720p, key frames only | −31 % | −25 % | −33 % | −32 % |
+| 720p, inter frames only | +103 % | +161 % | +291 % | +119 % |
+
+**What it shows:**
+- **The hybrid's lead is its key frames.** Its inter frames lose to libaom everywhere but 5K photos.
+- **On static content,** the inter-frame floor is the cause; the entry above halves it.
+- **On moving content at 720p (+90–290 %),** whole-sample motion is the cause. The 720p traces are downscaled from 5K, so their motion is fractional. Sub-sample motion vectors are next.
+- **At 5K the HEVC curve saturates.** Photos achieved 24.2 Mbit/s at both the 24 and 48 Mbit/s targets, and scroll 4.5 at a 12.8 target, at 37–42 dB. So the 5K HEVC numbers are the Host's HEVC settings, not HEVC's best.
+- **Speed:** libaom s9 on 8 CPU threads runs 2–5× the hybrid's frame rate on these traces:
+
+  | | libaom s9 | hybrid |
+  |---|---|---|
+  | 5K | 70–185 fps | 27–80 fps |
+  | 720p | 330–1590 fps | 80–340 fps |
+
+**Correction:** the "pinned HEVC loop" bitrates the entries below compare with (2.4 / 5.0 / 10.9 / 4.4 Mbit/s) are the whole Glass Act loop: lossless tiles, handoff, and repair under 5 % loss, over full traces. They're not an encoder's bitrate. This entry's HEVC numbers are the encoder alone.
+
+### Metal AV1: motion search in inter frames (2026-10-31)
+
+**What changed:** the 64×64s that aren't exact copies now search for motion on the GPU, inside the analysis (`AV1HybridEncoder.searchesMotion`, on with `interFrames`; `av1seq --no-motion-search` turns it off).
+- **`k_me`**, per 16×16, searches by SAD on every other row:
+  - whole-sample vectors within ±8 of no motion;
+  - ±4 around each of the frame's shift candidates (from the copy decisions);
+  - it keeps the best two.
+- **`k_inter`**, per block shape of 8×8 and up, runs after the intra analysis:
+  - it screens no motion and the vectors of the 16×16s the block covers;
+  - the best is costed with the analysis's own exact-rate RD (DCT_DCT, with rough motion-vector bits);
+  - where that's below the intra J, it takes its place. The partition DP then mixes inter and intra blocks as it would two intra modes.
+- **Prediction source:** the search predicts from the previous picture's *source*, which the GPU already holds. Picture i + 1's analysis doesn't wait for picture i's reconstruction, so the CPU/GPU overlap stays. The closed loop predicts exactly from the decoded picture and codes the residual (DCT_DCT for inter blocks, for now).
+
+**Results:** same setup as below (5K, 4×4 tiles, q20, turbo, first 100 frames; every frame decoded by libaom in order, exactly):
+
+| Trace | Inter frames: copies only → with search | Mbit/s at the trace's timing | Searched blocks, share of the picture | PSNR-Y |
+|---|---|---|---|---|
+| typing-cc | 2.4 → 2.0 KB | 0.6 → 0.5 | 0.0 % | 47.34 → 47.34 |
+| scroll-win | 10.1 → 5.8 KB | 2.4 → 1.7 | 0.7 % | 48.83 → 48.83 |
+| photos | 108 → 30.5 KB | 21.0 → 7.3 | 7.9 % | 42.74 → 42.86 |
+| cursor-drag | 2.8 → 2.2 KB | 1.2 → 1.1 | 0.1 % | 47.56 → 47.56 |
+
+- **Photos now comes in under the pinned HEVC loop** (10.9 Mbit/s over the whole trace), as typing, scroll and drag already did (2.4 / 5.0 / 4.4). Caveats as below: different spans, quality not matched.
+- **Speed:** photos 30.9 → 29.5 fps, with the GPU analysis at 21.3 → 24.9 ms a frame.
+  - The machine was loaded during these runs (other processes at ~130 % CPU), so speeds moved by up to 25 % run to run. For example, copies-only typing ran at 80–85 fps here, against 94 in the entry below.
+  - Typing and drag measured 63–80 fps with the search on; that needs re-measuring on a quiet machine before calling it a regression.
+
+**Limitations:**
+- Inter blocks are at loop filter level 0 (`lf_inter_off`), searched ones included, so their residual's block edges aren't deblocked. A per-superblock `delta_lf` would deblock the coded 64×64s and leave copies alone.
+- Whole-sample vectors only (`force_integer_mv`). DCT_DCT only. No chroma in the inter cost.
+- The motion-vector bits are a rough estimate, not the reference MV stack's.
+
+### Metal AV1: inter frames from exact copies (2026-10-31)
+
+**What changed:** `AV1HybridEncoder.interFrames` (`av1seq --inter`) codes a sequence as one stream: a key frame, then inter frames that each reference the frame before.
+- **Writer** (Rust): inter frames in video mode, with one reference (LAST_FRAME), whole-sample motion vectors, EIGHTTAP, and `primary_ref_frame` NONE. Each frame needs only its reference picture. Random inter sequences decode exactly in libaom, dav1d and aomdec.
+- **Copies:** per 64×64, before the GPU analysis (`rust/av1/src/motion.rs`):
+  - A 64×64 whose source equals the previous picture's, unchanged or at a whole-sample shift (candidates from row and column hashes, and the left and upper neighbours' shifts), becomes skip inter blocks at that shift.
+  - The GPU doesn't analyze copied 64×64s.
+  - The rest is coded intra, as before.
+- **Filters:** `lf_inter_off` codes loop filter ref deltas (INTRA_FRAME 0, LAST_FRAME −63), so inter blocks are at level 0. A copy of already-filtered content stays as it was, and only edges next to intra blocks are deblocked. Both post-filters (Rust and Metal) apply it; the region filtering treats a copy as unchanged when it was a copy, with no coded 64×64 around it, in the previous picture too.
+
+**Results:** 5120×2880, 4×4 tiles, q20, turbo, M4 Pro, the first 100 frames of each trace. Every frame decoded by libaom in order, equal to the encoder's picture.
+
+| Trace | fps | Key frame | Inter frames, mean | Copied (at a shift) | Mbit/s at the trace's timing: all / inter frames only | Key frames only (before) | PSNR-Y |
+|---|---|---|---|---|---|---|---|
+| typing-cc | 94 | 551 KB | 2.4 KB | 99.9 % (0 %) | 0.6 / 0.17 | 38.7 | 47.3 |
+| scroll-win | 69 | 473 KB | 10.1 KB | 98.7 % (4.9 %) | 2.4 / 1.6 | 79 | 48.8 |
+| photos | 32 | 1.08 MB | 108 KB | 87.1 % (52.3 %) | 21.0 / 18.6 | 190 | 42.7 |
+| cursor-drag | 92 | 510 KB | 2.8 KB | 99.9 % (0 %) | 1.2 / 0.42 | 84 | 47.6 |
+
+- **Against the pinned HEVC loop** (2.4 / 5.0 / 10.9 / 4.4 Mbit/s, measured over the whole traces earlier, with rate control): typing, scrolling and dragging come in under it, and photos at about twice it.
+  - The spans differ, so the comparison is rough: here the first 100 frames (4.6–11.6 s), where the key frame is most of the bytes for typing and drag.
+  - Quality isn't matched either: these are q20 throughout, and a copy keeps the quality its content was coded at.
+  - Not re-measured against HEVC: no hardware-encoder benches while the owner is connected.
+- **Photos' 13 % of 64×64s that aren't exact copies cost almost a key frame's share each.** That's the photos app's animated transitions (scaling, fading). This needs real motion search: inexact matches with a residual.
+- **Where the speed came from** (same bytes at every step):
+
+  | Step | scroll-win | photos |
+  |---|---|---|
+  | GPU analyzes every 64×64 | 36.6 fps | 6.9 fps |
+  | GPU skips copies | 59.1 | 22.2 |
+  | Shift candidates on 8 threads (deciding the copies: 3.3 → 1.3 ms, 14.8 → 3.9 ms) | 63.4 | 29.7 |
+  | Copies with no coded 64×64 around them copied into the filters' output, not filtered (photos: 82 → 24 % filtered) | 69.4 | 32.1 |
+
+  The table above is the last row's. Deciding the copies takes 0.9–1.3 ms a frame outside photos.
+
+**Not done yet:**
+- The analysis, rate estimates and CDFs still assume key-frame syntax for intra blocks in inter frames.
+- Tiles aren't kept across inter frames: every inter frame runs the closed loop and the writer over every tile.
+- References the Viewer has acknowledged (loss recovery): every frame references the one before.
+
+### Tiles as AV1: lossless and lossy AVIF, and the Metal encoder, against VP8L (2026-10-31)
+
+**What was compared:** changed 64×64 tiles, measured per tile.
+- **Corpora:** `glassact-bench dumptiles`, every 7th changed tile of the 5K traces. 400 tiles each, but only 67 for typing-cc.
+- **In process (`glassact-bench av1tiles`, new):**
+  - VP8L lossless, as the tile path codes a tile: efforts 1 and 4 (production: 4, or 1 in bursts over 32 tiles) and 9.
+  - The Metal/CPU hybrid AV1 encoder, coding each tile as its own 4:2:0 key frame.
+- **External tools (`scripts/tile-codec-probe`, new):**
+  - avifenc 1.4.2 (libaom 3.15.2 all-intra, single-threaded) and cwebp.
+  - Lossy tiles are scored with ssimulacra2 against the source tile.
+- **AVIF sizes:** given as the whole file and as the AV1 data in its mdat box. At this size, AVIF's container is ~275 B of the file.
+
+**Lossless (bytes a tile):**
+
+| Tiles | VP8L z1 | VP8L z4 | VP8L z9 | AVIF lossless s6: file / AV1 data | AVIF lossless s10: AV1 data |
+|---|---|---|---|---|---|
+| typing-cc | 440 | 417 | 413 | 1351 / 1076 | 2365 |
+| scroll-win | 394 | 381 | 370 | 1140 / 865 | 1561 |
+| photos | 3413 | 3332 | 3343 | 4553 / 4278 | 5636 |
+| cursor-drag | 2512 | 2381 | 2350 | 3277 / 3002 | 3948 |
+
+Even AV1 data alone, without its container, is 1.26–2.6× VP8L z4's bytes. VP8L z4 takes 165–1130 µs a tile on one core. This confirms the whole-frame result of 2026-08-07, by a wider margin at tile size. **AV1 lossless stays rejected for tiles.** The Metal encoder has no lossless mode: it would need qindex 0, the Walsh–Hadamard transform and 4:4:4.
+
+**Lossy (bytes a tile, then SSIMULACRA2 mean / p10):**
+
+| Tiles | AVIF 4:4:4 q90 s6 | AVIF 4:4:4 q75 s6 | AVIF 4:2:0 q75 s6 | WebP q90 | Metal AV1 4:2:0 q8: stream, payload | Metal q20 | VP8L z4 (lossless) |
+|---|---|---|---|---|---|---|---|
+| typing-cc | 379 · 94.1 / 91.6 | 282 · 91.0 / 89.0 | 274 · 88.6 / 87.4 | 502 · 89.2 / 88.1 | 364, 340 · 87.9 / 86.6 | 287 · 87.8 / 85.9 | 417 |
+| scroll-win | 270 · 95.6 / 91.7 | 210 · 94.3 / 89.1 | 200 · 91.3 / 82.0 | 357 · 90.4 / 82.7 | 246, 222 · 90.5 / 82.5 | 190 · 88.7 / 78.1 | 381 |
+| photos | 1026 · 91.0 / 84.9 | 631 · 87.6 / 77.6 | 615 · 86.0 / 74.7 | 897 · 86.2 / 75.8 | 808, 784 · 84.7 / 71.2 | 471 · 81.2 / 66.1 | 3332 |
+| cursor-drag | 526 · 91.5 / 87.9 | 358 · 89.1 / 82.8 | 344 · 86.4 / 74.9 | 538 · 85.2 / 73.6 | 390, 366 · 83.8 / 68.6 | 263 · 81.2 / 66.2 | 2381 |
+
+What the lossy rows show:
+- **Near-lossless gains depend on content.** AVIF 4:4:4 q90's AV1 data is near-lossless (SSIMULACRA2 91–96) and smaller than VP8L lossless by:
+
+  | Tiles | Smaller by |
+  |---|---|
+  | typing-cc (text) | 9 % |
+  | scroll-win | 29 % |
+  | photos | 69 % |
+  | cursor-drag | 78 % |
+
+  So lossy tiles pay on photos and graphics and barely on text, and they'd give up the canvas's byte-exactness.
+- **The Metal encoder trails AVIF at tile size.** It never reaches the AVIF 4:4:4 q90 tier: its mean SSIMULACRA2 tops out at 84–90, below AVIF 4:2:0 q75 at similar bytes. The reasons:
+  - 4:2:0 in video range;
+  - coding each tile as a cold, standalone frame, with ~24 B of TD, sequence and frame headers;
+  - its fast preset.
+- **Standalone tiles are slow on the GPU.** One at a time, a tile takes 2.7–4.6 ms, because each is a GPU round trip. Tiles belong in a frame.
+- **The colour format sets the ceiling.** The BGRA → 4:2:0 (video range) → BGRA conversion alone, with no coding at all, scores:
+
+  | Tiles | Mean | p10 |
+  |---|---|---|
+  | typing-cc | 91.2 | 90.6 |
+  | scroll-win | 92.3 | 86.0 |
+  | photos | 87.6 | 73.0 |
+  | cursor-drag | 86.5 | 70.2 |
+
+  That's below AVIF 4:4:4 q90. Most of the Metal encoder's gap is its 4:2:0 input, not its coding. Near-lossless tiles need 4:4:4 (AV1's high profile) and full range.
+
+**One-superblock tiles inside a frame,** i.e. coding the whole frame and cutting it into independently parseable 64×64 tiles. `av1seq` at 4096×2304, where AV1's 64-tile-column limit fits one 64-px superblock per tile column. 64×36 tiles against 4×4, 30 frames:
+
+| Sequence | 4×4 tiles | 64×36 tiles |
+|---|---|---|
+| typing-cc | 471.7 KB · 117 fps | 514.3 KB (+9.0 %) · 104 fps |
+| scroll-win | 391.6 KB · 133 fps | 433.7 KB (+10.8 %) · 110 fps |
+| photos | 888.9 KB · 11.2 fps | 927.6 KB (+4.4 %) · 10.8 fps |
+
+Encoding the whole frame and cutting it isn't wasteful in work: unchanged superblocks cost next to nothing, and that's what makes these frame rates. Cutting it has these costs:
+- **Bytes:** independent tiles (fresh CDFs, no prediction across tiles) cost 4–11 %.
+- **The deblocking and CDEF filters cross tile edges,** so a tile on its own decodes exactly only with them off. Measured with `av1seq --no-filters` (`AV1HybridEncoder.postfilters = false`), 64×36 tiles:
+
+  | Sequence | Filters on | Filters off |
+  |---|---|---|
+  | typing-cc | 514.3 KB · 45.43 dB · 108 fps | 513.5 KB · 45.26 dB · **122 fps** |
+  | scroll-win | 433.7 KB · 46.94 dB | 432.5 KB · 46.68 dB |
+  | photos | 927.6 KB · 41.84 dB · 10.6 fps | 926.6 KB · 41.75 dB · **12.4 fps** |
+
+  Without the filters, the bytes stay the same and PSNR-Y drops 0.1–0.27 dB, with no filter search. Tiles that decode alone cost little.
+- **Wider than 4096 doesn't fit.** At 5K's 80 superblock columns, AV1's 64-tile-column limit forces 128-px tiles or two frames.
+- **Decoders decode frames, not tiles.** Independent tiles need libaom's large-scale-tile mode or a stitched frame.
+
+### Metal AV1: an exact deblocked frame, and no analysis work when nothing changed (2026-10-31)
+
+**A bug in the previous entry, fixed.** The preset-change path was *not* exact: 720p typing-cc decoded differently from the encoder's picture at frame 3.
+
+- *Cause:* region deblocking reloads the changed area, plus two 64×64s around it, and deblocks it in place. Near that region's edge it reads neighbours that are deblocked already. It also filters their samples a second time, because an edge's filter reaches 7 samples into both sides.
+- *Why it hadn't shown:* until now, nothing read those samples. CDEF only reran one 64×64 inside the region.
+- *Why it showed now:* when new presets rerun CDEF where a strength changed, those 64×64s are read, in that picture or a later one.
+
+Now the unchanged 64×64s within three of a change, outside the exactly recomputed inner area, are saved before the reload and restored after the deblock. Their deblocked samples are the previous picture's, so the deblocked frame stays exact everywhere.
+
+A new test, `HybridEncoderTests.regionFilteringStaysExactAcrossPresetChanges`, encodes 40 pictures of random grainy edits that change the presets. Each picture is compared with a fresh full encode. It fails on the half fix.
+
+200 frames of typing-cc, scroll-win, photos and cursor-drag at 720p, typing and scroll at 1080p, and typing at 5K now all decode exactly.
+
+**Analysis overhead with little or nothing to analyze (kept, exact):**
+- *The padded source planes are pooled.* Partitions already waited on return them, so 22 MB of shared memory isn't made and cleared per 5K picture. `begin` went 4.3 → 3.0 ms.
+- *Only the changed 64×64s* are copied into the previous-source copy.
+- *No GPU dispatch at all* when every SB keeps its analysis. The kept results are in the cache already.
+- *Kept SBs' blocks are reused,* in `leafBlocks`, from the previous partition.
+
+Interleaved against the Rust port's commit (f755b42); middle of three runs, identical bytes:
+
+| Sequence | Before | After |
+|---|---|---|
+| typing-cc 720p, 3×3 | 233 fps | **391 fps** |
+| scroll-win 720p | 239 | **299** |
+| photos 720p | 79 | **86** |
+| typing-cc 1080p | 135 | **233** |
+| typing-cc 5K, 4×4 | 47 | **80** (filters 9.8 → 3.6 ms) |
+
+### Metal AV1: filters when the CDEF presets change; preset selection on the CPU (2026-10-31)
+
+`av1seq`, turbo, q20, 60 frames, M4 Pro. Interleaved A/B runs on a loaded machine; bytes unchanged. *Not exact as first committed:* see the entry above for the deblocking fix.
+
+**Presets that change no longer re-filter the frame (kept, exact).** With only changed tiles filtered, the whole frame was still filtered again whenever the joint search picked different CDEF presets. That happened often enough that 5K typing filtered 29 % of the frame on average.
+
+Now, when the presets differ:
+- every 64×64's preset is re-chosen from the SSE tables (the rows outside the changed area are still exact);
+- CDEF reruns only in the changed area and where a 64×64's applied strengths changed.
+
+5K typing-cc, 4×4 tiles: filtered 29 → 2 %, filters 10 → 5 ms, 44 → 60 fps.
+
+**Preset selection on the CPU (kept, exact).** libaom's joint greedy search (`l_select_small`: every cdef_bits level, 45 greedy and refinement steps) ran in a single 1024-thread GPU threadgroup in 64-bit math. That took ~2.5–3 ms of GPU time at 5K.
+
+It now runs as `av1enc_cdef_select_cpu`, the Rust reference the kernel was held to:
+- costs precomputed per (luma, chroma) preset pair as contiguous u32 rows (a 64×64's SSE fits);
+- each step a NEON min and widening sum;
+- the u64 reference loop as the fallback for tables that wouldn't fit 32 bits.
+
+The kernel is removed. Swapping in the CPU search unoptimized was slower at 5K (filters 5 → 6.7 ms); the rows made it faster.
+
+| Sequence | Before both | After |
+|---|---|---|
+| typing-cc 5K, 4×4 | 47 fps (filters 10.0 ms) | **65.8 fps** (3.6 ms) |
+| typing-cc 1080p, 3×3 | 208 | **232** |
+| photos 720p, 3×3 | 80 | **96** |
+
+### Metal AV1: the CPU code in Rust (2026-10-31)
+
+The AV1 encoder's CPU code moved from C++ to Rust (`rust/av1`, std only):
+- the writer and parser;
+- DSP and post-filters;
+- the range coder and AVIF;
+- the Metal encoder's host half;
+- the hybrid closed loop;
+- test support.
+
+The new code uses NEON for the transforms (forward and inverse), whole-block prediction, deblocking, CDEF, dequantization and the CDF update. The C++ is kept in `rust/av1/oracle/cpp` as the reference for the crate's differential tests, which require identical bytes, reconstructions and decisions.
+
+**`av1seq`** (turbo, q20, 60 frames, M4 Pro), C++ build (b589159) and Rust build interleaved, two runs each. All bytes are identical and every decode is exact.
+
+| Sequence | C++ | Rust | CPU closed loop, ms per frame | Writer |
+|---|---|---|---|---|
+| typing-cc 720p, 3×3 | 192 fps | **232 fps** | 1.7 → 0.7 | 0.5 → 0.4 |
+| photos 720p, 3×3 | 78 | 81 (GPU-bound) | 4.2 → 1.6 | 1.1 → 1.0 |
+| typing-cc 1080p, 3×3 | 126 | **207** | 3.3 → 1.2 | 0.8 → 0.6 |
+| typing-cc 5K, 4×4 | 34 | **47** | 7.0 → 3.1 | 1.4 → 1.5 |
+| photos 5K, 4×4, every SB analyzed | 5.5 | 5.5 (GPU-bound) | 72 → 21 | 11 → 11 |
+
+**Crate micro-benchmarks** (the C++ oracle is built at -O2 without LTO):
+
+| Piece | C++ | Rust |
+|---|---|---|
+| Hybrid closed loop, synthetic 5K first picture | 83 ms | 39 ms |
+| Hybrid closed loop, ~5 % changed | 18 ms | 9 ms |
+| Writer, 5K full encode with filters, 16 tiles | 499 ms | 75 ms |
+| Writer, bitstream only, 16 tiles | 6.4 ms | 6.6 ms |
+| Range coder, symbol streams | 83 Msym/s | 150 Msym/s |
+
+The writer's bitstream-only time is at parity: what's left there is the range coder and context derivation.
+
+### Metal AV1: why moving content is GPU-bound, and two exact speedups (2026-10-31)
+
+`av1seq`, turbo, q20, 60 frames, M4 Pro. Every superblock is analyzed (`--no-reuse`), which is the moving-content case. Every decode is exact.
+
+**Where photos 720p goes.** On an otherwise idle GPU (`--serial`), the analysis takes 16.6 ms a frame and the filters 2.4 ms. Overlapped, those 19 ms are the frame time (51 fps). Two encoders running at once reach 58.6 fps between them, so the GPU is ~87 % busy. The cost is the volume of search, not latency or serial work.
+
+Stage shares, from ablations (each stage replaced by a stub):
+
+| Stage | Share |
+|---|---|
+| Prediction in mode screening | ~5 ms |
+| The shapes' exact-rate RD (K = 1) | ~1.5 ms |
+| Leaf decisions | ~4.5 ms |
+| The rest: edges, SATD, setup, the partition DP | |
+
+turbo screens 13–25 candidates per block over 11 block shapes, about 175 predicted pixels per source pixel. libaom's realtime path tries a few modes at a few sizes. The difference is what buys the 30–48 % smaller files.
+
+`av1seq --profile` now reports each stage's best of 10 runs. Single isolated dispatches varied 2× from run to run.
+
+**Kept (exact, same decisions):**
+- *Hoisted prediction (`pred_cand` / `pred_fast`).* `av1g_pred_pixel` derived each candidate's angle zone and derivatives at every pixel. These are now derived once per candidate, in the shapes' screening and RD, and in the leaf pass.
+- *Leaf tx search across the SIMD-group.* Before, each of the ≤7 intra tx types ran its scalar evaluation on one lane, so 25 of 32 lanes idled. Now the types run one after another, each evaluated by the whole SIMD-group (`warp_eval`). Leaves 4.5 → 2.7 ms.
+
+Interleaved A/B against the previous commit, every SB analyzed:
+
+| Sequence | Before | After | Bytes |
+|---|---|---|---|
+| photos 720p | 51.6 fps | **67.4 fps** | 134.4 KB (±0) |
+| typing-cc 720p | 49.4 | **65.9** | 108.5 KB (±0) |
+| scroll-win 720p | 50.2 | **67.7** | 88.4 KB (±0) |
+| typing-cc 1080p | 25.0 | **33.5** | 199.6 KB (±0) |
+| typing-cc 5K, 4×4 | 4.0 | **5.6** | 550.4 → 550.5 KB (+0.02 %: float near-ties in the tx search) |
+| photos 5K, 4×4 | 3.9 | **5.4** | 1.16 MB (±0) |
+
+With reuse, photos 720p went 60.1 → 75.2 fps. The other reuse runs were too noisy to compare: another process was taking ~2 CPU cores, which shows up in the CPU closed loop.
+
+**Measured, not kept:**
+- *Edges in threadgroup memory* for the thread-per-block kernel (in case the thread arrays spilled): the 8×8 shape went from 6.9 to 8.9 ms.
+- *Checkerboard SATD screening for the 64–128-pixel shapes:* +2 fps for +0.1–0.2 % bytes.
+- *turbo2* (no 4×4 / 4×8 / 8×4): photos +11 % fps, but +3.6 % bytes and −0.18 dB.
+
+**What this means at 5K.** With every superblock changing, intra-only analysis is ~16× the work of 720p: 5.4 fps on photos. Reaching 60 fps there would take ~11× less work per pixel. That has to come from inter prediction (unchanged and moved blocks cost nothing to analyze) or from a codec designed for the GPU, not from trimming this search.
+
+### Metal AV1: filtering only around changes; a large-block prune (2026-10-31)
+
+`av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to
+the encoder's picture exactly.
+
+**Filters and strength search only around changes (kept).** Away from
+re-coded tiles, the reconstruction, block maps and source are the previous
+picture's. With the same filter parameters, each pixel's deblock and CDEF
+output and each SB's CDEF SSE row are too.
+- `search(changed:)` reloads and deblocks the re-coded SBs dilated by two
+  (so one SB in, it's exact).
+- It recomputes directions, SSE rows, cdef_idx and CDEF output on them
+  dilated by one.
+- It keeps the rest, and runs the preset selection over the whole table.
+- If the presets come out other than the previous picture's, it falls back
+  to filtering everything.
+
+The bytes are identical with and without (5K: 557.7 KB both). Pictures and
+libaom decodes are checked against fresh encodes (HybridEncoderTests).
+
+| typing-cc | before | around changes | filtered |
+|---|---|---|---|
+| 1080p, 3×3 | 128.7 fps | **150.6 fps** (filters 2.9 → 1.4 ms) | 5 % |
+| 5K, 4×4 | 29.7 fps | **50.2 fps** (filters 15.7 → 4.3 ms) | 1 % |
+
+**Busy large blocks pruned (kept, at 4).** av1gpu's `pruneVar` skips the
+analysis of 32×32-and-up shapes where the source variance exceeds v
+quantizer steps squared. These runs analyze every SB (`--no-reuse`, the
+moving-content case):
+
+| | v = 0 (off) | v = 4 (default) | v = 1 |
+|---|---|---|---|
+| photos 720p | 41.9 fps · 128.8 KB | 46.0 · 128.8 KB | 50.3 · 128.8 KB |
+| typing-cc 720p | 45.9 · 109.3 KB | 46.3 · 109.3 KB | 51.6 · 109.3 KB |
+| typing-cc 1080p | 21.4 · 201.4 KB | | 25.4 · 201.5 KB |
+| typing-cc 5K | 3.7 · 551.4 KB | 4.0 · 553.4 KB (+0.36 %) | 4.2 · 557.7 KB (+1.1 %) |
+
+From 1 down to 0.1 the bytes don't move at 720p, and the speed plateaus.
+`busyBlockPrune` defaults to 4 for bitrate efficiency, with 1 as the faster
+choice. Angle deltas off (`searchesAngleDeltas = false`) is ~20–30 % of the
+analysis for +0.1–0.9 % bytes: photos 720p 53.5 fps, typing 60.4.
+
+Now, with reuse: typing-cc 720p ~208 fps (3×3), scroll-win 88, photos 44,
+typing-cc 1080p 151, 5K 50. Photos is GPU-bound, with every SB changing:
+analysis 18 ms, and the filters waiting behind it.
+
+**The leaf decisions on moving content (`av1seq --profile`, kept).**
+Stage by stage on photos at 720p, the leaf pass is the largest GPU stage (8.3
+ms; the shapes take 0.9–3 ms each).
+- *Tx search size:* each 16×16 tx type runs serially on one lane.
+  Searching only up to 128 pixels (`leafTxSearchPixels`) saves ~13 % for
+  +0.08–0.2 % bytes; up to 64 pixels, +0.5–1.3 %; none, +3.3–6.8 %.
+- *Chroma modes:* screening the seven plain modes, without the six angled
+  ones (`leafChromaAngledModes`), costs 0–0.3 % bytes for ~5–8 %.
+- *Small kernel:* the thread-per-block analysis of 8×16 / 16×8 stays. With
+  the SIMD-group kernel, photos is 46.2 fps against 48.6.
+
+The hybrid's defaults (prune 4, tx search ≤128 px, plain chroma modes),
+analyzing every SB at 720p, 3×3 tiles:
+
+| | before these | now | bytes |
+|---|---|---|---|
+| photos | 41.9 fps | **53.0 fps** | 128.8 KB (±0) |
+| typing-cc | 45.9 | **53.2** | 109.5 KB (+0.2 %) |
+| scroll-win | 46.8 | **54.2** | 92.3 KB (+0.3 %) |
+
+With reuse at 720p: typing-cc **254.6 fps**, scroll-win 95.5, photos 51.3.
+libaom realtime key frames run 47–56 fps there, with 30–40 % more bytes.
+
+### Metal AV1: decisions up front on the GPU, and analysis kept across pictures (2026-10-30)
+
+`av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to
+the encoder's picture exactly.
+
+**Leaf decisions on the GPU (`k_leaf`, kept).** After the partition DP, each
+leaf's chroma mode and CfL and its luma tx type are decided from the source
+on the GPU, so the CPU closed loop only quantizes and reconstructs.
+typing-cc 100–139 at 720p, 2×2 tiles:
+
+| | CPU decides | GPU decides |
+|---|---|---|
+| size | 108.9 KB | 108.1 KB |
+| CPU closed loop / chroma | 14.6 / 3.7 ms | 6.9 / 0.8 ms |
+| GPU analysis incl. leaves | 18.2 ms | 24.9 ms |
+| fps | 36.0 | 32.6 (GPU-bound until the next change) |
+
+- A first version took 12 ms of GPU at 720p: one threadgroup per SB served
+  text SBs' ~200 leaves four at a time, and 4×4 chroma left 31 lanes idle.
+  `k_leaf_scan` now lays all leaves out as one list behind an indirect
+  dispatch, and lanes take (mode, plane, 4×4) items. That brought it to
+  ~4.5 ms.
+- Measured without the full GPU pass: transform types alone save 6 % (117.8
+  → 110.9 KB); chroma alone 2.4 %; both together match the CPU's choices.
+
+**Analysis kept across pictures (`reusesAnalysis`, kept, on in the
+hybrid).** The analysis reads only source pixels. An SB whose pixels, and
+those of the left, above, above-left, above-right and below-left SBs its
+edges read, haven't changed keeps the previous picture's block results,
+DP leaves and leaf decisions. HybridEncoderTests check that those code the
+same bytes as fresh analysis.
+
+| trace, frames | size, tiles | no reuse | reuse | kept |
+|---|---|---|---|---|
+| typing-cc 100–139 | 1280×720, 2×2 | 40.4 fps | **83.6 fps** | 97 % |
+| scroll-win 100–139 | 1280×720, 2×2 | 41.4 fps | **61.0 fps** | 59 % |
+| photos 100–139 | 1280×720, 2×2 | 38.2 fps | 39.7 fps | 5 % |
+| typing-cc 100–129 | 1920×1080, 2×2 | 21.1 fps | **39.9 fps** | 99 % |
+| typing-cc 100–109 | 5120×2880, 3×3 | 3.7 fps | **9.6 fps** | 100 % |
+
+The bytes are identical with and without reuse. With most of the analysis
+kept, the frame is the CPU's again. At 5K the closed loop takes 60 ms,
+filters 19, chroma bookkeeping 8 and the writer 6. Next: unchanged tiles
+could keep their closed loop and bitstream too.
+
+**Tiles kept across pictures (kept).** Prediction never crosses a tile and its
+CDFs start afresh. So a tile whose blocks' decisions and source are unchanged
+keeps its coefficients and reconstruction (av1core's `TileSkip`, the hybrid's
+`TileMem`). It keeps its bytes too while its cdef_idx values and cdef_bits
+are as last written (`av1enc_hybrid_write`). The bytes are still identical to
+fresh encoding (HybridEncoderTests).
+
+| trace, size | analysis kept only | + tiles kept | tiles kept |
+|---|---|---|---|
+| typing-cc 720p | 83.6 fps | **90.9 fps** (closed loop 6.2 → 3.2 ms, writer 1.3 → 0.7) | 94 % |
+| scroll-win 720p | 61.0 fps | 60.4 fps | 49 % |
+| typing-cc 1080p | 39.9 fps | **52.8 fps** | 94 % |
+| typing-cc 5K, 3×3 | 9.6 fps | **19.7 fps** (closed loop 60 → 9.7 ms, writer 5.8 → 0.6) | 99 % |
+
+**Only stale SBs dispatched; shapes concurrent (kept).** The analysis kernels
+and the DP take a list of the SBs to recompute instead of launching every
+block. That alone changed nothing, because the cost was latency: 19 shape
+dispatches in a row, each over a few SBs. A fully kept picture costs the GPU
+0.01 ms. With the encoder's dispatches concurrent (shapes are independent;
+barriers separate the stages), at 2×2 tiles:
+
+| trace, size | before | concurrent | GPU per frame |
+|---|---|---|---|
+| typing-cc 720p | 87.4 fps | **102.8 fps** | 9.2 → 3.3 ms |
+| scroll-win 720p | 61.8 | **72.6** | 14.2 → 9.8 |
+| photos 720p | 39.7 | **41.9** | |
+| typing-cc 1080p | 45.4 | **46.9** | 9.7 → 4.7 |
+
+**More tiles, now that unchanged ones cost nothing.** A changed tile is coded
+on one thread, so smaller tiles spread a change over more cores:
+
+| typing-cc | 2×2 (16) | 3×2 (32) | 3×3 (64) | 4×3 (128) |
+|---|---|---|---|---|
+| 720p | 102.8 fps · 108.1 KB | | **174.0 fps · 109.3 KB** | **184.2 fps · 110.2 KB** |
+| 1080p | 50.4 fps · 199.3 KB | 73.4 fps · 200.9 KB | **96.6 fps · 201.4 KB** | |
+| 5K | (3×3: 18.3 fps · 539.5 KB) | | 4×4: 20.5 · 551.4 KB | 5×4: 20.3 · 560.3 KB |
+
+The size cost is 1–2 % at 720p and 1080p. At 5K the frame doesn't
+follow, because whole-frame work leads there: the filters (~19 ms wall,
+~12 of it GPU) and the CPU's per-frame bookkeeping (~8 ms: padding the
+source, layout, block fields).
+
+**Fixed per-picture costs out (kept).** Each cut keeps the bytes:
+- Partition-only jobs leave the GPU closed loop's buffers out. They were
+  ~100 MB allocated and zeroed per 5K picture, on the CPU's path.
+- The hybrid stops zero-filling its coefficient array (the hook writes every
+  coefficient), pads the source on several threads, and skips its per-block
+  pass when the GPU decided chroma.
+- The filters keep their job's buffers across pictures of one geometry.
+
+| typing-cc | before | after (tiles) |
+|---|---|---|
+| 720p | 174.0 fps | **231.7 fps** (3×3) |
+| 1080p | 96.6 fps | **128.7 fps** (3×3) |
+| 5K | 20.5 fps | **29.7 fps** (4×4) |
+
+At 720p a frame is now 4.3 ms: GPU analysis 3.2 (overlapped), filters 1.8,
+closed loop 1.3, chroma 0.5, writer 0.3. At 5K the filters take 15.7 ms;
+their GPU work covers the whole frame (~12 ms) however little changed.
+
+What's left:
+- At 720p, the GPU's 9 ms with 97 % kept: every block's thread still
+  launches to find its SB kept (since fixed above).
+- At 5K, the filters (19 ms, whole frame) and the CPU's fixed costs: source
+  padding and recon copies of the whole frame, and per-block bookkeeping.
+
+### AV1HybridEncoder: sustained speed on frame sequences (2026-10-30)
+
+The hybrid is now a product class, `GlassActAV1.AV1HybridEncoder`. Its CPU
+closed loop moved from the test-support reference engine into
+`AV1Encoder/src/hybrid.cpp`, and the reference engine is upstream's again. A
+sequence starts picture i + 1's GPU analysis before finishing picture i on
+the CPU (`AV1MetalEncoder.beginPartition`).
+
+`glassact-bench av1seq` (new) encodes consecutive trace frames, each as an
+intra frame. Turbo, q20, after one warm-up picture; every stream decodes in
+libaom to the encoder's picture exactly. libaom is realtime key frames at
+the same quantizer, speed 9, 8 threads. M4 Pro.
+
+| trace, frames | size, tiles | hybrid | libaom s9 | hybrid bytes |
+|---|---|---|---|---|
+| typing-cc 100–139 | 1280×720, 2×2 | serial 23.8 fps → **overlapped 39.9 fps** · 108.9 KB · 41.60 dB | 48.0 fps · 182.9 KB · 43.05 dB | −40 % |
+| scroll-win 100–139 | 1280×720, 2×2 | **45.9 fps** · 90.9 KB · 43.37 dB | 56.0 fps · 130.0 KB · 44.34 dB | −30 % |
+| photos 100–139 | 1280×720, 2×2 | **38.7 fps** · 129.9 KB · 41.40 dB | 47.0 fps · 200.6 KB · 42.22 dB | −35 % |
+| typing-cc 100–129 | 1920×1080, 2×2 | **22.3 fps** · 200.9 KB · 42.64 dB | 26.5 fps · 354.1 KB · 43.70 dB | −43 % |
+| typing-cc 100–119 | 2560×1440, 3×2 | **14.1 fps** · 287.2 KB · 43.61 dB | 18.8 fps · 540.8 KB · 44.47 dB | −47 % |
+| typing-cc 100–109 | 5120×2880, 3×3 | **3.9 fps** · 542.5 KB · 47.46 dB | 6.6 fps · 1.03 MB · 47.61 dB | −47 % |
+
+- **Overlap works.** At 720p the frame time (21–26 ms) is the CPU's work
+  (chroma 3–4, closed loop 12–16, filters 3–4, writer 1–2), with the GPU
+  analysis (~18 ms) hidden behind it.
+- The hybrid runs at 75–85 % of libaom realtime's speed. At one quantizer
+  its files are 30–47 % smaller and its PSNR 0.2–1.4 dB lower. The
+  SSIMULACRA2-matched spot checks above put the size gap at 35–50 %.
+- Copying the filtered planes out by rows instead of pixels (kept) takes
+  720p typing-cc from 39.9 to **44.4 fps** (filters 4.2 → 2.7 ms).
+- **At 5K the filters take 85 ms** of wall time against 12 ms of GPU work.
+  Their dispatches queue with the next picture's 200 ms analysis. The next
+  levers are the filters' setup and copies, and their place in the overlap.
+
+### Metal AV1 hybrid at region sizes; where the CPU goes (2026-10-30)
+
+M4 Pro, turbo, q20, frame 200 / 150 / 150 of typing-cc / scroll-win /
+photos, resampled to 1280×720. The hybrid is GPU analysis and partition,
+then CPU chroma decisions and closed loop on tile threads, the GPU strength
+search and filters, and av1core's writer. Wall ms, and size @ SSIMULACRA2:
+
+| trace | GPU-only, 2×2 tiles (log2) | hybrid, 2×2 | libaom s9 (8 threads) |
+|---|---|---|---|
+| typing-cc | 104 · 106.6 KB @ 74.4 | **50** · 109.8 KB @ 73.9 | 37 · 184.2 KB @ 77.2 |
+| scroll-win | 110 · 85.1 KB @ 77.9 | **49** · 88.1 KB @ 77.5 | 29 · 127.7 KB @ 79.3 |
+| photos | 105 · 129.5 KB @ 78.9 | **56** · 134.4 KB @ 78.8 | 35 · 202.1 KB @ 80.2 |
+
+- The hybrid's ~50 ms: GPU analysis 18, CPU chroma 5, CPU closed loop
+  17–22, filters 3–5, writer 2–3, the rest overhead. With frame N+1's GPU
+  analysis overlapped with frame N's CPU work it would be ~30 ms
+  (projected).
+- **Thread-per-block analysis for 8×16 / 16×8** (kept): at 5K the
+  analysis goes from ~225 to ~205 ms, with the same bytes.
+- **CPU profile** (`sample`, 5K hybrid):
+  - The closed loop's tx-type trials (`trial`) are the largest part, and
+    their exact inverse transforms (`av1g_inv_1d`) add ~40 % more.
+  - The chroma decisions (prediction + Hadamard cost) are next, then entropy
+    coding.
+  - A float, vectorizable forward transform made the same bytes but no
+    measurable change (kept): the time isn't in the multiply.
+- At 5K the CPU side (~170 ms: chroma 42, closed loop 90, filters 30,
+  writer 6) is already below the GPU analysis (~210 ms). Overlapped, the
+  analysis bounds the frame, so GPU analysis time is the lever there.
+
+### av1core codes tiles in parallel (2026-10-30)
+
+av1core's encoder now codes each tile on a worker thread. A copy of the
+encoder holds the tile's state (contexts, CDFs, cursor); the frame's
+buffers, which tiles write in disjoint parts, are shared. The output is
+unchanged, and every gate holds: the decoder gate's random multi-tile
+records, GPU entropy against the writer, the post-filters, and the Metal
+encoder's tiled pictures through libaom. typing-cc frame 200, 5K, turbo,
+3×3 tiles (64), M4 Pro (14 cores):
+
+| | one thread | tile threads |
+|---|---|---|
+| writer (symbols only) | 65 ms | 6.5 ms |
+| writer with reconstruction | 184 ms | 18 ms |
+| hybrid CPU closed loop | ~1000 ms | 97 ms |
+
+The previous entry's projection holds. The hybrid now takes ~440 ms a frame,
+wall: GPU analysis 245, CPU chroma decisions 41, CPU closed loop 97,
+filters and search 29, writer 7. All-GPU takes ~515–540 ms (closed loop
+250–270), and the hybrid is 3–4 % larger. Overlapping frame N+1's GPU analysis
+with frame N's CPU work would make it ~245 ms a frame, analysis-bound
+(not built).
+
+### Metal AV1: small-shape kernel, and a first CPU closed loop (2026-10-30)
+
+The previous entries' frames and machine. `av1still --hybrid` (new).
+
+**Small-shape analysis kernel (kept).** av1gpu's thread-per-block analysis of
+the shapes up to 64 pixels, on by default upstream, is now ported and on.
+It makes the same decisions, so the same bytes. On turbo with 3×3 tiles at
+5K, the analysis drops from ~356 to ~225 ms on typing-cc, scroll-win and
+photos (−36 %); base drops from ~1160 to ~960 ms.
+
+**The hybrid (prototype).** The GPU's analysis and partition DP give the
+partition and luma modes. The closed loop runs on the CPU through
+av1core's `TxbHook`, built from the reference engine: chroma modes and CfL
+from the source, the GPU's dead zone (rnd 0.375, zbin 0.656), luma tx types
+searched by exact reconstruction error, then skip flags. The GPU strength
+search and filters follow, then av1core's writer. Every stream decodes in
+libaom to the filtered picture. Single-threaded: av1core codes tiles one
+after another.
+
+| typing-cc frame 200 | GPU closed loop | hybrid (1 CPU thread) | size, hybrid vs GPU |
+|---|---|---|---|
+| 1280×720 2×2, q12 | 143.1 KB @ 80.17, closed loop 77 ms | 147.5 KB @ 80.06, closed loop 116 ms | +3.1 % |
+| 1280×720 2×2, q28 | 78.0 KB @ 64.91, 72 ms | 80.8 KB @ 63.85, 100 ms | +3.6 % |
+| 5120×2880 3×3, q12 | 674.5 KB @ 81.62, 272 ms | 697.6 KB @ 81.73, 997 ms | +3.4 % |
+| 5120×2880 3×3, q28 | 413.2 KB @ 69.60, 260 ms | 431.4 KB @ 69.35, 999 ms | +4.4 % |
+
+- Keeping the analysis's luma tx types instead of searching halves the CPU
+  closed loop (56 ms at 720p q12) but costs +8.7 % size. Not worth it.
+- The CPU closed loop is ~4× the GPU's single-threaded. Most of that is
+  the tx-type trials: double-precision matrix transforms, an inverse and an
+  SSE for each type. The writer alone reconstructs the 5K frame in ~115 ms.
+- **Projection, not measured:** with tiles coded on parallel threads (64
+  tiles at 5K on 14 cores), the CPU closed loop would be ~90–100 ms against
+  the GPU's 260–270, the writer ~6 ms, and the frame ~350 ms. A pipeline
+  with frame N+1's analysis on the GPU during frame N's CPU closed loop
+  would be analysis-bound at ~230 ms a frame. Both need av1core to code
+  tiles concurrently: its encoder keeps tile state (contexts, CDFs, cursor)
+  in one object.
+
+### Where the Metal AV1 encoder's time goes (2026-10-30)
+
+The previous entry's encoder, turbo preset, typing-cc frame 200, q20,
+M4 Pro. I measured with per-dispatch command buffers (temporary
+instrumentation, not committed) and isolated 64×64 crops of the frame. Unless
+noted, numbers are at 5120×2880 with 3×3 tiles.
+
+**The analysis.** 376 ms. The four smallest shapes take half of it: 4×4 75 ms,
+4×8 38, 8×4 36, 8×8 44. Each block there gets a whole SIMD-group (32 lanes
+for 16–64 pixels). av1gpu's thread-per-block kernel for these shapes
+(`smallKernel`, on by default upstream) isn't ported yet. 64×64 takes 45 ms,
+at one SIMD-group per threadgroup (the 32 KB threadgroup-memory limit).
+
+**The closed loop.** 266 ms in 20 steps.
+- A step costs about its slowest superblock plus a throughput term: 64
+  superblocks ~8 ms, 304 ~19 ms.
+- Superblocks cropped from the frame and encoded alone take 0.7–24 ms
+  (median 1–2 ms). The slow ones are text with ~100–180 blocks, at
+  **100–220 µs per block**. Blocks within a superblock are coded in decode
+  order, so that's the critical path. Absolute values for single superblocks
+  are inflated by the GPU's low clock under light load.
+- Switching off CfL, the second chroma candidate and the closed-loop
+  tx-type search together saves 20 % (266 → 212 ms, +8.6 % size). The cost
+  is the per-block machinery itself, not the optional searches.
+- Padding the closed loop's threadgroup memory from 23.5 to 31.5 KB slows
+  turbo 41 % on 1024 superblocks in one step, and doesn't change base.
+  Threadgroup memory isn't base's limit, and is only part of turbo's.
+- Compiling the pipelines for their real thread counts
+  (`maxTotalThreadsPerThreadgroup` 128 / NW·32) changes nothing at frame
+  level. It's kept, since it's the right description of the kernels.
+
+**Smaller pictures don't escape the floor** (the same frame resampled; GPU ms
+at the best tiling, against libaom s9's CPU wall time on 8 threads):
+
+| size | Metal turbo | closed loop | libaom s9 |
+|---|---|---|---|
+| 1280×720, 2×2 tiles | 99 | 74 in 9 steps | 21 |
+| 2560×1440, 2×2 tiles | 269 | 177 in 20 steps | 51 |
+
+**The CPU's side, single-threaded.** av1core's writer codes the 5K frame in 53
+ms, and in 170 ms when it reconstructs too (prediction, inverse transforms,
+reconstruction of every block). At 720p it's 9.6 and 19.8 ms. That puts a CPU
+block at a few µs, against ~100 µs for one 128-thread threadgroup on the GPU.
+
+**Conclusion.** The GPU suits the parallel analysis. The serial closed loop
+belongs on the CPU, one thread per tile. av1core's writer already
+reconstructs, and offers the closed-loop hook (`TxbHook`, which its CPU
+reference engine uses) for choosing coefficients from the exact prediction.
+The next entry measures that hybrid.
+
+### Metal AV1 key frames vs libaom realtime: first measurements (2026-10-30)
+
+Research branch `metal-av1` (the Metal port of av1gpu, `GlassActAV1`).
+`glassact-bench av1still` (new) encodes one trace frame as an AV1 key frame
+two ways, at fixed quantizers q, and scores luma PSNR and SSIMULACRA2
+against the source:
+- **Metal:** GPU analysis, partition DP and closed loop at qindex 4q; the
+  GPU strength search and filters (libaom tune=iq's levels); av1core's CPU
+  writer.
+- **libaom realtime:** the retired AV1 video path's screen-content encoder
+  (palette, IntraBC), speed 9 or 6, 8 threads.
+
+Every Metal stream decodes in libaom to exactly the GPU's filtered picture.
+Machine: M4 Pro. Native 5120×2880, one frame per trace, so these are spot
+checks, not BD-rate.
+
+**Size at equal quality.** Metal base preset, minimum tiling; size @ SSIMULACRA2:
+
+| trace (frame) | Metal q12 | libaom s9 q12 | Metal q20 | libaom s9 q20 |
+|---|---|---|---|---|
+| typing-cc (200) | 653 KB @ 81.8 | 1.19 MB @ 81.5 | 510 KB @ 77.6 | 1.04 MB @ 78.4 |
+| scroll-win (150) | 540 KB @ 80.2 | 833 KB @ 79.8 | 432 KB @ 78.0 | 698 KB @ 78.4 |
+| photos (150) | 1.46 MB @ 81.2 | 2.44 MB @ 81.8 | 1.06 MB @ 76.5 | 2.06 MB @ 78.4 |
+
+That's 35–50 % smaller at matched SSIMULACRA2. libaom speed 6 lands within
+0.5 % of speed 9 here. At one q, Metal's quality falls faster with q than
+libaom's, so compare at equal scores, not equal q.
+
+**Time at 5K** (typing-cc, ms; GPU is from GPU timestamps, stage by stage):
+
+| configuration | analysis | closed loop | GPU total | writer (CPU) | size vs base |
+|---|---|---|---|---|---|
+| base, minimum tiles (128 steps) | 1093 | 1038 | 2131 | 65 | — |
+| base, 2×2 tiles (42 steps) | 1198 | 470 | 1668 | 93 | +0.3 % |
+| base, 3×3 tiles (20 steps) | 1181 | 296 | 1478 | 139 | +1.4 % |
+| base, 4×3 tiles (15 steps) | 1220 | 277 | 1498 | 85 | +2.6 % |
+| fast, 3×3 | 627 | 313 | 940 | 63 | +1.5 % |
+| faster, 3×3 | 660 | 276 | 936 | 64 | +1.5 % |
+| **turbo, 3×3** | 356 | 272 | **629** | 65 | +1.9 % |
+| turbo2, 3×3 | 224 | 171 | 395 | 76 | +39 % |
+| turbo3, 3×3 | 128 | 141 | 270 | 78 | +40 % |
+| libaom s9 (8 CPU threads) | | | 250–330 wall | | +80 % |
+
+These are q12 rows. The writer column is noisy (30–200 ms run to run). The
+filters and strength search take 12 ms of GPU time (~28 ms wall).
+
+- **The closed loop is latency-bound.** A wavefront step costs ~7 ms
+  whether it holds 10 superblocks (720p) or 40 (5K), so its time is the step
+  count; tiles cut it. Past 3×3 the steps get slower as they widen.
+- **The analysis is throughput-bound** (~13 MP/s on base). The presets cut
+  it most.
+- **turbo is the sweet spot on text:** 2.3× base's speed for +2 % size,
+  still ~43 % smaller than libaom s9 at equal SSIMULACRA2.
+  turbo2 / turbo3 drop 4×4 / 4×8 / 8×4 blocks, which costs text ~40 %.
+  Turning off angle deltas alone (turbo + turbo3's change) saves ~65 ms of
+  analysis for +0.7 %.
+- **Still 20× short of a 30 fps 5K frame.** Leads, unmeasured:
+  - occupancy: the closed loop's threadgroup takes 23.5 KB of threadgroup
+    memory and the large analysis shapes 20–32 KB;
+  - av1gpu's small-shape analysis kernel (`smallKernel`, on by default
+    upstream, not ported);
+  - writing tiles on parallel CPU threads;
+  - for video, encoding only the regions that change.
 
 ### Prefer smooth motion runs AV1 on a thin link (2026-10-28)
 
