@@ -6,7 +6,7 @@ use super::walk::{Frame, Rec, TileBufs, TileState, Walk};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::{RefPlane, tx_coeffs, tx_h, tx_w};
-use crate::entropy::Ec;
+use crate::entropy::{Ec, FrameCdfs};
 use crate::postfilter::{LF_ZERO, PfFrame, PfMaps, cdef_frame, deblock_frame};
 use crate::tables::{LAST_FRAME, TX_SIZES_ALL};
 use std::sync::Mutex;
@@ -66,6 +66,10 @@ pub struct Writer {
     seq: BitWriter,
     fh: BitWriter,
     threads: usize,
+    /// the context tile's saved CDFs, as its worker leaves them (captured, CDFs)
+    saved: Mutex<(bool, Box<FrameCdfs>)>,
+    /// tiles by block count, for the context tile
+    tile_order: Vec<(u32, usize)>,
 }
 
 impl Default for Writer {
@@ -226,6 +230,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.refresh_frame_flags,
         fp.error_resilient_mode,
         fp.lf_inter_off,
+        fp.cdf_from_ref,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
@@ -237,17 +242,28 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fail!(ERR_INVALID, "inter frames need video mode");
     }
     if fp.frame_type == FRAME_KEY {
-        if fp.ref_slot != 0 || fp.refresh_frame_flags != 0 || fp.error_resilient_mode != 0 || fp.lf_inter_off != 0 {
+        if fp.ref_slot != 0
+            || fp.refresh_frame_flags != 0
+            || fp.error_resilient_mode != 0
+            || fp.lf_inter_off != 0
+            || fp.cdf_from_ref != 0
+        {
             fail!(
                 ERR_INVALID,
-                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode and lf_inter_off must be 0"
+                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode, lf_inter_off and cdf_from_ref must be 0"
             );
         }
     } else {
-        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 || fp.lf_inter_off > 1 {
+        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 || fp.lf_inter_off > 1 || fp.cdf_from_ref > 1 {
             fail!(
                 ERR_INVALID,
-                "ref_slot must be 0..7, error_resilient_mode and lf_inter_off 0/1"
+                "ref_slot must be 0..7, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1"
+            );
+        }
+        if fp.cdf_from_ref != 0 && fp.error_resilient_mode != 0 {
+            fail!(
+                ERR_INVALID,
+                "cdf_from_ref needs error_resilient_mode 0 (which codes primary_ref_frame NONE)"
             );
         }
         if fp.allow_screen_content_tools != 1 {
@@ -360,6 +376,8 @@ impl Writer {
             ranges: Vec::new(),
             frame: FrameBufs::default(),
             cdef_out: Default::default(),
+            saved: Mutex::new((false, Box::new(FrameCdfs::new(0)))),
+            tile_order: Vec::new(),
             seq: BitWriter::default(),
             fh: BitWriter::default(),
             threads,
@@ -506,22 +524,6 @@ impl Writer {
                 fp.qm_u
             } as i32,
         ];
-        let f = Frame {
-            fp,
-            mi_cols,
-            mi_rows,
-            mono,
-            sb_cols,
-            sb_rows,
-            tiles,
-            qm_level,
-            do_recon,
-            fix_range,
-            check_edges,
-            ordmap: &self.ordmap,
-            inter,
-            refs,
-        };
 
         // ---- tiles ----
         // Every tile's blocks: all blocks whose position is inside it, contiguous in tile order.
@@ -555,6 +557,52 @@ impl Writer {
         }
         let skipped = |i: usize| skip.is_some_and(|s| s[i].skip);
         let ncoded = (0..ntiles).filter(|&i| !skipped(i)).count();
+        // the frame's CDFs: its reference's saved ones, or the defaults
+        let cdfs_in = if inter && fp.cdf_from_ref != 0 {
+            match extras.refs.and_then(|r| r[fp.ref_slot as usize]).and_then(|r| r.cdfs) {
+                Some(c) => Some(c),
+                None => fail!(
+                    ERR_INVALID,
+                    "cdf_from_ref: reference slot {} has no saved CDFs",
+                    fp.ref_slot
+                ),
+            }
+        } else {
+            None
+        };
+        // In video mode the frame saves the CDFs of its median tile by block count (ties: the lower
+        // index), which on screen content is neither an all-skip tile nor the busiest: smaller inter
+        // frames than libaom's largest tile, by up to 22 % at 5K (BENCHMARKS). Whether tiles are
+        // reused doesn't change it: a reused tile's CDFs aren't known, and none are saved then. A still
+        // picture names tile 0.
+        let mut context_tile = 0usize;
+        if fp.video != 0 {
+            let order = &mut self.tile_order;
+            order.clear();
+            order.extend((0..ntiles).map(|i| (self.tile_first[i + 1] - self.tile_first[i], i)));
+            order.sort_unstable();
+            context_tile = order[ntiles / 2].1;
+        }
+        self.saved.get_mut().unwrap().0 = false;
+        let f = Frame {
+            fp,
+            mi_cols,
+            mi_rows,
+            mono,
+            sb_cols,
+            sb_rows,
+            tiles,
+            qm_level,
+            do_recon,
+            fix_range,
+            check_edges,
+            ordmap: &self.ordmap,
+            inter,
+            refs,
+            cdfs_in,
+            cdfs_out: (fp.video != 0).then_some(&self.saved),
+            context_tile,
+        };
 
         if self.tiles.len() < ntiles {
             self.tiles.resize_with(ntiles, TileBufs::default);
@@ -735,9 +783,19 @@ impl Writer {
 
         let level = (opts.seq_level_idx >= 0).then_some(opts.seq_level_idx);
         let mut tiles_hdr = tiles;
+        let context_tile = f.context_tile as u32;
+        {
+            let g = self.saved.lock().unwrap();
+            match (g.0, &mut out.saved_cdfs) {
+                (true, Some(b)) => b.clone_from(&g.1),
+                (true, o) => *o = Some(g.1.clone()),
+                (false, o) => *o = None,
+            }
+        }
         let (tile_bytes, level) = frame_obus(
             &fp,
             &mut tiles_hdr,
+            context_tile,
             level,
             &self.payloads,
             opts.flags & ENC_TD != 0,

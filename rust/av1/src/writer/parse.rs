@@ -6,6 +6,7 @@ use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, Walk};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::clip3;
+use crate::entropy::FrameCdfs;
 use crate::tables::{
     ALTREF_FRAME, EIGHTTAP, INTER_FRAME, KEY_FRAME, LAST_FRAME, NUM_REF_FRAMES, PRIMARY_REF_NONE, REFS_PER_FRAME,
 };
@@ -85,11 +86,23 @@ struct Seq {
     film_grain: bool,
 }
 
-/// av1g_parse: an AV1 OBU stream (sequence header + one intra OBU_FRAME) back into a
-/// DecisionRecord.
+/// av1g_parse: an AV1 OBU stream (sequence header + one OBU_FRAME) back into a DecisionRecord. A
+/// frame that starts from a reference's saved CDFs (`fp.cdf_from_ref`) needs [`parse_with`].
 pub fn parse(obus: &[u8]) -> Result<Parsed, Error> {
+    parse_with(obus, None)
+}
+
+/// The reference slots' saved CDFs over a stream, for [`parse_with`]: frames update them as a
+/// decoder does (refresh_frame_flags; a key frame every slot).
+#[derive(Clone, Debug, Default)]
+pub struct ParseState {
+    pub slots: [Option<Box<FrameCdfs>>; 8],
+}
+
+/// [`parse`] of one frame of a stream, its frames in order through the same `state`.
+pub fn parse_with(obus: &[u8], state: Option<&mut ParseState>) -> Result<Parsed, Error> {
     let mut out = Parsed::default();
-    parse_into(obus, &mut out).map_err(|e| *e)?;
+    parse_into(obus, &mut out, state).map_err(|e| *e)?;
     Ok(out)
 }
 
@@ -189,7 +202,7 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     Ok(())
 }
 
-fn parse_into(obus: &[u8], out: &mut Parsed) -> Res<()> {
+fn parse_into(obus: &[u8], out: &mut Parsed, mut state: Option<&mut ParseState>) -> Res<()> {
     let n = obus.len();
     let mut sq = Seq {
         force_sct: 2,
@@ -235,6 +248,7 @@ fn parse_into(obus: &[u8], out: &mut Parsed) -> Res<()> {
                 (p.as_ptr() as usize - obus.as_ptr() as usize) as u64,
                 &mut fp,
                 out,
+                state.as_deref_mut(),
             )?;
             done = true;
         }
@@ -245,7 +259,14 @@ fn parse_into(obus: &[u8], out: &mut Parsed) -> Res<()> {
     Ok(())
 }
 
-fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut Parsed) -> Res<()> {
+fn parse_frame(
+    sq: &Seq,
+    p: &[u8],
+    p_off: u64,
+    fp: &mut FrameParams,
+    out: &mut Parsed,
+    state: Option<&mut ParseState>,
+) -> Res<()> {
     let sz = p.len();
     fp.enable_intra_edge_filter = sq.edge_filter;
     fp.enable_filter_intra = sq.filter_intra;
@@ -294,10 +315,12 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
     }
     if inter {
         if !err_res {
+            let prf = br.f(3)?;
             need!(
-                br.f(3)? == PRIMARY_REF_NONE as u32,
-                "primary_ref_frame other than NONE not supported"
+                prf == PRIMARY_REF_NONE as u32 || prf == 0,
+                "primary_ref_frame other than NONE or LAST_FRAME not supported"
             );
+            fp.cdf_from_ref = (prf == 0) as u8;
         }
         fp.refresh_frame_flags = br.f(8)? as u8;
         if err_res && sq.order_hint_bits != 0 {
@@ -344,13 +367,12 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
     } else if sct != 0 {
         need!(br.f(1)? == 0, "allow_intrabc=1 not supported");
     }
-    if !sq.reduced {
-        br.f(1)?; // disable_frame_end_update_cdf
-    }
+    let end_update = !sq.reduced && br.f(1)? == 0; // !disable_frame_end_update_cdf
     fp.width = fw;
     fp.height = fh;
     fp.monochrome = sq.mono as u8;
     let mut tile_size_bytes = 4;
+    let mut context_tile = 0usize;
     // tile_info
     {
         let mut t = TileInfo::default();
@@ -377,7 +399,7 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         fp.tile_cols_log2 = cl as i8;
         fp.tile_rows_log2 = rl as i8;
         if cl > 0 || rl > 0 {
-            br.f(cl + rl)?; // context_update_tile_id (irrelevant: no frame-end CDF update)
+            context_tile = br.f(cl + rl)? as usize;
             tile_size_bytes = br.f(2)? as i32 + 1;
         }
     }
@@ -509,6 +531,20 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
     tiles.tile_size_bytes = tile_size_bytes;
     let mono = fp.monochrome != 0;
     let ordmap: [Vec<u32>; 3] = Default::default();
+    // the CDFs it starts from: primary_ref_frame's slot's, or the defaults
+    let cdfs_in: Option<Box<FrameCdfs>> = if fp.cdf_from_ref != 0 {
+        match state.as_deref().and_then(|s| s.slots[fp.ref_slot as usize].clone()) {
+            Some(c) => Some(c),
+            None => fail!(
+                ERR_INVALID,
+                "the frame starts from slot {}'s saved CDFs: parse the stream's earlier frames first (parse_with)",
+                fp.ref_slot
+            ),
+        }
+    } else {
+        None
+    };
+    let saved = std::sync::Mutex::new((false, Box::new(FrameCdfs::new(0))));
     let f = Frame {
         fp: *fp,
         mi_cols,
@@ -532,6 +568,9 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         ordmap: &ordmap,
         inter,
         refs: None,
+        cdfs_in: cdfs_in.as_deref(),
+        cdfs_out: (state.is_some() && end_update).then_some(&saved),
+        context_tile,
     };
     // tile group
     let ntiles = (tiles.cols * tiles.rows) as usize;
@@ -575,6 +614,28 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         tpos += tsz;
     }
     pr.block_txb.push(pr.txb.len() as u32);
+    if let Some(state) = state
+        && fp.video != 0
+    {
+        // the slots it refreshes keep its saved CDFs: the context tile's, or (no frame-end update)
+        // the ones it started from
+        let (captured, end) = saved.into_inner().unwrap();
+        let kept = if end_update {
+            need!(
+                captured,
+                "context_update_tile_id {context_tile} is not a tile of the frame"
+            );
+            end
+        } else {
+            cdfs_in.unwrap_or_else(|| Box::new(FrameCdfs::new(fp.base_q_idx as i32)))
+        };
+        let refresh = if inter { fp.refresh_frame_flags } else { 0xFF };
+        for (i, s) in state.slots.iter_mut().enumerate() {
+            if refresh >> i & 1 != 0 {
+                *s = Some(kept.clone());
+            }
+        }
+    }
     out.rec = Record {
         fp: *fp,
         blocks: pr.blocks,

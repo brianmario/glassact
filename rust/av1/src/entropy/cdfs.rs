@@ -150,6 +150,17 @@ impl Cdfs {
            eob_pt_1024: 12, eob_extra: 3, dc_sign: 3, coeff_base_eob: 4, coeff_base: 5, coeff_br: 5)
     }
 
+    /// Every CDF's adaptation counter (its last element) set to 0, as the frame-end CDF update
+    /// leaves the saved CDFs.
+    pub fn clear_counters(&mut self) {
+        let w = self.words_mut();
+        for (id, len, n) in Cdfs::arrays() {
+            for k in 0..n {
+                w[id + k * len + len - 1] = 0;
+            }
+        }
+    }
+
     /// The cdf id (u16 offset in the struct) of `cdf`, a CDF inside the Cdfs at `base`
     /// (`self as *const Cdfs as usize`, taken before borrowing the field).
     #[inline(always)]
@@ -211,5 +222,55 @@ impl InterCdfs {
     /// The defaults, in place.
     pub fn init(&mut self) {
         *self = Self::default();
+    }
+
+    /// [`Cdfs::clear_counters`].
+    pub fn clear_counters(&mut self) {
+        fn clear<const L: usize>(cdfs: &mut [[u16; L]]) {
+            for c in cdfs {
+                c[L - 1] = 0;
+            }
+        }
+        clear(&mut self.y_mode);
+        clear(&mut self.is_inter);
+        clear(self.single_ref.as_flattened_mut());
+        clear(&mut self.new_mv);
+        clear(&mut self.zero_mv);
+        clear(&mut self.ref_mv);
+        clear(&mut self.drl_mode);
+        clear(&mut self.txfm_split);
+        clear(core::slice::from_mut(&mut self.mv_joint));
+        clear(&mut self.mv_class);
+        clear(&mut self.mv_class0_bit);
+        clear(&mut self.mv_sign);
+        clear(self.mv_bit.as_flattened_mut());
+        clear(&mut self.inter_tx_set1);
+        clear(core::slice::from_mut(&mut self.inter_tx_set2));
+        clear(&mut self.inter_tx_set3);
+    }
+}
+
+/// A frame's saved CDFs (the spec's save_cdfs / load_cdfs, per reference slot): what a later frame
+/// whose primary_ref_frame names the slot starts from. Every CDF the writer codes: the end of the
+/// frame's context_update_tile_id tile, counters cleared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameCdfs {
+    pub cdf: Cdfs,
+    pub icdf: InterCdfs,
+}
+
+impl FrameCdfs {
+    /// The defaults (a frame with primary_ref_frame NONE starts there), coefficient CDFs for
+    /// `base_q_idx`.
+    pub fn new(base_q_idx: i32) -> FrameCdfs {
+        FrameCdfs {
+            cdf: Cdfs::new(base_q_idx),
+            icdf: InterCdfs::default(),
+        }
+    }
+
+    pub fn clear_counters(&mut self) {
+        self.cdf.clear_counters();
+        self.icdf.clear_counters();
     }
 }

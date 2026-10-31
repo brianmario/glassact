@@ -28,6 +28,7 @@
 //! - [`tile_layout`], [`legalize_sb_qindex`], [`apply_sb_qindex`].
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
+use crate::entropy::FrameCdfs;
 use crate::types::*;
 
 mod encode;
@@ -49,7 +50,7 @@ pub(crate) use headers::{BitWriter, frame_obus};
 pub use layout::{
     LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex,
 };
-pub use parse::{Parsed, parse};
+pub use parse::{ParseState, Parsed, parse, parse_with};
 pub(crate) use tiles::choose_level;
 pub use tiles::{TileInfo, compute_tiles, tile_layout};
 
@@ -237,6 +238,10 @@ pub struct Output {
     pub n_symbols: u64,
     /// tx blocks repaired by [`ENC_FIX_RANGE`]
     pub n_fixed_txb: u32,
+    /// video mode: the frame's saved CDFs (a later frame with `fp.cdf_from_ref` that references a
+    /// slot this frame refreshes starts from them; [`RefPicture::cdfs`]). `None` when not known:
+    /// a still picture, or every coded tile skipped ([`TileSkip`]).
+    pub saved_cdfs: Option<Box<FrameCdfs>>,
 }
 
 impl Output {
@@ -255,6 +260,7 @@ impl Output {
             tile_bytes,
             n_symbols,
             n_fixed_txb,
+            saved_cdfs: _,
         } = self;
         obu.clear();
         avif.clear();
@@ -273,14 +279,17 @@ impl Output {
 pub struct RefPicture<'a> {
     pub plane: [&'a [u8]; 3],
     pub stride: [usize; 3],
+    /// the frame's saved CDFs ([`Output::saved_cdfs`]): needed by a `fp.cdf_from_ref` frame
+    pub cdfs: Option<&'a FrameCdfs>,
 }
 
 impl<'a> RefPicture<'a> {
-    /// A reconstruction as the writer returns it (tightly packed cropped planes).
+    /// A reconstruction as the writer returns it (tightly packed cropped planes), with its CDFs.
     pub fn from_output(o: &'a Output) -> RefPicture<'a> {
         RefPicture {
             plane: [&o.recon[0], &o.recon[1], &o.recon[2]],
             stride: [o.recon_w[0] as usize, o.recon_w[1] as usize, o.recon_w[2] as usize],
+            cdfs: o.saved_cdfs.as_deref(),
         }
     }
 }

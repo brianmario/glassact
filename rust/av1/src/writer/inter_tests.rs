@@ -115,16 +115,32 @@ fn inter_sequences_round_trip() {
             Ok(o) => o,
             Err((k, e)) => panic!("seed {seed} frame {k}: {e}"),
         };
+        let mut ps = ParseState::default();
         for (k, (rec, out)) in seq.frames.iter().zip(&outs).enumerate() {
-            let p = parse(&out.obu).unwrap_or_else(|e| panic!("seed {seed} frame {k}: parse: {e}"));
+            let before = ps.clone();
+            let p = parse_with(&out.obu, Some(&mut ps)).unwrap_or_else(|e| panic!("seed {seed} frame {k}: parse: {e}"));
             expect_parsed(rec, &p.rec, &format!("seed {seed} frame {k}"));
+            // the parser's saved CDFs are the writer's
+            if rec.fp.frame_type == FRAME_KEY || rec.fp.refresh_frame_flags != 0 {
+                let s = (0..8)
+                    .find(|&s| rec.fp.frame_type == FRAME_KEY || rec.fp.refresh_frame_flags >> s & 1 != 0)
+                    .unwrap();
+                assert!(ps.slots[s] == out.saved_cdfs, "seed {seed} frame {k}: saved CDFs");
+            }
             let mut again = p.rec.clone();
             let opts = EncodeOpts {
                 flags: ENC_BITSTREAM_ONLY | ENC_TD,
                 seq_level_idx: out.seq_level_idx as i32,
             };
             let mut o = Output::default();
-            w.encode(again.as_mut(), &opts, &mut o).unwrap();
+            let mut refs: RefSlots = [None; 8];
+            for (r, c) in refs.iter_mut().zip(&before.slots) {
+                *r = Some(RefPicture {
+                    cdfs: c.as_deref(),
+                    ..Default::default()
+                });
+            }
+            w.encode_ex(again.as_mut(), &opts, &refs, &mut o).unwrap();
             assert!(
                 o.obu == out.obu,
                 "seed {seed} frame {k}: the parsed record codes another stream"

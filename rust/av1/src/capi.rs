@@ -198,6 +198,11 @@ fn to_c_output(o: &writer::Output, out: &mut Output) {
     out.tile_bytes = o.tile_bytes;
     out.n_symbols = o.n_symbols;
     out.n_fixed_txb = o.n_fixed_txb;
+    // an opaque copy, freed by av1g_output_free
+    out.cdfs = o
+        .saved_cdfs
+        .as_ref()
+        .map_or(ptr::null_mut(), |c| Box::into_raw(c.clone()) as *mut c_void);
 }
 
 #[unsafe(no_mangle)]
@@ -271,6 +276,8 @@ pub unsafe extern "C" fn av1g_encode_ex(
                 pic.plane[p] = unsafe { slice::from_raw_parts(r.plane[p], (h as usize - 1) * stride + w as usize) };
                 pic.stride[p] = stride;
             }
+            // SAFETY: a non-null cdfs is an av1g_output.cdfs (a Box<FrameCdfs>) still alive
+            pic.cdfs = unsafe { (r.cdfs as *const crate::entropy::FrameCdfs).as_ref() };
             *slot = Some(pic);
         }
     }
@@ -303,9 +310,14 @@ pub unsafe extern "C" fn av1g_output_free(out: *mut Output) {
             free(p as *mut c_void);
         }
     }
+    if !out.cdfs.is_null() {
+        // SAFETY: made by to_c_output from a Box<FrameCdfs>
+        drop(unsafe { Box::from_raw(out.cdfs as *mut crate::entropy::FrameCdfs) });
+    }
     out.obu = ptr::null_mut();
     out.avif = ptr::null_mut();
     out.recon = [ptr::null_mut(); 3];
+    out.cdfs = ptr::null_mut();
     out.obu_size = 0;
     out.avif_size = 0;
 }

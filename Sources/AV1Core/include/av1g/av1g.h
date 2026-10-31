@@ -56,6 +56,8 @@ typedef struct av1g_output {
     uint64_t tile_bytes;     /* sum of tile payloads */
     uint64_t n_symbols;      /* adaptive symbols + literal bits coded */
     uint32_t n_fixed_txb;    /* tx blocks repaired by AV1G_ENC_FIX_RANGE */
+    void    *cdfs;           /* video mode: the frame's saved CDFs, for a later frame's
+                                av1g_ref_planes.cdfs (opaque; freed with the output), or NULL */
     char     error[256];
 } av1g_output;
 
@@ -112,6 +114,8 @@ void av1g_output_free(av1g_output *out);
 typedef struct av1g_ref_planes {
     const uint8_t *plane[3];  /* Y, U, V (U, V unused for monochrome) */
     int32_t stride[3];
+    const void *cdfs;         /* the slot's saved CDFs (its frame's av1g_output.cdfs): needed by
+                                 fp.cdf_from_ref frames; NULL otherwise */
 } av1g_ref_planes;
 
 /* av1g_encode with the reference pictures, by slot (video mode, decisions.h): an inter

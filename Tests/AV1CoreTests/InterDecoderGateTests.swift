@@ -43,6 +43,7 @@ struct InterDecoderGateTests {
                 let o = outputs[f]
                 refs[s].plane = (UnsafePointer(o.recon.0), UnsafePointer(o.recon.1), UnsafePointer(o.recon.2))
                 refs[s].stride = (Int32(o.recon_w.0), Int32(o.recon_w.1), Int32(o.recon_w.2))
+                refs[s].cdfs = UnsafeRawPointer(o.cdfs)
             }
             var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_FIX_RANGE) | UInt32(AV1G_ENC_TD), seq_level_idx: -1)
             var output = av1g_output()

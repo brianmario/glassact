@@ -159,6 +159,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// place of an intra one where it costs less. Off: copies only.
     public var searchesMotion = true
 
+    /// With `interFrames`: an inter frame starts from the CDFs its reference frame
+    /// saved instead of the defaults (on), so a picture that hardly changed costs
+    /// few bits. Loss-safe as long as the reference is a frame the decoder has.
+    public var carriesCDFs = true
+
     /// The last picture, for the next inter frame: its source, decoded
     /// output and per-64×64 decisions (copy, dx, dy).
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
@@ -298,6 +303,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 video.refresh_frame_flags = 1  // slot 0: always the previous picture
                 video.lf_inter_off = 1
                 video.allow_screen_content_tools = 1
+                video.cdf_from_ref = carriesCDFs ? 1 : 0
                 sbMotion = sbMotionIn
                 let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count
                 var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?

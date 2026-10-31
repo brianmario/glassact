@@ -64,7 +64,14 @@ pub(crate) fn put_leb128(o: &mut Vec<u8>, mut v: u64) {
 /// sequence_header_obu and uncompressed_header of a record's frame parameters: a reduced still
 /// picture, as Encoder::write_headers (and av1enc's copy, which is the same), or with `fp.video`
 /// a key or inter frame of a stream (the sequence header is the same for every frame of a stream).
-pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq: &mut BitWriter, fh: &mut BitWriter) {
+pub(crate) fn write_headers(
+    fp: &FrameParams,
+    tiles: &TileInfo,
+    context_tile: u32,
+    level: i32,
+    seq: &mut BitWriter,
+    fh: &mut BitWriter,
+) {
     let (w, h) = (fp.width as i32, fp.height as i32);
     let mono = fp.monochrome as u32;
     let video = fp.video != 0;
@@ -149,7 +156,15 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
         fh.put(0, 1); // frame_size_override_flag
         if inter {
             if fp.error_resilient_mode == 0 {
-                fh.put(PRIMARY_REF_NONE as u32, 3); // primary_ref_frame
+                // primary_ref_frame: LAST_FRAME (ref_frame_idx[0]) for its saved CDFs, or NONE
+                fh.put(
+                    if fp.cdf_from_ref != 0 {
+                        0
+                    } else {
+                        PRIMARY_REF_NONE as u32
+                    },
+                    3,
+                );
             }
             fh.put(fp.refresh_frame_flags as u32, 8);
             for _ in 0..REFS_PER_FRAME {
@@ -167,7 +182,7 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
                 fh.put(0, 1); // allow_intrabc
             }
         }
-        fh.put(1, 1); // disable_frame_end_update_cdf
+        fh.put(0, 1); // disable_frame_end_update_cdf: every frame saves its CDFs
     } else {
         fh.put(0, 1); // disable_cdf_update
         fh.put(sct, 1); // allow_screen_content_tools
@@ -198,7 +213,7 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
         }
     }
     if tiles.cols_log2 > 0 || tiles.rows_log2 > 0 {
-        fh.put(0, tiles.cols_log2 + tiles.rows_log2); // context_update_tile_id
+        fh.put(context_tile, tiles.cols_log2 + tiles.rows_log2); // context_update_tile_id
         fh.put((tiles.tile_size_bytes - 1) as u32, 2); // tile_size_bytes_minus_1
     }
     // quantization_params
@@ -305,6 +320,7 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
 pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     fp: &FrameParams,
     tiles: &mut TileInfo,
+    context_tile: u32,
     level: Option<i32>,
     payloads: &[P],
     temporal_delimiter: bool,
@@ -331,7 +347,7 @@ pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     let level = level.unwrap_or_else(|| super::choose_level(fp.width, fp.height, n as i32, tiles.cols as i32));
     seq.clear();
     fh.clear();
-    write_headers(fp, tiles, level, seq, fh);
+    write_headers(fp, tiles, context_tile, level, seq, fh);
     let tile_bytes: u64 = payloads.iter().map(|p| p.as_ref().len() as u64).sum();
     let tsb = tiles.tile_size_bytes as usize;
     let frame_len = fh.buf.len() + (n > 1) as usize + tile_bytes as usize + n.saturating_sub(1) * tsb;

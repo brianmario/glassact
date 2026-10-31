@@ -73,6 +73,7 @@ struct PostfilterTests {
                     let o = outputs[f]
                     refs[s].plane = (UnsafePointer(o.recon.0), UnsafePointer(o.recon.1), UnsafePointer(o.recon.2))
                     refs[s].stride = (Int32(o.recon_w.0), Int32(o.recon_w.1), Int32(o.recon_w.2))
+                    refs[s].cdfs = UnsafeRawPointer(o.cdfs)
                 }
                 var before = av1g_output(), after = av1g_output()
                 defer { av1g_output_free(&before) }

@@ -87,7 +87,9 @@ pub struct FrameParams {
     pub error_resilient_mode: u8,
     /// inter: 1 = inter blocks are not deblocked (ref deltas INTRA 0, LAST -63)
     pub lf_inter_off: u8,
-    pub reserved: [u8; 9],
+    /// inter: 1 = primary_ref_frame LAST: the frame starts from its reference's saved CDFs
+    pub cdf_from_ref: u8,
+    pub reserved: [u8; 8],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
@@ -164,6 +166,8 @@ pub struct Output {
     pub tile_bytes: u64,
     pub n_symbols: u64,
     pub n_fixed_txb: u32,
+    /// video mode: the frame's saved CDFs, for a later frame's av1g_ref_planes.cdfs (or null)
+    pub cdfs: *mut core::ffi::c_void,
     pub error: [u8; 256],
 }
 
@@ -175,6 +179,8 @@ pub struct Output {
 pub struct RefPlanesC {
     pub plane: [*const u8; 3],
     pub stride: [i32; 3],
+    /// the frame's saved CDFs (av1g_output.cdfs), or null
+    pub cdfs: *const core::ffi::c_void,
 }
 
 /// av1g_tiles
@@ -337,13 +343,14 @@ mod tests {
                cdef_y_pri: "cdef_y_pri", cdef_uv_sec: "cdef_uv_sec", allow_screen_content_tools: "allow_screen_content_tools");
         check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
                refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
+        check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
         check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
                inter: "inter");
-        check!(RefPlanesC, "RefPlanes", plane: "plane", stride: "stride");
+        check!(RefPlanesC, "RefPlanes", plane: "plane", stride: "stride", cdfs: "cdfs");
         check!(EncodeOpts, "EncodeOpts", seq_level_idx: "seq_level_idx");
         check!(Output, "Output", obu_size: "obu_size", recon: "recon", recon_h: "recon_h", tile_bytes: "tile_bytes",
-               n_symbols: "n_symbols", n_fixed_txb: "n_fixed_txb", error: "error");
+               n_symbols: "n_symbols", n_fixed_txb: "n_fixed_txb", cdfs: "cdfs", error: "error");
         check!(Tiles, "Tiles", cols: "cols", mi_col_starts: "mi_col_starts", mi_row_starts: "mi_row_starts");
         check!(Parsed, "Parsed", seq_level_idx: "seq_level_idx", tile_bytes: "tile_bytes", error: "error", priv_: "priv");
         check!(AvifMeta, "AvifMeta", icc_size: "icc_size", imir: "imir");

@@ -401,6 +401,7 @@ impl InterSeq {
                 };
                 fp.error_resilient_mode = rng.chance(30) as u8;
                 fp.lf_inter_off = rng.chance(50) as u8;
+                fp.cdf_from_ref = (fp.error_resilient_mode == 0 && rng.chance(60)) as u8;
             }
             let inter_pct = [0, 30, 60, 85, 100][rng.range(0, 4) as usize];
             let skip_pct = [5, 20, 50, 80][rng.range(0, 3) as usize];

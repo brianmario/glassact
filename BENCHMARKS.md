@@ -260,6 +260,81 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames start from their reference's CDFs (2026-10-31)
+
+**What changed:** an inter frame (`fp.cdf_from_ref`, on in `AV1HybridEncoder.carriesCDFs`; `av1seq --no-cdf-carry` turns it off) codes primary_ref_frame = LAST, and starts from the CDFs its reference saved instead of the defaults.
+- **Saving:** every video frame saves the CDFs of one tile (disable_frame_end_update_cdf = 0, counters cleared).
+- **Wire-up:** the writer returns them (`Output.saved_cdfs`, `av1g_output.cdfs`) and takes them per reference slot (`RefPicture.cdfs`, `av1g_ref_planes.cdfs`). The hybrid keeps a slot's from the write that refreshed it. `writer::parse_with` follows them over a stream.
+- **Loss:** this stays loss-safe while the reference is a frame the decoder has, which the acknowledged-reference scheme guarantees.
+- **Exact:** random sequences with it decode exactly in libaom (the Swift gate), dav1d and aomdec. Clearing the counters wrongly fails both.
+
+**Which tile's CDFs to save** (context_update_tile_id). Inter frame mean, 5K, 4×4 tiles:
+
+| Tile | typing-cc | cursor-drag | scroll-win | photos |
+|---|---|---|---|---|
+| the most blocks (libaom: the largest) | 884 B | 1.0 KB | 4.6 KB | 29.8 KB |
+| the fewest blocks | 691 B | 864 B | 4.6 KB | 30.3 KB |
+| **the median by blocks (kept)** | **691 B** | **864 B** | **4.5 KB** | **29.5 KB** |
+
+At 720p (2×2 tiles), median and most are within 2 % of each other.
+
+**Results:** first 100 frames, q20, every frame decoded by libaom in order, exactly. Inter frame mean:
+
+| Trace | 5K: default CDFs → carried | libaom s9 inter | 720p: default → carried | libaom s9 inter |
+|---|---|---|---|---|
+| typing-cc | 2.0 KB → 691 B | 324 B | 238 → 147 B | 123 B |
+| cursor-drag | 2.2 KB → 864 B | 486 B | 279 → 186 B | 125 B |
+| scroll-win | 5.8 → 4.5 KB | 4.0 KB | 5.0 → 4.9 KB | 2.0 KB |
+| photos | 30.5 → 29.5 KB | 37.2 KB | 56.1 → 55.7 KB | 14.4 KB |
+
+- **Static content's floor falls by 58–66 % at 5K.**
+- **Still about 2× libaom's on static content.** The rest is per-superblock symbols on 64×64 superblocks (libaom uses 128×128 at this size), tile overhead, and a sequence header on every frame.
+- **Moving content barely changes.** Its gap is the coding itself; the entry below has the measurements.
+- **Speed:** unchanged within noise (5K: typing 72, scroll 65, photos 27, drag 74 fps).
+
+### Metal AV1 against hardware HEVC and libaom, at equal quality (2026-10-31)
+
+**Setup:** first 100 frames of each trace, at the trace's timing. One quality metric for all three: `vquality`'s, BT.601 luma of the decoded picture in RGB against the trace frame (PSNR, and SSIM on 8×8 blocks).
+- **AV1:** `av1seq --score-rgb` (new) scores both AV1 encoders that way:
+  - the hybrid: inter frames, motion search, q 8–32;
+  - libaom realtime speed 9, 8 threads, inter frames (`--aom-inter`, new) at the same q.
+- **HEVC:** `vquality` runs the VideoToolbox HEVC encoder as the Host configures it (max frame QP 34, realtime, average-bitrate targets), at five targets per trace.
+- **Comparison:** BD-rate, i.e. bytes at equal quality, piecewise-linear in PSNR (or SSIM). Negative: smaller.
+- **Conditions:** M4 Pro, the owner's session disconnected; Spotlight and Time Machine were active, so speeds are approximate.
+
+**BD-rate by PSNR (by SSIM where PSNR ranges don't overlap):**
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K: hybrid vs HEVC | −40 % | −65 % (SSIM; by PSNR HEVC tops out below the hybrid's lowest point) | −81 % | −40 % |
+| 5K: hybrid vs libaom | −27 % | −1 % | −27 % | −26 % |
+| 720p: hybrid vs HEVC | −36 % | +28 % | +278 % | −33 % |
+| 720p: hybrid vs libaom | −23 % | +91 % | +255 % | −21 % |
+| 720p: libaom vs HEVC | (no overlap) | −38 % | +12 % | −15 % |
+
+**Split by frame type**, hybrid vs libaom by PSNR-Y, from the same sweep (before the CDF carry-over in the entry above):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K, key frames only | −44 % | −29 % | −44 % | −44 % |
+| 5K, inter frames only | +512 % | +43 % | −17 % | +340 % |
+| 720p, key frames only | −31 % | −25 % | −33 % | −32 % |
+| 720p, inter frames only | +103 % | +161 % | +291 % | +119 % |
+
+**What it shows:**
+- **The hybrid's lead is its key frames.** Its inter frames lose to libaom everywhere but 5K photos.
+- **On static content,** the inter-frame floor is the cause; the entry above halves it.
+- **On moving content at 720p (+90–290 %),** whole-sample motion is the cause. The 720p traces are downscaled from 5K, so their motion is fractional. Sub-sample motion vectors are next.
+- **At 5K the HEVC curve saturates.** Photos achieved 24.2 Mbit/s at both the 24 and 48 Mbit/s targets, and scroll 4.5 at a 12.8 target, at 37–42 dB. So the 5K HEVC numbers are the Host's HEVC settings, not HEVC's best.
+- **Speed:** libaom s9 on 8 CPU threads runs 2–5× the hybrid's frame rate on these traces:
+
+  | | libaom s9 | hybrid |
+  |---|---|---|
+  | 5K | 70–185 fps | 27–80 fps |
+  | 720p | 330–1590 fps | 80–340 fps |
+
+**Correction:** the "pinned HEVC loop" bitrates the entries below compare with (2.4 / 5.0 / 10.9 / 4.4 Mbit/s) are the whole Glass Act loop: lossless tiles, handoff, and repair under 5 % loss, over full traces. They're not an encoder's bitrate. This entry's HEVC numbers are the encoder alone.
+
 ### Metal AV1: motion search in inter frames (2026-10-31)
 
 **What changed:** the 64×64s that aren't exact copies now search for motion on the GPU, inside the analysis (`AV1HybridEncoder.searchesMotion`, on with `interFrames`; `av1seq --no-motion-search` turns it off).

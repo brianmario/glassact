@@ -11,7 +11,7 @@ use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
 use crate::blockinfo::*;
 use crate::dsp::*;
-use crate::entropy::{Cdfs, InterCdfs};
+use crate::entropy::{Cdfs, FrameCdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::*;
 
@@ -35,6 +35,12 @@ pub(crate) struct Frame<'a> {
     pub inter: bool,
     /// an inter frame with a reconstruction: LAST_FRAME's planes
     pub refs: Option<[RefPlane<'a>; 3]>,
+    /// the CDFs every tile starts from (primary_ref_frame's saved ones); `None`: the defaults
+    pub cdfs_in: Option<&'a FrameCdfs>,
+    /// video mode: where tile `context_tile` (context_update_tile_id) leaves its CDFs, counters
+    /// cleared, and sets the flag
+    pub cdfs_out: Option<&'a std::sync::Mutex<(bool, Box<FrameCdfs>)>>,
+    pub context_tile: usize,
 }
 
 impl Frame<'_> {
@@ -475,9 +481,15 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         st.mi_row_end = f.tiles.mi_row_starts[tile_row + 1] as i32;
         st.mi_col_start = f.tiles.mi_col_starts[tile_col] as i32;
         st.mi_col_end = f.tiles.mi_col_starts[tile_col + 1] as i32;
-        st.cdf.init(f.fp.base_q_idx as i32);
-        if f.inter {
-            st.icdf.init();
+        match f.cdfs_in {
+            Some(c) => {
+                st.cdf.clone_from(&c.cdf);
+                (*st.icdf).clone_from(&c.icdf);
+            }
+            None => {
+                st.cdf.init(f.fp.base_q_idx as i32);
+                st.icdf.init();
+            }
         }
         st.current_q_index = f.fp.base_q_idx as i32;
         st.block_q = -1;
@@ -499,6 +511,16 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 self.clear_block_decoded(r, c);
                 self.partition(rec, r, c, BLOCK_64X64)?;
             }
+        }
+        // the frame-end CDF update: the context tile's CDFs, counters cleared
+        if let Some(out) = f.cdfs_out
+            && tile_row * f.tiles.cols as usize + tile_col == f.context_tile
+        {
+            let mut g = out.lock().unwrap();
+            g.1.cdf.clone_from(&self.st.cdf);
+            g.1.icdf.clone_from(&self.st.icdf);
+            g.1.clear_counters();
+            g.0 = true;
         }
         Ok(())
     }

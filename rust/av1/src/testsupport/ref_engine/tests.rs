@@ -79,6 +79,7 @@ fn take(rc: c_int, o: &mut crate::types::Output) -> Result<Output, i32> {
             tile_bytes: o.tile_bytes,
             n_symbols: o.n_symbols,
             n_fixed_txb: o.n_fixed_txb,
+            saved_cdfs: None,
         };
         av1g_output_free(o);
         if rc == OK { Ok(r) } else { Err(rc) }

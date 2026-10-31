@@ -121,6 +121,7 @@ pub fn assemble_obus<P: AsRef<[u8]>>(fp: &FrameParams, tiles: &[P], temporal_del
     frame_obus(
         fp,
         &mut ti,
+        0,
         None,
         tiles,
         temporal_delimiter,

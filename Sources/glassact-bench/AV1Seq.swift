@@ -31,11 +31,14 @@ let av1SeqCommand = Command(
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
+        .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
         .int("aom-threads", "<n>", 1...64, "libaom worker threads (default 8)"),
+        .bool("score-rgb", "also score every frame as vquality scores HEVC: BT.601 luma of the decoded picture in BGRA against the trace frame (SSIM on 8x8 blocks, PSNR)"),
+        .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
     ],
     run: { opts in
         let trace = opts.required("trace")
@@ -89,6 +92,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     encoder.interFrames = inter
     encoder.searchesMotion = !opts.has("no-motion-search")
+    encoder.carriesCDFs = !opts.has("no-cdf-carry")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
@@ -113,6 +117,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
 
     var psnr = 0.0
+    let scoreRGB = opts.has("score-rgb")
+    let rgb = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: width, height: height) : nil
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
     defer { glassact_aom_dec_destroy(decoder) }
     for (i, f) in frames.enumerated() {
@@ -123,12 +129,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             throw BenchError("frame \(i): libaom's decode differs from the encoder's picture in plane \(p)")
         }
         psnr += decoded.psnrY(pictures[i])
+        try rgb?.add(decoded)
     }
     let n = Double(frames.count)
     func mean(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { frames.map { f($0.timing) }.reduce(0, +) / n * 1000 }
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
+    if let rgb { print(rgb.summary("hybrid")) }
     // the trace's own timing: frames arrive when the screen changes, at most ~60 a second
     if let first = stamps.first, let last = stamps.last, last > first, stamps.count > 1 {
         let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
@@ -172,7 +180,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
 
     if opts.has("aom-speed") {
-        let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8)
+        let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8), aomInter = opts.has("aom-inter")
         var options = glassact_aom_enc_options(speed: Int32(speed), vbr: 1)
         guard let enc = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads), 200_000, &options)
         else { throw BenchError("libaom: no encoder") }
@@ -182,7 +190,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         var total = 0, aomPSNR = 0.0, streams: [[UInt8]] = []
         let a0 = CACurrentMediaTime()
         for (i, p) in pictures.enumerated() {
-            let rc = p.withFrame { f in withUnsafePointer(to: f) { glassact_aom_enc_encode(enc, $0, Int64(i) * 16_667, 16_667, 1) } }
+            let forceKey: Int32 = aomInter && i > 0 ? 0 : 1
+            let rc = p.withFrame { f in withUnsafePointer(to: f) { glassact_aom_enc_encode(enc, $0, Int64(i) * 16_667, 16_667, forceKey) } }
             guard rc == 0 else { throw BenchError("libaom: \(String(cString: glassact_aom_enc_error(enc)))") }
             var size = 0, key: Int32 = 0, stream: [UInt8] = []
             while let pk = glassact_aom_enc_next_packet(enc, &size, &key) { stream += UnsafeBufferPointer(start: pk, count: size) }
@@ -192,11 +201,67 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let aomSeconds = CACurrentMediaTime() - a0
         var header = [UInt8](repeating: 0, count: 256)
         let headerSize = Int(glassact_aom_enc_sequence_header(enc, &header, header.count))
+        guard let aomDecoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
+        defer { glassact_aom_dec_destroy(aomDecoder) }
+        let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: width, height: height) : nil
         for (i, s) in streams.enumerated() {
-            let full = headerSize > 0 ? Array(header.prefix(headerSize)) + s : s
-            aomPSNR += try YUV420.decode(full, width: width, height: height).psnrY(pictures[i])
+            let full = headerSize > 0 && (!aomInter || i == 0) ? Array(header.prefix(headerSize)) + s : s
+            let decoded = aomInter ? try YUV420.decode(full, width: width, height: height, with: aomDecoder)
+                                   : try YUV420.decode(full, width: width, height: height)
+            aomPSNR += decoded.psnrY(pictures[i])
+            try aomRGB?.add(decoded)
         }
-        print(String(format: "  libaom s%d  %.1f fps (%.1f ms a frame, %d threads) · %@ a frame · PSNR-Y %.2f (key frames)",
-                     speed, n / aomSeconds, aomSeconds / n * 1000, threads, formatBytes(total / pictures.count), aomPSNR / n))
+        print(String(format: "  libaom s%d  %.1f fps (%.1f ms a frame, %d threads) · %@ a frame · PSNR-Y %.2f (%@)",
+                     speed, n / aomSeconds, aomSeconds / n * 1000, threads, formatBytes(total / pictures.count), aomPSNR / n,
+                     aomInter ? "inter frames" : "key frames"))
+        if let aomRGB { print(aomRGB.summary("libaom")) }
+        if aomInter, streams.count > 1, let first = stamps.first, let last = stamps.last, last > first {
+            let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
+            print(String(format: "             key frame %@ · inter frames %@ on average · %.2f Mbit/s at the trace's timing",
+                         formatBytes(streams[0].count), formatBytes(streams.dropFirst().map(\.count).reduce(0, +) / (streams.count - 1)),
+                         Double(total) * 8 / span / 1e6))
+        }
+    }
+}
+
+/// `--score-rgb`: decoded pictures scored as vquality scores HEVC (lumaQuality: BT.601 luma of BGRA,
+/// SSIM on 8x8 blocks and PSNR), against the trace's frames resampled to the canvas as av1seq
+/// resamples them before converting to 4:2:0. Reads the trace a second time, in step.
+final class RGBScorer {
+    let reader: ScapReader
+    let width: Int, height: Int
+    let full: UnsafeMutableRawBufferPointer, reference: UnsafeMutableRawBufferPointer, shown: UnsafeMutableRawBufferPointer
+    var rects: [DirtyRect] = []
+    var ssim = 0.0, psnr = 0.0, frames = 0
+
+    init(trace: String, skip: Int, width: Int, height: Int) throws {
+        reader = try openTrace(trace)
+        self.width = width
+        self.height = height
+        full = .allocate(byteCount: reader.header.width * reader.header.height * 4, alignment: 64)
+        reference = .allocate(byteCount: width * height * 4, alignment: 64)
+        shown = .allocate(byteCount: width * height * 4, alignment: 64)
+        for _ in 0..<skip { _ = try reader.readFrame(rects: &rects, into: full) }
+    }
+
+    deinit {
+        full.deallocate()
+        reference.deallocate()
+        shown.deallocate()
+    }
+
+    func add(_ decoded: YUV420) throws {
+        guard try reader.readFrame(rects: &rects, into: full) != nil else { throw BenchError("--score-rgb: the trace ended early") }
+        resample(full, reader.header.width, reader.header.height, into: reference, width, height)
+        try decoded.bgra(into: shown)
+        let (s, p) = lumaQuality(UnsafeRawBufferPointer(reference), UnsafeRawBufferPointer(shown), width, height)
+        ssim += s
+        if p.isFinite { psnr += p }
+        frames += 1
+    }
+
+    func summary(_ name: String) -> String {
+        String(format: "             %@, scored as vquality: SSIM mean %.4f · PSNR mean %.2f dB", name,
+               ssim / Double(max(1, frames)), psnr / Double(max(1, frames)))
     }
 }

@@ -33,6 +33,7 @@ pub(crate) use decide::{DecOpts, Decider, Src, pad_source};
 pub(crate) use quant::{HookOpts, QuantHook};
 
 use crate::blockinfo::{bh4, bw4, for_each_txb_ex, has_chroma, max_tx_depth, mi_cols, mi_rows};
+use crate::entropy::FrameCdfs;
 use crate::tables::{BLOCK_SIZES, DC_PRED, DCT_DCT};
 use crate::types::*;
 use crate::writer::{
@@ -145,6 +146,8 @@ pub struct Hybrid {
     keep_chroma: Vec<bool>,
     /// the last closed loop coded an inter frame (its tiles aren't kept)
     last_inter: bool,
+    /// video mode: each reference slot's saved CDFs, from the writes that refreshed it
+    slot_cdfs: [Option<Box<FrameCdfs>>; 8],
 }
 
 impl Default for Hybrid {
@@ -196,6 +199,7 @@ impl Hybrid {
             src_changed: Vec::new(),
             keep_chroma: Vec::new(),
             last_inter: false,
+            slot_cdfs: Default::default(),
         }
     }
 
@@ -334,6 +338,7 @@ impl Hybrid {
             threads,
             src_changed,
             keep_chroma,
+            slot_cdfs,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -359,6 +364,8 @@ impl Hybrid {
             (f.video, f.frame_type, f.ref_slot) = (v.fp.video, v.fp.frame_type, v.fp.ref_slot);
             (f.refresh_frame_flags, f.error_resilient_mode) = (v.fp.refresh_frame_flags, v.fp.error_resilient_mode);
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
+            // from the reference's saved CDFs, where the slot has them
+            f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
         }
         rec.inter.clear();
         rec.inter.extend_from_slice(inter);
@@ -617,7 +624,11 @@ impl Hybrid {
         if let Some(v) = video
             && inter_frame
         {
-            slots[(v.fp.ref_slot & 7) as usize] = v.reference;
+            let s = (v.fp.ref_slot & 7) as usize;
+            slots[s] = v.reference.map(|r| RefPicture {
+                cdfs: slot_cdfs[s].as_deref(),
+                ..r
+            });
         }
         let extras = Extras {
             tile_skip: Some(&skips),
@@ -710,6 +721,7 @@ impl Hybrid {
             cur,
             obu,
             writer,
+            slot_cdfs,
             ..
         } = self;
         let rec = &mut recs[*cur];
@@ -749,12 +761,35 @@ impl Hybrid {
             flags: ENC_TD | ENC_BITSTREAM_ONLY,
             seq_level_idx: -1,
         };
+        // an inter frame reads its reference's saved CDFs (no planes: the bitstream only)
+        let inter = fp.frame_type == FRAME_INTER;
+        let mut slots: RefSlots = [None; 8];
+        if inter {
+            let s = (fp.ref_slot & 7) as usize;
+            slots[s] = Some(RefPicture {
+                cdfs: slot_cdfs[s].as_deref(),
+                ..Default::default()
+            });
+        }
         let extras = Extras {
             tile_skip: Some(&skips),
             record_syms: false,
-            refs: None,
+            refs: inter.then_some(&slots),
         };
         writer.encode_with_hook::<NoHook>(rec.as_mut(), &opts, None, &extras, obu)?;
+        // the slots it refreshes keep its saved CDFs (none known: a later frame starts afresh)
+        if fp.video != 0 {
+            let refresh = if inter { fp.refresh_frame_flags } else { 0xFF };
+            for (i, s) in slot_cdfs.iter_mut().enumerate() {
+                if refresh >> i & 1 != 0 {
+                    match (&obu.saved_cdfs, s.as_mut()) {
+                        (Some(c), Some(b)) => b.clone_from(c),
+                        (Some(c), None) => *s = Some(c.clone()),
+                        (None, _) => *s = None,
+                    }
+                }
+            }
+        }
         let skipped: Vec<bool> = skips.iter().map(|s| s.skip).collect();
         let payloads = writer.tile_payloads();
         for i in 0..ntiles.min(payloads.len()) {

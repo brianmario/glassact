@@ -146,6 +146,12 @@
  *     deblocked only when a block on either side of it is intra (at the frame's levels); an
  *     encoder that copies already-filtered content leaves it as it is.  0: deltas off, every
  *     edge at the frame's levels.  Key frames: 0.
+ *   fp.cdf_from_ref (inter frames, error_resilient_mode 0): 1 codes primary_ref_frame = LAST, so
+ *     the frame's CDFs start from the ones its reference saved (av1g_output.cdfs, passed back in
+ *     av1g_ref_planes.cdfs), not the defaults: a frame of few changes costs few bits.  Every
+ *     video frame saves its CDFs (disable_frame_end_update_cdf = 0; context_update_tile_id: the
+ *     median tile by block count; none are saved when that tile is reused).  0: primary_ref_frame
+ *     NONE, as before.
  *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from ONE reference picture
  *     (LAST_FRAME; ref_frame_idx[] of all 7 references = fp.ref_slot); it refreshes the
  *     slots in fp.refresh_frame_flags.  allow_screen_content_tools must be 1 (it carries
@@ -269,7 +275,8 @@ typedef struct av1g_frame_params {
     uint8_t  refresh_frame_flags;  /* inter: bit i = this frame replaces slot i (0 = none) */
     uint8_t  error_resilient_mode; /* inter: 0/1 (header only: primary_ref_frame is NONE anyway) */
     uint8_t  lf_inter_off;         /* inter: 1 = inter blocks are not deblocked (see "Video mode") */
-    uint8_t  reserved[9];
+    uint8_t  cdf_from_ref;         /* inter: 1 = start from the reference's saved CDFs (see "Video mode") */
+    uint8_t  reserved[8];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {
