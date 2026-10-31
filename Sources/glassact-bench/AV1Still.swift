@@ -152,6 +152,19 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
             obu = Array(UnsafeBufferPointer(start: output.obu, count: output.obu_size))
         }
         let writer = writerTimes.sorted()[writerTimes.count / 2]
+        // the same writer reconstructing too: the decoder's half of a CPU closed loop
+        var reconTimes: [Double] = []
+        for _ in 0..<repeats {
+            var output = av1g_output()
+            let t1 = CACurrentMediaTime()
+            _ = encoded.withRecord { record -> Int32 in
+                var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_TD) | UInt32(AV1G_ENC_PREFILTER_RECON), seq_level_idx: -1)
+                return av1g_encode(&record, &options, &output)
+            }
+            reconTimes.append(CACurrentMediaTime() - t1)
+            av1g_output_free(&output)
+        }
+        let writerRecon = reconTimes.sorted()[reconTimes.count / 2]
         var entropyNote = ""
         if let entropy {
             let gpu = try encoded.withRecord { try entropy.encode($0) }
@@ -165,9 +178,9 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
             throw BenchError("q\(q): libaom's decode differs from the GPU's picture in plane \(p)")
         }
         let s = median { $0.analysis }, d = median { $0.partition }, c = median { $0.closedLoop }
-        let timing = String(format: "GPU %.1f (analysis %.1f · partition %.1f · closed loop %.1f in %d steps) · filters %.1f GPU / %.1f wall · writer %.1f%@ · wall %.0f",
+        let timing = String(format: "GPU %.1f (analysis %.1f · partition %.1f · closed loop %.1f in %d steps) · filters %.1f GPU / %.1f wall · writer %.1f (with recon %.1f)%@ · wall %.0f",
                             (s + d + c) * 1000, s * 1000, d * 1000, c * 1000, encoder.lastStages.wavefrontSteps,
-                            postfilter.lastGPUSeconds * 1000, searchWall * 1000, writer * 1000, entropyNote,
+                            postfilter.lastGPUSeconds * 1000, searchWall * 1000, writer * 1000, writerRecon * 1000, entropyNote,
                             (median { $0.wall } + searchWall + writer) * 1000)
         rows.append(Row(name: tileName, q: q, bytes: obu.count, psnr: decoded.psnrY(source), scoreIndex: try score(decoded), timing: timing))
     }

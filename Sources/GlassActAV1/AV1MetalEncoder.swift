@@ -114,15 +114,25 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                   let warps = Int(name.dropFirst(prefix.count)),
                   let function = library.makeFunction(name: name)
             else { throw Failure.metal("no \(prefix)…") }
-            analysis[bsize] = (try device.makeComputePipelineState(function: function), warps)
+            analysis[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
         }
         self.analysis = analysis
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
         dp = try device.makeComputePipelineState(function: dpFunction)
-        recon = try device.makeComputePipelineState(function: reconFunction)
+        recon = try Self.pipeline(reconFunction, threads: Self.reconThreads, device: device)
         params = Self.defaultParams()
+    }
+
+    /// A pipeline compiled for exactly the threads its threadgroups have: the
+    /// compiler then gives each thread more registers than the 1024-thread
+    /// default allows.
+    static func pipeline(_ function: any MTLFunction, threads: Int, device: any MTLDevice) throws -> any MTLComputePipelineState {
+        let descriptor = MTLComputePipelineDescriptor()
+        descriptor.computeFunction = function
+        descriptor.maxTotalThreadsPerThreadgroup = threads
+        return try device.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
     }
 
     /// AV1's block sizes in pixels, by `bsize` (128-pixel sizes unused: 0).

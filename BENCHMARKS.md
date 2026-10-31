@@ -259,6 +259,56 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Where the Metal AV1 encoder's time goes (2026-10-30)
+
+The previous entry's encoder, turbo preset, typing-cc frame 200, q20,
+M4 Pro. I measured with per-dispatch command buffers (temporary
+instrumentation, not committed) and isolated 64×64 crops of the frame. Unless
+noted, numbers are at 5120×2880 with 3×3 tiles.
+
+**The analysis.** 376 ms. The four smallest shapes take half of it: 4×4 75 ms,
+4×8 38, 8×4 36, 8×8 44. Each block there gets a whole SIMD-group (32 lanes
+for 16–64 pixels). av1gpu's thread-per-block kernel for these shapes
+(`smallKernel`, on by default upstream) isn't ported yet. 64×64 takes 45 ms,
+at one SIMD-group per threadgroup (the 32 KB threadgroup-memory limit).
+
+**The closed loop.** 266 ms in 20 steps.
+- A step costs about its slowest superblock plus a throughput term: 64
+  superblocks ~8 ms, 304 ~19 ms.
+- Superblocks cropped from the frame and encoded alone take 0.7–24 ms
+  (median 1–2 ms). The slow ones are text with ~100–180 blocks, at
+  **100–220 µs per block**. Blocks within a superblock are coded in decode
+  order, so that's the critical path. Absolute values for single superblocks
+  are inflated by the GPU's low clock under light load.
+- Switching off CfL, the second chroma candidate and the closed-loop
+  tx-type search together saves 20 % (266 → 212 ms, +8.6 % size). The cost
+  is the per-block machinery itself, not the optional searches.
+- Padding the closed loop's threadgroup memory from 23.5 to 31.5 KB slows
+  turbo 41 % on 1024 superblocks in one step, and doesn't change base.
+  Threadgroup memory isn't base's limit, and is only part of turbo's.
+- Compiling the pipelines for their real thread counts
+  (`maxTotalThreadsPerThreadgroup` 128 / NW·32) changes nothing at frame
+  level. It's kept, since it's the right description of the kernels.
+
+**Smaller pictures don't escape the floor** (the same frame resampled; GPU ms
+at the best tiling, against libaom s9's CPU wall time on 8 threads):
+
+| size | Metal turbo | closed loop | libaom s9 |
+|---|---|---|---|
+| 1280×720, 2×2 tiles | 99 | 74 in 9 steps | 21 |
+| 2560×1440, 2×2 tiles | 269 | 177 in 20 steps | 51 |
+
+**The CPU's side, single-threaded.** av1core's writer codes the 5K frame in 53
+ms, and in 170 ms when it reconstructs too (prediction, inverse transforms,
+reconstruction of every block). At 720p it's 9.6 and 19.8 ms. That puts a CPU
+block at a few µs, against ~100 µs for one 128-thread threadgroup on the GPU.
+
+**Conclusion.** The GPU suits the parallel analysis. The serial closed loop
+belongs on the CPU, one thread per tile. av1core's writer already
+reconstructs, and offers the closed-loop hook (`TxbHook`, which its CPU
+reference engine uses) for choosing coefficients from the exact prediction.
+The next entry measures that hybrid.
+
 ### Metal AV1 key frames vs libaom realtime: first measurements (2026-10-30)
 
 Research branch `metal-av1` (the Metal port of av1gpu, `GlassActAV1`).
