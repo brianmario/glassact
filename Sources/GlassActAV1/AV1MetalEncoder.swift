@@ -267,9 +267,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 shTotal[s] = UInt32(nbx[s] * nby[s])
                 blkTotal += shTotal[s]
             }
-            withUnsafeMutableBytes(of: &image.shOff) { $0.copyMemory(from: UnsafeRawBufferPointer(start: shOff, count: shOff.count * 4)) }
-            withUnsafeMutableBytes(of: &image.shNbx) { $0.copyMemory(from: UnsafeRawBufferPointer(start: nbx, count: nbx.count * 4)) }
-            withUnsafeMutableBytes(of: &image.shNby) { $0.copyMemory(from: UnsafeRawBufferPointer(start: nby, count: nby.count * 4)) }
+            shOff.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shOff) { $0.copyMemory(from: src) } }
+            nbx.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shNbx) { $0.copyMemory(from: src) } }
+            nby.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shNby) { $0.copyMemory(from: src) } }
 
             let nSb = sbCols * sbRows
             let imageBuffer = try make(MemoryLayout<GpImage>.stride)

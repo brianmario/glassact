@@ -106,7 +106,7 @@ the exception to the default no-dependencies posture.
   `Apps/Shared/Acknowledgements.txt` with the new `LICENSE`. Build both apps
   and run the local update test in RELEASING.md before landing.
 
-## av1gpu at a30b4e8 (`Sources/AV1Core`, `Sources/AV1CoreTestSupport`; research)
+## av1gpu at a30b4e8 (`Sources/AV1Core`, `Sources/AV1CoreTestSupport`, `Sources/AV1Encoder`, `Sources/GlassActAV1/Shaders`; research)
 
 - **Upstream:** https://github.com/maddog107/av1gpu, commit `a30b4e8`
   (main, 2026-10-30). A CUDA AV1 still-image encoder; its CPU core is
@@ -123,6 +123,9 @@ the exception to the default no-dependencies posture.
   (`include/av1g`). `AV1CoreTestSupport` is its fuzzer's record generator
   and its CPU reference engine, for tests. Their tests ran dav1d and aomdec
   through `system()`; ours decode in-process with the vendored libaom.
+  `AV1Encoder` and `Sources/GlassActAV1/Shaders` port its CUDA encoder
+  (`encoder/src`) and GPU entropy coder (`av1core/src/gpu_entropy.cu`,
+  `encoder/src/entropy_gpu.cpp`) to Metal and C++ hosts.
 - **Changes:** `internal.h` moved into `include/av1g`; module maps expose
   only the C API to Swift; the tests' tool paths, file I/O and JPEG input
   dropped. Files changed beyond include paths say so at the top.

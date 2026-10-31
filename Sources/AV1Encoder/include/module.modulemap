@@ -3,5 +3,6 @@
 module AV1Encoder {
     header "av1enc.h"
     header "av1enc/gp.h"
+    header "av1enc/ent.h"
     export *
 }
