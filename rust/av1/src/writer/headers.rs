@@ -109,7 +109,7 @@ pub(crate) fn write_headers(
     if video {
         seq.put(0, 1); // frame_id_numbers_present_flag
     }
-    seq.put(0, 1); // use_128x128_superblock
+    seq.put((fp.sb128 != 0) as u32, 1); // use_128x128_superblock
     seq.put(fp.enable_filter_intra as u32, 1);
     seq.put(fp.enable_intra_edge_filter as u32, 1);
     if video {
@@ -320,10 +320,11 @@ pub(crate) fn write_headers(
     fh.byte_align();
 }
 
-/// The OBUs of a picture around its tile payloads (tile raster order): [TD] + sequence header +
+/// The OBUs of a picture around its tile payloads (tile raster order): [TD] + [sequence header] +
 /// OBU_FRAME, into `out` (cleared). Sets `tiles.tile_size_bytes` from the payloads. `seq` / `fh` are
-/// scratch. `level`: seq_level_idx, or None for the smallest that fits. Returns the sum of the
-/// payload sizes and the level.
+/// scratch. `level`: seq_level_idx, or None for the smallest that fits. `seq_header`: false leaves
+/// the sequence header out (a later frame of a stream). Returns the sum of the payload sizes and
+/// the level.
 pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     fp: &FrameParams,
     tiles: &mut TileInfo,
@@ -331,6 +332,7 @@ pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     level: Option<i32>,
     payloads: &[P],
     temporal_delimiter: bool,
+    seq_header: bool,
     seq: &mut BitWriter,
     fh: &mut BitWriter,
     out: &mut Vec<u8>,
@@ -363,9 +365,11 @@ pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     if temporal_delimiter {
         out.extend_from_slice(&[0x12, 0x00]);
     }
-    out.push(0x0A); // OBU_SEQUENCE_HEADER, has_size_field
-    put_leb128(out, seq.buf.len() as u64);
-    out.extend_from_slice(&seq.buf);
+    if seq_header {
+        out.push(0x0A); // OBU_SEQUENCE_HEADER, has_size_field
+        put_leb128(out, seq.buf.len() as u64);
+        out.extend_from_slice(&seq.buf);
+    }
     out.push(0x32); // OBU_FRAME, has_size_field
     put_leb128(out, frame_len as u64);
     out.extend_from_slice(&fh.buf);

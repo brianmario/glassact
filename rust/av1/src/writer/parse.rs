@@ -1,6 +1,7 @@
 //! Parsing: OBUs -> DecisionRecord (the toolset the writer produces: a still picture, or a key or
-//! inter frame of a video stream, 64x64 superblocks, uniform tiles), the walk with the spec's
-//! symbol decoder. Inter frames parse without their reference pictures.
+//! inter frame of a video stream, 64x64 or 128x128 superblocks, uniform tiles), the walk with the
+//! spec's symbol decoder. Inter frames parse without their reference pictures; a later frame of a
+//! stream without its own sequence header parses with the stream's ([`ParseState`]).
 use super::sink::DecSink;
 use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, Walk};
 use super::*;
@@ -60,9 +61,11 @@ impl BitReader<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct Seq {
     seen: bool,
+    /// use_128x128_superblock
+    sb128: bool,
     still: bool,
     reduced: bool,
     interintra: bool,
@@ -87,16 +90,19 @@ struct Seq {
 }
 
 /// av1g_parse: an AV1 OBU stream (sequence header + one OBU_FRAME) back into a DecisionRecord. A
-/// frame that starts from a reference's saved CDFs (`fp.cdf_from_ref`) needs [`parse_with`].
+/// frame that starts from a reference's saved CDFs (`fp.cdf_from_ref`), or that has no sequence
+/// header of its own ([`ENC_NO_SEQ_HEADER`]), needs [`parse_with`].
 pub fn parse(obus: &[u8]) -> Result<Parsed, Error> {
     parse_with(obus, None)
 }
 
-/// The reference slots' saved CDFs over a stream, for [`parse_with`]: frames update them as a
-/// decoder does (refresh_frame_flags; a key frame every slot).
+/// A stream's state over its frames, for [`parse_with`]: the reference slots' saved CDFs, which
+/// frames update as a decoder does (refresh_frame_flags; a key frame every slot), and the last
+/// sequence header (frames without one use it).
 #[derive(Clone, Debug, Default)]
 pub struct ParseState {
     pub slots: [Option<Box<FrameCdfs>>; 8],
+    seq: Option<Box<Seq>>,
 }
 
 /// [`parse`] of one frame of a stream, its frames in order through the same `state`.
@@ -155,7 +161,7 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
         let frame_ids = br.b()?;
         need!(!frame_ids, "frame ids not supported");
     }
-    need!(br.f(1)? == 0, "128x128 superblocks not supported");
+    sq.sb128 = br.b()?;
     sq.filter_intra = br.f(1)? as u8;
     sq.edge_filter = br.f(1)? as u8;
     if !sq.reduced {
@@ -239,8 +245,19 @@ fn parse_into(obus: &[u8], out: &mut Parsed, mut state: Option<&mut ParseState>)
         let p = &obus[pos..pos + sz as usize];
         if ty == 1 {
             parse_seq(&mut BitReader { d: p, pos: 0 }, &mut sq)?;
+            if let Some(s) = state.as_deref_mut() {
+                s.seq = Some(Box::new(sq.clone()));
+            }
         } else if ty == 6 || ty == 3 {
-            need!(sq.seen, "frame before sequence header");
+            if !sq.seen
+                && let Some(s) = state.as_deref().and_then(|s| s.seq.as_deref())
+            {
+                sq = s.clone(); // a later frame of the stream: the stream's sequence header
+            }
+            need!(
+                sq.seen,
+                "frame before sequence header (a stream's later frame without one: parse_with the stream's ParseState)"
+            );
             need!(ty == 6, "separate frame header + tile group OBUs not supported");
             parse_frame(
                 &sq,
@@ -270,6 +287,7 @@ fn parse_frame(
     let sz = p.len();
     fp.enable_intra_edge_filter = sq.edge_filter;
     fp.enable_filter_intra = sq.filter_intra;
+    fp.sb128 = sq.sb128 as u8;
     need!(!sq.superres && !sq.film_grain, "superres / film grain not supported");
     let mut br = BitReader { d: p, pos: 0 };
     let mut inter = false;
@@ -373,7 +391,7 @@ fn parse_frame(
     // tile_info
     {
         let mut t = TileInfo::default();
-        compute_tiles(fw, fh, -1, -1, &mut t);
+        compute_tiles(fw, fh, -1, -1, sq.sb128, &mut t);
         need!(br.f(1)? == 1, "non-uniform tile spacing not supported");
         let mut cl = t.min_log2_tile_cols;
         while cl < t.max_log2_tile_cols {
@@ -384,7 +402,7 @@ fn parse_frame(
             }
         }
         let mut t2 = TileInfo::default();
-        compute_tiles(fw, fh, cl, -1, &mut t2);
+        compute_tiles(fw, fh, cl, -1, sq.sb128, &mut t2);
         let mut rl = t2.min_log2_tile_rows;
         while rl < t2.max_log2_tile_rows {
             if br.b()? {
@@ -517,7 +535,14 @@ fn parse_frame(
     // setup_frame
     let (mi_cols, mi_rows) = (mi_cols(fw as i32), mi_rows(fh as i32));
     let mut tiles = TileInfo::default();
-    if !compute_tiles(fw, fh, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32, &mut tiles) {
+    if !compute_tiles(
+        fw,
+        fh,
+        fp.tile_cols_log2 as i32,
+        fp.tile_rows_log2 as i32,
+        sq.sb128,
+        &mut tiles,
+    ) {
         fail!(
             ERR_INVALID,
             "illegal tiling {}/{} for {fw}x{fh}",
@@ -568,6 +593,7 @@ fn parse_frame(
         cdfs_in: cdfs_in.as_deref(),
         cdfs_out: (state.is_some() && end_update).then_some(&saved),
         context_tile,
+        sb128: sq.sb128,
     };
     // tile group
     let ntiles = (tiles.cols * tiles.rows) as usize;

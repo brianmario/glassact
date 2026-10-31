@@ -1,18 +1,64 @@
 use super::*;
 use crate::dsp::Rng;
 
-/// A random frame: legal-looking block tilings (random partitions of every 64x64), random filter
-/// parameters, and planes of piecewise-smooth content (flat areas, small steps, noise, edges), so
-/// every filter path runs.
+/// A random frame: legal-looking block tilings (random partitions of every 64x64, or 128x128 with
+/// [`random_case_ex`]), random filter parameters, and planes of piecewise-smooth content (flat
+/// areas, small steps, noise, edges), so every filter path runs.
 pub(crate) struct Case {
     pub fp: FrameParams,
     pub blocks: Vec<Block>,
     pub planes: [Vec<u8>; 3],
     pub stride: [usize; 3],
+    /// per block, [`PfMapsBuf::mark_block_flags`]' flags (inter blocks, level 0), or empty: none
+    pub flags: Vec<u8>,
+}
+
+impl Case {
+    /// The maps of the case's blocks.
+    pub fn maps(&self, f: &PfFrame) -> PfMapsBuf {
+        let mut mb = PfMapsBuf::new(f);
+        for (i, b) in self.blocks.iter().enumerate() {
+            mb.mark_block_flags(f, b, self.flags.get(i).copied().unwrap_or(0));
+        }
+        mb
+    }
 }
 
 fn partition(r: &mut Rng, row: i32, col: i32, log2: i32, mr: i32, mc: i32, out: &mut Vec<Block>) {
     if row >= mr || col >= mc {
+        return;
+    }
+    if log2 == 7 {
+        // a 128x128: one block, halves, or its 64x64s
+        let mut push = |bs: i32, row: i32, col: i32, r: &mut Rng| {
+            if row < mr && col < mc {
+                let tx_depth = r.range(0, max_tx_depth(bs)) as u8;
+                out.push(Block {
+                    mi_row: row as u16,
+                    mi_col: col as u16,
+                    bsize: bs as u8,
+                    tx_depth,
+                    skip: (r.below(2) == 0) as u8,
+                    ..Default::default()
+                });
+            }
+        };
+        match r.below(5) {
+            0 => push(BLOCK_128X128, row, col, r),
+            1 => {
+                push(BLOCK_128X64, row, col, r);
+                push(BLOCK_128X64, row + 16, col, r);
+            }
+            2 => {
+                push(BLOCK_64X128, row, col, r);
+                push(BLOCK_64X128, row, col + 16, r);
+            }
+            _ => {
+                for (dr, dc) in [(0, 0), (0, 16), (16, 0), (16, 16)] {
+                    partition(r, row + dr, col + dc, 6, mr, mc, out);
+                }
+            }
+        }
         return;
     }
     let sq = [BLOCK_4X4, BLOCK_8X8, BLOCK_16X16, BLOCK_32X32, BLOCK_64X64][(log2 - 2) as usize];
@@ -64,6 +110,12 @@ fn partition(r: &mut Rng, row: i32, col: i32, log2: i32, mr: i32, mc: i32, out: 
 }
 
 pub(crate) fn random_case(r: &mut Rng, max_dim: i32) -> Case {
+    random_case_ex(r, max_dim, false)
+}
+
+/// [`random_case`], or (`sb128`) with partitions of 128x128s (blocks up to 128x128) and random
+/// inter flags.
+pub(crate) fn random_case_ex(r: &mut Rng, max_dim: i32, sb128: bool) -> Case {
     let mut fp = FrameParams {
         width: r.range(1, max_dim) as u32,
         height: r.range(1, max_dim) as u32,
@@ -84,16 +136,29 @@ pub(crate) fn random_case(r: &mut Rng, max_dim: i32) -> Case {
     }
     let (mr, mc) = (mi_rows(fp.height as i32), mi_cols(fp.width as i32));
     let mut blocks = Vec::new();
-    for sr in (0..mr).step_by(16) {
-        for sc in (0..mc).step_by(16) {
+    let (step, log2) = if sb128 { (32, 7) } else { (16, 6) };
+    for sr in (0..mr).step_by(step) {
+        for sc in (0..mc).step_by(step) {
             let n0 = blocks.len();
-            partition(r, sr, sc, 6, mr, mc, &mut blocks);
+            partition(r, sr, sc, log2, mr, mc, &mut blocks);
             let idx = r.range(0, 7) as i8;
             for b in &mut blocks[n0..] {
                 b.cdef_idx = idx;
             }
         }
     }
+    let flags: Vec<u8> = if sb128 {
+        let lf_zero = r.below(3) == 0;
+        (0..blocks.len())
+            .map(|_| match r.below(3) {
+                0 => 0,
+                _ if lf_zero => PF_BLK_LF_ZERO | PF_BLK_INTER,
+                _ => PF_BLK_INTER,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut planes: [Vec<u8>; 3] = Default::default();
     let mut stride = [0usize; 3];
     for p in 0..3 {
@@ -127,6 +192,7 @@ pub(crate) fn random_case(r: &mut Rng, max_dim: i32) -> Case {
         blocks,
         planes,
         stride,
+        flags,
     }
 }
 
@@ -139,13 +205,10 @@ fn split(p: &mut [Vec<u8>; 3]) -> [&mut [u8]; 3] {
 fn deblock_simd_matches_scalar() {
     let mut r = Rng(31);
     let mut changed = 0;
-    for _ in 0..300 {
-        let c = random_case(&mut r, 200);
+    for k in 0..400 {
+        let c = random_case_ex(&mut r, 200, k >= 300);
         let f = PfFrame::new(&c.fp);
-        let mut mb = PfMapsBuf::new(&f);
-        for b in &c.blocks {
-            mb.mark_block(&f, b);
-        }
+        let mb = c.maps(&f);
         let m = mb.maps();
         let (mut a, mut b) = (c.planes.clone(), c.planes.clone());
         deblock_frame(&f, &m, &mut split(&mut a), &c.stride);
@@ -153,7 +216,61 @@ fn deblock_simd_matches_scalar() {
         assert!(a == b, "{:?}", c.fp);
         changed += (a != c.planes) as u32;
     }
-    assert!(changed > 200);
+    assert!(changed > 250);
+}
+
+/// A skipped inter block 128 wide or high isn't filtered at its 64x64 tx blocks' edge inside it
+/// (applyFilter's isBlockEdge), while an intra or coded one is, as are two 64-wide skipped inter
+/// blocks' block edge.
+#[test]
+fn skipped_inter_128_blocks_keep_their_inner_edges() {
+    let fp = FrameParams {
+        width: 128,
+        height: 128,
+        loop_filter_level: [40, 40, 30, 30],
+        ..Default::default()
+    };
+    let f = PfFrame::new(&fp);
+    // a step at x = 64 and y = 64 in every plane
+    let mut planes: [Vec<u8>; 3] = Default::default();
+    let mut stride = [0usize; 3];
+    for p in 0..3 {
+        let n = 128 >> (p != 0) as usize;
+        stride[p] = n;
+        planes[p] = (0..n * n)
+            .map(|i| 100 + 8 * ((i % n >= n / 2) as u8 + (i / n >= n / 2) as u8))
+            .collect();
+    }
+    let run = |blocks: &[Block], flags: u8| {
+        let mut mb = PfMapsBuf::new(&f);
+        for b in blocks {
+            mb.mark_block_flags(&f, b, flags);
+        }
+        let mut a = planes.clone();
+        deblock_frame(&f, &mb.maps(), &mut split(&mut a), &stride);
+        let mut b = planes.clone();
+        deblock_frame_scalar(&f, &mb.maps(), &mut split(&mut b), &stride);
+        assert!(a == b);
+        a != planes
+    };
+    let blk = |bs: i32, r: u16, c: u16, skip: u8| Block {
+        mi_row: r,
+        mi_col: c,
+        bsize: bs as u8,
+        skip,
+        ..Default::default()
+    };
+    let one = [blk(BLOCK_128X128, 0, 0, 1)];
+    assert!(!run(&one, PF_BLK_INTER), "skipped inter 128x128");
+    assert!(run(&one, 0), "skipped intra 128x128");
+    assert!(run(&[blk(BLOCK_128X128, 0, 0, 0)], PF_BLK_INTER), "coded inter 128x128");
+    let halves = [blk(BLOCK_128X64, 0, 0, 1), blk(BLOCK_128X64, 16, 0, 1)];
+    assert!(run(&halves, PF_BLK_INTER), "two 128x64s: a block edge at y = 64");
+    let quads: Vec<Block> = [(0, 0), (0, 16), (16, 0), (16, 16)]
+        .iter()
+        .map(|&(r, c)| blk(BLOCK_64X64, r, c, 1))
+        .collect();
+    assert!(run(&quads, PF_BLK_INTER), "four 64x64s");
 }
 
 #[test]
@@ -229,10 +346,7 @@ fn filter_paths_covered() {
         let mut fp = c.fp;
         fp.enable_cdef = 1;
         let f = PfFrame::new(&fp);
-        let mut mb = PfMapsBuf::new(&f);
-        for b in &c.blocks {
-            mb.mark_block(&f, b);
-        }
+        let mb = c.maps(&f);
         let m = mb.maps();
         let mut a = c.planes.clone();
         deblock_frame_scalar(&f, &m, &mut split(&mut a), &c.stride);
@@ -426,11 +540,31 @@ mod oracle {
         c
     }
 
+    unsafe extern "C" {
+        // oracle/postfilter.cpp: the per-block flags its maps mark with (av1g_pf_mark_block_flags;
+        // null: none), this thread's
+        fn oracle_pf_set_flags(flags: *const u8);
+    }
+
+    /// The flags the C maps of `c` mark with, from now on in this thread.
+    fn set_flags(c: &Case) {
+        // SAFETY: the flags (one per block) outlive the C calls on this case.
+        unsafe {
+            oracle_pf_set_flags(if c.flags.is_empty() {
+                core::ptr::null()
+            } else {
+                c.flags.as_ptr()
+            })
+        };
+    }
+
     fn cases(r: &mut Rng) -> Vec<Case> {
         let mut v: Vec<Case> = (0..40).map(|_| random_case(r, 220)).collect();
         for seed in 1..40 {
             v.push(fuzz_case(r, seed));
         }
+        // 128x128 superblocks, inter blocks (also at loop filter level 0)
+        v.extend((0..30).map(|_| random_case_ex(r, 300, true)));
         v
     }
 
@@ -453,10 +587,8 @@ mod oracle {
                 mine.extend(a);
             }
             assert_eq!(mine, o);
-            let mut mb = PfMapsBuf::new(&f);
-            for b in &c.blocks {
-                mb.mark_block(&f, b);
-            }
+            let mb = c.maps(&f);
+            set_flags(&c);
             let mut cm = PfMapsBuf::new(&f);
             // SAFETY: the buffers have PfMapsBuf::new's sizes, as the shim's maps.
             unsafe {
@@ -542,12 +674,10 @@ mod oracle {
         let mut r = Rng(43);
         for mut c in cases(&mut r) {
             let f = PfFrame::new(&c.fp);
-            let mut mb = PfMapsBuf::new(&f);
-            for b in &c.blocks {
-                mb.mark_block(&f, b);
-            }
+            let mb = c.maps(&f);
             let mut mine = c.planes.clone();
             deblock_frame(&f, &mb.maps(), &mut split(&mut mine), &c.stride);
+            set_flags(&c);
             let st = c.stride.map(|s| s as c_int);
             // SAFETY: the planes cover the coded area at these strides.
             unsafe {
@@ -570,10 +700,8 @@ mod oracle {
             let mut fp = c.fp;
             fp.enable_cdef = 1;
             let f = PfFrame::new(&fp);
-            let mut mb = PfMapsBuf::new(&f);
-            for b in &c.blocks {
-                mb.mark_block(&f, b);
-            }
+            let mb = c.maps(&f);
+            set_flags(&c);
             let src: [&[u8]; 3] = [&c.planes[0], &c.planes[1], &c.planes[2]];
             let mut mine = c.planes.clone();
             cdef_frame(&f, &mb.maps(), &src, &c.stride, &mut split(&mut mine), &c.stride);
@@ -598,7 +726,8 @@ mod oracle {
     #[test]
     fn postfilter_matches() {
         let mut r = Rng(45);
-        for mut c in cases(&mut r) {
+        // (the C++ av1g_postfilter has no inter blocks)
+        for mut c in cases(&mut r).into_iter().filter(|c| c.flags.is_empty()) {
             let mut mine = c.planes.clone();
             postfilter(&c.fp, &c.blocks, &mut split(&mut mine), &c.stride);
             let rec = DecisionRecord {

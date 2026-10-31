@@ -5,6 +5,8 @@
 #include "av1g/postfilter.h"
 
 namespace {
+// the per-block flags setup marks with (av1g_pf_mark_block_flags), or null: none
+thread_local const uint8_t *g_flags = nullptr;
 struct Maps {
     std::vector<uint8_t> skip, txY, txU, txV;
     std::vector<int8_t> cdef;
@@ -24,11 +26,14 @@ void setup(const av1g_frame_params *fp, const av1g_block *blocks, uint32_t n, av
     f.lfTx[1] = m.txU.data();
     f.lfTx[2] = m.txV.data();
     f.cdefIdx = m.cdef.data();
-    for (uint32_t b = 0; b < n; b++) av1g_pf_mark_block(&f, &blocks[b]);
+    for (uint32_t b = 0; b < n; b++) av1g_pf_mark_block_flags(&f, &blocks[b], g_flags ? g_flags[b] : 0);
 }
 }  // namespace
 
 extern "C" {
+
+// the flags (one per block) the maps of this thread's next calls mark with; null: none
+void oracle_pf_set_flags(const uint8_t *flags) { g_flags = flags; }
 
 // the frame parameters as ints: W H MiRows MiCols mono sbCols sbRows lfLevel[4] sharpness enableCdef damping
 // cdefYPri[8] cdefYSec[8] cdefUVPri[8] cdefUVSec[8] (46 ints)

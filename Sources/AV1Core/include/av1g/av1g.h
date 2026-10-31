@@ -33,6 +33,11 @@ extern "C" {
                                          MiCols*4 x MiRows*4 (>> 1 for chroma) because the filters
                                          read the decoded area beyond the picture.  Strength
                                          searches start here; av1g_postfilter finishes it. */
+#define AV1G_ENC_NO_SEQ_HEADER 0x40u /* video mode: no OBU_SEQUENCE_HEADER ([TD] + OBU_FRAME): a later
+                                         frame of a stream, which the stream's earlier sequence
+                                         header describes.  It must be the one this frame's would
+                                         be (the sequence header fields of decisions.h "Video
+                                         mode", fp.sb128, the seq_level_idx): not checked. */
 #define AV1G_ENC_BITSTREAM_ONLY 0x10000u /* no reconstruction and no range check: symbol coding only
                                             (~2x faster; for engines that reconstruct themselves and
                                             guarantee conformant coefficients) */
@@ -68,9 +73,12 @@ typedef struct av1g_tiles {
     uint32_t mi_row_starts[65];
 } av1g_tiles;
 
-/* Tile layout for a picture.  cols_log2/rows_log2 = -1 -> minimum legal tiling.
- * Returns AV1G_OK or AV1G_ERR_INVALID (out of range request). */
+/* Tile layout for a picture with 64x64 superblocks.  cols_log2/rows_log2 = -1 -> minimum legal
+ * tiling.  Returns AV1G_OK or AV1G_ERR_INVALID (out of range request). */
 int av1g_tile_layout(uint32_t width, uint32_t height, int cols_log2, int rows_log2, av1g_tiles *out);
+/* av1g_tile_layout for the superblock size of fp.sb128 (sb128 = 1: tiles in 128x128 units, so
+ * every tile boundary is a multiple of 32 in mi units). */
+int av1g_tile_layout_ex(uint32_t width, uint32_t height, int cols_log2, int rows_log2, int sb128, av1g_tiles *out);
 
 /* Compute the tx-block layout of rec->blocks (positions, sizes, coefficient
  * offsets) into rec->block_txb / rec->txb and set rec->n_txb / rec->n_coeffs.
@@ -84,14 +92,15 @@ int av1g_layout(av1g_decision_record *rec, uint32_t txb_cap, uint64_t coeff_cap)
  *   1 <= v <= 255.  Every legal value is reachable from every other one in one SB step
  *   (|reduced delta| <= 254 <= 512, no Clip3 effect), independent of decode order, tiles and
  *   skipped SBs - so engines can quantize with the returned values directly.
- * av1g_apply_sb_qindex: copy a per-SB map (raster over the 64x64 SB grid, sbCols =
- *   (MiCols + 15) >> 4) into blocks[].sb_qindex. */
+ * av1g_apply_sb_qindex: copy a per-SB map (raster over the frame's SB grid: sbCols =
+ *   (MiCols + 15) >> 4 for 64x64 SBs, (MiCols + 31) >> 5 with fp.sb128) into blocks[].sb_qindex. */
 void av1g_legalize_sb_qindex(int base_q_idx, int delta_q_res, const uint8_t *target, size_t n, uint8_t *legal);
 int av1g_apply_sb_qindex(av1g_decision_record *rec, const uint8_t *sb_map);
 
 /* Post-filters (deblocking, then CDEF) exactly as the decoder applies them, in place on a
  * pre-filter reconstruction (av1g_encode with AV1G_ENC_PREFILTER_RECON).  Uses fp's
- * loop_filter_* / cdef_* fields and the blocks' skip / tx_depth / cdef_idx.  planes: Y, U, V
+ * loop_filter_* / cdef_* fields (and lf_inter_off), the blocks' skip / tx_depth / cdef_idx and
+ * (inter frames, version 2) rec->inter.  planes: Y, U, V
  * (U/V ignored for monochrome), each at least MiCols*4 x MiRows*4 (>> 1 for chroma) with the
  * given strides.  Building blocks for GPU kernels are in av1g/postfilter.h (host + device). */
 int av1g_postfilter(const av1g_decision_record *rec, uint8_t *const planes[3], const int stride[3]);
@@ -125,7 +134,7 @@ int av1g_encode_ex(av1g_decision_record *rec, const av1g_encode_opts *opts, cons
                    av1g_output *out);
 
 /* Parse an AV1 OBU stream (sequence header + one OBU_FRAME of the toolset av1g_encode
- * writes: a still picture, or a key or inter frame of a video stream; 64x64
+ * writes: a still picture, or a key or inter frame of a video stream; 64x64 or 128x128
  * superblocks, uniform tiles) back into a DecisionRecord with all decisions and
  * quantized coefficients (rec.inter is set for inter frames).  Parsing needs no
  * reference pictures.  Used for libaom decision replay and round trips.  Free with

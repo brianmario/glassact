@@ -132,12 +132,21 @@ pub fn legalize_sb_qindex(base_q_idx: i32, delta_q_res: i32, target: &[u8], lega
     }
 }
 
-/// av1g_apply_sb_qindex: copies a per-SB map (raster over the 64x64 SB grid, sbCols = (MiCols +
-/// 15) >> 4) into the blocks' sb_qindex. Errors: [`ERR_INVALID`] when a block's SB is outside the
-/// map (nothing written).
+/// The superblock grid of a frame: (sbCols, sbRows, log2 of the SB size in 4x4 units), 64x64 or
+/// (fp.sb128) 128x128 superblocks.
+pub fn sb_grid(fp: &FrameParams) -> (usize, usize, u32) {
+    let sh = if fp.sb128 != 0 { 5 } else { 4 };
+    let n = |mi: i32| ((mi + (1 << sh) - 1) >> sh) as usize;
+    (n(mi_cols(fp.width as i32)), n(mi_rows(fp.height as i32)), sh as u32)
+}
+
+/// av1g_apply_sb_qindex: copies a per-SB map (raster over the frame's SB grid, [`sb_grid`]: sbCols
+/// = (MiCols + 15) >> 4 with 64x64 superblocks, (MiCols + 31) >> 5 with 128x128 ones) into the
+/// blocks' sb_qindex. Errors: [`ERR_INVALID`] when a block's SB is outside the map (nothing
+/// written).
 pub fn apply_sb_qindex(fp: &FrameParams, blocks: &mut [Block], sb_map: &[u8]) -> Result<(), i32> {
-    let sb_cols = ((mi_cols(fp.width as i32) + 15) >> 4) as usize;
-    let at = |k: &Block| (k.mi_row as usize >> 4) * sb_cols + (k.mi_col as usize >> 4);
+    let (sb_cols, _, sh) = sb_grid(fp);
+    let at = |k: &Block| (k.mi_row as usize >> sh) * sb_cols + (k.mi_col as usize >> sh);
     if blocks.iter().any(|k| at(k) >= sb_map.len()) {
         return Err(ERR_INVALID);
     }

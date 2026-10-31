@@ -9,8 +9,10 @@
 //!
 //! - [`ShiftFinder`] proposes candidate offsets from per-band row and column hashes.
 //! - [`sb_matches`] checks that a superblock is an exact copy at an offset.
-//! - [`inter_sb_cover`] covers a superblock with the largest legal blocks.
-use crate::types::{Block, BlockInter};
+//! - [`inter_sb_cover`] covers a superblock with the largest legal blocks ([`inter_sb_cover128`] a
+//!   128x128 one).
+//! - [`Motion::apply`] / [`Motion::apply_ex`] make a picture's partition with its copies covered.
+use crate::types::{Block, BlockInter, ERR_INVALID, Tiles};
 
 /// A whole-pixel offset into the previous picture: the superblock at (x, y) copies (x + dx, y + dy).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -68,9 +70,23 @@ pub fn sb_matches(cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, sb_x: usiz
 /// SPLIT where neither is. Every block is 8x8 or larger (MiCols and MiRows are even). Fields other
 /// than the position and size are left at `template`'s values.
 pub fn inter_sb_cover(mi_rows: i32, mi_cols: i32, sb_row: i32, sb_col: i32, template: &Block, out: &mut Vec<Block>) {
+    cover_node(mi_rows, mi_cols, sb_row * 16, sb_col * 16, 16, template, out);
+}
+
+/// [`inter_sb_cover`] of the 128x128 superblock (sb_row, sb_col) (128x128 units, fp.sb128): one
+/// 128x128 block where it fits, a 128x64 / 64x128 one where only the top / left half is inside the
+/// coded area, else its quadrants' covers.
+pub fn inter_sb_cover128(mi_rows: i32, mi_cols: i32, sb_row: i32, sb_col: i32, template: &Block, out: &mut Vec<Block>) {
+    cover_node(mi_rows, mi_cols, sb_row * 32, sb_col * 32, 32, template, out);
+}
+
+fn cover_node(mi_rows: i32, mi_cols: i32, r: i32, c: i32, n: i32, t: &Block, out: &mut Vec<Block>) {
     fn bsize(w4: i32, h4: i32) -> u8 {
         use crate::tables::*;
         (match (w4, h4) {
+            (32, 32) => BLOCK_128X128,
+            (32, 16) => BLOCK_128X64,
+            (16, 32) => BLOCK_64X128,
             (16, 16) => BLOCK_64X64,
             (16, 8) => BLOCK_64X32,
             (8, 16) => BLOCK_32X64,
@@ -84,33 +100,30 @@ pub fn inter_sb_cover(mi_rows: i32, mi_cols: i32, sb_row: i32, sb_col: i32, temp
             _ => unreachable!("no {w4}x{h4} (4x4 units) block in the cover"),
         }) as u8
     }
-    fn node(mi_rows: i32, mi_cols: i32, r: i32, c: i32, n: i32, t: &Block, out: &mut Vec<Block>) {
-        if r >= mi_rows || c >= mi_cols {
-            return;
-        }
-        let half = n / 2;
-        let below = r + half >= mi_rows;
-        let right = c + half >= mi_cols;
-        let mut emit = |w4: i32, h4: i32| {
-            out.push(Block {
-                mi_row: r as u16,
-                mi_col: c as u16,
-                bsize: bsize(w4, h4),
-                ..*t
-            });
-        };
-        match (below, right) {
-            (false, false) => emit(n, n),
-            (true, false) => emit(n, half),
-            (false, true) => emit(half, n),
-            (true, true) => {
-                for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
-                    node(mi_rows, mi_cols, r + dr, c + dc, half, t, out);
-                }
+    if r >= mi_rows || c >= mi_cols {
+        return;
+    }
+    let half = n / 2;
+    let below = r + half >= mi_rows;
+    let right = c + half >= mi_cols;
+    let mut emit = |w4: i32, h4: i32| {
+        out.push(Block {
+            mi_row: r as u16,
+            mi_col: c as u16,
+            bsize: bsize(w4, h4),
+            ..*t
+        });
+    };
+    match (below, right) {
+        (false, false) => emit(n, n),
+        (true, false) => emit(n, half),
+        (false, true) => emit(half, n),
+        (true, true) => {
+            for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+                cover_node(mi_rows, mi_cols, r + dr, c + dc, half, t, out);
             }
         }
     }
-    node(mi_rows, mi_cols, sb_row * 16, sb_col * 16, 16, template, out);
 }
 
 /// Candidate shifts from the previous picture to this one, from 64-sample bands: per band of
@@ -282,6 +295,8 @@ pub struct Motion {
     /// the last [`Motion::classify`]'s shift candidates (usable ones, best first)
     pub candidates: Vec<Shift>,
     threads: usize,
+    /// [`Motion::apply_ex`]'s per-64x64 runs of input blocks
+    runs: Vec<(u32, u32)>,
 }
 
 impl Default for Motion {
@@ -302,6 +317,7 @@ impl Motion {
             luma_tx: Vec::new(),
             candidates: Vec::new(),
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+            runs: Vec::new(),
         }
     }
 
@@ -364,11 +380,11 @@ impl Motion {
         self.sbs.iter().filter(|m| m.copy).count()
     }
 
-    /// `blocks` (a partition in coding order; with `luma_tx`, their luma tx types, and with
-    /// `inter`, their motion) with every superblock `sbs` copies (per 64x64, raster, `sb_cols`
-    /// wide) replaced by its [`inter_sb_cover`]: skip inter blocks at its shift, intra fields 0,
-    /// luma tx type 0. Into [`Motion::blocks`], [`Motion::inter`] (one per block) and
-    /// [`Motion::luma_tx`].
+    /// `blocks` (a partition in coding order, 64x64 superblocks; with `luma_tx`, their luma tx
+    /// types, and with `inter`, their motion) with every superblock `sbs` copies (per 64x64,
+    /// raster, `sb_cols` wide) replaced by its [`inter_sb_cover`]: skip inter blocks at its shift,
+    /// intra fields 0, luma tx type 0. Into [`Motion::blocks`], [`Motion::inter`] (one per block)
+    /// and [`Motion::luma_tx`].
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
@@ -415,6 +431,169 @@ impl Motion {
             }
             last = s;
         }
+    }
+
+    /// [`Motion::apply`] for 64x64 (`tiles` None: exactly it) or 128x128 superblocks (`tiles`: the
+    /// frame's tiling, [`crate::writer::tile_layout_ex`] with sb128), av1enc_motion_apply_ex.
+    ///
+    /// With 128x128 superblocks, `blocks` is a partition into 64x64s, each 64x64's blocks
+    /// contiguous and in its own coding order (a 64x64 superblock's partition subtree, as
+    /// [`Motion::apply`] takes it), the 64x64s in any order (the GPU's: tiles of 64x64s in raster
+    /// order); no block crosses a 64x64. Every 64x64 that starts inside the coded area has its
+    /// blocks there unless `sbs` copies it. The output is in the 128x128 superblocks' decode order:
+    /// tiles, the 128x128s of a tile in raster order, the four 64x64 quadrants of a 128x128 in
+    /// raster (Z) order (its partition SPLIT), each quadrant its blocks or, copied, its
+    /// [`inter_sb_cover`]. A 128x128 whose quadrants inside the coded area are all copies at one
+    /// shift becomes its [`inter_sb_cover128`] (one 128x128 skip inter block where it fits).
+    /// Errors: [`ERR_INVALID`] (`blocks` not of that form, or a 64x64 without blocks); the outputs
+    /// are then empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_ex(
+        &mut self,
+        sbs: &[SbMotion],
+        sb_cols: usize,
+        blocks: &[Block],
+        luma_tx: Option<&[u8]>,
+        inter: Option<&[BlockInter]>,
+        mi_rows: i32,
+        mi_cols: i32,
+        tiles: Option<&Tiles>,
+    ) -> Result<(), i32> {
+        let Some(tiles) = tiles else {
+            self.apply(sbs, sb_cols, blocks, luma_tx, inter, mi_rows, mi_cols);
+            return Ok(());
+        };
+        self.blocks.clear();
+        self.inter.clear();
+        self.luma_tx.clear();
+        let r = self.apply128(sbs, sb_cols, blocks, luma_tx, inter, mi_rows, mi_cols, tiles);
+        if r.is_err() {
+            self.blocks.clear();
+            self.inter.clear();
+            self.luma_tx.clear();
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply128(
+        &mut self,
+        sbs: &[SbMotion],
+        sb_cols: usize,
+        blocks: &[Block],
+        luma_tx: Option<&[u8]>,
+        inter: Option<&[BlockInter]>,
+        mi_rows: i32,
+        mi_cols: i32,
+        tiles: &Tiles,
+    ) -> Result<(), i32> {
+        let (c64, r64) = (((mi_cols + 15) >> 4) as usize, ((mi_rows + 15) >> 4) as usize);
+        if sb_cols != c64 && !sbs.is_empty() {
+            return Err(ERR_INVALID);
+        }
+        // each 64x64's run of blocks
+        let mut runs = core::mem::take(&mut self.runs);
+        runs.clear();
+        runs.resize(c64 * r64, (u32::MAX, 0));
+        let r = self.emit128(sbs, blocks, luma_tx, inter, mi_rows, mi_cols, tiles, &mut runs);
+        self.runs = runs;
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit128(
+        &mut self,
+        sbs: &[SbMotion],
+        blocks: &[Block],
+        luma_tx: Option<&[u8]>,
+        inter: Option<&[BlockInter]>,
+        mi_rows: i32,
+        mi_cols: i32,
+        tiles: &Tiles,
+        runs: &mut [(u32, u32)],
+    ) -> Result<(), i32> {
+        use crate::blockinfo::{bh4, bw4};
+        let c64 = ((mi_cols + 15) >> 4) as usize;
+        let mut last = usize::MAX;
+        for (i, b) in blocks.iter().enumerate() {
+            let (r, c, bs) = (b.mi_row as i32, b.mi_col as i32, b.bsize as i32);
+            if bs >= crate::tables::BLOCK_SIZES || r >= mi_rows || c >= mi_cols {
+                return Err(ERR_INVALID);
+            }
+            if (r & 15) + bh4(bs) > 16 || (c & 15) + bw4(bs) > 16 {
+                return Err(ERR_INVALID); // crosses a 64x64
+            }
+            let s = (r as usize >> 4) * c64 + (c as usize >> 4);
+            if s != last {
+                if runs[s].0 != u32::MAX {
+                    return Err(ERR_INVALID); // the 64x64's blocks aren't contiguous
+                }
+                runs[s].0 = i as u32;
+            }
+            runs[s].1 = i as u32 + 1;
+            last = s;
+        }
+        let template = Block {
+            skip: 1,
+            ..Default::default()
+        };
+        let copy_of = |s: usize| sbs.get(s).copied().filter(|m| m.copy);
+        let mv_of = |m: SbMotion| BlockInter {
+            mv_row: (m.shift.dy * 8) as i16,
+            mv_col: (m.shift.dx * 8) as i16,
+            is_inter: 1,
+            ..Default::default()
+        };
+        for tr in 0..tiles.rows as usize {
+            for tc in 0..tiles.cols as usize {
+                let (rs, re) = (tiles.mi_row_starts[tr] as i32, tiles.mi_row_starts[tr + 1] as i32);
+                let (cs, ce) = (tiles.mi_col_starts[tc] as i32, tiles.mi_col_starts[tc + 1] as i32);
+                if rs & 31 != 0 || cs & 31 != 0 {
+                    return Err(ERR_INVALID); // not a 128x128 tiling
+                }
+                for r in (rs..re).step_by(32) {
+                    for c in (cs..ce).step_by(32) {
+                        // the quadrants inside the coded area, in raster order
+                        let mut qs = [(0i32, 0i32, 0usize); 4];
+                        let mut nq = 0;
+                        for (dr, dc) in [(0, 0), (0, 16), (16, 0), (16, 16)] {
+                            let (qr, qc) = (r + dr, c + dc);
+                            if qr < mi_rows && qc < mi_cols {
+                                qs[nq] = (qr, qc, (qr as usize >> 4) * c64 + (qc as usize >> 4));
+                                nq += 1;
+                            }
+                        }
+                        let quads = &qs[..nq];
+                        let first = copy_of(quads[0].2);
+                        let one_copy = first.is_some_and(|m| quads.iter().all(|q| copy_of(q.2) == Some(m)));
+                        if let (true, Some(m)) = (one_copy, first) {
+                            inter_sb_cover128(mi_rows, mi_cols, r >> 5, c >> 5, &template, &mut self.blocks);
+                            self.inter.resize(self.blocks.len(), mv_of(m));
+                            self.luma_tx.resize(self.blocks.len(), 0);
+                            continue;
+                        }
+                        for &(qr, qc, s) in quads {
+                            if let Some(m) = copy_of(s) {
+                                inter_sb_cover(mi_rows, mi_cols, qr >> 4, qc >> 4, &template, &mut self.blocks);
+                                self.inter.resize(self.blocks.len(), mv_of(m));
+                                self.luma_tx.resize(self.blocks.len(), 0);
+                            } else {
+                                let (b0, b1) = runs[s];
+                                if b0 == u32::MAX {
+                                    return Err(ERR_INVALID); // a 64x64 without blocks
+                                }
+                                for i in b0 as usize..b1 as usize {
+                                    self.blocks.push(blocks[i]);
+                                    self.inter.push(inter.map_or(BlockInter::default(), |v| v[i]));
+                                    self.luma_tx.push(luma_tx.map_or(0, |l| l[i]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -484,6 +663,139 @@ mod tests {
             let mut rec = crate::writer::Record::new(fp, blocks);
             rec.layout().unwrap();
             crate::writer::validate(rec.as_mut()).unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+        }
+    }
+
+    #[test]
+    fn cover128_is_a_legal_partition() {
+        // the writer's validation of an sb128 record made of the 128x128 covers (as intra blocks),
+        // and of apply_ex's output for every copy pattern of a 2x2 grid of 128x128s' quadrants
+        for (w, h) in [
+            (128, 128),
+            (100, 70),
+            (333, 201),
+            (1280, 720),
+            (8, 8),
+            (72, 136),
+            (200, 130),
+            (1920, 1080),
+        ] {
+            let mut fp = crate::types::FrameParams {
+                version: 2,
+                width: w,
+                height: h,
+                base_q_idx: 100,
+                sb128: 1,
+                ..Default::default()
+            };
+            fp.tile_cols_log2 = -1;
+            fp.tile_rows_log2 = -1;
+            let (mi_cols, mi_rows) = (crate::blockinfo::mi_cols(w as i32), crate::blockinfo::mi_rows(h as i32));
+            let mut blocks = Vec::new();
+            let t = Block {
+                skip: 1,
+                ..Default::default()
+            };
+            for sr in 0..(mi_rows + 31) / 32 {
+                for sc in 0..(mi_cols + 31) / 32 {
+                    inter_sb_cover128(mi_rows, mi_cols, sr, sc, &t, &mut blocks);
+                }
+            }
+            if w >= 128 && h >= 128 {
+                assert!(blocks.iter().any(|b| b.bsize as i32 == BLOCK_128X128));
+            }
+            let mut rec = crate::writer::Record::new(fp, blocks);
+            rec.layout().unwrap();
+            crate::writer::validate(rec.as_mut()).unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+
+            // apply_ex: a 64x64 partition (each 64x64 one block, or its quadrants) with random copies
+            let tiles = crate::writer::tile_layout_ex(w, h, -1, -1, true).unwrap();
+            let (c64, r64) = (((mi_cols + 15) >> 4) as usize, ((mi_rows + 15) >> 4) as usize);
+            let mut s = 1u64 + w as u64 * 7 + h as u64;
+            for _ in 0..8 {
+                let mut part = Vec::new();
+                for sr in 0..r64 as i32 {
+                    for sc in 0..c64 as i32 {
+                        if rng(&mut s).is_multiple_of(2) {
+                            inter_sb_cover(mi_rows, mi_cols, sr, sc, &t, &mut part);
+                        } else {
+                            // its 32x32 quadrants' covers
+                            for (dr, dc) in [(0, 0), (0, 8), (8, 0), (8, 8)] {
+                                cover_node(mi_rows, mi_cols, sr * 16 + dr, sc * 16 + dc, 8, &t, &mut part);
+                            }
+                        }
+                    }
+                }
+                let sbs: Vec<SbMotion> = (0..c64 * r64)
+                    .map(|_| SbMotion {
+                        copy: !rng(&mut s).is_multiple_of(3),
+                        shift: Shift {
+                            dx: 0,
+                            dy: [0, 2][rng(&mut s).is_multiple_of(4) as usize],
+                        },
+                    })
+                    .collect();
+                let mut m = Motion::new();
+                m.apply_ex(&sbs, c64, &part, None, None, mi_rows, mi_cols, Some(&tiles))
+                    .unwrap();
+                let mut rec = crate::writer::Record::new(fp, m.blocks.clone());
+                rec.fp.video = 1;
+                rec.fp.frame_type = crate::types::FRAME_INTER;
+                rec.fp.allow_screen_content_tools = 1;
+                rec.inter = m.inter.clone();
+                rec.layout().unwrap();
+                crate::writer::validate(rec.as_mut()).unwrap_or_else(|e| panic!("{w}x{h} apply_ex: {e}"));
+                // every 64x64 is covered exactly once
+                let mut seen = vec![0u32; (mi_rows * mi_cols) as usize];
+                for b in &m.blocks {
+                    let bs = b.bsize as i32;
+                    for y in b.mi_row as i32..(b.mi_row as i32 + crate::blockinfo::bh4(bs)).min(mi_rows) {
+                        for x in b.mi_col as i32..(b.mi_col as i32 + crate::blockinfo::bw4(bs)).min(mi_cols) {
+                            seen[(y * mi_cols + x) as usize] += 1;
+                        }
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&k| k == 1),
+                    "{w}x{h}: apply_ex's blocks don't tile the picture"
+                );
+            }
+            // a 64x64 whose blocks aren't contiguous, or missing: refused
+            let mut part = Vec::new();
+            for sr in 0..r64 as i32 {
+                for sc in 0..c64 as i32 {
+                    inter_sb_cover(mi_rows, mi_cols, sr, sc, &t, &mut part);
+                }
+            }
+            let mut m = Motion::new();
+            let sb_of = |b: &Block| (b.mi_row >> 4, b.mi_col >> 4);
+            let last = sb_of(part.last().unwrap());
+            let rest: Vec<Block> = part.iter().copied().filter(|b| sb_of(b) != last).collect();
+            assert_eq!(
+                m.apply_ex(&[], 0, &rest, None, None, mi_rows, mi_cols, Some(&tiles)),
+                Err(ERR_INVALID)
+            );
+            if !rest.is_empty() {
+                // the last 64x64's blocks split around another's
+                let mut mixed = rest.clone();
+                let tail: Vec<Block> = part.iter().copied().filter(|b| sb_of(b) == last).collect();
+                mixed.insert(0, tail[0]);
+                mixed.extend(&tail[1..]);
+                let mut again = vec![tail[0]];
+                again.extend(&rest);
+                again.push(tail[0]);
+                assert_eq!(
+                    m.apply_ex(&[], 0, &again, None, None, mi_rows, mi_cols, Some(&tiles)),
+                    Err(ERR_INVALID)
+                );
+                if tail.len() > 1 {
+                    assert_eq!(
+                        m.apply_ex(&[], 0, &mixed, None, None, mi_rows, mi_cols, Some(&tiles)),
+                        Err(ERR_INVALID)
+                    );
+                }
+            }
+            assert!(m.blocks.is_empty());
         }
     }
 

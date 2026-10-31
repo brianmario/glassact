@@ -7,14 +7,15 @@ use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::{RefPlane, tx_coeffs, tx_h, tx_w};
 use crate::entropy::{Ec, FrameCdfs};
-use crate::postfilter::{LF_ZERO, PfFrame, PfMaps, cdef_frame, deblock_frame};
+use crate::postfilter::{PF_BLK_INTER, PF_BLK_LF_ZERO, PfFrame, PfMaps, cdef_frame, deblock_frame, pf_skip_value};
 use crate::tables::{LAST_FRAME, TX_SIZES_ALL};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Symbol coding only (validation): AV1G_ENC_SKIP_RECON.
 pub const ENC_SKIP_RECON: u32 = ENC_BITSTREAM_ONLY;
-/// Internal: cross-check [`crate::blockinfo::txb_edges`] against BlockDecoded (AV1G_ENC_CHECK_EDGES).
+/// Internal: cross-check [`crate::blockinfo::txb_edges`] against BlockDecoded (AV1G_ENC_CHECK_EDGES; 64x64
+/// superblocks only, as txb_edges: ignored with fp.sb128).
 pub const ENC_CHECK_EDGES: u32 = 0x20000;
 
 /// One tile thread's state. Reused.
@@ -232,12 +233,16 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.lf_inter_off,
         fp.cdf_from_ref,
         fp.mv_precision,
+        fp.sb128,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
     }
     if fp.video > 1 || fp.frame_type > FRAME_INTER {
         fail!(ERR_INVALID, "video must be 0/1, frame_type key or inter");
+    }
+    if fp.sb128 > 1 {
+        fail!(ERR_INVALID, "sb128 must be 0/1");
     }
     if fp.video == 0 && fp.frame_type != FRAME_KEY {
         fail!(ERR_INVALID, "inter frames need video mode");
@@ -469,6 +474,20 @@ impl Writer {
         if inter && extras.record_syms {
             fail!(ERR_INVALID, "symbol streams are for intra frames only");
         }
+        let sb128 = fp.sb128 != 0;
+        if sb128 && extras.record_syms {
+            fail!(
+                ERR_INVALID,
+                "symbol streams are for 64x64 superblocks only (the GPU entropy coder's)"
+            );
+        }
+        let seq_header = opts.flags & ENC_NO_SEQ_HEADER == 0;
+        if !seq_header && (fp.video == 0 || opts.flags & ENC_AVIF != 0) {
+            fail!(
+                ERR_INVALID,
+                "ENC_NO_SEQ_HEADER is for frames of a video stream (not still pictures or AVIF)"
+            );
+        }
         let refs = if inter && do_recon {
             Some(ref_planes(&fp, extras.refs)?)
         } else {
@@ -479,7 +498,14 @@ impl Writer {
         let (mi_cols, mi_rows) = (mi_cols(w as i32), mi_rows(h as i32));
         let (sb_cols, sb_rows) = ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4);
         let mut tiles = TileInfo::default();
-        if !compute_tiles(w, h, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32, &mut tiles) {
+        if !compute_tiles(
+            w,
+            h,
+            fp.tile_cols_log2 as i32,
+            fp.tile_rows_log2 as i32,
+            sb128,
+            &mut tiles,
+        ) {
             fail!(
                 ERR_INVALID,
                 "illegal tiling {}/{} for {w}x{h}",
@@ -488,7 +514,8 @@ impl Writer {
             );
         }
         let nplanes = if mono { 1 } else { 3 };
-        let check_edges = opts.flags & ENC_CHECK_EDGES != 0;
+        // (txb_edges models 64x64 superblocks: the GPU's)
+        let check_edges = opts.flags & ENC_CHECK_EDGES != 0 && !sb128;
         if check_edges {
             for p in 0..nplanes {
                 let sub = (p != 0) as i32;
@@ -609,6 +636,7 @@ impl Writer {
             cdfs_in,
             cdfs_out: (fp.video != 0).then_some(&self.saved),
             context_tile,
+            sb128,
         };
 
         if self.tiles.len() < ntiles {
@@ -806,6 +834,7 @@ impl Writer {
             level,
             &self.payloads,
             opts.flags & ENC_TD != 0,
+            seq_header,
             &mut self.seq,
             &mut self.fh,
             &mut out.obu,
@@ -890,18 +919,29 @@ fn recon(
     let pstride: [usize; 3] = core::array::from_fn(|p| ((f.sb_cols as usize) * 64) >> (p != 0) as usize);
     let pheight: [usize; 3] = core::array::from_fn(|p| ((f.sb_rows as usize) * 64) >> (p != 0) as usize);
     let (mc, mr) = (f.mi_cols as usize, f.mi_rows as usize);
-    // with lf_inter_off, inter blocks' level is 0
+    // the post-filters' skip map: with lf_inter_off, inter blocks' level is 0; with 128x128
+    // superblocks, skipped inter blocks larger than 64x64 have unfiltered tx edges inside
     let lf_off = f.inter && fp.lf_inter_off != 0;
+    let inner = f.inter && f.sb128;
     let mut pf_skip = core::mem::take(&mut frame.pf_skip);
-    if lf_off {
+    if lf_off || inner {
         pf_skip.clear();
         pf_skip.resize(mr * mc, 0);
+        let flags = if lf_off {
+            PF_BLK_LF_ZERO | PF_BLK_INTER
+        } else {
+            PF_BLK_INTER
+        };
         for t in &tiles[..ntiles] {
             let (c0, r0, mw, mh) = (t.c0 as usize, t.r0 as usize, t.mw as usize, t.mh as usize);
             for y in 0..mh {
                 for (x, d) in pf_skip[(r0 + y) * mc + c0..][..mw].iter_mut().enumerate() {
                     let k = y * mw + x;
-                    *d = t.skip[k] | if t.ref0[k] as i32 == LAST_FRAME { LF_ZERO } else { 0 };
+                    *d = if t.ref0[k] as i32 == LAST_FRAME {
+                        pf_skip_value(t.skip[k] != 0, flags, t.mi_size[k] as i32)
+                    } else {
+                        t.skip[k]
+                    };
                 }
             }
         }
@@ -949,7 +989,7 @@ fn recon(
         }
         (&mut fb.plane, &fb.skip, &fb.tx, &fb.lf_uv, &fb.sb_cdef)
     };
-    let skip: &[u8] = if lf_off { &pf_skip } else { skip };
+    let skip: &[u8] = if lf_off || inner { &pf_skip } else { skip };
     // Deblocking (spec 7.14) then CDEF (7.15): the decoder's output frame. The maps come from
     // the walk.
     let pf = PfFrame::new(fp);

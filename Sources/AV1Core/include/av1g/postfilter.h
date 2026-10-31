@@ -38,7 +38,8 @@ typedef struct av1g_pf_frame {
     int W, H, MiRows, MiCols, mono;
     AV1G_DEV uint8_t *plane[3];          /* frame being deblocked in place / CDEF source */
     int stride[3];
-    AV1G_DEV uint8_t *skip;              /* Skips (bit 0), MiRows x MiCols, stride MiCols; bit 1 (AV1G_PF_LF_ZERO): the block's loop filter level is 0 */
+    AV1G_DEV uint8_t *skip;              /* Skips (bit 0), MiRows x MiCols, stride MiCols; bit 1 (AV1G_PF_LF_ZERO): the block's loop filter level is 0;
+                                            AV1G_PF_SKIP_W128 / H128: a skipped inter block 128 wide / high */
     AV1G_DEV uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows/2) x (MiCols/2), stride MiCols/2 */
     AV1G_DEV int8_t *cdefIdx;            /* per 64x64, raster, stride sbCols; -1 = no CDEF (no non-skip block in it) */
     AV1G_DEV int32_t *cdefDirVar;        /* optional (GPU path): per 8x8, (var << 3) | yDir, stride MiCols/2 */
@@ -75,17 +76,37 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
 /* The skip map's bit for a block whose loop filter level is 0: an inter block of an inter frame
  * with fp.lf_inter_off (Glass Act). */
 #define AV1G_PF_LF_ZERO 2
+/* The skip map's bits for a skipped inter block 128 wide (W128) or 128 high (H128), with 128x128
+ * superblocks: its tx edges inside it (its 64x64 tx blocks' at 64 samples) aren't block edges and
+ * aren't filtered.  Deblocking's applyFilter is isTxEdge && (isBlockEdge || !skip || isIntra) (spec
+ * 7.14.2): every tx edge of an intra block or a coded one is filtered, and a skipped inter block's
+ * tx edges are its block edges (its tx size is Max_Tx_Size_Rect, the block's size) except inside
+ * one larger than 64 that way. */
+#define AV1G_PF_SKIP_W128 4
+#define AV1G_PF_SKIP_H128 8
+/* av1g_pf_mark_block_flags' per-block flags (p_mark's lfZero bytes): the block's loop filter level
+ * is 0 (an inter block with fp.lf_inter_off; implies AV1G_PF_BLK_INTER), the block is inter. */
+#define AV1G_PF_BLK_LF_ZERO 1
+#define AV1G_PF_BLK_INTER 2
 
-/* Writes one block's entries into the maps (Skips / LoopfilterTxSizes / cdef_idx); lfZero: the
- * block's loop filter level is 0 (AV1G_PF_LF_ZERO). */
-AV1G_HD void av1g_pf_mark_block_ex(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b, int lfZero) {
+/* Writes one block's entries into the maps (Skips / LoopfilterTxSizes / cdef_idx); flags:
+ * AV1G_PF_BLK_LF_ZERO, AV1G_PF_BLK_INTER.  A non-skip block larger than 64x64 sets the cdef_idx of
+ * every 64x64 it covers (spec read_cdef). */
+AV1G_HD void av1g_pf_mark_block_flags(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b, int flags) {
     const int r0 = b->mi_row, c0 = b->mi_col, bs = b->bsize;
     const int bw4 = av1g_bw4(bs), bh4 = av1g_bh4(bs);
     const int txY = av1g_luma_tx_size(bs, b->tx_depth);
+    const int inter = (flags & (AV1G_PF_BLK_LF_ZERO | AV1G_PF_BLK_INTER)) != 0;
+    int sk = b->skip ? 1 : 0;
+    if (flags & AV1G_PF_BLK_LF_ZERO) sk |= AV1G_PF_LF_ZERO;
+    if (b->skip && inter) {
+        if (bw4 > 16) sk |= AV1G_PF_SKIP_W128;
+        if (bh4 > 16) sk |= AV1G_PF_SKIP_H128;
+    }
     for (int y = r0; y < r0 + bh4 && y < f->MiRows; y++)
         for (int x = c0; x < c0 + bw4 && x < f->MiCols; x++) {
             const size_t k = (size_t)y * f->MiCols + x;
-            f->skip[k] = (uint8_t)(b->skip | (lfZero ? AV1G_PF_LF_ZERO : 0));
+            f->skip[k] = (uint8_t)sk;
             f->lfTx[0][k] = (uint8_t)txY;
         }
     if (av1g_has_chroma(bs, r0, c0, f->mono)) {
@@ -98,7 +119,16 @@ AV1G_HD void av1g_pf_mark_block_ex(AV1G_CONST const av1g_pf_frame *f, const av1g
                 f->lfTx[2][(size_t)y * cc + x] = (uint8_t)txUV;
             }
     }
-    if (f->enableCdef && !b->skip) f->cdefIdx[(size_t)(r0 >> 4) * f->sbCols + (c0 >> 4)] = b->cdef_idx;
+    if (f->enableCdef && !b->skip)
+        for (int y = r0; y < r0 + bh4 && y < f->MiRows; y += 16)
+            for (int x = c0; x < c0 + bw4 && x < f->MiCols; x += 16)
+                f->cdefIdx[(size_t)(y >> 4) * f->sbCols + (x >> 4)] = b->cdef_idx;
+}
+
+/* av1g_pf_mark_block_flags; lfZero: the block's loop filter level is 0 (AV1G_PF_LF_ZERO: an inter
+ * block). */
+AV1G_HD void av1g_pf_mark_block_ex(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b, int lfZero) {
+    av1g_pf_mark_block_flags(f, b, lfZero ? AV1G_PF_BLK_LF_ZERO : 0);
 }
 
 AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b) { av1g_pf_mark_block_ex(f, b, 0); }
@@ -184,17 +214,20 @@ AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass
     /* level 0 on both sides (lf_inter_off's inter blocks): not filtered */
     if (f->skip[(size_t)row * f->MiCols + col] & f->skip[(size_t)prevRow * f->MiCols + prevCol] & AV1G_PF_LF_ZERO) return;
     /* applyFilter = isTxEdge && (isBlockEdge || !skip || isIntra): an intra block's edges are its
-     * tx edges, a skipped inter block's only tx edges are its block edges (tx_depth 0, at most
-     * 64x64) and a coded one's are filtered, so isTxEdge throughout */
+     * tx edges, and a coded one's; a skipped inter block's tx edges are its block edges but inside
+     * one 128 wide / high (AV1G_PF_SKIP_W128 / H128: at 64 samples, off the 128 grid) */
+    const int sk = f->skip[(size_t)row * f->MiCols + col];
     int cur, prev;
     if (pass == 0) {
         cur = AV1G_T(Tx_Width)[txSz];
         prev = AV1G_T(Tx_Width)[prevTxSz];
         if (xP & (cur - 1)) return;
+        if ((sk & AV1G_PF_SKIP_W128) && ((xP << sub) & 127)) return;
     } else {
         cur = AV1G_T(Tx_Height)[txSz];
         prev = AV1G_T(Tx_Height)[prevTxSz];
         if (yP & (cur - 1)) return;
+        if ((sk & AV1G_PF_SKIP_H128) && ((yP << sub) & 127)) return;
     }
     const int baseSize = prev < cur ? prev : cur;
     const int cap = plane ? 8 : 16;

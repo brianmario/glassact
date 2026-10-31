@@ -21,7 +21,7 @@ pub(super) fn encode_seq(w: &mut Writer, seq: &mut InterSeq, flags: u32) -> Resu
                 }
             }
             let opts = EncodeOpts {
-                flags,
+                flags: flags | seq.flags[k],
                 seq_level_idx: -1,
             };
             w.encode_ex(rec.as_mut(), &opts, &refs, &mut out).map_err(|e| (k, e))?;
@@ -42,17 +42,24 @@ pub(super) fn encode_seq(w: &mut Writer, seq: &mut InterSeq, flags: u32) -> Resu
 }
 
 /// What the parser gives back for a written record: the decisions the bitstream carries (a skip
-/// block's cdef_idx and a skipped 64x64's qindex are not coded) and the written-back tx blocks.
+/// block's cdef_idx and a skipped SB-sized block's qindex are not coded) and the written-back tx
+/// blocks.
 fn expect_parsed(want: &Record, got: &Record, what: &str) {
     let mut fp = want.fp;
     (fp.tile_cols_log2, fp.tile_rows_log2) = (got.fp.tile_cols_log2, got.fp.tile_rows_log2);
     assert_eq!(fp, got.fp, "{what}: frame params");
+    expect_parsed_blocks(want, got, what);
+}
+
+/// [`expect_parsed`] without the frame parameters.
+fn expect_parsed_blocks(want: &Record, got: &Record, what: &str) {
     assert_eq!(want.blocks.len(), got.blocks.len(), "{what}: blocks");
     for (i, (b, pb)) in want.blocks.iter().zip(&got.blocks).enumerate() {
         let mut b = *b;
         if b.skip != 0 {
             b.cdef_idx = pb.cdef_idx;
-            if b.bsize as i32 == BLOCK_64X64 {
+            let sb = if want.fp.sb128 != 0 { BLOCK_128X128 } else { BLOCK_64X64 };
+            if b.bsize as i32 == sb {
                 b.sb_qindex = pb.sb_qindex;
             }
         }
@@ -106,11 +113,32 @@ fn seeds(n: u64, f: impl Fn(&mut Writer, u64) + Sync) {
 /// several.
 #[test]
 fn inter_sequences_round_trip() {
+    let frames = round_trip_seqs(160, 200, |_| true);
+    eprintln!("{frames} frames; {}; {}", coverage(), sb128_coverage());
+    assert_phase_coverage(20);
+}
+
+/// [`inter_sequences_round_trip`] of larger sequences with 128x128 superblocks: every type of the
+/// 128x128 node, 128-sample intra and inter blocks, skip and coded.
+#[test]
+fn sb128_sequences_round_trip() {
+    let frames = round_trip_seqs(240, 420, |s| s.frames[0].fp.sb128 != 0);
+    eprintln!("{frames} frames; {}", sb128_coverage());
+    assert!(frames > 300);
+    assert_sb128_coverage(10);
+}
+
+/// The round trips of [`inter_sequences_round_trip`] for the sequences of `n` seeds that `pick`
+/// takes, sides up to `maxdim`. Returns the frame count.
+fn round_trip_seqs(n: u64, maxdim: i32, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
     let frames = std::sync::atomic::AtomicU64::new(0);
-    seeds(160, |w, seed| {
-        let Some(mut seq) = InterSeq::make(seed, 200, 6) else {
+    seeds(n, |w, seed| {
+        let Some(mut seq) = InterSeq::make(seed, maxdim, 6) else {
             return;
         };
+        if !pick(&seq) {
+            return;
+        }
         let outs = match encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD) {
             Ok(o) => o,
             Err((k, e)) => panic!("seed {seed} frame {k}: {e}"),
@@ -129,7 +157,7 @@ fn inter_sequences_round_trip() {
             }
             let mut again = p.rec.clone();
             let opts = EncodeOpts {
-                flags: ENC_BITSTREAM_ONLY | ENC_TD,
+                flags: ENC_BITSTREAM_ONLY | ENC_TD | seq.flags[k],
                 seq_level_idx: out.seq_level_idx as i32,
             };
             let mut o = Output::default();
@@ -147,16 +175,15 @@ fn inter_sequences_round_trip() {
             );
         }
         frames.fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        if seed % 8 == 0 {
-            let Some(mut again) = InterSeq::make(seed, 200, 6) else {
+        if seed % 8 == 0 || (seq.frames[0].fp.sb128 != 0 && seed % 3 == 0) {
+            let Some(mut again) = InterSeq::make(seed, maxdim, 6) else {
                 return;
             };
             let one = encode_seq(&mut Writer::with_threads(1), &mut again, ENC_FIX_RANGE | ENC_TD).unwrap();
             assert!(one == outs, "seed {seed}: threads");
         }
     });
-    eprintln!("{} frames; {}", frames.into_inner(), coverage());
-    assert_phase_coverage(20);
+    frames.into_inner()
 }
 
 /// A key frame in video mode codes a still picture's tile data and reconstructs exactly as it.
@@ -276,7 +303,7 @@ fn hook_sees_the_inter_prediction() {
                     ..Extras::default()
                 };
                 let opts = EncodeOpts {
-                    flags: ENC_FIX_RANGE,
+                    flags: ENC_FIX_RANGE | seq.flags[k],
                     seq_level_idx: -1,
                 };
                 let mut out = Output::default();
@@ -319,14 +346,18 @@ fn damaged_inter_frames_parse_or_fail() {
             r ^= r << 17;
             r
         };
+        // the stream's state before each frame (a frame without a sequence header needs it)
+        let mut ps = ParseState::default();
         for o in &outs {
+            let before = ps.clone();
+            parse_with(&o.obu, Some(&mut ps)).unwrap();
             for _ in 0..8 {
                 let mut d = o.obu.clone();
                 for _ in 0..1 + next() % 3 {
                     let i = (next() as usize) % d.len();
                     d[i] ^= 1 << (next() % 8);
                 }
-                if let Ok(mut p) = parse(&d) {
+                if let Ok(mut p) = parse_with(&d, Some(&mut before.clone())) {
                     parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let opts = EncodeOpts {
                         flags: ENC_BITSTREAM_ONLY,
@@ -336,7 +367,7 @@ fn damaged_inter_frames_parse_or_fail() {
                 }
             }
             for cut in [1, 3, o.obu.len() / 3, o.obu.len() - 1] {
-                let _ = parse(&o.obu[..cut]);
+                let _ = parse_with(&o.obu[..cut], Some(&mut before.clone()));
             }
         }
     });
@@ -419,6 +450,190 @@ fn inter_records_refused() {
     .unwrap();
 }
 
+/// Still pictures with 128x128 superblocks (FuzzCase::make_ex): every record encodes, validates,
+/// parses back to what was written (which codes the same stream again), codes the same bytes and
+/// reconstruction on one thread as on several, and damaged copies parse or fail, never panic.
+#[test]
+fn sb128_still_pictures_round_trip() {
+    let (pictures, damaged) = (
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    );
+    seeds(300, |w, seed| {
+        let Some(mut rec) = sb128_still(seed, 420) else {
+            return;
+        };
+        let opts = EncodeOpts {
+            flags: if seed % 2 == 0 {
+                ENC_FIX_RANGE | ENC_TD
+            } else {
+                ENC_FIX_RANGE
+            },
+            seq_level_idx: -1,
+        };
+        let orig = rec.clone();
+        let mut out = Output::default();
+        w.encode(rec.as_mut(), &opts, &mut out)
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let mut v = rec.clone();
+        validate(v.as_mut()).unwrap_or_else(|e| panic!("seed {seed}: validate: {e}"));
+        let p = parse(&out.obu).unwrap_or_else(|e| panic!("seed {seed}: parse: {e}"));
+        assert_eq!((p.rec.fp.sb128, p.rec.fp.video), (1, 0), "seed {seed}");
+        expect_parsed_blocks(&rec, &p.rec, &format!("seed {seed}"));
+        let mut again = p.rec.clone();
+        let mut o = Output::default();
+        let bopts = EncodeOpts {
+            flags: ENC_BITSTREAM_ONLY | (opts.flags & ENC_TD),
+            seq_level_idx: out.seq_level_idx as i32,
+        };
+        w.encode(again.as_mut(), &bopts, &mut o).unwrap();
+        assert!(o.obu == out.obu, "seed {seed}: the parsed record codes another stream");
+        if seed % 3 == 0 {
+            let mut one = Output::default();
+            Writer::with_threads(1)
+                .encode(orig.clone().as_mut(), &opts, &mut one)
+                .unwrap();
+            let mut many = Output::default();
+            Writer::with_threads(8)
+                .encode(orig.clone().as_mut(), &opts, &mut many)
+                .unwrap();
+            assert!(one == out && many == out, "seed {seed}: threads");
+        }
+        let mut r = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..6 {
+            let mut d = out.obu.clone();
+            for _ in 0..1 + next() % 3 {
+                let i = (next() as usize) % d.len();
+                d[i] ^= 1 << (next() % 8);
+            }
+            if let Ok(mut p) = parse(&d) {
+                damaged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = w.encode(p.rec.as_mut(), &bopts, &mut Output::default());
+            }
+        }
+        pictures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    let s = super::walk::SB128_STAT
+        .each_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    eprintln!(
+        "{} pictures, {} damaged ones parsed; {}",
+        pictures.into_inner(),
+        damaged.into_inner(),
+        sb128_coverage()
+    );
+    assert!(
+        s[..11].iter().chain(&s[13..15]).all(|&k| k >= 20),
+        "{}",
+        sb128_coverage()
+    );
+}
+
+/// A still picture with 128x128 superblocks of `seed` (FuzzCase::make_ex), as a record.
+fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
+    let mut case = FuzzCase::make_ex(seed, maxdim, 4, true)?;
+    let mut rec = Record {
+        fp: case.fp,
+        blocks: core::mem::take(&mut case.blocks),
+        block_txb: core::mem::take(&mut case.block_txb),
+        txb: core::mem::take(&mut case.txb),
+        coeffs: core::mem::take(&mut case.coeffs),
+        inter: Vec::new(),
+    };
+    rec.coeffs.truncate(case.n_coeffs as usize);
+    Some(rec)
+}
+
+/// What 128x128 superblocks and ENC_NO_SEQ_HEADER refuse, and what a frame without a sequence
+/// header needs to parse.
+#[test]
+fn sb128_and_headerless_refusals() {
+    let mut w = Writer::with_threads(1);
+    let opts = |flags| EncodeOpts {
+        flags,
+        seq_level_idx: -1,
+    };
+    let bad = |w: &mut Writer, what: &str, mut r: Record, flags: u32, extras: &Extras| {
+        let e = w
+            .encode_with_hook::<NoHook>(r.as_mut(), &opts(flags), None, extras, &mut Output::default())
+            .expect_err(what);
+        assert_eq!(e.code, ERR_INVALID, "{what}: {}", e.msg);
+    };
+    let still = (0..)
+        .find_map(|s| {
+            sb128_still(s, 300).filter(|r| {
+                r.blocks
+                    .iter()
+                    .any(|b| matches!(b.bsize as i32, BLOCK_128X128 | BLOCK_128X64 | BLOCK_64X128))
+            })
+        })
+        .unwrap();
+    let none = Extras::default();
+    bad(
+        &mut w,
+        "no sequence header for a still picture",
+        still.clone(),
+        ENC_NO_SEQ_HEADER,
+        &none,
+    );
+    let mut r = still.clone();
+    r.fp.sb128 = 2;
+    bad(&mut w, "sb128 2", r, 0, &none);
+    let mut r = still.clone();
+    r.fp.version = 1;
+    bad(&mut w, "sb128 in a version 1 record", r, 0, &none);
+    let syms = Extras {
+        record_syms: true,
+        ..Extras::default()
+    };
+    bad(
+        &mut w,
+        "symbol streams with 128x128 superblocks",
+        still.clone(),
+        0,
+        &syms,
+    );
+    // 128-sample blocks need sb128
+    let mut r = still.clone();
+    r.fp.sb128 = 0;
+    bad(&mut w, "128-sample blocks without sb128", r, 0, &none);
+    let mut video = still.clone();
+    video.fp.video = 1;
+    bad(
+        &mut w,
+        "no sequence header with AVIF",
+        video.clone(),
+        ENC_NO_SEQ_HEADER | ENC_AVIF,
+        &none,
+    );
+    // a video key frame without its sequence header: TD + OBU_FRAME, parsed with the stream's
+    let mut with = Output::default();
+    w.encode(video.clone().as_mut(), &opts(ENC_TD), &mut with).unwrap();
+    let mut without = Output::default();
+    w.encode(video.clone().as_mut(), &opts(ENC_TD | ENC_NO_SEQ_HEADER), &mut without)
+        .unwrap();
+    assert_eq!(&without.obu[..3], &[0x12, 0x00, 0x32]);
+    assert_eq!(with.obu[2], 0x0A);
+    assert!(without.header_bytes < with.header_bytes);
+    assert_eq!(without.recon, with.recon);
+    let e = parse(&without.obu).expect_err("a frame without a sequence header, stateless");
+    assert!(e.msg.contains("ParseState"), "{}", e.msg);
+    assert!(parse_with(&without.obu, Some(&mut ParseState::default())).is_err());
+    let mut ps = ParseState::default();
+    let a = parse_with(&with.obu, Some(&mut ps)).unwrap();
+    let b = parse_with(&without.obu, Some(&mut ps)).unwrap();
+    assert_eq!(
+        (a.rec, a.seq_level_idx, a.tile_bytes),
+        (b.rec, b.seq_level_idx, b.tile_bytes)
+    );
+}
+
 /// IVF of a sequence's frames (each its TD + sequence header + frame).
 fn ivf(outs: &[Output], w: u32, h: u32) -> Vec<u8> {
     let mut v = Vec::new();
@@ -454,75 +669,147 @@ fn decoders() {
     let dir = std::env::temp_dir().join(format!("glassact-av1-decoders-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let frames = std::sync::atomic::AtomicU64::new(0);
+    let (sb128_frames, headerless) = (
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    );
+    let stills = std::sync::atomic::AtomicU64::new(0);
     seeds(n, |w, seed| {
         let Some(mut seq) = InterSeq::make(seed, maxdim, nframes) else {
             return;
         };
+        let count =
+            |c: &std::sync::atomic::AtomicU64, k: usize| c.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
+        count(&sb128_frames, seq.frames.iter().filter(|r| r.fp.sb128 != 0).count());
+        count(&headerless, seq.flags.iter().filter(|&&f| f != 0).count());
         let outs = encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD | ENC_CHECK_EDGES)
             .unwrap_or_else(|(k, e)| panic!("seed {seed} frame {k}: {e}"));
-        let fp = seq.frames[0].fp;
-        let src = dir.join(format!("s{seed}.ivf"));
-        std::fs::write(&src, ivf(&outs, fp.width, fp.height)).unwrap();
-        for (tool, args) in &tools {
-            let path = format!("/opt/homebrew/bin/{tool}");
-            if !std::path::Path::new(&path).exists() {
-                continue;
-            }
-            let yuv = dir.join(format!("s{seed}.{tool}.yuv"));
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| match *a {
-                    "IN" => src.display().to_string(),
-                    "OUT" => yuv.display().to_string(),
-                    a => a.to_string(),
-                })
-                .collect();
-            let st = std::process::Command::new(&path).args(&args).output().unwrap();
-            assert!(
-                st.status.success(),
-                "seed {seed}: {tool} failed: {}",
-                String::from_utf8_lossy(&st.stderr)
+        let kinds: Vec<&str> = seq
+            .frames
+            .iter()
+            .map(|r| if r.fp.frame_type == FRAME_KEY { "key" } else { "inter" })
+            .collect();
+        decode_check(&dir, &tools, &format!("s{seed}"), &outs, &seq.frames[0].fp, &kinds);
+        frames.fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // and a still picture with 128x128 superblocks
+        if let Some(mut rec) = sb128_still(seed, maxdim.max(260)) {
+            let opts = EncodeOpts {
+                flags: ENC_FIX_RANGE | ENC_TD,
+                seq_level_idx: -1,
+            };
+            let mut out = Output::default();
+            w.encode(rec.as_mut(), &opts, &mut out).unwrap();
+            decode_check(
+                &dir,
+                &tools,
+                &format!("p{seed}"),
+                &[out],
+                &rec.fp,
+                &["still, 128x128 superblocks"],
             );
-            let data = std::fs::read(&yuv).unwrap();
-            let (pw, ph) = (fp.width as usize, fp.height as usize);
-            let (cw, ch) = (pw.div_ceil(2), ph.div_ceil(2));
-            let mono = fp.monochrome != 0;
-            let per = if mono { pw * ph } else { pw * ph + 2 * cw * ch };
-            assert_eq!(data.len(), per * outs.len(), "seed {seed}: {tool} output size");
-            for (k, o) in outs.iter().enumerate() {
-                let f = &data[k * per..];
-                let planes = if mono { 1 } else { 3 };
-                let mut at = 0;
-                for p in 0..planes {
-                    let n = o.recon[p].len();
-                    if f[at..at + n] != o.recon[p][..] {
-                        let i = (0..n).find(|&i| f[at + i] != o.recon[p][i]).unwrap();
-                        let ww = o.recon_w[p] as usize;
-                        panic!(
-                            "seed {seed} {}x{} frame {k} ({}): {tool} plane {p} differs first at ({}, {}): writer {}, {tool} {}",
-                            fp.width,
-                            fp.height,
-                            if seq.frames[k].fp.frame_type == FRAME_KEY {
-                                "key"
-                            } else {
-                                "inter"
-                            },
-                            i % ww,
-                            i / ww,
-                            o.recon[p][i],
-                            f[at + i]
-                        );
-                    }
-                    at += n;
+            stills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    eprintln!(
+        "{} frames decode exactly ({} with 128x128 superblocks, {} without a sequence header), and {} \
+         still pictures with 128x128 superblocks; {}; {}",
+        frames.into_inner(),
+        sb128_frames.into_inner(),
+        headerless.into_inner(),
+        stills.into_inner(),
+        coverage(),
+        sb128_coverage()
+    );
+    assert_phase_coverage(1);
+    assert_sb128_coverage(1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Each installed decoder of `tools` decodes the frames `outs` (of a stream with the first frame's
+/// `fp`) to exactly their reconstructions. `kinds`: what each frame is, for the messages.
+fn decode_check(
+    dir: &std::path::Path,
+    tools: &[(&str, Vec<&str>)],
+    name: &str,
+    outs: &[Output],
+    fp: &FrameParams,
+    kinds: &[&str],
+) {
+    let src = dir.join(format!("{name}.ivf"));
+    std::fs::write(&src, ivf(outs, fp.width, fp.height)).unwrap();
+    for (tool, args) in tools {
+        let path = format!("/opt/homebrew/bin/{tool}");
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let yuv = dir.join(format!("{name}.{tool}.yuv"));
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| match *a {
+                "IN" => src.display().to_string(),
+                "OUT" => yuv.display().to_string(),
+                a => a.to_string(),
+            })
+            .collect();
+        let st = std::process::Command::new(&path).args(&args).output().unwrap();
+        assert!(
+            st.status.success(),
+            "{name}: {tool} failed: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        let data = std::fs::read(&yuv).unwrap();
+        let (pw, ph) = (fp.width as usize, fp.height as usize);
+        let (cw, ch) = (pw.div_ceil(2), ph.div_ceil(2));
+        let mono = fp.monochrome != 0;
+        let per = if mono { pw * ph } else { pw * ph + 2 * cw * ch };
+        assert_eq!(data.len(), per * outs.len(), "{name}: {tool} output size");
+        for (k, o) in outs.iter().enumerate() {
+            let f = &data[k * per..];
+            let planes = if mono { 1 } else { 3 };
+            let mut at = 0;
+            for p in 0..planes {
+                let n = o.recon[p].len();
+                if f[at..at + n] != o.recon[p][..] {
+                    let i = (0..n).find(|&i| f[at + i] != o.recon[p][i]).unwrap();
+                    let ww = o.recon_w[p] as usize;
+                    panic!(
+                        "{name} {}x{} frame {k} ({}): {tool} plane {p} differs first at ({}, {}): writer {}, {tool} {}",
+                        fp.width,
+                        fp.height,
+                        kinds[k],
+                        i % ww,
+                        i / ww,
+                        o.recon[p][i],
+                        f[at + i]
+                    );
                 }
+                at += n;
             }
         }
-        let _ = std::fs::remove_file(&src);
-        frames.fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    });
-    eprintln!("{} frames decode exactly; {}", frames.into_inner(), coverage());
-    assert_phase_coverage(1);
-    let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&yuv);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+/// What 128x128 superblocks the writer has coded so far in this process (walk::SB128_STAT).
+pub(super) fn sb128_coverage() -> String {
+    let s = super::walk::SB128_STAT
+        .each_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    format!(
+        "128x128 nodes: NONE {} HORZ {} VERT {} SPLIT {} HORZ_A {} HORZ_B {} VERT_A {} VERT_B {}; \
+         blocks 128x128 {} 128x64 {} 64x128 {}: intra {}, inter {}, skip {}, coded {}, inter coded {}",
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]
+    )
+}
+
+/// Every partition type of the 128x128 node and every 128-sample block size has been coded at
+/// least `n` times in this process, intra and inter, skip and coded.
+pub(super) fn assert_sb128_coverage(n: u64) {
+    let s = super::walk::SB128_STAT
+        .each_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(s.iter().all(|&k| k >= n), "128x128 superblocks: {}", sb128_coverage());
 }
 
 /// The inter syntax the writer has coded so far in this process (walk::INTER_STAT).
@@ -598,7 +885,8 @@ pub(super) fn assert_phase_coverage(n: u64) {
 /// block inter (a 16-row scroll: the luma copies and the chroma half-sample filters run on every
 /// block; tx types DCT); the sub-sample one is the same at a scroll of 16 3/8 rows and 1/4 column
 /// (mv_precision 2: both filter passes on every block, luma and chroma); the static one has every
-/// block inter with mv 0 and skip.
+/// block inter with mv 0 and skip. The copies are the motion module's covers (one skip inter
+/// block per 64x64 or 128x128 superblock) at mv 0 and at a 16-row scroll.
 /// `cargo test --release -- --ignored --nocapture bench_inter`
 #[test]
 #[ignore]
@@ -681,6 +969,46 @@ fn bench_inter_vs_key() {
         still.inter.iter_mut().for_each(|i| i.mv_row = 0);
         still.blocks.iter_mut().for_each(|b| (b.skip, b.tx_depth) = (1, 0));
         still.layout().unwrap();
+        // copies as the motion module makes them: every superblock one skip inter block (the
+        // largest that fits) with mv 0 or a 16-row scroll, 64x64 or 128x128 superblocks
+        let cover = |sb128: bool, mv_row: i16| {
+            let mut r = still.clone();
+            (r.fp.sb128, r.fp.tile_cols_log2, r.fp.tile_rows_log2) = (sb128 as u8, -1, -1);
+            let (mc, mr) = (crate::blockinfo::mi_cols(w as i32), crate::blockinfo::mi_rows(h as i32));
+            let t = Block {
+                skip: 1,
+                ..Default::default()
+            };
+            let tiles = tile_layout_ex(w, h, -1, -1, sb128).unwrap();
+            let n = if sb128 { 32 } else { 16 };
+            r.blocks.clear();
+            for tr in 0..tiles.rows as usize {
+                for tc in 0..tiles.cols as usize {
+                    for sr in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(n) {
+                        for sc in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(n) {
+                            let (sr, sc) = ((sr / n as u32) as i32, (sc / n as u32) as i32);
+                            if sb128 {
+                                crate::motion::inter_sb_cover128(mr, mc, sr, sc, &t, &mut r.blocks);
+                            } else {
+                                crate::motion::inter_sb_cover(mr, mc, sr, sc, &t, &mut r.blocks);
+                            }
+                        }
+                    }
+                }
+            }
+            r.inter = vec![
+                BlockInter {
+                    mv_row: mv_row * 8,
+                    is_inter: 1,
+                    ..Default::default()
+                };
+                r.blocks.len()
+            ];
+            r.layout().unwrap();
+            r
+        };
+        let (copy64, copy128) = (cover(false, 0), cover(true, 0));
+        let (scroll64, scroll128) = (cover(false, 16), cover(true, 16));
         let refs: RefSlots = [Some(RefPicture::from_output(&key_out)); 8];
         let mut wr = Writer::new();
         let opts = EncodeOpts {
@@ -693,6 +1021,10 @@ fn bench_inter_vs_key() {
             ("inter, scrolled, same residual", &scroll),
             ("inter, sub-sample scroll, same", &subpel),
             ("inter, static, all skip", &still),
+            ("copies, static, 64x64 SBs", &copy64),
+            ("copies, static, 128x128 SBs", &copy128),
+            ("copies, 16-row scroll, 64x64 SBs", &scroll64),
+            ("copies, 16-row scroll, 128x128 SBs", &scroll128),
         ] {
             let mut r = rec.clone();
             wr.encode_ex(r.as_mut(), &opts, &refs, &mut out).unwrap();

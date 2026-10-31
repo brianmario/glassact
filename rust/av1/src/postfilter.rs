@@ -22,7 +22,7 @@
 use crate::blockinfo::*;
 use crate::dsp::{clip3, round2};
 use crate::tables::*;
-use crate::types::{Block, FrameParams};
+use crate::types::{Block, BlockInter, FrameParams};
 
 #[cfg(target_arch = "aarch64")]
 mod lf_neon;
@@ -94,6 +94,38 @@ impl PfFrame {
 /// [`PfMaps::skip`]'s bit for a block whose loop filter level is 0 (fp.lf_inter_off's inter
 /// blocks); bit 0 is the block's skip.
 pub const LF_ZERO: u8 = 2;
+/// [`PfMaps::skip`]'s bits for a skipped inter block 128 wide ([`LF_SKIP_W128`]) or 128 high
+/// ([`LF_SKIP_H128`]): its tx edges inside it (the 64x64 tx blocks' at 64 samples) aren't block
+/// edges, and aren't filtered. The deblocking filter's applyFilter is isTxEdge && (isBlockEdge ||
+/// !skip || isIntra) (spec 7.14.2): every tx edge of an intra block or a coded one is filtered, and
+/// a skipped inter block's tx edges are its block edges (its tx size is Max_Tx_Size_Rect, the
+/// block's size) except inside one larger than 64 that way.
+pub const LF_SKIP_W128: u8 = 4;
+pub const LF_SKIP_H128: u8 = 8;
+/// Per-block flags of [`PfMapsBuf::mark_block_flags`] (av1g_pf_mark_block_flags, p_mark's
+/// `lfZero` bytes): the block's loop filter level is 0 (an inter block with fp.lf_inter_off; it
+/// implies [`PF_BLK_INTER`]), the block is inter.
+pub const PF_BLK_LF_ZERO: u8 = 1;
+pub const PF_BLK_INTER: u8 = 2;
+
+/// A block's [`PfMaps::skip`] value: its skip, [`LF_ZERO`], [`LF_SKIP_W128`] / [`LF_SKIP_H128`].
+#[inline]
+pub fn pf_skip_value(skip: bool, flags: u8, bsize: i32) -> u8 {
+    let inter = flags & (PF_BLK_LF_ZERO | PF_BLK_INTER) != 0;
+    let mut v = skip as u8;
+    if flags & PF_BLK_LF_ZERO != 0 {
+        v |= LF_ZERO;
+    }
+    if skip && inter {
+        if bw4(bsize) > 16 {
+            v |= LF_SKIP_W128;
+        }
+        if bh4(bsize) > 16 {
+            v |= LF_SKIP_H128;
+        }
+    }
+    v
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PfMaps<'a> {
@@ -127,15 +159,22 @@ impl PfMapsBuf {
         self.mark_block_ex(f, b, false);
     }
     /// av1g_pf_mark_block_ex: [`PfMapsBuf::mark_block`] with the block's loop filter level 0 or
-    /// not ([`LF_ZERO`]).
+    /// not ([`LF_ZERO`]; an inter block).
     pub fn mark_block_ex(&mut self, f: &PfFrame, b: &Block, lf_zero: bool) {
+        self.mark_block_flags(f, b, if lf_zero { PF_BLK_LF_ZERO } else { 0 });
+    }
+    /// av1g_pf_mark_block_flags: [`PfMapsBuf::mark_block`] of a block with its [`PF_BLK_LF_ZERO`] /
+    /// [`PF_BLK_INTER`] flags. A non-skip block larger than 64x64 sets the cdef_idx of every 64x64
+    /// it covers.
+    pub fn mark_block_flags(&mut self, f: &PfFrame, b: &Block, flags: u8) {
         let (r0, c0, bs) = (b.mi_row as i32, b.mi_col as i32, b.bsize as i32);
         let (bw, bh) = (bw4(bs), bh4(bs));
         let tx_y = luma_tx_size(bs, b.tx_depth as i32) as u8;
+        let sk = pf_skip_value(b.skip != 0, flags, bs);
         for y in r0..(r0 + bh).min(f.mi_rows) {
             for x in c0..(c0 + bw).min(f.mi_cols) {
                 let k = (y * f.mi_cols + x) as usize;
-                self.skip[k] = b.skip | if lf_zero { LF_ZERO } else { 0 };
+                self.skip[k] = sk;
                 self.lf_tx[0][k] = tx_y;
             }
         }
@@ -152,7 +191,11 @@ impl PfMapsBuf {
             }
         }
         if f.enable_cdef && b.skip == 0 {
-            self.cdef_idx[((r0 >> 4) * f.sb_cols + (c0 >> 4)) as usize] = b.cdef_idx;
+            for y in (r0..(r0 + bh).min(f.mi_rows)).step_by(16) {
+                for x in (c0..(c0 + bw).min(f.mi_cols)).step_by(16) {
+                    self.cdef_idx[((y >> 4) * f.sb_cols + (x >> 4)) as usize] = b.cdef_idx;
+                }
+            }
         }
     }
     pub fn maps(&self) -> PfMaps<'_> {
@@ -326,17 +369,18 @@ pub(crate) fn lf_filter_size(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize,
         return None;
     }
     // applyFilter = isTxEdge && (isBlockEdge || !skip || isIntra): an intra block's edges are
-    // its tx edges; a skipped inter block's only tx edges are its block edges (tx_depth 0, at
-    // most 64x64), and a coded one's tx edges are filtered: isTxEdge throughout
+    // its tx edges, and a coded one's; a skipped inter block's tx edges are its block edges but
+    // inside one 128 wide / high (LF_SKIP_W128 / H128: at 64 samples, off the 128 grid)
+    let sk = m.skip[row as usize * mc + col as usize];
     let (cur, prev) = if pass == 0 {
         let cur = Tx_Width[tx_sz] as i32;
-        if x_p & (cur - 1) != 0 {
+        if x_p & (cur - 1) != 0 || (sk & LF_SKIP_W128 != 0 && (x_p << sub) & 127 != 0) {
             return None;
         }
         (cur, Tx_Width[prev_tx_sz] as i32)
     } else {
         let cur = Tx_Height[tx_sz] as i32;
-        if y_p & (cur - 1) != 0 {
+        if y_p & (cur - 1) != 0 || (sk & LF_SKIP_H128 != 0 && (y_p << sub) & 127 != 0) {
             return None;
         }
         (cur, Tx_Height[prev_tx_sz] as i32)
@@ -690,10 +734,31 @@ pub fn cdef_frame(
 /// the coded area (MiCols * 4 x MiRows * 4 luma samples, the chroma planes at half that), with
 /// strides `stride`; the chroma planes are unused (and may be empty) for monochrome.
 pub fn postfilter(fp: &FrameParams, blocks: &[Block], planes: &mut [&mut [u8]; 3], stride: &[usize; 3]) {
+    postfilter_ex(fp, blocks, &[], planes, stride)
+}
+
+/// [`postfilter`] of a record with inter blocks (`inter`: one per block, or empty: all intra), and
+/// fp.lf_inter_off.
+pub fn postfilter_ex(
+    fp: &FrameParams,
+    blocks: &[Block],
+    inter: &[BlockInter],
+    planes: &mut [&mut [u8]; 3],
+    stride: &[usize; 3],
+) {
     let f = PfFrame::new(fp);
     let mut maps = PfMapsBuf::new(&f);
-    for b in blocks {
-        maps.mark_block(&f, b);
+    let lf_off = fp.frame_type == crate::types::FRAME_INTER && fp.lf_inter_off != 0;
+    for (i, b) in blocks.iter().enumerate() {
+        let is_inter = inter.get(i).is_some_and(|x| x.is_inter != 0);
+        let flags = if !is_inter {
+            0
+        } else if lf_off {
+            PF_BLK_LF_ZERO | PF_BLK_INTER
+        } else {
+            PF_BLK_INTER
+        };
+        maps.mark_block_flags(&f, b, flags);
     }
     let m = maps.maps();
     deblock_frame(&f, &m, planes, stride);

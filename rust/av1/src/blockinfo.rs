@@ -1,5 +1,7 @@
 //! Block / transform geometry rules of the AV1 syntax that every engine needs
-//! (Sources/AV1Core/include/av1g/blockinfo.h). 4:2:0 or monochrome, no 128x128 blocks.
+//! (Sources/AV1Core/include/av1g/blockinfo.h). 4:2:0 or monochrome. Blocks wider or taller than
+//! 64 (128x128 superblocks) code their residual per 64x64 unit ([`res_units`]); the C header's
+//! copies have no such blocks.
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 use crate::tables::*;
 
@@ -221,6 +223,31 @@ pub fn get_filter_type(
     (above_smooth || left_smooth) as i32
 }
 
+/// The 64x64 luma units of a block's residual (spec residual(): widthChunks x heightChunks): a block
+/// wider or taller than 64 codes the tx blocks of its first unit (Y, U, V), then of the next, in
+/// raster order. (1, 1) for blocks up to 64x64.
+#[inline]
+pub fn res_units(bsize: i32) -> (i32, i32) {
+    ((bw4(bsize) >> 4).max(1), (bh4(bsize) >> 4).max(1))
+}
+
+/// The intra-style tx blocks of one plane of residual unit (ux, uy) ([`res_units`]): `f(x, y)` with
+/// (x, y) the spec's transform_block x / y (4x4 units of the plane within the block).
+#[inline(always)]
+fn unit_plane_txbs(bsize: i32, plane: i32, tx_sz: i32, ux: i32, uy: i32, mut f: impl FnMut(i32, i32)) {
+    let sub = (plane != 0) as i32;
+    let step_x = Tx_Width[tx_sz as usize] as usize >> 2;
+    let step_y = Tx_Height[tx_sz as usize] as usize >> 2;
+    let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
+    let (w, h) = (bw4(plane_sz).min(16 >> sub), bh4(plane_sz).min(16 >> sub));
+    let (ox, oy) = ((ux << 4) >> sub, (uy << 4) >> sub);
+    for y in (0..h).step_by(step_y) {
+        for x in (0..w).step_by(step_x) {
+            f(ox + x, oy + y);
+        }
+    }
+}
+
 /// Iterates the coded tx blocks of one block in bitstream order: calls `f(plane, tx_sz, x4, y4, xi,
 /// yi)` where (x4, y4) is the tx block's position in its plane (4-sample units) and (xi, yi) its
 /// index within the block (4x4 units of the plane, the spec's x / y in transform_block). Returns
@@ -237,27 +264,25 @@ pub fn for_each_txb(
 ) -> i32 {
     let mut n = 0;
     let planes = if has_chroma(bsize, mi_row, mi_col, mono) { 3 } else { 1 };
-    for plane in 0..planes {
-        let sub = (plane != 0) as i32;
-        let tx_sz = if plane != 0 {
-            uv_tx_size(bsize)
-        } else {
-            luma_tx_size(bsize, tx_depth)
-        };
-        let step_x = Tx_Width[tx_sz as usize] as usize >> 2;
-        let step_y = Tx_Height[tx_sz as usize] as usize >> 2;
-        let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
-        let (num4x4_w, num4x4_h) = (bw4(plane_sz), bh4(plane_sz));
-        let (base_x4, base_y4) = (mi_col >> sub, mi_row >> sub);
-        let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub); // (MiCols * MI_SIZE) >> sub in 4-units
-        for y in (0..num4x4_h).step_by(step_y) {
-            for x in (0..num4x4_w).step_by(step_x) {
-                let (x4, y4) = (base_x4 + x, base_y4 + y);
-                if x4 >= max_x4 || y4 >= max_y4 {
-                    continue;
-                }
-                f(plane, tx_sz, x4, y4, x, y);
-                n += 1;
+    let (uw, uh) = res_units(bsize);
+    for uy in 0..uh {
+        for ux in 0..uw {
+            for plane in 0..planes {
+                let sub = (plane != 0) as i32;
+                let tx_sz = if plane != 0 {
+                    uv_tx_size(bsize)
+                } else {
+                    luma_tx_size(bsize, tx_depth)
+                };
+                let (base_x4, base_y4) = (mi_col >> sub, mi_row >> sub);
+                let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub); // (MiCols * MI_SIZE) >> sub in 4-units
+                unit_plane_txbs(bsize, plane, tx_sz, ux, uy, |x, y| {
+                    let (x4, y4) = (base_x4 + x, base_y4 + y);
+                    if x4 < max_x4 && y4 < max_y4 {
+                        f(plane, tx_sz, x4, y4, x, y);
+                        n += 1;
+                    }
+                });
             }
         }
     }
@@ -294,10 +319,22 @@ pub fn tx_tree_order(bsize: i32, tx_sz: i32, out: &mut [(i32, i32); 16]) -> usiz
     n
 }
 
+/// The block size whose transform_tree an inter block's residual unit has ([`res_units`]): the
+/// block's own, or 64x64 for blocks wider or taller than 64.
+#[inline]
+pub fn res_unit_bsize(bsize: i32) -> i32 {
+    if bw4(bsize) > 16 || bh4(bsize) > 16 {
+        BLOCK_64X64
+    } else {
+        bsize
+    }
+}
+
 /// [`for_each_txb`] for a block that may be inter: an inter block's luma tx blocks (one uniform
 /// size, `tx_depth` splits of Max_Tx_Size_Rect) come in the spec's transform_tree order (halves
 /// of the longer side, quadrants of squares, recursively), which differs from raster order when
-/// a quadrant is split again. Chroma is as for intra blocks.
+/// a quadrant is split again; per 64x64 residual unit for blocks wider or taller than 64. Chroma
+/// is as for intra blocks.
 pub fn for_each_txb_ex(
     bsize: i32,
     mi_row: i32,
@@ -315,28 +352,29 @@ pub fn for_each_txb_ex(
     let tx_sz = luma_tx_size(bsize, tx_depth);
     let mut order = [(0, 0); 16];
     let mut n = 0;
-    let leaves = tx_tree_order(bsize, tx_sz, &mut order);
-    for &(x, y) in &order[..leaves] {
-        if mi_col + x < mi_cols && mi_row + y < mi_rows {
-            f(0, tx_sz, mi_col + x, mi_row + y, x, y);
-            n += 1;
-        }
-    }
-    if has_chroma(bsize, mi_row, mi_col, mono) {
-        let tx_sz = uv_tx_size(bsize);
-        let step_x = Tx_Width[tx_sz as usize] as usize >> 2;
-        let step_y = Tx_Height[tx_sz as usize] as usize >> 2;
-        let plane_sz = uv_bsize(bsize);
-        let (base_x4, base_y4) = (mi_col >> 1, mi_row >> 1);
-        for plane in 1..3 {
-            for y in (0..bh4(plane_sz)).step_by(step_y) {
-                for x in (0..bw4(plane_sz)).step_by(step_x) {
-                    let (x4, y4) = (base_x4 + x, base_y4 + y);
-                    if x4 >= mi_cols >> 1 || y4 >= mi_rows >> 1 {
-                        continue;
-                    }
-                    f(plane, tx_sz, x4, y4, x, y);
+    let leaves = tx_tree_order(res_unit_bsize(bsize), tx_sz, &mut order);
+    let chroma = has_chroma(bsize, mi_row, mi_col, mono);
+    let (uw, uh) = res_units(bsize);
+    for uy in 0..uh {
+        for ux in 0..uw {
+            for &(x, y) in &order[..leaves] {
+                let (x, y) = (x + (ux << 4), y + (uy << 4));
+                if mi_col + x < mi_cols && mi_row + y < mi_rows {
+                    f(0, tx_sz, mi_col + x, mi_row + y, x, y);
                     n += 1;
+                }
+            }
+            if chroma {
+                let tx_sz = uv_tx_size(bsize);
+                let (base_x4, base_y4) = (mi_col >> 1, mi_row >> 1);
+                for plane in 1..3 {
+                    unit_plane_txbs(bsize, plane, tx_sz, ux, uy, |x, y| {
+                        let (x4, y4) = (base_x4 + x, base_y4 + y);
+                        if x4 < mi_cols >> 1 && y4 < mi_rows >> 1 {
+                            f(plane, tx_sz, x4, y4, x, y);
+                            n += 1;
+                        }
+                    });
                 }
             }
         }

@@ -47,6 +47,7 @@ pub fn ent_plan(fp: &FrameParams, n_blocks: u32, n_txb: u32, frame: &mut GaEntFr
         fp.height,
         fp.tile_cols_log2 as i32,
         fp.tile_rows_log2 as i32,
+        false,
         &mut ti,
     ) {
         return 0;
@@ -105,8 +106,11 @@ pub fn assemble_obus<P: AsRef<[u8]>>(fp: &FrameParams, tiles: &[P], temporal_del
         fp.height,
         fp.tile_cols_log2 as i32,
         fp.tile_rows_log2 as i32,
+        false,
         &mut ti,
-    ) {
+    ) || fp.sb128 != 0
+    {
+        // the GPU entropy coder's tiles have 64x64 superblocks
         return Err(-1);
     }
     let n = tiles.len();
@@ -125,6 +129,7 @@ pub fn assemble_obus<P: AsRef<[u8]>>(fp: &FrameParams, tiles: &[P], temporal_del
         None,
         tiles,
         temporal_delimiter,
+        true,
         &mut seq,
         &mut fh,
         &mut out,

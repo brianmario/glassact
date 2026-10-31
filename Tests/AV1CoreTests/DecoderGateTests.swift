@@ -25,8 +25,18 @@ struct DecoderGateTests {
         }
     }
 
-    static func check(seed: UInt64) throws {
-        let fuzzCase = try #require(av1t_case_make(seed, 300, 2), "seed \(seed): no record")
+    /// The same records with 128x128 superblocks (av1t_case_make_ex: the partition from 128x128,
+    /// 128-sample blocks of every partition type the 128x128 node has).
+    @Test(arguments: 0..<4)
+    func sb128RecordsDecodeToTheirReconstruction(chunk: UInt64) throws {
+        let perChunk: UInt64 = 25
+        for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
+            try Self.check(seed: seed, sb128: true)
+        }
+    }
+
+    static func check(seed: UInt64, sb128: Bool = false) throws {
+        let fuzzCase = try #require(av1t_case_make_ex(seed, sb128 ? 420 : 300, 2, sb128 ? 1 : 0), "seed \(seed): no record")
         defer { av1t_case_free(fuzzCase) }
         let record = try #require(av1t_case_record(fuzzCase))
         var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_FIX_RANGE) | UInt32(AV1G_ENC_TD) | checkEdges,
@@ -51,7 +61,7 @@ struct DecoderGateTests {
             let stride = Int(frame.stridesTuple(p))
             for y in 0..<h where memcmp(ours + y * w, theirs + y * stride, w) != 0 {
                 let x = (0..<w).first { ours[y * w + $0] != theirs[y * stride + $0] } ?? 0
-                let where_ = "seed \(seed) \(fp.width)×\(fp.height): plane \(p) differs first at (\(x), \(y))"
+                let where_ = "seed \(seed)\(sb128 ? " (128x128 superblocks)" : "") \(fp.width)×\(fp.height): plane \(p) differs first at (\(x), \(y))"
                 Issue.record("\(where_): av1core \(ours[y * w + x]), libaom \(theirs[y * stride + x])")
                 return
             }

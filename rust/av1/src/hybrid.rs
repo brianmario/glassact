@@ -38,7 +38,7 @@ use crate::tables::{BLOCK_SIZES, DC_PRED, DCT_DCT};
 use crate::types::*;
 use crate::writer::{
     Error, Extras, LayoutCounts, NoHook, Output, Record, RefPicture, RefSlots, TileSkip, Writer, layout_counts_ex,
-    tile_layout,
+    tile_layout_ex,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,8 +68,10 @@ pub const GIVEN_CHROMA: i32 = 1;
 #[derive(Clone, Copy, Debug)]
 pub struct Video<'a> {
     /// the frame's video fields: video, frame_type, ref_slot, refresh_frame_flags,
-    /// error_resilient_mode, lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision (the
-    /// rest is ignored)
+    /// error_resilient_mode, lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision,
+    /// sb128 (the rest is ignored). With sb128 the blocks are in 128x128-superblock decode order
+    /// ([`crate::motion::Motion::apply_ex`] makes it from a 64x64 one) and the tiles are
+    /// [`tile_layout_ex`]'s.
     pub fp: FrameParams,
     /// inter frames: one per block (empty: every block intra). Inter blocks are skip blocks
     /// (tx_depth 0, intra fields 0): they copy LAST_FRAME at their motion vector.
@@ -365,7 +367,7 @@ impl Hybrid {
             (f.video, f.frame_type, f.ref_slot) = (v.fp.video, v.fp.frame_type, v.fp.ref_slot);
             (f.refresh_frame_flags, f.error_resilient_mode) = (v.fp.refresh_frame_flags, v.fp.error_resilient_mode);
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
-            f.mv_precision = v.fp.mv_precision;
+            (f.mv_precision, f.sb128) = (v.fp.mv_precision, v.fp.sb128);
             // from the reference's saved CDFs, where the slot has them
             f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
         }
@@ -376,13 +378,14 @@ impl Hybrid {
         let (mcu, mru) = (mc as usize, mr as usize);
         // rows of the source on several threads: a 5K picture is 22 MB
         let pad_threads = ((sb_cols * sb_rows * 6144) >> 20).clamp(1, 8).min(*threads);
-        let Ok(tiles) = tile_layout(width, height, tile_cols_log2, tile_rows_log2) else {
+        let sb128 = rec.fp.sb128 != 0;
+        let Ok(tiles) = tile_layout_ex(width, height, tile_cols_log2, tile_rows_log2, sb128) else {
             pad_source(planes, w, h, sb_cols, sb_rows, 3, src, pad_threads, None);
             return Err(error(ERR_INVALID, "tiling"));
         };
         let ntiles = (tiles.rows * tiles.cols) as usize;
         let key = [
-            width as u64,
+            width as u64 | (sb128 as u64) << 32,
             height as u64,
             ((tile_cols_log2 as u32 as u64) << 32) | tile_rows_log2 as u32 as u64,
             qindex as i64 as u64,
@@ -411,12 +414,12 @@ impl Hybrid {
             b.skip = if is_inter(i) { b.skip.min(1) } else { 0 };
         }
         if !given_chroma {
-            // the chroma decisions read the blocks' areas: no block outside the padded source
-            for b in &rec.blocks {
+            // the chroma decisions read the blocks' areas: no block outside the padded source (an
+            // inter block, which has none, may be larger than 64x64 with 128x128 superblocks)
+            for (i, b) in rec.blocks.iter().enumerate() {
                 let bs = b.bsize as i32;
                 if bs >= BLOCK_SIZES
-                    || bw4(bs) > 16
-                    || bh4(bs) > 16
+                    || ((bw4(bs) > 16 || bh4(bs) > 16) && !(sb128 && is_inter(i)))
                     || b.mi_row as i32 >= mr
                     || b.mi_col as i32 >= mc
                     || b.mi_row as usize + bh4(bs) as usize > sb_rows * 16
@@ -714,6 +717,21 @@ impl Hybrid {
     /// whose cdef_idx values and cdef_bits are as last written, keeps its bytes. The bytes live
     /// here until the next write.
     pub fn write(&mut self, fp: &FrameParams, sb_cdef: Option<&[i8]>, sb_cols: usize) -> Result<&[u8], Error> {
+        self.write_ex(fp, sb_cdef, sb_cols, 0)
+    }
+
+    /// av1enc_hybrid_write_ex: [`Hybrid::write`] with encode flags: [`ENC_NO_SEQ_HEADER`] (a later
+    /// frame of a stream: no sequence header) or 0.
+    pub fn write_ex(
+        &mut self,
+        fp: &FrameParams,
+        sb_cdef: Option<&[i8]>,
+        sb_cols: usize,
+        flags: u32,
+    ) -> Result<&[u8], Error> {
+        if flags & !ENC_NO_SEQ_HEADER != 0 {
+            return Err(error(ERR_INVALID, "write flags: ENC_NO_SEQ_HEADER or 0"));
+        }
         let Hybrid {
             mem,
             reused,
@@ -760,7 +778,7 @@ impl Hybrid {
             })
             .collect();
         let opts = EncodeOpts {
-            flags: ENC_TD | ENC_BITSTREAM_ONLY,
+            flags: ENC_TD | ENC_BITSTREAM_ONLY | flags,
             seq_level_idx: -1,
         };
         // an inter frame reads its reference's saved CDFs (no planes: the bitstream only)
