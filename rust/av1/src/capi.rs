@@ -813,3 +813,92 @@ pub unsafe extern "C" fn av1t_inverse_transform(tx_sz: i32, tx_type: i32, dq: *c
 pub extern "C" fn av1t_tx_type_allowed(tx_sz: i32, tx_type: i32) -> i32 {
     crate::testsupport::tx_type_allowed(tx_sz, tx_type) as i32
 }
+
+// ---- av1enc.h: motion for screen content (crate::motion) ----
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1enc_motion_create() -> *mut crate::motion::ShiftFinder {
+    Box::into_raw(Box::new(crate::motion::ShiftFinder::new()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_destroy(m: *mut crate::motion::ShiftFinder) {
+    if !m.is_null() {
+        // SAFETY: m came from av1enc_motion_create
+        drop(unsafe { Box::from_raw(m) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_candidates(
+    m: *mut crate::motion::ShiftFinder,
+    y: *const u8,
+    stride: c_int,
+    width: c_int,
+    height: c_int,
+    changed: *const u8,
+    sb_cols: c_int,
+    sb_rows: c_int,
+    max: c_int,
+    out: *mut i32,
+) -> c_int {
+    // SAFETY: the finder; a luma plane of height rows `stride` apart; sb_cols x sb_rows flags; 2 * max ints.
+    let (w, h, s) = (width as usize, height as usize, stride as usize);
+    let plane = crate::motion::Plane {
+        data: unsafe { slice::from_raw_parts(y, s * (h - 1) + w) },
+        stride: s,
+        width: w,
+        height: h,
+    };
+    let changed = unsafe { slice::from_raw_parts(changed, (sb_cols * sb_rows) as usize) };
+    let c = unsafe { (*m).candidates(&plane, changed, sb_cols as usize, max as usize) };
+    let out = unsafe { slice::from_raw_parts_mut(out, 2 * max as usize) };
+    for (i, s) in c.iter().enumerate() {
+        out[2 * i] = s.dx;
+        out[2 * i + 1] = s.dy;
+    }
+    c.len() as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_sb_matches(
+    cur: *const *const u8,
+    cur_stride: *const c_int,
+    prev: *const *const u8,
+    prev_stride: *const c_int,
+    width: c_int,
+    height: c_int,
+    planes: c_int,
+    sb_x: c_int,
+    sb_y: c_int,
+    dx: c_int,
+    dy: c_int,
+) -> c_int {
+    // SAFETY: `planes` planes each (Y w x h, chroma half, rounded up) at their strides.
+    let mk = |p: *const *const u8, s: *const c_int, i: usize| unsafe {
+        let (w, h) = if i == 0 {
+            (width as usize, height as usize)
+        } else {
+            ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
+        };
+        let st = *s.add(i) as usize;
+        crate::motion::Plane {
+            data: slice::from_raw_parts(*p.add(i), st * (h - 1) + w),
+            stride: st,
+            width: w,
+            height: h,
+        }
+    };
+    let n = planes as usize;
+    let c = [
+        mk(cur, cur_stride, 0),
+        mk(cur, cur_stride, if n == 3 { 1 } else { 0 }),
+        mk(cur, cur_stride, if n == 3 { 2 } else { 0 }),
+    ];
+    let q = [
+        mk(prev, prev_stride, 0),
+        mk(prev, prev_stride, if n == 3 { 1 } else { 0 }),
+        mk(prev, prev_stride, if n == 3 { 2 } else { 0 }),
+    ];
+    crate::motion::sb_matches(&c, &q, n, sb_x as usize, sb_y as usize, crate::motion::Shift { dx, dy }) as c_int
+}

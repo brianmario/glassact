@@ -21,7 +21,11 @@ fn main() {
         root.join("Sources/AV1CoreTestSupport/include"),
     ];
     let mut sources: Vec<PathBuf> = Vec::new();
-    for d in src_dirs.iter().map(|d| crate_dir.join(d)).chain([crate_dir.join("oracle")]) {
+    for d in src_dirs
+        .iter()
+        .map(|d| crate_dir.join(d))
+        .chain([crate_dir.join("oracle")])
+    {
         println!("cargo:rerun-if-changed={}", d.display());
         for e in std::fs::read_dir(&d).unwrap() {
             let p = e.unwrap().path();

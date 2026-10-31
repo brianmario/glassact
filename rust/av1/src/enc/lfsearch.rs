@@ -84,8 +84,8 @@ pub fn cdef_select_cpu(
     // Every SB's cost under every (luma, chroma) candidate pair fits 32 bits for real SSE tables
     // (a 64x64's luma and chroma SSE together stay under 2^29): then the search runs on per-pair
     // rows, and each step is a vectorizable min and widening sum. Otherwise, the reference loop.
-    let fits = my.iter().max().copied().unwrap_or(0) as u64 + muv.iter().max().copied().unwrap_or(0) as u64
-        <= u32::MAX as u64;
+    let fits =
+        my.iter().max().copied().unwrap_or(0) as u64 + muv.iter().max().copied().unwrap_or(0) as u64 <= u32::MAX as u64;
     if fits && pairs <= 16 {
         return select_rows(my, muv, nc, nsb, mono, max_bits, refine, fast_mono, lev_out, tot_out);
     }

@@ -111,6 +111,22 @@ const uint8_t *av1enc_hybrid_source(const av1enc_hybrid *h, int plane, int *stri
 // the last call's seconds: 0 chroma decisions, 1 closed loop
 double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 
+// Motion for screen content (rust/av1/src/motion.rs): candidate whole-pixel shifts between pictures,
+// from per-band row and column hashes of the luma plane, and exact superblock copies.
+typedef struct av1enc_motion av1enc_motion;
+av1enc_motion *av1enc_motion_create(void);
+void av1enc_motion_destroy(av1enc_motion *m);
+// Up to max (dx, dy) pairs into out, best supported first, excluding (0, 0), for this picture's luma
+// against the previous call's; changed: per 64x64 (raster, sb_cols x sb_rows), nonzero where the
+// picture changed. Returns the count (0 on a first picture or a new size).
+int av1enc_motion_candidates(av1enc_motion *m, const uint8_t *y, int stride, int width, int height,
+                             const uint8_t *changed, int sb_cols, int sb_rows, int max, int32_t *out);
+// 1 if superblock (sb_x, sb_y) of cur (planes: 1 = Y, 3 = Y, U, V of 4:2:0) equals prev at (dx, dy)
+// over its part of the picture, the displaced area inside prev.
+int av1enc_motion_sb_matches(const uint8_t *const cur[3], const int cur_stride[3], const uint8_t *const prev[3],
+                             const int prev_stride[3], int width, int height, int planes, int sb_x, int sb_y,
+                             int dx, int dy);
+
 #ifdef __cplusplus
 }
 #endif
