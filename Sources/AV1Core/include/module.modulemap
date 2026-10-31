@@ -1,0 +1,7 @@
+// Swift sees av1core's C API only (av1g.h: the DecisionRecord, encode, layout,
+// tiles). The rest of include/av1g is shared by the C++ writer, its tests and
+// the Metal kernels, and stays out of Swift's importer.
+module AV1Core {
+    header "av1g/av1g.h"
+    export *
+}

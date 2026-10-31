@@ -105,3 +105,26 @@ the exception to the default no-dependencies posture.
   `Package.resolved`. Replace the Sparkle section of
   `Apps/Shared/Acknowledgements.txt` with the new `LICENSE`. Build both apps
   and run the local update test in RELEASING.md before landing.
+
+## av1gpu at a30b4e8 (`Sources/AV1Core`, `Sources/AV1CoreTestSupport`; research)
+
+- **Upstream:** https://github.com/maddog107/av1gpu, commit `a30b4e8`
+  (main, 2026-10-30). A CUDA AV1 still-image encoder; its CPU core is
+  plain C++.
+- **License:** BSD-2-Clause (`Sources/AV1Core/LICENSE`). Parts derive from
+  libaom (the range encoder in `entenc.h`, and the `tune=iq` decisions not
+  yet ported), under libaom's BSD-2-Clause; see
+  `Sources/AV1Core/THIRD_PARTY_NOTICES.md`.
+- **Scope used:** a research branch porting it to Metal, owner's decision
+  (2026-10-30): still images first, then video. Nothing in the apps links
+  it. `AV1Core` is av1gpu's `av1core`: the DecisionRecord interface, the CPU
+  bitstream writer with the decoder's exact reconstruction, the AVIF muxer,
+  and the spec-mirroring DSP headers that the CPU and the GPU kernels share
+  (`include/av1g`). `AV1CoreTestSupport` is its fuzzer's record generator
+  and its CPU reference engine, for tests. Their tests ran dav1d and aomdec
+  through `system()`; ours decode in-process with the vendored libaom.
+- **Changes:** `internal.h` moved into `include/av1g`; module maps expose
+  only the C API to Swift; the tests' tool paths, file I/O and JPEG input
+  dropped. Files changed beyond include paths say so at the top.
+- **Update procedure:** none while it's a fork in progress. Record here
+  which upstream commit a change was taken from.

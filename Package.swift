@@ -70,6 +70,21 @@ let package = Package(
                 .unsafeFlags(["-O2"], .when(configuration: .debug)),
             ]
         ),
+        // av1gpu's AV1 core (BSD-2, Sources/AV1Core/LICENSE), on its way to
+        // Metal: the DecisionRecord, the CPU bitstream writer with the exact
+        // reconstruction, and the decoder-mirroring DSP headers the GPU
+        // kernels share. Research for now; nothing in the apps uses it.
+        .target(
+            name: "AV1Core",
+            exclude: ["LICENSE", "THIRD_PARTY_NOTICES.md"],
+            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+        ),
+        // av1gpu's random legal records and CPU reference engine, for tests.
+        .target(
+            name: "AV1CoreTestSupport",
+            dependencies: ["AV1Core"],
+            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+        ),
         // Hot-path codec: xxh64, RAW/LZ4/LZBITMAP/WEBPL tile codecs, arenas.
         // Plain -O: -Ounchecked (§8.4) gains nothing measurable and would
         // strip the bounds preconditions guarding canvas writes (BENCHMARKS
@@ -124,6 +139,8 @@ let package = Package(
         .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "SessionTests", dependencies: ["GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "ShareTests", dependencies: ["GlassActShare", "GlassActCore"], swiftSettings: strict),
+        .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
-    ]
+    ],
+    cxxLanguageStandard: .cxx17
 )
