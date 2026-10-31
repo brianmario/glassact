@@ -1,6 +1,7 @@
-//! The sequence header and frame header (reduced still picture), and the OBUs around the tile
-//! payloads.
+//! The sequence header and frame header (a reduced still picture, or a frame of a video stream:
+//! decisions.h "Video mode"), and the OBUs around the tile payloads.
 use super::TileInfo;
+use crate::tables::{ALTREF_FRAME, EIGHTTAP, LAST_FRAME, PRIMARY_REF_NONE, REFS_PER_FRAME};
 use crate::types::FrameParams;
 
 /// MSB-first bit writer (av1g::BitWriter).
@@ -60,17 +61,33 @@ pub(crate) fn put_leb128(o: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// sequence_header_obu and uncompressed_header (reduced_still_picture_header) of a record's frame
-/// parameters, as Encoder::write_headers (and av1enc's copy, which is the same).
+/// sequence_header_obu and uncompressed_header of a record's frame parameters: a reduced still
+/// picture, as Encoder::write_headers (and av1enc's copy, which is the same), or with `fp.video`
+/// a key or inter frame of a stream (the sequence header is the same for every frame of a stream).
 pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq: &mut BitWriter, fh: &mut BitWriter) {
     let (w, h) = (fp.width as i32, fp.height as i32);
     let mono = fp.monochrome as u32;
+    let video = fp.video != 0;
+    let inter = video && fp.frame_type == crate::types::FRAME_INTER;
     let diff_uv = (fp.delta_q_v_dc != fp.delta_q_u_dc || fp.delta_q_v_ac != fp.delta_q_u_ac) as u32;
     let separate_uv = (mono == 0 && (diff_uv != 0 || (fp.using_qmatrix != 0 && fp.qm_v != fp.qm_u))) as u32;
     seq.put(0, 3); // seq_profile = Main
-    seq.put(1, 1); // still_picture
-    seq.put(1, 1); // reduced_still_picture_header
-    seq.put(level as u32, 5); // seq_level_idx[0]
+    if video {
+        seq.put(0, 1); // still_picture
+        seq.put(0, 1); // reduced_still_picture_header
+        seq.put(0, 1); // timing_info_present_flag
+        seq.put(0, 1); // initial_display_delay_present_flag
+        seq.put(0, 5); // operating_points_cnt_minus_1
+        seq.put(0, 12); // operating_point_idc[0]
+        seq.put(level as u32, 5); // seq_level_idx[0]
+        if level > 7 {
+            seq.put(0, 1); // seq_tier[0]
+        }
+    } else {
+        seq.put(1, 1); // still_picture
+        seq.put(1, 1); // reduced_still_picture_header
+        seq.put(level as u32, 5); // seq_level_idx[0]
+    }
     let (mut wb, mut hb) = (1, 1);
     while wb < 32 && ((w - 1) as u32) >> wb != 0 {
         wb += 1;
@@ -82,9 +99,24 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
     seq.put((hb - 1) as u32, 4);
     seq.put((w - 1) as u32, wb); // max_frame_width_minus_1
     seq.put((h - 1) as u32, hb);
+    if video {
+        seq.put(0, 1); // frame_id_numbers_present_flag
+    }
     seq.put(0, 1); // use_128x128_superblock
     seq.put(fp.enable_filter_intra as u32, 1);
     seq.put(fp.enable_intra_edge_filter as u32, 1);
+    if video {
+        seq.put(0, 1); // enable_interintra_compound
+        seq.put(0, 1); // enable_masked_compound
+        seq.put(0, 1); // enable_warped_motion
+        seq.put(0, 1); // enable_dual_filter
+        seq.put(0, 1); // enable_order_hint (so no jnt_comp, ref-frame MVs, order hints)
+        // Screen content tools are chosen per frame, so that a key frame codes exactly a still
+        // picture's tile data; with them (every inter frame), force_integer_mv = 1.
+        seq.put(1, 1); // seq_choose_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS
+        seq.put(0, 1); // seq_choose_integer_mv
+        seq.put(1, 1); // seq_force_integer_mv
+    }
     seq.put(0, 1); // enable_superres
     seq.put(fp.enable_cdef as u32, 1);
     seq.put(0, 1); // enable_restoration
@@ -103,16 +135,49 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
     seq.put(0, 1); // film_grain_params_present
     seq.trailing_bits();
 
-    // ---- uncompressed_header (reduced_still_picture_header) ----
+    // ---- uncompressed_header ----
     let sct = fp.allow_screen_content_tools as u32;
-    fh.put(0, 1); // disable_cdf_update
-    fh.put(sct, 1); // allow_screen_content_tools
-    if sct != 0 {
-        fh.put(0, 1); // force_integer_mv (overridden to 1 for intra frames)
-    }
-    fh.put(0, 1); // render_and_frame_size_different
-    if sct != 0 {
-        fh.put(0, 1); // allow_intrabc
+    if video {
+        fh.put(0, 1); // show_existing_frame
+        fh.put(inter as u32, 2); // frame_type: KEY_FRAME / INTER_FRAME
+        fh.put(1, 1); // show_frame (showable_frame = frame_type != KEY_FRAME)
+        if inter {
+            fh.put(fp.error_resilient_mode as u32, 1); // (key frames shown: 1)
+        }
+        fh.put(0, 1); // disable_cdf_update
+        fh.put(sct, 1); // allow_screen_content_tools (SELECT); force_integer_mv = seq's 1
+        fh.put(0, 1); // frame_size_override_flag
+        if inter {
+            if fp.error_resilient_mode == 0 {
+                fh.put(PRIMARY_REF_NONE as u32, 3); // primary_ref_frame
+            }
+            fh.put(fp.refresh_frame_flags as u32, 8);
+            for _ in 0..REFS_PER_FRAME {
+                fh.put(fp.ref_slot as u32, 3); // ref_frame_idx[i]
+            }
+            fh.put(0, 1); // render_and_frame_size_different
+            // force_integer_mv: no allow_high_precision_mv
+            fh.put(0, 1); // is_filter_switchable
+            fh.put(EIGHTTAP as u32, 2); // interpolation_filter
+            fh.put(0, 1); // is_motion_mode_switchable
+        } else {
+            // key frame: refresh_frame_flags = allFrames, primary_ref_frame = NONE
+            fh.put(0, 1); // render_and_frame_size_different
+            if sct != 0 {
+                fh.put(0, 1); // allow_intrabc
+            }
+        }
+        fh.put(1, 1); // disable_frame_end_update_cdf
+    } else {
+        fh.put(0, 1); // disable_cdf_update
+        fh.put(sct, 1); // allow_screen_content_tools
+        if sct != 0 {
+            fh.put(0, 1); // force_integer_mv (overridden to 1 for intra frames)
+        }
+        fh.put(0, 1); // render_and_frame_size_different
+        if sct != 0 {
+            fh.put(0, 1); // allow_intrabc
+        }
     }
     // tile_info
     fh.put(1, 1); // uniform_tile_spacing_flag
@@ -198,7 +263,15 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
     }
     // lr_params: disabled in the sequence header
     fh.put((fp.tx_mode_select != 0) as u32, 1);
+    if inter {
+        fh.put(0, 1); // reference_select (frame_reference_mode); no skip mode, no warped motion
+    }
     fh.put((fp.reduced_tx_set != 0) as u32, 1);
+    if inter {
+        for _ in LAST_FRAME..=ALTREF_FRAME {
+            fh.put(0, 1); // is_global (global_motion_params)
+        }
+    }
     fh.byte_align();
 }
 

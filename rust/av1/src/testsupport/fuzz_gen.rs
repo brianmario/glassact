@@ -529,6 +529,7 @@ impl FuzzCase {
             block_txb: self.block_txb.as_mut_ptr(),
             txb: self.txb.as_mut_ptr(),
             coeffs: self.coeffs.as_mut_ptr(),
+            inter: core::ptr::null_mut(),
         }
     }
 }

@@ -5,7 +5,7 @@ use super::sink::{EcSink, TeeSink};
 use super::walk::{Frame, Rec, TileBufs, TileState, Walk};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
-use crate::dsp::{tx_coeffs, tx_h, tx_w};
+use crate::dsp::{RefPlane, tx_coeffs, tx_h, tx_w};
 use crate::entropy::Ec;
 use crate::postfilter::{PfFrame, PfMaps, cdef_frame, deblock_frame};
 use crate::tables::TX_SIZES_ALL;
@@ -40,8 +40,12 @@ struct FrameBufs {
 pub struct Extras<'a> {
     /// one entry per tile (raster order): tiles the caller already has
     pub tile_skip: Option<&'a [TileSkip<'a>]>,
-    /// record every coded tile's packed symbol stream ([`Writer::tile_syms`])
+    /// record every coded tile's packed symbol stream ([`Writer::tile_syms`]; intra frames only:
+    /// the GPU entropy coder's symbol streams have no inter syntax)
     pub record_syms: bool,
+    /// the reference pictures by slot (video mode): an inter frame predicts from
+    /// `refs[fp.ref_slot]`, which must be present unless the reconstruction is skipped
+    pub refs: Option<&'a RefSlots<'a>>,
 }
 
 /// The DecisionRecord writer with its scratch: per-thread tile state, per-tile reconstruction
@@ -147,8 +151,8 @@ fn code_tile<H: TxbHook>(
 }
 
 fn check_frame(fp: &FrameParams) -> Res<()> {
-    if fp.version != DECISIONS_VERSION {
-        fail!(ERR_INVALID, "record version {} != {DECISIONS_VERSION}", fp.version);
+    if fp.version != DECISIONS_VERSION && fp.version != 1 {
+        fail!(ERR_INVALID, "record version {} (1 or {DECISIONS_VERSION})", fp.version);
     }
     if fp.width < 1 || fp.height < 1 || fp.width > 65535 || fp.height > 65535 {
         fail!(ERR_INVALID, "bad size {}x{}", fp.width, fp.height);
@@ -212,7 +216,75 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     if fp.allow_screen_content_tools > 1 {
         fail!(ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
+    // v2: video mode (in v1 these were reserved bytes, which must be 0)
+    let v2 = [
+        fp.video,
+        fp.frame_type,
+        fp.ref_slot,
+        fp.refresh_frame_flags,
+        fp.error_resilient_mode,
+    ];
+    if fp.version == 1 && v2.iter().any(|&r| r != 0) {
+        fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
+    }
+    if fp.video > 1 || fp.frame_type > FRAME_INTER {
+        fail!(ERR_INVALID, "video must be 0/1, frame_type key or inter");
+    }
+    if fp.video == 0 && fp.frame_type != FRAME_KEY {
+        fail!(ERR_INVALID, "inter frames need video mode");
+    }
+    if fp.frame_type == FRAME_KEY {
+        if fp.ref_slot != 0 || fp.refresh_frame_flags != 0 || fp.error_resilient_mode != 0 {
+            fail!(
+                ERR_INVALID,
+                "key frames refresh every slot: ref_slot, refresh_frame_flags and error_resilient_mode must be 0"
+            );
+        }
+    } else {
+        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 {
+            fail!(ERR_INVALID, "ref_slot must be 0..7, error_resilient_mode 0/1");
+        }
+        if fp.allow_screen_content_tools != 1 {
+            fail!(
+                ERR_INVALID,
+                "inter frames need allow_screen_content_tools = 1 (it carries force_integer_mv)"
+            );
+        }
+    }
     Ok(())
+}
+
+/// LAST_FRAME's planes of an inter frame: the slot's planes, checked against the picture size.
+fn ref_planes<'a>(fp: &FrameParams, refs: Option<&RefSlots<'a>>) -> Res<[RefPlane<'a>; 3]> {
+    let Some(r) = refs.and_then(|r| r[fp.ref_slot as usize]) else {
+        fail!(ERR_INVALID, "inter frame: reference slot {} is empty", fp.ref_slot);
+    };
+    let mut out = [RefPlane {
+        data: &[],
+        stride: 0,
+        w: 0,
+        h: 0,
+    }; 3];
+    for p in 0..if fp.monochrome != 0 { 1 } else { 3 } {
+        let sub = (p != 0) as u32;
+        let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
+        let (data, stride) = (r.plane[p], r.stride[p]);
+        if stride < w as usize || data.len() < (h as usize - 1) * stride + w as usize {
+            fail!(
+                ERR_INVALID,
+                "reference slot {} plane {p}: {} samples at stride {stride} don't hold {w}x{h}",
+                fp.ref_slot,
+                data.len()
+            );
+        }
+        out[p] = RefPlane {
+            data,
+            stride,
+            w: w as i32,
+            h: h as i32,
+        };
+    }
+    Ok(out)
 }
 
 /// The tx-block and coefficient ranges of each tile, if they are ordered and disjoint (always so
@@ -307,6 +379,21 @@ impl Writer {
         self.encode_with_hook::<NoHook>(rec, opts, None, &Extras::default(), out)
     }
 
+    /// av1g_encode_ex: [`Writer::encode`] with the reference pictures (inter frames).
+    pub fn encode_ex(
+        &mut self,
+        rec: RecordMut,
+        opts: &EncodeOpts,
+        refs: &RefSlots,
+        out: &mut Output,
+    ) -> Result<(), Error> {
+        let extras = Extras {
+            refs: Some(refs),
+            ..Extras::default()
+        };
+        self.encode_with_hook::<NoHook>(rec, opts, None, &extras, out)
+    }
+
     /// av1g::encode_with_hook: [`Writer::encode`] with the closed-loop hook, tile skips and the
     /// per-tile symbol streams.
     pub fn encode_with_hook<H: TxbHook>(
@@ -344,6 +431,18 @@ impl Writer {
         if rec.block_txb[n_blocks] as usize != rec.txb.len() {
             fail!(ERR_INVALID, "layout stale (call av1g_layout)");
         }
+        if !rec.inter.is_empty() && rec.inter.len() != n_blocks {
+            fail!(ERR_INVALID, "{} inter entries for {n_blocks} blocks", rec.inter.len());
+        }
+        let inter = fp.frame_type == FRAME_INTER;
+        if inter && extras.record_syms {
+            fail!(ERR_INVALID, "symbol streams are for intra frames only");
+        }
+        let refs = if inter && do_recon {
+            Some(ref_planes(&fp, extras.refs)?)
+        } else {
+            None
+        };
         let (w, h) = (fp.width, fp.height);
         let mono = fp.monochrome != 0;
         let (mi_cols, mi_rows) = (mi_cols(w as i32), mi_rows(h as i32));
@@ -414,6 +513,8 @@ impl Writer {
             fix_range,
             check_edges,
             ordmap: &self.ordmap,
+            inter,
+            refs,
         };
 
         // ---- tiles ----
@@ -496,6 +597,7 @@ impl Writer {
         if !parallel {
             let mut r = Rec::Write {
                 blocks: rec.blocks,
+                inter: rec.inter,
                 block_txb: rec.block_txb,
                 txb: &mut *rec.txb,
                 txb_base: 0,
@@ -557,6 +659,7 @@ impl Writer {
                     Mutex::new(TileTask {
                         rec: Rec::Write {
                             blocks: rec.blocks,
+                            inter: rec.inter,
                             block_txb: rec.block_txb,
                             txb: tx,
                             txb_base: t0,

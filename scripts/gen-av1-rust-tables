@@ -13,7 +13,7 @@ import os, re, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INC = [os.path.join(ROOT, p) for p in ("Sources/GlassActAV1/Shaders", "Sources/AV1Core/include", "Sources/AV1Encoder/include", "rust/av1/oracle/cpp/include")]
-HEADERS = ["av1g/spec_tables.h", "av1g/cdf_defaults.h", "av1f/aom_tables_gen.h"]
+HEADERS = ["av1g/spec_tables.h", "av1g/cdf_defaults.h", "av1g/inter_tables.h", "av1f/aom_tables_gen.h"]
 OUT = os.path.join(ROOT, "rust/av1/src/tables")
 RUST_T = {"uint8_t": "u8", "int8_t": "i8", "uint16_t": "u16", "int16_t": "i16", "uint32_t": "u32",
           "int32_t": "i32", "int": "i32"}

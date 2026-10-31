@@ -1,7 +1,7 @@
 //! The deterministic tx-block layout of a record (av1g_layout) and the delta-q helpers.
 use crate::blockinfo::*;
 use crate::tables::*;
-use crate::types::{Block, ERR_CAPACITY, ERR_INVALID, FrameParams, Txb};
+use crate::types::{Block, BlockInter, ERR_CAPACITY, ERR_INVALID, FrameParams, Txb};
 
 /// A record's tx-block and coefficient counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -14,21 +14,33 @@ fn depth(b: &Block) -> i32 {
     (b.tx_depth as i32).min(max_tx_depth(b.bsize as i32))
 }
 
+/// Whether block `b` is inter (`inter` empty: none is).
+#[inline]
+fn is_inter(inter: &[BlockInter], b: usize) -> bool {
+    inter.get(b).is_some_and(|i| i.is_inter != 0)
+}
+
 /// av1g_layout's first pass: the counts. Errors: [`ERR_INVALID`] (a bsize >= BLOCK_SIZES or a
 /// block starting outside the coded area).
 pub fn layout_counts(fp: &FrameParams, blocks: &[Block]) -> Result<LayoutCounts, i32> {
+    layout_counts_ex(fp, blocks, &[])
+}
+
+/// [`layout_counts`] of a record with inter blocks (`inter`: one entry per block, or empty).
+pub fn layout_counts_ex(fp: &FrameParams, blocks: &[Block], inter: &[BlockInter]) -> Result<LayoutCounts, i32> {
     let (mi_cols, mi_rows) = (mi_cols(fp.width as i32), mi_rows(fp.height as i32));
     let mono = fp.monochrome != 0;
     let (mut n, mut nc) = (0u32, 0u64);
-    for k in blocks {
+    for (b, k) in blocks.iter().enumerate() {
         if k.bsize as i32 >= BLOCK_SIZES || k.mi_row as i32 >= mi_rows || k.mi_col as i32 >= mi_cols {
             return Err(ERR_INVALID);
         }
-        for_each_txb(
+        for_each_txb_ex(
             k.bsize as i32,
             k.mi_row as i32,
             k.mi_col as i32,
             depth(k),
+            is_inter(inter, b),
             mono,
             mi_rows,
             mi_cols,
@@ -45,7 +57,19 @@ pub fn layout_counts(fp: &FrameParams, blocks: &[Block]) -> Result<LayoutCounts,
 /// coefficient offsets; tx_type DCT_DCT, eob 0) and returns the counts. Errors: [`ERR_INVALID`] as
 /// [`layout_counts`], [`ERR_CAPACITY`] when an array is too small (nothing written).
 pub fn layout(fp: &FrameParams, blocks: &[Block], block_txb: &mut [u32], txb: &mut [Txb]) -> Result<LayoutCounts, i32> {
-    let counts = layout_counts(fp, blocks)?;
+    layout_ex(fp, blocks, &[], block_txb, txb)
+}
+
+/// [`layout`] of a record with inter blocks (`inter`: one entry per block, or empty): an inter
+/// block's luma tx blocks are in transform_tree order ([`for_each_txb_ex`]).
+pub fn layout_ex(
+    fp: &FrameParams,
+    blocks: &[Block],
+    inter: &[BlockInter],
+    block_txb: &mut [u32],
+    txb: &mut [Txb],
+) -> Result<LayoutCounts, i32> {
+    let counts = layout_counts_ex(fp, blocks, inter)?;
     if block_txb.len() < blocks.len() + 1 || txb.len() < counts.n_txb as usize {
         return Err(ERR_CAPACITY);
     }
@@ -54,11 +78,12 @@ pub fn layout(fp: &FrameParams, blocks: &[Block], block_txb: &mut [u32], txb: &m
     let (mut n, mut nc) = (0usize, 0u64);
     for (b, k) in blocks.iter().enumerate() {
         block_txb[b] = n as u32;
-        for_each_txb(
+        for_each_txb_ex(
             k.bsize as i32,
             k.mi_row as i32,
             k.mi_col as i32,
             depth(k),
+            is_inter(inter, b),
             mono,
             mi_rows,
             mi_cols,

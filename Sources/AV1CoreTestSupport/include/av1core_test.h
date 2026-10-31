@@ -18,6 +18,21 @@ av1t_case *av1t_case_make(uint64_t seed, int maxdim, int big_pct);
 av1g_decision_record *av1t_case_record(av1t_case *c);
 void av1t_case_free(av1t_case *c);
 
+// A random legal inter sequence of `seed` (deterministic, video mode, see
+// av1g/decisions.h): `nframes` frames, the first a key frame, then mostly inter
+// frames with random inter / intra blocks, whole-sample motion vectors (some
+// far outside the picture), skip / non-skip, var-tx depths, random
+// coefficients, reference slots, refresh flags and post-filters; sides up to
+// `maxdim`, monochrome and odd sizes included. Every record is laid out and
+// ready for av1g_encode_ex: frame k's references are the reconstructions of
+// the frames that last refreshed each slot (a key frame refreshes all 8; an
+// inter frame the slots in fp.refresh_frame_flags), which the caller tracks.
+typedef struct av1t_inter_case av1t_inter_case;
+av1t_inter_case *av1t_inter_case_make(uint64_t seed, int maxdim, int nframes);
+int av1t_inter_case_frames(const av1t_inter_case *c);
+av1g_decision_record *av1t_inter_case_record(av1t_inter_case *c, int frame);
+void av1t_inter_case_free(av1t_inter_case *c);
+
 // av1gpu's CPU reference engine (valid and reasonable, not good) on 8-bit
 // 4:2:0 planes: Y w x h, U and V ((w+1)/2) x ((h+1)/2), tightly packed.
 // Writes the encoded picture (with its reconstruction) to `out`; free it

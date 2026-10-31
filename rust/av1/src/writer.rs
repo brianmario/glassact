@@ -2,6 +2,11 @@
 //! decisions and quantized coefficients in, a conformant OBU stream (and AVIF) and the decoder's
 //! exact reconstruction out; and the parser, OBUs back to a record.
 //!
+//! A record is a still picture, or (video mode, decisions.h) a key or inter frame of a stream.
+//! Inter frames take their reference pictures ([`RefSlots`], [`Extras::refs`],
+//! [`Writer::encode_ex`]): blocks predict from LAST_FRAME with whole-sample motion, and the writer
+//! derives each inter block's mode from its MV and the spec's candidate stack (`mvstack`).
+//!
 //! One syntax walk, two directions. The walk mirrors the AV1 spec syntax (5.9 / 5.11) element by
 //! element with the spec's context derivations (8.3.2), generic over a [`sink::Sink`]:
 //! - writing: every syntax element's value comes from the record, the sink codes it (od_ec) and
@@ -14,10 +19,12 @@
 //! and mode-info maps), which are merged into the frame for the post-filters and the outputs.
 //!
 //! - [`Writer`]: the encoder, with its scratch (one per stream: a long-lived writer doesn't
-//!   allocate per picture once its buffers have grown); [`Writer::encode`],
-//!   [`Writer::encode_with_hook`] (the closed-loop [`TxbHook`], tile skips, per-tile symbols);
+//!   allocate per picture once its buffers have grown); [`Writer::encode`], [`Writer::encode_ex`]
+//!   (reference pictures), [`Writer::encode_with_hook`] (the closed-loop [`TxbHook`], tile skips,
+//!   per-tile symbols, references);
 //! - [`validate`], [`parse`];
-//! - [`layout`] / [`layout_counts`] / [`Record::layout`]: the tx-block layout;
+//! - [`layout`] / [`layout_counts`] (`_ex`: with inter blocks) / [`Record::layout`]: the tx-block
+//!   layout;
 //! - [`tile_layout`], [`legalize_sb_qindex`], [`apply_sb_qindex`].
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
@@ -26,17 +33,22 @@ use crate::types::*;
 mod encode;
 mod headers;
 mod layout;
+mod mvstack;
 mod parse;
 pub(crate) mod sink;
 mod tiles;
 mod walk;
 
 #[cfg(test)]
+mod inter_tests;
+#[cfg(test)]
 mod tests;
 
 pub use encode::{ENC_CHECK_EDGES, ENC_SKIP_RECON, Extras, Writer, encode, validate};
 pub(crate) use headers::{BitWriter, frame_obus};
-pub use layout::{LayoutCounts, apply_sb_qindex, layout, layout_counts, legalize_sb_qindex};
+pub use layout::{
+    LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex,
+};
 pub use parse::{Parsed, parse};
 pub(crate) use tiles::choose_level;
 pub use tiles::{TileInfo, compute_tiles, tile_layout};
@@ -75,6 +87,8 @@ pub struct Record {
     pub block_txb: Vec<u32>,
     pub txb: Vec<Txb>,
     pub coeffs: Vec<i16>,
+    /// one entry per block, or empty: every block intra (decisions.h "Inter blocks")
+    pub inter: Vec<BlockInter>,
 }
 
 impl Record {
@@ -90,11 +104,11 @@ impl Record {
     /// rewritten (tx_type DCT_DCT, eob 0), `coeffs` is resized to the layout's count (existing
     /// values are kept, new ones are 0). Errors: [`ERR_INVALID`] (a block's bsize or position).
     pub fn layout(&mut self) -> Result<LayoutCounts, i32> {
-        let n = layout_counts(&self.fp, &self.blocks)?;
+        let n = layout_counts_ex(&self.fp, &self.blocks, &self.inter)?;
         self.block_txb.resize(self.blocks.len() + 1, 0);
         self.txb.resize(n.n_txb as usize, Txb::default());
         self.coeffs.resize(n.n_coeffs as usize, 0);
-        layout(&self.fp, &self.blocks, &mut self.block_txb, &mut self.txb)
+        layout_ex(&self.fp, &self.blocks, &self.inter, &mut self.block_txb, &mut self.txb)
     }
 
     /// The record as the writer takes it.
@@ -105,6 +119,7 @@ impl Record {
             block_txb: &self.block_txb,
             txb: &mut self.txb,
             coeffs: &mut self.coeffs,
+            inter: &self.inter,
         }
     }
 
@@ -119,6 +134,11 @@ impl Record {
             block_txb: self.block_txb.as_mut_ptr(),
             txb: self.txb.as_mut_ptr(),
             coeffs: self.coeffs.as_mut_ptr(),
+            inter: if self.inter.is_empty() {
+                core::ptr::null_mut()
+            } else {
+                self.inter.as_mut_ptr()
+            },
         }
     }
 }
@@ -134,11 +154,14 @@ pub struct RecordMut<'a> {
     pub block_txb: &'a [u32],
     pub txb: &'a mut [Txb],
     pub coeffs: &'a mut [i16],
+    /// `blocks.len()` entries, or empty: every block intra
+    pub inter: &'a [BlockInter],
 }
 
 impl<'a> RecordMut<'a> {
     /// Borrows a C record's arrays (n_blocks + 1 block_txb entries, n_txb tx blocks, n_coeffs
-    /// coefficients). Errors as av1g_encode: [`ERR_INVALID`] when an array is missing.
+    /// coefficients, and for version >= 2 the n_blocks inter entries if `inter` isn't null).
+    /// Errors as av1g_encode: [`ERR_INVALID`] when an array is missing.
     ///
     /// # Safety
     /// The record's pointers must be valid for its counts (block_txb for n_blocks + 1) and not
@@ -166,6 +189,11 @@ impl<'a> RecordMut<'a> {
                 } else {
                     core::slice::from_raw_parts_mut(rec.coeffs, rec.n_coeffs as usize)
                 },
+                inter: if rec.fp.version < 2 || rec.inter.is_null() || rec.n_blocks == 0 {
+                    &[]
+                } else {
+                    core::slice::from_raw_parts(rec.inter, rec.n_blocks as usize)
+                },
             })
         }
     }
@@ -178,6 +206,7 @@ impl<'a> RecordMut<'a> {
             block_txb: self.block_txb,
             txb: self.txb,
             coeffs: self.coeffs,
+            inter: self.inter,
         }
     }
 }
@@ -236,6 +265,29 @@ impl Output {
     }
 }
 
+/// A reference picture for inter frames: the decoder's output of the frame that refreshed a slot
+/// (that frame's [`Output::recon`]: post-filter, cropped, Y width x height, U / V ((width + 1) / 2)
+/// x ((height + 1) / 2), the stream's size), each plane at its row stride. Monochrome: Y only (the
+/// chroma slices are not read).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RefPicture<'a> {
+    pub plane: [&'a [u8]; 3],
+    pub stride: [usize; 3],
+}
+
+impl<'a> RefPicture<'a> {
+    /// A reconstruction as the writer returns it (tightly packed cropped planes).
+    pub fn from_output(o: &'a Output) -> RefPicture<'a> {
+        RefPicture {
+            plane: [&o.recon[0], &o.recon[1], &o.recon[2]],
+            stride: [o.recon_w[0] as usize, o.recon_w[1] as usize, o.recon_w[2] as usize],
+        }
+    }
+}
+
+/// The 8 reference slots (NUM_REF_FRAMES); an inter frame reads `fp.ref_slot`'s.
+pub type RefSlots<'a> = [Option<RefPicture<'a>>; 8];
+
 /// A tile the caller already has (its blocks unchanged since it was coded): the writer doesn't walk
 /// it and takes its payload as given (an empty payload if `None`). Its blocks' outputs (tx block
 /// eob, reconstruction: zeros in the output) are the caller's to fill.
@@ -264,11 +316,16 @@ pub struct TxbCtx<'a> {
     /// the plane's quantizer-matrix level (15 = none): the weights of a tx type are
     /// `dsp::qm(true, qm_level, plane, tx_size, tx_type)`
     pub qm_level: i32,
+    /// the block is inter: `recon` holds its motion-compensated prediction, a luma tx_type the
+    /// hook picks must be in the inter set (`dsp::get_tx_set_inter`), and the chroma type
+    /// derives from the co-located luma type (already final: luma is coded first)
+    pub is_inter: bool,
 }
 
 /// The closed-loop hook: called for every coded tx block of a non-skip block after its exact
-/// prediction has been written to the reconstruction and before the coefficients are range-checked
-/// and coded. It may overwrite the tx block's coefficients (`coeffs`, tw * th row-major) and, for
+/// prediction has been written to the reconstruction (an intra tx block's, or an inter block's
+/// motion-compensated prediction, which is made for the whole block first; [`TxbCtx::is_inter`])
+/// and before the coefficients are range-checked and coded. It may overwrite the tx block's coefficients (`coeffs`, tw * th row-major) and, for
 /// luma, `txb.tx_type`. Used by the hybrid encoder's closed loop and the reference engine.
 ///
 /// Tiles run on parallel threads and share the hook (`&self`, hence `Sync`), as the C++ shares its

@@ -74,10 +74,38 @@ pub struct FrameParams {
     pub cdef_uv_pri: [u8; 8],
     pub cdef_uv_sec: [u8; 8],
     pub allow_screen_content_tools: u8,
-    pub reserved: [u8; 15],
+    // v2: video mode (decisions.h "Video mode")
+    /// 1: one frame of a stream (full sequence and frame headers)
+    pub video: u8,
+    /// [`FRAME_KEY`] / [`FRAME_INTER`]
+    pub frame_type: u8,
+    /// inter: the reference slot (0..7) LAST_FRAME, and every other reference, uses
+    pub ref_slot: u8,
+    /// inter: bit i set = the frame replaces reference slot i
+    pub refresh_frame_flags: u8,
+    /// inter: 0/1
+    pub error_resilient_mode: u8,
+    pub reserved: [u8; 10],
 }
 
-pub const DECISIONS_VERSION: u32 = 1;
+/// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
+/// are still accepted.
+pub const DECISIONS_VERSION: u32 = 2;
+/// av1g_frame_params.frame_type
+pub const FRAME_KEY: u8 = 0;
+pub const FRAME_INTER: u8 = 1;
+
+/// av1g_block_inter: an inter block's motion (decisions.h "Inter blocks"). All zero: intra.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockInter {
+    /// luma motion, 1/8 sample, multiples of 8
+    pub mv_row: i16,
+    pub mv_col: i16,
+    /// 1: inter (LAST_FRAME), 0: intra
+    pub is_inter: u8,
+    pub reserved: [u8; 3],
+}
 
 /// av1g_decision_record: the picture's decisions, with its arrays owned elsewhere (C pointers).
 #[repr(C)]
@@ -91,6 +119,8 @@ pub struct DecisionRecord {
     pub block_txb: *mut u32,
     pub txb: *mut Txb,
     pub coeffs: *mut i16,
+    /// v2: `n_blocks` entries, or null (every block intra); not read for version 1 records
+    pub inter: *mut BlockInter,
 }
 
 // av1g.h return codes and av1g_encode_opts.flags
@@ -133,6 +163,16 @@ pub struct Output {
     pub n_symbols: u64,
     pub n_fixed_txb: u32,
     pub error: [u8; 256],
+}
+
+/// av1g_ref_planes: one reference slot for av1g_encode_ex, the decoder's output of the frame
+/// that refreshed it (av1g_output.recon: Y width x height, U / V ((width + 1) / 2) x ((height +
+/// 1) / 2), post-filter). A null `plane[0]` is an empty slot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RefPlanesC {
+    pub plane: [*const u8; 3],
+    pub stride: [i32; 3],
 }
 
 /// av1g_tiles
@@ -261,6 +301,7 @@ pub struct GaEntTile {
 const _: () = {
     assert!(size_of::<Block>() == 16);
     assert!(size_of::<Txb>() == 16);
+    assert!(size_of::<BlockInter>() == 8);
 };
 
 #[cfg(all(test, feature = "oracle"))]
@@ -292,7 +333,12 @@ mod tests {
         check!(Txb, "Txb", coeff_off: "coeff_off", x4: "x4", eob: "eob");
         check!(FrameParams, "FrameParams", width: "width", monochrome: "monochrome", loop_filter_level: "loop_filter_level",
                cdef_y_pri: "cdef_y_pri", cdef_uv_sec: "cdef_uv_sec", allow_screen_content_tools: "allow_screen_content_tools");
-        check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs");
+        check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
+               refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
+        check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
+        check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
+               inter: "inter");
+        check!(RefPlanesC, "RefPlanes", plane: "plane", stride: "stride");
         check!(EncodeOpts, "EncodeOpts", seq_level_idx: "seq_level_idx");
         check!(Output, "Output", obu_size: "obu_size", recon: "recon", recon_h: "recon_h", tile_bytes: "tile_bytes",
                n_symbols: "n_symbols", n_fixed_txb: "n_fixed_txb", error: "error");

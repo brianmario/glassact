@@ -1,6 +1,9 @@
 /* av1g/decisions.h - the DecisionRecord: every coding decision + quantized
- * coefficients for ONE AV1 intra-only still picture (8-bit, 4:2:0 or monochrome,
- * 64x64 superblocks, reduced_still_picture_header).  Interface version 1.
+ * coefficients for ONE AV1 picture (8-bit, 4:2:0 or monochrome, 64x64
+ * superblocks): an intra-only still picture (reduced_still_picture_header), or a
+ * key frame or inter frame of a video stream (fp.video, see "Video mode" below).
+ * Interface version 2 (version 1 records are still accepted: they are still
+ * pictures, and the version-2 fields are not read).
  *
  * Any search engine that fills this record gets (a) the exact decoder
  * reconstruction and (b) a conformant OBU stream / AVIF from av1core (av1g.h).
@@ -122,6 +125,58 @@
  *
  * Frame-level decisions are in av1g_frame_params.  Lossless (base_q_idx 0), loop
  * restoration, segmentation, delta-lf, palette and intra block copy are not supported.
+ *
+ * Video mode (fp.video = 1, version 2).  The picture is one frame of a stream: a full
+ *   sequence header (not still_picture, no timing info, one operating point, no order
+ *   hints, so no ref-frame MVs / skip mode / distance weights; screen content tools
+ *   selected per frame; seq_force_integer_mv = 1) and a full frame header (show_frame =
+ *   1, primary_ref_frame = NONE: every frame starts from the default CDFs and needs only
+ *   its reference pictures; EIGHTTAP interpolation, not switchable; no motion modes,
+ *   compound, inter-intra, global or warped motion; reference_select = 0).  Everything the
+ *   sequence header carries must be the same in every frame of a stream: width, height,
+ *   monochrome, enable_filter_intra, enable_intra_edge_filter, enable_cdef (a frame can
+ *   still turn CDEF off with cdef_bits = 0 and zero strengths) and separate_uv_delta_q
+ *   (delta_q_v / qm_v differ from U), and the seq_level_idx (pass it in the options when
+ *   tilings differ).
+ *   fp.frame_type AV1G_FRAME_KEY: a key frame; it refreshes every reference slot, and its
+ *     tile data and reconstruction are exactly the still picture's (video = 0).  ref_slot,
+ *     refresh_frame_flags and error_resilient_mode must be 0.
+ *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from ONE reference picture
+ *     (LAST_FRAME; ref_frame_idx[] of all 7 references = fp.ref_slot); it refreshes the
+ *     slots in fp.refresh_frame_flags.  allow_screen_content_tools must be 1 (it carries
+ *     force_integer_mv: every motion vector is whole-pel in luma).  Blocks are intra or
+ *     inter (av1g_decision_record.inter); intra blocks use the inter-frame syntax (y_mode
+ *     CDFs by size group, is_inter, palette flags coded as 0) with the same fields.
+ *   The encoder takes the reference pictures (av1g_encode_ex): the decoder's output of
+ *   the frames that refreshed each slot (its av1g_output.recon planes, post-filter and
+ *   cropped); prediction clamps to their edges as the spec does.
+ *
+ * Inter blocks (av1g_block_inter, one per block when rec.inter != NULL).
+ *   is_inter       1: the block predicts from LAST_FRAME with motion vector (mv_row, mv_col);
+ *                  0: an intra block (av1g_block's mode fields apply).  NULL rec.inter, and
+ *                  every block of a key frame: intra.
+ *   mv_row/mv_col  luma motion in 1/8 sample, multiples of 8 (whole samples), |mv| < 2^14
+ *                  (spec is_mv_valid).  May point outside the reference: samples clamp to its
+ *                  edges.  Chroma (4:2:0) uses mv / 2: half-sample positions, filtered with
+ *                  EIGHTTAP (4-tap for blocks 4 wide / high or less), as the spec specifies.
+ *   The mode is not stored: the writer derives it from the MV and the block's MV candidate
+ *   stack (spec 7.10.2, which depends only on decisions already coded): mv == 0 -> GLOBALMV
+ *   (identity global motion); mv == RefStackMv[0] -> NEARESTMV; mv == RefStackMv[1..3]
+ *   (an index the stack has) -> NEARMV with that drl index; otherwise NEWMV, coded as a
+ *   difference to the candidate (drl index 0..2 the stack allows) whose difference costs
+ *   the fewest MV-class bits (2 + 2 * mv_class per nonzero component, + the drl index; ties
+ *   to the lowest index).  The difference must fit (each component |diff| <= 2^14).
+ *   An inter block's av1g_block fields: mi_row, mi_col, bsize, skip, tx_depth, cdef_idx,
+ *   sb_qindex as for intra blocks; y_mode, angle_delta_y/uv, uv_mode, cfl_alpha_u/v and
+ *   filter_intra must be 0.  tx_depth (fp.tx_mode_select = 1, skip = 0): the luma tx size
+ *   is Max_Tx_Size_Rect[bsize] split tx_depth times, uniformly over the block (the spec's
+ *   var-tx tree, txfm_split coded at every node), 0..min(2, Max_Tx_Depth[bsize]) as for
+ *   intra blocks; skip inter blocks have no tx_depth (0).  Luma tx blocks are laid out in
+ *   the spec's transform_tree order (recursive halves / quadrants, not raster: they differ
+ *   for depth 2), then U and V as for intra blocks.  Luma tx_type: a type of the INTER set
+ *   of get_tx_set() (16 types up to 16x16, 12 at 16x16, IDTX / DCT at 32 or with
+ *   reduced_tx_set, DCT only at 64).  Chroma tx_type is derived (output): the co-located
+ *   luma tx block's type if it is in the chroma size's inter set, else DCT_DCT.
  * ==============================================================================
  */
 #ifndef AV1G_DECISIONS_H
@@ -134,7 +189,11 @@
 extern "C" {
 #endif
 
-#define AV1G_DECISIONS_VERSION 1
+#define AV1G_DECISIONS_VERSION 2
+
+/* av1g_frame_params.frame_type (video mode) */
+#define AV1G_FRAME_KEY   0
+#define AV1G_FRAME_INTER 1
 
 typedef struct av1g_block {
     uint16_t mi_row;         /* top-left position, luma 4x4 units */
@@ -196,9 +255,23 @@ typedef struct av1g_frame_params {
     /* ---- v1 extension (0 = off, backward compatible) ---- */
     uint8_t  allow_screen_content_tools; /* 1: frame header allows screen content tools; palette is still
                                             never used (has_palette_y/uv coded as 0).  Only needed to
-                                            replay libaom streams whose screen-content detection set it. */
-    uint8_t  reserved[15];
+                                            replay libaom streams whose screen-content detection set it.
+                                            Inter frames: must be 1 (force_integer_mv). */
+    /* ---- v2: video mode (0 = a still picture, as in v1), see "Video mode" above ---- */
+    uint8_t  video;                /* 1: one frame of a stream (full sequence + frame headers) */
+    uint8_t  frame_type;           /* AV1G_FRAME_KEY / AV1G_FRAME_INTER (needs video) */
+    uint8_t  ref_slot;             /* inter: the reference slot 0..7 LAST_FRAME (all 7 refs) uses */
+    uint8_t  refresh_frame_flags;  /* inter: bit i = this frame replaces slot i (0 = none) */
+    uint8_t  error_resilient_mode; /* inter: 0/1 (header only: primary_ref_frame is NONE anyway) */
+    uint8_t  reserved[10];
 } av1g_frame_params;
+
+typedef struct av1g_block_inter {
+    int16_t  mv_row;         /* luma, 1/8 sample, multiple of 8 */
+    int16_t  mv_col;
+    uint8_t  is_inter;       /* 1: inter (LAST_FRAME), 0: intra */
+    uint8_t  reserved[3];    /* 0 */
+} av1g_block_inter;
 
 typedef struct av1g_decision_record {
     av1g_frame_params fp;
@@ -209,6 +282,8 @@ typedef struct av1g_decision_record {
     uint32_t   *block_txb;   /* [n_blocks + 1] first txb of each block (layout) */
     av1g_txb   *txb;         /* [n_txb] */
     int16_t    *coeffs;      /* [n_coeffs] */
+    /* ---- v2 ---- */
+    av1g_block_inter *inter; /* [n_blocks] or NULL: every block intra (read for version >= 2 only) */
 } av1g_decision_record;
 
 #ifdef __cplusplus

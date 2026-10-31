@@ -6,11 +6,12 @@
 //! superblocks, at tile-local coordinates): every read of the walk is gated by tile-local
 //! availability, so tiles share nothing while they are coded.
 
+use super::mvstack::{MvMaps, MvStack, REF_UNSET, derive_mode, find_mv_stack, mv_class};
 use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
 use crate::blockinfo::*;
 use crate::dsp::*;
-use crate::entropy::Cdfs;
+use crate::entropy::{Cdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::*;
 
@@ -30,6 +31,10 @@ pub(crate) struct Frame<'a> {
     pub check_edges: bool,
     /// [`super::ENC_CHECK_EDGES`]: per plane, the covering tx block index of every 4x4
     pub ordmap: &'a [Vec<u32>; 3],
+    /// an inter frame (video mode, frame_type INTER): inter_frame_mode_info
+    pub inter: bool,
+    /// an inter frame with a reconstruction: LAST_FRAME's planes
+    pub refs: Option<[RefPlane<'a>; 3]>,
 }
 
 impl Frame<'_> {
@@ -65,6 +70,10 @@ pub(crate) struct TileBufs {
     pub lf_uv: [Vec<u8>; 2],
     /// cdef_idx per 64x64 (-1: no non-skip block)
     pub sb_cdef: Vec<i8>,
+    /// inter frames: RefFrames[.][.][0] (0 intra, 1 LAST_FRAME, REF_UNSET not coded yet) and
+    /// Mvs[.][.][0] (valid where LAST_FRAME), mh x mw
+    pub ref0: Vec<u8>,
+    pub mvs: Vec<[i16; 2]>,
 }
 
 impl TileBufs {
@@ -107,6 +116,11 @@ impl TileBufs {
         }
         self.sb_cdef.clear();
         self.sb_cdef.resize((self.sb_cols * self.sb_rows) as usize, -1);
+        if f.inter {
+            self.ref0.clear();
+            self.ref0.resize(nmi, REF_UNSET);
+            self.mvs.resize(nmi, [0; 2]);
+        }
     }
 
     /// A tile that isn't coded: zero samples and maps, as the C++'s zero-initialized frame has.
@@ -122,9 +136,22 @@ impl TileBufs {
     }
 }
 
+/// What the inter syntax coded, for the tests' coverage reports: GLOBALMV, NEARESTMV, NEARMV,
+/// NEWMV blocks; NEARMV / NEWMV with a drl index > 0 / 1; intra blocks of inter frames; inter
+/// blocks with a var-tx split; sub-8x8 chroma predicted from several blocks' motion.
+#[cfg(test)]
+pub(crate) static INTER_STAT: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+#[inline(always)]
+fn inter_stat(_k: usize) {
+    #[cfg(test)]
+    INTER_STAT[_k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The parser's record being built.
 #[derive(Default)]
 pub(crate) struct ParseRec {
+    /// inter frames: one entry per block
+    pub inter: Vec<BlockInter>,
     pub blocks: Vec<Block>,
     pub block_txb: Vec<u32>,
     pub txb: Vec<Txb>,
@@ -135,6 +162,8 @@ pub(crate) struct ParseRec {
 pub(crate) enum Rec<'a> {
     Write {
         blocks: &'a [Block],
+        /// one per block, or empty (all intra)
+        inter: &'a [BlockInter],
         block_txb: &'a [u32],
         /// this tile's tx blocks, the first being txb[txb_base]
         txb: &'a mut [Txb],
@@ -154,6 +183,15 @@ const LEV_N: usize = (32 + LEV_STRIDE_PAD) * (32 + LEV_STRIDE_PAD);
 /// One worker's tile state: CDFs, coefficient contexts, BlockDecoded, the current block. Reused.
 pub(crate) struct TileState {
     pub cdf: Cdfs,
+    /// inter frames' CDFs
+    icdf: Box<InterCdfs>,
+    mc: Box<McScratch>,
+    /// the current block's luma TxTypes (inter blocks: chroma derives from them), block-relative 4x4s
+    tx_types: [[u8; 16]; 16],
+    /// the current inter block's luma tx blocks in transform_tree order
+    tree: [(i32, i32); 16],
+    n_tree: usize,
+    is_inter: bool,
     above_level: [Vec<u8>; 3],
     above_dc: [Vec<u8>; 3],
     left_level: [Vec<u8>; 3],
@@ -200,6 +238,12 @@ impl Default for TileState {
     fn default() -> Self {
         TileState {
             cdf: Cdfs::new(0),
+            icdf: Box::default(),
+            mc: Box::default(),
+            tx_types: [[0; 16]; 16],
+            tree: [(0, 0); 16],
+            n_tree: 0,
+            is_inter: false,
             above_level: Default::default(),
             above_dc: Default::default(),
             left_level: Default::default(),
@@ -432,6 +476,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         st.mi_col_start = f.tiles.mi_col_starts[tile_col] as i32;
         st.mi_col_end = f.tiles.mi_col_starts[tile_col + 1] as i32;
         st.cdf.init(f.fp.base_q_idx as i32);
+        if f.inter {
+            st.icdf.init();
+        }
         st.current_q_index = f.fp.base_q_idx as i32;
         st.block_q = -1;
         st.set_block_q(&f.fp, f.fp.base_q_idx as i32);
@@ -677,250 +724,23 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         Ok(())
     }
 
-    fn check_block_fields(&self, b: &Block) -> Res<()> {
-        let fp = &self.f.fp;
-        let (st, b_idx) = (&*self.st, self.st.b_idx);
-        let bs = b.bsize as i32;
-        if bs >= BLOCK_SIZES || bs == BLOCK_64X128 || bs == BLOCK_128X64 || bs == BLOCK_128X128 {
-            fail!(ERR_INVALID, "block {b_idx}: invalid bsize {bs}");
-        }
-        if b.skip > 1 {
-            fail!(ERR_INVALID, "block {b_idx}: skip must be 0/1");
-        }
-        if b.y_mode as i32 > PAETH_PRED {
-            fail!(ERR_INVALID, "block {b_idx}: y_mode {}", b.y_mode);
-        }
-        let dir_ok = bs >= BLOCK_8X8;
-        if b.angle_delta_y < -3
-            || b.angle_delta_y > 3
-            || (b.angle_delta_y != 0 && !(dir_ok && is_directional(b.y_mode as i32)))
-        {
-            fail!(
-                ERR_INVALID,
-                "block {b_idx}: angle_delta_y {} not allowed",
-                b.angle_delta_y
-            );
-        }
-        if fp.tx_mode_select != 0 {
-            if b.tx_depth as i32 > max_tx_depth(bs) || (bs == BLOCK_4X4 && b.tx_depth != 0) {
-                fail!(ERR_INVALID, "block {b_idx}: tx_depth {} too large", b.tx_depth);
-            }
-        } else if b.tx_depth != 0 {
-            fail!(ERR_INVALID, "block {b_idx}: tx_depth must be 0 (TX_MODE_LARGEST)");
-        }
-        let cdef_bad = if fp.enable_cdef != 0 {
-            b.cdef_idx < 0 || b.cdef_idx as i32 >= (1 << fp.cdef_bits)
-        } else {
-            b.cdef_idx != 0
-        };
-        if cdef_bad {
-            fail!(ERR_INVALID, "block {b_idx}: cdef_idx {} out of range", b.cdef_idx);
-        }
-        if b.filter_intra != 0
-            && (b.filter_intra > 5
-                || fp.enable_filter_intra == 0
-                || b.y_mode as i32 != DC_PRED
-                || bw4(bs) > 8
-                || bh4(bs) > 8)
-        {
-            fail!(
-                ERR_INVALID,
-                "block {b_idx}: filter_intra {} not allowed here",
-                b.filter_intra
-            );
-        }
-        if fp.delta_q_present == 0 && b.sb_qindex != 0 && b.sb_qindex != fp.base_q_idx {
-            fail!(ERR_INVALID, "block {b_idx}: sb_qindex set but delta_q_present = 0");
-        }
-        if st.has_chroma {
-            if b.uv_mode as i32 > UV_CFL_PRED {
-                fail!(ERR_INVALID, "block {b_idx}: uv_mode {}", b.uv_mode);
-            }
-            if b.uv_mode as i32 == UV_CFL_PRED {
-                if !cfl_allowed(bs) {
-                    fail!(ERR_INVALID, "block {b_idx}: CFL not allowed for bsize {bs}");
-                }
-                if b.cfl_alpha_u < -16
-                    || b.cfl_alpha_u > 16
-                    || b.cfl_alpha_v < -16
-                    || b.cfl_alpha_v > 16
-                    || (b.cfl_alpha_u == 0 && b.cfl_alpha_v == 0)
-                {
-                    fail!(
-                        ERR_INVALID,
-                        "block {b_idx}: bad CFL alphas {} {}",
-                        b.cfl_alpha_u,
-                        b.cfl_alpha_v
-                    );
-                }
-            }
-            if b.angle_delta_uv < -3
-                || b.angle_delta_uv > 3
-                || (b.angle_delta_uv != 0 && !(dir_ok && is_directional(b.uv_mode as i32)))
-            {
-                fail!(
-                    ERR_INVALID,
-                    "block {b_idx}: angle_delta_uv {} not allowed",
-                    b.angle_delta_uv
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// decode_block (intra_frame_mode_info, the residual)
-    fn block(&mut self, rec: &mut Rec, r: i32, c: i32, bsize: i32) -> Res<()> {
+    /// The intra mode info of a block: intra_frame_mode_info's modes (key frames: y mode CDFs by
+    /// the neighbours' modes) or intra_block_mode_info (inter frames: by size group), then the
+    /// angles, the chroma mode and CfL, palette_mode_info (never a palette) and
+    /// filter_intra_mode_info.
+    #[inline(always)]
+    fn intra_mode_info(&mut self, b: &mut Block, r: i32, c: i32, bsize: i32) -> Res<()> {
         let f = self.f;
         let fp = &f.fp;
-        let mut b;
-        let mut parse_txb0 = 0u32;
-        match rec {
-            Rec::Write { blocks, .. } => {
-                let st = &mut *self.st;
-                if st.cursor >= st.tile_end {
-                    fail!(ERR_INVALID, "block list ends early (expected block at mi {r},{c})");
-                }
-                st.b_idx = st.cursor;
-                b = blocks[st.cursor as usize];
-                if b.mi_row as i32 != r || b.mi_col as i32 != c || b.bsize as i32 != bsize {
-                    fail!(
-                        ERR_INVALID,
-                        "block {}: got mi ({},{}) bsize {}, partition syntax expects ({r},{c}) bsize {bsize}",
-                        st.cursor,
-                        b.mi_row,
-                        b.mi_col,
-                        b.bsize
-                    );
-                }
-                st.cursor += 1;
-            }
-            Rec::Parse(p) => {
-                b = Block {
-                    mi_row: r as u16,
-                    mi_col: c as u16,
-                    bsize: bsize as u8,
-                    ..Default::default()
-                };
-                self.st.b_idx = p.blocks.len() as u32;
-                parse_txb0 = p.txb.len() as u32;
-            }
-        }
         let st = &mut *self.st;
-        st.mi_row = r;
-        st.mi_col = c;
-        st.mi_size = bsize;
-        st.bw4 = bw4(bsize);
-        st.bh4 = bh4(bsize);
-        st.has_chroma = has_chroma(bsize, r, c, f.mono);
-        st.avail_u = st.is_inside(r - 1, c);
-        st.avail_l = st.is_inside(r, c - 1);
-        st.avail_uc = st.avail_u;
-        st.avail_lc = st.avail_l;
-        if st.has_chroma {
-            if st.bh4 == 1 {
-                st.avail_uc = st.is_inside(r - 2, c);
-            }
-            if st.bw4 == 1 {
-                st.avail_lc = st.is_inside(r, c - 2);
-            }
-        } else {
-            st.avail_uc = false;
-            st.avail_lc = false;
-        }
-        let (avail_u, avail_l, has_chroma_) = (st.avail_u, st.avail_l, st.has_chroma);
+        let (avail_u, avail_l, has_chroma_, b_idx) = (st.avail_u, st.avail_l, st.has_chroma, st.b_idx);
         let (bw, bh) = (st.bw4, st.bh4);
-        if S::WRITE {
-            self.check_block_fields(&b)?;
-        }
-        // ---- intra_frame_mode_info ----
-        {
-            let bufs = &*self.bufs;
-            let ctx = if avail_u { bufs.skip[bufs.mi(r - 1, c)] } else { 0 }
-                + if avail_l { bufs.skip[bufs.mi(r, c - 1)] } else { 0 };
-            b.skip = self.sk.sym(&mut self.st.cdf.skip[ctx as usize], b.skip as i32) as u8;
-        }
-        // ---- read_cdef ----
-        if fp.enable_cdef != 0 && b.skip == 0 {
-            let sbi = self.st.sb_index;
-            let sb = self.bufs.sb_cdef[sbi];
-            if sb == -1 {
-                b.cdef_idx = self.lit(b.cdef_idx as i32, fp.cdef_bits as i32) as i8;
-                self.bufs.sb_cdef[sbi] = b.cdef_idx;
-            } else if S::WRITE {
-                if b.cdef_idx != sb {
-                    fail!(
-                        ERR_INVALID,
-                        "block {}: cdef_idx {} differs from its superblock's {sb}",
-                        self.st.b_idx,
-                        b.cdef_idx
-                    );
-                }
-            } else {
-                b.cdef_idx = sb;
-            }
-        }
-        // ---- read_delta_qindex ----
-        if fp.delta_q_present != 0 {
-            if self.st.read_deltas && !(bsize == BLOCK_64X64 && b.skip != 0) {
-                let res = fp.delta_q_res as i32;
-                let step = 1 << res;
-                let mut reduced_w = 0;
-                if S::WRITE {
-                    let diff = b.sb_qindex as i32 - self.st.current_q_index;
-                    if b.sb_qindex < 1 || diff % step != 0 {
-                        fail!(
-                            ERR_INVALID,
-                            "block {}: sb_qindex {} not reachable from {} with delta_q_res {res} (use av1g_legalize_sb_qindex)",
-                            self.st.b_idx,
-                            b.sb_qindex,
-                            self.st.current_q_index
-                        );
-                    }
-                    reduced_w = diff / step;
-                }
-                let abs_w = reduced_w.abs();
-                let mut a = self.sk.sym(&mut self.st.cdf.delta_q, abs_w.min(DELTA_Q_SMALL));
-                if a == DELTA_Q_SMALL {
-                    let mut rem_w = 1;
-                    while ((abs_w - 1) >> (rem_w + 1)) > 0 {
-                        rem_w += 1; // floor(log2(abs - 1))
-                    }
-                    let rem_bits = self.lit(rem_w - 1, 3) + 1;
-                    let abs_bits = self.lit((abs_w - 1) - (1 << rem_bits), rem_bits);
-                    a = abs_bits + (1 << rem_bits) + 1;
-                }
-                if a != 0 {
-                    let sign = self.sk.bit((reduced_w < 0) as i32);
-                    let reduced = if sign != 0 { -a } else { a };
-                    self.st.current_q_index = clip3(1, 255, self.st.current_q_index + reduced * step);
-                }
-            }
-            if S::WRITE {
-                if b.sb_qindex as i32 != self.st.current_q_index && !(bsize == BLOCK_64X64 && b.skip != 0) {
-                    fail!(
-                        ERR_INVALID,
-                        "block {}: sb_qindex {} differs from its superblock's qindex {}",
-                        self.st.b_idx,
-                        b.sb_qindex,
-                        self.st.current_q_index
-                    );
-                }
-            } else {
-                b.sb_qindex = self.st.current_q_index as u8;
-            }
-        }
-        let st = &mut *self.st;
-        st.read_deltas = false;
-        let q = if fp.delta_q_present != 0 {
-            st.current_q_index
-        } else {
-            fp.base_q_idx as i32
-        };
-        st.set_block_q(fp, q);
-        let b_idx = st.b_idx;
-        let bufs = &mut *self.bufs;
+        let bufs = &*self.bufs;
         let cdf = &mut st.cdf;
-        {
+        if f.inter {
+            let ctx = Size_Group[bsize as usize] as usize;
+            b.y_mode = self.sk.sym(&mut st.icdf.y_mode[ctx], b.y_mode as i32) as u8;
+        } else {
             let am = t8(
                 &Intra_Mode_Context,
                 if avail_u {
@@ -1020,34 +840,693 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         } else if !S::WRITE {
             b.filter_intra = 0;
         }
+        Ok(())
+    }
 
-        // ---- read_block_tx_size / read_tx_size(allowSelect = 1) ----
+    /// The tile's mode info as the MV stack reads it.
+    fn mv_maps(&self) -> MvMaps<'_> {
+        let (bufs, st) = (&*self.bufs, &*self.st);
+        MvMaps {
+            ref0: &bufs.ref0,
+            mvs: &bufs.mvs,
+            y_mode: &bufs.y_mode,
+            mi_size: &bufs.mi_size,
+            r0: bufs.r0,
+            c0: bufs.c0,
+            mw: bufs.mw,
+            row_start: st.mi_row_start,
+            row_end: st.mi_row_end,
+            col_start: st.mi_col_start,
+            col_end: st.mi_col_end,
+            mi_rows: self.f.mi_rows,
+            mi_cols: self.f.mi_cols,
+        }
+    }
+
+    /// inter_block_mode_info for the writer's toolset: read_ref_frames (LAST_FRAME), the MV stack,
+    /// the mode (derived from the MV when writing), the drl index, assign_mv. Returns the YMode.
+    #[inline(never)]
+    fn inter_block_mode_info(&mut self, r: i32, c: i32, bsize: i32, bi: &mut BlockInter) -> Res<i32> {
+        let b_idx = self.st.b_idx;
+        // read_ref_frames: single_ref_p1 = p3 = p4 = 0. With only LAST_FRAME and intra neighbours
+        // every count but LAST_FRAME's is 0, so the three contexts are ref_count_ctx(last, 0).
+        let last_count = {
+            let (bufs, st) = (&*self.bufs, &*self.st);
+            let last = |k: usize| (bufs.ref0[k] as i32 == LAST_FRAME) as i32;
+            (if st.avail_u { last(bufs.mi(r - 1, c)) } else { 0 })
+                + if st.avail_l { last(bufs.mi(r, c - 1)) } else { 0 }
+        };
+        let rctx = if last_count == 0 { 1 } else { 2 };
+        for p in [0, 2, 3] {
+            if self.sk.sym(&mut self.st.icdf.single_ref[rctx][p], 0) != 0 {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: reference frames other than LAST_FRAME are not supported"
+                );
+            }
+        }
+        let s: MvStack = find_mv_stack(&self.mv_maps(), r, c, bsize);
+        let mv_w = [bi.mv_row as i32, bi.mv_col as i32];
+        let (mode_w, idx_w) = if S::WRITE {
+            match derive_mode(&s, mv_w) {
+                Some(m) => m,
+                None => fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: mv ({},{}) is too far from every candidate to code (NEWMV difference > 2^14)",
+                    mv_w[0],
+                    mv_w[1]
+                ),
+            }
+        } else {
+            (0, 0)
+        };
+        let ic = &mut self.st.icdf;
+        let mode = if self.sk.sym(&mut ic.new_mv[s.new_mv_ctx], (mode_w != NEWMV) as i32) == 0 {
+            NEWMV
+        } else if self.sk.sym(&mut ic.zero_mv[0], (mode_w != GLOBALMV) as i32) == 0 {
+            GLOBALMV // ZeroMvContext is 0 without reference-frame MVs
+        } else if self.sk.sym(&mut ic.ref_mv[s.ref_mv_ctx], (mode_w == NEARMV) as i32) == 0 {
+            NEARESTMV
+        } else {
+            NEARMV
+        };
+        let mut ref_mv_idx = 0;
+        let first = if mode == NEWMV {
+            Some(0)
+        } else if mode == NEARMV {
+            ref_mv_idx = 1;
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(first) = first {
+            for idx in first..first + 2 {
+                if s.num > idx + 1 {
+                    if self.sk.sym(&mut ic.drl_mode[s.drl_ctx[idx]], (idx_w > idx) as i32) == 0 {
+                        ref_mv_idx = idx;
+                        break;
+                    }
+                    ref_mv_idx = idx + 1;
+                }
+            }
+        }
+        if S::WRITE && (mode, ref_mv_idx) != (mode_w, if mode_w == NEARESTMV { 0 } else { idx_w }) {
+            fail!(
+                ERR_INTERNAL,
+                "block {b_idx}: inter mode {mode_w}/{idx_w} coded as {mode}/{ref_mv_idx}"
+            );
+        }
+        // assign_mv
+        let mv = match mode {
+            GLOBALMV => [0, 0],
+            NEARESTMV => s.mv[0],
+            NEARMV => s.mv[ref_mv_idx],
+            _ => {
+                let pred = s.mv[if s.num <= 1 { 0 } else { ref_mv_idx }];
+                let dw = [mv_w[0] - pred[0], mv_w[1] - pred[1]];
+                // read_mv: mv_joint, then the nonzero components
+                let joint = self.sk.sym(
+                    &mut self.st.icdf.mv_joint,
+                    ((dw[0] != 0) as i32) * 2 + (dw[1] != 0) as i32,
+                );
+                let dr = if joint == 2 || joint == 3 {
+                    self.mv_component(0, dw[0])
+                } else {
+                    0
+                };
+                let dc = if joint == 1 || joint == 3 {
+                    self.mv_component(1, dw[1])
+                } else {
+                    0
+                };
+                [pred[0] + dr, pred[1] + dc]
+            }
+        };
+        if !S::WRITE && (mv[0].abs() >= 1 << 14 || mv[1].abs() >= 1 << 14) {
+            fail!(ERR_INVALID, "block {b_idx}: invalid mv ({},{})", mv[0], mv[1]);
+        }
+        if S::WRITE && mv != mv_w {
+            fail!(
+                ERR_INTERNAL,
+                "block {b_idx}: mv ({},{}) coded as ({},{})",
+                mv_w[0],
+                mv_w[1],
+                mv[0],
+                mv[1]
+            );
+        }
+        (bi.mv_row, bi.mv_col) = (mv[0] as i16, mv[1] as i16);
+        if S::WRITE {
+            inter_stat(match mode {
+                GLOBALMV => 0,
+                NEARESTMV => 1,
+                NEARMV => 2,
+                _ => 3,
+            });
+            if (mode == NEARMV && ref_mv_idx > 1) || (mode == NEWMV && ref_mv_idx > 0) {
+                inter_stat(4 + (mode == NEWMV) as usize);
+            }
+        }
+        Ok(mode)
+    }
+
+    /// read_mv_component with force_integer_mv (mv_class0_fr / mv_fr = 3, no hp bits): the
+    /// difference `v` (1/8 sample, a nonzero multiple of 8, |v| <= 2^14).
+    fn mv_component(&mut self, comp: usize, v: i32) -> i32 {
+        let ic = &mut self.st.icdf;
+        let sign = self.sk.sym(&mut ic.mv_sign[comp], (v < 0) as i32);
+        let a = v.unsigned_abs().max(8);
+        let cls = self.sk.sym(&mut ic.mv_class[comp], mv_class(a) as i32);
+        let d_w = (a as i32 >> 3) - 1;
+        let mag = if cls == 0 {
+            let bit = self.sk.sym(&mut ic.mv_class0_bit[comp], d_w & 1);
+            ((bit << 3) | (3 << 1) | 1) + 1
+        } else {
+            let d_w = d_w - (1 << cls);
+            let mut d = 0;
+            for i in 0..cls as usize {
+                d |= self.sk.sym(&mut ic.mv_bit[comp][i], (d_w >> i) & 1) << i;
+            }
+            (CLASS0_SIZE << (cls + 2)) + ((d << 3) | (3 << 1) | 1) + 1
+        };
+        if sign != 0 { -mag } else { mag }
+    }
+
+    /// read_var_tx_size: the txfm_split tree of an inter block (write: split down to `want`
+    /// levels everywhere). Leaves set InterTxSizes (the tile's tx_size map); `leaf` gets their
+    /// depth, which must be the same for all (the record has one tx_depth per block).
+    #[inline(never)]
+    fn var_tx(&mut self, row: i32, col: i32, tx_sz: i32, depth: i32, want: i32, leaf: &mut i32) -> Res<()> {
+        let f = self.f;
+        if row >= f.mi_rows || col >= f.mi_cols {
+            return Ok(());
+        }
+        let (tw, th) = (t8(&Tx_Width, tx_sz), t8(&Tx_Height, tx_sz));
+        let split = if tx_sz == TX_4X4 || depth == 2 {
+            false
+        } else {
+            let (bufs, st) = (&*self.bufs, &*self.st);
+            // get_above_tx_width / get_left_tx_height
+            let above_w = if row == st.mi_row && !st.avail_u {
+                64
+            } else {
+                let k = bufs.mi(row - 1, col);
+                if row == st.mi_row && bufs.skip[k] != 0 && bufs.ref0[k] as i32 == LAST_FRAME {
+                    4 * bw4(bufs.mi_size[k] as i32)
+                } else {
+                    t8(&Tx_Width, bufs.tx_size[k] as i32)
+                }
+            };
+            let left_h = if col == st.mi_col && !st.avail_l {
+                64
+            } else {
+                let k = bufs.mi(row, col - 1);
+                if col == st.mi_col && bufs.skip[k] != 0 && bufs.ref0[k] as i32 == LAST_FRAME {
+                    4 * bh4(bufs.mi_size[k] as i32)
+                } else {
+                    t8(&Tx_Height, bufs.tx_size[k] as i32)
+                }
+            };
+            let size = (4 * st.bw4.max(st.bh4)).min(64);
+            let max_tx_sz = size.trailing_zeros() as i32 - 2; // find_tx_size(size, size): TX_4X4 .. TX_64X64
+            let ctx = (t8(&Tx_Size_Sqr_Up, tx_sz) != max_tx_sz) as usize * 3
+                + (TX_SIZES - 1 - max_tx_sz) as usize * 6
+                + (above_w < tw) as usize
+                + (left_h < th) as usize;
+            self.sk.sym(&mut self.st.icdf.txfm_split[ctx], (depth < want) as i32) != 0
+        };
+        if split {
+            let sub = t8(&Split_Tx_Size, tx_sz);
+            let (sw, sh) = (t8(&Tx_Width, sub) >> 2, t8(&Tx_Height, sub) >> 2);
+            for i in (0..th >> 2).step_by(sh as usize) {
+                for j in (0..tw >> 2).step_by(sw as usize) {
+                    self.var_tx(row + i, col + j, sub, depth + 1, want, leaf)?;
+                }
+            }
+            return Ok(());
+        }
+        if *leaf < 0 {
+            *leaf = depth;
+        } else if *leaf != depth {
+            fail!(
+                ERR_INVALID,
+                "block {}: transform split depths differ within the block (not supported)",
+                self.st.b_idx
+            );
+        }
+        let bufs = &mut *self.bufs;
+        let (r_end, c_end) = ((row + (th >> 2)).min(f.mi_rows), (col + (tw >> 2)).min(f.mi_cols));
+        for y in row..r_end {
+            let k = bufs.mi(y, col);
+            fill_small(&mut bufs.tx_size[k..k + (c_end - col) as usize], tx_sz as u8);
+        }
+        Ok(())
+    }
+
+    /// compute_prediction of an inter block (spec 5.11.33 / 7.11.3): its planes from LAST_FRAME,
+    /// the whole block (past the coded area too: the closed loop transforms whole tx blocks). The
+    /// chroma of a block narrower or lower than 8 luma samples is predicted from the motion of each
+    /// block of its 8x8 unit, unless one of them is intra.
+    #[inline(never)]
+    fn predict_inter_block(&mut self, bsize: i32, has_chroma: bool) {
+        let f = self.f;
+        let Some(refs) = f.refs.as_ref() else { return };
+        let (st, bufs) = (&mut *self.st, &mut *self.bufs);
+        let (r, c) = (st.mi_row, st.mi_col);
+        for plane in 0..1 + 2 * has_chroma as usize {
+            let sub = (plane != 0) as i32;
+            let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
+            let (n4w, n4h) = (bw4(plane_sz), bh4(plane_sz));
+            let (base_x, base_y) = ((c >> sub) * 4, (r >> sub) * 4);
+            let (mut cand_r, mut cand_c) = ((r >> sub) << sub, (c >> sub) << sub);
+            let (mut pw, mut ph) = ((4 * bw4(bsize)) >> sub, (4 * bh4(bsize)) >> sub);
+            if sub != 0 {
+                // someUseIntra over the 8x8 unit (positions past the coded area are this block's)
+                let mut some_intra = false;
+                for y in cand_r..(cand_r + (n4h << sub)).min(f.mi_rows) {
+                    for x in cand_c..(cand_c + (n4w << sub)).min(f.mi_cols) {
+                        some_intra |= bufs.ref0[bufs.mi(y, x)] as i32 == INTRA_FRAME;
+                    }
+                }
+                if !some_intra && (pw < 4 || ph < 4) {
+                    inter_stat(8);
+                }
+                if some_intra {
+                    (pw, ph) = (n4w * 4, n4h * 4);
+                    (cand_r, cand_c) = (r, c);
+                }
+            }
+            let filters = [
+                subpel_filter(EIGHTTAP, pw as usize),
+                subpel_filter(EIGHTTAP, ph as usize),
+            ];
+            let (ox, oy) = ((bufs.c0 * 4) >> sub, (bufs.r0 * 4) >> sub);
+            let stride = bufs.stride[plane];
+            let (w, h) = (pw as usize, ph as usize);
+            for (ri, y) in (0..n4h * 4).step_by(h).enumerate() {
+                for (ci, x) in (0..n4w * 4).step_by(w).enumerate() {
+                    let (px, py) = (base_x + x, base_y + y);
+                    let m = bufs.mvs[bufs.mi(cand_r + ri as i32, cand_c + ci as i32)];
+                    let off = (py - oy) as usize * stride + (px - ox) as usize;
+                    predict_inter(
+                        &refs[plane],
+                        sub,
+                        px,
+                        py,
+                        w,
+                        h,
+                        [m[0] as i32, m[1] as i32],
+                        filters,
+                        &mut bufs.plane[plane][off..],
+                        stride,
+                        &mut st.mc,
+                    );
+                }
+            }
+        }
+    }
+
+    /// check_block_fields for a block with an inter entry (kept out of the intra path).
+    #[inline(never)]
+    fn check_inter_fields(&self, b: &Block, bi: &BlockInter) -> Res<()> {
+        let b_idx = self.st.b_idx;
+        if bi.is_inter > 1 || bi.reserved != [0; 3] {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: inter entry: is_inter must be 0/1, reserved 0"
+            );
+        }
+        if bi.is_inter != 0 {
+            if !self.f.inter {
+                fail!(ERR_INVALID, "block {b_idx}: inter block outside an inter frame");
+            }
+            let (mr, mc) = (bi.mv_row as i32, bi.mv_col as i32);
+            if mr & 7 != 0 || mc & 7 != 0 || mr.abs() >= 1 << 14 || mc.abs() >= 1 << 14 {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: mv ({mr},{mc}) must be whole samples (multiples of 8) below 2^14"
+                );
+            }
+            if b.y_mode != 0
+                || b.angle_delta_y != 0
+                || b.uv_mode != 0
+                || b.angle_delta_uv != 0
+                || b.cfl_alpha_u != 0
+                || b.cfl_alpha_v != 0
+                || b.filter_intra != 0
+            {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: an inter block's intra mode fields must be 0"
+                );
+            }
+            if b.skip != 0 && b.tx_depth != 0 {
+                fail!(ERR_INVALID, "block {b_idx}: a skip inter block has no tx_depth (0)");
+            }
+        } else if bi.mv_row != 0 || bi.mv_col != 0 {
+            fail!(ERR_INVALID, "block {b_idx}: an intra block's mv must be 0");
+        }
+        Ok(())
+    }
+
+    fn check_block_fields(&self, b: &Block, bi: &BlockInter) -> Res<()> {
+        let fp = &self.f.fp;
+        let (st, b_idx) = (&*self.st, self.st.b_idx);
+        let bs = b.bsize as i32;
+        if bs >= BLOCK_SIZES || bs == BLOCK_64X128 || bs == BLOCK_128X64 || bs == BLOCK_128X128 {
+            fail!(ERR_INVALID, "block {b_idx}: invalid bsize {bs}");
+        }
+        if b.skip > 1 {
+            fail!(ERR_INVALID, "block {b_idx}: skip must be 0/1");
+        }
+        if *bi != BlockInter::default() {
+            self.check_inter_fields(b, bi)?;
+        }
+        if b.y_mode as i32 > PAETH_PRED {
+            fail!(ERR_INVALID, "block {b_idx}: y_mode {}", b.y_mode);
+        }
+        let dir_ok = bs >= BLOCK_8X8;
+        if b.angle_delta_y < -3
+            || b.angle_delta_y > 3
+            || (b.angle_delta_y != 0 && !(dir_ok && is_directional(b.y_mode as i32)))
+        {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: angle_delta_y {} not allowed",
+                b.angle_delta_y
+            );
+        }
+        if fp.tx_mode_select != 0 {
+            if b.tx_depth as i32 > max_tx_depth(bs) || (bs == BLOCK_4X4 && b.tx_depth != 0) {
+                fail!(ERR_INVALID, "block {b_idx}: tx_depth {} too large", b.tx_depth);
+            }
+        } else if b.tx_depth != 0 {
+            fail!(ERR_INVALID, "block {b_idx}: tx_depth must be 0 (TX_MODE_LARGEST)");
+        }
+        let cdef_bad = if fp.enable_cdef != 0 {
+            b.cdef_idx < 0 || b.cdef_idx as i32 >= (1 << fp.cdef_bits)
+        } else {
+            b.cdef_idx != 0
+        };
+        if cdef_bad {
+            fail!(ERR_INVALID, "block {b_idx}: cdef_idx {} out of range", b.cdef_idx);
+        }
+        if b.filter_intra != 0
+            && (b.filter_intra > 5
+                || fp.enable_filter_intra == 0
+                || b.y_mode as i32 != DC_PRED
+                || bw4(bs) > 8
+                || bh4(bs) > 8)
+        {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: filter_intra {} not allowed here",
+                b.filter_intra
+            );
+        }
+        if fp.delta_q_present == 0 && b.sb_qindex != 0 && b.sb_qindex != fp.base_q_idx {
+            fail!(ERR_INVALID, "block {b_idx}: sb_qindex set but delta_q_present = 0");
+        }
+        if st.has_chroma {
+            if b.uv_mode as i32 > UV_CFL_PRED {
+                fail!(ERR_INVALID, "block {b_idx}: uv_mode {}", b.uv_mode);
+            }
+            if b.uv_mode as i32 == UV_CFL_PRED {
+                if !cfl_allowed(bs) {
+                    fail!(ERR_INVALID, "block {b_idx}: CFL not allowed for bsize {bs}");
+                }
+                if b.cfl_alpha_u < -16
+                    || b.cfl_alpha_u > 16
+                    || b.cfl_alpha_v < -16
+                    || b.cfl_alpha_v > 16
+                    || (b.cfl_alpha_u == 0 && b.cfl_alpha_v == 0)
+                {
+                    fail!(
+                        ERR_INVALID,
+                        "block {b_idx}: bad CFL alphas {} {}",
+                        b.cfl_alpha_u,
+                        b.cfl_alpha_v
+                    );
+                }
+            }
+            if b.angle_delta_uv < -3
+                || b.angle_delta_uv > 3
+                || (b.angle_delta_uv != 0 && !(dir_ok && is_directional(b.uv_mode as i32)))
+            {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: angle_delta_uv {} not allowed",
+                    b.angle_delta_uv
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// decode_block (intra_frame_mode_info / inter_frame_mode_info, the prediction of inter
+    /// blocks, the residual)
+    fn block(&mut self, rec: &mut Rec, r: i32, c: i32, bsize: i32) -> Res<()> {
+        let f = self.f;
+        let fp = &f.fp;
+        let mut b;
+        let mut bi = BlockInter::default();
+        let mut parse_txb0 = 0u32;
+        match rec {
+            Rec::Write { blocks, inter, .. } => {
+                let st = &mut *self.st;
+                if st.cursor >= st.tile_end {
+                    fail!(ERR_INVALID, "block list ends early (expected block at mi {r},{c})");
+                }
+                st.b_idx = st.cursor;
+                b = blocks[st.cursor as usize];
+                if let Some(x) = inter.get(st.cursor as usize) {
+                    bi = *x;
+                }
+                if b.mi_row as i32 != r || b.mi_col as i32 != c || b.bsize as i32 != bsize {
+                    fail!(
+                        ERR_INVALID,
+                        "block {}: got mi ({},{}) bsize {}, partition syntax expects ({r},{c}) bsize {bsize}",
+                        st.cursor,
+                        b.mi_row,
+                        b.mi_col,
+                        b.bsize
+                    );
+                }
+                st.cursor += 1;
+            }
+            Rec::Parse(p) => {
+                b = Block {
+                    mi_row: r as u16,
+                    mi_col: c as u16,
+                    bsize: bsize as u8,
+                    ..Default::default()
+                };
+                self.st.b_idx = p.blocks.len() as u32;
+                parse_txb0 = p.txb.len() as u32;
+            }
+        }
+        let st = &mut *self.st;
+        st.mi_row = r;
+        st.mi_col = c;
+        st.mi_size = bsize;
+        st.bw4 = bw4(bsize);
+        st.bh4 = bh4(bsize);
+        st.has_chroma = has_chroma(bsize, r, c, f.mono);
+        st.avail_u = st.is_inside(r - 1, c);
+        st.avail_l = st.is_inside(r, c - 1);
+        st.avail_uc = st.avail_u;
+        st.avail_lc = st.avail_l;
+        if st.has_chroma {
+            if st.bh4 == 1 {
+                st.avail_uc = st.is_inside(r - 2, c);
+            }
+            if st.bw4 == 1 {
+                st.avail_lc = st.is_inside(r, c - 2);
+            }
+        } else {
+            st.avail_uc = false;
+            st.avail_lc = false;
+        }
+        let (avail_u, avail_l, has_chroma_) = (st.avail_u, st.avail_l, st.has_chroma);
+        let (bw, bh) = (st.bw4, st.bh4);
+        if S::WRITE {
+            self.check_block_fields(&b, &bi)?;
+        }
+        // ---- intra_frame_mode_info / inter_frame_mode_info: skip, cdef, delta q ----
+        {
+            let bufs = &*self.bufs;
+            let ctx = if avail_u { bufs.skip[bufs.mi(r - 1, c)] } else { 0 }
+                + if avail_l { bufs.skip[bufs.mi(r, c - 1)] } else { 0 };
+            b.skip = self.sk.sym(&mut self.st.cdf.skip[ctx as usize], b.skip as i32) as u8;
+        }
+        // ---- read_cdef ----
+        if fp.enable_cdef != 0 && b.skip == 0 {
+            let sbi = self.st.sb_index;
+            let sb = self.bufs.sb_cdef[sbi];
+            if sb == -1 {
+                b.cdef_idx = self.lit(b.cdef_idx as i32, fp.cdef_bits as i32) as i8;
+                self.bufs.sb_cdef[sbi] = b.cdef_idx;
+            } else if S::WRITE {
+                if b.cdef_idx != sb {
+                    fail!(
+                        ERR_INVALID,
+                        "block {}: cdef_idx {} differs from its superblock's {sb}",
+                        self.st.b_idx,
+                        b.cdef_idx
+                    );
+                }
+            } else {
+                b.cdef_idx = sb;
+            }
+        }
+        // ---- read_delta_qindex ----
+        if fp.delta_q_present != 0 {
+            if self.st.read_deltas && !(bsize == BLOCK_64X64 && b.skip != 0) {
+                let res = fp.delta_q_res as i32;
+                let step = 1 << res;
+                let mut reduced_w = 0;
+                if S::WRITE {
+                    let diff = b.sb_qindex as i32 - self.st.current_q_index;
+                    if b.sb_qindex < 1 || diff % step != 0 {
+                        fail!(
+                            ERR_INVALID,
+                            "block {}: sb_qindex {} not reachable from {} with delta_q_res {res} (use av1g_legalize_sb_qindex)",
+                            self.st.b_idx,
+                            b.sb_qindex,
+                            self.st.current_q_index
+                        );
+                    }
+                    reduced_w = diff / step;
+                }
+                let abs_w = reduced_w.abs();
+                let mut a = self.sk.sym(&mut self.st.cdf.delta_q, abs_w.min(DELTA_Q_SMALL));
+                if a == DELTA_Q_SMALL {
+                    let mut rem_w = 1;
+                    while ((abs_w - 1) >> (rem_w + 1)) > 0 {
+                        rem_w += 1; // floor(log2(abs - 1))
+                    }
+                    let rem_bits = self.lit(rem_w - 1, 3) + 1;
+                    let abs_bits = self.lit((abs_w - 1) - (1 << rem_bits), rem_bits);
+                    a = abs_bits + (1 << rem_bits) + 1;
+                }
+                if a != 0 {
+                    let sign = self.sk.bit((reduced_w < 0) as i32);
+                    let reduced = if sign != 0 { -a } else { a };
+                    self.st.current_q_index = clip3(1, 255, self.st.current_q_index + reduced * step);
+                }
+            }
+            if S::WRITE {
+                if b.sb_qindex as i32 != self.st.current_q_index && !(bsize == BLOCK_64X64 && b.skip != 0) {
+                    fail!(
+                        ERR_INVALID,
+                        "block {}: sb_qindex {} differs from its superblock's qindex {}",
+                        self.st.b_idx,
+                        b.sb_qindex,
+                        self.st.current_q_index
+                    );
+                }
+            } else {
+                b.sb_qindex = self.st.current_q_index as u8;
+            }
+        }
+        let st = &mut *self.st;
+        st.read_deltas = false;
+        let q = if fp.delta_q_present != 0 {
+            st.current_q_index
+        } else {
+            fp.base_q_idx as i32
+        };
+        st.set_block_q(fp, q);
+        // ---- read_is_inter ----
+        let is_inter = if f.inter {
+            let bufs = &*self.bufs;
+            let intra_at = |k: usize| bufs.ref0[k] as i32 == INTRA_FRAME;
+            let above_intra = avail_u && intra_at(bufs.mi(r - 1, c));
+            let left_intra = avail_l && intra_at(bufs.mi(r, c - 1));
+            let ctx = if avail_u && avail_l {
+                if left_intra && above_intra {
+                    3
+                } else {
+                    (left_intra || above_intra) as usize
+                }
+            } else if avail_u || avail_l {
+                2 * (if avail_u { above_intra } else { left_intra }) as usize
+            } else {
+                0
+            };
+            self.sk.sym(&mut self.st.icdf.is_inter[ctx], bi.is_inter as i32) != 0
+        } else {
+            false
+        };
+        bi.is_inter = is_inter as u8;
+        self.st.is_inter = is_inter;
+        // the YModes value of the block: its intra mode, or its inter mode
+        let y_mode_map = if is_inter {
+            self.inter_block_mode_info(r, c, bsize, &mut bi)? as u8
+        } else {
+            self.intra_mode_info(&mut b, r, c, bsize)?;
+            b.y_mode
+        };
+
+        // ---- read_block_tx_size ----
         if fp.tx_mode_select != 0 && bsize > BLOCK_4X4 {
-            let max_rect = t8(&Max_Tx_Size_Rect, bsize);
-            let max_tx_depth = t8(&Max_Tx_Depth, bsize);
-            let above_w = if avail_u {
-                t8(&Tx_Width, bufs.tx_size[bufs.mi(r - 1, c)] as i32)
+            if is_inter {
+                if b.skip == 0 {
+                    // read_var_tx_size (blocks are at most 64x64: one chunk)
+                    let mut leaf = -1;
+                    self.var_tx(r, c, t8(&Max_Tx_Size_Rect, bsize), 0, b.tx_depth as i32, &mut leaf)?;
+                    if !S::WRITE {
+                        b.tx_depth = leaf.max(0) as u8;
+                    }
+                }
             } else {
-                0
-            };
-            let left_h = if avail_l {
-                t8(&Tx_Height, bufs.tx_size[bufs.mi(r, c - 1)] as i32)
-            } else {
-                0
-            };
-            let ctx = ((above_w >= t8(&Tx_Width, max_rect)) as usize) + ((left_h >= t8(&Tx_Height, max_rect)) as usize);
-            let d = b.tx_depth as i32;
-            b.tx_depth = match max_tx_depth {
-                4 => self.sk.sym(&mut cdf.tx_64x64[ctx], d),
-                3 => self.sk.sym(&mut cdf.tx_32x32[ctx], d),
-                2 => self.sk.sym(&mut cdf.tx_16x16[ctx], d),
-                _ => self.sk.sym(&mut cdf.tx_8x8[ctx], d),
-            } as u8;
+                let bufs = &*self.bufs;
+                let cdf = &mut self.st.cdf;
+                let max_rect = t8(&Max_Tx_Size_Rect, bsize);
+                let max_tx_depth = t8(&Max_Tx_Depth, bsize);
+                let inter_at = |k: usize| f.inter && bufs.ref0[k] as i32 == LAST_FRAME;
+                let above_w = if !avail_u {
+                    0
+                } else {
+                    let k = bufs.mi(r - 1, c);
+                    if inter_at(k) {
+                        4 * bw4(bufs.mi_size[k] as i32)
+                    } else {
+                        t8(&Tx_Width, bufs.tx_size[k] as i32)
+                    }
+                };
+                let left_h = if !avail_l {
+                    0
+                } else {
+                    let k = bufs.mi(r, c - 1);
+                    if inter_at(k) {
+                        4 * bh4(bufs.mi_size[k] as i32)
+                    } else {
+                        t8(&Tx_Height, bufs.tx_size[k] as i32)
+                    }
+                };
+                let ctx =
+                    ((above_w >= t8(&Tx_Width, max_rect)) as usize) + ((left_h >= t8(&Tx_Height, max_rect)) as usize);
+                let d = b.tx_depth as i32;
+                b.tx_depth = match max_tx_depth {
+                    4 => self.sk.sym(&mut cdf.tx_64x64[ctx], d),
+                    3 => self.sk.sym(&mut cdf.tx_32x32[ctx], d),
+                    2 => self.sk.sym(&mut cdf.tx_16x16[ctx], d),
+                    _ => self.sk.sym(&mut cdf.tx_8x8[ctx], d),
+                } as u8;
+            }
         }
         let tx_size = luma_tx_size(bsize, b.tx_depth as i32);
         self.st.tx_size = tx_size;
+        if S::WRITE && f.inter {
+            if !is_inter {
+                inter_stat(6);
+            } else if b.tx_depth > 0 {
+                inter_stat(7);
+            }
+        }
         if !S::WRITE {
-            self.check_block_fields(&b)?;
+            self.check_block_fields(&b, &bi)?;
         }
 
         let planes = 1 + 2 * has_chroma_ as usize;
@@ -1070,18 +1549,74 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let c_end = (c + bw).min(f.mi_cols);
         {
             let bufs = &mut *self.bufs;
+            let n = (c_end - c) as usize;
             for y in r..r_end {
                 let k = bufs.mi(y, c);
-                let n = (c_end - c) as usize;
-                fill_small(&mut bufs.y_mode[k..k + n], b.y_mode);
-                if has_chroma_ {
+                fill_small(&mut bufs.y_mode[k..k + n], y_mode_map);
+                if is_inter {
+                    // UVModes is only read for intra blocks (is_smooth checks RefFrames first)
+                    fill_small(&mut bufs.uv_mode[k..k + n], 0xFF);
+                } else if has_chroma_ {
                     fill_small(&mut bufs.uv_mode[k..k + n], b.uv_mode);
+                }
+                if f.inter {
+                    fill_small(
+                        &mut bufs.ref0[k..k + n],
+                        if is_inter { LAST_FRAME } else { INTRA_FRAME } as u8,
+                    );
+                    if is_inter {
+                        bufs.mvs[k..k + n].fill([bi.mv_row, bi.mv_col]);
+                    }
                 }
             }
         }
+        // ---- compute_prediction (inter blocks: the whole block, before its residual) ----
+        if is_inter && f.do_recon {
+            self.predict_inter_block(bsize, has_chroma_);
+        }
 
-        // ---- residual: tx blocks in bitstream order ----
+        // ---- residual: tx blocks in bitstream order (an inter block's luma in transform_tree
+        // order) ----
         let (mi_cols, mi_rows) = (f.mi_cols, f.mi_rows);
+        if is_inter {
+            let st = &mut *self.st;
+            st.n_tree = tx_tree_order(bsize, tx_size, &mut st.tree);
+        }
+        // every coded tx block of the block, in order: $body with (plane, tx_sz, x, y, x4, y4)
+        macro_rules! for_each_txb {
+            (|$plane:ident, $tx_sz:ident, $x:ident, $y:ident, $x4:ident, $y4:ident| $body:block) => {
+                for $plane in 0..planes {
+                    let sub = ($plane != 0) as i32;
+                    let $tx_sz = if $plane != 0 { uv_tx_size(bsize) } else { tx_size };
+                    let step_x = t8(&Tx_Width, $tx_sz) >> 2;
+                    let step_y = t8(&Tx_Height, $tx_sz) >> 2;
+                    let plane_sz = if $plane != 0 { uv_bsize(bsize) } else { bsize };
+                    let (num4x4_w, num4x4_h) = (bw4(plane_sz), bh4(plane_sz));
+                    let (base_x4, base_y4) = (c >> sub, r >> sub);
+                    let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub);
+                    if $plane == 0 && is_inter {
+                        for k in 0..self.st.n_tree {
+                            let ($x, $y) = self.st.tree[k];
+                            let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
+                            if $x4 >= max_x4 || $y4 >= max_y4 {
+                                continue;
+                            }
+                            $body
+                        }
+                    } else {
+                        for $y in (0..num4x4_h).step_by(step_y as usize) {
+                            for $x in (0..num4x4_w).step_by(step_x as usize) {
+                                let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
+                                if $x4 >= max_x4 || $y4 >= max_y4 {
+                                    continue;
+                                }
+                                $body
+                            }
+                        }
+                    }
+                }
+            };
+        }
         match rec {
             Rec::Write {
                 block_txb,
@@ -1094,86 +1629,57 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 let b_idx = self.st.b_idx as usize;
                 let (t0, t1) = (block_txb[b_idx] as usize, block_txb[b_idx + 1] as usize);
                 let mut ti = t0;
-                for plane in 0..planes {
-                    let sub = (plane != 0) as i32;
-                    let tx_sz = if plane != 0 { uv_tx_size(bsize) } else { tx_size };
-                    let step_x = t8(&Tx_Width, tx_sz) >> 2;
-                    let step_y = t8(&Tx_Height, tx_sz) >> 2;
-                    let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
-                    let (num4x4_w, num4x4_h) = (bw4(plane_sz), bh4(plane_sz));
-                    let (base_x4, base_y4) = (c >> sub, r >> sub);
-                    let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub);
-                    for y in (0..num4x4_h).step_by(step_y as usize) {
-                        for x in (0..num4x4_w).step_by(step_x as usize) {
-                            let (x4, y4) = (base_x4 + x, base_y4 + y);
-                            if x4 >= max_x4 || y4 >= max_y4 {
-                                continue;
-                            }
-                            let tl = ti.wrapping_sub(*txb_base);
-                            let t = match txb.get_mut(tl) {
-                                Some(t)
-                                    if ti < t1
-                                        && t.plane as usize == plane
-                                        && t.tx_size as i32 == tx_sz
-                                        && t.x4 as i32 == x4
-                                        && t.y4 as i32 == y4 =>
-                                {
-                                    t
-                                }
-                                _ => fail!(ERR_INVALID, "block {b_idx}: tx layout mismatch (call av1g_layout)"),
-                            };
-                            let n = tx_coeffs(tx_sz);
-                            let off = (t.coeff_off as usize).wrapping_sub(*coeff_base);
-                            let Some(q) = coeffs.get_mut(off..off.wrapping_add(n)) else {
-                                fail!(
-                                    ERR_INVALID,
-                                    "block {b_idx}: coefficients of tx block {ti} outside the record"
-                                );
-                            };
-                            self.st.cur_txb = ti as u32;
-                            self.txb(&b, t, q, x, y)?;
-                            ti += 1;
+                for_each_txb!(|plane, tx_sz, x, y, x4, y4| {
+                    let tl = ti.wrapping_sub(*txb_base);
+                    let t = match txb.get_mut(tl) {
+                        Some(t)
+                            if ti < t1
+                                && t.plane as usize == plane
+                                && t.tx_size as i32 == tx_sz
+                                && t.x4 as i32 == x4
+                                && t.y4 as i32 == y4 =>
+                        {
+                            t
                         }
-                    }
-                }
+                        _ => fail!(ERR_INVALID, "block {b_idx}: tx layout mismatch (call av1g_layout)"),
+                    };
+                    let n = tx_coeffs(tx_sz);
+                    let off = (t.coeff_off as usize).wrapping_sub(*coeff_base);
+                    let Some(q) = coeffs.get_mut(off..off.wrapping_add(n)) else {
+                        fail!(
+                            ERR_INVALID,
+                            "block {b_idx}: coefficients of tx block {ti} outside the record"
+                        );
+                    };
+                    self.st.cur_txb = ti as u32;
+                    self.txb(&b, t, q, x, y)?;
+                    ti += 1;
+                });
                 if ti != t1 {
                     fail!(ERR_INVALID, "block {b_idx}: tx layout mismatch (count)");
                 }
             }
             Rec::Parse(p) => {
-                for plane in 0..planes {
-                    let sub = (plane != 0) as i32;
-                    let tx_sz = if plane != 0 { uv_tx_size(bsize) } else { tx_size };
-                    let step_x = t8(&Tx_Width, tx_sz) >> 2;
-                    let step_y = t8(&Tx_Height, tx_sz) >> 2;
-                    let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
-                    let (num4x4_w, num4x4_h) = (bw4(plane_sz), bh4(plane_sz));
-                    let (base_x4, base_y4) = (c >> sub, r >> sub);
-                    let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub);
-                    for y in (0..num4x4_h).step_by(step_y as usize) {
-                        for x in (0..num4x4_w).step_by(step_x as usize) {
-                            let (x4, y4) = (base_x4 + x, base_y4 + y);
-                            if x4 >= max_x4 || y4 >= max_y4 {
-                                continue;
-                            }
-                            let off = p.coeffs.len();
-                            let n = tx_coeffs(tx_sz);
-                            let mut t = Txb {
-                                coeff_off: off as u32,
-                                x4: x4 as u16,
-                                y4: y4 as u16,
-                                plane: plane as u8,
-                                tx_size: tx_sz as u8,
-                                ..Default::default()
-                            };
-                            p.coeffs.resize(off + n, 0);
-                            self.txb(&b, &mut t, &mut p.coeffs[off..off + n], x, y)?;
-                            p.txb.push(t);
-                        }
-                    }
-                }
+                for_each_txb!(|plane, tx_sz, x, y, x4, y4| {
+                    let off = p.coeffs.len();
+                    let n = tx_coeffs(tx_sz);
+                    let mut t = Txb {
+                        coeff_off: off as u32,
+                        x4: x4 as u16,
+                        y4: y4 as u16,
+                        plane: plane as u8,
+                        tx_size: tx_sz as u8,
+                        ..Default::default()
+                    };
+                    p.coeffs.resize(off + n, 0);
+                    self.txb(&b, &mut t, &mut p.coeffs[off..off + n], x, y)?;
+                    p.txb.push(t);
+                });
                 p.blocks.push(b);
                 p.block_txb.push(parse_txb0);
+                if f.inter {
+                    p.inter.push(bi);
+                }
             }
         }
 
@@ -1210,8 +1716,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let (lx, ly) = (start_x - ox, start_y - oy);
         let stride = self.bufs.stride[plane];
         let off = ly as usize * stride + lx as usize;
+        let is_inter = self.st.is_inter;
 
-        if f.do_recon {
+        if f.do_recon && !is_inter {
             let st = &*self.st;
             let mode = if plane == 0 {
                 b.y_mode as i32
@@ -1348,7 +1855,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 );
             }
         }
-        if plane == 0 {
+        if plane == 0 && !is_inter {
             self.st.max_luma_w = lx + step_x * 4;
             self.st.max_luma_h = ly + step_y * 4;
         }
@@ -1356,7 +1863,21 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let mut tx_type = if plane == 0 {
             t.tx_type as i32
         } else {
-            let tt = chroma_tx_type(tx_sz, b.uv_mode as i32, fp.reduced_tx_set != 0);
+            let tt = if is_inter {
+                // compute_tx_type: the luma type at Max(MiRow / MiCol, the chroma position << 1)
+                let st = &*self.st;
+                let (y4, x4) = (
+                    ((t.y4 as i32) << 1).max(st.mi_row) - st.mi_row,
+                    ((t.x4 as i32) << 1).max(st.mi_col) - st.mi_col,
+                );
+                chroma_tx_type_inter(
+                    tx_sz,
+                    st.tx_types[y4 as usize][x4 as usize] as i32,
+                    fp.reduced_tx_set != 0,
+                )
+            } else {
+                chroma_tx_type(tx_sz, b.uv_mode as i32, fp.reduced_tx_set != 0)
+            };
             t.tx_type = tt as u8;
             tt
         };
@@ -1377,6 +1898,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                         ac_q: st.ac_q[plane],
                         derived_tx_type: tx_type,
                         qm_level: if fp.using_qmatrix != 0 { f.qm_level[plane] } else { 15 },
+                        is_inter,
                     };
                     h.on_txb(self.hs, &ctx, t, q);
                     if plane == 0 {
@@ -1390,12 +1912,20 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 eob = eob_of(&q[..n], get_iscan(tx_sz, tx_type));
                 let mut nz = eob > 0;
                 if nz && plane == 0 {
-                    let set = get_tx_set_intra(tx_sz, fp.reduced_tx_set != 0);
-                    if tx_type >= TX_TYPES || !tx_type_in_set_intra(set, tx_type) {
+                    let reduced = fp.reduced_tx_set != 0;
+                    let (set, ok) = if is_inter {
+                        let set = get_tx_set_inter(tx_sz, reduced);
+                        (set, tx_type < TX_TYPES && tx_type_in_set_inter(set, tx_type))
+                    } else {
+                        let set = get_tx_set_intra(tx_sz, reduced);
+                        (set, tx_type < TX_TYPES && tx_type_in_set_intra(set, tx_type))
+                    };
+                    if !ok {
                         fail!(
                             ERR_INVALID,
-                            "block {}: luma tx_type {tx_type} not in tx set {set} of tx size {tx_sz}",
-                            self.st.b_idx
+                            "block {}: luma tx_type {tx_type} not in {} tx set {set} of tx size {tx_sz}",
+                            self.st.b_idx,
+                            if is_inter { "inter" } else { "intra" }
                         );
                     }
                 }
@@ -1551,7 +2081,28 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 *tx_type = DCT_DCT;
             }
         } else {
-            if plane == 0 {
+            if plane == 0 && st.is_inter {
+                // transform_type(), inter sets
+                let set = get_tx_set_inter(tx_sz, f.fp.reduced_tx_set != 0);
+                let ic = &mut st.icdf;
+                let sqr = Tx_Size_Sqr[tsz] as usize;
+                let pos = |inv: &[u8]| inv.iter().rposition(|&t| t as i32 == *tx_type).unwrap_or(0) as i32;
+                *tx_type = match set {
+                    TX_SET_INTER_1 => {
+                        let i = self.sk.sym(&mut ic.inter_tx_set1[sqr], pos(&Tx_Type_Inter_Inv_Set1));
+                        Tx_Type_Inter_Inv_Set1[i as usize] as i32
+                    }
+                    TX_SET_INTER_2 => {
+                        let i = self.sk.sym(&mut ic.inter_tx_set2, pos(&Tx_Type_Inter_Inv_Set2));
+                        Tx_Type_Inter_Inv_Set2[i as usize] as i32
+                    }
+                    TX_SET_INTER_3 => {
+                        let i = self.sk.sym(&mut ic.inter_tx_set3[sqr], pos(&Tx_Type_Inter_Inv_Set3));
+                        Tx_Type_Inter_Inv_Set3[i as usize] as i32
+                    }
+                    _ => DCT_DCT,
+                };
+            } else if plane == 0 {
                 // transform_type()
                 let set = get_tx_set_intra(tx_sz, f.fp.reduced_tx_set != 0);
                 if set > 0 {
@@ -1794,6 +2345,13 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 cul_level += a;
             }
             cul_level = cul_level.min(63);
+        }
+        if plane == 0 && st.is_inter {
+            // TxTypes of the block's luma (the chroma of inter blocks derives from them)
+            let (y0, x0) = ((y4 - st.mi_row) as usize, (x4 - st.mi_col) as usize);
+            for row in &mut st.tx_types[y0..(y0 + h4 as usize).min(16)] {
+                fill_small(&mut row[x0..(x0 + w4 as usize).min(16)], *tx_type as u8);
+            }
         }
         let (al, ad) = (&mut st.above_level[plane], &mut st.above_dc[plane]);
         fill_small(&mut al[xs..xs + w4 as usize], cul_level as u8);
