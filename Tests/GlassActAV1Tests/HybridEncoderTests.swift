@@ -70,6 +70,16 @@ extension HybridEncoderTests {
             kept += frame.timing.kept
             let alone = try fresh.encode(pictures[i], qindex: 120)
             #expect(frame.obu == alone.obu, "\(width)×\(height): picture \(i) codes differently with kept analysis")
+            // and the picture it reports, filtered only around what changed, is the decoder's
+            #expect(frame.planes == alone.planes, "\(width)×\(height): picture \(i) filters differently around changes")
+            let decoder = try #require(glassact_aom_dec_create(1))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var decoded = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0)
+            let theirs = try #require(decoded.planesTuple(0))
+            let stride = Int(decoded.stridesTuple(0))
+            let rows = (0..<height).filter { r in (0..<width).contains { frame.planes[0][r * width + $0] != theirs[r * stride + $0] } }
+            #expect(rows.isEmpty, "\(width)×\(height): picture \(i) differs from libaom on \(rows.count) rows")
         })
         #expect(kept > 0.5, "\(width)×\(height): almost nothing was kept (\(kept) pictures' worth)")
     }

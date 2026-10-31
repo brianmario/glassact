@@ -23,6 +23,7 @@ let av1SeqCommand = Command(
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .int("repeat", "<n>", 1...1000, "encode the sequence n times over (for profiling; default 1)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
+        .string("prune", "<v>", "skip 32x32-and-up analysis where variance > v quantizer steps squared (default 4; 0 off, 1 faster)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
@@ -75,6 +76,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.gpuDecides = !opts.has("cpu-decides")
     encoder.reusesAnalysis = !opts.has("no-reuse")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
+    if let v = opts.string("prune") {
+        guard let f = Float(v), f >= 0 else { throw BenchError("--prune \(v): not a number >= 0") }
+        encoder.busyBlockPrune = f
+    }
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
 
     var frames: [AV1HybridEncoder.Frame] = []
@@ -105,9 +110,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
-    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %%",
+    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %% · filtered %.0f %%",
                  mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },
-                 mean { $0.kept } / 10, mean { $0.keptTiles } / 10))
+                 mean { $0.kept } / 10, mean { $0.keptTiles } / 10, mean { $0.filtered } / 10))
 
     if opts.has("aom-speed") {
         let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8)

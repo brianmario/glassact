@@ -138,13 +138,10 @@ static inline int lf_pri_sum(thread const LfTaps &t, int x0, int adj, int dampin
 
 // one threadgroup (256 threads) per 64x64: luma, then both chroma planes; targets are the source
 // planes, padded like the reconstruction, with its strides
-kernel void l_cdef_sse(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand &cd [[buffer(1)]],
-                       device const uint8_t *s0 [[buffer(3)]], device const uint8_t *s1 [[buffer(4)]],
-                       device const uint8_t *s2 [[buffer(5)]], device uint32_t *mse_y [[buffer(6)]],
-                       device uint32_t *mse_uv [[buffer(7)]], uint sb [[threadgroup_position_in_grid]],
-                       uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                       uint warp [[simdgroup_index_in_threadgroup]]) {
-    threadgroup uint32_t red[8][LF_NC];
+static void lf_cdef_sse_sb(constant av1g_pf_frame &f, constant LfCand &cd, device const uint8_t *s0,
+                           device const uint8_t *s1, device const uint8_t *s2, device uint32_t *mse_y,
+                           device uint32_t *mse_uv, uint sb, uint tid, uint lane, uint warp,
+                           threadgroup uint32_t (&red)[8][LF_NC]) {
     const int sbr = (int)sb / f.sbCols, sbc = (int)sb % f.sbCols;
     const bool active = f.cdefIdx[sb] >= 0;
     const int n8c = f.MiCols >> 1;
@@ -206,6 +203,16 @@ kernel void l_cdef_sse(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand 
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+kernel void l_cdef_sse(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand &cd [[buffer(1)]],
+                       device const uint8_t *s0 [[buffer(3)]], device const uint8_t *s1 [[buffer(4)]],
+                       device const uint8_t *s2 [[buffer(5)]], device uint32_t *mse_y [[buffer(6)]],
+                       device uint32_t *mse_uv [[buffer(7)]], uint sb [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                       uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint32_t red[8][LF_NC];
+    lf_cdef_sse_sb(f, cd, s0, s1, s2, mse_y, mse_uv, sb, tid, lane, warp, red);
 }
 
 // The whole joint preset search (every cdef_bits level, greedy + refinement) in one 1024-thread
@@ -279,6 +286,108 @@ kernel void l_assign(constant av1g_pf_frame &f [[buffer(0)]], device const uint3
                      constant int32_t *args [[buffer(4)]], uint sb [[thread_position_in_grid]]) {
     const int nc = args[0], nsb = args[1], mono = args[2], nb = args[3];
     if ((int)sb >= nsb) return;
+    if (f.cdefIdx[sb] < 0) return;
+    uint64_t b = ~(uint64_t)0;
+    int bg = 0;
+    for (int g = 0; g < nb; g++) {
+        uint64_t c = my[sb * nc + lev[g]];
+        if (!mono) c += muv[sb * nc + lev[8 + g]];
+        if (c < b) { b = c; bg = g; }
+    }
+    f.cdefIdx[sb] = (int8_t)bg;
+}
+
+// ---------------------------------------------------------------------------
+// Glass Act: the same filters over a list of 64x64s only (AV1MetalPostfilter.search with changed
+// SBs): everything else keeps the previous picture's output. One thread per position of a listed
+// SB; z = plane.
+
+struct PfRegion {
+    uint32_t n, sbCols;  // listed SBs, SBs per row
+};
+
+kernel void p_deblock_r(constant av1g_pf_frame &f [[buffer(0)]], constant int32_t &pass [[buffer(2)]],
+                        constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
+                        uint3 g [[thread_position_in_grid]]) {
+    const int plane = (int)g.z, sub = plane ? 1 : 0;
+    const uint32_t j = g.x / 256, k = g.x % 256;  // 16 x 16 luma 4x4 positions per SB, 8 x 8 chroma
+    if (j >= R.n) return;
+    const int side = 16 >> sub;
+    if ((int)k >= side * side) return;
+    const uint32_t sb = list[j];
+    const int col = (int)(sb % R.sbCols) * side + (int)k % side, row = (int)(sb / R.sbCols) * side + (int)k / side;
+    if (col >= (f.MiCols >> sub) || row >= (f.MiRows >> sub)) return;
+    av1g_lf_edge(&f, plane, pass, row << sub, col << sub);
+}
+
+kernel void p_cdef_dir_r(constant av1g_pf_frame &f [[buffer(0)]], constant PfRegion &R [[buffer(8)]],
+                         device const uint32_t *list [[buffer(9)]], uint gid [[thread_position_in_grid]]) {
+    const uint32_t j = gid / 64, k = gid % 64;  // 8 x 8 blocks of 8x8 per SB
+    if (j >= R.n) return;
+    const uint32_t sb = list[j];
+    const int bx = (int)(sb % R.sbCols) * 8 + (int)k % 8, by = (int)(sb / R.sbCols) * 8 + (int)k / 8;
+    const int n8c = f.MiCols >> 1;
+    if (bx >= n8c || by >= (f.MiRows >> 1)) return;
+    int yDir = 0, var = 0;
+    if (av1g_cdef_active_idx(&f, by * 2, bx * 2) >= 0)
+        av1g_cdef_direction(f.plane[0] + (by * 8) * f.stride[0] + bx * 8, f.stride[0], &yDir, &var);
+    f.cdefDirVar[by * n8c + bx] = (var << 3) | yDir;
+}
+
+kernel void p_cdef_r(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *outY [[buffer(3)]],
+                     device uint8_t *outU [[buffer(4)]], device uint8_t *outV [[buffer(5)]],
+                     constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
+                     uint3 g [[thread_position_in_grid]]) {
+    const int plane = (int)g.z, sub = plane ? 1 : 0;
+    const uint32_t j = g.x / 4096, k = g.x % 4096;
+    if (j >= R.n) return;
+    const int side = 64 >> sub;
+    if ((int)k >= side * side) return;
+    const uint32_t sb = list[j];
+    const int x = (int)(sb % R.sbCols) * side + (int)k % side, y = (int)(sb / R.sbCols) * side + (int)k / side;
+    if (x >= (f.MiCols * 4) >> sub || y >= (f.MiRows * 4) >> sub) return;
+    const int bx = x >> (3 - sub), by = y >> (3 - sub);
+    const int idx = av1g_cdef_active_idx(&f, by * 2, bx * 2);
+    device const uint8_t *src = f.plane[plane];
+    const int ss = f.stride[plane];
+    int v = src[y * ss + x];
+    if (idx >= 0) {
+        const int dv = f.cdefDirVar[by * (f.MiCols >> 1) + bx];
+        const av1g_cdef_blk b = av1g_cdef_params(&f, idx, dv & 7, dv >> 3);
+        v = plane == 0 ? av1g_cdef_pixel(&f, src, ss, 0, x, y, b.yPri, b.ySec, f.cdefDamping, b.yDir)
+                       : av1g_cdef_pixel(&f, src, ss, plane, x, y, b.uvPri, b.uvSec, f.cdefDamping - 1, b.uvDir);
+    }
+    device uint8_t *out = plane == 0 ? outY : plane == 1 ? outU : outV;
+    out[y * ss + x] = (uint8_t)v;
+}
+
+kernel void l_cdef_sse_r(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand &cd [[buffer(1)]],
+                         device const uint8_t *s0 [[buffer(3)]], device const uint8_t *s1 [[buffer(4)]],
+                         device const uint8_t *s2 [[buffer(5)]], device uint32_t *mse_y [[buffer(6)]],
+                         device uint32_t *mse_uv [[buffer(7)]], constant PfRegion &R [[buffer(8)]],
+                         device const uint32_t *list [[buffer(9)]], uint tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                         uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint32_t red[8][LF_NC];
+    if (tg >= R.n) return;
+    lf_cdef_sse_sb(f, cd, s0, s1, s2, mse_y, mse_uv, list[tg], tid, lane, warp, red);
+}
+
+// the SBs outside the region take the preset they had (their SSE rows, and so the assignment, are
+// unchanged); the region's are assigned anew by l_assign_r
+kernel void l_restore_idx(constant av1g_pf_frame &f [[buffer(0)]], device const int8_t *prev [[buffer(1)]],
+                          device const uint8_t *inRegion [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if ((int)i >= f.sbCols * f.sbRows || inRegion[i]) return;
+    if (f.cdefIdx[i] >= 0) f.cdefIdx[i] = prev[i];
+}
+
+kernel void l_assign_r(constant av1g_pf_frame &f [[buffer(0)]], device const uint32_t *my [[buffer(1)]],
+                       device const uint32_t *muv [[buffer(2)]], device const int32_t *lev [[buffer(3)]],
+                       constant int32_t *args [[buffer(4)]], constant PfRegion &R [[buffer(8)]],
+                       device const uint32_t *list [[buffer(9)]], uint j [[thread_position_in_grid]]) {
+    const int nc = args[0], mono = args[2], nb = args[3];
+    if (j >= R.n) return;
+    const uint32_t sb = list[j];
     if (f.cdefIdx[sb] < 0) return;
     uint64_t b = ~(uint64_t)0;
     int bg = 0;

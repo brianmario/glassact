@@ -97,9 +97,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// results are the same as analyzing everything.
     public var reusesAnalysis = false
     /// Skip the analysis of 32×32 and larger shapes where the source's
-    /// variance is above one quantizer step squared: they don't win there, and
-    /// on the reference traces the bytes don't move (0.08 % at most).
-    public var prunesBusyLargeBlocks = false
+    /// variance is above this many quantizer steps squared, as they rarely win
+    /// there (0: analyze them everywhere). On the reference traces 4 costs at
+    /// most 0.4 % of bytes (5K), and 1 at most 1.1 %, for ~10–20 % of the
+    /// analysis (BENCHMARKS.md).
+    public var busyBlockPrune: Float = 0
     /// Try each directional mode's angle deltas (the preset's choice). Off
     /// trades ~0.1–0.9 % of bytes for ~20–30 % of the analysis.
     public var searchesAngleDeltas = true
@@ -197,7 +199,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var p = params
         var key = withUnsafeBytes(of: &p) { Array($0) }
         for v in [width, height, qindex, tiling.columnsLog2, tiling.rowsLog2, decidesLeaves ? 1 : 0,
-                  prunesBusyLargeBlocks ? 1 : 0, searchesAngleDeltas ? 1 : 0] {
+                  Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -635,7 +637,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var compute: (any MTLComputeCommandEncoder)?
             var params = encoder.params
             params.leafDecide = decidesLeaves ? 1 : 0
-            if encoder.prunesBusyLargeBlocks { params.pruneVar = 1 }
+            params.pruneVar = encoder.busyBlockPrune
             if !encoder.searchesAngleDeltas { params.deltas = 0; params.uvDeltas = 0 }
             params.leafTxSearch = 1
             func open() throws -> any MTLComputeCommandEncoder {

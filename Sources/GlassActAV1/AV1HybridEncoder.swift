@@ -58,6 +58,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var kept = 0.0
         /// The share of tiles whose closed loop (and, mostly, bytes) were kept.
         public var keptTiles = 0.0
+        /// The share of 64×64s filtered anew.
+        public var filtered = 1.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -118,12 +120,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.searchesAngleDeltas = newValue }
     }
 
+    /// Skip 32×32-and-up analysis where the source is busy
+    /// (`AV1MetalEncoder.busyBlockPrune`; 4 by default, 0 off, 1 faster).
+    public var busyBlockPrune: Float {
+        get { metal.busyBlockPrune }
+        set { metal.busyBlockPrune = newValue }
+    }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
-        metal.prunesBusyLargeBlocks = true
+        metal.busyBlockPrune = 4
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
@@ -215,12 +224,17 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(Int(stride))
         }
         let n = Int(record.pointee.n_blocks)
+        let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
+        var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
+        let known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
-                                           planes: recon, source: source, sourceStrides: strides)
+                                           planes: recon, source: source, sourceStrides: strides,
+                                           changed: known ? changed : nil)
         let sbCols = (2 * ((p.width + 7) >> 3) + 15) >> 4
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
+        timing.filtered = postfilter.lastFilteredShare
 
         var params = search.params
         var bytes: UnsafeMutablePointer<UInt8>?

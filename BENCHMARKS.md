@@ -259,6 +259,52 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: filtering only around changes; a large-block prune (2026-10-31)
+
+`av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to
+the encoder's picture exactly.
+
+**Filters and strength search only around changes (kept).** Away from
+re-coded tiles, the reconstruction, block maps and source are the previous
+picture's. With the same filter parameters, each pixel's deblock and CDEF
+output and each SB's CDEF SSE row are too.
+- `search(changed:)` reloads and deblocks the re-coded SBs dilated by two
+  (so one SB in, it's exact).
+- It recomputes directions, SSE rows, cdef_idx and CDEF output on them
+  dilated by one.
+- It keeps the rest, and runs the preset selection over the whole table.
+- If the presets come out other than the previous picture's, it falls back
+  to filtering everything.
+
+The bytes are identical with and without (5K: 557.7 KB both). Pictures and
+libaom decodes are checked against fresh encodes (HybridEncoderTests).
+
+| typing-cc | before | around changes | filtered |
+|---|---|---|---|
+| 1080p, 3×3 | 128.7 fps | **150.6 fps** (filters 2.9 → 1.4 ms) | 5 % |
+| 5K, 4×4 | 29.7 fps | **50.2 fps** (filters 15.7 → 4.3 ms) | 1 % |
+
+**Busy large blocks pruned (kept, at 4).** av1gpu's `pruneVar` skips the
+analysis of 32×32-and-up shapes where the source variance exceeds v
+quantizer steps squared. These runs analyze every SB (`--no-reuse`, the
+moving-content case):
+
+| | v = 0 (off) | v = 4 (default) | v = 1 |
+|---|---|---|---|
+| photos 720p | 41.9 fps · 128.8 KB | 46.0 · 128.8 KB | 50.3 · 128.8 KB |
+| typing-cc 720p | 45.9 · 109.3 KB | 46.3 · 109.3 KB | 51.6 · 109.3 KB |
+| typing-cc 1080p | 21.4 · 201.4 KB | | 25.4 · 201.5 KB |
+| typing-cc 5K | 3.7 · 551.4 KB | 4.0 · 553.4 KB (+0.36 %) | 4.2 · 557.7 KB (+1.1 %) |
+
+From 1 down to 0.1 the bytes don't move at 720p, and the speed plateaus.
+`busyBlockPrune` defaults to 4 for bitrate efficiency, with 1 as the faster
+choice. Angle deltas off (`searchesAngleDeltas = false`) is ~20–30 % of the
+analysis for +0.1–0.9 % bytes: photos 720p 53.5 fps, typing 60.4.
+
+Now, with reuse: typing-cc 720p ~208 fps (3×3), scroll-win 88, photos 44,
+typing-cc 1080p 151, 5K 50. Photos is GPU-bound, with every SB changing:
+analysis 18 ms, and the filters waiting behind it.
+
 ### Metal AV1: decisions up front on the GPU, and analysis kept across pictures (2026-10-30)
 
 `av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to

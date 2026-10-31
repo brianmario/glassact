@@ -101,6 +101,9 @@ int av1enc_hybrid_write(av1enc_hybrid *h, const av1g_frame_params *fp, const int
 void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
 // Tiles the last closed loop kept.
 uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h);
+// Per 64x64 (raster), nonzero where the last closed loop re-coded the tile: elsewhere the
+// reconstruction, blocks and source are the previous picture's. Returns 0 if unknown.
+int av1enc_hybrid_changed_superblocks(const av1enc_hybrid *h, uint8_t *out, int sb_cols, int sb_rows);
 const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane);
 // the source the last call coded, padded by edge replication to whole superblocks (at least the
 // post-filters' MiCols*4 x MiRows*4, chroma half): rows *stride apart

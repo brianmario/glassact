@@ -872,6 +872,18 @@ extern "C" void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on) {
 }
 extern "C" uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h) { return h->reusedCount; }
 
+extern "C" int av1enc_hybrid_changed_superblocks(const av1enc_hybrid *h, uint8_t *out, int sb_cols, int sb_rows) {
+    if (!h || !out || h->reused.size() != h->tiles.rows * h->tiles.cols) return 0;
+    for (int r = 0; r < sb_rows; r++)
+        for (int c = 0; c < sb_cols; c++) {
+            uint32_t tc = 0, tr = 0;
+            while (tc + 1 < h->tiles.cols && (int)h->tiles.mi_col_starts[tc + 1] <= c * 16) tc++;
+            while (tr + 1 < h->tiles.rows && (int)h->tiles.mi_row_starts[tr + 1] <= r * 16) tr++;
+            out[r * sb_cols + c] = h->reused[tr * h->tiles.cols + tc] ? 0 : 1;
+        }
+    return 1;
+}
+
 extern "C" av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h) { return &h->rec; }
 extern "C" const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane) {
     return plane >= 0 && plane < 3 ? h->out.recon[plane] : nullptr;
