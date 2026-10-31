@@ -259,6 +259,36 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 hybrid at region sizes; where the CPU goes (2026-10-30)
+
+M4 Pro, turbo, q20, frame 200 / 150 / 150 of typing-cc / scroll-win /
+photos, resampled to 1280×720. The hybrid is GPU analysis and partition,
+then CPU chroma decisions and closed loop on tile threads, the GPU strength
+search and filters, and av1core's writer. Wall ms, and size @ SSIMULACRA2:
+
+| trace | GPU-only, 2×2 tiles (log2) | hybrid, 2×2 | libaom s9 (8 threads) |
+|---|---|---|---|
+| typing-cc | 104 · 106.6 KB @ 74.4 | **50** · 109.8 KB @ 73.9 | 37 · 184.2 KB @ 77.2 |
+| scroll-win | 110 · 85.1 KB @ 77.9 | **49** · 88.1 KB @ 77.5 | 29 · 127.7 KB @ 79.3 |
+| photos | 105 · 129.5 KB @ 78.9 | **56** · 134.4 KB @ 78.8 | 35 · 202.1 KB @ 80.2 |
+
+- The hybrid's ~50 ms: GPU analysis 18, CPU chroma 5, CPU closed loop
+  17–22, filters 3–5, writer 2–3, the rest overhead. With frame N+1's GPU
+  analysis overlapped with frame N's CPU work it would be ~30 ms
+  (projected).
+- **Thread-per-block analysis for 8×16 / 16×8** (kept): at 5K the
+  analysis goes from ~225 to ~205 ms, with the same bytes.
+- **CPU profile** (`sample`, 5K hybrid):
+  - The closed loop's tx-type trials (`trial`) are the largest part, and
+    their exact inverse transforms (`av1g_inv_1d`) add ~40 % more.
+  - The chroma decisions (prediction + Hadamard cost) are next, then entropy
+    coding.
+  - A float, vectorizable forward transform made the same bytes but no
+    measurable change (kept): the time isn't in the multiply.
+- At 5K the CPU side (~170 ms: chroma 42, closed loop 90, filters 30,
+  writer 6) is already below the GPU analysis (~210 ms). Overlapped, the
+  analysis bounds the frame, so GPU analysis time is the lever there.
+
 ### av1core codes tiles in parallel (2026-10-30)
 
 av1core's encoder now codes each tile on a worker thread. A copy of the
