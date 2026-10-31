@@ -863,7 +863,12 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // its user answers; keep redialing (outside the retry budget) while
         // both screens show the code, up to a limit.
         let awaitingApproval = failed.lastFailureAwaitsApproval && !wasInSession
-        let code = awaitingApproval ? failed.verificationCode() : nil
+        // A refused redial usually fails before the host's key is seen, so
+        // without a code; while its user is still deciding, keep the code
+        // shown (the same host and key, the same code). Otherwise the wait
+        // turned into "Reconnecting" and gave up after the retry budget
+        // instead of the approval limit.
+        let code = awaitingApproval ? failed.verificationCode() : model.phase.approvalCode
         let presentedKey = failed.observedHostFingerprint
         let reason = failed.lastFailureReason
         configurePoll?.invalidate()
