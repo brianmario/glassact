@@ -243,6 +243,40 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         return Partition(blocks: blocks, lumaTxTypes: types, tiles: run.tiles)
     }
 
+    /// A picture's analysis and partition DP, running on the GPU: the caller
+    /// overlaps other work with it, then waits.
+    public final class PendingPartition: @unchecked Sendable {
+        let run: Run
+        let commands: (any MTLCommandBuffer)?
+
+        init(run: Run, commands: (any MTLCommandBuffer)?) {
+            self.run = run
+            self.commands = commands
+        }
+
+        /// The partition, once the GPU is done.
+        public func wait() throws -> Partition {
+            if let commands {
+                commands.waitUntilCompleted()
+                if let error = commands.error { throw Failure.metal("\(error)") }
+                var stages = StageTimes()
+                stages.analysis = commands.gpuEndTime - commands.gpuStartTime
+                run.encoder.lastStages = stages
+                run.encoder.lastGPUSeconds = stages.analysis
+            }
+            let (blocks, types) = run.leafBlocks()
+            return Partition(blocks: blocks, lumaTxTypes: types, tiles: run.tiles)
+        }
+    }
+
+    /// Starts `partition` without waiting for it. (With `profilesStages` on,
+    /// the stages run to completion first.)
+    public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
+                               width: Int, height: Int, qindex: Int) throws -> PendingPartition {
+        let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex)
+        return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
+    }
+
     /// The whole encoder on one picture: decisions and reconstruction.
     public func encode(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                        width: Int, height: Int, qindex: Int) throws -> Encoded {
@@ -424,7 +458,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             buffers = made
         }
 
-        func execute(closedLoop: Bool) throws {
+        /// Encodes the stages. With `wait` false (and no profiling), returns the
+        /// committed command buffer instead of waiting for it.
+        @discardableResult
+        func execute(closedLoop: Bool, wait: Bool = true) throws -> (any MTLCommandBuffer)? {
             let profiling = encoder.profilesStages
             var stages = StageTimes()
             stages.wavefrontSteps = closedLoop ? steps.count : 0
@@ -492,6 +529,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             if let c = commands, let e = compute {
                 e.endEncoding()
                 c.commit()
+                if !wait { return c }
                 c.waitUntilCompleted()
                 if let error = c.error { throw Failure.metal("\(error)") }
                 encoder.lastGPUSeconds = c.gpuEndTime - c.gpuStartTime
@@ -500,6 +538,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             stages.wall = CACurrentMediaTime() - t0
             encoder.lastStages = stages
+            return nil
         }
 
         /// Superblocks in decode order: tiles in raster order, superblocks in raster order inside each.

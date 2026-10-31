@@ -6,7 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "av1g/decisions.h"
+#include "av1g/av1g.h"  // AV1Core's module header, so Swift sees its types as AV1Core's
 #include "av1enc/ent.h"
 
 #ifdef __cplusplus
@@ -74,6 +74,26 @@ void av1enc_cdef_presets(const int32_t lev[16], int bits, int cdef_mode, const G
 // lev_out: (max_bits + 1) x 16; tot_out: max_bits + 1.
 void av1enc_cdef_select_cpu(const uint32_t *my, const uint32_t *muv, int nc, int nsb, int mono, int max_bits,
                             int refine, int fast_mono, int32_t *lev_out, uint64_t *tot_out);
+
+// The CPU half of the hybrid encoder (src/hybrid.cpp): the closed loop on blocks the Metal
+// analysis decided (av1g_block with mi_row, mi_col, bsize, y_mode and angle_delta_y set; the rest
+// is decided here), on 8-bit 4:2:0 planes (tight: Y w x h, U and V ((w+1)/2) x ((h+1)/2)), with
+// the given tiling. On success the handle holds the record (chroma modes, coefficients, skip
+// flags; no post-filter parameters yet) and the PADDED pre-filter reconstruction
+// (MiCols*4 x MiRows*4, chroma half), until the next call. Reuse one handle per picture stream.
+typedef struct av1enc_hybrid av1enc_hybrid;
+av1enc_hybrid *av1enc_hybrid_create(void);
+void av1enc_hybrid_destroy(av1enc_hybrid *h);
+int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
+                              uint32_t hgt, const av1g_block *blocks, uint32_t n, int qindex, int tile_cols_log2,
+                              int tile_rows_log2, char *err, size_t errlen);
+av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
+const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane);
+// the source the last call coded, padded by edge replication to whole superblocks (at least the
+// post-filters' MiCols*4 x MiRows*4, chroma half): rows *stride apart
+const uint8_t *av1enc_hybrid_source(const av1enc_hybrid *h, int plane, int *stride);
+// the last call's seconds: 0 chroma decisions, 1 closed loop
+double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 
 #ifdef __cplusplus
 }

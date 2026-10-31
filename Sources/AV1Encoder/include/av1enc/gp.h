@@ -18,7 +18,11 @@
 #define GP_H
 
 #include <stdint.h>
+#if defined(__METAL_VERSION__)
 #include "av1g/decisions.h"
+#else
+#include "av1g/av1g.h"  // AV1Core's module header, so Swift sees its types as AV1Core's
+#endif
 
 #if defined(__METAL_VERSION__)
 #define GP_DEV device

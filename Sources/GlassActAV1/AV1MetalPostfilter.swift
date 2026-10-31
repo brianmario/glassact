@@ -106,7 +106,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// sizes, edge-replicated past the picture), and filters it with them.
     /// `params` supplies the size, monochrome and base_q_idx.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
-                       planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>]) throws -> Search {
+                       planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
+                       sourceStrides: [Int]? = nil) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -137,7 +138,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
 
         let target = try (0..<3).map { p -> any MTLBuffer in
             let b = try job.make(job.pw[p] * job.ph[p])
-            if p < job.nPlanes { b.contents().copyMemory(from: source[p], byteCount: job.pw[p] * job.ph[p]) }
+            if p < job.nPlanes { Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: b, width: job.pw[p], height: job.ph[p]) }
             return b
         }
         let lumaSSE = try job.make(4 * nsb * nc), chromaSSE = try job.make(4 * nsb * nc)
@@ -198,6 +199,16 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
                       lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
+    }
+
+    /// A plane of `width` × `height` from rows `stride` apart, tightly into `buffer`.
+    static func copy(_ plane: UnsafePointer<UInt8>, stride: Int, into buffer: any MTLBuffer, width: Int, height: Int) {
+        let d = buffer.contents().assumingMemoryBound(to: UInt8.self)
+        if stride == width {
+            d.update(from: plane, count: width * height)
+        } else {
+            for row in 0..<height { (d + row * width).update(from: plane + row * stride, count: width) }
+        }
     }
 
     private func run(_ body: (any MTLComputeCommandEncoder) -> Void) throws {

@@ -56,8 +56,6 @@ namespace {
 struct FwdTx {
     // F[kind][log2n] = inverse of the n x n matrix of the 1-D inverse transform
     std::vector<double> F[3][7];
-    // Glass Act: the same in float, and transposed (FT[k * n + j] = F[j * n + k]), for forward_f
-    std::vector<float> Ff[3][7], FfT[3][7];
     FwdTx() {
         for (int k = 0; k < 3; k++)
             for (int ln = 2; ln <= 6; ln++) {
@@ -74,13 +72,6 @@ struct FwdTx {
                     for (int i = 0; i < n; i++) M[(size_t)i * n + j] = (double)T[i] / A;
                 }
                 F[k][ln] = invert(M, n);
-                Ff[k][ln].resize((size_t)n * n);
-                FfT[k][ln].resize((size_t)n * n);
-                for (int i = 0; i < n; i++)
-                    for (int j = 0; j < n; j++) {
-                        Ff[k][ln][(size_t)i * n + j] = (float)F[k][ln][(size_t)i * n + j];
-                        FfT[k][ln][(size_t)j * n + i] = (float)F[k][ln][(size_t)i * n + j];
-                    }
             }
     }
     static std::vector<double> invert(std::vector<double> a, int n) {
@@ -130,48 +121,6 @@ struct FwdTx {
             }
     }
 };
-
-// Glass Act: forward() in float with the flips applied once and the loops in axpy form, so the
-// compiler vectorizes them (the hybrid encoder's closed loop spends most of its time here).
-void forward_f(const FwdTx &F, const int *res, int txSz, int txType, float *out) {
-    const int lw = AV1G_T(Tx_Width_Log2)[txSz], lh = AV1G_T(Tx_Height_Log2)[txSz];
-    const int w = 1 << lw, h = 1 << lh, tw = w > 32 ? 32 : w, th = h > 32 ? 32 : h;
-    const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
-    const float *FrT = F.FfT[rk][lw].data(), *Fc = F.Ff[ck][lh].data();
-    const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
-    const float rect = (lw - lh == 1 || lh - lw == 1) ? 2896.0f / 4096.0f : 1.0f;
-    const float scale = (float)(1 << (AV1G_T(Transform_Row_Shift)[txSz] + 4)) / rect;
-    static thread_local float r[64 * 64], tmp[64 * 64];
-    for (int i = 0; i < h; i++) {
-        const int *src = res + (fud ? h - 1 - i : i) * w;
-        float *d = r + i * w;
-        if (flr) for (int j = 0; j < w; j++) d[j] = (float)src[w - 1 - j];
-        else for (int j = 0; j < w; j++) d[j] = (float)src[j];
-    }
-    for (int i = 0; i < th; i++) {  // tmp = Fc * r (th rows)
-        float *t = tmp + i * w;
-        for (int j = 0; j < w; j++) t[j] = 0.f;
-        const float *fc = Fc + (size_t)i * h;
-        for (int k = 0; k < h; k++) {
-            const float c = fc[k];
-            if (c == 0.f) continue;
-            const float *rk_ = r + k * w;
-            for (int j = 0; j < w; j++) t[j] += c * rk_[j];
-        }
-    }
-    for (int i = 0; i < th; i++) {  // out = tmp * Fr^T (tw columns)
-        float *o = out + i * tw;
-        for (int j = 0; j < tw; j++) o[j] = 0.f;
-        const float *t = tmp + i * w;
-        for (int k = 0; k < w; k++) {
-            const float c = t[k];
-            if (c == 0.f) continue;
-            const float *ft = FrT + (size_t)k * w;
-            for (int j = 0; j < tw; j++) o[j] += c * ft[j];
-        }
-        for (int j = 0; j < tw; j++) o[j] *= scale;
-    }
-}
 
 const FwdTx &fwd() {
     static FwdTx f;
@@ -443,16 +392,15 @@ struct QuantHook : TxbHook {
                  const uint8_t *s, int sstride, int plane, int qmLevel) const {
         const int n = av1g_tx_coeffs(txSz);
         const int tw = std::min(32, av1g_tx_w(txSz));
-        static thread_local float D[1024];
-        forward_f(fwd(), res, txSz, type, D);
+        static thread_local double D[1024];
+        fwd().forward(res, txSz, type, D);
         const int den = av1g_dq_denom(txSz);
         const uint8_t *qm = av1g_qm(1, qmLevel, plane, txSz, type);  // NULL for level 15 / IDTX-class types
         const double lambda = 0.12 * (acQ / 8.0) * (acQ / 8.0);       // follows the block's (delta-q) quantizer
         int nz = 0;
         for (int i = 0; i < n; i++) {
-            const double v = (double)D[i] * den / av1g_qm_step(i == 0 ? dcQ : acQ, qm, i);
-            const double a = fabs(v);
-            int qi = a < o.quant_zbin ? 0 : (int)floor(a + o.quant_rnd);
+            double v = D[i] * den / av1g_qm_step(i == 0 ? dcQ : acQ, qm, i);
+            int qi = (int)floor(fabs(v) + 0.5);
             if (qi > 32767) qi = 32767;
             q[i] = (int16_t)(v < 0 ? -qi : qi);
             nz |= q[i];
@@ -507,20 +455,6 @@ struct QuantHook : TxbHook {
             return;
         }
         const int set = av1g_get_tx_set_intra(txSz, reduced);
-        if (o.given_luma_tx) {
-            if (!av1g_tx_type_in_set_intra(set, t.tx_type)) t.tx_type = AV1G_DCT_DCT;
-            const double J = trial(res, txSz, t.tx_type, dcQ, acQ, coeffs, pred, pstride, s, sstride, 0, qmLevel);
-            if (o.given_luma_tx == 2 && t.tx_type != AV1G_DCT_DCT) {
-                static thread_local int16_t dct[1024];
-                const double lam = 0.12 * (acQ / 8.0) * (acQ / 8.0);
-                const double Jd = trial(res, txSz, AV1G_DCT_DCT, dcQ, acQ, dct, pred, pstride, s, sstride, 0, qmLevel);
-                if (Jd + lam * 1.0 < J + lam * 3.0) {
-                    t.tx_type = AV1G_DCT_DCT;
-                    memcpy(coeffs, dct, sizeof(int16_t) * av1g_tx_coeffs(txSz));
-                }
-            }
-            return;
-        }
         if (set == AV1G_TX_SET_DCTONLY || !o.tx_types) {
             t.tx_type = AV1G_DCT_DCT;
             trial(res, txSz, AV1G_DCT_DCT, dcQ, acQ, coeffs, pred, pstride, s, sstride, 0, qmLevel);
@@ -541,95 +475,6 @@ struct QuantHook : TxbHook {
 };
 
 }  // namespace
-
-namespace {
-void setup_fp(const Image &img, const RefEngineOpts &o, av1g_frame_params &fp) {
-    fp.version = AV1G_DECISIONS_VERSION;
-    fp.width = img.W;
-    fp.height = img.H;
-    fp.monochrome = (uint8_t)img.mono;
-    fp.base_q_idx = (uint8_t)o.qindex;
-    fp.reduced_tx_set = (uint8_t)o.reduced_tx_set;
-    fp.tile_cols_log2 = (int8_t)o.tile_cols_log2;
-    fp.tile_rows_log2 = (int8_t)o.tile_rows_log2;
-    fp.enable_intra_edge_filter = o.edge_filter ? 1 : 0;
-}
-}  // namespace
-
-int ref_engine_closed_loop(const Image &img, const RefEngineOpts &o, const std::vector<av1g_block> &given,
-                           OwnedRecord &R, av1g_output *out, RefEngineStats *stats, std::string &err,
-                           const uint8_t *luma_tx) {
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-    memset(&R.rec, 0, sizeof R.rec);
-    setup_fp(img, o, R.rec.fp);
-    const int MiCols = av1g_mi_cols(img.W), MiRows = av1g_mi_rows(img.H);
-    const int sbCols = (MiCols + 15) >> 4, sbRows = (MiRows + 15) >> 4;
-    Src src;
-    pad_source(img, sbCols, sbRows, src);
-    av1g_tiles tiles;
-    if (av1g_tile_layout(img.W, img.H, o.tile_cols_log2, o.tile_rows_log2, &tiles) != AV1G_OK) { err = "tiling"; return AV1G_ERR_INVALID; }
-    const double stepY = av1g_ac_q(o.qindex) / 8.0, stepC = av1g_ac_q(o.qindex) / 8.0;
-    Decider dec(src, o, MiCols, MiRows, img.mono, stepY, stepC);
-    R.blocks = given;
-    {  // chroma from the source, in parallel (each block's decision is its own)
-        std::atomic<size_t> next{0};
-        auto work = [&]() {
-            Decider d = dec;
-            for (;;) {
-                const size_t i = next.fetch_add(64);
-                if (i >= R.blocks.size()) break;
-                for (size_t k = i; k < std::min(R.blocks.size(), i + 64); k++) {
-                    av1g_block &b = R.blocks[k];
-                    // the tile origin of the block, for edge availability
-                    uint32_t tc = 0, tr = 0;
-                    while (tc + 1 < tiles.cols && tiles.mi_col_starts[tc + 1] <= b.mi_col) tc++;
-                    while (tr + 1 < tiles.rows && tiles.mi_row_starts[tr + 1] <= b.mi_row) tr++;
-                    d.tx0 = (int)tiles.mi_col_starts[tc] * 4;
-                    d.ty0 = (int)tiles.mi_row_starts[tr] * 4;
-                    b.uv_mode = AV1G_DC_PRED;
-                    b.angle_delta_uv = 0;
-                    b.cfl_alpha_u = b.cfl_alpha_v = 0;
-                    b.skip = 0;
-                    b.sb_qindex = (uint8_t)o.qindex;
-                    if (av1g_has_chroma(b.bsize, b.mi_row, b.mi_col, img.mono)) d.best_chroma(b.mi_col * 4, b.mi_row * 4, b.bsize, b);
-                }
-            }
-        };
-        const int nthreads = std::max(1, (int)std::thread::hardware_concurrency());
-        std::vector<std::thread> th;
-        for (int i = 0; i < nthreads; i++) th.emplace_back(work);
-        for (auto &t : th) t.join();
-    }
-    if (R.layout() != AV1G_OK) { err = "layout failed"; return AV1G_ERR_INTERNAL; }
-    if (luma_tx)  // one luma tx block per block at tx_depth 0
-        for (uint32_t b = 0; b < R.rec.n_blocks; b++)
-            for (uint32_t t = R.block_txb[b]; t < R.block_txb[b + 1]; t++)
-                if (R.txb[t].plane == 0) R.txb[t].tx_type = luma_tx[b];
-    auto t1 = clk::now();
-    QuantHook hook(src, o, 0.12 * stepY * stepY, 0.12 * stepC * stepC);
-    av1g_encode_opts eo = {AV1G_ENC_FIX_RANGE | AV1G_ENC_PREFILTER_RECON, -1};
-    av1g_output o1;
-    int rc = encode_with_hook(&R.rec, &eo, &o1, &hook);
-    if (rc != AV1G_OK) { err = o1.error; return rc; }
-    uint32_t nskip = 0, ncfl = 0;
-    for (uint32_t b = 0; b < R.rec.n_blocks; b++) {
-        bool zero = true;
-        for (uint32_t t = R.block_txb[b]; t < R.block_txb[b + 1]; t++) zero &= R.txb[t].eob == 0;
-        if (zero) { R.blocks[b].skip = 1; nskip++; }
-        if (R.blocks[b].uv_mode == AV1G_UV_CFL_PRED) ncfl++;
-    }
-    *out = o1;  // the skip flags change no reconstruction before the filters
-    auto t2 = clk::now();
-    if (stats) {
-        stats->seconds_decide = std::chrono::duration<double>(t1 - t0).count();
-        stats->seconds_encode = std::chrono::duration<double>(t2 - t1).count();
-        stats->blocks = R.rec.n_blocks;
-        stats->skip_blocks = nskip;
-        stats->cfl_blocks = ncfl;
-    }
-    return AV1G_OK;
-}
 
 int ref_engine_encode(const Image &img, const RefEngineOpts &o, OwnedRecord &R, av1g_output *out,
                       RefEngineStats *stats, std::string &err) {

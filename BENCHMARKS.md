@@ -259,6 +259,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### AV1HybridEncoder: sustained speed on frame sequences (2026-10-30)
+
+The hybrid is now a product class, `GlassActAV1.AV1HybridEncoder`. Its CPU
+closed loop moved from the test-support reference engine into
+`AV1Encoder/src/hybrid.cpp`, and the reference engine is upstream's again. A
+sequence starts picture i + 1's GPU analysis before finishing picture i on
+the CPU (`AV1MetalEncoder.beginPartition`).
+
+`glassact-bench av1seq` (new) encodes consecutive trace frames, each as an
+intra frame. Turbo, q20, after one warm-up picture; every stream decodes in
+libaom to the encoder's picture exactly. libaom is realtime key frames at
+the same quantizer, speed 9, 8 threads. M4 Pro.
+
+| trace, frames | size, tiles | hybrid | libaom s9 | hybrid bytes |
+|---|---|---|---|---|
+| typing-cc 100–139 | 1280×720, 2×2 | serial 23.8 fps → **overlapped 39.9 fps** · 108.9 KB · 41.60 dB | 48.0 fps · 182.9 KB · 43.05 dB | −40 % |
+| scroll-win 100–139 | 1280×720, 2×2 | **45.9 fps** · 90.9 KB · 43.37 dB | 56.0 fps · 130.0 KB · 44.34 dB | −30 % |
+| photos 100–139 | 1280×720, 2×2 | **38.7 fps** · 129.9 KB · 41.40 dB | 47.0 fps · 200.6 KB · 42.22 dB | −35 % |
+| typing-cc 100–129 | 1920×1080, 2×2 | **22.3 fps** · 200.9 KB · 42.64 dB | 26.5 fps · 354.1 KB · 43.70 dB | −43 % |
+| typing-cc 100–119 | 2560×1440, 3×2 | **14.1 fps** · 287.2 KB · 43.61 dB | 18.8 fps · 540.8 KB · 44.47 dB | −47 % |
+| typing-cc 100–109 | 5120×2880, 3×3 | **3.9 fps** · 542.5 KB · 47.46 dB | 6.6 fps · 1.03 MB · 47.61 dB | −47 % |
+
+- **Overlap works.** At 720p the frame time (21–26 ms) is the CPU's work
+  (chroma 3–4, closed loop 12–16, filters 3–4, writer 1–2), with the GPU
+  analysis (~18 ms) hidden behind it.
+- The hybrid runs at 75–85 % of libaom realtime's speed. At one quantizer
+  its files are 30–47 % smaller and its PSNR 0.2–1.4 dB lower. The
+  SSIMULACRA2-matched spot checks above put the size gap at 35–50 %.
+- **At 5K the filters take 85 ms** of wall time against 12 ms of GPU work.
+  Their dispatches queue with the next picture's 200 ms analysis. The next
+  levers are the filters' setup and copies, and their place in the overlap.
+
 ### Metal AV1 hybrid at region sizes; where the CPU goes (2026-10-30)
 
 M4 Pro, turbo, q20, frame 200 / 150 / 150 of typing-cc / scroll-win /

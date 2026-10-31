@@ -7,7 +7,6 @@
 // filtered picture exactly.
 import Accelerate
 import AV1Core
-import AV1CoreTestSupport
 import Foundation
 import GlassActAV1
 import GlassActCore
@@ -29,8 +28,7 @@ let av1StillCommand = Command(
         .string("ssimulacra2", "<path|off>", "SSIMULACRA2 binary (default: `ssimulacra2` on PATH, if any)"),
         .string("preset", "<list>", "Metal encoder presets, comma-separated: slow, base (default), fast, faster, turbo, turbo2, turbo3"),
         .string("tiles", "<list>", "Metal encoder tilings: log2 of the tile columns and rows, comma-separated, e.g. 2x2 (default auto, the fewest legal)"),
-        .bool("hybrid", "also run each Metal row's GPU analysis with the closed loop on the CPU (av1core's hook, the reference engine's chroma and quantizer search, the GPU's dead zone)"),
-        .choice("hybrid-tx", ["search", "keep", "dct"], "with --hybrid: luma tx types searched on the CPU (default), the analysis's kept, or the analysis's tried against DCT_DCT"),
+        .bool("hybrid", "also encode each Metal row with AV1HybridEncoder: GPU analysis, CPU closed loop on tile threads, GPU filters"),
         .bool("gpu-entropy", "also time the GPU entropy coder (output checked against the CPU writer's)"),
     ],
     run: { opts in
@@ -97,6 +95,7 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
     encoder.profilesStages = true
     let postfilter = try AV1MetalPostfilter(device: device)
     let entropy = opts.has("gpu-entropy") ? try AV1MetalEntropy(device: device) : nil
+    let hybrid = try AV1HybridEncoder(device: device)
     let miCols = 2 * ((width + 7) >> 3), miRows = 2 * ((height + 7) >> 3), sbCols = (miCols + 15) >> 4
     let padded = source.padded(width: miCols * 4, height: miRows * 4)
     let presets = try (opts.string("preset") ?? "base").split(separator: ",").map { name -> AV1MetalEncoder.Preset in
@@ -188,60 +187,20 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
         rows.append(Row(name: tileName, q: q, bytes: obu.count, psnr: decoded.psnrY(source), scoreIndex: try score(decoded), timing: timing))
 
         if opts.has("hybrid") {
-            // GPU analysis + partition; CPU chroma decisions and closed loop; GPU strength search; CPU writer
-            let tA = CACurrentMediaTime()
-            let partition = try source.withPlanes { y, u, v in
-                try encoder.partition(y: y, u: u, v: v, width: width, height: height, qindex: qindex)
-            }
-            let gpuStages = encoder.lastStages
-            let tB = CACurrentMediaTime()
-            var message = [CChar](repeating: 0, count: 256)
-            let hybrid = try source.withPlanes { y, u, v in
-                try partition.blocks.withUnsafeBufferPointer { blocks -> OpaquePointer in
-                    let txMode = opts.string("hybrid-tx") ?? "search", search = txMode == "search"
-                    guard let h = partition.lumaTxTypes.withUnsafeBufferPointer({ types in
-                        av1t_hybrid_closed_loop(y, u, v, UInt32(width), UInt32(height), blocks.baseAddress,
-                                                UInt32(blocks.count), search ? nil : types.baseAddress, Int32(qindex),
-                                                0.375, 0.656, txMode == "dct" ? 2 : 1, Int32(tiling.0), Int32(tiling.1), &message, 256)
-                    })
-                    else { throw BenchError("hybrid: \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))") }
-                    return h
-                }
-            }
-            defer { av1t_hybrid_free(hybrid) }
-            let tC = CACurrentMediaTime()
-            let record = av1t_hybrid_record(hybrid)!
-            let recon = (0..<3).map { p in
-                Array(UnsafeBufferPointer(start: av1t_hybrid_recon(hybrid, Int32(p)), count: (p == 0 ? 16 : 4) * miCols * miRows))
-            }
-            let hs = try withPlaneArrays(recon) { planes in
-                try withPlaneArrays(padded) { sources in
-                    try postfilter.search(params: record.pointee.fp,
-                                          blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: Int(record.pointee.n_blocks)),
-                                          planes: planes, source: sources)
-                }
-            }
-            let tD = CACurrentMediaTime()
-            for i in 0..<Int(record.pointee.n_blocks) {
-                let b = record.pointee.blocks[i]
-                record.pointee.blocks[i].cdef_idx = max(0, hs.superblockCDEF[(Int(b.mi_row) >> 4) * sbCols + (Int(b.mi_col) >> 4)])
-            }
-            record.pointee.fp = hs.params
-            var output = av1g_output()
-            defer { av1g_output_free(&output) }
-            var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_TD) | UInt32(AV1G_ENC_BITSTREAM_ONLY), seq_level_idx: -1)
-            guard av1g_encode(record, &options, &output) == AV1G_OK else { throw BenchError("hybrid q\(q): av1core rejected the record") }
-            let tE = CACurrentMediaTime()
-            let stream = Array(UnsafeBufferPointer(start: output.obu, count: output.obu_size))
-            let hd = try YUV420.decode(stream, width: width, height: height)
-            for p in 0..<3 where hd.planes[p] != hs.planes[p] {
+            // GPU analysis + partition; CPU chroma and closed loop on tile threads; GPU filters; CPU writer
+            hybrid.preset = preset
+            hybrid.tiling = tiling
+            let frame = try hybrid.encode(AV1HybridEncoder.Picture(y: source.planes[0], u: source.planes[1], v: source.planes[2],
+                                                                    width: width, height: height), qindex: qindex)
+            let hd = try YUV420.decode(frame.obu, width: width, height: height)
+            for p in 0..<3 where hd.planes[p] != frame.planes[p] {
                 throw BenchError("hybrid q\(q): libaom's decode differs from the filtered picture in plane \(p)")
             }
+            let t = frame.timing
             let ht = String(format: "GPU analysis %.1f · CPU chroma %.1f + closed loop %.1f (tile threads) · filters %.1f wall · writer %.1f · wall %.0f",
-                            (gpuStages.analysis + gpuStages.partition) * 1000, av1t_hybrid_seconds(hybrid, 0) * 1000,
-                            av1t_hybrid_seconds(hybrid, 1) * 1000, (tD - tC) * 1000, (tE - tD) * 1000, (tE - tA) * 1000)
-            _ = tB
-            rows.append(Row(name: "hybrid " + tileName, q: q, bytes: stream.count, psnr: hd.psnrY(source), scoreIndex: try score(hd), timing: ht))
+                            t.analysis * 1000, t.chroma * 1000, t.closedLoop * 1000, t.filters * 1000, t.writer * 1000,
+                            (t.analysis + t.wall) * 1000)
+            rows.append(Row(name: "hybrid " + tileName, q: q, bytes: frame.obu.count, psnr: hd.psnrY(source), scoreIndex: try score(hd), timing: ht))
         }
     }
     }
