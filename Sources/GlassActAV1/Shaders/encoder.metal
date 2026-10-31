@@ -32,3 +32,25 @@ GA_ANALYSIS(64, 32, AV1G_BLOCK_64X32, 2)
 GA_ANALYSIS(64, 64, AV1G_BLOCK_64X64, 1)
 GA_ANALYSIS(16, 64, AV1G_BLOCK_16X64, 4)
 GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 4)
+
+// Partition DP: one thread per 64x64.
+#include "k_dp.h"
+
+// The layouts the host fills (Swift's import of gp.h) and the kernels read: EncoderLayoutTests
+// compares them field by field.
+kernel void ga_layout(device uint *out [[buffer(0)]]) {
+    uint i = 0;
+#define GA_OFF(T, f) out[i++] = (uint)__builtin_offsetof(T, f)
+    out[i++] = sizeof(GpParams); GA_OFF(GpParams, satdLambda); GA_OFF(GpParams, K); GA_OFF(GpParams, shapeMask);
+    GA_OFF(GpParams, uvOverheadBits); GA_OFF(GpParams, pruneFlat);
+    out[i++] = sizeof(GpImage); GA_OFF(GpImage, sbQ); GA_OFF(GpImage, usingQm); GA_OFF(GpImage, ssimLog); GA_OFF(GpImage, src);
+    GA_OFF(GpImage, spitch); GA_OFF(GpImage, rec); GA_OFF(GpImage, aw); GA_OFF(GpImage, tileColStart);
+    GA_OFF(GpImage, shOff); GA_OFF(GpImage, sbBase); GA_OFF(GpImage, mYMode); GA_OFF(GpImage, cDc);
+    out[i++] = sizeof(GpBlockRes); GA_OFF(GpBlockRes, cand); GA_OFF(GpBlockRes, tx);
+    out[i++] = sizeof(GpLeaf); out[i++] = sizeof(GpSbOut);
+    out[i++] = sizeof(GpBatch); GA_OFF(GpBatch, img); GA_OFF(GpBatch, nSb); GA_OFF(GpBatch, leaves); GA_OFF(GpBatch, oCoeffs);
+    GA_OFF(GpBatch, extCand); GA_OFF(GpBatch, extTopK); GA_OFF(GpBatch, bigScratch);
+    out[i++] = sizeof(av1g_block); out[i++] = sizeof(av1g_txb);
+#undef GA_OFF
+    out[i++] = 0xFFFFFFFFu;
+}
