@@ -274,18 +274,26 @@ which.
 
 | Trace | fps | Key frame | Inter frames, mean | Copied (at a shift) | Mbit/s at the trace's timing: all / inter frames only | Key frames only (before) | PSNR-Y |
 |---|---|---|---|---|---|---|---|
-| typing-cc | 92 | 551 KB | 2.4 KB | 99.9 % (0 %) | 0.6 / 0.17 | 38.7 | 47.3 |
-| scroll-win | 59 | 473 KB | 10.1 KB | 98.7 % (4.9 %) | 2.4 / 1.6 | 79 | 48.8 |
-| photos | 22 | 1.08 MB | 108 KB | 87.1 % (52.3 %) | 21.0 / 18.6 | 190 | 42.7 |
-| cursor-drag | 85 | 510 KB | 2.8 KB | 99.9 % (0 %) | 1.2 / 0.42 | 84 | 47.6 |
+| typing-cc | 94 | 551 KB | 2.4 KB | 99.9 % (0 %) | 0.6 / 0.17 | 38.7 | 47.3 |
+| scroll-win | 69 | 473 KB | 10.1 KB | 98.7 % (4.9 %) | 2.4 / 1.6 | 79 | 48.8 |
+| photos | 32 | 1.08 MB | 108 KB | 87.1 % (52.3 %) | 21.0 / 18.6 | 190 | 42.7 |
+| cursor-drag | 92 | 510 KB | 2.8 KB | 99.9 % (0 %) | 1.2 / 0.42 | 84 | 47.6 |
 
 - **Against the pinned HEVC loop** (2.4 / 5.0 / 10.9 / 4.4 Mbit/s, measured over the whole traces earlier, with rate control): typing, scrolling and dragging come in under it, and photos at about twice it.
   - The spans differ, so the comparison is rough: here the first 100 frames (4.6–11.6 s), where the key frame is most of the bytes for typing and drag.
   - Quality isn't matched either: these are q20 throughout, and a copy keeps the quality its content was coded at.
   - Not re-measured against HEVC: no hardware-encoder benches while the owner is connected.
 - **Photos' 13 % of 64×64s that aren't exact copies cost almost a key frame's share each.** That's the photos app's animated transitions (scaling, fading). This needs real motion search: inexact matches with a residual.
-- **Analysis skipped for copies:** same bytes, and speed went from 36.6 to 59.1 fps (scroll-win) and from 6.9 to 22.2 fps (photos).
-- **Deciding the copies** costs 1.0–1.2 ms a frame on typing and drag, 3.3 ms on scroll and 14.8 ms on photos. It runs on the CPU before the GPU starts, mostly in one thread: it's the next thing to speed up.
+- **Where the speed came from** (same bytes at every step):
+
+  | Step | scroll-win | photos |
+  |---|---|---|
+  | GPU analyzes every 64×64 | 36.6 fps | 6.9 fps |
+  | GPU skips copies | 59.1 | 22.2 |
+  | Shift candidates on 8 threads (deciding the copies: 3.3 → 1.3 ms, 14.8 → 3.9 ms) | 63.4 | 29.7 |
+  | Copies with no coded 64×64 around them copied into the filters' output, not filtered (photos: 82 → 24 % filtered) | 69.4 | 32.1 |
+
+  The table above is the last row's. Deciding the copies takes 0.9–1.3 ms a frame outside photos.
 
 **Not done yet:**
 - The analysis, rate estimates and CDFs still assume key-frame syntax for intra blocks in inter frames.

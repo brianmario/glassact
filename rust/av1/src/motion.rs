@@ -117,9 +117,20 @@ pub fn inter_sb_cover(mi_rows: i32, mi_cols: i32, sb_row: i32, sb_col: i32, temp
 /// columns, row hashes (vertical motion), and per band of rows, column hashes (horizontal motion).
 /// Each band votes for the offsets at which its rows (columns) reappear; offsets that enough rows
 /// agree on, in some band, are proposed. Only bands with a changed superblock are hashed, in both
-/// pictures.
-#[derive(Default)]
+/// pictures, on up to `threads` threads.
 pub struct ShiftFinder {
+    threads: usize,
+}
+
+impl Default for ShiftFinder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One thread's buffers for [`ShiftFinder`].
+#[derive(Default)]
+struct BandScratch {
     now: Vec<u64>,
     before: Vec<u64>,
     index: Vec<(u64, u32)>,
@@ -129,7 +140,9 @@ pub struct ShiftFinder {
 
 impl ShiftFinder {
     pub fn new() -> ShiftFinder {
-        ShiftFinder::default()
+        ShiftFinder {
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+        }
     }
 
     /// Up to `max` candidate shifts from `prev` to `cur` (luma planes of one size), best supported
@@ -141,39 +154,51 @@ impl ShiftFinder {
             return Vec::new();
         }
         let sb_rows = changed.len() / sb_cols.max(1);
-        let mut found: Vec<(Shift, u32)> = Vec::new();
-        // vertical: per band of columns, its rows now against before
-        for b in 0..w.div_ceil(64) {
-            if !(0..sb_rows).any(|r| changed.get(r * sb_cols + b).copied().unwrap_or(0) != 0) {
-                continue;
-            }
-            let (x0, x1) = (b * 64, w.min(b * 64 + 64));
-            self.now.clear();
-            self.now
-                .extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
-            self.before.clear();
-            self.before
-                .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
-            for (s, n) in self.vote() {
-                found.push((Shift { dx: 0, dy: s }, n));
-            }
-        }
-        // horizontal: per band of rows, its columns
-        for b in 0..h.div_ceil(64) {
-            if !(0..sb_cols).any(|c| changed.get(b * sb_cols + c).copied().unwrap_or(0) != 0) {
-                continue;
-            }
-            let (y0, y1) = (b * 64, h.min(b * 64 + 64));
-            self.col_hashes(cur, y0, y1);
-            self.now.clear();
-            self.now.extend(self.col_hash.iter().map(|&k| k as u64));
-            self.col_hashes(prev, y0, y1);
-            self.before.clear();
-            self.before.extend(self.col_hash.iter().map(|&k| k as u64));
-            for (s, n) in self.vote() {
-                found.push((Shift { dx: s, dy: 0 }, n));
-            }
-        }
+        let at = |r: usize, c: usize| changed.get(r * sb_cols + c).copied().unwrap_or(0) != 0;
+        // (vertical, band): bands of columns vote for vertical shifts, bands of rows horizontal ones
+        let mut bands: Vec<(bool, usize)> = (0..w.div_ceil(64))
+            .filter(|&b| (0..sb_rows).any(|r| at(r, b)))
+            .map(|b| (true, b))
+            .collect();
+        bands.extend(
+            (0..h.div_ceil(64))
+                .filter(|&b| (0..sb_cols).any(|c| at(b, c)))
+                .map(|b| (false, b)),
+        );
+        let per = bands.len().div_ceil(self.threads.max(1)).max(1);
+        let mut found: Vec<(Shift, u32)> = std::thread::scope(|sc| {
+            let jobs: Vec<_> = bands
+                .chunks(per)
+                .map(|part| {
+                    sc.spawn(move || {
+                        let mut t = BandScratch::default();
+                        let mut out = Vec::new();
+                        for &(vertical, b) in part {
+                            if vertical {
+                                let (x0, x1) = (b * 64, w.min(b * 64 + 64));
+                                t.now.clear();
+                                t.now.extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
+                                t.before.clear();
+                                t.before
+                                    .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
+                                out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: 0, dy: s }, n)));
+                            } else {
+                                let (y0, y1) = (b * 64, h.min(b * 64 + 64));
+                                t.col_hashes(cur, y0, y1);
+                                t.now.clear();
+                                t.now.extend(t.col_hash.iter().map(|&k| k as u64));
+                                t.col_hashes(prev, y0, y1);
+                                t.before.clear();
+                                t.before.extend(t.col_hash.iter().map(|&k| k as u64));
+                                out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: s, dy: 0 }, n)));
+                            }
+                        }
+                        out
+                    })
+                })
+                .collect();
+            jobs.into_iter().flat_map(|j| j.join().unwrap()).collect()
+        });
         // merge: total support per shift, best first
         found.sort_by_key(|&(s, _)| (s.dx, s.dy));
         let mut merged: Vec<(Shift, u32)> = Vec::new();
@@ -186,7 +211,9 @@ impl ShiftFinder {
         merged.sort_by(|a, b| b.1.cmp(&a.1).then((a.0.dx, a.0.dy).cmp(&(b.0.dx, b.0.dy))));
         merged.into_iter().take(max).map(|(s, _)| s).collect()
     }
+}
 
+impl BandScratch {
     /// FNV-1a (32-bit) down each column of rows y0..y1, all columns at once (it vectorizes).
     fn col_hashes(&mut self, y: &Plane, y0: usize, y1: usize) {
         let w = y.width;

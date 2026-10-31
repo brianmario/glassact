@@ -350,17 +350,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             return frame
         }
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
+        var direct: [UInt8]?
         let known: Bool
         if reference != nil {
-            known = reusesAnalysis && Self.unchangedForFilters(now: sbMotion, before: previous?.motion ?? [], sbCols: sbCols0,
-                                                               sbRows: sbRows0, into: &changed)
+            var d = [UInt8](repeating: 0, count: sbCols0 * sbRows0)
+            known = reusesAnalysis && Self.filterRegions(now: sbMotion, before: previous?.motion ?? [], sbCols: sbCols0,
+                                                         sbRows: sbRows0, changed: &changed, direct: &d)
+            direct = d
         } else {
             known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
         }
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
-                                           changed: known ? changed : nil,
+                                           changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : inter.map(\.is_inter))
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
@@ -391,26 +394,32 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         previous = interFrames ? (p, frame.planes, sbMotion) : nil
     }
 
-    /// Per 64×64 of an inter frame, nonzero (into `changed`) unless its reconstruction before the
-    /// filters, its blocks and its source are the previous picture's: a copy at no motion now,
-    /// that was a copy in the previous picture (an inter frame's `now`, `before` its decisions),
-    /// where no 64×64 around it was coded then (deblocking an edge with an intra block changes
-    /// both sides, and the copy now holds that). False when the previous picture wasn't an
-    /// inter frame.
-    static func unchangedForFilters(now: [Int32], before: [Int32], sbCols: Int, sbRows: Int,
-                                    into changed: inout [UInt8]) -> Bool {
+    /// Per 64×64 of an inter frame, how the post-filters treat it. `changed`: the coded ones
+    /// (intra blocks). `direct`: copies that differ from the previous picture's output, whose
+    /// filtered samples are their reconstruction unless an intra block is next to them (a coded
+    /// 64×64 around them, which `changed` covers). The rest are the previous picture's: copies at
+    /// no motion now that were copies in the previous picture (an inter frame's decisions in
+    /// `before`) with no coded 64×64 around them then (deblocking an edge with an intra block
+    /// changes both sides, and the copy now holds that). False when the previous picture wasn't
+    /// an inter frame.
+    static func filterRegions(now: [Int32], before: [Int32], sbCols: Int, sbRows: Int,
+                              changed: inout [UInt8], direct: inout [UInt8]) -> Bool {
         let nsb = sbCols * sbRows
         guard now.count == 3 * nsb, before.count == 3 * nsb else { return false }
         for r in 0..<sbRows {
             for c in 0..<sbCols {
                 let s = r * sbCols + c
-                var same = now[3 * s] != 0 && now[3 * s + 1] == 0 && now[3 * s + 2] == 0
+                guard now[3 * s] != 0 else {
+                    (changed[s], direct[s]) = (1, 0)
+                    continue
+                }
+                var same = now[3 * s + 1] == 0 && now[3 * s + 2] == 0
                 for dr in -1...1 where same {
                     for dc in -1...1 where r + dr >= 0 && r + dr < sbRows && c + dc >= 0 && c + dc < sbCols {
                         if before[3 * ((r + dr) * sbCols + c + dc)] == 0 { same = false }
                     }
                 }
-                changed[s] = same ? 0 : 1
+                (changed[s], direct[s]) = (0, same ? 0 : 1)
             }
         }
         return true

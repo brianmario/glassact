@@ -119,9 +119,15 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// different, every 64×64's choice is redone and CDEF reruns wherever its
     /// strengths changed. A first picture is filtered whole. The result is
     /// the same either way.
+    ///
+    /// `direct` (with `changed`, per 64×64): ones that come out of the filters
+    /// as they went in, though they differ from the previous picture's (an
+    /// inter frame's copies: every block skipped and at level 0, and no intra
+    /// block in the 64×64s around them). They're copied, not filtered.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
-                       sourceStrides: [Int]? = nil, changed: [UInt8]? = nil, lfZero: [UInt8]? = nil) throws -> Search {
+                       sourceStrides: [Int]? = nil, changed: [UInt8]? = nil, direct: [UInt8]? = nil,
+                       lfZero: [UInt8]? = nil) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -139,7 +145,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         if let changed, tf.cdef_mode != 0, let job = lastJob, job.width == Int(fp.width), job.height == Int(fp.height),
            job.nPlanes == (mono ? 1 : 3), job.previousKey == key, changed.count == job.sbCols * job.sbRows,
            let result = try searchChanged(job, fp: fp, tf: tf, blocks: blocks, planes: planes, source: source,
-                                          sourceStrides: sourceStrides, changed: changed, lfZero: lfZero) {
+                                          sourceStrides: sourceStrides, changed: changed, direct: direct, lfZero: lfZero) {
             return result
         }
         let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
@@ -221,7 +227,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private func searchChanged(_ job: Job, fp base: av1g_frame_params, tf: GaTuneiqFrame,
                                blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                                source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8],
-                               lfZero: [UInt8]?) throws -> Search? {
+                               direct: [UInt8]?, lfZero: [UInt8]?) throws -> Search? {
         var fp = base
         let sbCols = job.sbCols, sbRows = job.sbRows, nsb = sbCols * sbRows, mono = fp.monochrome != 0
         let nc = Int(Self.candidates.npri * Self.candidates.nsec)
@@ -247,6 +253,24 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         // are unchanged, so their deblocked samples are the previous picture's: kept aside and
         // put back, so the whole deblocked frame stays exact for whatever reads it later (CDEF
         // where new presets change a strength, in this picture or a later one).
+        let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
+        if let direct, direct.count == nsb {
+            // their filtered and deblocked samples are their reconstruction, and their SSE rows
+            // a full search's (CDEF is inactive in them: zero)
+            let list = (0..<nsb).filter { direct[$0] != 0 }.map(UInt32.init)
+            for p in 0..<job.nPlanes {
+                for target in [job.source[p], job.output[p]] {
+                    Self.copy(planes[p], stride: job.pw[p], into: target, width: job.pw[p], height: job.ph[p],
+                              superblocks: list, side: p == 0 ? 64 : 32, sbCols: sbCols)
+                }
+            }
+            let ly = lumaSSE.contents().assumingMemoryBound(to: UInt32.self)
+            let luv = chromaSSE.contents().assumingMemoryBound(to: UInt32.self)
+            for sb in list {
+                (ly + Int(sb) * nc).update(repeating: 0, count: nc)
+                (luv + Int(sb) * nc).update(repeating: 0, count: nc)
+            }
+        }
         let around = dilate(outer)
         let ringList = (0..<nsb).filter { around[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
         let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", job.pw[$0] * job.ph[$0]) }
@@ -263,7 +287,6 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: target[p], width: job.pw[p], height: job.ph[p],
                       superblocks: innerList, side: p == 0 ? 64 : 32, sbCols: sbCols)
         }
-        let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
         let bitsCount = Self.maxCDEFBits + 1
         let levels = try job.scratch("levels", 4 * 16 * bitsCount), totals = try job.scratch("totals", 8 * bitsCount)
         let innerBuffer = try job.scratch("innerList", 4 * max(1, innerList.count))
