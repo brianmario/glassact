@@ -260,6 +260,28 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: long-range motion per superblock, from projections (2026-10-31)
+
+**Why:** libaom realtime's screen path (read in the vendored source) finds each superblock's motion from 1-D row and column projections over a long range (`av1_int_pro_motion_estimation`, mcomp.c; called from var_based_part.c). Our search looked ±8 around no motion and ±4 around the frame's hashed shifts, and those need exact line matches. So a photo sliding tens of samples a frame, or fading, was never found.
+
+**What changed:** `k_proj`, one threadgroup per coded 64×64, runs before `k_me`.
+- **Matching:** it matches the superblock's 64 row sums against the previous source's over ±192 rows, and its 64 column sums over ±96 columns (doubled from 3840 wide).
+- **Cost:** the variance of the difference, so a brightness change still matches, with a slight bias toward short vectors.
+- **Checking:** the horizontal, vertical and combined vectors are checked by SAD, and the best goes to `GpImage.meSb`.
+- **Search:** `k_me` searches ±4 around it as one more candidate centre.
+
+**Results** (first 100 frames, q20, every frame exact; inter frame mean):
+
+| Trace | 720p: before → now | libaom s9 | 5K: before → now | libaom s9 |
+|---|---|---|---|---|
+| photos | 44.2 → **14.3 KB**, PSNR-Y 41.12 → 41.29 | 14.4 KB, 41.29 | 29.5 → 29.5 KB | 37.2 KB |
+| scroll-win | 4.5 → **2.2 KB** | 2.0 KB | 4.5 → 4.3 KB | 4.0 KB |
+| typing-cc | 149 → 149 B | 123 B | 692 → 665 B | 324 B |
+| cursor-drag | 187 → 187 B | 125 B | 865 → 856 B | 486 B |
+
+- **Speed is unchanged:** 720p photos 86 and scroll 221 inter frames a second; 5K photos 29 and scroll 87.
+- **720p moving content is now level with libaom.** The rest of the gap is static content (the next entries: no sequence header on inter frames, 128×128 superblocks).
+
 ### Metal AV1: quarter-sample motion vectors (2026-10-31)
 
 **What changed:**

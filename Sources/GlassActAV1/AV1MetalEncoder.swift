@@ -93,7 +93,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let dp: any MTLComputePipelineState
     let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
     /// Inter frames' motion search: k_me, and per block size of 8×8 and up k_inter and its warps.
-    let motionSearch: any MTLComputePipelineState
+    let motionSearch: any MTLComputePipelineState, projectionSearch: any MTLComputePipelineState
     let inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int)]
     /// Keep each superblock's analysis, partition and leaf decisions from the
     /// previous picture when the source they read hasn't changed (the
@@ -343,8 +343,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             inter[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
         }
         self.inter = inter
-        guard let meFunction = library.makeFunction(name: "k_me") else { throw Failure.metal("no k_me") }
+        guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj")
+        else { throw Failure.metal("no k_me / k_proj") }
         motionSearch = try Self.pipeline(meFunction, threads: 128, device: device)
+        projectionSearch = try Self.pipeline(projFunction, threads: 256, device: device)
         var small: [Int: any MTLComputePipelineState] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
             guard let function = library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)")
@@ -668,6 +670,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 let me = try make((aw / 16) * (ah / 16) * 2 * Int(GP_ME_KEEP) * 2)
                 image.meBest = AV1MetalEncoder.address(me)
                 meBest = me
+                image.meSb = AV1MetalEncoder.address(try make(sbCols * sbRows * 4))
             } else {
                 meBest = nil
             }
@@ -807,7 +810,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let t0 = CACurrentMediaTime()
             var e = try open()
             let analyzed = staleSuperblocks ?? (sbCols * sbRows)
-            if isInter, analyzed > 0 {  // motion per 16x16, alongside the analysis
+            if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
+                var sbs = UInt32(analyzed)
+                e.setComputePipelineState(encoder.projectionSearch)
+                e.setBytes(&sbs, length: 4, index: 2)
+                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
                 var cells = UInt32(analyzed * 16)
                 e.setComputePipelineState(encoder.motionSearch)
                 e.setBytes(&cells, length: 4, index: 2)

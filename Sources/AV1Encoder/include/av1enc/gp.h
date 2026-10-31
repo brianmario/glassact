@@ -135,6 +135,8 @@ struct GpImage {
     // per 16x16 of the padded picture (aw / 16 x ah / 16, raster): k_me's best GP_ME_KEEP (dx, dy),
     // 1/8 luma sample
     GP_DEV int16_t *meBest;
+    // per SB (raster): k_proj's long-range vector (dx, dy), whole samples; k_me searches around it
+    GP_DEV int16_t *meSb;
 };
 
 // Analysis result per (shape, position).

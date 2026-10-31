@@ -2,10 +2,16 @@
 // previous picture's source (GpImage.ref), so the analysis needn't wait for the previous picture's
 // reconstruction and keeps overlapping the CPU's work; the closed loop predicts from the decoded
 // picture, exactly. Vectors are in 1/8 luma sample (the bitstream's unit).
+//   k_proj   one threadgroup per listed SB: long-range motion from row and column projections
+//            (libaom's av1_int_pro_motion_estimation, for screen content): the SB's 64 row sums
+//            matched against the previous picture's over +-192 rows, its 64 column sums over +-96
+//            columns (doubled from 3840 wide), by the variance of the difference (so a fade still
+//            matches); the horizontal, vertical and combined vectors checked by SAD, the best into
+//            GpImage.meSb
 //   k_me     one SIMD-group per 16x16 of the listed SBs: SAD (every other row) at whole-sample
-//            vectors within +-8 of no motion and +-4 of each of the frame's shift candidates; the
-//            best refined to half and then quarter samples (GpParams.meSubpel); keeps the best
-//            GP_ME_KEEP in GpImage.meBest
+//            vectors within +-8 of no motion, +-4 of each of the frame's shift candidates and +-4
+//            of its SB's k_proj vector; the best refined to half and then quarter samples
+//            (GpParams.meSubpel); keeps the best GP_ME_KEEP in GpImage.meBest
 //   k_inter  one SIMD-group per (shape, position) of 8x8 and up, after k_analysis: SAD screening
 //            of no motion and the vectors k_me kept for the 16x16s the block covers, then the
 //            analysis's exact-rate RD (DCT_DCT) of the best; where it costs less than the intra
@@ -16,12 +22,124 @@
 #pragma once
 #include "k_analysis.h"
 
-// k_me's vectors: index i < 289 is no motion's +-8 window, then 81 per candidate (+-4)
+// k_me's vectors: index i < 289 is no motion's +-8 window, then 81 per candidate (+-4): the frame's
+// shift candidates, then the SB's k_proj vector `sbv`
 constant int GA_ME_ZERO = 289;
-static inline int2 ga_me_vector(device const GpImage &I, int i) {
+static inline int2 ga_me_vector(device const GpImage &I, int i, int2 sbv) {
     if (i < GA_ME_ZERO) return int2(i % 17 - 8, i / 17 - 8);
     const int j = i - GA_ME_ZERO, c = j / 81, o = j % 81;
-    return int2(I.meCand[2 * c] + o % 9 - 4, I.meCand[2 * c + 1] + o / 9 - 4);
+    const int2 centre = c < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * c], I.meCand[2 * c + 1]) : sbv;
+    return centre + int2(o % 9 - 4, o / 9 - 4);
+}
+
+#define GA_PROJ_T 256
+#define GA_PROJ_RY 192
+#define GA_PROJ_RX 96
+// the variance of a - b (64 terms), the projections' match cost
+static inline float ga_proj_cost(threadgroup const int *a, threadgroup const int *b) {
+    float s = 0.f, s2 = 0.f;
+    for (int k = 0; k < 64; k++) {
+        const float d = (float)(a[k] - b[k]);
+        s += d;
+        s2 += d * d;
+    }
+    return s2 - s * s / 64.f;
+}
+
+kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
+                   constant uint32_t &nSbs [[buffer(2)]], uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_position_in_threadgroup]]) {
+    constexpr int RYMAX = 2 * GA_PROJ_RY, RXMAX = 2 * GA_PROJ_RX;
+    threadgroup int srow[64], scol[64], rrow[64 + 2 * RYMAX], rcol[64 + 2 * RXMAX];
+    threadgroup float bestCost[GA_PROJ_T];
+    threadgroup int bestOff[GA_PROJ_T];
+    threadgroup uint sadOf[4];
+    if (tg >= nSbs) return;
+    device const GpImage &I = B.img[0];
+    const uint32_t sb = B.sbList ? B.sbList[tg] : tg;
+    const int x = (int)(sb % I.sbCols) * 64, y = (int)(sb / I.sbCols) * 64, sp = I.spitch[0];
+    const int big = I.W >= 3840 ? 2 : 1, ry = GA_PROJ_RY * big, rx = GA_PROJ_RX * big;
+    device const uint8_t *src = I.src[0], *ref = I.ref;
+    // the SB's projections, and the previous picture's over the search range (outside it: none)
+    for (int k = (int)tid; k < 64; k += GA_PROJ_T) {
+        int r = 0, c = 0;
+        for (int j = 0; j < 64; j++) {
+            r += src[(size_t)(y + k) * sp + x + j];
+            c += src[(size_t)(y + j) * sp + x + k];
+        }
+        srow[k] = r;
+        scol[k] = c;
+    }
+    for (int k = (int)tid; k < 64 + 2 * ry; k += GA_PROJ_T) {
+        const int row = y - ry + k;
+        int r = -1;
+        if (row >= 0 && row < I.ah) {
+            r = 0;
+            for (int j = 0; j < 64; j++) r += ref[(size_t)row * sp + x + j];
+        }
+        rrow[k] = r;
+    }
+    for (int k = (int)tid; k < 64 + 2 * rx; k += GA_PROJ_T) {
+        const int col = x - rx + k;
+        int c = -1;
+        if (col >= 0 && col < I.aw) {
+            c = 0;
+            for (int j = 0; j < 64; j++) c += ref[(size_t)(y + j) * sp + col];
+        }
+        rcol[k] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // best offset along one axis: each thread takes offsets, then a reduction (smaller |d| on ties)
+    auto search = [&](threadgroup const int *a, threadgroup const int *b, int r) -> int {
+        float bc = GP_INF;
+        int bo = 0;
+        for (int d = (int)tid - r; d <= r; d += GA_PROJ_T) {
+            threadgroup const int *t = b + r + d;
+            if (t[0] < 0 || t[63] < 0) continue;  // reaches outside the picture
+            const float c = ga_proj_cost(a, t) * (1.f + 0.0005f * (float)abs(d));
+            if (c < bc) { bc = c; bo = d; }
+        }
+        bestCost[tid] = bc;
+        bestOff[tid] = bo;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = GA_PROJ_T / 2; s > 0; s >>= 1) {
+            if (tid < s && (bestCost[tid + s] < bestCost[tid] ||
+                            (bestCost[tid + s] == bestCost[tid] && abs(bestOff[tid + s]) < abs(bestOff[tid])))) {
+                bestCost[tid] = bestCost[tid + s];
+                bestOff[tid] = bestOff[tid + s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const int o = bestOff[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        return o;
+    };
+    const int dy = search(srow, rrow, ry), dx = search(scol, rcol, rx);
+    // the candidates by SAD over the SB (every 4th row): none, horizontal, vertical, both
+    const int2 cand[4] = {int2(0, 0), int2(dx, 0), int2(0, dy), int2(dx, dy)};
+    if (tid < 4) sadOf[tid] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int c = 0; c < 4; c++) {
+        const int2 v = cand[c];
+        if (x + v.x < 0 || y + v.y < 0 || x + v.x + 64 > I.aw || y + v.y + 64 > I.ah) {
+            if (tid == 0) sadOf[c] = 0xFFFFFFFFu;
+            continue;
+        }
+        uint sad = 0;
+        for (int p = (int)tid; p < 16 * 64; p += GA_PROJ_T) {
+            const int r = (p >> 6) * 4, cc = p & 63;
+            sad += (uint)abs((int)src[(size_t)(y + r) * sp + x + cc] - (int)ref[(size_t)(y + r + v.y) * sp + x + cc + v.x]);
+        }
+        atomic_fetch_add_explicit((threadgroup atomic_uint *)&sadOf[c], sad, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int b = 0;
+        for (int c = 1; c < 4; c++)
+            if (sadOf[c] < sadOf[b]) b = c;
+        I.meSb[2 * sb] = (int16_t)cand[b].x;
+        I.meSb[2 * sb + 1] = (int16_t)cand[b].y;
+    }
 }
 
 // motion vector bits (v in 1/8 sample), roughly: is_inter and the mode, then per nonzero component
@@ -65,25 +183,26 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
     for (int p = (int)lane; p < 256; p += 32) cur[warp][p] = src[(p >> 4) * sp + (p & 15)];
     simdgroup_barrier(mem_flags::mem_threadgroup);
-    const int n = GA_ME_ZERO + 81 * min(I.nMeCand, GP_ME_CANDS);
-    uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 10 | i): the lane's best two
+    const int2 sbv = I.meSb ? int2(I.meSb[2 * sb], I.meSb[2 * sb + 1]) : int2(0, 0);
+    const int n = GA_ME_ZERO + 81 * (min(I.nMeCand, GP_ME_CANDS) + (I.meSb && (sbv.x | sbv.y) ? 1 : 0));
+    uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 11 | i): the lane's best two
     for (int i = (int)lane; i < n; i += 32) {
-        const int2 v = ga_me_vector(I, i);
+        const int2 v = ga_me_vector(I, i, sbv);
         const int rx = x + v.x, ry = y + v.y;
         if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
         device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
         uint sad = 0;
         for (int row = 0; row < 16; row += 2)
             for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-        const uint key = (sad << 10) | (uint)i;
+        const uint key = (sad << 11) | (uint)i;
         if (key < k0) { k1 = k0; k0 = key; }
         else if (key < k1) k1 = key;
     }
     const uint b0 = simd_min(k0);
     const uint b1 = simd_min(k0 == b0 ? k1 : k0);
     // none found (every vector outside the picture): no motion
-    int2 best[2] = {b0 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b0 & 1023)) * 8,
-                    b1 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b1 & 1023)) * 8};
+    int2 best[2] = {b0 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b0 & 2047), sbv) * 8,
+                    b1 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b1 & 2047), sbv) * 8};
     if (P.meSubpel && b0 != 0xFFFFFFFFu) {
         // the best one to half, then quarter samples: the 8 neighbours at each step, every row
         uint bestSad = 0xFFFFFFFFu;
