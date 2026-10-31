@@ -13,6 +13,7 @@ let allCommands: [Command] = [
     keyframeCommand,
     av1StillCommand,
     av1SeqCommand,
+    av1TilesCommand,
     dragScanCommand,
     dumpPNGCommand,
     dumpTilesCommand,

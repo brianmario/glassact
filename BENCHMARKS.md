@@ -132,6 +132,7 @@ the numbers and the reasoning.
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
+| AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31) | AV1 data alone 1.26–2.6× VP8L z4's bytes | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31) |
 | Lossy WebP / AVIF tiles | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
 | VP8L positional routing memory | kept | 96 % of probes avoided on churn, 0 % on text (zero regret) | [entry](#vp8l-routing-memory-positional-outcome-memory-2026-08-05) |
@@ -258,6 +259,69 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Tiles as AV1: lossless and lossy AVIF, and the Metal encoder, against VP8L (2026-10-31)
+
+**What was compared:** changed 64×64 tiles, measured per tile.
+- **Corpora:** `glassact-bench dumptiles`, every 7th changed tile of the 5K traces. 400 tiles each, but only 67 for typing-cc.
+- **In process (`glassact-bench av1tiles`, new):**
+  - VP8L lossless, as the tile path codes a tile: efforts 1 and 4 (production: 4, or 1 in bursts over 32 tiles) and 9.
+  - The Metal/CPU hybrid AV1 encoder, coding each tile as its own 4:2:0 key frame.
+- **External tools (`scripts/tile-codec-probe`, new):**
+  - avifenc 1.4.2 (libaom 3.15.2 all-intra, single-threaded) and cwebp.
+  - Lossy tiles are scored with ssimulacra2 against the source tile.
+- **AVIF sizes:** given as the whole file and as the AV1 data in its mdat box. At this size, AVIF's container is ~275 B of the file.
+
+**Lossless (bytes a tile):**
+
+| Tiles | VP8L z1 | VP8L z4 | VP8L z9 | AVIF lossless s6: file / AV1 data | AVIF lossless s10: AV1 data |
+|---|---|---|---|---|---|
+| typing-cc | 440 | 417 | 413 | 1351 / 1076 | 2365 |
+| scroll-win | 394 | 381 | 370 | 1140 / 865 | 1561 |
+| photos | 3413 | 3332 | 3343 | 4553 / 4278 | 5636 |
+| cursor-drag | 2512 | 2381 | 2350 | 3277 / 3002 | 3948 |
+
+Even AV1 data alone, without its container, is 1.26–2.6× VP8L z4's bytes. VP8L z4 takes 165–1130 µs a tile on one core. This confirms the whole-frame result of 2026-08-07, by a wider margin at tile size. **AV1 lossless stays rejected for tiles.** The Metal encoder has no lossless mode: it would need qindex 0, the Walsh–Hadamard transform and 4:4:4.
+
+**Lossy (bytes a tile, then SSIMULACRA2 mean / p10):**
+
+| Tiles | AVIF 4:4:4 q90 s6 | AVIF 4:4:4 q75 s6 | AVIF 4:2:0 q75 s6 | WebP q90 | Metal AV1 4:2:0 q8: stream, payload | Metal q20 | VP8L z4 (lossless) |
+|---|---|---|---|---|---|---|---|
+| typing-cc | 379 · 94.1 / 91.6 | 282 · 91.0 / 89.0 | 274 · 88.6 / 87.4 | 502 · 89.2 / 88.1 | 364, 340 · 87.9 / 86.6 | 287 · 87.8 / 85.9 | 417 |
+| scroll-win | 270 · 95.6 / 91.7 | 210 · 94.3 / 89.1 | 200 · 91.3 / 82.0 | 357 · 90.4 / 82.7 | 246, 222 · 90.5 / 82.5 | 190 · 88.7 / 78.1 | 381 |
+| photos | 1026 · 91.0 / 84.9 | 631 · 87.6 / 77.6 | 615 · 86.0 / 74.7 | 897 · 86.2 / 75.8 | 808, 784 · 84.7 / 71.2 | 471 · 81.2 / 66.1 | 3332 |
+| cursor-drag | 526 · 91.5 / 87.9 | 358 · 89.1 / 82.8 | 344 · 86.4 / 74.9 | 538 · 85.2 / 73.6 | 390, 366 · 83.8 / 68.6 | 263 · 81.2 / 66.2 | 2381 |
+
+What the lossy rows show:
+- **Near-lossless gains depend on content.** AVIF 4:4:4 q90's AV1 data is near-lossless (SSIMULACRA2 91–96) and smaller than VP8L lossless by:
+
+  | Tiles | Smaller by |
+  |---|---|
+  | typing-cc (text) | 9 % |
+  | scroll-win | 29 % |
+  | photos | 69 % |
+  | cursor-drag | 78 % |
+
+  So lossy tiles pay on photos and graphics and barely on text, and they'd give up the canvas's byte-exactness.
+- **The Metal encoder trails AVIF at tile size.** It never reaches the AVIF 4:4:4 q90 tier: its mean SSIMULACRA2 tops out at 84–90, below AVIF 4:2:0 q75 at similar bytes. The reasons:
+  - 4:2:0 in video range;
+  - coding each tile as a cold, standalone frame, with ~24 B of TD, sequence and frame headers;
+  - its fast preset.
+- **Standalone tiles are slow on the GPU.** One at a time, a tile takes 2.7–4.6 ms, because each is a GPU round trip. Tiles belong in a frame.
+
+**One-superblock tiles inside a frame,** i.e. coding the whole frame and cutting it into independently parseable 64×64 tiles. `av1seq` at 4096×2304, where AV1's 64-tile-column limit fits one 64-px superblock per tile column. 64×36 tiles against 4×4, 30 frames:
+
+| Sequence | 4×4 tiles | 64×36 tiles |
+|---|---|---|
+| typing-cc | 471.7 KB · 117 fps | 514.3 KB (+9.0 %) · 104 fps |
+| scroll-win | 391.6 KB · 133 fps | 433.7 KB (+10.8 %) · 110 fps |
+| photos | 888.9 KB · 11.2 fps | 927.6 KB (+4.4 %) · 10.8 fps |
+
+Encoding the whole frame and cutting it isn't wasteful in work: unchanged superblocks cost next to nothing, and that's what makes these frame rates. Cutting it has these costs:
+- **Bytes:** independent tiles (fresh CDFs, no prediction across tiles) cost 4–11 %.
+- **The deblocking and CDEF filters cross tile edges.** A tile on its own decodes exactly only with them off, which hasn't been measured.
+- **Wider than 4096 doesn't fit.** At 5K's 80 superblock columns, AV1's 64-tile-column limit forces 128-px tiles or two frames.
+- **Decoders decode frames, not tiles.** Independent tiles need libaom's large-scale-tile mode or a stitched frame.
 
 ### Metal AV1: an exact deblocked frame, and no analysis work when nothing changed (2026-10-31)
 
