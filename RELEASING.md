@@ -145,6 +145,66 @@ than one remote; for a fork, use your own.
 If anything is missing, the workflow stops at "Secrets present" and names
 it.
 
+## TestFlight (iPad Viewer)
+
+The iPad Viewer goes out through TestFlight and, later, the App Store, not
+GitHub releases. It has the same version as the Mac apps
+(`Apps/Version.xcconfig`); each upload's build number is the UTC time, so it
+always goes up.
+
+**By hand, from Xcode** (the simplest way, and the way to make the first
+build): pick the **iPad** scheme and **Any iOS Device**, then Product ›
+Archive, and in the Organizer, Distribute App › TestFlight & App Store.
+Xcode signs it with your account.
+
+**From the TestFlight workflow** (Actions › TestFlight › Run workflow, from
+any branch): it runs `Apps/ci-testflight.sh`, which needs no Xcode account.
+One-time setup, on top of the team ID and API key above:
+
+1. **App record.** At App Store Connect › Apps, add an iOS app for the
+   bundle ID `app.glassact.viewer` (the Mac Viewer's too, which keeps a
+   universal purchase possible later).
+
+2. **Apple Distribution certificate** (secrets `DISTRIBUTION_P12_BASE64` and
+   `DISTRIBUTION_P12_PASSWORD`). The one Xcode makes when it distributes is
+   managed in the cloud and can't be exported, so make your own: Xcode ›
+   Settings › Accounts › your team › Manage Certificates › + › **Apple
+   Distribution**. Then export it from Keychain Access with its private key
+   as a `.p12`, as for the Developer ID certificate:
+   ```sh
+   base64 -i Distribution.p12 | gh secret set DISTRIBUTION_P12_BASE64 -R brianmario/glassact
+   gh secret set DISTRIBUTION_P12_PASSWORD -R brianmario/glassact
+   ```
+
+3. **App Store profile** (secret `IPAD_PROFILE_BASE64`, variable
+   `IPAD_PROFILE_NAME`). At developer.apple.com › Profiles, add an **App
+   Store Connect** profile (under Distribution) for iOS, App ID
+   `app.glassact.viewer`, with that certificate. Name it, for example,
+   `Glass Act iPad App Store`, then:
+   ```sh
+   base64 -i Glass_Act_iPad_App_Store.mobileprovision | gh secret set IPAD_PROFILE_BASE64 -R brianmario/glassact
+   gh variable set IPAD_PROFILE_NAME -R brianmario/glassact --body "Glass Act iPad App Store"
+   ```
+
+4. **The API key uploads too.** The upload uses the same `ASC_KEY_*`
+   secrets as notarization. A team key needs the **App Manager** role to
+   upload (Developer is enough for notarization only); an individual key has
+   your own account's access. If the upload step is refused, make a team key
+   with App Manager and replace the secrets.
+
+With the certificate and profile installed locally, `UPLOAD=0` checks the
+build without uploading:
+
+```sh
+TEAM=VJ4FHSCMNE IPAD_PROFILE="Glass Act iPad App Store" UPLOAD=0 Apps/ci-testflight.sh
+```
+
+**Review.** Testers in your team (App Store Connect users, up to 100) get
+builds as soon as they're processed. Testers outside it need Beta App
+Review, once per version. Reviewers can't reach a Mac of yours, so put a
+short screen recording and how to try it in the review notes, or give them
+a test host to reach (`glassact-testhost` on a Mac they can connect to).
+
 ## Checking the release build locally
 
 `Apps/ci-release.sh` is what the workflow runs. With the certificate in your
