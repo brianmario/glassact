@@ -1,10 +1,14 @@
 //! The host half of the Metal encoder (Sources/AV1Encoder): libaom tune=iq's frame decisions, the
 //! host half of the post-filter strength search, and the derived tables the kernels compile.
+pub mod entropy;
 pub mod lfsearch;
+pub mod pf_frame;
 pub mod tables;
 pub mod tuneiq;
 
+pub use entropy::{assemble_obus, ent_plan};
 pub use lfsearch::{cdef_bits, cdef_presets, cdef_select_cpu};
+pub use pf_frame::{GpuPfFrame, pf_frame};
 pub use tables::tables_msl;
 pub use tuneiq::{TuneiqFrame, tuneiq_fill_fp, tuneiq_frame, tuneiq_frame_init};
 
