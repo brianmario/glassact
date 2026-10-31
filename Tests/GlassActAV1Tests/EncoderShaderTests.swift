@@ -4,7 +4,7 @@ import Metal
 import Testing
 
 /// The encoder's kernels (Sources/GlassActAV1/Shaders/encoder.metal) compile,
-/// and every analysis shape fits Metal's threadgroup memory.
+/// and each fits Metal's threadgroup memory.
 @Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
 struct EncoderShaderTests {
     @available(macOS 27, *)
@@ -15,7 +15,8 @@ struct EncoderShaderTests {
             let library = try AV1ShaderSource.library(main, device: device)
             let analysis = library.functionNames.filter { $0.hasPrefix("k_analysis_") }
             #expect(analysis.count == 19, "\(analysis.sorted())")
-            for name in analysis {
+            #expect(library.functionNames.contains("k_recon") && library.functionNames.contains("k_dp"))
+            for name in analysis + ["k_recon", "k_dp"] {
                 let pipeline = try device.makeComputePipelineState(function: try #require(library.makeFunction(name: name)))
                 #expect(pipeline.staticThreadgroupMemoryLength <= device.maxThreadgroupMemoryLength, "\(name)")
             }

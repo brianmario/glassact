@@ -54,3 +54,6 @@ kernel void ga_layout(device uint *out [[buffer(0)]]) {
 #undef GA_OFF
     out[i++] = 0xFFFFFFFFu;
 }
+
+// Closed loop: one threadgroup of RC_NT (128) threads per 64x64, in wavefront steps.
+#include "k_recon.h"
