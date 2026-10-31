@@ -259,6 +259,70 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 key frames vs libaom realtime: first measurements (2026-10-30)
+
+Research branch `metal-av1` (the Metal port of av1gpu, `GlassActAV1`).
+`glassact-bench av1still` (new) encodes one trace frame as an AV1 key frame
+two ways, at fixed quantizers q, and scores luma PSNR and SSIMULACRA2
+against the source:
+- **Metal:** GPU analysis, partition DP and closed loop at qindex 4q; the
+  GPU strength search and filters (libaom tune=iq's levels); av1core's CPU
+  writer.
+- **libaom realtime:** the retired AV1 video path's screen-content encoder
+  (palette, IntraBC), speed 9 or 6, 8 threads.
+
+Every Metal stream decodes in libaom to exactly the GPU's filtered picture.
+Machine: M4 Pro. Native 5120×2880, one frame per trace, so these are spot
+checks, not BD-rate.
+
+**Size at equal quality.** Metal base preset, minimum tiling; size @ SSIMULACRA2:
+
+| trace (frame) | Metal q12 | libaom s9 q12 | Metal q20 | libaom s9 q20 |
+|---|---|---|---|---|
+| typing-cc (200) | 653 KB @ 81.8 | 1.19 MB @ 81.5 | 510 KB @ 77.6 | 1.04 MB @ 78.4 |
+| scroll-win (150) | 540 KB @ 80.2 | 833 KB @ 79.8 | 432 KB @ 78.0 | 698 KB @ 78.4 |
+| photos (150) | 1.46 MB @ 81.2 | 2.44 MB @ 81.8 | 1.06 MB @ 76.5 | 2.06 MB @ 78.4 |
+
+That's 35–50 % smaller at matched SSIMULACRA2. libaom speed 6 lands within
+0.5 % of speed 9 here. At one q, Metal's quality falls faster with q than
+libaom's, so compare at equal scores, not equal q.
+
+**Time at 5K** (typing-cc, ms; GPU is from GPU timestamps, stage by stage):
+
+| configuration | analysis | closed loop | GPU total | writer (CPU) | size vs base |
+|---|---|---|---|---|---|
+| base, minimum tiles (128 steps) | 1093 | 1038 | 2131 | 65 | — |
+| base, 2×2 tiles (42 steps) | 1198 | 470 | 1668 | 93 | +0.3 % |
+| base, 3×3 tiles (20 steps) | 1181 | 296 | 1478 | 139 | +1.4 % |
+| base, 4×3 tiles (15 steps) | 1220 | 277 | 1498 | 85 | +2.6 % |
+| fast, 3×3 | 627 | 313 | 940 | 63 | +1.5 % |
+| faster, 3×3 | 660 | 276 | 936 | 64 | +1.5 % |
+| **turbo, 3×3** | 356 | 272 | **629** | 65 | +1.9 % |
+| turbo2, 3×3 | 224 | 171 | 395 | 76 | +39 % |
+| turbo3, 3×3 | 128 | 141 | 270 | 78 | +40 % |
+| libaom s9 (8 CPU threads) | | | 250–330 wall | | +80 % |
+
+These are q12 rows. The writer column is noisy (30–200 ms run to run). The
+filters and strength search take 12 ms of GPU time (~28 ms wall).
+
+- **The closed loop is latency-bound.** A wavefront step costs ~7 ms
+  whether it holds 10 superblocks (720p) or 40 (5K), so its time is the step
+  count; tiles cut it. Past 3×3 the steps get slower as they widen.
+- **The analysis is throughput-bound** (~13 MP/s on base). The presets cut
+  it most.
+- **turbo is the sweet spot on text:** 2.3× base's speed for +2 % size,
+  still ~43 % smaller than libaom s9 at equal SSIMULACRA2.
+  turbo2 / turbo3 drop 4×4 / 4×8 / 8×4 blocks, which costs text ~40 %.
+  Turning off angle deltas alone (turbo + turbo3's change) saves ~65 ms of
+  analysis for +0.7 %.
+- **Still 20× short of a 30 fps 5K frame.** Leads, unmeasured:
+  - occupancy: the closed loop's threadgroup takes 23.5 KB of threadgroup
+    memory and the large analysis shapes 20–32 KB;
+  - av1gpu's small-shape analysis kernel (`smallKernel`, on by default
+    upstream, not ported);
+  - writing tiles on parallel CPU threads;
+  - for video, encoding only the regions that change.
+
 ### Prefer smooth motion runs AV1 on a thin link (2026-10-28)
 
 The next entry's candidate, in the product. With the Viewer's AV1 opt-in

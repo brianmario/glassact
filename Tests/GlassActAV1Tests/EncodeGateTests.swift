@@ -17,12 +17,28 @@ struct EncodeGateTests {
     @available(macOS 27, *)
     @Test(.serialized, arguments: [(333, 201, 40), (333, 201, 120), (1280, 720, 120), (1280, 720, 200)])
     func gpuReconstructionIsTheDecoders(width: Int, height: Int, qindex: Int) throws {
+        try check(width: width, height: height, qindex: qindex, preset: .base, tiling: (-1, -1))
+    }
+
+    /// The faster presets prune, subsample and drop tools, and tiles cut the
+    /// contexts: the reconstruction must stay the decoder's.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [("slow", 0, 0), ("faster", 1, 0), ("turbo", 1, 1), ("turbo3", 2, 1)])
+    func presetsAndTilesStayExact(preset: String, columnsLog2: Int, rowsLog2: Int) throws {
+        try check(width: 1280, height: 720, qindex: 120, preset: try #require(AV1MetalEncoder.Preset(rawValue: preset)),
+                  tiling: (columnsLog2, rowsLog2))
+    }
+
+    @available(macOS 27, *)
+    func check(width: Int, height: Int, qindex: Int, preset: AV1MetalEncoder.Preset, tiling: (Int, Int)) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let encoder: AV1MetalEncoder
         do { encoder = try AV1MetalEncoder(device: device) } catch {
             Issue.record("\(error)")
             return
         }
+        encoder.preset = preset
+        encoder.tiling = tiling
         let picture = PartitionTests.Picture(width: width, height: height)
         var encoded = try picture.y.withUnsafeBufferPointer { y in
             try picture.u.withUnsafeBufferPointer { u in
@@ -32,7 +48,7 @@ struct EncodeGateTests {
                 }
             }
         }
-        let label = "\(width)×\(height) q\(qindex)"
+        let label = "\(width)×\(height) q\(qindex) \(preset) tiles \(tiling)"
 
         // 1. av1core's layout of these blocks is the GPU's
         let gpuTxb = encoded.txb, gpuBlockTxb = encoded.blockTxb

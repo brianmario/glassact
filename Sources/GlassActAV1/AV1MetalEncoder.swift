@@ -2,6 +2,7 @@ public import AV1Core
 internal import AV1Encoder
 internal import Foundation
 public import Metal
+internal import QuartzCore
 
 /// av1gpu's AV1 intra encoder, on Metal (research; DESIGN doesn't cover it
 /// yet): the open-loop analysis of every block shape, the partition DP, and
@@ -47,6 +48,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var txb: [av1g_txb]
         public var coeffs: [Int16]
         public var reconstruction: [[UInt8]]
+        /// The same reconstruction at the post-filters' size, which reaches past
+        /// the picture: MiCols·4 × MiRows·4, chroma half that each way.
+        public var filterInput: [[UInt8]]
 
         /// The record, pointing into this value's arrays for the duration of `body`.
         public mutating func withRecord<R>(_ body: (inout av1g_decision_record) throws -> R) rethrows -> R {
@@ -80,6 +84,22 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
     public private(set) var lastGPUSeconds: Double = 0
+
+    /// The last picture's GPU time by stage (when `profilesStages` is on), and
+    /// its wall-clock time from the first dispatch to the last completion.
+    public struct StageTimes: Sendable {
+        public var analysis = 0.0, partition = 0.0, closedLoop = 0.0, wall = 0.0
+        /// Closed-loop dispatches that must run one after another.
+        public var wavefrontSteps = 0
+    }
+    /// Runs each stage in its own command buffer so it can be timed, which
+    /// adds a little latency between stages. For measurement.
+    public var profilesStages = false
+    /// Uniform tiles, as log2 of the columns and rows (-1: the fewest legal).
+    /// Tiles run the closed loop's wavefronts side by side, and cost the
+    /// bits of contexts that don't cross them.
+    public var tiling: (columnsLog2: Int, rowsLog2: Int) = (-1, -1)
+    public private(set) var lastStages = StageTimes()
 
     public init(device: any MTLDevice) throws {
         self.device = device
@@ -115,6 +135,52 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// scratch each one needs (RC_CTA_BIG_BYTES: 4 × RcBigScr + 8 kept 32×32 levels).
     static let reconThreads = 128
     static let reconScratchBytes = 4 * (64 * 64 * 2 + 32 * 65 * 4 + 32 * 32 * 2) + 8 * 32 * 32 * 2
+
+    /// av1gpu's speed presets (encoder/apps/av1gpu.cpp), each searching less
+    /// than the one before. Their tilings are `tiling`'s to choose here, and
+    /// `slow`'s exhaustive loop-filter searches aren't ported.
+    public enum Preset: String, CaseIterable, Sendable {
+        /// Closed-loop tx-size search, every tx type for every re-checked
+        /// candidate, K 6, filter intra.
+        case slow
+        /// Everything at av1gpu's defaults (K 4, tx search in the analysis).
+        case base
+        /// No 4:1 shapes, K 2, no tx search in the analysis.
+        case fast
+        /// + flat-region pruning, one closed-loop candidate.
+        case faster
+        /// + no 32×64 / 64×32, 2× subsampled screening for ≥ 16×16, K 1:
+        /// av1gpu's default.
+        case turbo
+        /// + no 4×4 / 4×8 / 8×4, no closed-loop tx search, one chroma candidate.
+        case turbo2
+        /// + no angle deltas.
+        case turbo3
+    }
+
+    /// The search effort; `base` by default.
+    public var preset: Preset = .base {
+        didSet { params = Self.params(for: preset) }
+    }
+
+    static func params(for preset: Preset) -> GpParams {
+        var p = defaultParams()
+        switch preset {
+        case .base:
+            break
+        case .slow:
+            p.txSizeSearch = 1; p.txAllCL = 1; p.K = 6; p.Krecheck = 6; p.filterIntra = 1
+        case .fast:
+            p.shapeMask = 0x1FFF; p.K = 2; p.Krecheck = 2; p.txSearch = 0
+        case .faster:
+            p.shapeMask = 0x1FFF; p.K = 2; p.Krecheck = 1; p.txSearch = 0; p.pruneFlat = 1
+        case .turbo, .turbo2, .turbo3:
+            p.shapeMask = 0x13FF; p.K = 1; p.Krecheck = 1; p.txSearch = 0; p.pruneFlat = 1; p.screenSub = 2
+            if preset != .turbo { p.shapeMask = 0x13F8; p.txSearchCL = 0; p.uvK = 1 }
+            if preset == .turbo3 { p.deltas = 0; p.uvDeltas = 0 }
+        }
+        return p
+    }
 
     /// av1gpu's base configuration (GpConfig), without the small-shape kernel.
     static func defaultParams() -> GpParams {
@@ -217,8 +283,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             rec = recPlanes
             var tl = av1g_tiles()
-            guard av1g_tile_layout(UInt32(width), UInt32(height), -1, -1, &tl) == AV1G_OK
-            else { throw Failure.metal("tile layout") }
+            guard av1g_tile_layout(UInt32(width), UInt32(height), Int32(encoder.tiling.columnsLog2),
+                                   Int32(encoder.tiling.rowsLog2), &tl) == AV1G_OK
+            else { throw Failure.metal("tile layout \(encoder.tiling) for \(width)×\(height)") }
 
             var image = GpImage()
             image.W = Int32(width); image.H = Int32(height)
@@ -328,39 +395,74 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
 
         func execute(closedLoop: Bool) throws {
-            guard let commands = encoder.queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
-            else { throw Failure.metal("no command encoder") }
-            for b in buffers { compute.useResource(b, usage: [.read, .write]) }
+            let profiling = encoder.profilesStages
+            var stages = StageTimes()
+            stages.wavefrontSteps = closedLoop ? steps.count : 0
+            var commands: (any MTLCommandBuffer)?
+            var compute: (any MTLComputeCommandEncoder)?
             var params = encoder.params
-            compute.setBytes(&batch, length: MemoryLayout<GpBatch>.stride, index: 0)
-            compute.setBytes(&params, length: MemoryLayout<GpParams>.stride, index: 1)
+            func open() throws -> any MTLComputeCommandEncoder {
+                if let compute { return compute }
+                guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder()
+                else { throw Failure.metal("no command encoder") }
+                for b in buffers { e.useResource(b, usage: [.read, .write]) }
+                e.setBytes(&batch, length: MemoryLayout<GpBatch>.stride, index: 0)
+                e.setBytes(&params, length: MemoryLayout<GpParams>.stride, index: 1)
+                commands = c
+                compute = e
+                return e
+            }
+            /// Ends a stage: when profiling, commits it and returns its GPU time.
+            func close() throws -> Double {
+                guard let c = commands, let e = compute else { return 0 }
+                e.endEncoding()
+                c.commit()
+                c.waitUntilCompleted()
+                if let error = c.error { throw Failure.metal("\(error)") }
+                commands = nil
+                compute = nil
+                return c.gpuEndTime - c.gpuStartTime
+            }
+            let t0 = CACurrentMediaTime()
+            var e = try open()
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
                 guard let (pipeline, warps) = encoder.analysis[s] else { continue }
                 var n = shTotal[s]
-                compute.setComputePipelineState(pipeline)
-                compute.setBytes(&n, length: 4, index: 2)
-                compute.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
-                                             threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                e.setComputePipelineState(pipeline)
+                e.setBytes(&n, length: 4, index: 2)
+                e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
             }
-            compute.memoryBarrier(scope: .buffers)
+            stages.analysis = profiling ? try close() : 0
+            e = try open()
+            e.memoryBarrier(scope: .buffers)
             let nSb = sbCols * sbRows
-            compute.setComputePipelineState(encoder.dp)
-            compute.dispatchThreads(MTLSize(width: nSb, height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: min(64, nSb), height: 1, depth: 1))
+            e.setComputePipelineState(encoder.dp)
+            e.dispatchThreads(MTLSize(width: nSb, height: 1, depth: 1),
+                              threadsPerThreadgroup: MTLSize(width: min(64, nSb), height: 1, depth: 1))
+            stages.partition = profiling ? try close() : 0
             if closedLoop {
-                compute.setComputePipelineState(encoder.recon)
+                e = try open()
+                e.setComputePipelineState(encoder.recon)
                 for step in steps {
-                    compute.memoryBarrier(scope: .buffers)
-                    compute.setBytes(step, length: step.count * 4, index: 2)
-                    compute.dispatchThreadgroups(MTLSize(width: step.count, height: 1, depth: 1),
-                                                 threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.reconThreads, height: 1, depth: 1))
+                    e.memoryBarrier(scope: .buffers)
+                    e.setBytes(step, length: step.count * 4, index: 2)
+                    e.dispatchThreadgroups(MTLSize(width: step.count, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.reconThreads, height: 1, depth: 1))
                 }
+                stages.closedLoop = profiling ? try close() : 0
             }
-            compute.endEncoding()
-            commands.commit()
-            commands.waitUntilCompleted()
-            if let error = commands.error { throw Failure.metal("\(error)") }
-            encoder.lastGPUSeconds = commands.gpuEndTime - commands.gpuStartTime
+            if let c = commands, let e = compute {
+                e.endEncoding()
+                c.commit()
+                c.waitUntilCompleted()
+                if let error = c.error { throw Failure.metal("\(error)") }
+                encoder.lastGPUSeconds = c.gpuEndTime - c.gpuStartTime
+            } else {
+                encoder.lastGPUSeconds = stages.analysis + stages.partition + stages.closedLoop
+            }
+            stages.wall = CACurrentMediaTime() - t0
+            encoder.lastStages = stages
         }
 
         /// Superblocks in decode order: tiles in raster order, superblocks in raster order inside each.
@@ -427,20 +529,25 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             fp.height = UInt32(height)
             fp.base_q_idx = UInt8(qindex)
             fp.tx_mode_select = encoder.params.txSizeSearch != 0 ? 1 : 0
-            fp.tile_cols_log2 = -1
-            fp.tile_rows_log2 = -1
+            fp.tile_cols_log2 = Int8(encoder.tiling.columnsLog2)
+            fp.tile_rows_log2 = Int8(encoder.tiling.rowsLog2)
             fp.enable_filter_intra = UInt8(encoder.params.filterIntra)
-            var reconstruction: [[UInt8]] = []
-            for p in 0..<3 {
-                let w = p == 0 ? width : (width + 1) / 2, h = p == 0 ? height : (height + 1) / 2
-                let pitch = p == 0 ? aw : aw / 2
-                let base = rec[p].contents().assumingMemoryBound(to: UInt8.self)
-                var plane = [UInt8](repeating: 0, count: w * h)
-                for row in 0..<h { for col in 0..<w { plane[row * w + col] = base[row * pitch + col] } }
-                reconstruction.append(plane)
+            func planes(_ size: (Int) -> (Int, Int)) -> [[UInt8]] {
+                (0..<3).map { p in
+                    let (w, h) = size(p)
+                    let pitch = p == 0 ? aw : aw / 2
+                    let base = rec[p].contents().assumingMemoryBound(to: UInt8.self)
+                    var plane = [UInt8](repeating: 0, count: w * h)
+                    plane.withUnsafeMutableBufferPointer { d in
+                        for row in 0..<h { (d.baseAddress! + row * w).update(from: base + row * pitch, count: w) }
+                    }
+                    return plane
+                }
             }
+            let reconstruction = planes { $0 == 0 ? (width, height) : ((width + 1) / 2, (height + 1) / 2) }
+            let filterInput = planes { $0 == 0 ? (miCols * 4, miRows * 4) : (miCols * 2, miRows * 2) }
             return Encoded(params: fp, blocks: blocks, blockTxb: blockTxb, txb: txb, coeffs: coeffs,
-                           reconstruction: reconstruction)
+                           reconstruction: reconstruction, filterInput: filterInput)
         }
     }
 

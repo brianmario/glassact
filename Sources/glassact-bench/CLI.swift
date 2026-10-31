@@ -11,6 +11,7 @@ let allCommands: [Command] = [
     replayCommand,
     codecsCommand,
     keyframeCommand,
+    av1StillCommand,
     dragScanCommand,
     dumpPNGCommand,
     dumpTilesCommand,
