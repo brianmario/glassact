@@ -305,10 +305,6 @@ fn parse_frame(
             sq.force_int_mv
         };
     }
-    need!(
-        !inter || force_integer_mv == 1,
-        "inter frames without force_integer_mv not supported"
-    );
     let override_ = if !sq.reduced { br.b()? } else { false };
     if sq.order_hint_bits != 0 {
         br.f(sq.order_hint_bits)?;
@@ -350,7 +346,8 @@ fn parse_frame(
         br.f(16)?;
     }
     if inter {
-        // force_integer_mv: no allow_high_precision_mv
+        // fp.mv_precision: force_integer_mv (intra frames: 1), else allow_high_precision_mv
+        fp.mv_precision = if force_integer_mv != 0 { 0 } else { 1 + br.f(1)? as u8 };
         need!(br.f(1)? == 0, "switchable interpolation filters not supported");
         need!(
             br.f(2)? == EIGHTTAP as u32,

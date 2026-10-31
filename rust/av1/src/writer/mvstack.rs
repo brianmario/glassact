@@ -1,7 +1,8 @@
 //! The motion vector candidate stack (spec 7.10.2, find_mv_stack) for the writer's inter
-//! toolset: single prediction from LAST_FRAME, identity global motion (GlobalMvs are 0),
-//! force_integer_mv = 1, no reference-frame MVs (use_ref_frame_mvs = 0: no temporal scan, so
-//! ZeroMvContext is 0), 64x64 superblocks. It reads only the tile's mode info of blocks already
+//! toolset: single prediction from LAST_FRAME, identity global motion (GlobalMvs are 0), the
+//! frame's MV precision (force_integer_mv, allow_high_precision_mv: fp.mv_precision), no
+//! reference-frame MVs (use_ref_frame_mvs = 0: no temporal scan, so ZeroMvContext is 0), 64x64
+//! superblocks. It reads only the tile's mode info of blocks already
 //! coded, so the writer and the parser build the same stack.
 //!
 //! [`derive_mode`] is the writer's rule from a block's motion vector to its mode (decisions.h
@@ -28,6 +29,8 @@ pub(crate) struct MvMaps<'a> {
     pub col_end: i32,
     pub mi_rows: i32,
     pub mi_cols: i32,
+    /// the frame's fp.mv_precision (0 force_integer_mv, 1 quarter, 2 allow_high_precision_mv)
+    pub mv_precision: u8,
 }
 
 /// RefFrames of a 4x4 not coded yet in this frame.
@@ -57,11 +60,19 @@ pub(crate) struct MvStack {
     pub drl_ctx: [usize; 8],
 }
 
-/// lower_mv_precision with force_integer_mv = 1 (allow_high_precision_mv = 0)
+/// lower_mv_precision (spec 7.10.2.10) of one component, for fp.mv_precision `prec`: 0
+/// (force_integer_mv) rounds to whole samples (halves toward zero), 1 (allow_high_precision_mv 0)
+/// moves an odd component one toward zero, 2 (allow_high_precision_mv 1) keeps it.
 #[inline]
-fn lower_precision(v: i32) -> i32 {
-    let a = (v.abs() + 3) >> 3;
-    if v > 0 { a << 3 } else { -(a << 3) }
+pub(crate) fn lower_mv_precision(v: i32, prec: u8) -> i32 {
+    match prec {
+        0 => {
+            let a = (v.abs() + 3) >> 3;
+            if v > 0 { a << 3 } else { -(a << 3) }
+        }
+        1 if v & 1 != 0 => v - v.signum(),
+        _ => v,
+    }
 }
 
 struct Search<'a, 'b> {
@@ -84,7 +95,8 @@ impl Search<'_, '_> {
             return; // IsInters == 0 (or not LAST_FRAME)
         }
         let mv = self.m.mvs[k];
-        let cand = [lower_precision(mv[0] as i32), lower_precision(mv[1] as i32)];
+        let p = self.m.mv_precision;
+        let cand = [lower_mv_precision(mv[0] as i32, p), lower_mv_precision(mv[1] as i32, p)];
         if self.m.y_mode[k] as i32 == NEWMV {
             self.new_count += 1;
         }
@@ -311,17 +323,17 @@ pub(crate) fn find_mv_stack(m: &MvMaps, mi_row: i32, mi_col: i32, bsize: i32) ->
 }
 
 /// The MV-class bit cost the writer minimises for a NEWMV difference component (decisions.h): 0
-/// for 0, else 2 + 2 * mv_class.
+/// for 0, else 2 + 2 * mv_class (the fr / hp bits a frame codes are the same for every class).
 #[inline]
 pub(crate) fn mv_comp_cost(d: i32) -> u32 {
     if d == 0 { 0 } else { 2 + 2 * mv_class(d.unsigned_abs()) }
 }
 
-/// The mv_class of a nonzero whole-sample difference magnitude `a` (1/8 sample, a multiple of 8,
-/// <= 2^14): class 0 holds 1..2 samples, class c >= 1 holds 2^c + 1 .. 2^(c + 1).
+/// The mv_class of a nonzero difference magnitude `a` (1/8 sample, 1 ..= 2^14): class 0 holds
+/// 1/8 .. 2 samples, class c >= 1 holds 2^c + 1/8 .. 2^(c + 1) samples.
 #[inline]
 pub(crate) fn mv_class(a: u32) -> u32 {
-    let v = (a >> 3) - 1;
+    let v = (a - 1) >> 3;
     if v < 2 { 0 } else { 31 - v.leading_zeros() }
 }
 
@@ -422,6 +434,7 @@ mod tests {
                 col_end: self.mw,
                 mi_rows: self.mh,
                 mi_cols: self.mw,
+                mv_precision: 0,
             }
         }
     }
@@ -488,5 +501,30 @@ mod tests {
             }
         }
         assert_eq!(mag(10, 1023), MV_DIFF_MAX as u32);
+        // every magnitude: the class whose range (spec read_mv_component's mag) holds it
+        for a in 1..=MV_DIFF_MAX as u32 {
+            let c = mv_class(a);
+            let lo = if c == 0 { 1 } else { (2 << (c + 2)) + 1 };
+            assert!(c <= 10 && a >= lo && a < lo + (8 << c.max(1)), "{a}: class {c}");
+        }
+    }
+
+    #[test]
+    fn lower_precision() {
+        for v in -100..=100 {
+            let w = lower_mv_precision(v, 0);
+            // whole samples, rounding halves toward zero
+            assert_eq!(w & 7, 0);
+            assert!(
+                (w - v).abs() < 4 || ((w - v).abs() == 4 && w.abs() < v.abs()),
+                "{v} -> {w}"
+            );
+            let q = lower_mv_precision(v, 1);
+            assert_eq!(q, if v % 2 == 0 { v } else { v - v.signum() });
+            assert_eq!(lower_mv_precision(v, 2), v);
+        }
+        assert_eq!(lower_mv_precision(12, 0), 8);
+        assert_eq!(lower_mv_precision(-12, 0), -8);
+        assert_eq!(lower_mv_precision(13, 0), 16);
     }
 }

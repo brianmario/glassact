@@ -144,9 +144,16 @@ impl TileBufs {
 
 /// What the inter syntax coded, for the tests' coverage reports: GLOBALMV, NEARESTMV, NEARMV,
 /// NEWMV blocks; NEARMV / NEWMV with a drl index > 0 / 1; intra blocks of inter frames; inter
-/// blocks with a var-tx split; sub-8x8 chroma predicted from several blocks' motion.
+/// blocks with a var-tx split; sub-8x8 chroma predicted from several blocks' motion; NEWMV
+/// components with fr bits, with hp bits; then [`INTER_STAT_PHASE`]: the predictions' filter
+/// phases.
 #[cfg(test)]
-pub(crate) static INTER_STAT: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+pub(crate) static INTER_STAT: [std::sync::atomic::AtomicU64; INTER_STAT_PHASE + 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; INTER_STAT_PHASE + 64];
+/// INTER_STAT[INTER_STAT_PHASE + chroma * 32 + four_tap * 16 + phase]: the 1/16-sample positions
+/// (horizontal and vertical) predictions filtered at, by plane type and filter variant.
+#[cfg(test)]
+pub(crate) const INTER_STAT_PHASE: usize = 11;
 #[inline(always)]
 fn inter_stat(_k: usize) {
     #[cfg(test)]
@@ -882,6 +889,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             col_end: st.mi_col_end,
             mi_rows: self.f.mi_rows,
             mi_cols: self.f.mi_cols,
+            mv_precision: self.f.fp.mv_precision,
         }
     }
 
@@ -1012,25 +1020,43 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         Ok(mode)
     }
 
-    /// read_mv_component with force_integer_mv (mv_class0_fr / mv_fr = 3, no hp bits): the
-    /// difference `v` (1/8 sample, a nonzero multiple of 8, |v| <= 2^14).
+    /// read_mv_component (MvCtx 0) of the difference `v` (1/8 sample, nonzero, |v| <= 2^14, of
+    /// the frame's precision): mv_class0_fr / mv_fr are 3 with force_integer_mv (fp.mv_precision
+    /// 0), mv_class0_hp / mv_hp 1 without allow_high_precision_mv (fp.mv_precision 0, 1).
     fn mv_component(&mut self, comp: usize, v: i32) -> i32 {
+        let prec = self.f.fp.mv_precision;
         let ic = &mut self.st.icdf;
         let sign = self.sk.sym(&mut ic.mv_sign[comp], (v < 0) as i32);
-        let a = v.unsigned_abs().max(8);
+        let a = v.unsigned_abs().max(1);
         let cls = self.sk.sym(&mut ic.mv_class[comp], mv_class(a) as i32);
-        let d_w = (a as i32 >> 3) - 1;
-        let mag = if cls == 0 {
-            let bit = self.sk.sym(&mut ic.mv_class0_bit[comp], d_w & 1);
-            ((bit << 3) | (3 << 1) | 1) + 1
+        // the class's first magnitude - 1, and the written magnitude's offset in the class:
+        // d << 3 | fr << 1 | hp
+        let base = if cls == 0 { 0 } else { CLASS0_SIZE << (cls + 2) };
+        let off_w = a as i32 - 1 - base;
+        let (d, fr_cdf, hp_cdf) = if cls == 0 {
+            let bit = self.sk.sym(&mut ic.mv_class0_bit[comp], (off_w >> 3) & 1);
+            (
+                bit,
+                &mut ic.mv_class0_fr[comp][bit as usize],
+                &mut ic.mv_class0_hp[comp],
+            )
         } else {
-            let d_w = d_w - (1 << cls);
             let mut d = 0;
             for i in 0..cls as usize {
-                d |= self.sk.sym(&mut ic.mv_bit[comp][i], (d_w >> i) & 1) << i;
+                d |= self.sk.sym(&mut ic.mv_bit[comp][i], (off_w >> (3 + i)) & 1) << i;
             }
-            (CLASS0_SIZE << (cls + 2)) + ((d << 3) | (3 << 1) | 1) + 1
+            (d, &mut ic.mv_fr[comp], &mut ic.mv_hp[comp])
         };
+        let fr = if prec == 0 {
+            3
+        } else {
+            self.sk.sym(fr_cdf, (off_w >> 1) & 3)
+        };
+        let hp = if prec == 2 { self.sk.sym(hp_cdf, off_w & 1) } else { 1 };
+        if S::WRITE && prec != 0 {
+            inter_stat(9 + (prec == 2) as usize);
+        }
+        let mag = base + ((d << 3) | (fr << 1) | hp) + 1;
         if sign != 0 { -mag } else { mag }
     }
 
@@ -1149,6 +1175,13 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 for (ci, x) in (0..n4w * 4).step_by(w).enumerate() {
                     let (px, py) = (base_x + x, base_y + y);
                     let m = bufs.mvs[bufs.mi(cand_r + ri as i32, cand_c + ci as i32)];
+                    #[cfg(test)]
+                    {
+                        let (qx, qy) = crate::dsp::mc_position(px, py, [m[0] as i32, m[1] as i32], sub);
+                        let k = INTER_STAT_PHASE + 32 * sub as usize;
+                        inter_stat(k + 16 * (filters[0] >= 4) as usize + (qx & 15) as usize);
+                        inter_stat(k + 16 * (filters[1] >= 4) as usize + (qy & 15) as usize);
+                    }
                     let off = (py - oy) as usize * stride + (px - ox) as usize;
                     predict_inter(
                         &refs[plane],
@@ -1183,10 +1216,16 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 fail!(ERR_INVALID, "block {b_idx}: inter block outside an inter frame");
             }
             let (mr, mc) = (bi.mv_row as i32, bi.mv_col as i32);
-            if mr & 7 != 0 || mc & 7 != 0 || mr.abs() >= 1 << 14 || mc.abs() >= 1 << 14 {
+            // fp.mv_precision: whole samples (multiples of 8), quarter (even), eighth (any)
+            let (mask, what) = match self.f.fp.mv_precision {
+                0 => (7, "whole samples: multiples of 8"),
+                1 => (1, "quarter samples: even"),
+                _ => (0, "eighth samples"),
+            };
+            if (mr | mc) & mask != 0 || mr.abs() >= 1 << 14 || mc.abs() >= 1 << 14 {
                 fail!(
                     ERR_INVALID,
-                    "block {b_idx}: mv ({mr},{mc}) must be whole samples (multiples of 8) below 2^14"
+                    "block {b_idx}: mv ({mr},{mc}) must be below 2^14 and of the frame's precision ({what})"
                 );
             }
             if b.y_mode != 0

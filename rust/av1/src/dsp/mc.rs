@@ -297,13 +297,17 @@ mod tests {
     }
 
     /// The fast paths (in place and edge-clamped, every sub-sample position and filter, every
-    /// block size from 2 to 64) equal the spec's loops.
+    /// block size from 2 to 64) equal the spec's loops: every 1/16 position a plane gets (luma's
+    /// even ones: its MVs are 1/8 sample; chroma's all) along each axis with every filter,
+    /// including the 4-tap ones of blocks 4 or fewer samples across.
     #[test]
     fn predict_inter_matches_ref() {
         let mut rng = Rng(0x5eed_1234);
         let mut s = Box::<McScratch>::default();
         let sizes = [2usize, 4, 8, 16, 32, 64];
         let mut n = [0u32; 4];
+        // [sub][axis][filter][phase]
+        let mut seen = [[[[0u32; 16]; 6]; 2]; 2];
         for it in 0..6000 {
             let (pw, ph) = (1 + rng.below(150) as usize, 1 + rng.below(150) as usize);
             let stride = pw + rng.below(9) as usize;
@@ -331,6 +335,8 @@ mod tests {
             let mv = if rng.below(3) == 0 { mv.map(|v| v & !7) } else { mv };
             let (px, py) = mc_position(x, y, mv, sub);
             n[((px & 15 != 0) as usize) | (((py & 15 != 0) as usize) << 1)] += 1;
+            seen[sub as usize][0][filters[0]][(px & 15) as usize] += 1;
+            seen[sub as usize][1][filters[1]][(py & 15) as usize] += 1;
             let mut want = vec![0u8; 64 * 64];
             let mut got = vec![0u8; 64 * 64];
             predict_inter_ref(&r, sub, x, y, w, h, mv, filters, &mut want, 64);
@@ -341,6 +347,19 @@ mod tests {
             );
         }
         assert!(n.iter().all(|&k| k > 500), "{n:?}");
+        for (sub, axes) in seen.iter().enumerate() {
+            for (axis, filters) in axes.iter().enumerate() {
+                for (f, phases) in filters.iter().enumerate() {
+                    for (ph, &k) in phases.iter().enumerate() {
+                        let possible = sub == 1 || ph % 2 == 0;
+                        assert!(
+                            (k > 0) == possible,
+                            "sub {sub} axis {axis} filter {f} phase {ph}: {k} predictions"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The NEON passes equal the scalar ones on random rows (any filter and position).

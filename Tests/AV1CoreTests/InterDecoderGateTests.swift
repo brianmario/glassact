@@ -6,7 +6,7 @@ import libaom
 
 /// av1core's inter frames against an independent decoder: random legal inter
 /// sequences (a key frame, then mostly inter frames: inter and intra blocks,
-/// whole-sample motion vectors near and far outside the picture, skip and
+/// motion vectors of every precision near and far outside the picture, skip and
 /// var-tx, random coefficients, reference slots and refresh flags, the
 /// post-filters, monochrome and odd sizes) are encoded frame by frame, each
 /// predicting from the reconstructions av1core returned for the frames that
