@@ -1,0 +1,7 @@
+// Swift sees the C API and the structures it fills for the kernels (gp.h);
+// the rest of av1gpu's host code stays C++.
+module AV1Encoder {
+    header "av1enc.h"
+    header "av1enc/gp.h"
+    export *
+}

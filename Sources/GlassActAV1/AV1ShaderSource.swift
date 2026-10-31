@@ -1,3 +1,4 @@
+internal import AV1Encoder
 public import Foundation
 public import Metal
 
@@ -28,8 +29,18 @@ public enum AV1ShaderSource {
     /// Where quoted includes are looked up, in order.
     public static let defaultIncludeDirectories: [URL] = [
         sourceRoot.appending(path: "AV1Core/include"),
+        sourceRoot.appending(path: "AV1Encoder/include"),
         sourceRoot.appending(path: "GlassActAV1/Shaders"),
     ]
+
+    /// Includes that are made, not read: `#include "av1enc_tables.h"` is the
+    /// encoder's derived tables (av1enc_tables_msl).
+    public static let generatedIncludes: [String: String] = {
+        var length = 0
+        guard let text = av1enc_tables_msl(&length) else { return [:] }
+        defer { free(text) }
+        return ["av1enc_tables.h": String(cString: text)]
+    }()
 
     /// `Sources/`.
     static let sourceRoot = URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
@@ -85,7 +96,12 @@ public enum AV1ShaderSource {
                 out += "\n"
                 continue
             }
-            if let name = quotedName(trimmed) {
+            if let name = quotedName(trimmed), let generated = generatedIncludes[name] {
+                if seen.insert("generated:" + name).inserted {
+                    out += "#line 1 \"\(name)\"\n"
+                    out += generated
+                }
+            } else if let name = quotedName(trimmed) {
                 let candidates = [file.deletingLastPathComponent()] + includeDirectories
                 guard let found = candidates.map({ $0.appending(path: name) })
                     .first(where: { FileManager.default.fileExists(atPath: $0.path) })

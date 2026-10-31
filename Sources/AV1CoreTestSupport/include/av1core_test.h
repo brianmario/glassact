@@ -63,6 +63,12 @@ typedef struct av1t_dsp_set {
 const av1t_dsp_set *av1t_dsp_set_make(uint64_t seed);
 void av1t_dsp_set_free(const av1t_dsp_set *set);
 
+// av1core's exact 2-D inverse transform of dequantized coefficients (th x tw,
+// row-major, at most 32x32) into residual (W x H). Returns the conformance flags.
+uint32_t av1t_inverse_transform(int32_t txSz, int32_t txType, const int32_t *dq, int32_t *residual);
+// 1 if txType is in txSz's intra set (DCT only for 64-point sizes).
+int32_t av1t_tx_type_allowed(int32_t txSz, int32_t txType);
+
 #ifdef __cplusplus
 }
 #endif

@@ -79,11 +79,18 @@ let package = Package(
             exclude: ["LICENSE", "THIRD_PARTY_NOTICES.md"],
             cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
         ),
+        // The host half of av1gpu's encoder: tables, and the structures the
+        // host fills for the kernels (include/av1enc/gp.h).
+        .target(
+            name: "AV1Encoder",
+            dependencies: ["AV1Core"],
+            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+        ),
         // The Metal port of av1gpu's encoder: kernels compiled at run time
         // from Shaders/ and AV1Core's shared headers.
         .target(
             name: "GlassActAV1",
-            dependencies: ["AV1Core"],
+            dependencies: ["AV1Core", "AV1Encoder"],
             exclude: ["Shaders"],
             swiftSettings: strictLibrary
         ),
@@ -148,7 +155,7 @@ let package = Package(
         .testTarget(name: "SessionTests", dependencies: ["GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "ShareTests", dependencies: ["GlassActShare", "GlassActCore"], swiftSettings: strict),
         .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
-        .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "GlassActTestSupport"],
+        .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActTestSupport"],
                     exclude: ["Shaders"], swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
     ],

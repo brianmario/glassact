@@ -179,3 +179,14 @@ extern "C" void av1t_dsp_set_free(const av1t_dsp_set *p) {
     delete static_cast<Set *>(p->priv);
 }
 
+
+extern "C" uint32_t av1t_inverse_transform(int32_t txSz, int32_t txType, const int32_t *dq, int32_t *residual) {
+    uint32_t err = 0;
+    av1g_inv_txfm2d(dq, txSz, txType, residual, &err);
+    return err;
+}
+
+extern "C" int32_t av1t_tx_type_allowed(int32_t txSz, int32_t txType) {
+    if (AV1G_T(Tx_Size_Sqr_Up)[txSz] > AV1G_TX_32X32) return txType == AV1G_DCT_DCT;
+    return av1g_tx_type_in_set_intra(av1g_get_tx_set_intra(txSz, 0), txType);
+}
