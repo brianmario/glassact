@@ -68,7 +68,8 @@ pub const GIVEN_CHROMA: i32 = 1;
 #[derive(Clone, Copy, Debug)]
 pub struct Video<'a> {
     /// the frame's video fields: video, frame_type, ref_slot, refresh_frame_flags,
-    /// error_resilient_mode, lf_inter_off, allow_screen_content_tools (the rest is ignored)
+    /// error_resilient_mode, lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision (the
+    /// rest is ignored)
     pub fp: FrameParams,
     /// inter frames: one per block (empty: every block intra). Inter blocks are skip blocks
     /// (tx_depth 0, intra fields 0): they copy LAST_FRAME at their motion vector.
@@ -364,6 +365,7 @@ impl Hybrid {
             (f.video, f.frame_type, f.ref_slot) = (v.fp.video, v.fp.frame_type, v.fp.ref_slot);
             (f.refresh_frame_flags, f.error_resilient_mode) = (v.fp.refresh_frame_flags, v.fp.error_resilient_mode);
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
+            f.mv_precision = v.fp.mv_precision;
             // from the reference's saved CDFs, where the slot has them
             f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
         }

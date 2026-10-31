@@ -10,8 +10,9 @@
 //            of no motion and the vectors k_me kept for the 16x16s the block covers, then the
 //            analysis's exact-rate RD (DCT_DCT) of the best; where it costs less than the intra
 //            J, it takes its place (GpInterRes.isInter), and the partition DP weighs it as any other
-// Sub-sample positions are predicted bilinearly here: an estimate of AV1's 8-tap filter, which
-// only the closed loop needs exactly.
+// Sub-sample positions are predicted bilinearly here: an estimate of AV1's 8-tap filter, which only
+// the closed loop needs exactly. (The 8-tap filter here measured 1 % smaller frames than bilinear
+// on 720p photos for a third of the frame rate: BENCHMARKS.)
 #pragma once
 #include "k_analysis.h"
 

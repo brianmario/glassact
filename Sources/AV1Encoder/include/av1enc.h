@@ -92,7 +92,7 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
                               int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
 // av1enc_hybrid_closed_loop for a frame of a stream: video (null: a still picture) supplies the
 // frame's video fields (video, frame_type, ref_slot, refresh_frame_flags, error_resilient_mode,
-// lf_inter_off, allow_screen_content_tools; the rest is ignored). An inter frame takes inter (one
+// lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision; the rest is ignored). An inter frame takes inter (one
 // per block, or null: all intra) and ref, LAST_FRAME's picture (the decoder's output of the frame
 // in ref_slot: planes of the picture's size at their strides). Inter blocks are skip blocks
 // (tx_depth 0, intra fields 0) and copy the reference at their motion vector. An inter frame's

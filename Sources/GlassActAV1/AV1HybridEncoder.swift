@@ -164,8 +164,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// few bits. Loss-safe as long as the reference is a frame the decoder has.
     public var carriesCDFs = true
 
-    /// With `searchesMotion`: refine motion vectors to quarter samples (scaled or
-    /// animated content moves by fractions of a sample). Off: whole samples.
+    /// With `searchesMotion`: refine motion vectors to quarter samples (on). Scaled
+    /// or animated content moves by fractions of a sample; captured scrolling and
+    /// dragging at full size don't, and cost nothing more. Off: whole samples.
     public var searchesSubpelMotion: Bool {
         get { metal.searchesSubpelMotion }
         set { metal.searchesSubpelMotion = newValue }
@@ -197,6 +198,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.busyBlockPrune = 4
         metal.leafTxSearchPixels = 128
         metal.leafChromaAngledModes = false
+        metal.searchesSubpelMotion = true
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu

@@ -260,6 +260,33 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: quarter-sample motion vectors (2026-10-31)
+
+**What changed:**
+- **Writer** (subagent): `fp.mv_precision` (0 whole, 1 quarter, 2 eighth samples). The sequence header now selects force_integer_mv per frame. The MV stack lowers candidates to the frame's precision, and the fr/hp bits and their CDFs (carried with `cdf_from_ref`) are coded.
+  - **Exact:** 3200 random frames decode exactly in dav1d and aomdec, and the Swift libaom gate passes. Every filter phase is covered.
+  - **Whole-sample tile data is byte-identical** to before.
+  - **Writer cost:** a sub-sample frame costs the writer +13–16 % (both filter passes on every block).
+- **GPU search:**
+  - `k_me` refines each 16×16's best vector to half and then quarter samples.
+  - `k_inter` screens and costs fractional candidates.
+  - The GPU predicts fractional positions bilinearly; the closed loop is exact.
+  - On by default (`AV1HybridEncoder.searchesSubpelMotion`, `av1seq --no-subpel`); those frames code `mv_precision` 1.
+
+**Results** (first 100 frames, q20, every frame exact in libaom; inter frame mean, steady-state inter frames a second):
+
+| Trace | 720p whole → quarter | 5K whole → quarter |
+|---|---|---|
+| scroll-win | 4.9 → 4.5 KB (−8 %) · 209 → 218 fps | 4.5 → 4.5 KB · 92 → 94 fps |
+| photos | 55.7 → 44.2 KB (−21 %), PSNR-Y 40.97 → 41.12 · 91 → 88 fps | 29.5 → 29.5 KB · 30 → 30 fps |
+| typing-cc | 148 → 149 B | 691 → 692 B |
+| cursor-drag | 187 → 187 B | 864 → 865 B |
+
+- **Downscaled content gains** (the 720p traces are resampled from 5K, so their motion is fractional); the native 5K captures move by whole samples.
+- **libaom is still ahead at 720p:** 2.0 KB (scroll) and 14.4 KB (photos).
+- **Few vectors go fractional:** only ~2–3 % of the searched blocks choose one.
+- **Rejected: the exact 8-tap filter in the GPU's estimates** in place of bilinear. Photos 720p came out 43.6 KB against bilinear's 44.2 (−1 %), but at 49 against 88 inter frames a second (5K photos 21 against 30). At 64 multiply-adds per fractional sample it isn't worth it.
+
 ### Metal AV1: inter frames' fixed costs; steady-state frame rates (2026-10-31)
 
 **What changed** (same bytes everywhere):

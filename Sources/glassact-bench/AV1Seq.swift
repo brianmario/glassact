@@ -31,7 +31,7 @@ let av1SeqCommand = Command(
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
-        .bool("subpel", "with --inter: quarter-sample motion vectors in the motion search"),
+        .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
@@ -94,7 +94,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.interFrames = inter
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
-    encoder.searchesSubpelMotion = opts.has("subpel")
+    encoder.searchesSubpelMotion = !opts.has("no-subpel")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
