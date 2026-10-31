@@ -282,6 +282,16 @@ which.
 - The cycle is `finish`, ~15–19 ms: the closed loop 5.5–6 ms, and the filters 6–10 ms.
 - Most of the filters' time is their first command buffer, which waits behind the next picture's analysis (~12.7 ms of GPU work, committed just before).
 
+**Rejected: holding back part of the next picture's analysis until the filters finish.**
+- The next picture's blocks 16×16 and up, its partition and its leaves went in a second command buffer, released after this picture's filters.
+- The filters got faster (8.7 → 7.1 ms), but 5K photos went 57.5 → 54.5 inter frames a second: the thread then waited for that half instead.
+- The GPU is the limit now. An inter frame's serialized stages (`av1seq --profile --inter`, 5K photos), in ms:
+  - motion search 2.6;
+  - inter candidates 3.7;
+  - intra analysis 8.1, of which 6.2 is the shapes up to 16×8;
+  - partition 0.3;
+  - leaves 0.3.
+
 ### Metal AV1: each inter candidate once; parallel post-filter copies; interPreset's shapes (2026-10-31)
 
 **What changed:**
