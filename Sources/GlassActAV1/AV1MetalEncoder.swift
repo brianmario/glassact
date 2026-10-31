@@ -83,6 +83,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// The thread-per-block analysis kernels of the shapes up to 64 pixels.
     let analysisSmall: [Int: any MTLComputePipelineState]
     static let smallThreads = 128
+    /// The largest shape (in pixels) the thread-per-block kernel takes: av1gpu's 64, and 8x16 / 16x8.
+    static let smallMaxPixels = 128
     let dp: any MTLComputePipelineState
     let recon: any MTLComputePipelineState
     var params: GpParams
@@ -122,7 +124,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
         self.analysis = analysis
         var small: [Int: any MTLComputePipelineState] = [:]
-        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= 64 {
+        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
             guard let function = library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)")
             else { throw Failure.metal("no k_analysis_small_\(size.w)x\(size.h)") }
             small[bsize] = try Self.pipeline(function, threads: Self.smallThreads, device: device)

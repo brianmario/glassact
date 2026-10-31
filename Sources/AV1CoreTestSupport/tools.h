@@ -51,8 +51,9 @@ struct RefEngineOpts {
     // Glass Act: the closed loop's quantizer, level = |v| < zbin ? 0 : floor(|v| + rnd) in step units
     // (default: plain rounding; the Metal encoder's dead zone is rnd 0.375, zbin 0.656)
     double quant_rnd = 0.5, quant_zbin = 0.0;
-    // Glass Act: keep the record's luma tx types (decided elsewhere) instead of searching them
-    bool given_luma_tx = false;
+    // Glass Act: the record's luma tx types (decided elsewhere): 0 ignore them and search,
+    // 1 keep them, 2 try them and DCT_DCT
+    int given_luma_tx = 0;
     int tile_cols_log2 = -1, tile_rows_log2 = -1;  // Glass Act: ref_engine_closed_loop's tiling
 };
 

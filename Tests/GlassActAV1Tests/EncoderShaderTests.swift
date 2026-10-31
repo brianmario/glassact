@@ -15,7 +15,7 @@ struct EncoderShaderTests {
             let library = try AV1ShaderSource.library(main, device: device)
             let analysis = library.functionNames.filter { $0.hasPrefix("k_analysis_") }
             let small = analysis.filter { $0.hasPrefix("k_analysis_small_") }
-            #expect(analysis.count == 19 + 6 && small.count == 6, "\(analysis.sorted())")
+            #expect(analysis.count == 19 + 8 && small.count == 8, "\(analysis.sorted())")
             #expect(library.functionNames.contains("k_recon") && library.functionNames.contains("k_dp"))
             for name in analysis + ["k_recon", "k_dp"] {
                 let pipeline = try device.makeComputePipelineState(function: try #require(library.makeFunction(name: name)))

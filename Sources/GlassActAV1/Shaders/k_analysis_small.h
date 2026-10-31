@@ -108,7 +108,8 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     device GpBlockRes &out = B.blk[I.shOff[BS] + li];
     if (x >= I.MiCols * 4 || y >= I.MiRows * 4) { out.J = GP_INF; out.ncand = 0; return; }
     constexpr int txSz = (W == 4 && H == 4) ? AV1G_TX_4X4 : (W == 8 && H == 8) ? AV1G_TX_8X8 : (W == 4 && H == 8) ? AV1G_TX_4X8
-                       : (W == 8 && H == 4) ? AV1G_TX_8X4 : (W == 4 && H == 16) ? AV1G_TX_4X16 : AV1G_TX_16X4;
+                       : (W == 8 && H == 4) ? AV1G_TX_8X4 : (W == 4 && H == 16) ? AV1G_TX_4X16 : (W == 16 && H == 4) ? AV1G_TX_16X4
+                       : (W == 8 && H == 16) ? AV1G_TX_8X16 : AV1G_TX_16X8;
     const int set = av1g_get_tx_set_intra(txSz, 0);
     const TileBox tb = tile_of(I, x, y);
     const int haveLeft = x > tb.x0, haveAbove = y > tb.y0;

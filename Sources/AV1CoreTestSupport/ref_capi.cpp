@@ -52,7 +52,7 @@ extern "C" av1t_hybrid *av1t_hybrid_closed_loop(const uint8_t *y, const uint8_t 
     o.quant_rnd = rnd;
     o.quant_zbin = zbin;
     o.tx_types = tx_types != 0;
-    o.given_luma_tx = luma_tx != nullptr;
+    o.given_luma_tx = luma_tx ? (tx_types == 2 ? 2 : 1) : 0;
     o.tile_cols_log2 = tile_cols_log2;
     o.tile_rows_log2 = tile_rows_log2;
     auto *hy = new av1t_hybrid();

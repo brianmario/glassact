@@ -39,7 +39,8 @@ int av1t_ref_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32
 // (rnd, zbin in step units; plain rounding is 0.5, 0), luma tx types searched when tx_types,
 // then skip flags. The record and the PADDED pre-filter reconstruction stay in the handle.
 typedef struct av1t_hybrid av1t_hybrid;
-// luma_tx (optional): each block's luma tx type, kept instead of searched.
+// luma_tx (optional): each block's luma tx type, kept instead of searched (tx_types 2: tried
+// against DCT_DCT).
 av1t_hybrid *av1t_hybrid_closed_loop(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w, uint32_t h,
                                      const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int qindex,
                                      double rnd, double zbin, int tx_types, int tile_cols_log2, int tile_rows_log2,

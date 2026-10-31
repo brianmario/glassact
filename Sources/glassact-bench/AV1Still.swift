@@ -30,7 +30,7 @@ let av1StillCommand = Command(
         .string("preset", "<list>", "Metal encoder presets, comma-separated: slow, base (default), fast, faster, turbo, turbo2, turbo3"),
         .string("tiles", "<list>", "Metal encoder tilings: log2 of the tile columns and rows, comma-separated, e.g. 2x2 (default auto, the fewest legal)"),
         .bool("hybrid", "also run each Metal row's GPU analysis with the closed loop on the CPU (av1core's hook, the reference engine's chroma and quantizer search, the GPU's dead zone)"),
-        .bool("hybrid-tx-search", "with --hybrid: search the luma tx types on the CPU instead of keeping the analysis's"),
+        .choice("hybrid-tx", ["search", "keep", "dct"], "with --hybrid: luma tx types searched on the CPU (default), the analysis's kept, or the analysis's tried against DCT_DCT"),
         .bool("gpu-entropy", "also time the GPU entropy coder (output checked against the CPU writer's)"),
     ],
     run: { opts in
@@ -198,11 +198,11 @@ func cmdAV1Still(_ reader: ScapReader, traceName: String, opts: Options) throws 
             var message = [CChar](repeating: 0, count: 256)
             let hybrid = try source.withPlanes { y, u, v in
                 try partition.blocks.withUnsafeBufferPointer { blocks -> OpaquePointer in
-                    let search = opts.has("hybrid-tx-search")
+                    let txMode = opts.string("hybrid-tx") ?? "search", search = txMode == "search"
                     guard let h = partition.lumaTxTypes.withUnsafeBufferPointer({ types in
                         av1t_hybrid_closed_loop(y, u, v, UInt32(width), UInt32(height), blocks.baseAddress,
                                                 UInt32(blocks.count), search ? nil : types.baseAddress, Int32(qindex),
-                                                0.375, 0.656, 1, Int32(tiling.0), Int32(tiling.1), &message, 256)
+                                                0.375, 0.656, txMode == "dct" ? 2 : 1, Int32(tiling.0), Int32(tiling.1), &message, 256)
                     })
                     else { throw BenchError("hybrid: \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))") }
                     return h

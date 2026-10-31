@@ -458,7 +458,16 @@ struct QuantHook : TxbHook {
         const int set = av1g_get_tx_set_intra(txSz, reduced);
         if (o.given_luma_tx) {
             if (!av1g_tx_type_in_set_intra(set, t.tx_type)) t.tx_type = AV1G_DCT_DCT;
-            trial(res, txSz, t.tx_type, dcQ, acQ, coeffs, pred, pstride, s, sstride, 0, qmLevel);
+            const double J = trial(res, txSz, t.tx_type, dcQ, acQ, coeffs, pred, pstride, s, sstride, 0, qmLevel);
+            if (o.given_luma_tx == 2 && t.tx_type != AV1G_DCT_DCT) {
+                static thread_local int16_t dct[1024];
+                const double lam = 0.12 * (acQ / 8.0) * (acQ / 8.0);
+                const double Jd = trial(res, txSz, AV1G_DCT_DCT, dcQ, acQ, dct, pred, pstride, s, sstride, 0, qmLevel);
+                if (Jd + lam * 1.0 < J + lam * 3.0) {
+                    t.tx_type = AV1G_DCT_DCT;
+                    memcpy(coeffs, dct, sizeof(int16_t) * av1g_tx_coeffs(txSz));
+                }
+            }
             return;
         }
         if (set == AV1G_TX_SET_DCTONLY || !o.tx_types) {
