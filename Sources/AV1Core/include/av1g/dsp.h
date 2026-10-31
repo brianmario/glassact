@@ -65,7 +65,7 @@ AV1G_HD int av1g_tx_class(int txType) {
 }
 
 /* get_scan() (spec 5.11.41).  Returns the scan table and writes its length. */
-AV1G_HD const uint16_t *av1g_get_scan(int txSz, int txType) {
+AV1G_HD AV1G_CONST const uint16_t *av1g_get_scan(int txSz, int txType) {
     if (txSz == AV1G_TX_16X64) return AV1G_T(Default_Scan_16x32);
     if (txSz == AV1G_TX_64X16) return AV1G_T(Default_Scan_32x16);
     if (AV1G_T(Tx_Size_Sqr_Up)[txSz] == AV1G_TX_64X64) return AV1G_T(Default_Scan_32x32);
@@ -141,12 +141,12 @@ AV1G_HD int32_t av1g_dequant_coef(int32_t quant, int q, int dqDenom) {
  * or NULL when no matrix applies: using_qmatrix == 0, level 15 (flat), or a tx type
  * >= IDTX (IDTX, V_*, H_* are never weighted).  level = qm_y for plane 0, qm_u / qm_v
  * for planes 1 / 2.  Weights are in 1/32 units (32 = flat). */
-AV1G_HD const uint8_t *av1g_qm(int using_qmatrix, int level, int plane, int txSz, int txType) {
+AV1G_HD AV1G_CONST const uint8_t *av1g_qm(int using_qmatrix, int level, int plane, int txSz, int txType) {
     if (!using_qmatrix || level >= 15 || txType >= AV1G_IDTX) return 0;
     return &AV1G_T(Quantizer_Matrix)[level][plane > 0][AV1G_T(Qm_Offset)[txSz]];
 }
 /* q2 of one coefficient: the effective (pre-dqDenom) quantizer step at position pos */
-AV1G_HD int av1g_qm_step(int q, const uint8_t *qm, int pos) {
+AV1G_HD int av1g_qm_step(int q, AV1G_CONST const uint8_t *qm, int pos) {
     return qm ? av1g_round2(q * qm[pos], 5) : q;
 }
 
@@ -165,7 +165,7 @@ AV1G_HD int av1g_qm_level_allintra(int qindex) {
 
 /* Dequantize a whole tx block: quant/out are th x tw row-major (tw,th <= 32).
  * qm: av1g_qm(...) of the tx block, or NULL. */
-AV1G_HD void av1g_dequant(const int16_t *quant, int32_t *out, int txSz, int dcQ, int acQ, const uint8_t *qm) {
+AV1G_HD void av1g_dequant(const int16_t *quant, int32_t *out, int txSz, int dcQ, int acQ, AV1G_CONST const uint8_t *qm) {
     int tw = av1g_tx_w(txSz); if (tw > 32) tw = 32;
     int th = av1g_tx_h(txSz); if (th > 32) th = 32;
     int den = av1g_dq_denom(txSz);
@@ -481,7 +481,7 @@ AV1G_HD void av1g_build_edges(const uint8_t *plane, int stride, int x, int y, in
 
 AV1G_HD int av1g_is_directional(int mode) { return mode >= AV1G_V_PRED && mode <= AV1G_D67_PRED; }
 
-AV1G_HD const uint8_t *av1g_sm_weights(int log2) {
+AV1G_HD AV1G_CONST const uint8_t *av1g_sm_weights(int log2) {
     switch (log2) {
     case 2: return AV1G_T(Sm_Weights_Tx_4x4);
     case 3: return AV1G_T(Sm_Weights_Tx_8x8);
@@ -553,16 +553,16 @@ AV1G_HD int av1g_pred_pixel_up(int mode, int pAngle, int i, int j, int log2W, in
         }
     }
     if (mode == AV1G_SMOOTH_PRED) {
-        const uint8_t *wx = av1g_sm_weights(log2W), *wy = av1g_sm_weights(log2H);
+        AV1G_CONST const uint8_t *wx = av1g_sm_weights(log2W), *wy = av1g_sm_weights(log2H);
         int s = wy[i] * above[j] + (256 - wy[i]) * left[h - 1] + wx[j] * left[i] + (256 - wx[j]) * above[w - 1];
         return av1g_round2(s, 9);
     }
     if (mode == AV1G_SMOOTH_V_PRED) {
-        const uint8_t *wy = av1g_sm_weights(log2H);
+        AV1G_CONST const uint8_t *wy = av1g_sm_weights(log2H);
         return av1g_round2(wy[i] * above[j] + (256 - wy[i]) * left[h - 1], 8);
     }
     if (mode == AV1G_SMOOTH_H_PRED) {
-        const uint8_t *wx = av1g_sm_weights(log2W);
+        AV1G_CONST const uint8_t *wx = av1g_sm_weights(log2W);
         return av1g_round2(wx[j] * left[i] + (256 - wx[j]) * above[w - 1], 8);
     }
     /* PAETH (basic intra prediction process) */

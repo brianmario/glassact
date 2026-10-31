@@ -29,6 +29,8 @@ AV1G_HD void av1g_ec_init(av1g_ec *e, uint16_t *buf, uint32_t cap) {
 AV1G_HD int av1g_ilog_nz(uint32_t x) { /* 1 + floor(log2(x)), x > 0 */
 #if defined(__CUDA_ARCH__)
     return 32 - __clz(x);
+#elif defined(__METAL_VERSION__)
+    return 32 - (int)clz(x);
 #else
     return 32 - __builtin_clz(x);
 #endif

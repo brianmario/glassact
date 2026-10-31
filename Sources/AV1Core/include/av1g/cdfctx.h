@@ -60,7 +60,7 @@ AV1G_HD int av1g_coeff_cdf_q_ctx(int base_q_idx) {
 }
 
 #define AV1G_CDF_COPY(dst, src) do { \
-    const uint16_t *s_ = (const uint16_t *)(src); uint16_t *d_ = (uint16_t *)(dst); \
+    AV1G_CONST const uint16_t *s_ = (AV1G_CONST const uint16_t *)(src); uint16_t *d_ = (uint16_t *)(dst); \
     for (unsigned i_ = 0; i_ < sizeof(dst) / sizeof(uint16_t); i_++) d_[i_] = s_[i_]; } while (0)
 
 AV1G_HDI void av1g_cdfs_init(av1g_cdfs *c, int base_q_idx) {

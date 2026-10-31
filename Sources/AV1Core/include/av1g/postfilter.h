@@ -216,6 +216,8 @@ AV1G_HD void av1g_deblock_frame(const av1g_pf_frame *f) {
 AV1G_HD int av1g_floor_log2(uint32_t x) {  /* FloorLog2; -1 for 0 */
 #ifdef __CUDA_ARCH__
     return 31 - __clz((int)x);
+#elif defined(__METAL_VERSION__)
+    return 31 - (int)clz(x);  /* clz(0) == 32 */
 #else
     return x ? 31 - __builtin_clz(x) : -1;
 #endif

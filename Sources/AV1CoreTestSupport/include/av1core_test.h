@@ -33,6 +33,36 @@ typedef struct av1t_ref_opts {
 int av1t_ref_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w, uint32_t h,
                     const av1t_ref_opts *opts, av1g_output *out);
 
+// av1gpu's GPU-vs-CPU cases for the shared DSP (av1g_test/dsp_cases.h), with
+// the CPU's results. Arrays are tightly packed per case; the case and symbol
+// structs are opaque here (Swift only uploads them), sized by *_size.
+typedef struct av1t_dsp_set {
+    // 1. dequant + inverse transform: coeffs in, residual and conformance flags out
+    int32_t itx_count, itx_flagged_count;
+    const void *itx_cases;
+    uint32_t itx_case_size, itx_coeffs_per_case, itx_residual_per_case;
+    const int16_t *itx_coeffs;
+    const int32_t *itx_residual;
+    const uint32_t *itx_flags;
+    // 2./3. intra prediction + CfL: a side x side plane per case in, predicted plane out
+    int32_t pred_count, pred_cfl_count, pred_side;
+    const void *pred_cases;
+    uint32_t pred_case_size, pred_luma_size;
+    const uint8_t *pred_planes;
+    const uint8_t *pred_luma;
+    const uint8_t *pred_out;
+    // 4. range coder: symbol streams in, coded bytes out (ec_capacity per stream)
+    int32_t ec_count, ec_qindex, ec_symbol_count;
+    uint32_t ec_capacity, ec_cdfs_size, ec_symbol_size;
+    const void *ec_symbols;
+    const int32_t *ec_offsets, *ec_counts;
+    const int32_t *ec_sizes;
+    const uint8_t *ec_bytes;
+    void *priv;
+} av1t_dsp_set;
+const av1t_dsp_set *av1t_dsp_set_make(uint64_t seed);
+void av1t_dsp_set_free(const av1t_dsp_set *set);
+
 #ifdef __cplusplus
 }
 #endif
