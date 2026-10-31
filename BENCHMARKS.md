@@ -260,6 +260,19 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the closed loop's reconstruction assembled on several threads (2026-10-31)
+
+**What changed:** the writer's pre-filter reconstruction (tiles → one frame-sized picture, which the post-filters read) is now copied in bands of rows on several threads.
+- It was one thread copying 22 MB a 5K picture: 1.35 ms, more than coding the tiles (0.93 ms), on 5K typing-cc inter frames (timed in the writer).
+
+**Results** (5K, libaom's tiling, `--no-planes`; same bytes):
+
+| Trace | Closed loop | Inter frames a second | libaom s9 |
+|---|---|---|---|
+| typing-cc | 2.2 → 1.4 ms | 168 → 208 | 225 |
+| scroll-win | | 109 → 130 | 170 |
+| photos | | 42 → 43 | 92 |
+
 ### Metal AV1: no intra search where the inter residual is nothing (2026-10-31)
 
 **What changed:** in inter frames, `k_inter` now runs *before* the intra analysis.

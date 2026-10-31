@@ -862,6 +862,7 @@ impl Writer {
                 &f,
                 ntiles,
                 opts.flags & ENC_PREFILTER_RECON != 0,
+                self.threads,
                 out,
             );
         }
@@ -891,28 +892,48 @@ fn recon(
     f: &Frame,
     ntiles: usize,
     prefilter: bool,
+    threads: usize,
     out: &mut Output,
 ) {
     let fp = &f.fp;
     let nplanes = if f.mono { 1 } else { 3 };
     if prefilter {
         // straight from the tiles: the decoded area up to MiCols * 4 x MiRows * 4 (the filters
-        // read it)
-        for p in 0..nplanes {
+        // read it), in bands of rows on several threads (22 MB at 5K: 1.3 ms on one)
+        let tiles = &tiles[..ntiles];
+        let mut bands: Vec<(usize, usize, &mut [u8])> = Vec::new();
+        for (p, o) in out.recon.iter_mut().enumerate().take(nplanes) {
             let sub = (p != 0) as usize;
             let (w, h) = ((f.mi_cols as usize * 4) >> sub, (f.mi_rows as usize * 4) >> sub);
-            let o = &mut out.recon[p];
             o.resize(w * h, 0);
-            for t in &tiles[..ntiles] {
-                let (x0, y0) = ((t.c0 as usize * 4) >> sub, (t.r0 as usize * 4) >> sub);
-                let (tw, th) = ((t.mw as usize * 4) >> sub, (t.mh as usize * 4) >> sub);
-                let s = t.stride[p];
-                for y in 0..th {
-                    o[(y0 + y) * w + x0..][..tw].copy_from_slice(&t.plane[p][y * s..][..tw]);
-                }
-            }
             out.recon_w[p] = w as u32;
             out.recon_h[p] = h as u32;
+            let rows = h.div_ceil(threads.clamp(1, 8)).max(16);
+            for (k, band) in o.chunks_mut(rows * w).enumerate() {
+                bands.push((p, k * rows, band));
+            }
+        }
+        let copy = |(p, y0, band): &mut (usize, usize, &mut [u8])| {
+            let sub = (*p != 0) as usize;
+            let w = (f.mi_cols as usize * 4) >> sub;
+            let (b0, b1) = (*y0, *y0 + band.len() / w);
+            for t in tiles {
+                let (x0, ty0) = ((t.c0 as usize * 4) >> sub, (t.r0 as usize * 4) >> sub);
+                let (tw, th) = ((t.mw as usize * 4) >> sub, (t.mh as usize * 4) >> sub);
+                let s = t.stride[*p];
+                for y in b0.max(ty0)..b1.min(ty0 + th) {
+                    band[(y - b0) * w + x0..][..tw].copy_from_slice(&t.plane[*p][(y - ty0) * s..][..tw]);
+                }
+            }
+        };
+        if threads <= 1 || bands.len() <= 1 {
+            bands.iter_mut().for_each(copy);
+        } else {
+            std::thread::scope(|sc| {
+                for b in bands.iter_mut() {
+                    sc.spawn(move || copy(b));
+                }
+            });
         }
         return;
     }
