@@ -9,6 +9,7 @@ use crate::dsp::{
     Rng, dq_denom, get_tx_set_intra, is_directional, qm, qm_step, tx_coeffs, tx_h, tx_type_in_set_intra, tx_w,
 };
 use crate::tables::*;
+use crate::writer::tile_layout;
 
 // ---------------------------------------------------------------------------------------------
 // SIMD against scalar
@@ -543,6 +544,195 @@ fn rust_only_sequence_is_deterministic() {
         kept += a.reused_tiles();
     }
     assert!(kept > 0);
+}
+
+/// 128x128 superblocks through the hybrid encoder: a key frame whose 64x64-superblock partition
+/// Motion::apply_ex puts in 128x128 decode order, then an inter frame of the next picture (the top
+/// unchanged, the rest scrolled) whose copies apply_ex covers (one 128x128 skip inter block where
+/// a 128x128 is all copies at one shift). Both code, write and parse back to their records, and
+/// every copied 64x64 of the inter frame reconstructs as the key frame's reconstruction moved.
+#[test]
+fn sb128_frames_from_motion() {
+    use crate::motion::{Motion, Plane, Shift};
+    use crate::writer::{ParseState, parse_with, tile_layout_ex};
+    let (w, h) = (520usize, 330usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let pic0 = screen_pic(w, h, 5, false);
+    // the next picture: rows 0..128 unchanged, the rest scrolled up 16 rows (new rows at the bottom)
+    let mut pic1 = pic0.clone();
+    let mut rng = Rng(19);
+    for y in 128..h {
+        for x in 0..w {
+            pic1.y[y * w + x] = if y + 16 < h {
+                pic0.y[(y + 16) * w + x]
+            } else {
+                rng.below(256) as u8
+            };
+        }
+    }
+    for y in 64..ch {
+        for x in 0..cw {
+            let (u, v) = if y + 8 < ch {
+                (pic0.u[(y + 8) * cw + x], pic0.v[(y + 8) * cw + x])
+            } else {
+                (rng.below(256) as u8, rng.below(256) as u8)
+            };
+            (pic1.u[y * cw + x], pic1.v[y * cw + x]) = (u, v);
+        }
+    }
+    let (mc, mr) = (mi_cols(w as i32), mi_rows(h as i32));
+    let sb_cols = w.div_ceil(64);
+    let tiles64 = tile_layout(w as u32, h as u32, 0, 0).unwrap();
+    let tiles128 = tile_layout_ex(w as u32, h as u32, 1, 0, true).unwrap();
+    assert_eq!(tiles128.cols, 2);
+    let mut m = Motion::new();
+    let mut hy = Hybrid::new();
+    let mut ps = ParseState::default();
+    let wfp_of = |hy: &Hybrid| {
+        // the post-filters off: the decoder's output is the pre-filter reconstruction
+        let mut f = hy.record().fp;
+        (f.loop_filter_level, f.enable_cdef) = ([0; 4], 0);
+        f
+    };
+    // ---- the key frame ----
+    let blocks0 = partition(&pic0, &tiles64, &mut rng, Style::Random, false);
+    m.apply_ex(&[], 0, &blocks0, None, None, mr, mc, Some(&tiles128))
+        .unwrap();
+    assert_eq!(m.blocks.len(), blocks0.len());
+    let key_blocks = m.blocks.clone();
+    let mut fp = FrameParams {
+        video: 1,
+        sb128: 1,
+        ..Default::default()
+    };
+    let video = Video {
+        fp,
+        inter: &[],
+        reference: None,
+    };
+    hy.closed_loop_ex(
+        &pic0.y,
+        &pic0.u,
+        &pic0.v,
+        w as u32,
+        h as u32,
+        &key_blocks,
+        None,
+        0,
+        90,
+        1,
+        0,
+        Some(&video),
+    )
+    .unwrap();
+    let wfp = wfp_of(&hy);
+    let obu = hy.write(&wfp, None, sb_cols).unwrap().to_vec();
+    let p = parse_with(&obu, Some(&mut ps)).unwrap();
+    assert_eq!(p.rec.fp.sb128, 1);
+    assert_eq!(p.rec.blocks.len(), hy.record().blocks.len());
+    let recon0: Vec<Vec<u8>> = (0..3).map(|k| hy.recon(k).unwrap().to_vec()).collect();
+    let rw0 = hy.output().recon_w;
+    // ---- the inter frame ----
+    fn planes(p: &Pic) -> [Plane<'_>; 3] {
+        let (w, h, cw, ch) = (p.w, p.h, p.w.div_ceil(2), p.h.div_ceil(2));
+        [
+            Plane {
+                data: &p.y,
+                stride: w,
+                width: w,
+                height: h,
+            },
+            Plane {
+                data: &p.u,
+                stride: cw,
+                width: cw,
+                height: ch,
+            },
+            Plane {
+                data: &p.v,
+                stride: cw,
+                width: cw,
+                height: ch,
+            },
+        ]
+    }
+    let (cur, prev) = (planes(&pic1), planes(&pic0));
+    let copies = m.classify(&cur, &prev, 3, 4);
+    assert!(copies >= 8, "{copies} copies");
+    let sbs = m.sbs.clone();
+    assert!(sbs.iter().any(|s| s.copy && s.shift == Shift { dx: 0, dy: 16 }));
+    let blocks1 = partition(&pic1, &tiles64, &mut rng, Style::Random, false);
+    m.apply_ex(&sbs, sb_cols, &blocks1, None, None, mr, mc, Some(&tiles128))
+        .unwrap();
+    assert!(
+        m.blocks
+            .iter()
+            .zip(&m.inter)
+            .any(|(b, i)| b.bsize as i32 == BLOCK_128X128 && i.is_inter != 0),
+        "no 128x128 copy"
+    );
+    (
+        fp.frame_type,
+        fp.refresh_frame_flags,
+        fp.mv_precision,
+        fp.allow_screen_content_tools,
+    ) = (FRAME_INTER, 1, 0, 1);
+    let (blocks, inter) = (m.blocks.clone(), m.inter.clone());
+    let reference = RefPicture {
+        plane: [&recon0[0], &recon0[1], &recon0[2]],
+        stride: [rw0[0] as usize, rw0[1] as usize, rw0[2] as usize],
+        cdfs: None,
+    };
+    let video = Video {
+        fp,
+        inter: &inter,
+        reference: Some(reference),
+    };
+    hy.closed_loop_ex(
+        &pic1.y,
+        &pic1.u,
+        &pic1.v,
+        w as u32,
+        h as u32,
+        &blocks,
+        None,
+        0,
+        90,
+        1,
+        0,
+        Some(&video),
+    )
+    .unwrap();
+    let rw1 = hy.output().recon_w;
+    for (s, sm) in sbs.iter().enumerate() {
+        if !sm.copy {
+            continue;
+        }
+        let (sx, sy) = (s % sb_cols, s / sb_cols);
+        for p in 0..3 {
+            let sub = (p != 0) as usize;
+            let (pw, ph) = if p == 0 { (w, h) } else { (cw, ch) };
+            let rec1 = hy.recon(p).unwrap();
+            for y in ((sy * 64) >> sub)..(((sy + 1) * 64) >> sub).min(ph) {
+                for x in ((sx * 64) >> sub)..(((sx + 1) * 64) >> sub).min(pw) {
+                    let (qx, qy) = (x as i32 + (sm.shift.dx >> sub), y as i32 + (sm.shift.dy >> sub));
+                    assert_eq!(
+                        rec1[y * rw1[p] as usize + x],
+                        recon0[p][qy as usize * rw0[p] as usize + qx as usize],
+                        "64x64 {s} plane {p} ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+    let wfp = wfp_of(&hy);
+    assert!(hy.write_ex(&wfp, None, sb_cols, ENC_AVIF).is_err());
+    let obu = hy.write_ex(&wfp, None, sb_cols, ENC_NO_SEQ_HEADER).unwrap().to_vec();
+    assert_eq!(&obu[..3], &[0x12, 0x00, 0x32], "TD, frame");
+    let p = parse_with(&obu, Some(&mut ps)).unwrap();
+    assert_eq!((p.rec.fp.sb128, p.rec.fp.frame_type), (1, FRAME_INTER));
+    assert_eq!(p.rec.blocks.len(), hy.record().blocks.len());
+    assert_eq!(p.rec.inter, inter);
 }
 
 // ---------------------------------------------------------------------------------------------

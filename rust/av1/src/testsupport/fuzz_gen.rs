@@ -7,11 +7,14 @@
 //! The C++ also counts what it generated (a thread_local `Coverage`); nothing reads the counts
 //! back, so they don't shape the record and aren't ported. The C++'s `m2` mode (DC-only records)
 //! is never used by av1t_case_make and isn't ported either.
+//!
+//! [`FuzzCase::make_ex`] adds 128x128 superblocks (fp.sb128, which the C++ doesn't have): the
+//! partition starts at 128x128 there, with every type the 128x128 node allows.
 use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma, max_tx_depth, mi_cols, mi_rows, tx_coeffs};
 use crate::dsp::{chroma_tx_type, get_scan, get_tx_set_intra, is_directional, tx_type_in_set_intra};
 use crate::tables::*;
 use crate::types::{Block, DECISIONS_VERSION, DecisionRecord, FrameParams, Tiles, Txb};
-use crate::writer::{apply_sb_qindex, layout, layout_counts, legalize_sb_qindex, tile_layout};
+use crate::writer::{apply_sb_qindex, layout, layout_counts, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
 /// splitmix64, with the seed hashed so that streams of consecutive seeds are not shifted copies.
 struct Rng {
@@ -57,6 +60,8 @@ struct Gen<'a> {
     pf_smooth: bool,
     /// enable_filter_intra
     fi: bool,
+    /// the superblock size: BLOCK_64X64, or BLOCK_128X128 (fp.sb128)
+    sb_bsize: i32,
 }
 
 impl Gen<'_> {
@@ -68,7 +73,7 @@ impl Gen<'_> {
             bsize: bs as u8,
             ..Block::default()
         };
-        b.skip = rng.chance(if bs == BLOCK_64X64 && self.dq_bias {
+        b.skip = rng.chance(if bs == self.sb_bsize && self.dq_bias {
             60
         } else if self.pf_smooth {
             45
@@ -112,6 +117,16 @@ impl Gen<'_> {
         if has_rows && has_cols {
             if bs == BLOCK_8X8 {
                 return rng.range(0, 3);
+            }
+            if bs == BLOCK_128X128 {
+                // the 8 types of the 128x128 node (no 4-way splits)
+                if self.dq_bias && rng.chance(25) {
+                    return PARTITION_NONE;
+                }
+                if rng.chance(35 * self.max_depth_bias / 2) {
+                    return PARTITION_SPLIT;
+                }
+                return rng.range(0, 7);
             }
             if bs == BLOCK_64X64 && self.dq_bias && rng.chance(25) {
                 return PARTITION_NONE;
@@ -219,11 +234,12 @@ impl Gen<'_> {
     }
 
     fn gen_blocks(&mut self, tiles: &Tiles) {
+        let step = (bw4(self.sb_bsize)) as usize;
         for tr in 0..tiles.rows as usize {
             for tc in 0..tiles.cols as usize {
-                for r in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(16) {
-                    for c in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(16) {
-                        self.partition(r as i32, c as i32, BLOCK_64X64);
+                for r in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(step) {
+                    for c in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(step) {
+                        self.partition(r as i32, c as i32, self.sb_bsize);
                     }
                 }
             }
@@ -290,6 +306,13 @@ impl FuzzCase {
     /// sides up to `maxdim` (>= 1), `big_pct` percent of cases wide enough to force several tiles.
     /// Laid out and ready for av1g_encode. `None` where the C++ returns null (a layout failure).
     pub fn make(seed: u64, maxdim: i32, big_pct: i32) -> Option<FuzzCase> {
+        Self::make_ex(seed, maxdim, big_pct, false)
+    }
+
+    /// [`FuzzCase::make`] with 128x128 superblocks (`sb128`, fp.sb128 = 1; av1t_case_make_ex): the
+    /// same draws, the partition (and the per-SB qindex map) of 128x128 superblocks. Without
+    /// `sb128` exactly [`FuzzCase::make`].
+    pub fn make_ex(seed: u64, maxdim: i32, big_pct: i32, sb128: bool) -> Option<FuzzCase> {
         let mut rng = Rng::new(seed);
         // ---- frame parameters ----
         const SPECIAL: [(i32, i32); 10] = [
@@ -366,18 +389,19 @@ impl FuzzCase {
             fp.delta_q_present = 1;
             fp.delta_q_res = rng.range(0, 3) as u8;
         }
+        fp.sb128 = sb128 as u8;
         // optional extra tiles for moderately sized pictures
         let (uw, uh) = (width as u32, height as u32);
-        let mt = tile_layout(uw, uh, -1, -1).ok()?;
+        let mt = tile_layout_ex(uw, uh, -1, -1, sb128).ok()?;
         if rng.chance(15) {
             let cl = mt.cols_log2 + rng.range(0, 2);
             let rl = rng.range(0, 2);
-            if tile_layout(uw, uh, cl, rl).is_ok() {
+            if tile_layout_ex(uw, uh, cl, rl, sb128).is_ok() {
                 fp.tile_cols_log2 = cl as i8;
                 fp.tile_rows_log2 = rl as i8;
             }
         }
-        let tiles = tile_layout(uw, uh, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32).ok()?;
+        let tiles = tile_layout_ex(uw, uh, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32, sb128).ok()?;
         // deblocking / CDEF parameters from their own stream (keeps the pre-M5.5 cases of each seed)
         let mut prng = Rng::new(seed ^ 0x5DEECE66D);
         if prng.chance(45) {
@@ -433,6 +457,7 @@ impl FuzzCase {
             dq_bias: fp.delta_q_present != 0,
             pf_smooth,
             fi: fp.enable_filter_intra != 0,
+            sb_bsize: if sb128 { BLOCK_128X128 } else { BLOCK_64X64 },
         };
         g.gen_blocks(&tiles);
         let mut blocks = g.blocks;
@@ -448,7 +473,8 @@ impl FuzzCase {
             // random per-SB qindex map, legalized
             let base = fp.base_q_idx as i32;
             let mode = rng.range(0, 2);
-            let target: Vec<u8> = (0..sb_cols * sb_rows)
+            let (qc, qr, _) = sb_grid(&fp);
+            let target: Vec<u8> = (0..qc * qr)
                 .map(|_| {
                     (match mode {
                         0 => rng.range(1, 255),
@@ -537,4 +563,9 @@ impl FuzzCase {
 /// av1t_case_make: [`FuzzCase::make`].
 pub fn case_make(seed: u64, maxdim: i32, big_pct: i32) -> Option<FuzzCase> {
     FuzzCase::make(seed, maxdim, big_pct)
+}
+
+/// av1t_case_make_ex: [`FuzzCase::make_ex`].
+pub fn case_make_ex(seed: u64, maxdim: i32, big_pct: i32, sb128: bool) -> Option<FuzzCase> {
+    FuzzCase::make_ex(seed, maxdim, big_pct, sb128)
 }

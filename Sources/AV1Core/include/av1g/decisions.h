@@ -1,5 +1,5 @@
 /* av1g/decisions.h - the DecisionRecord: every coding decision + quantized
- * coefficients for ONE AV1 picture (8-bit, 4:2:0 or monochrome, 64x64
+ * coefficients for ONE AV1 picture (8-bit, 4:2:0 or monochrome, 64x64 or 128x128
  * superblocks): an intra-only still picture (reduced_still_picture_header), or a
  * key frame or inter frame of a video stream (fp.video, see "Video mode" below).
  * Interface version 2 (version 1 records are still accepted: they are still
@@ -18,11 +18,19 @@
  *   (edge replication) - samples in the padding are coded and reconstructed like
  *   any others, the output is cropped to width x height.
  *
- * Tiles.  Uniform tile spacing, 64x64 superblocks.  fp.tile_cols_log2 /
+ * Superblocks.  64x64 (fp.sb128 = 0), or 128x128 (fp.sb128 = 1: use_128x128_superblock, a
+ *   sequence header field, so the same in every frame of a stream; still pictures may use it
+ *   too).  "SB" below is the frame's superblock size unless it says 64x64.  With 128x128 SBs
+ *   the partition tree starts at 128x128 (PARTITION_HORZ_4 / VERT_4 aren't allowed there, the
+ *   other 8 types are; SPLIT gives four 64x64 quadrants in raster order, each with its own
+ *   subtree), blocks may be 128x128, 128x64 or 64x128, and tiles are in 128x128 units.  CDEF
+ *   (cdef_idx) stays per 64x64.
+ *
+ * Tiles.  Uniform tile spacing, in SBs.  fp.tile_cols_log2 /
  *   fp.tile_rows_log2 = -1 selects the minimum legal tiling (one tile unless the
- *   padded width > 4096 or area > 4096*2304 luma samples); av1g_tile_layout()
- *   returns the tile boundaries.  Edge availability for prediction and contexts is
- *   TILE-LOCAL (AV1 is_inside()).
+ *   padded width > 4096 or area > 4096*2304 luma samples); av1g_tile_layout() (64x64 SBs) /
+ *   av1g_tile_layout_ex() returns the tile boundaries.  Edge availability for prediction and
+ *   contexts is TILE-LOCAL (AV1 is_inside()).
  *
  * Block order (blocks[]).  Exactly the order of decode_block() calls in the AV1
  *   syntax: tiles in raster order; superblocks in raster order inside the tile;
@@ -42,12 +50,14 @@
  *   re-derived (and fully validated) by the backend.  Rules the sequence must obey:
  *   8x8 nodes only use NONE/HORZ/VERT/SPLIT; a node whose lower half starts outside
  *   the coded area may only be HORZ or SPLIT, one whose right half starts outside only
- *   VERT or SPLIT, one with both only SPLIT; 128-pixel block sizes are not allowed.
+ *   VERT or SPLIT, one with both only SPLIT; 128-pixel block sizes need fp.sb128 (they are
+ *   the 128x128 node's NONE / HORZ / VERT / _A / _B blocks).
  *   Blocks may extend past the coded area (e.g. a 64x64 block covering 8 visible
  *   columns); only transform blocks whose top-left lies inside are coded.
  *
  * Per-block fields (av1g_block, 16 bytes):
- *   bsize          AV1G_BLOCK_* (any of the 19 sizes 4x4..64x64)
+ *   bsize          AV1G_BLOCK_* (any of the 19 sizes 4x4..64x64; with fp.sb128 also 128x128,
+ *                  128x64 and 64x128)
  *   skip           1 = no residual in any plane (coefficients are ignored);
  *                  0 = residual coded (a tx block may still be all-zero)
  *   tx_depth       0..min(2, Max_Tx_Depth[bsize]); luma tx size =
@@ -72,8 +82,8 @@
  *                  this block's superblock (same value in all blocks of the SB; legal values are
  *                  == base_q_idx mod 2^delta_q_res, see av1g_legalize_sb_qindex()).  The backend
  *                  codes the per-SB delta on the first block of each SB (spec read_delta_qindex);
- *                  an SB consisting of a single skipped 64x64 block codes no delta and its value
- *                  is ignored.  0 when delta_q_present = 0.
+ *                  an SB consisting of a single skipped SB-sized block (64x64, or 128x128 with
+ *                  fp.sb128) codes no delta and its value is ignored.  0 when delta_q_present = 0.
  *   filter_intra   fp.enable_filter_intra = 1: 0 = off, 1 + FILTER_INTRA_MODE (1..5); only
  *                  for y_mode == DC_PRED and blocks with both sides <= 32 (spec
  *                  filter_intra_mode_info); 0 otherwise.  Luma tx type CDFs then use
@@ -81,11 +91,15 @@
  *   cdef_idx       fp.enable_cdef = 1: preset index 0 .. (1 << cdef_bits) - 1 of this
  *                  block's 64x64; must be the same in every NON-skip block of the 64x64
  *                  (coded once, on the first non-skip block; ignored for skip blocks, an
- *                  all-skip 64x64 is not filtered).  0 when CDEF is off.
+ *                  all-skip 64x64 is not filtered).  A non-skip block larger than 64x64
+ *                  (fp.sb128) gives every 64x64 it covers its cdef_idx (spec read_cdef).  0 when
+ *                  CDEF is off.
  *
  * Transform blocks (txb[], 16 bytes each).  For every block, in order: all luma
  *   tx blocks of the block in raster order, then (if the block carries chroma) all
- *   U tx blocks, then all V tx blocks.  Tx blocks whose top-left sample is outside
+ *   U tx blocks, then all V tx blocks.  A block wider or taller than 64 (fp.sb128) does
+ *   this per 64x64 luma unit in raster order (spec residual(): Y, U, V of the first 64x64,
+ *   then of the next), its luma tx blocks being at most 64x64.  Tx blocks whose top-left sample is outside
  *   the coded area (x >= MiCols*4 >> ssx or y >= MiRows*4 >> ssy) do not exist.
  *   block_txb[b] .. block_txb[b+1]-1 are block b's entries.  The layout (offsets,
  *   positions, sizes) is deterministic given blocks[] - call av1g_layout() (or
@@ -194,7 +208,8 @@
  *   var-tx tree, txfm_split coded at every node), 0..min(2, Max_Tx_Depth[bsize]) as for
  *   intra blocks; skip inter blocks have no tx_depth (0).  Luma tx blocks are laid out in
  *   the spec's transform_tree order (recursive halves / quadrants, not raster: they differ
- *   for depth 2), then U and V as for intra blocks.  Luma tx_type: a type of the INTER set
+ *   for depth 2), then U and V as for intra blocks (blocks wider or taller than 64: per
+ *   64x64 unit, each unit's luma tree rooted at 64x64).  Luma tx_type: a type of the INTER set
  *   of get_tx_set() (16 types up to 16x16, 12 at 16x16, IDTX / DCT at 32 or with
  *   reduced_tx_set, DCT only at 64).  Chroma tx_type is derived (output): the co-located
  *   luma tx block's type if it is in the chroma size's inter set, else DCT_DCT.
@@ -288,7 +303,8 @@ typedef struct av1g_frame_params {
     uint8_t  lf_inter_off;         /* inter: 1 = inter blocks are not deblocked (see "Video mode") */
     uint8_t  cdf_from_ref;         /* inter: 1 = start from the reference's saved CDFs (see "Video mode") */
     uint8_t  mv_precision;         /* inter: 0 whole samples, 1 quarter, 2 eighth (see "Video mode") */
-    uint8_t  reserved[7];
+    uint8_t  sb128;                /* 1: 128x128 superblocks (see "Superblocks"); 0: 64x64 */
+    uint8_t  reserved[6];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {

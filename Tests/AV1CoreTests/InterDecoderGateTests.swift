@@ -12,7 +12,9 @@ import libaom
 /// predicting from the reconstructions av1core returned for the frames that
 /// last refreshed its slots. The vendored libaom decodes the stream, and every
 /// frame must decode to exactly av1core's reconstruction of it: the ground an
-/// inter encoder on av1core stands on.
+/// inter encoder on av1core stands on. Some sequences have 128x128
+/// superblocks, and some frames after the first leave the sequence header out
+/// (av1t_inter_case_flags).
 @Suite(.enabled(if: glassact_aom_available() != 0, "libaom is arm64 only"))
 struct InterDecoderGateTests {
     static let framesPerSequence: Int32 = 8
@@ -20,14 +22,32 @@ struct InterDecoderGateTests {
     @Test(arguments: 0..<8)
     func randomSequencesDecodeToTheirReconstructions(chunk: UInt64) throws {
         let perChunk: UInt64 = 12
+        var headerless = 0
         for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
-            try Self.check(seed: seed)
+            headerless += try Self.check(seed: seed, maxdim: 240)
         }
+        #expect(headerless > 0, "no frame without a sequence header")
     }
 
-    static func check(seed: UInt64) throws {
-        let sequence = try #require(av1t_inter_case_make(seed, 240, framesPerSequence), "seed \(seed): no sequence")
+    /// Larger sequences with 128x128 superblocks (the others of these seeds are skipped).
+    @Test(arguments: 0..<4)
+    func sb128SequencesDecodeToTheirReconstructions(chunk: UInt64) throws {
+        let perChunk: UInt64 = 24
+        var checked = 0
+        for seed in (1000 + chunk * perChunk)..<(1000 + (chunk + 1) * perChunk) {
+            if try Self.check(seed: seed, maxdim: 420, onlySB128: true) >= 0 { checked += 1 }
+        }
+        #expect(checked >= 4, "only \(checked) sequences with 128x128 superblocks")
+    }
+
+    /// Checks the sequence of `seed`; returns how many of its frames had no sequence header, or -1
+    /// when `onlySB128` skipped it.
+    @discardableResult
+    static func check(seed: UInt64, maxdim: Int32, onlySB128: Bool = false) throws -> Int {
+        let sequence = try #require(av1t_inter_case_make(seed, maxdim, framesPerSequence), "seed \(seed): no sequence")
         defer { av1t_inter_case_free(sequence) }
+        if onlySB128, let first = av1t_inter_case_record(sequence, 0), first.pointee.fp.sb128 == 0 { return -1 }
+        var headerless = 0
         let decoder = try #require(glassact_aom_dec_create(1))
         defer { glassact_aom_dec_destroy(decoder) }
         var outputs: [av1g_output] = []
@@ -45,7 +65,9 @@ struct InterDecoderGateTests {
                 refs[s].stride = (Int32(o.recon_w.0), Int32(o.recon_w.1), Int32(o.recon_w.2))
                 refs[s].cdfs = UnsafeRawPointer(o.cdfs)
             }
-            var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_FIX_RANGE) | UInt32(AV1G_ENC_TD), seq_level_idx: -1)
+            let extra = av1t_inter_case_flags(sequence, Int32(k)) // AV1G_ENC_NO_SEQ_HEADER for some frames
+            if extra != 0 { headerless += 1 }
+            var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_FIX_RANGE) | UInt32(AV1G_ENC_TD) | extra, seq_level_idx: -1)
             var output = av1g_output()
             let rc = av1g_encode_ex(record, &options, refs, &output)
             outputs.append(output)
@@ -65,7 +87,7 @@ struct InterDecoderGateTests {
                     let x = (0..<w).first { ours[y * w + $0] != theirs[y * stride + $0] } ?? 0
                     let where_ = "seed \(seed) \(fp.width)×\(fp.height) frame \(k) (\(kind)): plane \(p) differs first at (\(x), \(y))"
                     Issue.record("\(where_): av1core \(ours[y * w + x]), libaom \(theirs[y * stride + x])")
-                    return
+                    return headerless
                 }
             }
             let refresh = fp.frame_type == AV1G_FRAME_KEY ? 0xFF : Int(fp.refresh_frame_flags)
@@ -73,6 +95,7 @@ struct InterDecoderGateTests {
                 slots[s] = k
             }
         }
+        return headerless
     }
 
     private static func message(_ output: inout av1g_output) -> String {

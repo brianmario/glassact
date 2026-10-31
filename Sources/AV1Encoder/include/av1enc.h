@@ -92,22 +92,30 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
                               int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
 // av1enc_hybrid_closed_loop for a frame of a stream: video (null: a still picture) supplies the
 // frame's video fields (video, frame_type, ref_slot, refresh_frame_flags, error_resilient_mode,
-// lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision; the rest is ignored). An inter frame takes inter (one
+// lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision, sb128; the rest is ignored). An inter frame takes inter (one
 // per block, or null: all intra) and ref, LAST_FRAME's picture (the decoder's output of the frame
 // in ref_slot: planes of the picture's size at their strides). Inter blocks are skip blocks
 // (tx_depth 0, intra fields 0) and copy the reference at their motion vector. An inter frame's
-// tiles are coded afresh, and the next picture's aren't kept from it.
+// tiles are coded afresh, and the next picture's aren't kept from it. With sb128 the blocks are in
+// 128x128-superblock decode order (av1enc_motion_apply_ex makes it from a 64x64 one), tiled as
+// av1g_tile_layout_ex(..., 1) gives it, and inter blocks may be 128x128, 128x64 or 64x128.
 int av1enc_hybrid_closed_loop_ex(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
                                  uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
                                  int qindex, int tile_cols_log2, int tile_rows_log2, const av1g_frame_params *video,
                                  const av1g_block_inter *inter, const av1g_ref_planes *ref, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
-// The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp) and
-// every 64x64's cdef_idx (raster, sb_cols wide; -1 as 0): [TD,] sequence header and frame. A tile
+// The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp, its
+// other fields as the closed loop's: video fields, sb128) and every 64x64's cdef_idx (raster,
+// sb_cols wide; -1 as 0; a non-skip block larger than 64x64 takes its top-left 64x64's for every
+// 64x64 it covers): [TD,] sequence header and frame. A tile
 // whose closed loop was kept, and whose cdef_idx values and cdef_bits are as last written, keeps
 // its bytes. *obu is malloc'd (free it).
 int av1enc_hybrid_write(av1enc_hybrid *h, const av1g_frame_params *fp, const int8_t *sb_cdef, int sb_cols,
                         uint8_t **obu, size_t *size, char *err, size_t errlen);
+// av1enc_hybrid_write with encode flags: AV1G_ENC_NO_SEQ_HEADER (a later frame of a video stream,
+// whose earlier sequence header applies: [TD,] frame) or 0.
+int av1enc_hybrid_write_ex(av1enc_hybrid *h, const av1g_frame_params *fp, const int8_t *sb_cdef, int sb_cols,
+                           uint32_t flags, uint8_t **obu, size_t *size, char *err, size_t errlen);
 // Keep unchanged tiles' closed loop and bitstream from picture to picture (on by default).
 void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
 // Tiles the last closed loop kept.
@@ -145,6 +153,21 @@ int av1enc_motion_apply(av1enc_motion *m, const int32_t *sb_motion, const av1g_b
                         const uint8_t *luma_tx, const av1g_block_inter *inter, int width,
                         int height, const av1g_block **out_blocks, const av1g_block_inter **out_inter,
                         const uint8_t **out_luma_tx);
+// av1enc_motion_apply for 64x64 (sb128 = 0: exactly it) or 128x128 superblocks (sb128 = 1, the
+// frame's tiling tile_cols_log2 / tile_rows_log2 as av1g_tile_layout_ex gives it; -1 minimum).
+// With 128x128 superblocks `blocks` is a partition into 64x64s: every block inside one 64x64, each
+// 64x64's blocks contiguous and in its own coding order (as av1enc_motion_apply takes them), the
+// 64x64s in any order (e.g. tiles of 64x64s in raster order); every 64x64 starting inside the coded
+// area has blocks unless sb_motion copies it.  The output is in the 128x128 superblocks' decode
+// order: tiles in raster order, a tile's 128x128s in raster order, a 128x128's four 64x64 quadrants
+// in raster order (each its blocks, or a copied one's cover).  A 128x128 whose quadrants inside the
+// coded area are all copies at one shift becomes one 128x128 skip inter block (128x64 / 64x128, or
+// its quadrants' covers, where only part of it is inside).  Returns the block count, or -1 (blocks
+// not of that form, or an illegal tiling).
+int av1enc_motion_apply_ex(av1enc_motion *m, const int32_t *sb_motion, const av1g_block *blocks, uint32_t n,
+                           const uint8_t *luma_tx, const av1g_block_inter *inter, int width, int height, int sb128,
+                           int tile_cols_log2, int tile_rows_log2, const av1g_block **out_blocks,
+                           const av1g_block_inter **out_inter, const uint8_t **out_luma_tx);
 
 #ifdef __cplusplus
 }

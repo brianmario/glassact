@@ -15,6 +15,9 @@ extern "C" {
 // several tiles. Laid out (av1g_layout) and ready for av1g_encode.
 typedef struct av1t_case av1t_case;
 av1t_case *av1t_case_make(uint64_t seed, int maxdim, int big_pct);
+// av1t_case_make with 128x128 superblocks (sb128 = 1: fp.sb128, the partition starting at 128x128
+// with every type its node allows); sb128 = 0: av1t_case_make.
+av1t_case *av1t_case_make_ex(uint64_t seed, int maxdim, int big_pct, int sb128);
 av1g_decision_record *av1t_case_record(av1t_case *c);
 void av1t_case_free(av1t_case *c);
 
@@ -23,13 +26,17 @@ void av1t_case_free(av1t_case *c);
 // frames with random inter / intra blocks, whole-sample motion vectors (some
 // far outside the picture), skip / non-skip, var-tx depths, random
 // coefficients, reference slots, refresh flags and post-filters; sides up to
-// `maxdim`, monochrome and odd sizes included. Every record is laid out and
+// `maxdim`, monochrome and odd sizes included; 128x128 superblocks in some
+// sequences. Every record is laid out and
 // ready for av1g_encode_ex: frame k's references are the reconstructions of
 // the frames that last refreshed each slot (a key frame refreshes all 8; an
 // inter frame the slots in fp.refresh_frame_flags), which the caller tracks.
 typedef struct av1t_inter_case av1t_inter_case;
 av1t_inter_case *av1t_inter_case_make(uint64_t seed, int maxdim, int nframes);
 int av1t_inter_case_frames(const av1t_inter_case *c);
+// The encode flags frame `frame` adds to its options: AV1G_ENC_NO_SEQ_HEADER for some frames after
+// the first (a stream's later frames without their own sequence header), else 0.
+uint32_t av1t_inter_case_flags(const av1t_inter_case *c, int frame);
 av1g_decision_record *av1t_inter_case_record(av1t_inter_case *c, int frame);
 void av1t_inter_case_free(av1t_inter_case *c);
 

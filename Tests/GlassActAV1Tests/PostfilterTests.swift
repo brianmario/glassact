@@ -7,19 +7,22 @@ import Testing
 
 /// The GPU post-filters against av1core's, which the decoder gate holds to
 /// libaom: on every random legal record (deblocking levels and sharpness,
-/// CDEF presets, skip and tx-size maps, frame edges), deblocking and CDEF of
-/// the reconstruction before them give av1core's filtered picture exactly.
+/// CDEF presets, skip and tx-size maps, frame edges, 128x128 superblocks),
+/// deblocking and CDEF of the reconstruction before them give av1core's
+/// filtered picture exactly.
 @Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
 struct PostfilterTests {
     @available(macOS 27, *)
-    @Test(arguments: 0..<4)
+    @Test(arguments: 0..<6)
     func filtersMatchAV1Core(chunk: UInt64) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let postfilter = try AV1MetalPostfilter(device: device)
         let perChunk: UInt64 = 50
         var filtered = 0
+        // chunks 4 and 5: 128x128 superblocks (blocks up to 128x128, CDEF per 64x64 of them)
+        let sb128: Int32 = chunk >= 4 ? 1 : 0
         for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
-            let fuzzCase = try #require(av1t_case_make(seed, 300, 2), "seed \(seed): no record")
+            let fuzzCase = try #require(av1t_case_make_ex(seed, sb128 != 0 ? 420 : 300, 2, sb128), "seed \(seed): no record")
             defer { av1t_case_free(fuzzCase) }
             let record = try #require(av1t_case_record(fuzzCase))
             let fp = record.pointee.fp
@@ -50,17 +53,19 @@ struct PostfilterTests {
     }
 
     /// The same on random inter sequences (the frames av1core's inter decoder gate checks), with
-    /// lf_inter_off's inter blocks at level 0: each frame is coded from the filtered pictures
-    /// before it.
+    /// lf_inter_off's inter blocks at level 0, and 128x128 superblocks (a skipped inter block
+    /// larger than 64x64 keeps the tx edges inside it): each frame is coded from the filtered
+    /// pictures before it. The blocks' flags are av1g_pf_mark_block_flags': AV1G_PF_BLK_INTER for
+    /// an inter block, with AV1G_PF_BLK_LF_ZERO under lf_inter_off.
     @available(macOS 27, *)
-    @Test(arguments: 0..<4)
+    @Test(arguments: 0..<6)
     func interFiltersMatchAV1Core(chunk: UInt64) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let postfilter = try AV1MetalPostfilter(device: device)
         let perChunk: UInt64 = 12
-        var lfOff = 0
+        var lfOff = 0, sb128Frames = 0
         for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
-            let sequence = try #require(av1t_inter_case_make(seed, 240, 6), "seed \(seed): no sequence")
+            let sequence = try #require(av1t_inter_case_make(seed, chunk >= 4 ? 420 : 240, 6), "seed \(seed): no sequence")
             defer { av1t_inter_case_free(sequence) }
             var outputs: [av1g_output] = []
             defer { for i in outputs.indices { av1g_output_free(&outputs[i]) } }
@@ -84,15 +89,19 @@ struct PostfilterTests {
                 outputs.append(after)
                 try #require(rc == AV1G_OK, "seed \(seed) frame \(k)")
                 let n = Int(record.pointee.n_blocks)
-                var lfZero: [UInt8]?
-                if fp.lf_inter_off != 0, let inter = record.pointee.inter {
-                    lfZero = (0..<n).map { inter[$0].is_inter }
-                    lfOff += 1
+                var flags: [UInt8]?
+                if let inter = record.pointee.inter {
+                    let lfZero = fp.lf_inter_off != 0
+                    // av1g/postfilter.h (not in Swift's importer): AV1G_PF_BLK_INTER 2, AV1G_PF_BLK_LF_ZERO 1
+                    let blk: UInt8 = 2 | (lfZero ? 1 : 0)
+                    flags = (0..<n).map { inter[$0].is_inter != 0 ? blk : 0 }
+                    if lfZero { lfOff += 1 }
                 }
+                if fp.sb128 != 0 { sb128Frames += 1 }
                 let nPlanes = fp.monochrome != 0 ? 1 : 3
                 let source = [before.recon.0, before.recon.1, before.recon.2].prefix(nPlanes).map { UnsafePointer($0!) }
                 let gpu = try postfilter.filter(params: fp, blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
-                                                planes: source, lfZero: lfZero)
+                                                planes: source, lfZero: flags)
                 let cpu = [after.recon.0, after.recon.1, after.recon.2]
                 for p in 0..<nPlanes {
                     let ours = try #require(cpu[p])
@@ -106,5 +115,6 @@ struct PostfilterTests {
             }
         }
         #expect(lfOff > 0, "no frame had lf_inter_off")
+        #expect(sb128Frames > 0, "no frame had 128x128 superblocks")
     }
 }

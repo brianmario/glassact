@@ -41,12 +41,19 @@ pub(crate) struct Frame<'a> {
     /// cleared, and sets the flag
     pub cdfs_out: Option<&'a std::sync::Mutex<(bool, Box<FrameCdfs>)>>,
     pub context_tile: usize,
+    /// fp.sb128: 128x128 superblocks
+    pub sb128: bool,
 }
 
 impl Frame<'_> {
     #[inline(always)]
     fn planes(&self) -> usize {
         if self.mono { 1 } else { 3 }
+    }
+    /// the superblock's size in luma 4x4 units (sbSize4)
+    #[inline(always)]
+    fn sb_size4(&self) -> i32 {
+        if self.sb128 { 32 } else { 16 }
     }
 }
 
@@ -58,10 +65,11 @@ pub(crate) struct TileBufs {
     pub c0: i32,
     pub mw: i32,
     pub mh: i32,
-    /// the tile's superblocks
+    /// the tile's 64x64s (also with 128x128 superblocks: the buffers stay 64x64-granular, a
+    /// 128x128 superblock's blocks never reaching past the 64x64s that start inside the frame)
     pub sb_cols: i32,
     pub sb_rows: i32,
-    /// the tile's superblocks' samples (64 x 64 luma each), stride sb_cols * 64 >> sub
+    /// the tile's 64x64s' samples, stride sb_cols * 64 >> sub
     pub plane: [Vec<u8>; 3],
     pub stride: [usize; 3],
     pub height: [usize; 3],
@@ -140,6 +148,13 @@ impl TileBufs {
     fn mi(&self, r: i32, c: i32) -> usize {
         ((r - self.r0) * self.mw + (c - self.c0)) as usize
     }
+
+    /// The sb_cdef entry of the 64x64 holding luma 4x4 (r, c), if it's one of the tile's.
+    #[inline(always)]
+    fn cdef_at(&self, r: i32, c: i32) -> Option<usize> {
+        let (y, x) = ((r - self.r0) >> 4, (c - self.c0) >> 4);
+        (y < self.sb_rows && x < self.sb_cols).then_some((y * self.sb_cols + x) as usize)
+    }
 }
 
 /// What the inter syntax coded, for the tests' coverage reports: GLOBALMV, NEARESTMV, NEARMV,
@@ -154,6 +169,16 @@ pub(crate) static INTER_STAT: [std::sync::atomic::AtomicU64; INTER_STAT_PHASE + 
 /// (horizontal and vertical) predictions filtered at, by plane type and filter variant.
 #[cfg(test)]
 pub(crate) const INTER_STAT_PHASE: usize = 11;
+/// What 128x128 superblocks coded, for the tests' coverage reports: the 128x128 node's partition
+/// types (0..8); 128x128, 128x64, 64x128 blocks (8..11); of those, intra (11), inter (12), skip
+/// (13), coded (14), inter and coded (15).
+#[cfg(test)]
+pub(crate) static SB128_STAT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+#[inline(always)]
+fn sb128_stat(_k: usize) {
+    #[cfg(test)]
+    SB128_STAT[_k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 #[inline(always)]
 fn inter_stat(_k: usize) {
     #[cfg(test)]
@@ -200,8 +225,9 @@ pub(crate) struct TileState {
     icdf: Box<InterCdfs>,
     mc: Box<McScratch>,
     /// the current block's luma TxTypes (inter blocks: chroma derives from them), block-relative 4x4s
-    tx_types: [[u8; 16]; 16],
-    /// the current inter block's luma tx blocks in transform_tree order
+    tx_types: [[u8; 32]; 32],
+    /// the current inter block's luma tx blocks in transform_tree order (of one 64x64 residual
+    /// unit for blocks wider or taller than 64)
     tree: [(i32, i32); 16],
     n_tree: usize,
     is_inter: bool,
@@ -209,7 +235,8 @@ pub(crate) struct TileState {
     above_dc: [Vec<u8>; 3],
     left_level: [Vec<u8>; 3],
     left_dc: [Vec<u8>; 3],
-    block_decoded: [[[u8; 18]; 18]; 3],
+    /// BlockDecoded[plane][y + 1][x + 1], y and x -1 ..= sbSize4 >> sub
+    block_decoded: [[[u8; 34]; 34]; 3],
     dq: Box<[i32; 1024]>,
     res: Box<[i32; 4096]>,
     lev: Box<[u8; LEV_N]>,
@@ -226,8 +253,6 @@ pub(crate) struct TileState {
     block_q: i32,
     dc_q: [i32; 3],
     ac_q: [i32; 3],
-    /// the current SB in the tile's sb_cdef
-    sb_index: usize,
     // current block
     b_idx: u32,
     mi_row: i32,
@@ -253,7 +278,7 @@ impl Default for TileState {
             cdf: Cdfs::new(0),
             icdf: Box::default(),
             mc: Box::default(),
-            tx_types: [[0; 16]; 16],
+            tx_types: [[0; 32]; 32],
             tree: [(0, 0); 16],
             n_tree: 0,
             is_inter: false,
@@ -261,7 +286,7 @@ impl Default for TileState {
             above_dc: Default::default(),
             left_level: Default::default(),
             left_dc: Default::default(),
-            block_decoded: [[[0; 18]; 18]; 3],
+            block_decoded: [[[0; 34]; 34]; 3],
             dq: Box::new([0; 1024]),
             res: Box::new([0; 4096]),
             lev: Box::new([0; LEV_N]),
@@ -277,7 +302,6 @@ impl Default for TileState {
             block_q: -1,
             dc_q: [0; 3],
             ac_q: [0; 3],
-            sb_index: 0,
             b_idx: 0,
             mi_row: 0,
             mi_col: 0,
@@ -506,17 +530,25 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             st.above_dc[p].fill(0);
         }
         let (r0, r1, c0, c1) = (st.mi_row_start, st.mi_row_end, st.mi_col_start, st.mi_col_end);
-        for r in (r0..r1).step_by(16) {
+        let sb4 = f.sb_size4();
+        let sb_bsize = if f.sb128 { BLOCK_128X128 } else { BLOCK_64X64 };
+        for r in (r0..r1).step_by(sb4 as usize) {
             for p in 0..3 {
                 self.st.left_level[p].fill(0);
                 self.st.left_dc[p].fill(0);
             }
-            for c in (c0..c1).step_by(16) {
+            for c in (c0..c1).step_by(sb4 as usize) {
                 self.st.read_deltas = f.fp.delta_q_present != 0;
-                self.st.sb_index = (((r - r0) >> 4) * self.bufs.sb_cols + ((c - c0) >> 4)) as usize;
-                self.bufs.sb_cdef[self.st.sb_index] = -1; // clear_cdef
+                // clear_cdef: the superblock's 64x64s
+                for y in (r..r + sb4).step_by(16) {
+                    for x in (c..c + sb4).step_by(16) {
+                        if let Some(k) = self.bufs.cdef_at(y, x) {
+                            self.bufs.sb_cdef[k] = -1;
+                        }
+                    }
+                }
                 self.clear_block_decoded(r, c);
-                self.partition(rec, r, c, BLOCK_64X64)?;
+                self.partition(rec, r, c, sb_bsize)?;
             }
         }
         // the frame-end CDF update: the context tile's CDFs, counters cleared
@@ -533,18 +565,19 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     }
 
     fn clear_block_decoded(&mut self, r: i32, c: i32) {
+        let sb4 = self.f.sb_size4();
         let st = &mut *self.st;
         for p in 0..self.f.planes() {
             let sub = (p != 0) as i32;
             let sb_width4 = (st.mi_col_end - c) >> sub;
             let sb_height4 = (st.mi_row_end - r) >> sub;
-            for y in -1..=(16 >> sub) {
-                for x in -1..=(16 >> sub) {
+            for y in -1..=(sb4 >> sub) {
+                for x in -1..=(sb4 >> sub) {
                     let v = (y < 0 && x < sb_width4) || (x < 0 && y < sb_height4);
                     st.block_decoded[p][(y + 1) as usize][(x + 1) as usize] = v as u8;
                 }
             }
-            st.block_decoded[p][((16 >> sub) + 1) as usize][0] = 0;
+            st.block_decoded[p][((sb4 >> sub) + 1) as usize][0] = 0;
         }
     }
 
@@ -613,7 +646,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         } else {
             PARTITION_SPLIT
         };
-        let ok = if b_size == BLOCK_8X8 && p > PARTITION_SPLIT {
+        let ok = if (b_size == BLOCK_8X8 && p > PARTITION_SPLIT) || (b_size == BLOCK_128X128 && p > PARTITION_VERT_B) {
             false
         } else if has_rows && has_cols {
             true
@@ -668,6 +701,26 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     );
                 }
                 self.sk.sym(&mut cdf.partition_w8[ctx], p_w)
+            } else if bsl == 5 {
+                // the 128x128 node: no 4-way splits
+                let pc = &mut self.st.icdf.partition_w128[ctx];
+                if has_rows && has_cols {
+                    self.sk.sym(pc, p_w)
+                } else if has_cols {
+                    if self.sk.split_or(pc, false, (p_w == PARTITION_SPLIT) as i32) != 0 {
+                        PARTITION_SPLIT
+                    } else {
+                        PARTITION_HORZ
+                    }
+                } else if has_rows {
+                    if self.sk.split_or(pc, true, (p_w == PARTITION_SPLIT) as i32) != 0 {
+                        PARTITION_SPLIT
+                    } else {
+                        PARTITION_VERT
+                    }
+                } else {
+                    PARTITION_SPLIT
+                }
             } else {
                 let pc = match bsl {
                     2 => &mut cdf.partition_w16[ctx],
@@ -693,6 +746,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 }
             }
         };
+        if S::WRITE && b_size == BLOCK_128X128 {
+            sb128_stat(p as usize);
+        }
         let sub_size = Partition_Subsize[p as usize][b_size as usize] as i32;
         let split_size = Partition_Subsize[PARTITION_SPLIT as usize][b_size as usize] as i32;
         match p {
@@ -1182,20 +1238,27 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                         inter_stat(k + 16 * (filters[0] >= 4) as usize + (qx & 15) as usize);
                         inter_stat(k + 16 * (filters[1] >= 4) as usize + (qy & 15) as usize);
                     }
-                    let off = (py - oy) as usize * stride + (px - ox) as usize;
-                    predict_inter(
-                        &refs[plane],
-                        sub,
-                        px,
-                        py,
-                        w,
-                        h,
-                        [m[0] as i32, m[1] as i32],
-                        filters,
-                        &mut bufs.plane[plane][off..],
-                        stride,
-                        &mut st.mc,
-                    );
+                    // blocks wider or taller than MC_MAX (128-sample ones) in parts: a sample's
+                    // prediction depends only on its position and the block's filters
+                    for dy in (0..h).step_by(MC_MAX) {
+                        for dx in (0..w).step_by(MC_MAX) {
+                            let (qx, qy) = (px + dx as i32, py + dy as i32);
+                            let off = (qy - oy) as usize * stride + (qx - ox) as usize;
+                            predict_inter(
+                                &refs[plane],
+                                sub,
+                                qx,
+                                qy,
+                                (w - dx).min(MC_MAX),
+                                (h - dy).min(MC_MAX),
+                                [m[0] as i32, m[1] as i32],
+                                filters,
+                                &mut bufs.plane[plane][off..],
+                                stride,
+                                &mut st.mc,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1254,8 +1317,11 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let fp = &self.f.fp;
         let (st, b_idx) = (&*self.st, self.st.b_idx);
         let bs = b.bsize as i32;
-        if bs >= BLOCK_SIZES || bs == BLOCK_64X128 || bs == BLOCK_128X64 || bs == BLOCK_128X128 {
-            fail!(ERR_INVALID, "block {b_idx}: invalid bsize {bs}");
+        if bs >= BLOCK_SIZES || (!self.f.sb128 && (bs == BLOCK_64X128 || bs == BLOCK_128X64 || bs == BLOCK_128X128)) {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: invalid bsize {bs} (128-sample blocks need fp.sb128)"
+            );
         }
         if b.skip > 1 {
             fail!(ERR_INVALID, "block {b_idx}: skip must be 0/1");
@@ -1420,18 +1486,25 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 + if avail_l { bufs.skip[bufs.mi(r, c - 1)] } else { 0 };
             b.skip = self.sk.sym(&mut self.st.cdf.skip[ctx as usize], b.skip as i32) as u8;
         }
-        // ---- read_cdef ----
+        // ---- read_cdef: per 64x64 (a block larger than 64x64 sets every one it covers) ----
         if fp.enable_cdef != 0 && b.skip == 0 {
-            let sbi = self.st.sb_index;
+            let (r64, c64) = (r & !15, c & !15);
+            let sbi = self.bufs.cdef_at(r64, c64).unwrap();
             let sb = self.bufs.sb_cdef[sbi];
             if sb == -1 {
                 b.cdef_idx = self.lit(b.cdef_idx as i32, fp.cdef_bits as i32) as i8;
-                self.bufs.sb_cdef[sbi] = b.cdef_idx;
+                for y in (r64..r64 + bh).step_by(16) {
+                    for x in (c64..c64 + bw).step_by(16) {
+                        if let Some(k) = self.bufs.cdef_at(y, x) {
+                            self.bufs.sb_cdef[k] = b.cdef_idx;
+                        }
+                    }
+                }
             } else if S::WRITE {
                 if b.cdef_idx != sb {
                     fail!(
                         ERR_INVALID,
-                        "block {}: cdef_idx {} differs from its superblock's {sb}",
+                        "block {}: cdef_idx {} differs from its 64x64's {sb}",
                         self.st.b_idx,
                         b.cdef_idx
                     );
@@ -1441,8 +1514,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             }
         }
         // ---- read_delta_qindex ----
+        let sb_bsize = if f.sb128 { BLOCK_128X128 } else { BLOCK_64X64 };
         if fp.delta_q_present != 0 {
-            if self.st.read_deltas && !(bsize == BLOCK_64X64 && b.skip != 0) {
+            if self.st.read_deltas && !(bsize == sb_bsize && b.skip != 0) {
                 let res = fp.delta_q_res as i32;
                 let step = 1 << res;
                 let mut reduced_w = 0;
@@ -1477,7 +1551,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 }
             }
             if S::WRITE {
-                if b.sb_qindex as i32 != self.st.current_q_index && !(bsize == BLOCK_64X64 && b.skip != 0) {
+                if b.sb_qindex as i32 != self.st.current_q_index && !(bsize == sb_bsize && b.skip != 0) {
                     fail!(
                         ERR_INVALID,
                         "block {}: sb_qindex {} differs from its superblock's qindex {}",
@@ -1533,9 +1607,16 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         if fp.tx_mode_select != 0 && bsize > BLOCK_4X4 {
             if is_inter {
                 if b.skip == 0 {
-                    // read_var_tx_size (blocks are at most 64x64: one chunk)
+                    // read_var_tx_size of every Max_Tx_Size_Rect area (blocks larger than 64x64:
+                    // their 64x64s in raster order)
                     let mut leaf = -1;
-                    self.var_tx(r, c, t8(&Max_Tx_Size_Rect, bsize), 0, b.tx_depth as i32, &mut leaf)?;
+                    let max_tx = t8(&Max_Tx_Size_Rect, bsize);
+                    let (tw4, th4) = (t8(&Tx_Width, max_tx) >> 2, t8(&Tx_Height, max_tx) >> 2);
+                    for row in (r..r + bh).step_by(th4 as usize) {
+                        for col in (c..c + bw).step_by(tw4 as usize) {
+                            self.var_tx(row, col, max_tx, 0, b.tx_depth as i32, &mut leaf)?;
+                        }
+                    }
                     if !S::WRITE {
                         b.tx_depth = leaf.max(0) as u8;
                     }
@@ -1584,6 +1665,18 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 inter_stat(6);
             } else if b.tx_depth > 0 {
                 inter_stat(7);
+            }
+        }
+        if S::WRITE && (bw > 16 || bh > 16) {
+            sb128_stat(match bsize {
+                BLOCK_128X128 => 8,
+                BLOCK_128X64 => 9,
+                _ => 10,
+            });
+            sb128_stat(if is_inter { 12 } else { 11 });
+            sb128_stat(if b.skip != 0 { 13 } else { 14 });
+            if is_inter && b.skip == 0 {
+                sb128_stat(15);
             }
         }
         if !S::WRITE {
@@ -1641,37 +1734,45 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let (mi_cols, mi_rows) = (f.mi_cols, f.mi_rows);
         if is_inter {
             let st = &mut *self.st;
-            st.n_tree = tx_tree_order(bsize, tx_size, &mut st.tree);
+            st.n_tree = tx_tree_order(res_unit_bsize(bsize), tx_size, &mut st.tree);
         }
-        // every coded tx block of the block, in order: $body with (plane, tx_sz, x, y, x4, y4)
+        let (units_w, units_h) = res_units(bsize);
+        // every coded tx block of the block, in order (per 64x64 residual unit: Y, U, V): $body
+        // with (plane, tx_sz, x, y, x4, y4)
         macro_rules! for_each_txb {
             (|$plane:ident, $tx_sz:ident, $x:ident, $y:ident, $x4:ident, $y4:ident| $body:block) => {
-                for $plane in 0..planes {
-                    let sub = ($plane != 0) as i32;
-                    let $tx_sz = if $plane != 0 { uv_tx_size(bsize) } else { tx_size };
-                    let step_x = t8(&Tx_Width, $tx_sz) >> 2;
-                    let step_y = t8(&Tx_Height, $tx_sz) >> 2;
-                    let plane_sz = if $plane != 0 { uv_bsize(bsize) } else { bsize };
-                    let (num4x4_w, num4x4_h) = (bw4(plane_sz), bh4(plane_sz));
-                    let (base_x4, base_y4) = (c >> sub, r >> sub);
-                    let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub);
-                    if $plane == 0 && is_inter {
-                        for k in 0..self.st.n_tree {
-                            let ($x, $y) = self.st.tree[k];
-                            let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
-                            if $x4 >= max_x4 || $y4 >= max_y4 {
-                                continue;
-                            }
-                            $body
-                        }
-                    } else {
-                        for $y in (0..num4x4_h).step_by(step_y as usize) {
-                            for $x in (0..num4x4_w).step_by(step_x as usize) {
-                                let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
-                                if $x4 >= max_x4 || $y4 >= max_y4 {
-                                    continue;
+                for uy in 0..units_h {
+                    for ux in 0..units_w {
+                        for $plane in 0..planes {
+                            let sub = ($plane != 0) as i32;
+                            let $tx_sz = if $plane != 0 { uv_tx_size(bsize) } else { tx_size };
+                            let step_x = t8(&Tx_Width, $tx_sz) >> 2;
+                            let step_y = t8(&Tx_Height, $tx_sz) >> 2;
+                            let plane_sz = if $plane != 0 { uv_bsize(bsize) } else { bsize };
+                            let (num4x4_w, num4x4_h) = (bw4(plane_sz).min(16 >> sub), bh4(plane_sz).min(16 >> sub));
+                            let (ox, oy) = ((ux << 4) >> sub, (uy << 4) >> sub);
+                            let (base_x4, base_y4) = (c >> sub, r >> sub);
+                            let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub);
+                            if $plane == 0 && is_inter {
+                                for k in 0..self.st.n_tree {
+                                    let (tx, ty) = self.st.tree[k];
+                                    let ($x, $y) = (tx + ox, ty + oy);
+                                    let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
+                                    if $x4 >= max_x4 || $y4 >= max_y4 {
+                                        continue;
+                                    }
+                                    $body
                                 }
-                                $body
+                            } else {
+                                for $y in (oy..oy + num4x4_h).step_by(step_y as usize) {
+                                    for $x in (ox..ox + num4x4_w).step_by(step_x as usize) {
+                                        let ($x4, $y4) = (base_x4 + $x, base_y4 + $y);
+                                        if $x4 >= max_x4 || $y4 >= max_y4 {
+                                            continue;
+                                        }
+                                        $body
+                                    }
+                                }
                             }
                         }
                     }
@@ -1766,7 +1867,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let (start_x, start_y) = (t.x4 as i32 * 4, t.y4 as i32 * 4);
         let row = (start_y << sub) >> 2;
         let col = (start_x << sub) >> 2;
-        let (sbr, sbc) = (row & 15, col & 15);
+        let sb_mask = f.sb_size4() - 1;
+        let (sbr, sbc) = (row & sb_mask, col & sb_mask);
         let step_x = t8(&Tx_Width, tx_sz) >> 2;
         let step_y = t8(&Tx_Height, tx_sz) >> 2;
         let log2w = t8(&Tx_Width_Log2, tx_sz);
@@ -1798,7 +1900,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             let bd = &st.block_decoded[plane];
             let have_above_right = bd[((sbr >> sub) - 1 + 1) as usize][((sbc >> sub) + step_x + 1) as usize] != 0;
             let have_below_left = bd[((sbr >> sub) + step_y + 1) as usize][((sbc >> sub) - 1 + 1) as usize] != 0;
-            if f.check_edges {
+            if f.check_edges && !f.sb128 {
                 let e = txb_edges(
                     plane as i32,
                     t.x4 as i32,
@@ -2410,8 +2512,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         if plane == 0 && st.is_inter {
             // TxTypes of the block's luma (the chroma of inter blocks derives from them)
             let (y0, x0) = ((y4 - st.mi_row) as usize, (x4 - st.mi_col) as usize);
-            for row in &mut st.tx_types[y0..(y0 + h4 as usize).min(16)] {
-                fill_small(&mut row[x0..(x0 + w4 as usize).min(16)], *tx_type as u8);
+            for row in &mut st.tx_types[y0..(y0 + h4 as usize).min(32)] {
+                fill_small(&mut row[x0..(x0 + w4 as usize).min(32)], *tx_type as u8);
             }
         }
         let (al, ad) = (&mut st.above_level[plane], &mut st.above_dc[plane]);

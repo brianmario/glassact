@@ -9,7 +9,10 @@
 //! so that the candidate stack finds them, nudged by a sub-sample step, small, and far outside the
 //! frame, at every sub-sample position), skip and non-skip, uniform var-tx depths, luma tx types
 //! of the inter sets; intra blocks with every mode, angle, CfL and filter intra; sparse random
-//! coefficients up to the Golomb range.
+//! coefficients up to the Golomb range. From a stream of their own (so that a seed's sequence is
+//! otherwise what it was without them): 128x128 superblocks for some sequences (fp.sb128, every
+//! type of the 128x128 node, 128-sample inter and intra blocks), and frames after the first that
+//! leave the sequence header out ([`InterSeq::flags`]: [`ENC_NO_SEQ_HEADER`]).
 //!
 //! The records are laid out and ready for [`crate::writer::Writer::encode_ex`]: frame k's
 //! reference pictures are the reconstructions of the frames that last refreshed each slot (a key
@@ -19,8 +22,8 @@ use crate::dsp::{
     get_scan, get_tx_set_inter, get_tx_set_intra, is_directional, tx_type_in_set_inter, tx_type_in_set_intra,
 };
 use crate::tables::*;
-use crate::types::{Block, BlockInter, DECISIONS_VERSION, FRAME_INTER, FRAME_KEY, FrameParams};
-use crate::writer::{Record, apply_sb_qindex, legalize_sb_qindex, tile_layout};
+use crate::types::{Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams};
+use crate::writer::{Record, apply_sb_qindex, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
 /// splitmix64 (as fuzz_gen's, its own stream)
 struct Rng(u64);
@@ -46,6 +49,8 @@ impl Rng {
 #[derive(Clone, Debug)]
 pub struct InterSeq {
     pub frames: Vec<Record>,
+    /// per frame, the encode flags it adds: [`ENC_NO_SEQ_HEADER`] or 0 (never on the first)
+    pub flags: Vec<u32>,
 }
 
 /// What a frame's blocks are drawn from.
@@ -167,6 +172,13 @@ impl Gen<'_> {
         } else if has_rows && has_cols {
             if b_size == BLOCK_8X8 {
                 rng.range(0, 3)
+            } else if b_size == BLOCK_128X128 {
+                // the 8 types of the 128x128 node (no 4-way splits)
+                if rng.chance(30) {
+                    PARTITION_SPLIT
+                } else {
+                    rng.range(0, 7)
+                }
             } else if rng.chance(if b_size == BLOCK_64X64 { 45 } else { 30 }) {
                 PARTITION_SPLIT
             } else {
@@ -291,6 +303,11 @@ impl InterSeq {
     pub fn make(seed: u64, maxdim: i32, nframes: usize) -> Option<InterSeq> {
         let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) ^ 0x1D872B41);
         rng.next();
+        // 128x128 superblocks and the frames without a sequence header, from their own stream
+        let mut srng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0x5B12_8C0D);
+        srng.next();
+        let sb128 = srng.chance(35);
+        let seq_mode = srng.range(0, 2);
         const SPECIAL: [(i32, i32); 8] = [(1, 1), (7, 13), (65, 65), (64, 64), (8, 8), (13, 7), (72, 40), (129, 3)];
         let (w, h) = if rng.chance(15) {
             SPECIAL[rng.range(0, 7) as usize]
@@ -314,6 +331,7 @@ impl InterSeq {
         base.enable_intra_edge_filter = rng.chance(50) as u8;
         base.enable_cdef = rng.chance(50) as u8;
         let mono = base.monochrome != 0;
+        base.sb128 = sb128 as u8;
         if rng.chance(20) {
             base.delta_q_y_dc = rng.range(-15, 15) as i8;
         }
@@ -338,23 +356,27 @@ impl InterSeq {
                 },
             )
         };
-        let mt = tile_layout(w as u32, h as u32, -1, -1).ok()?;
+        let mt = tile_layout_ex(w as u32, h as u32, -1, -1, sb128).ok()?;
         if rng.chance(20) {
             let (cl, rl) = (mt.cols_log2 + rng.range(0, 2), rng.range(0, 2));
-            if tile_layout(w as u32, h as u32, cl, rl).is_ok() {
+            if tile_layout_ex(w as u32, h as u32, cl, rl, sb128).is_ok() {
                 (base.tile_cols_log2, base.tile_rows_log2) = (cl as i8, rl as i8);
             }
         }
-        let tiles = tile_layout(
+        let tiles = tile_layout_ex(
             w as u32,
             h as u32,
             base.tile_cols_log2 as i32,
             base.tile_rows_log2 as i32,
+            sb128,
         )
         .ok()?;
         let (mi_c, mi_r) = (mi_cols(w), mi_rows(h));
         let (sb_cols, sb_rows) = (((mi_c + 15) >> 4) as usize, ((mi_r + 15) >> 4) as usize);
+        let (q_cols, q_rows, _) = sb_grid(&base);
+        let (sb_bsize, sb_step) = if sb128 { (BLOCK_128X128, 32) } else { (BLOCK_64X64, 16) };
         let mut frames = Vec::with_capacity(nframes);
+        let mut flags = Vec::with_capacity(nframes);
         for k in 0..nframes {
             let mut fp = base;
             let key = k == 0 || rng.chance(8);
@@ -440,9 +462,9 @@ impl InterSeq {
             };
             for tr in 0..tiles.rows as usize {
                 for tc in 0..tiles.cols as usize {
-                    for r in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(16) {
-                        for c in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(16) {
-                            g.partition(r as i32, c as i32, BLOCK_64X64);
+                    for r in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(sb_step) {
+                        for c in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(sb_step) {
+                            g.partition(r as i32, c as i32, sb_bsize);
                         }
                     }
                 }
@@ -450,7 +472,7 @@ impl InterSeq {
             let (mut blocks, inter) = (g.blocks, g.inter);
             if fp.delta_q_present != 0 {
                 let b = fp.base_q_idx as i32;
-                let target: Vec<u8> = (0..sb_cols * sb_rows)
+                let target: Vec<u8> = (0..q_cols * q_rows)
                     .map(|_| (b + rng.range(-30, 30)).clamp(1, 255) as u8)
                     .collect();
                 let mut legal = vec![0u8; target.len()];
@@ -502,8 +524,11 @@ impl InterSeq {
                 }
             }
             frames.push(rec);
+            // 0: every frame has a sequence header; 1: only the first; 2: some others too
+            let omit = k > 0 && (seq_mode == 1 || (seq_mode == 2 && srng.chance(50)));
+            flags.push(if omit { ENC_NO_SEQ_HEADER } else { 0 });
         }
-        Some(InterSeq { frames })
+        Some(InterSeq { frames, flags })
     }
 }
 

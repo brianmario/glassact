@@ -78,6 +78,25 @@ pub unsafe extern "C" fn av1g_tile_layout(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_tile_layout_ex(
+    width: u32,
+    height: u32,
+    cols_log2: c_int,
+    rows_log2: c_int,
+    sb128: c_int,
+    out: *mut Tiles,
+) -> c_int {
+    match writer::tile_layout_ex(width, height, cols_log2, rows_log2, sb128 != 0) {
+        Ok(t) => {
+            // SAFETY: out is the caller's av1g_tiles.
+            unsafe { *out = t };
+            OK
+        }
+        Err(e) => e,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1g_layout(rec: *mut DecisionRecord, txb_cap: u32, coeff_cap: u64) -> c_int {
     // SAFETY: rec is the caller's record, its arrays valid for n_blocks (+ 1) and the capacities.
     let rec = unsafe { &mut *rec };
@@ -122,8 +141,7 @@ pub unsafe extern "C" fn av1g_apply_sb_qindex(rec: *mut DecisionRecord, sb_map: 
     // SAFETY: the record's blocks, and a map covering its SB grid.
     let rec = unsafe { &mut *rec };
     let blocks = unsafe { slice::from_raw_parts_mut(rec.blocks, rec.n_blocks as usize) };
-    let sb_cols = (crate::blockinfo::mi_cols(rec.fp.width as i32) as usize + 15) >> 4;
-    let sb_rows = (crate::blockinfo::mi_rows(rec.fp.height as i32) as usize + 15) >> 4;
+    let (sb_cols, sb_rows, _) = writer::sb_grid(&rec.fp);
     let map = unsafe { slice::from_raw_parts(sb_map, sb_cols * sb_rows) };
     match writer::apply_sb_qindex(&rec.fp, blocks, map) {
         Ok(()) => OK,
@@ -153,7 +171,12 @@ pub unsafe extern "C" fn av1g_postfilter(
         strides[p] = s;
         views[p] = unsafe { slice::from_raw_parts_mut(*planes.add(p), s * h) };
     }
-    crate::postfilter::postfilter(&rec.fp, blocks, &mut views, &strides);
+    let inter = if rec.fp.version >= 2 {
+        unsafe { opt_slice(rec.inter, rec.n_blocks as usize) }
+    } else {
+        &[]
+    };
+    crate::postfilter::postfilter_ex(&rec.fp, blocks, inter, &mut views, &strides);
     OK
 }
 
@@ -781,6 +804,22 @@ pub unsafe extern "C" fn av1enc_hybrid_write(
     err: *mut c_char,
     errlen: usize,
 ) -> c_int {
+    // SAFETY: as av1enc_hybrid_write_ex's
+    unsafe { av1enc_hybrid_write_ex(h, fp, sb_cdef, sb_cols, 0, obu, size, err, errlen) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_write_ex(
+    h: *mut HybridHandle,
+    fp: *const FrameParams,
+    sb_cdef: *const i8,
+    sb_cols: c_int,
+    flags: u32,
+    obu: *mut *mut u8,
+    size: *mut usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
     if h.is_null() || fp.is_null() || obu.is_null() || size.is_null() {
         return ERR_INVALID;
     }
@@ -791,7 +830,9 @@ pub unsafe extern "C" fn av1enc_hybrid_write(
         let rows = (crate::blockinfo::mi_rows(fp.height as i32) as usize + 15) >> 4;
         unsafe { slice::from_raw_parts(sb_cdef, rows * sb_cols.max(0) as usize) }
     });
-    let r = hh.h.write(fp, sb_cdef, sb_cols.max(0) as usize).map(|b| b.to_vec());
+    let r =
+        hh.h.write_ex(fp, sb_cdef, sb_cols.max(0) as usize, flags)
+            .map(|b| b.to_vec());
     hh.rec = hh.h.record_c();
     match r {
         Ok(bytes) => {
@@ -891,6 +932,17 @@ pub extern "C" fn av1t_case_make(seed: u64, maxdim: c_int, big_pct: c_int) -> *m
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn av1t_case_make_ex(seed: u64, maxdim: c_int, big_pct: c_int, sb128: c_int) -> *mut CaseHandle {
+    match crate::testsupport::case_make_ex(seed, maxdim, big_pct, sb128 != 0) {
+        Some(mut case) => {
+            let rec = case.record();
+            Box::into_raw(Box::new(CaseHandle { case, rec }))
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1t_case_record(c: *mut CaseHandle) -> *mut DecisionRecord {
     // SAFETY: c came from av1t_case_make; the record points into its vectors.
     unsafe { &mut (*c).rec }
@@ -936,6 +988,13 @@ pub unsafe extern "C" fn av1t_inter_case_record(c: *mut InterCaseHandle, frame: 
         Some(r) => r,
         None => ptr::null_mut(),
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_inter_case_flags(c: *const InterCaseHandle, frame: c_int) -> u32 {
+    // SAFETY: c came from av1t_inter_case_make
+    let c = unsafe { &*c };
+    c.seq.flags.get(frame.max(0) as usize).copied().unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -1132,9 +1191,55 @@ pub unsafe extern "C" fn av1enc_motion_apply(
     out_inter: *mut *const BlockInter,
     out_luma_tx: *mut *const u8,
 ) -> c_int {
+    // SAFETY: as av1enc_motion_apply_ex's
+    unsafe {
+        av1enc_motion_apply_ex(
+            m,
+            sb_motion,
+            blocks,
+            n,
+            luma_tx,
+            inter,
+            width,
+            height,
+            0,
+            0,
+            0,
+            out_blocks,
+            out_inter,
+            out_luma_tx,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_apply_ex(
+    m: *mut crate::motion::Motion,
+    sb_motion: *const i32,
+    blocks: *const Block,
+    n: u32,
+    luma_tx: *const u8,
+    inter: *const BlockInter,
+    width: c_int,
+    height: c_int,
+    sb128: c_int,
+    tile_cols_log2: c_int,
+    tile_rows_log2: c_int,
+    out_blocks: *mut *const Block,
+    out_inter: *mut *const BlockInter,
+    out_luma_tx: *mut *const u8,
+) -> c_int {
     if m.is_null() || blocks.is_null() || width < 1 || height < 1 {
         return -1;
     }
+    let tiles = if sb128 != 0 {
+        match writer::tile_layout_ex(width as u32, height as u32, tile_cols_log2, tile_rows_log2, true) {
+            Ok(t) => Some(t),
+            Err(_) => return -1,
+        }
+    } else {
+        None
+    };
     // SAFETY: the handle; 3 ints per 64x64 when given; n blocks and n luma tx types when given;
     // the outputs point into the handle until its next call (av1enc.h)
     let m = unsafe { &mut *m };
@@ -1156,7 +1261,7 @@ pub unsafe extern "C" fn av1enc_motion_apply(
             })
             .collect()
     };
-    m.apply(
+    if m.apply_ex(
         &sbs,
         sb_cols,
         b,
@@ -1164,7 +1269,12 @@ pub unsafe extern "C" fn av1enc_motion_apply(
         iv,
         crate::blockinfo::mi_rows(height),
         crate::blockinfo::mi_cols(width),
-    );
+        tiles.as_ref(),
+    )
+    .is_err()
+    {
+        return -1;
+    }
     unsafe {
         *out_blocks = m.blocks.as_ptr();
         *out_inter = m.inter.as_ptr();

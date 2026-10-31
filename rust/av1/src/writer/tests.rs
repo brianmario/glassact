@@ -685,7 +685,7 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
             2 => fp.qm_v = 16,
             _ => fp.using_qmatrix = 2,
         },
-        28 => fp.reserved[r.below(7) as usize] = 1,
+        28 => fp.reserved[r.below(6) as usize] = 1,
         29 => fp.allow_screen_content_tools = 2,
         30 => {
             fp.tile_cols_log2 = r.below(8) as i8 - 1;
@@ -940,8 +940,9 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
 fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
     let (crc, c) = c_parse(obus);
     match parse(obus) {
-        Ok(r) if r.rec.fp.frame_type == FRAME_INTER && crc != OK => {
-            // an inter frame (a damaged frame_type): the C++ has no inter frames
+        Ok(r) if (r.rec.fp.frame_type == FRAME_INTER || r.rec.fp.sb128 != 0) && crc != OK => {
+            // an inter frame or 128x128 superblocks (a damaged frame_type or
+            // use_128x128_superblock): the C++ has neither
             Some(r)
         }
         Ok(r) => {
@@ -1058,6 +1059,7 @@ fn full_header_stream(fp: &FrameParams, payloads: &[Vec<u8>], r: &mut Rnd, bad: 
         fp.height,
         fp.tile_cols_log2 as i32,
         fp.tile_rows_log2 as i32,
+        false,
         &mut tiles
     ));
     let mono = fp.monochrome != 0;

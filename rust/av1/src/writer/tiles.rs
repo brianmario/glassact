@@ -49,13 +49,16 @@ fn tile_log2(blk: i32, target: i32) -> i32 {
 }
 
 /// compute_tiles: the tiling for `cols_log2` / `rows_log2` (-1: the minimum legal one; rows grow
-/// until the tile area is legal). Returns false (with `t` partly set, as the C++) for an
-/// out-of-range request.
-pub fn compute_tiles(w: u32, h: u32, cols_log2: i32, rows_log2: i32, t: &mut TileInfo) -> bool {
+/// until the tile area is legal), in superblocks of 64x64 or (`sb128`) 128x128 (spec tile_info).
+/// Returns false (with `t` partly set, as the C++) for an out-of-range request.
+pub fn compute_tiles(w: u32, h: u32, cols_log2: i32, rows_log2: i32, sb128: bool, t: &mut TileInfo) -> bool {
     let (mi_cols, mi_rows) = (mi_cols(w as i32), mi_rows(h as i32));
-    let (sb_cols, sb_rows) = ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4);
-    let max_tile_width_sb = MAX_TILE_WIDTH >> 6;
-    let max_tile_area_sb = MAX_TILE_AREA >> 12;
+    let sb_shift = if sb128 { 5 } else { 4 };
+    let sb_mask = (1 << sb_shift) - 1;
+    let (sb_cols, sb_rows) = ((mi_cols + sb_mask) >> sb_shift, (mi_rows + sb_mask) >> sb_shift);
+    let sb_size_log2 = sb_shift + 2;
+    let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size_log2;
+    let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size_log2);
     t.min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
     t.max_log2_tile_cols = tile_log2(1, sb_cols.min(MAX_TILE_COLS));
     t.max_log2_tile_rows = tile_log2(1, sb_rows.min(MAX_TILE_ROWS));
@@ -69,7 +72,7 @@ pub fn compute_tiles(w: u32, h: u32, cols_log2: i32, rows_log2: i32, t: &mut Til
     let mut i = 0;
     let mut s = 0;
     while s < sb_cols {
-        t.mi_col_starts[i] = (s << 4) as u32;
+        t.mi_col_starts[i] = (s << sb_shift) as u32;
         i += 1;
         s += tile_width_sb;
     }
@@ -87,7 +90,7 @@ pub fn compute_tiles(w: u32, h: u32, cols_log2: i32, rows_log2: i32, t: &mut Til
             let mut i = 0;
             let mut s = 0;
             while s < sb_rows {
-                t.mi_row_starts[i] = (s << 4) as u32;
+                t.mi_row_starts[i] = (s << sb_shift) as u32;
                 i += 1;
                 s += tile_height_sb;
             }
@@ -103,11 +106,16 @@ pub fn compute_tiles(w: u32, h: u32, cols_log2: i32, rows_log2: i32, t: &mut Til
     }
 }
 
-/// av1g_tile_layout: the tile boundaries for a picture size and tiling choice (-1: minimum legal).
-/// Errors: [`ERR_INVALID`] (an empty picture or an out-of-range request).
+/// av1g_tile_layout: the tile boundaries for a picture size and tiling choice (-1: minimum legal),
+/// 64x64 superblocks. Errors: [`ERR_INVALID`] (an empty picture or an out-of-range request).
 pub fn tile_layout(width: u32, height: u32, cols_log2: i32, rows_log2: i32) -> Result<Tiles, i32> {
+    tile_layout_ex(width, height, cols_log2, rows_log2, false)
+}
+
+/// av1g_tile_layout_ex: [`tile_layout`] for 64x64 or (`sb128`, fp.sb128) 128x128 superblocks.
+pub fn tile_layout_ex(width: u32, height: u32, cols_log2: i32, rows_log2: i32, sb128: bool) -> Result<Tiles, i32> {
     let mut t = TileInfo::default();
-    if width < 1 || height < 1 || !compute_tiles(width, height, cols_log2, rows_log2, &mut t) {
+    if width < 1 || height < 1 || !compute_tiles(width, height, cols_log2, rows_log2, sb128, &mut t) {
         return Err(ERR_INVALID);
     }
     let mut out = Tiles {

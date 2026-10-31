@@ -11,8 +11,9 @@ pub(crate) trait Sink {
     fn sym<const L: usize>(&mut self, cdf: &mut [u16; L], s: i32) -> i32;
     /// L(1): an equiprobable bit
     fn bit(&mut self, b: i32) -> i32;
-    /// split_or_horz / split_or_vert (spec 8.3.2), from the 10-symbol partition CDF `pc`
-    fn split_or(&mut self, pc: &[u16; 11], vert: bool, b: i32) -> i32;
+    /// split_or_horz / split_or_vert (spec 8.3.2), from the partition CDF `pc` (10 symbols, or the
+    /// 128x128 node's 8)
+    fn split_or(&mut self, pc: &[u16], vert: bool, b: i32) -> i32;
 }
 
 /// Writes with the range encoder.
@@ -36,7 +37,7 @@ impl Sink for EcSink<'_> {
         b
     }
     #[inline(always)]
-    fn split_or(&mut self, pc: &[u16; 11], vert: bool, b: i32) -> i32 {
+    fn split_or(&mut self, pc: &[u16], vert: bool, b: i32) -> i32 {
         self.ec.split_or(pc, vert, b != 0);
         self.nsym += 1;
         b
@@ -69,7 +70,7 @@ impl Sink for TeeSink<'_> {
         self.ec.bit(b)
     }
     #[inline(always)]
-    fn split_or(&mut self, pc: &[u16; 11], vert: bool, b: i32) -> i32 {
+    fn split_or(&mut self, pc: &[u16], vert: bool, b: i32) -> i32 {
         let kind = if vert { SYM_SPLIT_OR_VERT } else { SYM_SPLIT_OR_HORZ };
         self.out.push(sym_pack(kind, Cdfs::cdf_id(self.base, pc), b as u32, 2));
         self.ec.split_or(pc, vert, b)
@@ -159,7 +160,7 @@ impl Sink for DecSink<'_> {
         self.read(&[1 << 14, 1 << 15, 0], 2) as i32
     }
     #[inline]
-    fn split_or(&mut self, pc: &[u16; 11], vert: bool, _: i32) -> i32 {
+    fn split_or(&mut self, pc: &[u16], vert: bool, _: i32) -> i32 {
         let tmp = [32768u32.wrapping_sub(split_or_psum(pc, vert)) as u16, 32768, 0];
         self.read(&tmp, 2) as i32
     }

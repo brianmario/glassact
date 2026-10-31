@@ -25,11 +25,16 @@ pub fn sym_pack(kind: u32, cdf: u32, s: u32, n: u32) -> u32 {
 }
 
 /// av1g_split_or_psum: the probability sum of the partition symbols that imply "split", for
-/// split_or_horz (`vert` false) or split_or_vert.
+/// split_or_horz (`vert` false) or split_or_vert, of the 10-symbol partition CDF `pc` (11 entries
+/// with the counter), or of the 128x128 node's 8-symbol one (9 entries: no 4-way splits, whose
+/// terms the spec leaves out there).
 #[inline(always)]
 pub fn split_or_psum(pc: &[u16], vert: bool) -> u32 {
     let p = |x: i32| -> u32 {
         let x = x as usize;
+        if x >= pc.len() - 1 {
+            return 0; // a 4-way split of the 128x128 node's CDF
+        }
         (pc[x] as u32).wrapping_sub(if x > 0 { pc[x - 1] as u32 } else { 0 })
     };
     if !vert {

@@ -169,8 +169,9 @@ impl Cdfs {
     }
 }
 
-/// The CDFs inter frames add (spec init_non_coeff_cdfs; MvCtx 0 only: no intra block copy). Not
-/// part of [`Cdfs`], whose layout the GPU entropy kernels share: inter frames aren't coded there.
+/// The CDFs inter frames add (spec init_non_coeff_cdfs; MvCtx 0 only: no intra block copy), and
+/// the 128x128 superblocks' partition CDF. Not part of [`Cdfs`], whose layout the GPU entropy
+/// kernels share: inter frames and 128x128 superblocks aren't coded there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterCdfs {
     /// YModeCdf (intra blocks of inter frames), by Size_Group
@@ -199,6 +200,8 @@ pub struct InterCdfs {
     pub inter_tx_set1: [[u16; 17]; 2],
     pub inter_tx_set2: [u16; 13],
     pub inter_tx_set3: [[u16; 3]; 4],
+    /// PartitionW128Cdf (fp.sb128: the 128x128 node; 8 partition types, no 4-way splits)
+    pub partition_w128: [[u16; 9]; 4],
 }
 
 impl Default for InterCdfs {
@@ -224,6 +227,7 @@ impl Default for InterCdfs {
             inter_tx_set1: Default_Inter_Tx_Type_Set1_Cdf,
             inter_tx_set2: Default_Inter_Tx_Type_Set2_Cdf,
             inter_tx_set3: Default_Inter_Tx_Type_Set3_Cdf,
+            partition_w128: Default_Partition_W128_Cdf,
         }
     }
 }
@@ -261,6 +265,7 @@ impl InterCdfs {
         clear(&mut self.inter_tx_set1);
         clear(core::slice::from_mut(&mut self.inter_tx_set2));
         clear(&mut self.inter_tx_set3);
+        clear(&mut self.partition_w128);
     }
 }
 

@@ -1,9 +1,11 @@
 //! The motion vector candidate stack (spec 7.10.2, find_mv_stack) for the writer's inter
 //! toolset: single prediction from LAST_FRAME, identity global motion (GlobalMvs are 0), the
 //! frame's MV precision (force_integer_mv, allow_high_precision_mv: fp.mv_precision), no
-//! reference-frame MVs (use_ref_frame_mvs = 0: no temporal scan, so ZeroMvContext is 0), 64x64
-//! superblocks. It reads only the tile's mode info of blocks already
-//! coded, so the writer and the parser build the same stack.
+//! reference-frame MVs (use_ref_frame_mvs = 0: no temporal scan, so ZeroMvContext is 0). It reads
+//! only the tile's mode info of blocks already coded, so the writer and the parser build the same
+//! stack; that is also what makes it right for either superblock size: the top-right candidate is
+//! taken where it has been coded in this frame (the spec's scan_point), which is the decode order's
+//! (libaom's has_top_right) for 64x64 and 128x128 superblocks alike.
 //!
 //! [`derive_mode`] is the writer's rule from a block's motion vector to its mode (decisions.h
 //! "Inter blocks").

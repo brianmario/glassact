@@ -92,7 +92,10 @@ pub struct FrameParams {
     /// inter: the motion vectors' precision: 0 whole luma samples (force_integer_mv), 1 quarter
     /// (allow_high_precision_mv 0), 2 eighth (allow_high_precision_mv 1)
     pub mv_precision: u8,
-    pub reserved: [u8; 7],
+    /// 1: 128x128 superblocks (use_128x128_superblock; a sequence header field: the same in every
+    /// frame of a stream); 0: 64x64
+    pub sb128: u8,
+    pub reserved: [u8; 6],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
@@ -141,6 +144,8 @@ pub const ENC_NO_RECON: u32 = 2;
 pub const ENC_TD: u32 = 4;
 pub const ENC_AVIF: u32 = 8;
 pub const ENC_PREFILTER_RECON: u32 = 0x20;
+/// video mode: no OBU_SEQUENCE_HEADER (the stream's earlier one, which must match, applies)
+pub const ENC_NO_SEQ_HEADER: u32 = 0x40;
 pub const ENC_BITSTREAM_ONLY: u32 = 0x10000;
 
 /// av1g_encode_opts
@@ -347,7 +352,7 @@ mod tests {
         check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
                refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
         check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref",
-               mv_precision: "mv_precision");
+               mv_precision: "mv_precision", sb128: "sb128");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
         check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
                inter: "inter");

@@ -25,7 +25,11 @@
 //! - [`validate`], [`parse`];
 //! - [`layout`] / [`layout_counts`] (`_ex`: with inter blocks) / [`Record::layout`]: the tx-block
 //!   layout;
-//! - [`tile_layout`], [`legalize_sb_qindex`], [`apply_sb_qindex`].
+//! - [`tile_layout`] / [`tile_layout_ex`], [`legalize_sb_qindex`], [`apply_sb_qindex`].
+//!
+//! Superblocks are 64x64 or (fp.sb128) 128x128: then the partition starts at 128x128, blocks may be
+//! 128 wide or high, a block larger than 64x64 codes its residual per 64x64 unit, tiles are in
+//! 128x128 units; CDEF stays per 64x64, and the reconstruction buffers 64x64-granular.
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use crate::entropy::FrameCdfs;
@@ -48,11 +52,11 @@ mod tests;
 pub use encode::{ENC_CHECK_EDGES, ENC_SKIP_RECON, Extras, Writer, encode, validate};
 pub(crate) use headers::{BitWriter, frame_obus};
 pub use layout::{
-    LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex,
+    LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex, sb_grid,
 };
 pub use parse::{ParseState, Parsed, parse, parse_with};
 pub(crate) use tiles::choose_level;
-pub use tiles::{TileInfo, compute_tiles, tile_layout};
+pub use tiles::{TileInfo, compute_tiles, tile_layout, tile_layout_ex};
 
 /// An error of the writer or the parser: one of the `ERR_*` codes and a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +220,7 @@ impl<'a> RecordMut<'a> {
 /// capacity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Output {
-    /// [TD] + OBU_SEQUENCE_HEADER + OBU_FRAME
+    /// [TD] + OBU_SEQUENCE_HEADER (unless [`ENC_NO_SEQ_HEADER`]) + OBU_FRAME
     pub obu: Vec<u8>,
     /// the AVIF file ([`ENC_AVIF`]), else empty
     pub avif: Vec<u8>,
