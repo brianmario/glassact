@@ -18,7 +18,8 @@ struct PartitionTests {
         var y: [UInt8], u: [UInt8], v: [UInt8]
 
         /// Flat background, a title bar, a block of dense glyph-like text in
-        /// the top left, a noisy gradient along the bottom.
+        /// the top left, a noisy gradient along the bottom; a coloured bar, and
+        /// chroma that follows luma in the gradient.
         init(width: Int, height: Int) {
             self.width = width
             self.height = height
@@ -33,6 +34,15 @@ struct PartitionTests {
             }
             for row in max(0, height - 60)..<height {
                 for col in 0..<width { y[row * width + col] = UInt8(clamping: col / 4 + row / 3 + rng.int(0..<10)) }
+            }
+            // colour: a bar, and chroma that follows luma in the gradient (what CfL predicts)
+            for row in (min(24, ch - 1))..<min(30, ch) { for col in 0..<min(120, cw) { u[row * cw + col] = 80; v[row * cw + col] = 190 } }
+            for row in max(0, (height - 60) / 2)..<ch {
+                for col in 0..<cw {
+                    let l = Int(y[min(height - 1, 2 * row) * width + min(width - 1, 2 * col)])
+                    u[row * cw + col] = UInt8(clamping: 128 + (l - 128) / 2)
+                    v[row * cw + col] = UInt8(clamping: 128 - (l - 128) / 3)
+                }
             }
         }
     }
