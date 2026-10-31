@@ -11,7 +11,11 @@ fn main() {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = crate_dir.join("../..");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let src_dirs = ["Sources/AV1Core/src", "Sources/AV1Encoder/src", "Sources/AV1CoreTestSupport"];
+    let src_dirs = [
+        "Sources/AV1Core/src",
+        "Sources/AV1Encoder/src",
+        "Sources/AV1CoreTestSupport",
+    ];
     let includes = [
         root.join("Sources/AV1Core/include"),
         root.join("Sources/AV1Encoder/include"),
@@ -48,7 +52,13 @@ fn main() {
     });
     let lib = out.join("liboracle.a");
     let _ = std::fs::remove_file(&lib);
-    let status = Command::new("xcrun").arg("ar").arg("crs").arg(&lib).args(&objects).status().unwrap();
+    let status = Command::new("xcrun")
+        .arg("ar")
+        .arg("crs")
+        .arg(&lib)
+        .args(&objects)
+        .status()
+        .unwrap();
     assert!(status.success(), "ar failed");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=oracle");

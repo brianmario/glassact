@@ -9,14 +9,15 @@
 //!
 //! The Metal kernels keep their own copy of the decoder-mirroring DSP in MSL
 //! (Sources/GlassActAV1/Shaders); tests hold the two to the same results.
-pub mod tables;
-pub mod types;
+pub mod avif;
 pub mod blockinfo;
 pub mod dsp;
-pub mod postfilter;
-pub mod entropy;
-pub mod avif;
-pub mod writer;
 pub mod enc;
+pub mod entropy;
 pub mod hybrid;
+pub mod postfilter;
+#[allow(clippy::all)]
+pub mod tables;
 pub mod testsupport;
+pub mod types;
+pub mod writer;
