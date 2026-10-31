@@ -295,6 +295,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Tiles in 128×128-superblock units (the stream's are), so that the analysis's tiles are
     /// the bitstream's; the analysis itself stays 64×64.
     public var largeSuperblocks = false
+    /// Inter frames' analysis effort (nil: `preset`'s): their intra blocks matter less, as
+    /// most of the picture is copied or predicted from the previous one.
+    public var interPreset: Preset?
     let recon: any MTLComputePipelineState
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
@@ -776,7 +779,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             stages.wavefrontSteps = closedLoop ? steps.count : 0
             var commands: (any MTLCommandBuffer)?
             var compute: (any MTLComputeCommandEncoder)?
-            var params = encoder.params
+            var params = isInter && encoder.interPreset != nil ? AV1MetalEncoder.params(for: encoder.interPreset!) : encoder.params
             params.leafDecide = decidesLeaves ? 1 : 0
             params.pruneVar = encoder.busyBlockPrune
             if !encoder.searchesAngleDeltas { params.deltas = 0; params.uvDeltas = 0 }

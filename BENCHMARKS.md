@@ -260,6 +260,39 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: no decoded picture copied out; a lighter inter preset as an opt-in (2026-10-31)
+
+**What changed:**
+- **`AV1HybridEncoder.returnsPlanes`** (on; `av1seq --no-planes` turns it off).
+  - Off, a frame comes back without its decoded picture, and the next inter frame references the post-filter's output buffers (`AV1MetalPostfilter.outputPlanes`).
+  - That saves copying 22 MB out every 5K picture. Same bytes and PSNR, so the GPU-side reference is the decoded picture.
+- **`interPreset`** (`av1seq --inter-preset`): inter frames' analysis effort, separate from key frames'. `turbo3` (no angle deltas) is opt-in only.
+
+**Results** (5K, 8 tile columns, steady-state inter frames a second):
+
+| Trace | planes → no planes |
+|---|---|
+| typing-cc | 126 → 161 (175 in another run) |
+| scroll-win | 88 → 112 |
+| photos | 30 → 31 |
+
+**`turbo3` for inter frames:**
+
+| photos | inter frames | inter frames a second |
+|---|---|---|
+| 5K | 26.5 → 26.8 KB (+1.1 %) | 31.4 → 37.7 |
+| 720p | 12.2 → 12.2 KB | 90 → 108 |
+
+Above the 0.4 % default rule, so it's an opt-in. `turbo2` changed nothing for inter frames.
+
+**Where a near-static 5K inter frame's ~5.7 ms goes:**
+- the closed loop over every tile, 2.2 ms (motion-compensating and assembling 22 MB of copies);
+- the filters, 1.4 ms;
+- deciding the copies, ~1 ms;
+- the writer, 0.3 ms.
+
+libaom does such a frame in ~4.4 ms. On moving content, the GPU's intra analysis of the coded superblocks is the limit (photos 31 against libaom's 92).
+
 ### Metal AV1: 128×128 superblocks, no sequence header on inter frames, fewer tiles; equal quality again (2026-10-31)
 
 **What changed:**

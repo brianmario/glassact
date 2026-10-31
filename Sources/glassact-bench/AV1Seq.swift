@@ -32,6 +32,8 @@ let av1SeqCommand = Command(
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
+        .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
+        .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
@@ -94,6 +96,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.interFrames = inter
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
+    encoder.returnsPlanes = !opts.has("no-planes")
+    if let name = opts.string("inter-preset") {
+        guard let p = AV1MetalEncoder.Preset(rawValue: name) else { throw BenchError("--inter-preset: unknown") }
+        encoder.interPreset = p
+    }
     encoder.searchesSubpelMotion = !opts.has("no-subpel")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
@@ -132,7 +139,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         // intra frames each alone; a stream in order
         let decoded = inter ? try YUV420.decode(f.obu, width: width, height: height, with: decoder)
                             : try YUV420.decode(f.obu, width: width, height: height)
-        for p in 0..<3 where decoded.planes[p] != f.planes[p] {
+        for p in 0..<3 where !f.planes.isEmpty && decoded.planes[p] != f.planes[p] {
             throw BenchError("frame \(i): libaom's decode differs from the encoder's picture in plane \(p)")
         }
         psnr += decoded.psnrY(pictures[i])

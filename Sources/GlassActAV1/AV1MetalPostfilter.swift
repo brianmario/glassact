@@ -67,6 +67,18 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public private(set) var lastGPUSeconds: Double = 0
     /// The share of 64×64s the last `search` filtered anew (1 unless `changed` allowed less).
     public private(set) var lastFilteredShare = 1.0
+    /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, chroma half;
+    /// the picture's samples at the top left), valid until the next call: what a caller that
+    /// doesn't take `Search.planes` reads instead.
+    public private(set) var outputPlanes: [UnsafePointer<UInt8>] = [], outputStrides: [Int] = []
+
+    /// A search's planes: `planes` cropped into arrays, or (crop false) none; either way it's
+    /// `outputPlanes`.
+    private func output(_ job: Job, _ planes: [any MTLBuffer], crop: Bool) -> [[UInt8]] {
+        outputPlanes = (0..<job.nPlanes).map { UnsafePointer(planes[$0].contents().assumingMemoryBound(to: UInt8.self)) }
+        outputStrides = Array(job.pw.prefix(job.nPlanes))
+        return crop ? job.cropped(planes) : []
+    }
 
     public init(device: any MTLDevice) throws {
         self.device = device
@@ -127,7 +139,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
                        sourceStrides: [Int]? = nil, changed: [UInt8]? = nil, direct: [UInt8]? = nil,
-                       lfZero: [UInt8]? = nil) throws -> Search {
+                       lfZero: [UInt8]? = nil, cropsOutput: Bool = true) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -145,7 +157,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         if let changed, tf.cdef_mode != 0, let job = lastJob, job.width == Int(fp.width), job.height == Int(fp.height),
            job.nPlanes == (mono ? 1 : 3), job.previousKey == key, changed.count == job.sbCols * job.sbRows,
            let result = try searchChanged(job, fp: fp, tf: tf, blocks: blocks, planes: planes, source: source,
-                                          sourceStrides: sourceStrides, changed: changed, direct: direct, lfZero: lfZero) {
+                                          sourceStrides: sourceStrides, changed: changed, direct: direct, lfZero: lfZero,
+                                          cropsOutput: cropsOutput) {
             return result
         }
         let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
@@ -161,7 +174,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 job.normalizeCDEF(compute)
                 job.deblock(compute)
             }
-            return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.source),
+            return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: output(job, job.source, crop: cropsOutput),
                           lumaSSE: [], chromaSSE: [], presets: [], presetSSE: [])
         }
 
@@ -215,7 +228,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: UInt32.self), count: nsb * nc))
         }
         try job.remember(key: key, params: fp)
-        return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
+        return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: output(job, job.output, crop: cropsOutput),
                       lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
     }
 
@@ -227,7 +240,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private func searchChanged(_ job: Job, fp base: av1g_frame_params, tf: GaTuneiqFrame,
                                blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                                source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8],
-                               direct: [UInt8]?, lfZero: [UInt8]?) throws -> Search? {
+                               direct: [UInt8]?, lfZero: [UInt8]?, cropsOutput: Bool) throws -> Search? {
         var fp = base
         let sbCols = job.sbCols, sbRows = job.sbRows, nsb = sbCols * sbRows, mono = fp.monochrome != 0
         let nc = Int(Self.candidates.npri * Self.candidates.nsec)
@@ -377,7 +390,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             }
             try job.remember(key: job.previousKey!, params: fp)
             lastFilteredShare = Double(redo.count) / Double(nsb)
-            return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
+            return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: output(job, job.output, crop: cropsOutput),
                           lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
         }
         job.setParams(fp)
@@ -407,7 +420,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         try job.remember(key: job.previousKey!, params: fp)
         lastFilteredShare = Double(innerList.count) / Double(nsb)
-        return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
+        return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: output(job, job.output, crop: cropsOutput),
                       lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
     }
 

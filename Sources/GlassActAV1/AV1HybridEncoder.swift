@@ -173,6 +173,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// applies.
     public var omitsSequenceHeaders = true
 
+    /// Whether a frame comes with its decoded picture (`Frame.planes`; on). Off saves copying
+    /// it out of the GPU's buffers every picture (22 MB at 5K): an encoder for a decoder
+    /// elsewhere doesn't need it, and its inter frames reference the GPU's copy.
+    public var returnsPlanes = true
+
+    /// Inter frames' analysis effort (nil: `preset`'s).
+    public var interPreset: AV1MetalEncoder.Preset? {
+        get { metal.interPreset }
+        set { metal.interPreset = newValue }
+    }
+
+    /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
+    private var previousOnGPU = false
+
     /// The current stream's superblock size (set when it starts).
     private var streamSB128 = false
 
@@ -372,13 +386,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
         }
         let refPlanes = reference?.planes ?? []
+        let gpuRef = reference != nil && previousOnGPU ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
                     blocks.withUnsafeBufferPointer { blocks in
                         lumaTx.withUnsafeBufferPointer { types in
                             inter.withUnsafeBufferPointer { inter in
-                                Self.reference(refPlanes, width: p.width) { ref in
+                                Self.reference(refPlanes, gpu: gpuRef, width: p.width) { ref in
                                     withUnsafePointer(to: video) { vp in
                                     av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
                                                                  UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
@@ -434,7 +449,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
-                                           lfZero: inter.isEmpty ? nil : inter.map { $0.is_inter != 0 ? 3 : 0 })
+                                           lfZero: inter.isEmpty ? nil : inter.map { $0.is_inter != 0 ? 3 : 0 },
+                                           cropsOutput: returnsPlanes)
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
@@ -467,6 +483,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The picture the next inter frame references.
     private func remember(_ p: Picture, _ frame: Frame, _ sbMotion: [Int32]) {
         previous = interFrames ? (p, frame.planes, sbMotion) : nil
+        previousOnGPU = interFrames && frame.planes.isEmpty
     }
 
     /// Per 64×64 of an inter frame, how the post-filters treat it. `changed`: the coded ones
@@ -510,7 +527,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The reference picture (cropped planes, tight) as av1g_ref_planes; nil when there's none.
-    static func reference<R>(_ planes: [[UInt8]], width: Int, _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+    static func reference<R>(_ planes: [[UInt8]], gpu: ([UnsafePointer<UInt8>], [Int])?, width: Int,
+                             _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+        if let (p, s) = gpu, p.count == 3, s.count == 3 {
+            var r = av1g_ref_planes()
+            r.plane = (p[0], p[1], p[2])
+            r.stride = (Int32(s[0]), Int32(s[1]), Int32(s[2]))
+            return body(&r)
+        }
         guard planes.count == 3 else { return body(nil) }
         return planes[0].withUnsafeBufferPointer { y in
             planes[1].withUnsafeBufferPointer { u in
