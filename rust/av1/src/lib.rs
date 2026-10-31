@@ -11,6 +11,8 @@
 //! (Sources/GlassActAV1/Shaders); tests hold the two to the same results.
 pub mod avif;
 pub mod blockinfo;
+#[cfg(feature = "capi")]
+pub mod capi;
 pub mod dsp;
 pub mod enc;
 pub mod entropy;
