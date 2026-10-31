@@ -78,6 +78,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let dp: any MTLComputePipelineState
     let recon: any MTLComputePipelineState
     var params: GpParams
+    /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
+    public private(set) var lastGPUSeconds: Double = 0
 
     public init(device: any MTLDevice) throws {
         self.device = device
@@ -358,6 +360,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             commands.commit()
             commands.waitUntilCompleted()
             if let error = commands.error { throw Failure.metal("\(error)") }
+            encoder.lastGPUSeconds = commands.gpuEndTime - commands.gpuStartTime
         }
 
         /// Superblocks in decode order: tiles in raster order, superblocks in raster order inside each.
