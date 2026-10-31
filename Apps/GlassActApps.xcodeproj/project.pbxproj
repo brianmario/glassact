@@ -11,11 +11,13 @@
 		AA0000000000000000000027 /* GlassAct in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000025 /* GlassAct */; };
 		AA00000000000000000000B3 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000000B1 /* Sparkle */; };
 		AA00000000000000000000B4 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00000000000000000000B2 /* Sparkle */; };
+		AA0000000000000000000057 /* GlassActViewer in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000055 /* GlassActViewer */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		AA0000000000000000000016 /* Glass Act Host.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Glass Act Host.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000000000000000000026 /* Glass Act Viewer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Glass Act Viewer.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA0000000000000000000056 /* Glass Act.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Glass Act.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000000000000000000040 /* Signing.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Signing.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -35,6 +37,11 @@
 			path = Shared;
 			sourceTree = "<group>";
 		};
+		AA000000000000000000000B /* iPad */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = iPad;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -52,6 +59,12 @@
 				AA00000000000000000000B4 /* Sparkle in Frameworks */,
 			);
 		};
+		AA0000000000000000000053 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+				AA0000000000000000000057 /* GlassActViewer in Frameworks */,
+			);
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -62,6 +75,7 @@
 				AA0000000000000000000005 /* Host */,
 				AA0000000000000000000006 /* Viewer */,
 				AA0000000000000000000009 /* Shared */,
+				AA000000000000000000000B /* iPad */,
 				AA0000000000000000000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -71,6 +85,7 @@
 			children = (
 				AA0000000000000000000016 /* Glass Act Host.app */,
 				AA0000000000000000000026 /* Glass Act Viewer.app */,
+				AA0000000000000000000056 /* Glass Act.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -124,6 +139,27 @@
 			productReference = AA0000000000000000000026 /* Glass Act Viewer.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AA0000000000000000000050 /* iPad */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA0000000000000000000051 /* Build configuration list for PBXNativeTarget "iPad" */;
+			buildPhases = (
+				AA0000000000000000000052 /* Sources */,
+				AA0000000000000000000053 /* Frameworks */,
+				AA0000000000000000000054 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA000000000000000000000B /* iPad */,
+			);
+			name = iPad;
+			packageProductDependencies = (
+				AA0000000000000000000055 /* GlassActViewer */,
+			);
+			productName = iPad;
+			productReference = AA0000000000000000000056 /* Glass Act.app */;
+			productType = "com.apple.product-type.application";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -153,6 +189,7 @@
 			targets = (
 				AA0000000000000000000010 /* Host */,
 				AA0000000000000000000020 /* Viewer */,
+				AA0000000000000000000050 /* iPad */,
 			);
 		};
 /* End PBXProject section */
@@ -168,6 +205,11 @@
 			files = (
 			);
 		};
+		AA0000000000000000000052 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */
@@ -177,6 +219,11 @@
 			);
 		};
 		AA0000000000000000000031 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		AA0000000000000000000054 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);
@@ -325,6 +372,72 @@
 			};
 			name = Release;
 		};
+		AA0000000000000000000058 /* Debug configuration for PBXNativeTarget "iPad" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CURRENT_PROJECT_VERSION = "$(GLASSACT_BUILD)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "iPad-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Glass Act finds Macs sharing their screens on your local network, and connects to them.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				MARKETING_VERSION = "$(GLASSACT_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(GLASSACT_BUNDLE_PREFIX).viewer";
+				PRODUCT_NAME = "Glass Act";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		AA0000000000000000000059 /* Release configuration for PBXNativeTarget "iPad" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = "$(ARCHS_STANDARD)";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CURRENT_PROJECT_VERSION = "$(GLASSACT_BUILD)";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "iPad-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "Glass Act";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Brian Lopez. MIT License.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Glass Act finds Macs sharing their screens on your local network, and connects to them.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				MARKETING_VERSION = "$(GLASSACT_VERSION)";
+				PRODUCT_BUNDLE_IDENTIFIER = "$(GLASSACT_BUNDLE_PREFIX).viewer";
+				PRODUCT_NAME = "Glass Act";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -349,6 +462,14 @@
 			buildConfigurations = (
 				AA0000000000000000000028 /* Debug configuration for PBXNativeTarget "Viewer" */,
 				AA0000000000000000000029 /* Release configuration for PBXNativeTarget "Viewer" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		AA0000000000000000000051 /* Build configuration list for PBXNativeTarget "iPad" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA0000000000000000000058 /* Debug configuration for PBXNativeTarget "iPad" */,
+				AA0000000000000000000059 /* Release configuration for PBXNativeTarget "iPad" */,
 			);
 			defaultConfigurationName = Release;
 		};
@@ -390,6 +511,10 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA00000000000000000000B0 /* XCRemoteSwiftPackageReference "Sparkle" */;
 			productName = Sparkle;
+		};
+		AA0000000000000000000055 /* GlassActViewer */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = GlassActViewer;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

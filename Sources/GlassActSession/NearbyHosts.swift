@@ -1,36 +1,45 @@
-import AppKit
+import Foundation
 import Network
-import Observation
+public import Observation
 import dnssd
 
 /// A Glass Act Host announcing itself on the local network (see the host's
 /// HostPresence). Where to dial comes from its TXT record — the service name
 /// is the computer's name, not an address.
-struct NearbyHost: Identifiable, Hashable, Sendable {
-    var id: String { name }
-    let name: String  // "Alex’s Mac mini"
-    let host: String  // "Alexs-Mac-mini.local"
-    let port: UInt16
-    let isLaptop: Bool
+public struct NearbyHost: Identifiable, Hashable, Sendable {
+    public var id: String { name }
+    public let name: String  // "Alex’s Mac mini"
+    public let host: String  // "Alexs-Mac-mini.local"
+    public let port: UInt16
+    public let isLaptop: Bool
 
-    var symbol: String { isLaptop ? "laptopcomputer" : "desktopcomputer" }
+    public init(name: String, host: String, port: UInt16, isLaptop: Bool) {
+        self.name = name
+        self.host = host
+        self.port = port
+        self.isLaptop = isLaptop
+    }
+
+    public var symbol: String { isLaptop ? "laptopcomputer" : "desktopcomputer" }
 }
 
-/// Bonjour browse for `_glassact._udp`, main thread. Listing a host is a
+/// Bonjour browse for `_glassact._udp`, main thread (Mac and iPad Viewers). Listing a host is a
 /// convenience, not trust: the dial still pins (or trusts on first use) the
 /// host's key, and the host still asks its user to approve this viewer.
 @MainActor @Observable
-final class NearbyHosts {
-    static let serviceType = "_glassact._udp"
+public final class NearbyHosts {
+    public static let serviceType = "_glassact._udp"
 
-    private(set) var hosts: [NearbyHost] = []
-    /// macOS isn't letting this app use the local network (Privacy &
+    public private(set) var hosts: [NearbyHost] = []
+    /// The OS isn't letting this app use the local network (Privacy &
     /// Security › Local Network) — or the user hasn't answered yet. Nearby
     /// can't list anything, and dialing a LAN address will fail.
-    private(set) var isBlocked = false
+    public private(set) var isBlocked = false
     @ObservationIgnored private var browser: NWBrowser?
 
-    func start() {
+    public init() {}
+
+    public func start() {
         guard browser == nil else { return }
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Self.serviceType, domain: "local."),
                                 using: NWParameters())
@@ -56,14 +65,6 @@ final class NearbyHosts {
         }
         browser.start(queue: .main)
         self.browser = browser
-    }
-
-    /// Privacy & Security (Local Network has no deep link of its own).
-    static func openPrivacySettings(_ anchor: String? = nil) {
-        let query = anchor.map { "?\($0)" } ?? "?Privacy"
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security\(query)") {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     private func update(_ found: [NearbyHost]) {

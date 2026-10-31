@@ -1,4 +1,5 @@
 import Foundation
+import GlassActSession
 import GlassActTransport
 import Observation
 

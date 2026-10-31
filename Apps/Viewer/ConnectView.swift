@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import GlassActSession
 
 /// The connect window: pick a nearby Mac (or type an address), choose what
 /// to show, connect. While a connection is in progress the same window

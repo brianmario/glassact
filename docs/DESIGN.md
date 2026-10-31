@@ -1143,6 +1143,8 @@ Sources/
   GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
+  glassact-testhost/       a Host with a synthetic screen that draws the input it gets, for
+                           developing viewers (the iPad Viewer in the Simulator)
   glassact-trace/          .scap inspection and diff
 Tests/                     WireTests CodecTests CoreTests TransportTests SessionTests ShareTests
                            (+ GlassActTestSupport)
@@ -1152,6 +1154,7 @@ scripts/vendor-libaom      re-vendors libaom from a checkout
 Apps/GlassActApps.xcodeproj
   Host/                    menu-bar app: capture, input, approvals, agents policy
   Viewer/                  window app: connect, render, input, settings
+  iPad/                    iPad Viewer (iPadOS 27): connect, render, touch/pointer/keyboard input
   Shared/                  both apps: About panel, MetricKit crash reporter (§13)
   Signing.xcconfig         (+ git-ignored Signing.local.xcconfig), release.sh
 scripts/symbolicate-crash  a crash report's stacks → function names (§13)

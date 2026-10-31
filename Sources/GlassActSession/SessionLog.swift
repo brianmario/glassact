@@ -62,10 +62,14 @@ public final class SessionLog: @unchecked Sendable {
     public func writeHeader(arguments: [String], displays: [String]) {
         var fields: [String] = []
         if let exe = Bundle.main.executableURL {
+            #if os(macOS)
+            // The bundle's date (outside the container on an iPad, where
+            // reading it needs a reason the App Store doesn't list).
             let attrs = try? FileManager.default.attributesOfItem(atPath: exe.path)
             if let date = attrs?[.modificationDate] as? Date {
                 fields.append("build_time=\(ISO8601DateFormatter().string(from: date))")
             }
+            #endif
             if let data = try? Data(contentsOf: exe, options: .mappedIfSafe) {
                 fields.append("build_sha256=\(SHA256.hash(data: data).prefix(6).map { String(format: "%02x", $0) }.joined())")
             }
