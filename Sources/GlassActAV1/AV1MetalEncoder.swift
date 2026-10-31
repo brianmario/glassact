@@ -295,6 +295,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Tiles in 128×128-superblock units (the stream's are), so that the analysis's tiles are
     /// the bitstream's; the analysis itself stays 64×64.
     public var largeSuperblocks = false
+    /// Inter frames search no intra modes for a block whose motion-compensated residual
+    /// quantizes to nothing (libaom realtime's rule; on).
+    public var interSkipsIntra = true
     /// Inter frames' analysis effort (nil: `preset`'s): their intra blocks matter less, as
     /// most of the picture is copied or predicted from the previous one.
     public var interPreset: Preset?
@@ -786,6 +789,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
             params.meSubpel = encoder.searchesSubpelMotion ? 1 : 0
+            params.interSkipsIntra = encoder.interSkipsIntra ? 1 : 0
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -829,6 +833,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             }
+            if isInter, analyzed > 0 {  // the inter candidates, which the intra analysis then weighs
+                e.memoryBarrier(scope: .buffers)
+                for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
+                    guard let (pipeline, warps) = encoder.inter[s] else { continue }
+                    let size = AV1MetalEncoder.blockSizes[s]
+                    var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
+                    e.setComputePipelineState(pipeline)
+                    e.setBytes(&n, length: 4, index: 2)
+                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                }
+            }
+            if isInter, analyzed > 0 { e.memoryBarrier(scope: .buffers) }
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
                 var n = shTotal[s]
                 if let stale = staleSuperblocks {  // only the listed SBs' blocks
@@ -864,18 +881,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     stages.shapes[s] = t
                     stages.analysis += t
                     e = try open()
-                }
-            }
-            if isInter, analyzed > 0 {  // inter candidates against the analysis's intra costs
-                e.memoryBarrier(scope: .buffers)
-                for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
-                    guard let (pipeline, warps) = encoder.inter[s] else { continue }
-                    let size = AV1MetalEncoder.blockSizes[s]
-                    var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
-                    e.setComputePipelineState(pipeline)
-                    e.setBytes(&n, length: 4, index: 2)
-                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
-                                           threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
                 }
             }
             if profiling { stages.analysis += try close() }

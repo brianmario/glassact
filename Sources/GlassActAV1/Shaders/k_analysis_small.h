@@ -115,6 +115,8 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     device GpBlockRes &out = B.blk[I.shOff[BS] + li];
     if (x >= I.MiCols * 4 || y >= I.MiRows * 4) { out.J = GP_INF; out.ncand = 0; return; }
     if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) return;  // unchanged source
+    device GpInterRes *ir = ga_inter_of<W, H>(B, I, BS, li);
+    if (ir && P.interSkipsIntra && ir->zero && ir->J < GP_INF) { out.J = ir->J; out.ncand = 0; ir->isInter = 1; return; }  // no intra search
     constexpr int txSz = (W == 4 && H == 4) ? AV1G_TX_4X4 : (W == 8 && H == 8) ? AV1G_TX_8X8 : (W == 4 && H == 8) ? AV1G_TX_4X8
                        : (W == 8 && H == 4) ? AV1G_TX_8X4 : (W == 4 && H == 16) ? AV1G_TX_4X16 : (W == 16 && H == 4) ? AV1G_TX_16X4
                        : (W == 8 && H == 16) ? AV1G_TX_8X16 : AV1G_TX_16X8;
@@ -130,7 +132,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
     const float lamS = P.satdLambda * sqrtf(lambda);
     AV1G_CONST const float *C = g_cost[I.qctx];
-    if (prune_flat(I, P, x, y, W, H, qidx)) { out.J = GP_INF; out.ncand = 0; return; }
+    if (prune_flat(I, P, x, y, W, H, qidx)) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; return; }
     constexpr int EL = AV1G_EDGE_OFF + 2 * (W + H) + 8;
     uint8_t ea[EL], el[EL];
     uint8_t *A = ea + AV1G_EDGE_OFF, *L = el + AV1G_EDGE_OFF;
@@ -264,7 +266,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
             if (J < bestJ) { bestJ = J; bestTx = t; }
         }
     }
-    out.J = nc ? bestJ : GP_INF;
+    ga_merge_inter(out, ir, nc ? bestJ : GP_INF);
     out.tx = (uint8_t)bestTx;
     int m = 0;
     if (nc) out.cand[m++] = (uint8_t)cands[bestK];

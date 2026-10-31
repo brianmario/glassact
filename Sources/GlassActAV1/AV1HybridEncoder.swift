@@ -178,6 +178,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// elsewhere doesn't need it, and its inter frames reference the GPU's copy.
     public var returnsPlanes = true
 
+    /// Inter frames search no intra modes for a block whose motion-compensated residual
+    /// quantizes to nothing (on): libaom realtime's rule, a third more speed on moving content.
+    public var interSkipsIntra: Bool {
+        get { metal.interSkipsIntra }
+        set { metal.interSkipsIntra = newValue }
+    }
+
     /// Inter frames' analysis effort (nil: `preset`'s).
     public var interPreset: AV1MetalEncoder.Preset? {
         get { metal.interPreset }

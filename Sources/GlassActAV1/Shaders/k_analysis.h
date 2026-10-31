@@ -170,6 +170,21 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
     return warp_sum(e);
 }
 
+// Glass Act: an inter frame's candidate for a block of 8x8 and up (k_inter's, run before this), or
+// null. The analysis keeps the cheaper of it and the intra J (`ga_merge_inter`), and doesn't search
+// intra where the inter residual quantizes to nothing.
+template <int W, int H>
+static inline device GpInterRes *ga_inter_of(constant GpBatch &B, device const GpImage &I, int bs, uint32_t li) {
+    return (W >= 8 && H >= 8 && B.inter) ? B.inter + I.shOff[bs] + li : nullptr;
+}
+static inline void ga_merge_inter(device GpBlockRes &out, device GpInterRes *ir, float intraJ) {
+    out.J = intraJ;
+    if (!ir) return;
+    const bool inter = ir->J < intraJ;
+    if (inter) out.J = ir->J;
+    ir->isInter = inter ? 1 : 0;
+}
+
 template <int W, int H, int BS, int NW>
 kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
@@ -212,6 +227,12 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             continue;
         }
         if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) continue;  // Glass Act: unchanged source
+        device GpInterRes *ir = ga_inter_of<W, H>(B, I, BS, li);
+        if (ir && P.interSkipsIntra && ir->zero && ir->J < GP_INF) {  // Glass Act: an inter block with no residual, no intra search
+            if (lane == 0) { out.J = ir->J; out.ncand = 0; ir->isInter = 1; }
+            __syncwarp();
+            continue;
+        }
         const TileBox tb = tile_of(I, x, y);
         const int haveLeft = x > tb.x0, haveAbove = y > tb.y0;
         const int haveAR = ol_decoded(x + W, y - 1, x, y, 0, tb);
@@ -224,7 +245,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         const float lamS = P.satdLambda * sqrtf(lambda);
         AV1G_CONST const float *C = g_cost[I.qctx];
         if (prune_flat(I, P, x, y, W, H, qidx)) {
-            if (lane == 0) { out.J = GP_INF; out.ncand = 0; }
+            if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
             __syncwarp();
             continue;
         }
@@ -240,7 +261,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             const float var = s2 / (W * H) - (s1 / (W * H)) * (s1 / (W * H));
             const float st = av1g_ac_q(qidx) / 8.f;
             if (var > P.pruneVar * st * st) {
-                if (lane == 0) { out.J = GP_INF; out.ncand = 0; }
+                if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
                 __syncwarp();
                 continue;
             }
@@ -352,7 +373,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             }
         }
         if (lane == 0) {
-            out.J = bestJ;
+            ga_merge_inter(out, ir, bestJ);
             out.tx = (uint8_t)bestTx;
             int n = 0;
             out.cand[n++] = (uint8_t)S.cand[top[bestK]];

@@ -260,6 +260,23 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: no intra search where the inter residual is nothing (2026-10-31)
+
+**What changed:** in inter frames, `k_inter` now runs *before* the intra analysis.
+- It records its J, and whether the residual quantizes to nothing (`GpInterRes.J`, `.zero`).
+- The intra kernels (both kinds) skip a block whose inter residual is nothing, and otherwise keep the cheaper J (`ga_merge_inter`).
+- This is libaom realtime's `skip_intra_pred` rule. It's on by default (`AV1HybridEncoder.interSkipsIntra`; `av1seq --intra-everywhere` turns it off).
+
+**Results** (first 100 frames, libaom's tiling, `--no-planes`; BD-rate by PSNR-Y over q 12 / 20 / 28):
+
+| Trace | BD-rate, stream / inter frames | Inter frames a second |
+|---|---|---|
+| photos 5K | −0.10 % / −0.24 % | ×1.44 (29 → 42) |
+| photos 720p | +0.30 % / +0.29 % | ×1.24 (87 → 108) |
+| scroll-win 720p | +0.20 % / +0.21 % | ×1.18 (237 → 279) |
+
+Within the 0.4 % that a default may cost.
+
 ### Metal AV1: no decoded picture copied out; a lighter inter preset as an opt-in (2026-10-31)
 
 **What changed:**

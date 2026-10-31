@@ -12,10 +12,12 @@
 //            vectors within +-8 of no motion, +-4 of each of the frame's shift candidates and +-4
 //            of its SB's k_proj vector; the best refined to half and then quarter samples
 //            (GpParams.meSubpel); keeps the best GP_ME_KEEP in GpImage.meBest
-//   k_inter  one SIMD-group per (shape, position) of 8x8 and up, after k_analysis: SAD screening
-//            of no motion and the vectors k_me kept for the 16x16s the block covers, then the
-//            analysis's exact-rate RD (DCT_DCT) of the best; where it costs less than the intra
-//            J, it takes its place (GpInterRes.isInter), and the partition DP weighs it as any other
+//   k_inter  one SIMD-group per (shape, position) of 8x8 and up, before the intra analysis: SAD
+//            screening of no motion and the vectors k_me kept for the 16x16s the block covers, then
+//            the analysis's exact-rate RD (DCT_DCT) of the best, into GpInterRes (J, and zero when
+//            the residual quantizes to nothing). The intra analysis skips a zero one (libaom
+//            realtime tries no intra where the best inter is skip) and otherwise keeps the cheaper,
+//            so the partition DP weighs the inter block as any other
 // Sub-sample positions are predicted bilinearly here: an estimate of AV1's 8-tap filter, which only
 // the closed loop needs exactly. (The 8-tap filter here measured 1 % smaller frames than bilinear
 // on 720p photos for a third of the frame rate: BENCHMARKS.)
@@ -267,10 +269,9 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             li = (uint32_t)(by * nbx + bx);
         }
         const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
-        device GpBlockRes &out = B.blk[I.shOff[BS] + li];
         device GpInterRes &ir = B.inter[I.shOff[BS] + li];
         if (x >= I.MiCols * 4 || y >= I.MiRows * 4) {
-            if (lane == 0) ir.isInter = 0;
+            if (lane == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
             continue;
         }
         if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) continue;
@@ -321,11 +322,11 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         const int hasC = av1g_has_chroma(BS, y >> 2, x >> 2, I.mono);
         const float J = o.D + lambda * (o.R + ga_mv_bits(best, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
         if (lane == 0) {
-            const bool wins = J < out.J;
-            if (wins) out.J = J;
             ir.dx = (int16_t)best.x;
             ir.dy = (int16_t)best.y;
-            ir.isInter = wins ? 1 : 0;
+            ir.isInter = 0;
+            ir.zero = o.eob == 0 ? 1 : 0;
+            ir.J = J;
         }
         __syncwarp();
     }

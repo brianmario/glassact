@@ -33,6 +33,7 @@ let av1SeqCommand = Command(
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
+        .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
@@ -97,6 +98,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
     encoder.returnsPlanes = !opts.has("no-planes")
+    encoder.interSkipsIntra = !opts.has("intra-everywhere")
     if let name = opts.string("inter-preset") {
         guard let p = AV1MetalEncoder.Preset(rawValue: name) else { throw BenchError("--inter-preset: unknown") }
         encoder.interPreset = p

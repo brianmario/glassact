@@ -93,6 +93,8 @@ struct GpParams {
     int leafChromaAngled; // 1: k_leaf screens all 13 chroma modes; 0: not the six angled ones (D45 .. D67)
     // Glass Act: inter frames' motion search refines to quarter samples (k_me, k_inter); 0: whole samples
     int meSubpel;
+    // Glass Act: inter frames search no intra for a block whose inter residual quantizes to nothing
+    int interSkipsIntra;
 };
 
 // Per-image descriptor (device copy in an array; host fills it).
@@ -147,12 +149,15 @@ struct GpBlockRes {
     uint8_t tx;                // best tx type for cand[0]
 };
 
-// Glass Act: the inter analysis per (shape, position), parallel to GpBlockRes (inter frames): when
-// isInter, the block's J is its prediction from the previous picture at (dx, dy), 1/8 luma sample.
+// Glass Act: the inter analysis per (shape, position), parallel to GpBlockRes (inter frames). k_inter
+// costs the prediction from the previous picture at (dx, dy) (1/8 luma sample): J, and zero when its
+// residual quantizes to nothing; the intra analysis, after it, skips such a block and otherwise keeps
+// the cheaper: isInter when the block's GpBlockRes.J is this J.
 struct GpInterRes {
     int16_t dx, dy;
-    uint8_t isInter;
-    uint8_t pad[3];
+    uint8_t isInter, zero;
+    uint8_t pad[2];
+    float J;
 };
 
 // DP output: leaf blocks of one SB in decode order.
