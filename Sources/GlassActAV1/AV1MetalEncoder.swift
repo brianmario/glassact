@@ -16,8 +16,6 @@ internal import QuartzCore
 /// ## Deviations
 /// - av1gpu batches many pictures per dispatch for throughput; this encodes
 ///   one picture per call, the shape of a live frame.
-/// - `smallKernel` is off: the thread-per-block analysis kernel for shapes up
-///   to 64 pixels isn't ported; the warp-per-block one covers every shape.
 /// - The per-superblock outputs are packed into the record on the CPU, not by
 ///   k_pack, and no post-filters, delta-q or quantizer matrices yet.
 @available(macOS 27, iOS 27, *)
@@ -79,6 +77,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let queue: any MTLCommandQueue
     /// Per AV1 block size: the analysis kernel and its warps per threadgroup.
     let analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int)]
+    /// The thread-per-block analysis kernels of the shapes up to 64 pixels.
+    let analysisSmall: [Int: any MTLComputePipelineState]
+    static let smallThreads = 128
     let dp: any MTLComputePipelineState
     let recon: any MTLComputePipelineState
     var params: GpParams
@@ -117,6 +118,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             analysis[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
         }
         self.analysis = analysis
+        var small: [Int: any MTLComputePipelineState] = [:]
+        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= 64 {
+            guard let function = library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)")
+            else { throw Failure.metal("no k_analysis_small_\(size.w)x\(size.h)") }
+            small[bsize] = try Self.pipeline(function, threads: Self.smallThreads, device: device)
+        }
+        analysisSmall = small
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
@@ -213,7 +221,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         p.uvOverheadBits = 1.5
         p.splitBias = 1
         p.lambdaCMul = 1
-        p.smallKernel = 0
+        p.smallKernel = 1
         p.pruneMinArea = 1024
         p.screenSub = 1
         p.uvDeltas = 1
@@ -436,8 +444,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let t0 = CACurrentMediaTime()
             var e = try open()
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
-                guard let (pipeline, warps) = encoder.analysis[s] else { continue }
                 var n = shTotal[s]
+                if params.smallKernel != 0, let pipeline = encoder.analysisSmall[s] {
+                    e.setComputePipelineState(pipeline)
+                    e.setBytes(&n, length: 4, index: 2)
+                    e.dispatchThreads(MTLSize(width: Int(n), height: 1, depth: 1),
+                                      threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.smallThreads, height: 1, depth: 1))
+                    continue
+                }
+                guard let (pipeline, warps) = encoder.analysis[s] else { continue }
                 e.setComputePipelineState(pipeline)
                 e.setBytes(&n, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),

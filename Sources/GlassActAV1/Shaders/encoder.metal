@@ -55,5 +55,19 @@ kernel void ga_layout(device uint *out [[buffer(0)]]) {
     out[i++] = 0xFFFFFFFFu;
 }
 
+// Analysis of the shapes up to 64 pixels, one thread per block (GpParams.smallKernel):
+// k_analysis_small_<W>x<H>, dispatched in threadgroups of 128.
+#include "k_analysis_small.h"
+#define GA_SMALL(W, H, BS)                                                                                    \
+    template [[host_name("k_analysis_small_" #W "x" #H)]] kernel void k_analysis_small<W, H, BS>(            \
+        constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                               \
+        constant uint32_t &nTotal [[buffer(2)]], uint gb [[thread_position_in_grid]]);
+GA_SMALL(4, 4, AV1G_BLOCK_4X4)
+GA_SMALL(4, 8, AV1G_BLOCK_4X8)
+GA_SMALL(8, 4, AV1G_BLOCK_8X4)
+GA_SMALL(8, 8, AV1G_BLOCK_8X8)
+GA_SMALL(4, 16, AV1G_BLOCK_4X16)
+GA_SMALL(16, 4, AV1G_BLOCK_16X4)
+
 // Closed loop: one threadgroup of RC_NT (128) threads per 64x64, in wavefront steps.
 #include "k_recon.h"
