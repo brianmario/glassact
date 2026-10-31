@@ -246,7 +246,30 @@ pub(crate) fn write_headers(fp: &FrameParams, tiles: &TileInfo, level: i32, seq:
         fh.put(lf[3] as u32, 6);
     }
     fh.put(fp.loop_filter_sharpness as u32, 3);
-    fh.put(0, 1); // loop_filter_delta_enabled
+    if fp.lf_inter_off != 0 {
+        // loop_filter_delta_enabled, _update; from setup_past_independence's ref deltas
+        // (INTRA_FRAME 1, LAST_FRAME 0): INTRA_FRAME 0 (the levels as given), LAST_FRAME -63
+        // (inter blocks at level 0); the mode deltas stay 0
+        fh.put(1, 1);
+        fh.put(1, 1);
+        for i in 0..8 {
+            match i {
+                0 => {
+                    fh.put(1, 1);
+                    fh.su(0, 7);
+                }
+                1 => {
+                    fh.put(1, 1);
+                    fh.su(-63, 7);
+                }
+                _ => fh.put(0, 1),
+            }
+        }
+        fh.put(0, 1);
+        fh.put(0, 1);
+    } else {
+        fh.put(0, 1); // loop_filter_delta_enabled
+    }
     if fp.enable_cdef != 0 {
         // cdef_params
         fh.put(fp.cdef_damping_minus_3 as u32, 2);

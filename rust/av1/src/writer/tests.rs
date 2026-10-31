@@ -684,7 +684,7 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
             2 => fp.qm_v = 16,
             _ => fp.using_qmatrix = 2,
         },
-        28 => fp.reserved[r.below(10) as usize] = 1,
+        28 => fp.reserved[r.below(9) as usize] = 1,
         29 => fp.allow_screen_content_tools = 2,
         30 => {
             fp.tile_cols_log2 = r.below(8) as i8 - 1;

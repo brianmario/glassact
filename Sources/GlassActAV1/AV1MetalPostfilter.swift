@@ -87,10 +87,12 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// filters: `planes` are MiCols·4 × MiRows·4 (chroma half that each way),
     /// tightly packed, because the filters read past the picture's edge. The
     /// result is cropped: Y width × height, U and V half that, rounded up (Y
-    /// only for a monochrome picture).
+    /// only for a monochrome picture). `lfZero` (per block, nonzero where its
+    /// loop filter level is 0: an inter block of a frame with lf_inter_off)
+    /// defaults to none.
     public func filter(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
-                       planes: [UnsafePointer<UInt8>]) throws -> [[UInt8]] {
-        let job = try self.job(params: fp, blocks: blocks, planes: planes)
+                       planes: [UnsafePointer<UInt8>], lfZero: [UInt8]? = nil) throws -> [[UInt8]] {
+        let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         lastGPUSeconds = 0
         try run { compute in
             job.mark(compute)
@@ -107,7 +109,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// libaom tune=iq does, from its reconstruction before the filters
     /// (`planes`, as `filter` takes them) and its source (`source`: the same
     /// sizes, edge-replicated past the picture), and filters it with them.
-    /// `params` supplies the size, monochrome and base_q_idx.
+    /// `params` supplies the size, monochrome and base_q_idx (and an inter
+    /// frame's video fields and lf_inter_off, with `lfZero` as `filter` takes it).
     ///
     /// With `changed` (per 64×64, raster: nonzero where the reconstruction,
     /// the blocks or the source may differ from the previous call's picture),
@@ -118,7 +121,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// the same either way.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
-                       sourceStrides: [Int]? = nil, changed: [UInt8]? = nil) throws -> Search {
+                       sourceStrides: [Int]? = nil, changed: [UInt8]? = nil, lfZero: [UInt8]? = nil) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -136,10 +139,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         if let changed, tf.cdef_mode != 0, let job = lastJob, job.width == Int(fp.width), job.height == Int(fp.height),
            job.nPlanes == (mono ? 1 : 3), job.previousKey == key, changed.count == job.sbCols * job.sbRows,
            let result = try searchChanged(job, fp: fp, tf: tf, blocks: blocks, planes: planes, source: source,
-                                          sourceStrides: sourceStrides, changed: changed) {
+                                          sourceStrides: sourceStrides, changed: changed, lfZero: lfZero) {
             return result
         }
-        let job = try self.job(params: fp, blocks: blocks, planes: planes)
+        let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         job.previousKey = nil
         lastFilteredShare = 1
         let nsb = job.sbCols * job.sbRows
@@ -217,7 +220,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// previous picture.
     private func searchChanged(_ job: Job, fp base: av1g_frame_params, tf: GaTuneiqFrame,
                                blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
-                               source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8]) throws -> Search? {
+                               source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8],
+                               lfZero: [UInt8]?) throws -> Search? {
         var fp = base
         let sbCols = job.sbCols, sbRows = job.sbRows, nsb = sbCols * sbRows, mono = fp.monochrome != 0
         let nc = Int(Self.candidates.npri * Self.candidates.nsec)
@@ -253,7 +257,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             }
         }
         copyRing(from: job.source, to: ring)
-        try job.load(params: fp, blocks: blocks, planes: planes, only: outerList)
+        try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero, only: outerList)
         let target = try (0..<3).map { try job.scratch("target\($0)", job.pw[$0] * job.ph[$0]) }
         for p in 0..<job.nPlanes {
             Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: target[p], width: job.pw[p], height: job.ph[p],
@@ -441,7 +445,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// the same (nothing allocated or cleared per picture), loaded with its inputs.
     private var lastJob: Job?
     private func job(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
-                     planes: [UnsafePointer<UInt8>]) throws -> Job {
+                     planes: [UnsafePointer<UInt8>], lfZero: [UInt8]?) throws -> Job {
         let job: Job
         if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3) {
             job = j
@@ -449,7 +453,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             job = try Job(self, params: fp)
             lastJob = job
         }
-        try job.load(params: fp, blocks: blocks, planes: planes)
+        try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         return job
     }
 
@@ -471,7 +475,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         let pw: [Int], ph: [Int]
         var made: [any MTLBuffer] = []
         var source: [any MTLBuffer] = [], output: [any MTLBuffer] = []
-        var cdefIdx: (any MTLBuffer)!, blockBuffer: (any MTLBuffer)!
+        var cdefIdx: (any MTLBuffer)!, blockBuffer: (any MTLBuffer)!, lfZeroBuffer: (any MTLBuffer)!
         var addrs = GaPfAddrs()
         var frame: [UInt8] = []
         var params: av1g_frame_params
@@ -502,6 +506,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             cdefIdx = try make(sbCols * sbRows)
             let dirVar = try make(4 * nuv)
             blockBuffer = try make(16)
+            lfZeroBuffer = try make(16)
             addrs.plane = (source[0].gpuAddress, source[1].gpuAddress, source[2].gpuAddress)
             addrs.stride = (Int32(pw[0]), Int32(pw[1]), Int32(pw[2]))
             addrs.skip = skip.gpuAddress
@@ -511,28 +516,26 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
 
         /// A picture's reconstruction before the filters, blocks and parameters.
-        func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>]) throws {
+        func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
+                  lfZero: [UInt8]?) throws {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
             for p in 0..<nPlanes { source[p].contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p]) }
-            memset(cdefIdx.contents(), 0xFF, sbCols * sbRows)
-            let bytes = blocks.count * MemoryLayout<av1g_block>.stride
-            if blockBuffer.length < bytes {
-                made.removeAll { $0 === blockBuffer }
-                blockBuffer = try make(bytes + bytes / 4)
-            }
-            if let base = blocks.baseAddress { blockBuffer.contents().copyMemory(from: base, byteCount: bytes) }
-            blockCount = blocks.count
-            setParams(fp)
+            try load(params: fp, blocks: blocks, lfZero: lfZero)
         }
 
         /// As `load`, but the reconstruction of the listed 64×64s only.
         func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
-                  only superblocks: [UInt32]) throws {
+                  lfZero: [UInt8]?, only superblocks: [UInt32]) throws {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
             for p in 0..<nPlanes {
                 AV1MetalPostfilter.copy(planes[p], stride: pw[p], into: source[p], width: pw[p], height: ph[p],
                                         superblocks: superblocks, side: p == 0 ? 64 : 32, sbCols: sbCols)
             }
+            try load(params: fp, blocks: blocks, lfZero: lfZero)
+        }
+
+        private func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, lfZero: [UInt8]?) throws {
+            if let lfZero, lfZero.count != blocks.count { throw Failure.metal("\(lfZero.count) lfZero entries for \(blocks.count) blocks") }
             memset(cdefIdx.contents(), 0xFF, sbCols * sbRows)
             let bytes = blocks.count * MemoryLayout<av1g_block>.stride
             if blockBuffer.length < bytes {
@@ -540,6 +543,15 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 blockBuffer = try make(bytes + bytes / 4)
             }
             if let base = blocks.baseAddress { blockBuffer.contents().copyMemory(from: base, byteCount: bytes) }
+            if lfZeroBuffer.length < blocks.count {
+                made.removeAll { $0 === lfZeroBuffer }
+                lfZeroBuffer = try make(blocks.count + blocks.count / 4)
+            }
+            if let lfZero, !lfZero.isEmpty {
+                lfZero.withUnsafeBytes { lfZeroBuffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+            } else {
+                memset(lfZeroBuffer.contents(), 0, blocks.count)
+            }
             blockCount = blocks.count
             setParams(fp)
         }
@@ -594,6 +606,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             var n = UInt32(blockCount)
             compute.setBuffer(blockBuffer, offset: 0, index: 1)
             compute.setBytes(&n, length: 4, index: 2)
+            compute.setBuffer(lfZeroBuffer, offset: 0, index: 3)
             grid(compute, blockCount, 1, 1, tw: min(128, blockCount), th: 1)
         }
 

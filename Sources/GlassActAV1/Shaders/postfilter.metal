@@ -13,11 +13,13 @@
 #include "av1g/blockinfo.h"
 #include "av1g/postfilter.h"
 
+// lfZero: per block, nonzero where its loop filter level is 0 (an inter block with fp.lf_inter_off)
 kernel void p_mark(constant av1g_pf_frame &f [[buffer(0)]], device const av1g_block *blocks [[buffer(1)]],
-                   constant uint32_t &n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+                   constant uint32_t &n [[buffer(2)]], device const uint8_t *lfZero [[buffer(3)]],
+                   uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
     const av1g_block b = blocks[i];
-    av1g_pf_mark_block(&f, &b);
+    av1g_pf_mark_block_ex(&f, &b, lfZero[i]);
 }
 
 // one thread per (plane, 4x4 edge position); chroma positions in chroma 4x4 units

@@ -38,7 +38,7 @@ typedef struct av1g_pf_frame {
     int W, H, MiRows, MiCols, mono;
     AV1G_DEV uint8_t *plane[3];          /* frame being deblocked in place / CDEF source */
     int stride[3];
-    AV1G_DEV uint8_t *skip;              /* Skips, MiRows x MiCols, stride MiCols */
+    AV1G_DEV uint8_t *skip;              /* Skips (bit 0), MiRows x MiCols, stride MiCols; bit 1 (AV1G_PF_LF_ZERO): the block's loop filter level is 0 */
     AV1G_DEV uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows/2) x (MiCols/2), stride MiCols/2 */
     AV1G_DEV int8_t *cdefIdx;            /* per 64x64, raster, stride sbCols; -1 = no CDEF (no non-skip block in it) */
     AV1G_DEV int32_t *cdefDirVar;        /* optional (GPU path): per 8x8, (var << 3) | yDir, stride MiCols/2 */
@@ -72,15 +72,20 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
     }
 }
 
-/* Writes one block's entries into the maps (Skips / LoopfilterTxSizes / cdef_idx). */
-AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b) {
+/* The skip map's bit for a block whose loop filter level is 0: an inter block of an inter frame
+ * with fp.lf_inter_off (Glass Act). */
+#define AV1G_PF_LF_ZERO 2
+
+/* Writes one block's entries into the maps (Skips / LoopfilterTxSizes / cdef_idx); lfZero: the
+ * block's loop filter level is 0 (AV1G_PF_LF_ZERO). */
+AV1G_HD void av1g_pf_mark_block_ex(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b, int lfZero) {
     const int r0 = b->mi_row, c0 = b->mi_col, bs = b->bsize;
     const int bw4 = av1g_bw4(bs), bh4 = av1g_bh4(bs);
     const int txY = av1g_luma_tx_size(bs, b->tx_depth);
     for (int y = r0; y < r0 + bh4 && y < f->MiRows; y++)
         for (int x = c0; x < c0 + bw4 && x < f->MiCols; x++) {
             const size_t k = (size_t)y * f->MiCols + x;
-            f->skip[k] = b->skip;
+            f->skip[k] = (uint8_t)(b->skip | (lfZero ? AV1G_PF_LF_ZERO : 0));
             f->lfTx[0][k] = (uint8_t)txY;
         }
     if (av1g_has_chroma(bs, r0, c0, f->mono)) {
@@ -95,6 +100,8 @@ AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_bl
     }
     if (f->enableCdef && !b->skip) f->cdefIdx[(size_t)(r0 >> 4) * f->sbCols + (c0 >> 4)] = b->cdef_idx;
 }
+
+AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b) { av1g_pf_mark_block_ex(f, b, 0); }
 
 /* ---------------- deblocking ---------------- */
 AV1G_HD int av1g_iabs(int x) { return x < 0 ? -x : x; }
@@ -174,7 +181,11 @@ AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass
     const int s = f->MiCols >> sub;
     const int txSz = f->lfTx[plane][(size_t)(row >> sub) * s + (col >> sub)];
     const int prevTxSz = f->lfTx[plane][(size_t)(prevRow >> sub) * s + (prevCol >> sub)];
-    /* intra frame: applyFilter = isTxEdge (isIntra = 1), so MiSize / skip do not matter */
+    /* level 0 on both sides (lf_inter_off's inter blocks): not filtered */
+    if (f->skip[(size_t)row * f->MiCols + col] & f->skip[(size_t)prevRow * f->MiCols + prevCol] & AV1G_PF_LF_ZERO) return;
+    /* applyFilter = isTxEdge && (isBlockEdge || !skip || isIntra): an intra block's edges are its
+     * tx edges, a skipped inter block's only tx edges are its block edges (tx_depth 0, at most
+     * 64x64) and a coded one's are filtered, so isTxEdge throughout */
     int cur, prev;
     if (pass == 0) {
         cur = AV1G_T(Tx_Width)[txSz];
@@ -298,7 +309,7 @@ AV1G_HD int av1g_cdef_active_idx(AV1G_CONST const av1g_pf_frame *f, int r, int c
     if (idx < 0) return -1;
     const uint8_t *sk = f->skip;
     const size_t mc = (size_t)f->MiCols;
-    if (sk[r * mc + c] && sk[(r + 1) * mc + c] && sk[r * mc + c + 1] && sk[(r + 1) * mc + c + 1]) return -1;
+    if (sk[r * mc + c] & sk[(r + 1) * mc + c] & sk[r * mc + c + 1] & sk[(r + 1) * mc + c + 1] & 1) return -1;
     return idx;
 }
 

@@ -400,6 +400,7 @@ impl InterSeq {
                     rng.range(1, 255) as u8
                 };
                 fp.error_resilient_mode = rng.chance(30) as u8;
+                fp.lf_inter_off = rng.chance(50) as u8;
             }
             let inter_pct = [0, 30, 60, 85, 100][rng.range(0, 4) as usize];
             let skip_pct = [5, 20, 50, 80][rng.range(0, 3) as usize];

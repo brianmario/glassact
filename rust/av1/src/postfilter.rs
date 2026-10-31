@@ -91,8 +91,13 @@ impl PfFrame {
 /// The maps the filters read: `skip` (Skips) and `lf_tx[0]` (luma LoopfilterTxSizes) are MiRows x
 /// MiCols, stride MiCols; `lf_tx[1..3]` are (MiRows / 2) x (MiCols / 2), stride MiCols / 2;
 /// `cdef_idx` is per 64x64, raster, stride sbCols, -1 = no CDEF (no non-skip block in it).
+/// [`PfMaps::skip`]'s bit for a block whose loop filter level is 0 (fp.lf_inter_off's inter
+/// blocks); bit 0 is the block's skip.
+pub const LF_ZERO: u8 = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PfMaps<'a> {
+    /// per luma 4x4: the block's skip, and [`LF_ZERO`]
     pub skip: &'a [u8],
     pub lf_tx: [&'a [u8]; 3],
     pub cdef_idx: &'a [i8],
@@ -119,13 +124,18 @@ impl PfMapsBuf {
     }
     /// av1g_pf_mark_block: writes one block's entries (Skips / LoopfilterTxSizes / cdef_idx).
     pub fn mark_block(&mut self, f: &PfFrame, b: &Block) {
+        self.mark_block_ex(f, b, false);
+    }
+    /// av1g_pf_mark_block_ex: [`PfMapsBuf::mark_block`] with the block's loop filter level 0 or
+    /// not ([`LF_ZERO`]).
+    pub fn mark_block_ex(&mut self, f: &PfFrame, b: &Block, lf_zero: bool) {
         let (r0, c0, bs) = (b.mi_row as i32, b.mi_col as i32, b.bsize as i32);
         let (bw, bh) = (bw4(bs), bh4(bs));
         let tx_y = luma_tx_size(bs, b.tx_depth as i32) as u8;
         for y in r0..(r0 + bh).min(f.mi_rows) {
             for x in c0..(c0 + bw).min(f.mi_cols) {
                 let k = (y * f.mi_cols + x) as usize;
-                self.skip[k] = b.skip;
+                self.skip[k] = b.skip | if lf_zero { LF_ZERO } else { 0 };
                 self.lf_tx[0][k] = tx_y;
             }
         }
@@ -310,7 +320,14 @@ pub(crate) fn lf_filter_size(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize,
     let lf = m.lf_tx[plane];
     let tx_sz = lf[(row >> sub) as usize * s + (col >> sub) as usize] as usize;
     let prev_tx_sz = lf[(prev_row >> sub) as usize * s + (prev_col >> sub) as usize] as usize;
-    // intra frame: applyFilter = isTxEdge (isIntra = 1), so MiSize / skip do not matter
+    // level 0 on both sides (lf_inter_off's inter blocks): the edge isn't filtered
+    let mc = f.mi_cols as usize;
+    if m.skip[row as usize * mc + col as usize] & m.skip[prev_row as usize * mc + prev_col as usize] & LF_ZERO != 0 {
+        return None;
+    }
+    // applyFilter = isTxEdge && (isBlockEdge || !skip || isIntra): an intra block's edges are
+    // its tx edges; a skipped inter block's only tx edges are its block edges (tx_depth 0, at
+    // most 64x64), and a coded one's tx edges are filtered: isTxEdge throughout
     let (cur, prev) = if pass == 0 {
         let cur = Tx_Width[tx_sz] as i32;
         if x_p & (cur - 1) != 0 {
@@ -495,7 +512,7 @@ pub fn cdef_active_idx(f: &PfFrame, m: &PfMaps, r: i32, c: i32) -> i32 {
     }
     let (sk, mc) = (m.skip, f.mi_cols as usize);
     let (r, c) = (r as usize, c as usize);
-    if sk[r * mc + c] != 0 && sk[(r + 1) * mc + c] != 0 && sk[r * mc + c + 1] != 0 && sk[(r + 1) * mc + c + 1] != 0 {
+    if sk[r * mc + c] & sk[(r + 1) * mc + c] & sk[r * mc + c + 1] & sk[(r + 1) * mc + c + 1] & 1 != 0 {
         return -1;
     }
     idx

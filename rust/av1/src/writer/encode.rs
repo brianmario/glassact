@@ -7,8 +7,8 @@ use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::{RefPlane, tx_coeffs, tx_h, tx_w};
 use crate::entropy::Ec;
-use crate::postfilter::{PfFrame, PfMaps, cdef_frame, deblock_frame};
-use crate::tables::TX_SIZES_ALL;
+use crate::postfilter::{LF_ZERO, PfFrame, PfMaps, cdef_frame, deblock_frame};
+use crate::tables::{LAST_FRAME, TX_SIZES_ALL};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -30,6 +30,8 @@ struct Worker {
 struct FrameBufs {
     plane: [Vec<u8>; 3],
     skip: Vec<u8>,
+    /// the post-filters' skip map with fp.lf_inter_off (postfilter::LF_ZERO on inter blocks)
+    pf_skip: Vec<u8>,
     tx: Vec<u8>,
     lf_uv: [Vec<u8>; 2],
     sb_cdef: Vec<i8>,
@@ -223,6 +225,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.ref_slot,
         fp.refresh_frame_flags,
         fp.error_resilient_mode,
+        fp.lf_inter_off,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
@@ -234,15 +237,18 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fail!(ERR_INVALID, "inter frames need video mode");
     }
     if fp.frame_type == FRAME_KEY {
-        if fp.ref_slot != 0 || fp.refresh_frame_flags != 0 || fp.error_resilient_mode != 0 {
+        if fp.ref_slot != 0 || fp.refresh_frame_flags != 0 || fp.error_resilient_mode != 0 || fp.lf_inter_off != 0 {
             fail!(
                 ERR_INVALID,
-                "key frames refresh every slot: ref_slot, refresh_frame_flags and error_resilient_mode must be 0"
+                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode and lf_inter_off must be 0"
             );
         }
     } else {
-        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 {
-            fail!(ERR_INVALID, "ref_slot must be 0..7, error_resilient_mode 0/1");
+        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 || fp.lf_inter_off > 1 {
+            fail!(
+                ERR_INVALID,
+                "ref_slot must be 0..7, error_resilient_mode and lf_inter_off 0/1"
+            );
         }
         if fp.allow_screen_content_tools != 1 {
             fail!(
@@ -819,12 +825,28 @@ fn recon(
     let pstride: [usize; 3] = core::array::from_fn(|p| ((f.sb_cols as usize) * 64) >> (p != 0) as usize);
     let pheight: [usize; 3] = core::array::from_fn(|p| ((f.sb_rows as usize) * 64) >> (p != 0) as usize);
     let (mc, mr) = (f.mi_cols as usize, f.mi_rows as usize);
+    // with lf_inter_off, inter blocks' level is 0
+    let lf_off = f.inter && fp.lf_inter_off != 0;
+    let mut pf_skip = core::mem::take(&mut frame.pf_skip);
+    if lf_off {
+        pf_skip.clear();
+        pf_skip.resize(mr * mc, 0);
+        for t in &tiles[..ntiles] {
+            let (c0, r0, mw, mh) = (t.c0 as usize, t.r0 as usize, t.mw as usize, t.mh as usize);
+            for y in 0..mh {
+                for (x, d) in pf_skip[(r0 + y) * mc + c0..][..mw].iter_mut().enumerate() {
+                    let k = y * mw + x;
+                    *d = t.skip[k] | if t.ref0[k] as i32 == LAST_FRAME { LF_ZERO } else { 0 };
+                }
+            }
+        }
+    }
     // the frame: one tile's buffers are it; several tiles' are merged
     let (planes, skip, tx, lf_uv, sb_cdef) = if ntiles == 1 {
         let t = &mut tiles[0];
         (&mut t.plane, &t.skip, &t.tx_size, &t.lf_uv, &t.sb_cdef)
     } else {
-        let fb = frame;
+        let fb = &mut *frame;
         fb.skip.resize(mr * mc, 0);
         fb.tx.resize(mr * mc, 0);
         for m in &mut fb.lf_uv {
@@ -862,6 +884,7 @@ fn recon(
         }
         (&mut fb.plane, &fb.skip, &fb.tx, &fb.lf_uv, &fb.sb_cdef)
     };
+    let skip: &[u8] = if lf_off { &pf_skip } else { skip };
     // Deblocking (spec 7.14) then CDEF (7.15): the decoder's output frame. The maps come from
     // the walk.
     let pf = PfFrame::new(fp);
@@ -898,6 +921,7 @@ fn recon(
         out.recon_w[p] = w;
         out.recon_h[p] = h;
     }
+    frame.pf_skip = pf_skip;
 }
 
 /// av1g_encode with a fresh [`Writer`].

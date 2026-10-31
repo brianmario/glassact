@@ -85,7 +85,9 @@ pub struct FrameParams {
     pub refresh_frame_flags: u8,
     /// inter: 0/1
     pub error_resilient_mode: u8,
-    pub reserved: [u8; 10],
+    /// inter: 1 = inter blocks are not deblocked (ref deltas INTRA 0, LAST -63)
+    pub lf_inter_off: u8,
+    pub reserved: [u8; 9],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)

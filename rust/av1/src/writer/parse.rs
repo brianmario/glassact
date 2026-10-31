@@ -419,26 +419,30 @@ fn parse_frame(sq: &Seq, p: &[u8], p_off: u64, fp: &mut FrameParams, out: &mut P
         lvl[3] = br.f(6)? as i32;
     }
     fp.loop_filter_sharpness = br.f(3)? as u8;
-    let mut ref_delta_intra = 1; // setup_past_independence default
+    // setup_past_independence's defaults (primary_ref_frame is NONE)
+    let mut ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
+    let mut mode_deltas = [0, 0];
     let delta_enabled = br.b()?;
-    need!(
-        !(inter && delta_enabled),
-        "loop filter deltas in inter frames not supported"
-    );
     if delta_enabled && br.b()? {
-        for i in 0..8 {
+        for d in &mut ref_deltas {
             if br.b()? {
-                let v = br.su(7)?;
-                if i == 0 {
-                    ref_delta_intra = v;
-                }
+                *d = br.su(7)?;
             }
         }
-        for _ in 0..2 {
+        for d in &mut mode_deltas {
             if br.b()? {
-                br.su(7)?;
+                *d = br.su(7)?;
             }
         }
+    }
+    let ref_delta_intra = ref_deltas[0];
+    if inter && delta_enabled {
+        // only lf_inter_off's deltas: the levels as given for intra blocks, 0 for inter ones
+        need!(
+            ref_deltas[0] == 0 && ref_deltas[1] == -63 && mode_deltas == [0, 0],
+            "loop filter deltas in inter frames other than lf_inter_off's not supported"
+        );
+        fp.lf_inter_off = 1;
     }
     if lvl[0] != 0 || lvl[1] != 0 {
         for i in 0..4 {

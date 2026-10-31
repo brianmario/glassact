@@ -141,6 +141,11 @@
  *   fp.frame_type AV1G_FRAME_KEY: a key frame; it refreshes every reference slot, and its
  *     tile data and reconstruction are exactly the still picture's (video = 0).  ref_slot,
  *     refresh_frame_flags and error_resilient_mode must be 0.
+ *   fp.lf_inter_off (inter frames): 1 codes loop_filter_delta_enabled with ref deltas
+ *     INTRA_FRAME 0 and LAST_FRAME -63, so an inter block's filter level is 0 and an edge is
+ *     deblocked only when a block on either side of it is intra (at the frame's levels); an
+ *     encoder that copies already-filtered content leaves it as it is.  0: deltas off, every
+ *     edge at the frame's levels.  Key frames: 0.
  *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from ONE reference picture
  *     (LAST_FRAME; ref_frame_idx[] of all 7 references = fp.ref_slot); it refreshes the
  *     slots in fp.refresh_frame_flags.  allow_screen_content_tools must be 1 (it carries
@@ -263,7 +268,8 @@ typedef struct av1g_frame_params {
     uint8_t  ref_slot;             /* inter: the reference slot 0..7 LAST_FRAME (all 7 refs) uses */
     uint8_t  refresh_frame_flags;  /* inter: bit i = this frame replaces slot i (0 = none) */
     uint8_t  error_resilient_mode; /* inter: 0/1 (header only: primary_ref_frame is NONE anyway) */
-    uint8_t  reserved[10];
+    uint8_t  lf_inter_off;         /* inter: 1 = inter blocks are not deblocked (see "Video mode") */
+    uint8_t  reserved[9];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {
