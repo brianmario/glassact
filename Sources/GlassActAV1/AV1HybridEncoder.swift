@@ -164,6 +164,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// few bits. Loss-safe as long as the reference is a frame the decoder has.
     public var carriesCDFs = true
 
+    /// With `searchesMotion`: refine motion vectors to quarter samples (scaled or
+    /// animated content moves by fractions of a sample). Off: whole samples.
+    public var searchesSubpelMotion: Bool {
+        get { metal.searchesSubpelMotion }
+        set { metal.searchesSubpelMotion = newValue }
+    }
+
     /// The last picture, for the next inter frame: its source, decoded
     /// output and per-64×64 decisions (copy, dx, dy).
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
@@ -304,6 +311,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 video.lf_inter_off = 1
                 video.allow_screen_content_tools = 1
                 video.cdf_from_ref = carriesCDFs ? 1 : 0
+                video.mv_precision = searchesMotion && searchesSubpelMotion ? 1 : 0
                 sbMotion = sbMotionIn
                 let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count
                 var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?

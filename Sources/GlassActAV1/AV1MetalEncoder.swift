@@ -199,7 +199,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 return
             }
             var changed = [Bool](repeating: false, count: sbCols * sbRows)
-            for (p, (pixels, w, h)) in planes.enumerated() {
+            if let skip {
+                // the mask decides: every SB not skipped is analyzed (and its source remembered, which
+                // for an unchanged one changes nothing), with no comparison
+                for i in changed.indices { changed[i] = skip[i] == 0 }
+            }
+            for (p, (pixels, w, h)) in planes.enumerated() where skip == nil {
                 let side = p == 0 ? 64 : 32
                 prev[p].withUnsafeBufferPointer { old in
                     for sr in 0..<sbRows {
@@ -284,6 +289,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Whether `decidesLeaves` screens the six angled chroma modes too. Off
     /// saves ~5–8 % of a moving picture's GPU time for 0–0.3 % of bytes.
     public var leafChromaAngledModes = true
+    /// Inter frames' motion search refines vectors to quarter samples (off: whole
+    /// samples). The frame must then allow them (av1g_frame_params.mv_precision 1).
+    public var searchesSubpelMotion = false
     let recon: any MTLComputePipelineState
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
@@ -496,8 +504,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     /// Starts `partition` without waiting for it. (With `profilesStages` on,
     /// the stages run to completion first.)
-    /// `skip` (per 64×64, raster; with `reusesAnalysis`): superblocks whose analysis
-    /// the caller doesn't need, which keep the previous picture's where it has one.
+    /// `skip` (per 64×64, raster; with `reusesAnalysis`): superblocks the caller replaces,
+    /// which aren't analyzed and come back as one 64×64 block each.
     /// `motion` (an inter frame's shift candidates, (dx, dy) pairs): search for motion
     /// from the last picture waited on, of the same size (its source); the partition
     /// then mixes inter blocks with intra ones (`Partition.inter`).
@@ -546,6 +554,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// k_leaf's list of every SB's leaves, and its indirect dispatch.
         let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer
         let decidesLeaves: Bool
+        /// SBs the caller replaces (`beginPartition(skip:)`): the partition gives each one block.
+        let skipped: [UInt8]?
         var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
@@ -559,6 +569,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             self.width = width
             self.height = height
             self.qindex = qindex
+            skipped = skip
             miCols = 2 * ((width + 7) >> 3)
             miRows = 2 * ((height + 7) >> 3)
             sbCols = (miCols + 15) >> 4
@@ -765,6 +776,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             if !encoder.searchesAngleDeltas { params.deltas = 0; params.uvDeltas = 0 }
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
+            params.meSubpel = encoder.searchesSubpelMotion ? 1 : 0
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -809,7 +821,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     n = UInt32(stale * (64 / size.w) * (64 / size.h))
                     if n == 0 { continue }
                 }
-                if params.smallKernel != 0, let pipeline = encoder.analysisSmall[s] {
+                // the thread-per-block kernel has the throughput, but one block's chain of work on
+                // one thread takes ~1.5 ms: an inter frame analyzing little takes the SIMD-group one
+                // (whose float sums may order differently: kept analysis of a key frame stays the
+                // thread kernel, and so the same as fresh analysis)
+                let fewBlocks = isInter && n < 4096
+                if params.smallKernel != 0, !fewBlocks, let pipeline = encoder.analysisSmall[s] {
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
                     e.dispatchThreads(MTLSize(width: Int(n), height: 1, depth: 1),
@@ -932,6 +949,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 cache.sbInter = Array(repeating: [], count: sbCols * sbRows)
             }
             for sb in decodeOrder() {
+                if let skipped, skipped.count == sbCols * sbRows, skipped[sb] != 0 {
+                    // the caller replaces it: one block at its origin stands for it
+                    var b = av1g_block()
+                    (b.mi_row, b.mi_col, b.bsize) = (UInt16((sb / sbCols) * 16), UInt16((sb % sbCols) * 16), UInt8(AV1G_BLOCK_64X64))
+                    blocks.append(b)
+                    types.append(0)
+                    if isInter { inter.append(av1g_block_inter()) }
+                    continue
+                }
                 if let cache, let kept, kept[sb] != 0, !cache.sbBlocks[sb].isEmpty {
                     blocks += cache.sbBlocks[sb]
                     types += cache.sbTypes[sb]
@@ -957,8 +983,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     if isInter, size.w >= 8, size.h >= 8, interRes[Int(shapeOffset[s]) + li].isInter != 0 {
                         let m = interRes[Int(shapeOffset[s]) + li]
                         bi.is_inter = 1
-                        bi.mv_row = m.dy * 8
-                        bi.mv_col = m.dx * 8
+                        bi.mv_row = m.dy
+                        bi.mv_col = m.dx
                     } else if res.ncand > 0 {
                         let cand = Int(res.cand.0)
                         b.y_mode = UInt8(cand >> 3)

@@ -260,6 +260,31 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames' fixed costs; steady-state frame rates (2026-10-31)
+
+**What changed** (same bytes everywhere):
+- **Placeholders for copies:** a superblock the caller replaces (an inter frame's copy) comes back from the partition as one placeholder block, not its cached block list (~3,600 lists rebuilt a 5K frame).
+- **No comparison under a skip mask:** with the mask, the analysis cache doesn't compare the whole source; the mask decides.
+- **`k_leaf` visits only analyzed superblocks' leaves:** its prefix scan counts no leaves for kept ones.
+- **SIMD-group analysis for small inter workloads:** an inter frame analyzing fewer than 4,096 blocks of a shape uses the SIMD-group-per-block analysis for the small shapes, not thread-per-block.
+  - The thread-per-block kernel's single-thread chain takes ~1.5 ms for an 8×16, so a few blocks cost the GPU 5.4 ms; now 1.6 ms (5K typing, stages timed one by one).
+  - Its float sums may order differently, so key frames keep the thread kernel, and kept analysis there still codes as fresh analysis.
+
+**Measured** (5K typing-cc, inter frames, the overlapped pipeline):
+
+| | Before | After |
+|---|---|---|
+| Starting a picture (copy decisions, source padding and comparison) | 4.0 ms | 1.4 ms |
+| fps, the whole run with its key frame | 68.5 | 107–110 |
+
+**`av1seq` now prints steady-state inter frames a second,** from the first frame's output to the last, for both encoders.
+- The whole-run fps above includes the key frame's ~300 ms full analysis at 5K. An earlier "3.3 ms wait for the partition" on every inter frame was just that, averaged over 100 frames.
+
+| inter frames a second (ours / libaom s9, 8 threads) | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K | 134 / 225 | 89 / 169 | 30 / 87 | 132 / 227 |
+| 720p | 474 / 2006 | 227 / 974 | 87 / 481 | 493 / 2012 |
+
 ### Metal AV1: inter frames start from their reference's CDFs (2026-10-31)
 
 **What changed:** an inter frame (`fp.cdf_from_ref`, on in `AV1HybridEncoder.carriesCDFs`; `av1seq --no-cdf-carry` turns it off) codes primary_ref_frame = LAST, and starts from the CDFs its reference saved instead of the defaults.

@@ -31,6 +31,7 @@ let av1SeqCommand = Command(
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
+        .bool("subpel", "with --inter: quarter-sample motion vectors in the motion search"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
@@ -93,6 +94,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.interFrames = inter
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
+    encoder.searchesSubpelMotion = opts.has("subpel")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
@@ -104,6 +106,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var frames: [AV1HybridEncoder.Frame] = []
     frames.reserveCapacity(pictures.count)
     let repeats = opts.int("repeat", 1)
+    var outputAt: [Double] = []  // when each frame came out (overlapped runs)
     var seconds = 0.0
     for r in 0..<repeats {
         if r > 0 { frames.removeAll(keepingCapacity: true) }
@@ -111,7 +114,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         if serial {
             for i in 0..<pictures.count { frames.append(try encoder.encode(picture(i), qindex: qindex)) }
         } else {
-            try encoder.encode(count: pictures.count, qindex: qindex, picture: { picture($0) }, output: { _, f in frames.append(f) })
+            outputAt.removeAll(keepingCapacity: true)
+            try encoder.encode(count: pictures.count, qindex: qindex, picture: { picture($0) }, output: { _, f in
+                frames.append(f)
+                outputAt.append(CACurrentMediaTime())
+            })
         }
         seconds = CACurrentMediaTime() - t0
     }
@@ -151,8 +158,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let rest = frames.dropFirst()
         let m = Double(rest.count)
         func avg(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { rest.map { f($0.timing) }.reduce(0, +) / m }
-        print(String(format: "             key frame %@ · inter frames %@ on average · copied %.1f %% of 64x64s (%.1f %% at a shift) · deciding them %.2f ms · motion-searched blocks %.1f %% of the picture",
-                     formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count),
+        let steady = outputAt.count == frames.count && frames.count > 1
+            ? String(format: " · %.1f inter frames a second", Double(frames.count - 1) / (outputAt[frames.count - 1] - outputAt[0])) : ""
+        print(String(format: "             key frame %@ · inter frames %@ on average%@ · copied %.1f %% of 64x64s (%.1f %% at a shift) · deciding them %.2f ms · motion-searched blocks %.1f %% of the picture",
+                     formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count), steady,
                      avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.motion } * 1000, avg { $0.searched } * 100))
     }
 
@@ -187,7 +196,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         defer { glassact_aom_enc_destroy(enc) }
         _ = glassact_aom_enc_set_max_quantizer(enc, Int32(q))
         _ = glassact_aom_enc_set_min_quantizer(enc, Int32(q))
-        var total = 0, aomPSNR = 0.0, streams: [[UInt8]] = []
+        var total = 0, aomPSNR = 0.0, streams: [[UInt8]] = [], keySeconds = 0.0
         let a0 = CACurrentMediaTime()
         for (i, p) in pictures.enumerated() {
             let forceKey: Int32 = aomInter && i > 0 ? 0 : 1
@@ -197,6 +206,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             while let pk = glassact_aom_enc_next_packet(enc, &size, &key) { stream += UnsafeBufferPointer(start: pk, count: size) }
             streams.append(stream)
             total += stream.count
+            if i == 0 { keySeconds = CACurrentMediaTime() - a0 }
         }
         let aomSeconds = CACurrentMediaTime() - a0
         var header = [UInt8](repeating: 0, count: 256)
@@ -217,9 +227,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         if let aomRGB { print(aomRGB.summary("libaom")) }
         if aomInter, streams.count > 1, let first = stamps.first, let last = stamps.last, last > first {
             let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
-            print(String(format: "             key frame %@ · inter frames %@ on average · %.2f Mbit/s at the trace's timing",
+            print(String(format: "             key frame %@ · inter frames %@ on average · %.1f inter frames a second · %.2f Mbit/s at the trace's timing",
                          formatBytes(streams[0].count), formatBytes(streams.dropFirst().map(\.count).reduce(0, +) / (streams.count - 1)),
-                         Double(total) * 8 / span / 1e6))
+                         Double(streams.count - 1) / (aomSeconds - keySeconds), Double(total) * 8 / span / 1e6))
         }
     }
 }

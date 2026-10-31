@@ -224,14 +224,16 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// the leaves of every SB as one list: leafOff[sb] = leaves before it, leafOff[nSb] = all; and the
-// indirect dispatch of k_leaf (LEAF_NW leaves per threadgroup). One threadgroup of 1024 threads.
+// the leaves of every SB analyzed (not kept: B.sbKeep) as one list: leafOff[sb] = leaves before it,
+// leafOff[nSb] = all; and the indirect dispatch of k_leaf (LEAF_NW leaves per threadgroup), which
+// so doesn't visit the kept SBs' leaves. One threadgroup of 1024 threads.
 kernel void k_leaf_scan(constant GpBatch &B [[buffer(0)]], device uint32_t *leafOff [[buffer(2)]],
                         device uint32_t *dispatch [[buffer(3)]], uint tid [[thread_position_in_threadgroup]]) {
     threadgroup uint32_t part[1024];
     const uint32_t n = B.nSb, per = (n + 1023) / 1024, b = min(tid * per, n), e = min(b + per, n);
+    auto count = [&](uint32_t i) -> uint32_t { return B.sbKeep && B.sbKeep[i] ? 0u : (uint32_t)B.leafCountW[i]; };
     uint32_t s = 0;
-    for (uint32_t i = b; i < e; i++) s += B.leafCountW[i];
+    for (uint32_t i = b; i < e; i++) s += count(i);
     part[tid] = s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint32_t d = 1; d < 1024; d <<= 1) {
@@ -243,7 +245,7 @@ kernel void k_leaf_scan(constant GpBatch &B [[buffer(0)]], device uint32_t *leaf
     uint32_t run = tid ? part[tid - 1] : 0;
     for (uint32_t i = b; i < e; i++) {
         leafOff[i] = run;
-        run += B.leafCountW[i];
+        run += count(i);
     }
     if (tid == 1023) {
         leafOff[n] = part[1023];
@@ -266,6 +268,7 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
         const uint32_t mid = (lo + hi) >> 1;
         if (leafOff[mid] <= g) lo = mid; else hi = mid;
     }
+    // (the last SB with leafOff <= g is the one with the leaf: kept SBs before it have none here)
     const uint32_t sb = lo, k = g - leafOff[sb];
     if (B.sbKeep && B.sbKeep[sb]) return;  // unchanged source: the previous picture's decisions stand
     device const GpImage &I = B.img[B.sbImg[sb]];

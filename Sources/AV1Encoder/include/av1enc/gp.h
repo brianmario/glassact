@@ -91,6 +91,8 @@ struct GpParams {
     int leafDecide;      // 1: run k_leaf (AV1HybridEncoder)
     int leafTxSearch;    // k_leaf searches luma tx types of blocks up to this many pixels (<= 256); 0: DCT_DCT
     int leafChromaAngled; // 1: k_leaf screens all 13 chroma modes; 0: not the six angled ones (D45 .. D67)
+    // Glass Act: inter frames' motion search refines to quarter samples (k_me, k_inter); 0: whole samples
+    int meSubpel;
 };
 
 // Per-image descriptor (device copy in an array; host fills it).
@@ -130,7 +132,8 @@ struct GpImage {
     GP_DEV const uint8_t *ref;
     int nMeCand;
     int16_t meCand[2 * GP_ME_CANDS];
-    // per 16x16 of the padded picture (aw / 16 x ah / 16, raster): k_me's best GP_ME_KEEP (dx, dy)
+    // per 16x16 of the padded picture (aw / 16 x ah / 16, raster): k_me's best GP_ME_KEEP (dx, dy),
+    // 1/8 luma sample
     GP_DEV int16_t *meBest;
 };
 
@@ -143,7 +146,7 @@ struct GpBlockRes {
 };
 
 // Glass Act: the inter analysis per (shape, position), parallel to GpBlockRes (inter frames): when
-// isInter, the block's J is its prediction from the previous picture at (dx, dy) whole samples.
+// isInter, the block's J is its prediction from the previous picture at (dx, dy), 1/8 luma sample.
 struct GpInterRes {
     int16_t dx, dy;
     uint8_t isInter;
