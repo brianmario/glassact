@@ -345,9 +345,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             (0..<nPlanes).map { p in
                 let w = p == 0 ? width : (width + 1) / 2, h = p == 0 ? height : (height + 1) / 2
                 let base = planes[p].contents().assumingMemoryBound(to: UInt8.self)
-                var plane = [UInt8](repeating: 0, count: w * h)
-                for row in 0..<h { for col in 0..<w { plane[row * w + col] = base[row * pw[p] + col] } }
-                return plane
+                return [UInt8](unsafeUninitializedCapacity: w * h) { d, count in
+                    for row in 0..<h { (d.baseAddress! + row * w).update(from: base + row * pw[p], count: w) }
+                    count = w * h
+                }
             }
         }
     }

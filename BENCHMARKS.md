@@ -287,6 +287,8 @@ the same quantizer, speed 9, 8 threads. M4 Pro.
 - The hybrid runs at 75–85 % of libaom realtime's speed. At one quantizer
   its files are 30–47 % smaller and its PSNR 0.2–1.4 dB lower. The
   SSIMULACRA2-matched spot checks above put the size gap at 35–50 %.
+- Copying the filtered planes out by rows instead of pixels (kept) takes
+  720p typing-cc from 39.9 to **44.4 fps** (filters 4.2 → 2.7 ms).
 - **At 5K the filters take 85 ms** of wall time against 12 ms of GPU work.
   Their dispatches queue with the next picture's 200 ms analysis. The next
   levers are the filters' setup and copies, and their place in the overlap.
