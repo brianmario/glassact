@@ -259,6 +259,40 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the CPU code in Rust (2026-10-31)
+
+The AV1 encoder's CPU code moved from C++ to Rust (`rust/av1`, std only):
+- the writer and parser;
+- DSP and post-filters;
+- the range coder and AVIF;
+- the Metal encoder's host half;
+- the hybrid closed loop;
+- test support.
+
+The new code uses NEON for the transforms (forward and inverse), whole-block prediction, deblocking, CDEF, dequantization and the CDF update. The C++ is kept in `rust/av1/oracle/cpp` as the reference for the crate's differential tests, which require identical bytes, reconstructions and decisions.
+
+**`av1seq`** (turbo, q20, 60 frames, M4 Pro), C++ build (b589159) and Rust build interleaved, two runs each. All bytes are identical and every decode is exact.
+
+| Sequence | C++ | Rust | CPU closed loop, ms per frame | Writer |
+|---|---|---|---|---|
+| typing-cc 720p, 3×3 | 192 fps | **232 fps** | 1.7 → 0.7 | 0.5 → 0.4 |
+| photos 720p, 3×3 | 78 | 81 (GPU-bound) | 4.2 → 1.6 | 1.1 → 1.0 |
+| typing-cc 1080p, 3×3 | 126 | **207** | 3.3 → 1.2 | 0.8 → 0.6 |
+| typing-cc 5K, 4×4 | 34 | **47** | 7.0 → 3.1 | 1.4 → 1.5 |
+| photos 5K, 4×4, every SB analyzed | 5.5 | 5.5 (GPU-bound) | 72 → 21 | 11 → 11 |
+
+**Crate micro-benchmarks** (the C++ oracle is built at -O2 without LTO):
+
+| Piece | C++ | Rust |
+|---|---|---|
+| Hybrid closed loop, synthetic 5K first picture | 83 ms | 39 ms |
+| Hybrid closed loop, ~5 % changed | 18 ms | 9 ms |
+| Writer, 5K full encode with filters, 16 tiles | 499 ms | 75 ms |
+| Writer, bitstream only, 16 tiles | 6.4 ms | 6.6 ms |
+| Range coder, symbol streams | 83 Msym/s | 150 Msym/s |
+
+The writer's bitstream-only time is at parity: what's left there is the range coder and context derivation.
+
 ### Metal AV1: why moving content is GPU-bound, and two exact speedups (2026-10-31)
 
 `av1seq`, turbo, q20, 60 frames, M4 Pro. Every superblock is analyzed (`--no-reuse`), which is the moving-content case. Every decode is exact.

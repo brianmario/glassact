@@ -430,6 +430,9 @@ pub unsafe extern "C" fn av1enc_pf_frame(
     out: *mut c_void,
     cap: usize,
 ) -> usize {
+    if fp.is_null() || addrs.is_null() {
+        return size_of::<crate::enc::GpuPfFrame>(); // a size query
+    }
     // SAFETY: fp and addrs are the caller's; out holds cap bytes.
     let f = crate::enc::pf_frame(unsafe { &*fp }, unsafe { &*addrs });
     let bytes = f.as_bytes();
@@ -507,4 +510,306 @@ pub unsafe extern "C" fn av1enc_cdef_select_cpu(
             tot,
         );
     }
+}
+
+// ---- av1enc.h: the hybrid encoder ----
+
+/// av1enc_hybrid: the encoder and the C view of its record, which Swift holds a pointer to.
+pub struct HybridHandle {
+    h: crate::hybrid::Hybrid,
+    rec: DecisionRecord,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1enc_hybrid_create() -> *mut HybridHandle {
+    // SAFETY: plain data, all zero is empty
+    let rec = unsafe { core::mem::zeroed() };
+    Box::into_raw(Box::new(HybridHandle {
+        h: crate::hybrid::Hybrid::new(),
+        rec,
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_destroy(h: *mut HybridHandle) {
+    if !h.is_null() {
+        // SAFETY: h came from av1enc_hybrid_create
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_closed_loop(
+    h: *mut HybridHandle,
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    w: u32,
+    hgt: u32,
+    blocks: *const Block,
+    n: u32,
+    luma_tx: *const u8,
+    flags: c_int,
+    qindex: c_int,
+    tile_cols_log2: c_int,
+    tile_rows_log2: c_int,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || y.is_null() || u.is_null() || v.is_null() || blocks.is_null() || n == 0 || w < 1 || hgt < 1 {
+        unsafe { set_error_raw(err, errlen, "bad arguments") };
+        return ERR_INVALID;
+    }
+    // SAFETY: tight 4:2:0 planes, n blocks, and n luma tx types when given (av1enc.h).
+    let hh = unsafe { &mut *h };
+    let (cw, ch) = (w.div_ceil(2) as usize, hgt.div_ceil(2) as usize);
+    let (y, u, v, blocks) = unsafe {
+        (
+            slice::from_raw_parts(y, w as usize * hgt as usize),
+            slice::from_raw_parts(u, cw * ch),
+            slice::from_raw_parts(v, cw * ch),
+            slice::from_raw_parts(blocks, n as usize),
+        )
+    };
+    let luma_tx = (!luma_tx.is_null()).then(|| unsafe { slice::from_raw_parts(luma_tx, n as usize) });
+    let r = hh.h.closed_loop(
+        y,
+        u,
+        v,
+        w,
+        hgt,
+        blocks,
+        luma_tx,
+        flags,
+        qindex,
+        tile_cols_log2,
+        tile_rows_log2,
+    );
+    hh.rec = hh.h.record_c();
+    match r {
+        Ok(()) => OK,
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_record(h: *mut HybridHandle) -> *mut DecisionRecord {
+    // SAFETY: h came from av1enc_hybrid_create; the view stays valid until the next call.
+    unsafe { &mut (*h).rec }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_write(
+    h: *mut HybridHandle,
+    fp: *const FrameParams,
+    sb_cdef: *const i8,
+    sb_cols: c_int,
+    obu: *mut *mut u8,
+    size: *mut usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || fp.is_null() || obu.is_null() || size.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: the handle, fp, and a per-SB cdef map covering the picture (sb_cols wide) when given.
+    let hh = unsafe { &mut *h };
+    let fp = unsafe { &*fp };
+    let sb_cdef = (!sb_cdef.is_null()).then(|| {
+        let rows = (crate::blockinfo::mi_rows(fp.height as i32) as usize + 15) >> 4;
+        unsafe { slice::from_raw_parts(sb_cdef, rows * sb_cols.max(0) as usize) }
+    });
+    let r = hh.h.write(fp, sb_cdef, sb_cols.max(0) as usize).map(|b| b.to_vec());
+    hh.rec = hh.h.record_c();
+    match r {
+        Ok(bytes) => {
+            unsafe {
+                *obu = malloc_copy(&bytes);
+                *size = bytes.len();
+            }
+            OK
+        }
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_reuse(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_reuse(on != 0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_reused_tiles(h: *const HybridHandle) -> u32 {
+    // SAFETY: the handle
+    unsafe { (*h).h.reused_tiles() }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_changed_superblocks(
+    h: *const HybridHandle,
+    out: *mut u8,
+    sb_cols: c_int,
+    sb_rows: c_int,
+) -> c_int {
+    if h.is_null() || out.is_null() || sb_cols < 0 || sb_rows < 0 {
+        return 0;
+    }
+    // SAFETY: the handle, and sb_cols x sb_rows bytes at out.
+    let out = unsafe { slice::from_raw_parts_mut(out, sb_cols as usize * sb_rows as usize) };
+    unsafe { (*h).h.changed_superblocks(out, sb_cols as usize, sb_rows as usize) as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_recon(h: *const HybridHandle, plane: c_int) -> *const u8 {
+    if plane < 0 {
+        return ptr::null();
+    }
+    // SAFETY: the handle; the plane stays valid until the next call.
+    match unsafe { (*h).h.recon(plane as usize) } {
+        Some(p) if !p.is_empty() => p.as_ptr(),
+        _ => ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_source(h: *const HybridHandle, plane: c_int, stride: *mut c_int) -> *const u8 {
+    if plane < 0 {
+        return ptr::null();
+    }
+    // SAFETY: the handle; the plane stays valid until the next call.
+    match unsafe { (*h).h.source(plane as usize) } {
+        Some((p, s)) => {
+            if !stride.is_null() {
+                unsafe { *stride = s as c_int };
+            }
+            p.as_ptr()
+        }
+        None => ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_seconds(h: *const HybridHandle, which: c_int) -> f64 {
+    // SAFETY: the handle
+    unsafe { (*h).h.seconds(which as usize) }
+}
+
+// ---- av1core_test.h ----
+
+/// av1t_case: a random legal record and the C view Swift holds a pointer to.
+pub struct CaseHandle {
+    #[allow(dead_code)] // owns the vectors `rec` points into
+    case: crate::testsupport::FuzzCase,
+    rec: DecisionRecord,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_case_make(seed: u64, maxdim: c_int, big_pct: c_int) -> *mut CaseHandle {
+    match crate::testsupport::case_make(seed, maxdim, big_pct) {
+        Some(mut case) => {
+            let rec = case.record();
+            Box::into_raw(Box::new(CaseHandle { case, rec }))
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_case_record(c: *mut CaseHandle) -> *mut DecisionRecord {
+    // SAFETY: c came from av1t_case_make; the record points into its vectors.
+    unsafe { &mut (*c).rec }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_case_free(c: *mut CaseHandle) {
+    if !c.is_null() {
+        // SAFETY: c came from av1t_case_make
+        drop(unsafe { Box::from_raw(c) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_ref_encode(
+    y: *const u8,
+    u: *const u8,
+    v: *const u8,
+    w: u32,
+    h: u32,
+    opts: *const crate::testsupport::RefOpts,
+    out: *mut Output,
+) -> c_int {
+    // SAFETY: tight 4:2:0 planes; opts and out are the caller's.
+    let out = unsafe { &mut *out };
+    *out = zero_output();
+    let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+    let (y, u, v) = unsafe {
+        (
+            opt_slice(y, w as usize * h as usize),
+            opt_slice(u, cw * ch),
+            opt_slice(v, cw * ch),
+        )
+    };
+    match crate::testsupport::ref_encode(y, u, v, w, h, unsafe { &*opts }) {
+        Ok(o) => {
+            to_c_output(&o, out);
+            OK
+        }
+        Err(e) => {
+            set_error(&mut out.error, &e.msg);
+            e.code
+        }
+    }
+}
+
+/// av1t_dsp_set: the C view first, so the pointer Swift holds is the box's.
+#[repr(C)]
+pub struct DspSetHandle {
+    view: crate::testsupport::DspSetC,
+    set: crate::testsupport::DspSet,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_dsp_set_make(seed: u64) -> *const crate::testsupport::DspSetC {
+    let set = crate::testsupport::DspSet::make(seed);
+    let view = set.c_view();
+    let b = Box::into_raw(Box::new(DspSetHandle { view, set }));
+    // SAFETY: b was just allocated; the view's arrays point into the boxed set, which doesn't move.
+    unsafe {
+        (*b).view.priv_ = b as *mut c_void;
+        &(*b).view
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_dsp_set_free(p: *const crate::testsupport::DspSetC) {
+    if !p.is_null() {
+        // SAFETY: p is the view of a set from av1t_dsp_set_make.
+        drop(unsafe { Box::from_raw((*p).priv_ as *mut DspSetHandle) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1t_inverse_transform(tx_sz: i32, tx_type: i32, dq: *const i32, residual: *mut i32) -> u32 {
+    // SAFETY: dq holds th x tw (<= 32x32) values, residual W x H (<= 64x64) (av1core_test.h).
+    let n = crate::dsp::tx_coeffs(tx_sz);
+    let (wd, ht) = (crate::dsp::tx_w(tx_sz) as usize, crate::dsp::tx_h(tx_sz) as usize);
+    let (dq, res) = unsafe {
+        (
+            slice::from_raw_parts(dq, n),
+            slice::from_raw_parts_mut(residual, wd * ht),
+        )
+    };
+    crate::testsupport::inverse_transform(tx_sz, tx_type, dq, res)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_tx_type_allowed(tx_sz: i32, tx_type: i32) -> i32 {
+    crate::testsupport::tx_type_allowed(tx_sz, tx_type) as i32
 }

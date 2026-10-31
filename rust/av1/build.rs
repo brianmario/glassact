@@ -1,5 +1,6 @@
-// With the `oracle` feature, compiles the C++ original and the test shims (oracle/*.cpp) into a
-// static library the differential tests link. Without it, nothing to do.
+// With the `oracle` feature, compiles the C++ original (oracle/cpp, the code this crate was ported
+// from, kept as the tests' reference) and the test shims (oracle/*.cpp) into a static library the
+// differential tests link. Without it, nothing to do.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,19 +12,16 @@ fn main() {
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = crate_dir.join("../..");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let src_dirs = [
-        "Sources/AV1Core/src",
-        "Sources/AV1Encoder/src",
-        "Sources/AV1CoreTestSupport",
-    ];
+    let src_dirs = ["oracle/cpp/av1core", "oracle/cpp/av1encoder", "oracle/cpp/testsupport"];
     let includes = [
+        crate_dir.join("oracle/cpp/include"),
+        crate_dir.join("oracle/cpp/testsupport"),
         root.join("Sources/AV1Core/include"),
         root.join("Sources/AV1Encoder/include"),
         root.join("Sources/AV1CoreTestSupport/include"),
-        root.join("Sources/AV1CoreTestSupport"),
     ];
     let mut sources: Vec<PathBuf> = Vec::new();
-    for d in src_dirs.iter().map(|d| root.join(d)).chain([crate_dir.join("oracle")]) {
+    for d in src_dirs.iter().map(|d| crate_dir.join(d)).chain([crate_dir.join("oracle")]) {
         println!("cargo:rerun-if-changed={}", d.display());
         for e in std::fs::read_dir(&d).unwrap() {
             let p = e.unwrap().path();

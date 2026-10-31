@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generates rust/av1/src/tables/{spec.rs,consts.rs} from the C tables the Metal kernels use.
 
-The GPU kernels compile the C headers in Sources/GlassActAV1/Shaders/av1g (spec tables, default
-CDFs, libaom's quantizer tables, levels and constants); the Rust CPU code must use the same values.
+The GPU kernels compile the C headers in Sources/AV1Core/include/av1g (spec tables, default CDFs,
+levels and constants); the Rust CPU code must use the same values. libaom's quantizer tables
+(av1f/aom_tables_gen.h) are only the CPU's, and sit with the C++ reference in rust/av1/oracle/cpp.
 This compiles a dumper against those headers with clang++, so the C compiler, not a parser here,
 decides what every initializer means, and writes the values out as Rust arrays of the same shape.
 
@@ -11,7 +12,7 @@ Run it after changing a table header; `cargo test` checks the committed output i
 import os, re, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INC = [os.path.join(ROOT, p) for p in ("Sources/GlassActAV1/Shaders", "Sources/AV1Core/include", "Sources/AV1Encoder/include")]
+INC = [os.path.join(ROOT, p) for p in ("Sources/GlassActAV1/Shaders", "Sources/AV1Core/include", "Sources/AV1Encoder/include", "rust/av1/oracle/cpp/include")]
 HEADERS = ["av1g/spec_tables.h", "av1g/cdf_defaults.h", "av1f/aom_tables_gen.h"]
 OUT = os.path.join(ROOT, "rust/av1/src/tables")
 RUST_T = {"uint8_t": "u8", "int8_t": "i8", "uint16_t": "u16", "int16_t": "i16", "uint32_t": "u32",

@@ -70,21 +70,27 @@ let package = Package(
                 .unsafeFlags(["-O2"], .when(configuration: .debug)),
             ]
         ),
-        // av1gpu's AV1 core (BSD-2, Sources/AV1Core/LICENSE), on its way to
-        // Metal: the DecisionRecord, the CPU bitstream writer with the exact
-        // reconstruction, and the decoder-mirroring DSP headers the GPU
-        // kernels share. Research for now; nothing in the apps uses it.
+        // The AV1 CPU code's C API (a port of av1gpu, BSD-2, Sources/AV1Core/LICENSE):
+        // the DecisionRecord, the bitstream writer with the exact reconstruction,
+        // the post-filters. It's implemented in Rust (rust/av1), built by
+        // scripts/build-rust into .build/rust/libglassact_av1.a (`just` runs it),
+        // and linked here. include/av1g also holds the decoder-mirroring DSP
+        // headers the Metal kernels compile. Research for now; nothing in the
+        // apps uses it.
         .target(
             name: "AV1Core",
             exclude: ["LICENSE", "THIRD_PARTY_NOTICES.md"],
-            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+            linkerSettings: [
+                .unsafeFlags(["-L", Context.packageDirectory + "/.build/rust"]),
+                .linkedLibrary("glassact_av1"),
+            ]
         ),
-        // The host half of av1gpu's encoder: tables, and the structures the
-        // host fills for the kernels (include/av1enc/gp.h).
+        // The host half of the Metal encoder and the hybrid encoder's CPU closed
+        // loop (also Rust): the structures the host fills for the kernels
+        // (include/av1enc/gp.h).
         .target(
             name: "AV1Encoder",
-            dependencies: ["AV1Core"],
-            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+            dependencies: ["AV1Core"]
         ),
         // The Metal port of av1gpu's encoder: kernels compiled at run time
         // from Shaders/ and AV1Core's shared headers.
@@ -94,11 +100,10 @@ let package = Package(
             exclude: ["Shaders"],
             swiftSettings: strictLibrary
         ),
-        // av1gpu's random legal records and CPU reference engine, for tests.
+        // av1gpu's random legal records and CPU reference engine, for tests (Rust too).
         .target(
             name: "AV1CoreTestSupport",
-            dependencies: ["AV1Core"],
-            cxxSettings: [.unsafeFlags(["-O2"], .when(configuration: .debug))]
+            dependencies: ["AV1Core"]
         ),
         // Hot-path codec: xxh64, RAW/LZ4/LZBITMAP/WEBPL tile codecs, arenas.
         // Plain -O: -Ounchecked (§8.4) gains nothing measurable and would
@@ -159,6 +164,5 @@ let package = Package(
         .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActTestSupport", "libaom"],
                     exclude: ["Shaders"], swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
-    ],
-    cxxLanguageStandard: .cxx17
+    ]
 )
