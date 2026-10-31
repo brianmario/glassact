@@ -30,9 +30,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     }
 
     /// A picture's blocks in decode order (tiles, then superblocks, then
-    /// decode_partition's pre-order), with their sizes and positions set.
+    /// decode_partition's pre-order), with their sizes and positions set, and
+    /// the analysis's luma mode and angle delta for each.
     public struct Partition {
         public var blocks: [av1g_block]
+        /// Each block's luma tx type, from the analysis (for its largest tx size).
+        public var lumaTxTypes: [UInt8]
         public var tiles: av1g_tiles
     }
 
@@ -234,7 +237,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                           width: Int, height: Int, qindex: Int) throws -> Partition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex)
         try run.execute(closedLoop: false)
-        return Partition(blocks: run.leafBlocks(), tiles: run.tiles)
+        let (blocks, types) = run.leafBlocks()
+        return Partition(blocks: blocks, lumaTxTypes: types, tiles: run.tiles)
     }
 
     /// The whole encoder on one picture: decisions and reconstruction.
@@ -258,6 +262,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let leaves: any MTLBuffer, leafCount: any MTLBuffer
         let sbOut: any MTLBuffer, oBlocks: any MTLBuffer, oBlockTxb: any MTLBuffer, oTxb: any MTLBuffer
         let oCoeffs: any MTLBuffer
+        /// The analysis's result per (shape, position), and each shape's grid.
+        let blockResults: any MTLBuffer
+        var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
 
@@ -360,6 +367,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let imageBuffer = try make(MemoryLayout<GpImage>.stride)
             imageBuffer.contents().storeBytes(of: image, as: GpImage.self)
             let blk = try make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)
+            blockResults = blk
+            shapeOffset = shOff
+            shapeColumns = nbx
             let starts = try make(Int(GP_NSHAPES) * 2 * 4)   // per shape: [first block of image 0, total]
             for s in 0..<Int(GP_NSHAPES) {
                 starts.contents().storeBytes(of: shTotal[s], toByteOffset: s * 8 + 4, as: UInt32.self)
@@ -507,9 +517,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             return order
         }
 
-        func leafBlocks() -> [av1g_block] {
-            var blocks: [av1g_block] = []
+        func leafBlocks() -> ([av1g_block], [UInt8]) {
+            var blocks: [av1g_block] = [], types: [UInt8] = []
             let leafPtr = leaves.contents().assumingMemoryBound(to: GpLeaf.self)
+            let results = blockResults.contents().assumingMemoryBound(to: GpBlockRes.self)
             let counts = leafCount.contents().assumingMemoryBound(to: UInt16.self)
             for sb in decodeOrder() {
                 let r = (sb / sbCols) * 16, c = (sb % sbCols) * 16
@@ -519,10 +530,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     b.mi_row = UInt16(r + Int(leaf.y4))
                     b.mi_col = UInt16(c + Int(leaf.x4))
                     b.bsize = leaf.bsize
+                    // the analysis's best luma mode for this shape at this position
+                    let s = Int(leaf.bsize), size = AV1MetalEncoder.blockSizes[s]
+                    let li = (Int(b.mi_row) * 4 / size.h) * Int(shapeColumns[s]) + Int(b.mi_col) * 4 / size.w
+                    let res = results[Int(shapeOffset[s]) + li]
+                    if res.ncand > 0 {
+                        let cand = Int(res.cand.0)
+                        b.y_mode = UInt8(cand >> 3)
+                        b.angle_delta_y = Int8((cand & 7) - 3)
+                    }
                     blocks.append(b)
+                    types.append(res.ncand > 0 ? res.tx : 0)
                 }
             }
-            return blocks
+            return (blocks, types)
         }
 
         /// k_pack's work on the CPU: the per-superblock slots into one record, in decode order.

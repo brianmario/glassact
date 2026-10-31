@@ -259,6 +259,45 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: small-shape kernel, and a first CPU closed loop (2026-10-30)
+
+The previous entries' frames and machine. `av1still --hybrid` (new).
+
+**Small-shape analysis kernel (kept).** av1gpu's thread-per-block analysis of
+the shapes up to 64 pixels, on by default upstream, is now ported and on.
+It makes the same decisions, so the same bytes. On turbo with 3×3 tiles at
+5K, the analysis drops from ~356 to ~225 ms on typing-cc, scroll-win and
+photos (−36 %); base drops from ~1160 to ~960 ms.
+
+**The hybrid (prototype).** The GPU's analysis and partition DP give the
+partition and luma modes. The closed loop runs on the CPU through
+av1core's `TxbHook`, built from the reference engine: chroma modes and CfL
+from the source, the GPU's dead zone (rnd 0.375, zbin 0.656), luma tx types
+searched by exact reconstruction error, then skip flags. The GPU strength
+search and filters follow, then av1core's writer. Every stream decodes in
+libaom to the filtered picture. Single-threaded: av1core codes tiles one
+after another.
+
+| typing-cc frame 200 | GPU closed loop | hybrid (1 CPU thread) | size, hybrid vs GPU |
+|---|---|---|---|
+| 1280×720 2×2, q12 | 143.1 KB @ 80.17, closed loop 77 ms | 147.5 KB @ 80.06, closed loop 116 ms | +3.1 % |
+| 1280×720 2×2, q28 | 78.0 KB @ 64.91, 72 ms | 80.8 KB @ 63.85, 100 ms | +3.6 % |
+| 5120×2880 3×3, q12 | 674.5 KB @ 81.62, 272 ms | 697.6 KB @ 81.73, 997 ms | +3.4 % |
+| 5120×2880 3×3, q28 | 413.2 KB @ 69.60, 260 ms | 431.4 KB @ 69.35, 999 ms | +4.4 % |
+
+- Keeping the analysis's luma tx types instead of searching halves the CPU
+  closed loop (56 ms at 720p q12) but costs +8.7 % size. Not worth it.
+- The CPU closed loop is ~4× the GPU's single-threaded. Most of that is
+  the tx-type trials: double-precision matrix transforms, an inverse and an
+  SSE for each type. The writer alone reconstructs the 5K frame in ~115 ms.
+- **Projection, not measured:** with tiles coded on parallel threads (64
+  tiles at 5K on 14 cores), the CPU closed loop would be ~90–100 ms against
+  the GPU's 260–270, the writer ~6 ms, and the frame ~350 ms. A pipeline
+  with frame N+1's analysis on the GPU during frame N's CPU closed loop
+  would be analysis-bound at ~230 ms a frame. Both need av1core to code
+  tiles concurrently: its encoder keeps tile state (contexts, CDFs, cursor)
+  in one object.
+
 ### Where the Metal AV1 encoder's time goes (2026-10-30)
 
 The previous entry's encoder, turbo preset, typing-cc frame 200, q20,

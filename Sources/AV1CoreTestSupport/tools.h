@@ -48,6 +48,12 @@ struct RefEngineOpts {
     int lf_sharpness = 0;
     int cdef = 0;               // 1: CDEF with one fixed preset for every 64x64 (cdef_bits 0); no search
     int cdef_y_pri = 4, cdef_y_sec = 1, cdef_uv_pri = 2, cdef_uv_sec = 1, cdef_damping = 5;
+    // Glass Act: the closed loop's quantizer, level = |v| < zbin ? 0 : floor(|v| + rnd) in step units
+    // (default: plain rounding; the Metal encoder's dead zone is rnd 0.375, zbin 0.656)
+    double quant_rnd = 0.5, quant_zbin = 0.0;
+    // Glass Act: keep the record's luma tx types (decided elsewhere) instead of searching them
+    bool given_luma_tx = false;
+    int tile_cols_log2 = -1, tile_rows_log2 = -1;  // Glass Act: ref_engine_closed_loop's tiling
 };
 
 struct RefEngineStats {
@@ -63,6 +69,14 @@ struct RefEngineStats {
 // encoded output.
 int ref_engine_encode(const Image &src, const RefEngineOpts &o, OwnedRecord &rec, av1g_output *out,
                       RefEngineStats *stats, std::string &err);
+
+// Glass Act: the engine's closed loop on given blocks (partition and luma modes decided elsewhere,
+// e.g. by the Metal encoder's analysis): chroma modes and CfL from the source, then the closed
+// loop and the skip pass. No post-filters: out->recon is the PADDED pre-filter reconstruction
+// (AV1G_ENC_PREFILTER_RECON), and rec holds the record.
+int ref_engine_closed_loop(const Image &src, const RefEngineOpts &o, const std::vector<av1g_block> &given,
+                           OwnedRecord &rec, av1g_output *out, RefEngineStats *stats, std::string &err,
+                           const uint8_t *luma_tx = nullptr);
 
 }  // namespace av1g
 #endif

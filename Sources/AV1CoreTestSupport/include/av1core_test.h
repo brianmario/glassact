@@ -33,6 +33,23 @@ typedef struct av1t_ref_opts {
 int av1t_ref_encode(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w, uint32_t h,
                     const av1t_ref_opts *opts, av1g_output *out);
 
+// Glass Act research: the reference engine's closed loop on given blocks (partition and luma
+// modes decided elsewhere, e.g. by the Metal encoder's analysis), on 8-bit 4:2:0 planes as
+// av1t_ref_encode takes them: chroma modes and CfL from the source, the dead-zone quantizer
+// (rnd, zbin in step units; plain rounding is 0.5, 0), luma tx types searched when tx_types,
+// then skip flags. The record and the PADDED pre-filter reconstruction stay in the handle.
+typedef struct av1t_hybrid av1t_hybrid;
+// luma_tx (optional): each block's luma tx type, kept instead of searched.
+av1t_hybrid *av1t_hybrid_closed_loop(const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w, uint32_t h,
+                                     const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int qindex,
+                                     double rnd, double zbin, int tx_types, int tile_cols_log2, int tile_rows_log2,
+                                     char *err, size_t errlen);
+av1g_decision_record *av1t_hybrid_record(av1t_hybrid *h);
+const uint8_t *av1t_hybrid_recon(const av1t_hybrid *h, int plane);
+// 0: chroma decisions, 1: closed loop (seconds)
+double av1t_hybrid_seconds(const av1t_hybrid *h, int which);
+void av1t_hybrid_free(av1t_hybrid *h);
+
 // av1gpu's GPU-vs-CPU cases for the shared DSP (av1g_test/dsp_cases.h), with
 // the CPU's results. Arrays are tightly packed per case; the case and symbol
 // structs are opaque here (Swift only uploads them), sized by *_size.
