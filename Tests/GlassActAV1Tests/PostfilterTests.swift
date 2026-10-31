@@ -10,7 +10,7 @@ import Testing
 /// CDEF presets, skip and tx-size maps, frame edges, 128x128 superblocks),
 /// deblocking and CDEF of the reconstruction before them give av1core's
 /// filtered picture exactly.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct PostfilterTests {
     @available(macOS 27, *)
     @Test(arguments: 0..<6)

@@ -11,8 +11,8 @@ import libaom
 /// - av1core writes it, and its reconstruction is the GPU's, byte for byte, in
 ///   every plane: the GPU predicted from exactly what a decoder will have;
 /// - libaom decodes the stream to that same picture.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil && glassact_aom_available() != 0,
-                "needs a Metal device and libaom (arm64)"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
+                "needs an Apple-silicon GPU (not a VM's paravirtual one) and libaom (arm64)"))
 struct EncodeGateTests {
     @available(macOS 27, *)
     @Test(.serialized, arguments: [(333, 201, 40), (333, 201, 120), (1280, 720, 120), (1280, 720, 200)])

@@ -11,7 +11,7 @@ import Testing
 /// upsampling, filter intra), CfL, and the range coder with CDF adaptation.
 /// The CPU side is what DecoderGateTests checks against libaom, so equal here
 /// means the GPU computes what a decoder does.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct DSPEquivalenceTests {
     @available(macOS 27, *)
     @Test func gpuMatchesCPU() throws {

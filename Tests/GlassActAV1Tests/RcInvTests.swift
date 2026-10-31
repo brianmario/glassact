@@ -1,5 +1,6 @@
 import AV1CoreTestSupport
 import Foundation
+import GlassActAV1
 import Metal
 import Testing
 
@@ -7,7 +8,7 @@ import Testing
 /// rc_inv.cuh, in Metal) give av1core's residual for every conformant tx
 /// block of the DSP cases, and flag every non-conformant one. 128 threads per
 /// block take rows, then columns, as the closed loop runs them.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct RcInvTests {
     @available(macOS 27, *)
     @Test func matchesAV1Core() throws {

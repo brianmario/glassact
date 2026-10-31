@@ -8,7 +8,7 @@ import Testing
 /// The structures the host fills and the kernels read (gp.h) have one layout:
 /// Swift's import of the C header and the Metal compiler agree on every size
 /// and on the offsets of fields after each change of type.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct EncoderLayoutTests {
     @available(macOS 27, *)
     @Test func hostAndKernelsAgree() throws {

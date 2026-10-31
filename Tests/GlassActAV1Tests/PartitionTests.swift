@@ -10,8 +10,8 @@ import libaom
 /// screen-like picture: av1core accepts it as a record (every block DC and
 /// skipped) and libaom decodes that to av1core's reconstruction. And they
 /// decide like an encoder: small blocks on dense text, large ones on flat UI.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil && glassact_aom_available() != 0,
-                "needs a Metal device and libaom (arm64)"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
+                "needs an Apple-silicon GPU (not a VM's paravirtual one) and libaom (arm64)"))
 struct PartitionTests {
     struct Picture {
         let width: Int, height: Int

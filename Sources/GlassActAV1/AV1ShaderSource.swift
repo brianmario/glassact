@@ -45,6 +45,14 @@ public enum AV1ShaderSource {
     /// `Sources/`, for tests that compile a shader of the package.
     public static var sourceRootForTests: URL { sourceRoot }
 
+    /// Whether this Mac's GPU runs the kernels: an Apple-silicon GPU, not a virtual machine's
+    /// paravirtual one. CI's hosted runners are VMs: the encoder's library doesn't compile there,
+    /// and kernels that do compile don't compute exactly, so the GPU tests need real hardware.
+    public static var hasCapableGPU: Bool {
+        guard let device = MTLCreateSystemDefaultDevice() else { return false }
+        return device.supportsFamily(.apple7) && !device.name.localizedCaseInsensitiveContains("paravirtual")
+    }
+
     /// `Sources/`.
     static let sourceRoot = URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
 

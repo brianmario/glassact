@@ -5,7 +5,7 @@ import Testing
 
 /// The encoder's kernels (Sources/GlassActAV1/Shaders/encoder.metal) compile,
 /// and each fits Metal's threadgroup memory.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct EncoderShaderTests {
     @available(macOS 27, *)
     @Test func kernelsCompile() throws {

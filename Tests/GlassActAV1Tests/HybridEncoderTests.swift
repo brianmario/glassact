@@ -10,8 +10,8 @@ import libaom
 /// filters, av1core's writer) is an encoder of the decoder's pictures: every
 /// stream decodes in libaom to exactly the picture it reports, alone and in
 /// an overlapped sequence, and a sequence gives the pictures alone would.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil && glassact_aom_available() != 0,
-                "needs a Metal device and libaom (arm64)"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
+                "needs an Apple-silicon GPU (not a VM's paravirtual one) and libaom (arm64)"))
 struct HybridEncoderTests {
     @available(macOS 27, *)
     @Test(.serialized, arguments: [(333, 201, 40, -1), (1280, 720, 120, 2), (1280, 720, 200, 1)])

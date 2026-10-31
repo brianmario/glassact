@@ -11,7 +11,7 @@ import libaom
 /// tiles, partitions at the frame edges, modes, CfL, tx sizes and types,
 /// coefficients up to the Golomb range, delta-q, filter intra, CDEF indices)
 /// and the Metal encoder's own pictures must give the CPU's OBUs exactly.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct EntropyTests {
     @available(macOS 27, *)
     @Test(arguments: 0..<4)

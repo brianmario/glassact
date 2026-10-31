@@ -46,6 +46,10 @@ jobs:
         # of lag. Hosted VMs can't drive the relay hard enough for that
         # (byte-gate p95 ~400 ms instead of > 1 s), so it only runs locally
         # (`just test`).
+        # The AV1 encoder's GPU suites (GlassActAV1Tests) skip themselves here: a hosted runner is a
+        # VM whose paravirtual GPU doesn't compile or run the kernels exactly
+        # (AV1ShaderSource.hasCapableGPU). Their CPU half runs: the Rust tests above and the libaom
+        # decode gates (AV1CoreTests).
         run: swift test --skip "VideoSendGateTests|$QUIC_SUITES"
       - name: Real-QUIC tests
         # One suite at a time: run side by side, the suites still starved each

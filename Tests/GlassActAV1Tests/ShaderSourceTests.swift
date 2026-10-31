@@ -4,7 +4,7 @@ import Metal
 import Testing
 
 /// Every av1core header the kernels share compiles as Metal Shading Language.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct ShaderSourceTests {
     @available(macOS 27, *)
     @Test func sharedHeadersCompile() throws {

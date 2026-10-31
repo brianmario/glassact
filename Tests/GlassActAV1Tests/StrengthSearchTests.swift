@@ -14,8 +14,8 @@ import libaom
 /// - its preset search chooses what the sequential reference chooses;
 /// - the picture coded with its choices decodes in libaom to exactly the
 ///   picture it filtered.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil && glassact_aom_available() != 0,
-                "needs a Metal device and libaom (arm64)"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
+                "needs an Apple-silicon GPU (not a VM's paravirtual one) and libaom (arm64)"))
 struct StrengthSearchTests {
     @available(macOS 27, *)
     @Test(.serialized, arguments: [(333, 201, 24), (333, 201, 120), (1280, 720, 120), (333, 201, 240)])

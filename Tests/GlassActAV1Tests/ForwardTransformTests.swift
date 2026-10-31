@@ -1,5 +1,6 @@
 import AV1CoreTestSupport
 import Foundation
+import GlassActAV1
 import GlassActTestSupport
 import Metal
 import Testing
@@ -9,7 +10,7 @@ import Testing
 /// the decoder's inverse: av1core's inverse of the rounded coefficients gives
 /// back the residual within rounding, for every tx size up to 32 points and
 /// every intra tx type.
-@Suite(.enabled(if: MTLCreateSystemDefaultDevice() != nil, "needs a Metal device"))
+@Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct ForwardTransformTests {
     @available(macOS 27, *)
     @Test func inverseUndoesIt() throws {
