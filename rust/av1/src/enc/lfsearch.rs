@@ -79,11 +79,19 @@ pub fn cdef_select_cpu(
     tot_out: &mut [u64],
 ) {
     let pairs = if mono { nc } else { nc * nc };
+    let my = &my[..nsb * nc];
+    let muv = if mono { &[][..] } else { &muv[..nsb * nc] };
+    // Every SB's cost under every (luma, chroma) candidate pair fits 32 bits for real SSE tables
+    // (a 64x64's luma and chroma SSE together stay under 2^29): then the search runs on per-pair
+    // rows, and each step is a vectorizable min and widening sum. Otherwise, the reference loop.
+    let fits = my.iter().max().copied().unwrap_or(0) as u64 + muv.iter().max().copied().unwrap_or(0) as u64
+        <= u32::MAX as u64;
+    if fits && pairs <= 16 {
+        return select_rows(my, muv, nc, nsb, mono, max_bits, refine, fast_mono, lev_out, tot_out);
+    }
     let mut lev = [0usize; 16];
     let mut cur = vec![0u64; nsb];
     let mut tot = vec![0u64; pairs];
-    let my = &my[..nsb * nc];
-    let muv = if mono { &[][..] } else { &muv[..nsb * nc] };
     for i in 0..=max_bits {
         let nb = 1 << i;
         let steps = nb + if fast_mono { 0 } else { refine * nb };
@@ -131,5 +139,102 @@ pub fn cdef_select_cpu(
         for j in 0..16 {
             lev_out[i * 16 + j] = lev[j] as i32;
         }
+    }
+}
+
+/// cdef_select_cpu on per-pair rows: `rows[p][sb]` is SB sb's cost under candidate pair p (luma p / nc,
+/// chroma p % nc; luma p for mono). Same steps, same results.
+#[allow(clippy::too_many_arguments)]
+fn select_rows(
+    my: &[u32],
+    muv: &[u32],
+    nc: usize,
+    nsb: usize,
+    mono: bool,
+    max_bits: usize,
+    refine: usize,
+    fast_mono: bool,
+    lev_out: &mut [i32],
+    tot_out: &mut [u64],
+) {
+    let pairs = if mono { nc } else { nc * nc };
+    let mut rows = vec![0u32; pairs * nsb];
+    for (p, row) in rows.chunks_exact_mut(nsb).enumerate() {
+        let (pj, pk) = if mono { (p, 0) } else { (p / nc, p % nc) };
+        for (sb, r) in row.iter_mut().enumerate() {
+            *r = my[sb * nc + pj] + if mono { 0 } else { muv[sb * nc + pk] };
+        }
+    }
+    let pair_of = |lev: &[usize; 16], g: usize| if mono { lev[g] } else { lev[g] * nc + lev[8 + g] };
+    let mut lev = [0usize; 16];
+    let mut cur = vec![0u32; nsb];
+    let mut tot = [0u64; 16];
+    for i in 0..=max_bits {
+        let nb = 1 << i;
+        let steps = nb + if fast_mono { 0 } else { refine * nb };
+        for st in 0..steps {
+            let k = if st < nb { st } else { nb - 1 };
+            if st >= nb {
+                for j in 0..nb - 1 {
+                    lev[j] = lev[j + 1];
+                    lev[8 + j] = lev[8 + j + 1];
+                }
+            }
+            // the cost with the k presets kept (none: no bound)
+            cur.fill(u32::MAX);
+            for g in 0..k {
+                let row = &rows[pair_of(&lev, g) * nsb..][..nsb];
+                for (c, &r) in cur.iter_mut().zip(row) {
+                    *c = (*c).min(r);
+                }
+            }
+            for (p, t) in tot[..pairs].iter_mut().enumerate() {
+                *t = min_sum(&rows[p * nsb..][..nsb], &cur);
+            }
+            let mut bi = 0;
+            for q in 1..pairs {
+                if tot[q] < tot[bi] {
+                    bi = q;
+                }
+            }
+            lev[k] = if mono { bi } else { bi / nc };
+            lev[8 + k] = if mono { 0 } else { bi % nc };
+            tot_out[i] = tot[bi];
+        }
+        for j in 0..16 {
+            lev_out[i * 16 + j] = lev[j] as i32;
+        }
+    }
+}
+
+/// sum over i of min(a[i], b[i]), widened to u64
+#[inline]
+fn min_sum(a: &[u32], b: &[u32]) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let n = a.len().min(b.len());
+        let mut i = 0;
+        // SAFETY: loads stay within i + 8 <= n; NEON is baseline on aarch64.
+        let mut acc = unsafe { [vdupq_n_u64(0); 2] };
+        unsafe {
+            while i + 8 <= n {
+                let m0 = vminq_u32(vld1q_u32(a.as_ptr().add(i)), vld1q_u32(b.as_ptr().add(i)));
+                let m1 = vminq_u32(vld1q_u32(a.as_ptr().add(i + 4)), vld1q_u32(b.as_ptr().add(i + 4)));
+                acc[0] = vpadalq_u32(acc[0], m0);
+                acc[1] = vpadalq_u32(acc[1], m1);
+                i += 8;
+            }
+        }
+        // SAFETY: NEON is baseline on aarch64.
+        let mut s = unsafe { vaddvq_u64(vaddq_u64(acc[0], acc[1])) };
+        for j in i..n {
+            s += a[j].min(b[j]) as u64;
+        }
+        s
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        a.iter().zip(b).map(|(&x, &y)| x.min(y) as u64).sum()
     }
 }

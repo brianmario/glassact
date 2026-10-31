@@ -75,7 +75,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/postfilter.metal"), device: device)
         var pipelines: [String: any MTLComputePipelineState] = [:]
-        for name in ["p_mark", "p_deblock", "p_cdef_dir", "p_cdef", "l_cdef_idx_norm", "l_cdef_sse", "l_select_small", "l_assign",
+        for name in ["p_mark", "p_deblock", "p_cdef_dir", "p_cdef", "l_cdef_idx_norm", "l_cdef_sse", "l_assign",
                      "p_deblock_r", "p_cdef_dir_r", "p_cdef_r", "l_cdef_sse_r", "l_restore_idx", "l_assign_r"] {
             guard let function = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }
             pipelines[name] = try device.makeComputePipelineState(function: function)
@@ -112,9 +112,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// With `changed` (per 64×64, raster: nonzero where the reconstruction,
     /// the blocks or the source may differ from the previous call's picture),
     /// only the area around them is filtered and searched anew, and the rest
-    /// keeps the previous picture's output, as long as the presets come out
-    /// the same; otherwise, and on a first picture, everything is. The result
-    /// is the same either way.
+    /// keeps the previous picture's output. When the presets come out
+    /// different, every 64×64's choice is redone and CDEF reruns wherever its
+    /// strengths changed. A first picture is filtered whole. The result is
+    /// the same either way.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
                        sourceStrides: [Int]? = nil, changed: [UInt8]? = nil) throws -> Search {
@@ -162,7 +163,6 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
         if job.nPlanes == 1 { memset(chromaSSE.contents(), 0, 4 * nsb * nc) }  // stays 0 for a monochrome picture
-        let current = try job.scratch("current", 8 * nsb)
         let bitsCount = Self.maxCDEFBits + 1
         let levels = try job.scratch("levels", 4 * 16 * bitsCount), totals = try job.scratch("totals", 8 * bitsCount)
         var candidates = Self.candidates
@@ -179,19 +179,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             compute.setBuffer(chromaSSE, offset: 0, index: 7)
             compute.dispatchThreadgroups(MTLSize(width: nsb, height: 1, depth: 1),
                                          threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            compute.memoryBarrier(scope: .buffers)
-            compute.setComputePipelineState(pipelines["l_select_small"]!)
-            var args: [Int32] = [Int32(nc), Int32(nsb), mono ? 1 : 0, Int32(Self.maxCDEFBits), Int32(Self.refinements),
-                                 mono ? 1 : 0]  // libaom doesn't refine a fast single-plane search
-            compute.setBuffer(lumaSSE, offset: 0, index: 0)
-            compute.setBuffer(chromaSSE, offset: 0, index: 1)
-            compute.setBuffer(current, offset: 0, index: 2)
-            compute.setBuffer(levels, offset: 0, index: 3)
-            compute.setBuffer(totals, offset: 0, index: 4)
-            compute.setBytes(&args, length: 4 * args.count, index: 5)
-            compute.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
         }
+        Self.select(lumaSSE, chromaSSE, nc: nc, nsb: nsb, mono: mono, levels: levels, totals: totals)
 
         let presetSSE = Array(UnsafeBufferPointer(start: totals.contents().assumingMemoryBound(to: UInt64.self), count: bitsCount))
         let lev = levels.contents().assumingMemoryBound(to: Int32.self)
@@ -223,8 +212,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
 
     /// `search` around the changed 64×64s only, on the previous picture's job:
     /// deblocking over them dilated by two (so that one in, it's exact),
-    /// directions, SSE rows, assignment and CDEF over them dilated by one. Nil
-    /// if the presets come out other than the previous picture's.
+    /// directions, SSE rows, assignment and CDEF over them dilated by one (and
+    /// CDEF wherever new presets change a 64×64's strengths). Nil without a
+    /// previous picture.
     private func searchChanged(_ job: Job, fp base: av1g_frame_params, tf: GaTuneiqFrame,
                                blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                                source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8]) throws -> Search? {
@@ -254,7 +244,6 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                       superblocks: innerList, side: p == 0 ? 64 : 32, sbCols: sbCols)
         }
         let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
-        let current = try job.scratch("current", 8 * nsb)
         let bitsCount = Self.maxCDEFBits + 1
         let levels = try job.scratch("levels", 4 * 16 * bitsCount), totals = try job.scratch("totals", 8 * bitsCount)
         let innerBuffer = try job.scratch("innerList", 4 * max(1, innerList.count))
@@ -294,18 +283,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 compute.dispatchThreadgroups(MTLSize(width: innerList.count, height: 1, depth: 1),
                                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
-            compute.memoryBarrier(scope: .buffers)
-            compute.setComputePipelineState(pipelines["l_select_small"]!)
-            var args: [Int32] = [Int32(nc), Int32(nsb), mono ? 1 : 0, Int32(Self.maxCDEFBits), Int32(Self.refinements), mono ? 1 : 0]
-            compute.setBuffer(lumaSSE, offset: 0, index: 0)
-            compute.setBuffer(chromaSSE, offset: 0, index: 1)
-            compute.setBuffer(current, offset: 0, index: 2)
-            compute.setBuffer(levels, offset: 0, index: 3)
-            compute.setBuffer(totals, offset: 0, index: 4)
-            compute.setBytes(&args, length: 4 * args.count, index: 5)
-            compute.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
         }
+        Self.select(lumaSSE, chromaSSE, nc: nc, nsb: nsb, mono: mono, levels: levels, totals: totals)
         let presetSSE = Array(UnsafeBufferPointer(start: totals.contents().assumingMemoryBound(to: UInt64.self), count: bitsCount))
         let lev = levels.contents().assumingMemoryBound(to: Int32.self)
         let presets = (0..<bitsCount).map { Array(UnsafeBufferPointer(start: lev + 16 * $0, count: 16)) }
@@ -314,9 +293,50 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             av1enc_cdef_bits($0.baseAddress, Int32(Self.maxCDEFBits), Int32(active), mono ? 1 : 0, tf.rdmult)
         })
         av1enc_cdef_presets(presets[bits], Int32(bits), tf.cdef_mode, &candidates, &fp)
-        guard let previous = job.previousParams, Self.sameCDEF(fp, previous) else { return nil }
-        job.setParams(fp)
+        guard let previous = job.previousParams else { return nil }
         let prevIdx = try job.scratch("previousIndex", nsb)
+        func words(_ b: any MTLBuffer) -> [UInt32] {
+            Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: UInt32.self), count: nsb * nc))
+        }
+        if !Self.sameCDEF(fp, previous) {
+            // New presets: every SB's choice is redone from the SSE tables (the rows outside the
+            // region are still exact: their deblocked input and source are unchanged), and CDEF is
+            // rerun where a choice's strengths differ from what the previous picture applied.
+            job.setParams(fp)
+            try run { compute in
+                job.begin(compute, "l_assign")
+                var args: [Int32] = [Int32(nc), Int32(nsb), mono ? 1 : 0, Int32(1 << bits)]
+                compute.setBuffer(lumaSSE, offset: 0, index: 1)
+                compute.setBuffer(chromaSSE, offset: 0, index: 2)
+                compute.setBuffer(levels, offset: 16 * 4 * bits, index: 3)
+                compute.setBytes(&args, length: 4 * args.count, index: 4)
+                compute.dispatchThreads(MTLSize(width: nsb, height: 1, depth: 1),
+                                        threadsPerThreadgroup: MTLSize(width: min(64, nsb), height: 1, depth: 1))
+            }
+            let now = job.cdefIdx.contents().assumingMemoryBound(to: Int8.self)
+            let before = prevIdx.contents().assumingMemoryBound(to: Int8.self)
+            let redo = (0..<nsb).filter {
+                inner[$0] != 0 || (now[$0] >= 0 && Self.strengths(fp, now[$0]) != Self.strengths(previous, before[$0]))
+            }.map(UInt32.init)
+            if !redo.isEmpty {
+                let redoBuffer = try job.scratch("redoList", 4 * redo.count)
+                redo.withUnsafeBytes { redoBuffer.contents().copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
+                var redoRegion = (UInt32(redo.count), UInt32(sbCols))
+                try run { compute in
+                    job.begin(compute, "p_cdef_r")
+                    for p in 0..<3 { compute.setBuffer(job.output[p], offset: 0, index: 3 + p) }
+                    compute.setBytes(&redoRegion, length: 8, index: 8)
+                    compute.setBuffer(redoBuffer, offset: 0, index: 9)
+                    compute.dispatchThreads(MTLSize(width: redo.count * 4096, height: 1, depth: job.nPlanes),
+                                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                }
+            }
+            try job.remember(key: job.previousKey!, params: fp)
+            lastFilteredShare = Double(redo.count) / Double(nsb)
+            return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
+                          lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
+        }
+        job.setParams(fp)
         try run { compute in
             job.begin(compute, "l_restore_idx")
             compute.setBuffer(prevIdx, offset: 0, index: 1)
@@ -341,13 +361,32 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             compute.dispatchThreads(MTLSize(width: innerList.count * 4096, height: 1, depth: job.nPlanes),
                                     threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
         }
-        func words(_ b: any MTLBuffer) -> [UInt32] {
-            Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: UInt32.self), count: nsb * nc))
-        }
         try job.remember(key: job.previousKey!, params: fp)
         lastFilteredShare = Double(innerList.count) / Double(nsb)
         return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: job.cropped(job.output),
                       lumaSSE: words(lumaSSE), chromaSSE: words(chromaSSE), presets: presets, presetSSE: presetSSE)
+    }
+
+    /// What CDEF applies to a 64×64 with preset `idx` under fp: luma and chroma primary and
+    /// secondary strengths (nil: not filtered).
+    static func strengths(_ fp: av1g_frame_params, _ idx: Int8) -> [UInt8]? {
+        guard idx >= 0 else { return nil }
+        let i = Int(idx)
+        func at(_ t: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)) -> UInt8 { withUnsafeBytes(of: t) { $0[i] } }
+        return [at(fp.cdef_y_pri), at(fp.cdef_y_sec), at(fp.cdef_uv_pri), at(fp.cdef_uv_sec)]
+    }
+
+    /// libaom's joint greedy preset search on the SSE tables (av1enc_cdef_select_cpu), into
+    /// `levels` and `totals`. On the CPU: it's a few million min-and-adds, serial from step to
+    /// step, which a single GPU threadgroup of 64-bit math did several times slower at 5K.
+    static func select(_ lumaSSE: any MTLBuffer, _ chromaSSE: any MTLBuffer, nc: Int, nsb: Int, mono: Bool,
+                       levels: any MTLBuffer, totals: any MTLBuffer) {
+        av1enc_cdef_select_cpu(lumaSSE.contents().assumingMemoryBound(to: UInt32.self),
+                               chromaSSE.contents().assumingMemoryBound(to: UInt32.self), Int32(nc), Int32(nsb),
+                               mono ? 1 : 0, Int32(maxCDEFBits), Int32(refinements),
+                               mono ? 1 : 0,  // libaom doesn't refine a fast single-plane search
+                               levels.contents().assumingMemoryBound(to: Int32.self),
+                               totals.contents().assumingMemoryBound(to: UInt64.self))
     }
 
     static func sameCDEF(_ a: av1g_frame_params, _ b: av1g_frame_params) -> Bool {

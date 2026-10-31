@@ -259,6 +259,33 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: filters when the CDEF presets change; preset selection on the CPU (2026-10-31)
+
+`av1seq`, turbo, q20, 60 frames, M4 Pro. Interleaved A/B runs on a loaded machine; every byte is unchanged and every decode exact.
+
+**Presets that change no longer re-filter the frame (kept, exact).** With only changed tiles filtered, the whole frame was still filtered again whenever the joint search picked different CDEF presets. That happened often enough that 5K typing filtered 29 % of the frame on average.
+
+Now, when the presets differ:
+- every 64×64's preset is re-chosen from the SSE tables (the rows outside the changed area are still exact);
+- CDEF reruns only in the changed area and where a 64×64's applied strengths changed.
+
+5K typing-cc, 4×4 tiles: filtered 29 → 2 %, filters 10 → 5 ms, 44 → 60 fps.
+
+**Preset selection on the CPU (kept, exact).** libaom's joint greedy search (`l_select_small`: every cdef_bits level, 45 greedy and refinement steps) ran in a single 1024-thread GPU threadgroup in 64-bit math. That took ~2.5–3 ms of GPU time at 5K.
+
+It now runs as `av1enc_cdef_select_cpu`, the Rust reference the kernel was held to:
+- costs precomputed per (luma, chroma) preset pair as contiguous u32 rows (a 64×64's SSE fits);
+- each step a NEON min and widening sum;
+- the u64 reference loop as the fallback for tables that wouldn't fit 32 bits.
+
+The kernel is removed. Swapping in the CPU search unoptimized was slower at 5K (filters 5 → 6.7 ms); the rows made it faster.
+
+| Sequence | Before both | After |
+|---|---|---|
+| typing-cc 5K, 4×4 | 47 fps (filters 10.0 ms) | **65.8 fps** (3.6 ms) |
+| typing-cc 1080p, 3×3 | 208 | **232** |
+| photos 720p, 3×3 | 80 | **96** |
+
 ### Metal AV1: the CPU code in Rust (2026-10-31)
 
 The AV1 encoder's CPU code moved from C++ to Rust (`rust/av1`, std only):
