@@ -191,6 +191,10 @@ struct GpBatch {
     // Glass Act: per SB (raster), 1 = keep the previous picture's analysis, DP and leaf decisions
     // (the source it reads is unchanged); may be null (compute every SB)
     GP_DEV const uint8_t *sbKeep;
+    // Glass Act: if set (one image), the analysis kernels and the DP visit only these SBs (raster),
+    // nSbList of them: per shape the grid is nSbList x the shape's blocks per SB
+    GP_DEV const uint32_t *sbList;
+    uint32_t nSbList;
 };
 
 #endif

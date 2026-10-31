@@ -105,6 +105,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let key: [UInt8]
         let blockResults: any MTLBuffer, leaves: any MTLBuffer, leafCount: any MTLBuffer
         let leafDecisions: any MTLBuffer, sbJ: any MTLBuffer, keep: any MTLBuffer
+        /// The SBs to analyze (raster), staleCount of them.
+        let stale: any MTLBuffer
+        var staleCount = 0
         var previous: [[UInt8]]? = nil
         var keptCount = 0
 
@@ -122,6 +125,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
             sbJ = try make(nSb * 4)
             keep = try make(nSb)
+            stale = try make(nSb * 4)
         }
 
         /// Sets `keep` from the new source against the previous one, and remembers the new one.
@@ -130,8 +134,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let cw = (width + 1) / 2, ch = (height + 1) / 2
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
             let k = keep.contents().assumingMemoryBound(to: UInt8.self)
+            let list = stale.contents().assumingMemoryBound(to: UInt32.self)
             guard let prev = previous else {
                 memset(k, 0, sbCols * sbRows)
+                for i in 0..<(sbCols * sbRows) { list[i] = UInt32(i) }
+                staleCount = sbCols * sbRows
                 keptCount = 0
                 previous = planes.map { Array(UnsafeBufferPointer(start: $0.0, count: $0.1 * $0.2)) }
                 return
@@ -155,12 +162,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             func changedAt(_ r: Int, _ c: Int) -> Bool { r >= 0 && c >= 0 && r < sbRows && c < sbCols && changed[r * sbCols + c] }
             keptCount = 0
+            staleCount = 0
             for r in 0..<sbRows {
                 for c in 0..<sbCols {
-                    let stale = changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
+                    let isStale = changedAt(r, c) || changedAt(r, c - 1) || changedAt(r - 1, c) || changedAt(r - 1, c - 1)
                         || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1)
-                    k[r * sbCols + c] = stale ? 0 : 1
-                    if !stale { keptCount += 1 }
+                    k[r * sbCols + c] = isStale ? 0 : 1
+                    if isStale {
+                        list[staleCount] = UInt32(r * sbCols + c)
+                        staleCount += 1
+                    } else {
+                        keptCount += 1
+                    }
                 }
             }
             for (p, (pixels, w, h)) in planes.enumerated() {
@@ -414,6 +427,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let leafDecisions: any MTLBuffer
         /// Superblocks whose analysis the previous picture's stands for (`reusesAnalysis`).
         let keptSuperblocks: Int
+        /// With `reusesAnalysis`, the superblocks to analyze (the rest are kept).
+        let staleSuperblocks: Int?
         /// k_leaf's list of every SB's leaves, and its indirect dispatch.
         let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer
         let decidesLeaves: Bool
@@ -540,12 +555,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             leafOffsets = try make(4 * (nSb + 1))
             leafDispatch = try make(MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
             let sbJ = try cache.map { keep($0.sbJ) } ?? make(nSb * 4)
-            var sbKeep: (any MTLBuffer)?
+            var sbKeep: (any MTLBuffer)?, sbList: (any MTLBuffer)?
             if let cache {
                 cache.markUnchanged(y: y, u: u, v: v, width: width, height: height,
                                     sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4)
                 sbKeep = keep(cache.keep)
+                sbList = keep(cache.stale)
             }
+            staleSuperblocks = cache?.staleCount
             keptSuperblocks = cache?.keptCount ?? 0
             encoder.lastKeptSuperblocks = keptSuperblocks
             sbOut = try make(nSb * MemoryLayout<GpSbOut>.stride)
@@ -590,6 +607,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.bigScratch = UnsafeMutableRawPointer(bitPattern: UInt(scratch.gpuAddress))
             batch.leafDec = AV1MetalEncoder.address(leafDecisions)
             batch.sbKeep = sbKeep.flatMap { AV1MetalEncoder.address($0) }
+            batch.sbList = sbList.flatMap { AV1MetalEncoder.address($0) }
+            batch.nSbList = UInt32(staleSuperblocks ?? 0)
             tiles = tl
             buffers = made
         }
@@ -608,7 +627,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.leafTxSearch = 1
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
-                guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder()
+                guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
                 else { throw Failure.metal("no command encoder") }
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
                 e.setBytes(&batch, length: MemoryLayout<GpBatch>.stride, index: 0)
@@ -632,6 +651,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var e = try open()
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
                 var n = shTotal[s]
+                if let stale = staleSuperblocks {  // only the listed SBs' blocks
+                    let size = AV1MetalEncoder.blockSizes[s]
+                    n = UInt32(stale * (64 / size.w) * (64 / size.h))
+                    if n == 0 { continue }
+                }
                 if params.smallKernel != 0, let pipeline = encoder.analysisSmall[s] {
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
@@ -649,9 +673,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             e = try open()
             e.memoryBarrier(scope: .buffers)
             let nSb = sbCols * sbRows
-            e.setComputePipelineState(encoder.dp)
-            e.dispatchThreads(MTLSize(width: nSb, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: min(64, nSb), height: 1, depth: 1))
+            let dpThreads = staleSuperblocks ?? nSb
+            if dpThreads > 0 {
+                e.setComputePipelineState(encoder.dp)
+                e.dispatchThreads(MTLSize(width: dpThreads, height: 1, depth: 1),
+                                  threadsPerThreadgroup: MTLSize(width: min(64, dpThreads), height: 1, depth: 1))
+            }
             if decidesLeaves {
                 e.memoryBarrier(scope: .buffers)
                 e.setComputePipelineState(encoder.leafScan)

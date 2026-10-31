@@ -318,9 +318,37 @@ fresh encoding (HybridEncoderTests).
 | typing-cc 1080p | 39.9 fps | **52.8 fps** | 94 % |
 | typing-cc 5K, 3×3 | 9.6 fps | **19.7 fps** (closed loop 60 → 9.7 ms, writer 5.8 → 0.6) | 99 % |
 
+**Only stale SBs dispatched; shapes concurrent (kept).** The analysis kernels
+and the DP take a list of the SBs to recompute instead of launching every
+block. That alone changed nothing, because the cost was latency: 19 shape
+dispatches in a row, each over a few SBs. A fully kept picture costs the GPU
+0.01 ms. With the encoder's dispatches concurrent (shapes are independent;
+barriers separate the stages), at 2×2 tiles:
+
+| trace, size | before | concurrent | GPU per frame |
+|---|---|---|---|
+| typing-cc 720p | 87.4 fps | **102.8 fps** | 9.2 → 3.3 ms |
+| scroll-win 720p | 61.8 | **72.6** | 14.2 → 9.8 |
+| photos 720p | 39.7 | **41.9** | |
+| typing-cc 1080p | 45.4 | **46.9** | 9.7 → 4.7 |
+
+**More tiles, now that unchanged ones cost nothing.** A changed tile is coded
+on one thread, so smaller tiles spread a change over more cores:
+
+| typing-cc | 2×2 (16) | 3×2 (32) | 3×3 (64) | 4×3 (128) |
+|---|---|---|---|---|
+| 720p | 102.8 fps · 108.1 KB | | **174.0 fps · 109.3 KB** | **184.2 fps · 110.2 KB** |
+| 1080p | 50.4 fps · 199.3 KB | 73.4 fps · 200.9 KB | **96.6 fps · 201.4 KB** | |
+| 5K | (3×3: 18.3 fps · 539.5 KB) | | 4×4: 20.5 · 551.4 KB | 5×4: 20.3 · 560.3 KB |
+
+The size cost is 1–2 % at 720p and 1080p. At 5K the frame doesn't
+follow, because whole-frame work leads there: the filters (~19 ms wall,
+~12 of it GPU) and the CPU's per-frame bookkeeping (~8 ms: padding the
+source, layout, block fields).
+
 What's left:
 - At 720p, the GPU's 9 ms with 97 % kept: every block's thread still
-  launches to find its SB kept.
+  launches to find its SB kept (since fixed above).
 - At 5K, the filters (19 ms, whole frame) and the CPU's fixed costs: source
   padding and recon copies of the whole frame, and per-block bookkeeping.
 

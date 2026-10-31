@@ -137,8 +137,15 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             if (starts[mid] <= gb) lo = mid; else hi = mid - 1;
         }
         device const GpImage &I = B.img[lo];
-        const uint32_t li = gb - starts[lo];
         const int nbx = I.shNbx[BS];
+        uint32_t li = gb - starts[lo];
+        if (B.sbList) {  // Glass Act: only the listed SBs (one image)
+            const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
+            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            if (bx >= nbx || by >= I.shNby[BS]) continue;
+            li = (uint32_t)(by * nbx + bx);
+        }
         const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
         device GpBlockRes &out = B.blk[I.shOff[BS] + li];
         if (x >= I.MiCols * 4 || y >= I.MiRows * 4) {

@@ -21,6 +21,7 @@ let av1SeqCommand = Command(
         .int("q", "<0-63>", 0...63, "quantizer, libaom's scale; qindex 4q, 63 → 255 (default 20)"),
         .string("preset", "<name>", "analysis preset: slow, base, fast, faster, turbo (default), turbo2, turbo3"),
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
+        .int("repeat", "<n>", 1...1000, "encode the sequence n times over (for profiling; default 1)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
@@ -76,13 +77,18 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 
     var frames: [AV1HybridEncoder.Frame] = []
     frames.reserveCapacity(pictures.count)
-    let t0 = CACurrentMediaTime()
-    if serial {
-        for i in 0..<pictures.count { frames.append(try encoder.encode(picture(i), qindex: qindex)) }
-    } else {
-        try encoder.encode(count: pictures.count, qindex: qindex, picture: { picture($0) }, output: { _, f in frames.append(f) })
+    let repeats = opts.int("repeat", 1)
+    var seconds = 0.0
+    for r in 0..<repeats {
+        if r > 0 { frames.removeAll(keepingCapacity: true) }
+        let t0 = CACurrentMediaTime()
+        if serial {
+            for i in 0..<pictures.count { frames.append(try encoder.encode(picture(i), qindex: qindex)) }
+        } else {
+            try encoder.encode(count: pictures.count, qindex: qindex, picture: { picture($0) }, output: { _, f in frames.append(f) })
+        }
+        seconds = CACurrentMediaTime() - t0
     }
-    let seconds = CACurrentMediaTime() - t0
 
     var psnr = 0.0
     for (i, f) in frames.enumerated() {

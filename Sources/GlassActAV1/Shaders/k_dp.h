@@ -20,7 +20,9 @@ __device__ __forceinline__ float dp_blockJ(constant GpBatch &B, device const GpI
 
 struct DpNode { float J; int8_t p; };
 
-kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]], uint sb [[thread_position_in_grid]]) {
+kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]], uint tid [[thread_position_in_grid]]) {
+    // Glass Act: with an SB list, thread i takes its i-th SB
+    const uint32_t sb = B.sbList ? (tid < B.nSbList ? B.sbList[tid] : 0xFFFFFFFFu) : tid;
     if (sb >= B.nSb) return;
     if (B.sbKeep && B.sbKeep[sb]) return;  // Glass Act: unchanged source, so unchanged leaves
     device const GpImage &I = B.img[B.sbImg[sb]];
