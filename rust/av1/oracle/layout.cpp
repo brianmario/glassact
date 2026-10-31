@@ -18,6 +18,7 @@ extern "C" long long oracle_layout(const char *what) {
     O("FrameParams", av1g_frame_params, ref_slot) O("FrameParams", av1g_frame_params, refresh_frame_flags)
     O("FrameParams", av1g_frame_params, error_resilient_mode) O("FrameParams", av1g_frame_params, reserved)
     O("FrameParams", av1g_frame_params, lf_inter_off) O("FrameParams", av1g_frame_params, cdf_from_ref)
+    O("FrameParams", av1g_frame_params, mv_precision)
     S("BlockInter", av1g_block_inter) O("BlockInter", av1g_block_inter, mv_row) O("BlockInter", av1g_block_inter, mv_col)
     O("BlockInter", av1g_block_inter, is_inter) O("BlockInter", av1g_block_inter, reserved)
     S("RefPlanes", av1g_ref_planes) O("RefPlanes", av1g_ref_planes, plane) O("RefPlanes", av1g_ref_planes, stride)

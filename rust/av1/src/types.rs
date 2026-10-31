@@ -89,7 +89,10 @@ pub struct FrameParams {
     pub lf_inter_off: u8,
     /// inter: 1 = primary_ref_frame LAST: the frame starts from its reference's saved CDFs
     pub cdf_from_ref: u8,
-    pub reserved: [u8; 8],
+    /// inter: the motion vectors' precision: 0 whole luma samples (force_integer_mv), 1 quarter
+    /// (allow_high_precision_mv 0), 2 eighth (allow_high_precision_mv 1)
+    pub mv_precision: u8,
+    pub reserved: [u8; 7],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
@@ -343,7 +346,8 @@ mod tests {
                cdef_y_pri: "cdef_y_pri", cdef_uv_sec: "cdef_uv_sec", allow_screen_content_tools: "allow_screen_content_tools");
         check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
                refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
-        check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref");
+        check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref",
+               mv_precision: "mv_precision");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
         check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
                inter: "inter");

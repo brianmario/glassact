@@ -276,7 +276,8 @@ typedef struct av1g_frame_params {
     uint8_t  error_resilient_mode; /* inter: 0/1 (header only: primary_ref_frame is NONE anyway) */
     uint8_t  lf_inter_off;         /* inter: 1 = inter blocks are not deblocked (see "Video mode") */
     uint8_t  cdf_from_ref;         /* inter: 1 = start from the reference's saved CDFs (see "Video mode") */
-    uint8_t  reserved[8];
+    uint8_t  mv_precision;         /* inter: 0 whole samples, 1 quarter, 2 eighth (see "Video mode") */
+    uint8_t  reserved[7];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {

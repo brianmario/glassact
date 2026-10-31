@@ -231,6 +231,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.error_resilient_mode,
         fp.lf_inter_off,
         fp.cdf_from_ref,
+        fp.mv_precision,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
@@ -259,6 +260,9 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
                 ERR_INVALID,
                 "ref_slot must be 0..7, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1"
             );
+        }
+        if fp.mv_precision != 0 {
+            fail!(ERR_INVALID, "mv_precision other than whole samples isn't supported yet");
         }
         if fp.cdf_from_ref != 0 && fp.error_resilient_mode != 0 {
             fail!(
