@@ -45,6 +45,36 @@ typedef struct GaPfAddrs {
 // those addresses, written to out when cap holds it. Returns its size.
 size_t av1enc_pf_frame(const av1g_frame_params *fp, const GaPfAddrs *addrs, void *out, size_t cap);
 
+// libaom tune=iq's frame-level loop-filter decisions for a base qindex (av1f_tuneiq_frame_init):
+// the effective deblocking level (all four), sharpness, CDEF damping, CDEF mode (0: off at
+// qindex <= 32, 1: halved strengths, 2: full) and the frame RDMULT.
+typedef struct GaTuneiqFrame {
+    int32_t lf_level, lf_sharpness, cdef_damping, cdef_mode, rdmult;
+} GaTuneiqFrame;
+void av1enc_tuneiq_frame(int base_q_idx, int mono, GaTuneiqFrame *out);
+
+// CDEF candidate strengths: npri x nsec, signalled primary and applied secondary (0, 1, 2, 4)
+// values. Candidate index = pri index * nsec + sec index. libaom's fast search: {0, 11} x {0, 2}.
+typedef struct GaCdefCand {
+    int32_t pri[16], sec[4];
+    int32_t npri, nsec;
+} GaCdefCand;
+
+// libaom's RD choice of cdef_bits: tots[i] is the joint search's SSE with 2^i presets,
+// n_active the 64x64s that code a cdef_idx.
+int av1enc_cdef_bits(const uint64_t *tots, int max_bits, int n_active, int mono, int rdmult);
+
+// Writes enable_cdef, cdef_bits and the presets the search chose (lev: 8 luma then 8 chroma
+// candidate indices) into fp, halving them in CDEF mode 1 as libaom's CDEF_ADAPTIVE does.
+void av1enc_cdef_presets(const int32_t lev[16], int bits, int cdef_mode, const GaCdefCand *cd,
+                         av1g_frame_params *fp);
+
+// The joint greedy preset search (libaom search_one_dual + refinement) on per-SB SSE tables
+// ([nsb][nc], luma and chroma), sequentially: the reference the GPU's search is held to.
+// lev_out: (max_bits + 1) x 16; tot_out: max_bits + 1.
+void av1enc_cdef_select_cpu(const uint32_t *my, const uint32_t *muv, int nc, int nsb, int mono, int max_bits,
+                            int refine, int fast_mono, int32_t *lev_out, uint64_t *tot_out);
+
 #ifdef __cplusplus
 }
 #endif
