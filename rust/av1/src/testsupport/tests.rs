@@ -4,7 +4,7 @@
 #![allow(clashing_extern_declarations)]
 use super::*;
 use crate::tables::*;
-use crate::types::{Block, DecisionRecord, ERR_CAPACITY, FrameParams, OK, Tiles, Txb};
+use crate::types::{DecisionRecord, OK};
 use core::ffi::{c_char, c_void};
 use core::mem::{offset_of, size_of};
 use std::sync::Mutex;
@@ -22,10 +22,6 @@ unsafe extern "C" {
     fn av1t_inverse_transform(tx_sz: i32, tx_type: i32, dq: *const i32, residual: *mut i32) -> u32;
     fn av1t_tx_type_allowed(tx_sz: i32, tx_type: i32) -> i32;
     // av1g.h
-    fn av1g_tile_layout(width: u32, height: u32, cols_log2: i32, rows_log2: i32, out: *mut Tiles) -> i32;
-    fn av1g_layout(rec: *mut DecisionRecord, txb_cap: u32, coeff_cap: u64) -> i32;
-    fn av1g_legalize_sb_qindex(base_q_idx: i32, delta_q_res: i32, target: *const u8, n: usize, legal: *mut u8);
-    fn av1g_apply_sb_qindex(rec: *mut DecisionRecord, sb_map: *const u8) -> i32;
     fn av1g_validate(rec: *const DecisionRecord, err: *mut c_char, errlen: usize) -> i32;
 }
 
@@ -276,76 +272,6 @@ fn ec_stream_overflows_as_c() {
 
 // ---- fuzz_gen ----
 
-/// The C++ writer's functions (Sources/AV1Core/src/encoder.cpp), until crate::writer has them.
-struct OracleWriter;
-
-impl WriterOps for OracleWriter {
-    fn tile_layout(&self, width: u32, height: u32, cols_log2: i32, rows_log2: i32) -> Option<Tiles> {
-        let mut t = Tiles {
-            cols_log2: 0,
-            rows_log2: 0,
-            cols: 0,
-            rows: 0,
-            mi_col_starts: [0; 65],
-            mi_row_starts: [0; 65],
-        };
-        // SAFETY: t is a whole av1g_tiles.
-        (unsafe { av1g_tile_layout(width, height, cols_log2, rows_log2, &mut t) } == OK).then_some(t)
-    }
-
-    fn layout(&self, fp: &FrameParams, blocks: &[Block], block_txb: &mut Vec<u32>, txb: &mut Vec<Txb>) -> Option<u64> {
-        block_txb.resize(blocks.len() + 1, 0);
-        let mut rec = DecisionRecord {
-            fp: *fp,
-            n_blocks: blocks.len() as u32,
-            n_txb: 0,
-            n_coeffs: 0,
-            blocks: blocks.as_ptr() as *mut Block, // av1g_layout only reads the blocks
-            block_txb: block_txb.as_mut_ptr(),
-            txb: core::ptr::null_mut(),
-            coeffs: core::ptr::null_mut(),
-        };
-        // SAFETY: the record's arrays are the slices above (txb null: counts only).
-        if unsafe { av1g_layout(&mut rec, 0, 0) } != ERR_CAPACITY {
-            return None;
-        }
-        txb.clear();
-        txb.resize(rec.n_txb as usize, Txb::default());
-        rec.txb = txb.as_mut_ptr();
-        // SAFETY: txb now holds n_txb entries, block_txb n_blocks + 1.
-        (unsafe { av1g_layout(&mut rec, rec.n_txb, rec.n_coeffs) } == OK).then_some(rec.n_coeffs)
-    }
-
-    fn legalize_sb_qindex(&self, base_q_idx: i32, delta_q_res: i32, target: &[u8], legal: &mut [u8]) {
-        assert_eq!(target.len(), legal.len());
-        // SAFETY: both arrays hold target.len() bytes.
-        unsafe {
-            av1g_legalize_sb_qindex(
-                base_q_idx,
-                delta_q_res,
-                target.as_ptr(),
-                target.len(),
-                legal.as_mut_ptr(),
-            )
-        }
-    }
-
-    fn apply_sb_qindex(&self, fp: &FrameParams, blocks: &mut [Block], sb_map: &[u8]) {
-        let mut rec = DecisionRecord {
-            fp: *fp,
-            n_blocks: blocks.len() as u32,
-            n_txb: 0,
-            n_coeffs: 0,
-            blocks: blocks.as_mut_ptr(),
-            block_txb: core::ptr::null_mut(),
-            txb: core::ptr::null_mut(),
-            coeffs: core::ptr::null_mut(),
-        };
-        // SAFETY: the C reads the blocks and the SB map (one entry per SB of fp's picture).
-        unsafe { av1g_apply_sb_qindex(&mut rec, sb_map.as_ptr()) };
-    }
-}
-
 /// SAFETY: `p` points to `n` initialized `T`s that outlive the slice.
 unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
     // SAFETY: as the caller promises.
@@ -355,7 +281,7 @@ unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
 /// Compares the Rust record of (seed, maxdim, big_pct) with the C++'s; Err describes the first
 /// difference.
 fn compare_case(seed: u64, maxdim: i32, big_pct: i32) -> Result<(), String> {
-    let r = FuzzCase::make(seed, maxdim, big_pct, &OracleWriter);
+    let r = FuzzCase::make(seed, maxdim, big_pct);
     // SAFETY: the C case and its record live until av1t_case_free; the lengths are the record's own
     // (coeffs has n_coeffs + 1 entries, block_txb n_blocks + 1).
     unsafe {
@@ -469,7 +395,7 @@ fn fuzz_cases_match_c_big() {
 fn fuzz_records_validate() {
     let mut big = 0;
     for seed in 0..300 {
-        let mut c = FuzzCase::make(seed, 300, 2, &OracleWriter).unwrap();
+        let mut c = FuzzCase::make(seed, 300, 2).unwrap();
         let rec = c.record();
         assert_eq!(rec.n_blocks as usize, c.blocks.len());
         assert_eq!(rec.blocks, c.blocks.as_mut_ptr());
@@ -492,7 +418,7 @@ fn fuzz_cases_cover_features() {
     let (mut tiles, mut dq, mut cdef, mut lf, mut qm, mut fi, mut cfl, mut sct, mut golomb, mut mono) =
         (false, false, false, false, false, false, false, false, false, false);
     for seed in 0..2000 {
-        let c = FuzzCase::make(seed, 300, 2, &OracleWriter).unwrap();
+        let c = FuzzCase::make(seed, 300, 2).unwrap();
         let fp = &c.fp;
         tiles |= fp.tile_cols_log2 > 0 || fp.tile_rows_log2 > 0 || fp.width > 4096;
         dq |= fp.delta_q_present != 0 && c.blocks.iter().any(|b| b.sb_qindex != fp.base_q_idx);

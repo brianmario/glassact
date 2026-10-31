@@ -11,24 +11,7 @@ use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma, max_tx_depth, mi_cols,
 use crate::dsp::{chroma_tx_type, get_scan, get_tx_set_intra, is_directional, tx_type_in_set_intra};
 use crate::tables::*;
 use crate::types::{Block, DECISIONS_VERSION, DecisionRecord, FrameParams, Tiles, Txb};
-
-/// The writer's functions the generator calls (av1g.h): tile layout, tx-block layout and the
-/// delta-q helpers.
-///
-/// TODO(writer): `crate::writer` is porting these (av1g_tile_layout, av1g_layout,
-/// av1g_legalize_sb_qindex, av1g_apply_sb_qindex). Once it lands, [`FuzzCase::make`] calls them
-/// directly and this trait and the `w` parameters go; until then the tests pass the C++ oracle's.
-pub trait WriterOps {
-    /// av1g_tile_layout: `None` where the C returns an error.
-    fn tile_layout(&self, width: u32, height: u32, cols_log2: i32, rows_log2: i32) -> Option<Tiles>;
-    /// av1g_layout of `blocks` under `fp`: fills `block_txb` (n_blocks + 1 entries) and `txb`
-    /// (resized to n_txb) and returns n_coeffs, or `None` where the C returns an error.
-    fn layout(&self, fp: &FrameParams, blocks: &[Block], block_txb: &mut Vec<u32>, txb: &mut Vec<Txb>) -> Option<u64>;
-    /// av1g_legalize_sb_qindex (`legal.len() == target.len()`).
-    fn legalize_sb_qindex(&self, base_q_idx: i32, delta_q_res: i32, target: &[u8], legal: &mut [u8]);
-    /// av1g_apply_sb_qindex: copies the per-SB map into `blocks[].sb_qindex`.
-    fn apply_sb_qindex(&self, fp: &FrameParams, blocks: &mut [Block], sb_map: &[u8]);
-}
+use crate::writer::{apply_sb_qindex, layout, layout_counts, legalize_sb_qindex, tile_layout};
 
 /// splitmix64, with the seed hashed so that streams of consecutive seeds are not shifted copies.
 struct Rng {
@@ -306,7 +289,7 @@ impl FuzzCase {
     /// make_case: the random legal record of `seed` (deterministic), as av1gpu's fuzzer makes it:
     /// sides up to `maxdim` (>= 1), `big_pct` percent of cases wide enough to force several tiles.
     /// Laid out and ready for av1g_encode. `None` where the C++ returns null (a layout failure).
-    pub fn make(seed: u64, maxdim: i32, big_pct: i32, w: &impl WriterOps) -> Option<FuzzCase> {
+    pub fn make(seed: u64, maxdim: i32, big_pct: i32) -> Option<FuzzCase> {
         let mut rng = Rng::new(seed);
         // ---- frame parameters ----
         const SPECIAL: [(i32, i32); 10] = [
@@ -385,16 +368,16 @@ impl FuzzCase {
         }
         // optional extra tiles for moderately sized pictures
         let (uw, uh) = (width as u32, height as u32);
-        let mt = w.tile_layout(uw, uh, -1, -1)?;
+        let mt = tile_layout(uw, uh, -1, -1).ok()?;
         if rng.chance(15) {
             let cl = mt.cols_log2 + rng.range(0, 2);
             let rl = rng.range(0, 2);
-            if w.tile_layout(uw, uh, cl, rl).is_some() {
+            if tile_layout(uw, uh, cl, rl).is_ok() {
                 fp.tile_cols_log2 = cl as i8;
                 fp.tile_rows_log2 = rl as i8;
             }
         }
-        let tiles = w.tile_layout(uw, uh, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32)?;
+        let tiles = tile_layout(uw, uh, fp.tile_cols_log2 as i32, fp.tile_rows_log2 as i32).ok()?;
         // deblocking / CDEF parameters from their own stream (keeps the pre-M5.5 cases of each seed)
         let mut prng = Rng::new(seed ^ 0x5DEECE66D);
         if prng.chance(45) {
@@ -453,10 +436,11 @@ impl FuzzCase {
         };
         g.gen_blocks(&tiles);
         let mut blocks = g.blocks;
-        // TODO(writer): crate::writer's layout, once it lands (see WriterOps).
+        let counts = layout_counts(&fp, &blocks).ok()?;
         let mut block_txb = vec![0u32; blocks.len() + 1];
-        let mut txb = Vec::new();
-        let n_coeffs = w.layout(&fp, &blocks, &mut block_txb, &mut txb)?;
+        let mut txb = vec![Txb::default(); counts.n_txb as usize];
+        layout(&fp, &blocks, &mut block_txb, &mut txb).ok()?;
+        let n_coeffs = counts.n_coeffs;
         let mut coeffs = vec![0i16; n_coeffs as usize + 1];
         let sb_cols = ((mi_c + 15) >> 4) as usize;
         let sb_rows = ((mi_r + 15) >> 4) as usize;
@@ -480,8 +464,9 @@ impl FuzzCase {
                 })
                 .collect();
             let mut legal = vec![0u8; target.len()];
-            w.legalize_sb_qindex(base, fp.delta_q_res as i32, &target, &mut legal);
-            w.apply_sb_qindex(&fp, &mut blocks, &legal);
+            legalize_sb_qindex(base, fp.delta_q_res as i32, &target, &mut legal);
+            // every block's SB is in the map (the C++ ignores the result too)
+            let _ = apply_sb_qindex(&fp, &mut blocks, &legal);
         }
         if fp.enable_cdef != 0 {
             // one random cdef_idx per 64x64 (all blocks of an SB share it)
@@ -549,6 +534,6 @@ impl FuzzCase {
 }
 
 /// av1t_case_make: [`FuzzCase::make`].
-pub fn case_make(seed: u64, maxdim: i32, big_pct: i32, w: &impl WriterOps) -> Option<FuzzCase> {
-    FuzzCase::make(seed, maxdim, big_pct, w)
+pub fn case_make(seed: u64, maxdim: i32, big_pct: i32) -> Option<FuzzCase> {
+    FuzzCase::make(seed, maxdim, big_pct)
 }
