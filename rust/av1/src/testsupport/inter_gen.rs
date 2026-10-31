@@ -3,11 +3,13 @@
 //! fixes what the sequence header carries (size, odd ones included; monochrome; filter intra; the
 //! intra edge filter; CDEF on or off; separate U / V quantizers; the tiling) and each frame draws
 //! the rest: quantizer, tx mode and set, delta-q, deblocking and CDEF strengths, screen content
-//! tools on key frames, the reference slot, the refresh flags and error resilience; partitions of
-//! every kind; inter blocks (by a per-frame share, 0 to 100 %) with whole-sample motion vectors
-//! (zero, repeated so that the candidate stack finds them, small, and far outside the frame),
-//! skip and non-skip, uniform var-tx depths, luma tx types of the inter sets; intra blocks with
-//! every mode, angle, CfL and filter intra; sparse random coefficients up to the Golomb range.
+//! tools, the reference slot, the refresh flags and error resilience, the motion vector precision
+//! (whole, quarter or eighth samples; mostly sub-sample); partitions of every kind; inter blocks
+//! (by a per-frame share, 0 to 100 %) with motion vectors of the frame's precision (zero, repeated
+//! so that the candidate stack finds them, nudged by a sub-sample step, small, and far outside the
+//! frame, at every sub-sample position), skip and non-skip, uniform var-tx depths, luma tx types
+//! of the inter sets; intra blocks with every mode, angle, CfL and filter intra; sparse random
+//! coefficients up to the Golomb range.
 //!
 //! The records are laid out and ready for [`crate::writer::Writer::encode_ex`]: frame k's
 //! reference pictures are the reconstructions of the frames that last refreshed each slot (a key
@@ -61,6 +63,8 @@ struct Gen<'a> {
     mv_pool: Vec<[i16; 2]>,
     /// the largest motion, in samples
     mv_far: i32,
+    /// the frame's MV unit in 1/8 sample: 8 (mv_precision 0), 2 (1) or 1 (2)
+    mv_unit: i32,
     blocks: Vec<Block>,
     inter: Vec<BlockInter>,
 }
@@ -68,6 +72,7 @@ struct Gen<'a> {
 impl Gen<'_> {
     fn mv(&mut self) -> [i16; 2] {
         let rng = &mut *self.rng;
+        let u = self.mv_unit;
         let k = rng.range(0, 99);
         let s = if k < 15 {
             [0, 0]
@@ -75,14 +80,23 @@ impl Gen<'_> {
             let i = rng.range(0, self.mv_pool.len() as i32 - 1) as usize;
             let mut m = self.mv_pool[i];
             if rng.chance(20) {
-                m[rng.range(0, 1) as usize] += 8 * rng.range(-2, 2) as i16;
+                // nudged by whole samples or by the frame's sub-sample step
+                let step = if rng.chance(50) { 8 } else { u };
+                m[rng.range(0, 1) as usize] += (step * rng.range(-2, 2)) as i16;
             }
             return m;
         } else if k < 85 {
-            [8 * rng.range(-24, 24), 8 * rng.range(-24, 24)]
+            // whole samples plus a sub-sample offset of the frame's precision
+            [
+                8 * rng.range(-24, 24) + rng.range(0, 7) / u * u,
+                8 * rng.range(-24, 24) + rng.range(0, 7) / u * u,
+            ]
         } else {
             let f = self.mv_far;
-            [8 * rng.range(-f, f), 8 * rng.range(-f, f)]
+            [
+                8 * rng.range(-f, f) + rng.range(0, 7) / u * u,
+                8 * rng.range(-f, f) + rng.range(0, 7) / u * u,
+            ]
         };
         let m = [s[0] as i16, s[1] as i16];
         if self.mv_pool.len() < 6 && m != [0, 0] {
@@ -390,7 +404,9 @@ impl InterSeq {
                 fp.allow_screen_content_tools = rng.chance(30) as u8;
             } else {
                 fp.frame_type = FRAME_INTER;
-                fp.allow_screen_content_tools = 1;
+                // mostly sub-sample; whole samples need screen content tools (force_integer_mv)
+                fp.mv_precision = [0, 1, 1, 2, 2, 2][rng.range(0, 5) as usize];
+                fp.allow_screen_content_tools = (fp.mv_precision == 0 || rng.chance(40)) as u8;
                 fp.ref_slot = rng.range(0, 7) as u8;
                 fp.refresh_frame_flags = if rng.chance(15) {
                     0
@@ -418,6 +434,7 @@ impl InterSeq {
                 fi: fp.enable_filter_intra != 0,
                 mv_pool: Vec::new(),
                 mv_far,
+                mv_unit: [8, 2, 1][fp.mv_precision as usize],
                 blocks: Vec::new(),
                 inter: Vec::new(),
             };

@@ -156,6 +156,7 @@ fn inter_sequences_round_trip() {
         }
     });
     eprintln!("{} frames; {}", frames.into_inner(), coverage());
+    assert_phase_coverage(20);
 }
 
 /// A key frame in video mode codes a still picture's tile data and reconstructs exactly as it.
@@ -345,7 +346,16 @@ fn damaged_inter_frames_parse_or_fail() {
 /// Records the writer must refuse.
 #[test]
 fn inter_records_refused() {
-    let mut seq = InterSeq::make(3, 64, 2).unwrap();
+    // a key frame, then an inter frame with whole-sample MVs (some not 0)
+    let has_mv = |r: &Record| {
+        r.inter
+            .iter()
+            .any(|i| i.is_inter != 0 && (i.mv_row != 0 || i.mv_col != 0))
+    };
+    let mut seq = (0..)
+        .filter_map(|s| InterSeq::make(s, 64, 2))
+        .find(|q| q.frames[1].fp.frame_type == FRAME_INTER && q.frames[1].fp.mv_precision == 0 && has_mv(&q.frames[1]))
+        .unwrap();
     let (key, inter) = (seq.frames[0].clone(), seq.frames[1].clone());
     let mut w = Writer::with_threads(1);
     let opts = EncodeOpts {
@@ -370,10 +380,25 @@ fn inter_records_refused() {
     r.fp.refresh_frame_flags = 1;
     bad("key frame refresh flags", &mut w, r, &refs);
     let mut r = inter.clone();
-    if let Some(i) = r.inter.iter().position(|i| i.is_inter != 0) {
-        r.inter[i].mv_row |= 4;
-        bad("half-sample mv", &mut w, r, &refs);
-    }
+    r.fp.mv_precision = 3;
+    bad("mv_precision 3", &mut w, r, &refs);
+    let mut r = key.clone();
+    r.fp.mv_precision = 2;
+    bad("key frame mv_precision", &mut w, r, &refs);
+    let i = inter.inter.iter().position(|i| i.is_inter != 0).unwrap();
+    let mut r = inter.clone();
+    r.inter[i].mv_row |= 4;
+    bad("half-sample mv in a whole-sample frame", &mut w, r, &refs);
+    let mut r = inter.clone();
+    r.fp.mv_precision = 1;
+    r.inter[i].mv_col |= 1;
+    bad("eighth-sample mv in a quarter-sample frame", &mut w, r, &refs);
+    // the same at eighth samples, without screen content tools, is fine; the MV stack's
+    // candidates move with it
+    let mut r = inter.clone();
+    (r.fp.mv_precision, r.fp.allow_screen_content_tools) = (2, 0);
+    r.inter[i].mv_col |= 1;
+    w.encode_ex(r.as_mut(), &opts, &refs, &mut Output::default()).unwrap();
     let mut r = key.clone();
     r.inter = vec![BlockInter::default(); r.blocks.len()];
     r.inter[0].is_inter = 1;
@@ -496,6 +521,7 @@ fn decoders() {
         frames.fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
     });
     eprintln!("{} frames decode exactly; {}", frames.into_inner(), coverage());
+    assert_phase_coverage(1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -504,18 +530,75 @@ pub(super) fn coverage() -> String {
     let s = super::walk::INTER_STAT
         .each_ref()
         .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    let p = &s[super::walk::INTER_STAT_PHASE..];
+    let sub: u64 = (0..64).filter(|i| i % 16 != 0).map(|i| p[i]).sum();
+    let whole: u64 = (0..64).filter(|i| i % 16 == 0).map(|i| p[i]).sum();
+    let min = |plane: usize, four: usize| {
+        let ph = &p[plane * 32 + four * 16..][..16];
+        (1..16)
+            .filter(|i| plane == 1 || i % 2 == 0)
+            .map(|i| ph[i])
+            .min()
+            .unwrap()
+    };
     format!(
         "inter blocks: {} GLOBALMV, {} NEARESTMV, {} NEARMV ({} drl > 1), {} NEWMV ({} drl > 0); \
-         {} intra blocks in inter frames, {} var-tx splits, {} sub-8x8 chroma from several MVs",
-        s[0], s[1], s[2], s[4], s[3], s[5], s[6], s[7], s[8]
+         {} intra blocks in inter frames, {} var-tx splits, {} sub-8x8 chroma from several MVs; \
+         NEWMV components with fr bits {}, with hp bits {}; prediction axes at sub-sample positions {sub}, \
+         whole {whole}; fewest at one phase: luma 8-tap {} 4-tap {}, chroma 8-tap {} 4-tap {}",
+        s[0],
+        s[1],
+        s[2],
+        s[4],
+        s[3],
+        s[5],
+        s[6],
+        s[7],
+        s[8],
+        s[9] + s[10],
+        s[10],
+        min(0, 0),
+        min(0, 1),
+        min(1, 0),
+        min(1, 1)
     )
+}
+
+/// Every sub-sample filter phase (luma: the 7 even 1/16 positions; chroma: all 15), with both
+/// filter variants (8-tap, and 4-tap for 4-or-fewer-sample blocks), has been predicted at least
+/// `n` times along each axis in this process; and NEWMV differences coded fr and hp bits.
+pub(super) fn assert_phase_coverage(n: u64) {
+    let s = super::walk::INTER_STAT
+        .each_ref()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+    let p = &s[super::walk::INTER_STAT_PHASE..];
+    for plane in 0..2 {
+        for four in 0..2 {
+            for ph in 1..16 {
+                if plane == 0 && ph % 2 != 0 {
+                    assert_eq!(p[four * 16 + ph], 0, "luma at an odd 1/16 position");
+                    continue;
+                }
+                let k = p[plane * 32 + four * 16 + ph];
+                assert!(
+                    k >= n,
+                    "{} {}-tap phase {ph}/16: {k} predictions",
+                    ["luma", "chroma"][plane],
+                    [8, 4][four]
+                );
+            }
+        }
+    }
+    assert!(s[9] >= n && s[10] >= n, "fr / hp bits coded: {} {}", s[9], s[10]);
 }
 
 /// Writer speed: an inter frame against the key frame of the same content (the reference
 /// engine's decisions on a synthetic screen at 2560x1440 and 5120x2880, deblocking and CDEF on).
 /// The scrolled inter frame keeps the key frame's partition, tx sizes and coefficients with every
 /// block inter (a 16-row scroll: the luma copies and the chroma half-sample filters run on every
-/// block; tx types DCT); the static one has every block inter with mv 0 and skip.
+/// block; tx types DCT); the sub-sample one is the same at a scroll of 16 3/8 rows and 1/4 column
+/// (mv_precision 2: both filter passes on every block, luma and chroma); the static one has every
+/// block inter with mv 0 and skip.
 /// `cargo test --release -- --ignored --nocapture bench_inter`
 #[test]
 #[ignore]
@@ -588,6 +671,12 @@ fn bench_inter_vs_key() {
         // where the order is the same, else another tx block's of the same size)
         scroll.layout().unwrap();
         scroll.txb.iter_mut().for_each(|t| t.tx_type = DCT_DCT as u8);
+        let mut subpel = scroll.clone();
+        subpel.fp.mv_precision = 2;
+        subpel
+            .inter
+            .iter_mut()
+            .for_each(|i| (i.mv_row, i.mv_col) = (16 * 8 + 3, 2));
         let mut still = scroll.clone();
         still.inter.iter_mut().for_each(|i| i.mv_row = 0);
         still.blocks.iter_mut().for_each(|b| (b.skip, b.tx_depth) = (1, 0));
@@ -602,6 +691,7 @@ fn bench_inter_vs_key() {
         for (name, rec) in [
             ("key", &key),
             ("inter, scrolled, same residual", &scroll),
+            ("inter, sub-sample scroll, same", &subpel),
             ("inter, static, all skip", &still),
         ] {
             let mut r = rec.clone();

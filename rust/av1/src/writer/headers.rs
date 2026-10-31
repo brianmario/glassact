@@ -119,10 +119,9 @@ pub(crate) fn write_headers(
         seq.put(0, 1); // enable_dual_filter
         seq.put(0, 1); // enable_order_hint (so no jnt_comp, ref-frame MVs, order hints)
         // Screen content tools are chosen per frame, so that a key frame codes exactly a still
-        // picture's tile data; with them (every inter frame), force_integer_mv = 1.
+        // picture's tile data, and so is force_integer_mv (fp.mv_precision), in frames with them.
         seq.put(1, 1); // seq_choose_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS
-        seq.put(0, 1); // seq_choose_integer_mv
-        seq.put(1, 1); // seq_force_integer_mv
+        seq.put(1, 1); // seq_choose_integer_mv: SELECT_INTEGER_MV
     }
     seq.put(0, 1); // enable_superres
     seq.put(fp.enable_cdef as u32, 1);
@@ -144,6 +143,8 @@ pub(crate) fn write_headers(
 
     // ---- uncompressed_header ----
     let sct = fp.allow_screen_content_tools as u32;
+    // inter frames: force_integer_mv (mv_precision 0, which needs allow_screen_content_tools)
+    let force_integer_mv = inter && fp.mv_precision == 0;
     if video {
         fh.put(0, 1); // show_existing_frame
         fh.put(inter as u32, 2); // frame_type: KEY_FRAME / INTER_FRAME
@@ -152,7 +153,11 @@ pub(crate) fn write_headers(
             fh.put(fp.error_resilient_mode as u32, 1); // (key frames shown: 1)
         }
         fh.put(0, 1); // disable_cdf_update
-        fh.put(sct, 1); // allow_screen_content_tools (SELECT); force_integer_mv = seq's 1
+        fh.put(sct, 1); // allow_screen_content_tools (SELECT)
+        if sct != 0 {
+            // force_integer_mv (SELECT; 0 without screen content tools); key frames: overridden to 1
+            fh.put(force_integer_mv as u32, 1);
+        }
         fh.put(0, 1); // frame_size_override_flag
         if inter {
             if fp.error_resilient_mode == 0 {
@@ -171,7 +176,9 @@ pub(crate) fn write_headers(
                 fh.put(fp.ref_slot as u32, 3); // ref_frame_idx[i]
             }
             fh.put(0, 1); // render_and_frame_size_different
-            // force_integer_mv: no allow_high_precision_mv
+            if !force_integer_mv {
+                fh.put((fp.mv_precision == 2) as u32, 1); // allow_high_precision_mv
+            }
             fh.put(0, 1); // is_filter_switchable
             fh.put(EIGHTTAP as u32, 2); // interpolation_filter
             fh.put(0, 1); // is_motion_mode_switchable

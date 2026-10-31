@@ -248,21 +248,24 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
             || fp.error_resilient_mode != 0
             || fp.lf_inter_off != 0
             || fp.cdf_from_ref != 0
+            || fp.mv_precision != 0
         {
             fail!(
                 ERR_INVALID,
-                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode, lf_inter_off and cdf_from_ref must be 0"
+                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode, lf_inter_off, cdf_from_ref and mv_precision must be 0"
             );
         }
     } else {
-        if fp.ref_slot > 7 || fp.error_resilient_mode > 1 || fp.lf_inter_off > 1 || fp.cdf_from_ref > 1 {
+        if fp.ref_slot > 7
+            || fp.error_resilient_mode > 1
+            || fp.lf_inter_off > 1
+            || fp.cdf_from_ref > 1
+            || fp.mv_precision > 2
+        {
             fail!(
                 ERR_INVALID,
-                "ref_slot must be 0..7, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1"
+                "ref_slot must be 0..7, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1, mv_precision 0..2"
             );
-        }
-        if fp.mv_precision != 0 {
-            fail!(ERR_INVALID, "mv_precision other than whole samples isn't supported yet");
         }
         if fp.cdf_from_ref != 0 && fp.error_resilient_mode != 0 {
             fail!(
@@ -270,10 +273,10 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
                 "cdf_from_ref needs error_resilient_mode 0 (which codes primary_ref_frame NONE)"
             );
         }
-        if fp.allow_screen_content_tools != 1 {
+        if fp.mv_precision == 0 && fp.allow_screen_content_tools != 1 {
             fail!(
                 ERR_INVALID,
-                "inter frames need allow_screen_content_tools = 1 (it carries force_integer_mv)"
+                "whole-sample inter frames (mv_precision 0) need allow_screen_content_tools = 1 (it carries force_integer_mv)"
             );
         }
     }

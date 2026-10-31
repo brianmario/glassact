@@ -128,8 +128,8 @@
  *
  * Video mode (fp.video = 1, version 2).  The picture is one frame of a stream: a full
  *   sequence header (not still_picture, no timing info, one operating point, no order
- *   hints, so no ref-frame MVs / skip mode / distance weights; screen content tools
- *   selected per frame; seq_force_integer_mv = 1) and a full frame header (show_frame =
+ *   hints, so no ref-frame MVs / skip mode / distance weights; screen content tools and
+ *   force_integer_mv selected per frame) and a full frame header (show_frame =
  *   1, primary_ref_frame = NONE: every frame starts from the default CDFs and needs only
  *   its reference pictures; EIGHTTAP interpolation, not switchable; no motion modes,
  *   compound, inter-intra, global or warped motion; reference_select = 0).  Everything the
@@ -154,10 +154,16 @@
  *     NONE, as before.
  *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from ONE reference picture
  *     (LAST_FRAME; ref_frame_idx[] of all 7 references = fp.ref_slot); it refreshes the
- *     slots in fp.refresh_frame_flags.  allow_screen_content_tools must be 1 (it carries
- *     force_integer_mv: every motion vector is whole-pel in luma).  Blocks are intra or
- *     inter (av1g_decision_record.inter); intra blocks use the inter-frame syntax (y_mode
- *     CDFs by size group, is_inter, palette flags coded as 0) with the same fields.
+ *     slots in fp.refresh_frame_flags.  Blocks are intra or inter
+ *     (av1g_decision_record.inter); intra blocks use the inter-frame syntax (y_mode CDFs by
+ *     size group, is_inter, palette flags coded as 0) with the same fields.
+ *   fp.mv_precision (inter frames; key frames: 0): the precision of every motion vector of
+ *     the frame.  0: whole luma samples (force_integer_mv = 1; needs
+ *     allow_screen_content_tools = 1, which carries it).  1: quarter samples
+ *     (force_integer_mv = 0, allow_high_precision_mv = 0).  2: eighth samples
+ *     (allow_high_precision_mv = 1).  With 1 and 2 allow_screen_content_tools may be 0 or 1.
+ *     The finer the precision, the more bits a NEWMV difference costs (2 fr bits per nonzero
+ *     component, and 1 hp bit at 2), the same for every difference.
  *   The encoder takes the reference pictures (av1g_encode_ex): the decoder's output of
  *   the frames that refreshed each slot (its av1g_output.recon planes, post-filter and
  *   cropped); prediction clamps to their edges as the spec does.
@@ -166,12 +172,16 @@
  *   is_inter       1: the block predicts from LAST_FRAME with motion vector (mv_row, mv_col);
  *                  0: an intra block (av1g_block's mode fields apply).  NULL rec.inter, and
  *                  every block of a key frame: intra.
- *   mv_row/mv_col  luma motion in 1/8 sample, multiples of 8 (whole samples), |mv| < 2^14
- *                  (spec is_mv_valid).  May point outside the reference: samples clamp to its
- *                  edges.  Chroma (4:2:0) uses mv / 2: half-sample positions, filtered with
- *                  EIGHTTAP (4-tap for blocks 4 wide / high or less), as the spec specifies.
+ *   mv_row/mv_col  luma motion in 1/8 sample, |mv| < 2^14 (spec is_mv_valid), of the frame's
+ *                  fp.mv_precision: multiples of 8 (whole samples) at 0, even (quarter
+ *                  samples) at 1, any at 2.  May point outside the reference: samples clamp to
+ *                  its edges.  Luma predicts at the 1/8 position, chroma (4:2:0) at the same
+ *                  value in 1/16 chroma sample (half the motion), both filtered with EIGHTTAP
+ *                  (its 4-tap variant along an axis where the block is 4 samples or fewer), as
+ *                  the spec specifies.
  *   The mode is not stored: the writer derives it from the MV and the block's MV candidate
- *   stack (spec 7.10.2, which depends only on decisions already coded): mv == 0 -> GLOBALMV
+ *   stack (spec 7.10.2, which depends only on decisions already coded; lowering its
+ *   candidates to the frame's precision leaves the frame's own MVs as they are): mv == 0 -> GLOBALMV
  *   (identity global motion); mv == RefStackMv[0] -> NEARESTMV; mv == RefStackMv[1..3]
  *   (an index the stack has) -> NEARMV with that drl index; otherwise NEWMV, coded as a
  *   difference to the candidate (drl index 0..2 the stack allows) whose difference costs
@@ -267,7 +277,8 @@ typedef struct av1g_frame_params {
     uint8_t  allow_screen_content_tools; /* 1: frame header allows screen content tools; palette is still
                                             never used (has_palette_y/uv coded as 0).  Only needed to
                                             replay libaom streams whose screen-content detection set it.
-                                            Inter frames: must be 1 (force_integer_mv). */
+                                            Inter frames with mv_precision 0: must be 1 (it
+                                            carries force_integer_mv). */
     /* ---- v2: video mode (0 = a still picture, as in v1), see "Video mode" above ---- */
     uint8_t  video;                /* 1: one frame of a stream (full sequence + frame headers) */
     uint8_t  frame_type;           /* AV1G_FRAME_KEY / AV1G_FRAME_INTER (needs video) */
@@ -281,7 +292,7 @@ typedef struct av1g_frame_params {
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {
-    int16_t  mv_row;         /* luma, 1/8 sample, multiple of 8 */
+    int16_t  mv_row;         /* luma, 1/8 sample, of fp.mv_precision (multiple of 8 / even / any) */
     int16_t  mv_col;
     uint8_t  is_inter;       /* 1: inter (LAST_FRAME), 0: intra */
     uint8_t  reserved[3];    /* 0 */

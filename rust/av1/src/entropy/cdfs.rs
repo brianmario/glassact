@@ -189,6 +189,12 @@ pub struct InterCdfs {
     pub mv_class0_bit: [[u16; 3]; 2],
     pub mv_sign: [[u16; 3]; 2],
     pub mv_bit: [[[u16; 3]; 10]; 2],
+    /// MvClass0FrCdf[comp][mv_class0_bit], MvFrCdf[comp], MvClass0HpCdf[comp], MvHpCdf[comp]: the
+    /// sub-sample bits (frames without force_integer_mv; hp with allow_high_precision_mv)
+    pub mv_class0_fr: [[[u16; 5]; 2]; 2],
+    pub mv_fr: [[u16; 5]; 2],
+    pub mv_class0_hp: [[u16; 3]; 2],
+    pub mv_hp: [[u16; 3]; 2],
     /// InterTxTypeSet1Cdf[Tx_Size_Sqr], Set2, Set3Cdf[Tx_Size_Sqr]
     pub inter_tx_set1: [[u16; 17]; 2],
     pub inter_tx_set2: [u16; 13],
@@ -211,6 +217,10 @@ impl Default for InterCdfs {
             mv_class0_bit: [Default_Mv_Class0_Bit_Cdf; 2],
             mv_sign: [Default_Mv_Sign_Cdf; 2],
             mv_bit: [Default_Mv_Bit_Cdf; 2],
+            mv_class0_fr: Default_Mv_Class0_Fr_Cdf,
+            mv_fr: Default_Mv_Fr_Cdf,
+            mv_class0_hp: [Default_Mv_Class0_Hp_Cdf; 2],
+            mv_hp: [Default_Mv_Hp_Cdf; 2],
             inter_tx_set1: Default_Inter_Tx_Type_Set1_Cdf,
             inter_tx_set2: Default_Inter_Tx_Type_Set2_Cdf,
             inter_tx_set3: Default_Inter_Tx_Type_Set3_Cdf,
@@ -244,6 +254,10 @@ impl InterCdfs {
         clear(&mut self.mv_class0_bit);
         clear(&mut self.mv_sign);
         clear(self.mv_bit.as_flattened_mut());
+        clear(self.mv_class0_fr.as_flattened_mut());
+        clear(&mut self.mv_fr);
+        clear(&mut self.mv_class0_hp);
+        clear(&mut self.mv_hp);
         clear(&mut self.inter_tx_set1);
         clear(core::slice::from_mut(&mut self.inter_tx_set2));
         clear(&mut self.inter_tx_set3);
