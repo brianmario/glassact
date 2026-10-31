@@ -71,5 +71,8 @@ GA_SMALL(16, 4, AV1G_BLOCK_16X4)
 GA_SMALL(8, 16, AV1G_BLOCK_8X16)  // Glass Act: upstream stops at 64 pixels; these measured faster too
 GA_SMALL(16, 8, AV1G_BLOCK_16X8)
 
+// The leaves' open-loop decisions after the DP (AV1HybridEncoder): one thread per leaf.
+#include "k_leaf.h"
+
 // Closed loop: one threadgroup of RC_NT (128) threads per 64x64, in wavefront steps.
 #include "k_recon.h"

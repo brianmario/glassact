@@ -84,9 +84,12 @@ void av1enc_cdef_select_cpu(const uint32_t *my, const uint32_t *muv, int nc, int
 typedef struct av1enc_hybrid av1enc_hybrid;
 av1enc_hybrid *av1enc_hybrid_create(void);
 void av1enc_hybrid_destroy(av1enc_hybrid *h);
+// luma_tx (optional): every block's luma tx type, kept instead of searched. flags:
+// AV1ENC_HYBRID_GIVEN_CHROMA: the blocks' uv_mode / angle_delta_uv / cfl_alpha_* are decided already.
+#define AV1ENC_HYBRID_GIVEN_CHROMA 1
 int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
-                              uint32_t hgt, const av1g_block *blocks, uint32_t n, int qindex, int tile_cols_log2,
-                              int tile_rows_log2, char *err, size_t errlen);
+                              uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
+                              int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
 const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane);
 // the source the last call coded, padded by edge replication to whole superblocks (at least the

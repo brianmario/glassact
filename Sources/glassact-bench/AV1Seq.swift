@@ -22,6 +22,7 @@ let av1SeqCommand = Command(
         .string("preset", "<name>", "analysis preset: slow, base, fast, faster, turbo (default), turbo2, turbo3"),
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
+        .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
         .int("aom-threads", "<n>", 1...64, "libaom worker threads (default 8)"),
     ],
@@ -63,11 +64,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                                  width: width, height: height)
     }
     let serial = opts.has("serial")
-    print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")")
+    print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")\(opts.has("cpu-decides") ? ", CPU decides chroma and tx" : ", GPU decides chroma and tx")")
 
     let encoder = try AV1HybridEncoder(device: device)
     encoder.preset = preset
     encoder.tiling = (tileParts[0], tileParts[1])
+    encoder.gpuDecides = !opts.has("cpu-decides")
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
 
     var frames: [AV1HybridEncoder.Frame] = []

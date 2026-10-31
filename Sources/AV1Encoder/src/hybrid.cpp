@@ -573,7 +573,8 @@ extern "C" av1enc_hybrid *av1enc_hybrid_create(void) { return new av1enc_hybrid(
 extern "C" void av1enc_hybrid_destroy(av1enc_hybrid *h) { delete h; }
 
 extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v,
-                                         uint32_t W, uint32_t H, const av1g_block *given, uint32_t n, int qindex,
+                                         uint32_t W, uint32_t H, const av1g_block *given, uint32_t n,
+                                         const uint8_t *luma_tx, int flags, int qindex,
                                          int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen) {
     using namespace av1g;
     using clk = std::chrono::steady_clock;
@@ -585,6 +586,8 @@ extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, con
     const auto t0 = clk::now();
     HybridOpts o;
     o.qindex = qindex;
+    o.given_luma_tx = luma_tx ? 1 : 0;
+    const bool givenChroma = (flags & AV1ENC_HYBRID_GIVEN_CHROMA) != 0;
     av1g_output_free(&h->out);
     memset(&h->out, 0, sizeof h->out);
     memset(&h->rec, 0, sizeof h->rec);
@@ -618,22 +621,30 @@ extern "C" int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, con
                     while (tr + 1 < tiles.rows && tiles.mi_row_starts[tr + 1] <= b.mi_row) tr++;
                     d.tx0 = (int)tiles.mi_col_starts[tc] * 4;
                     d.ty0 = (int)tiles.mi_row_starts[tr] * 4;
-                    b.uv_mode = AV1G_DC_PRED;
-                    b.angle_delta_uv = 0;
-                    b.cfl_alpha_u = b.cfl_alpha_v = 0;
                     b.skip = 0;
                     b.tx_depth = 0;
                     b.sb_qindex = (uint8_t)qindex;
+                    if (givenChroma) continue;
+                    b.uv_mode = AV1G_DC_PRED;
+                    b.angle_delta_uv = 0;
+                    b.cfl_alpha_u = b.cfl_alpha_v = 0;
                     if (av1g_has_chroma(b.bsize, b.mi_row, b.mi_col, 0)) d.best_chroma(b.mi_col * 4, b.mi_row * 4, b.bsize, b);
                 }
             }
         };
-        const int nthreads = std::max(1, (int)std::thread::hardware_concurrency());
-        std::vector<std::thread> th;
-        for (int i = 0; i < nthreads; i++) th.emplace_back(work);
-        for (auto &t : th) t.join();
+        const int nthreads = givenChroma ? 1 : std::max(1, (int)std::thread::hardware_concurrency());
+        if (nthreads == 1) work();
+        else {
+            std::vector<std::thread> th;
+            for (int i = 0; i < nthreads; i++) th.emplace_back(work);
+            for (auto &t : th) t.join();
+        }
     }
     if (h->layout() != AV1G_OK) return fail(AV1G_ERR_INVALID, "layout");
+    if (luma_tx)  // one luma tx block per block at tx_depth 0
+        for (uint32_t b = 0; b < h->rec.n_blocks; b++)
+            for (uint32_t t = h->block_txb[b]; t < h->block_txb[b + 1]; t++)
+                if (h->txb[t].plane == 0) h->txb[t].tx_type = luma_tx[b];
     const auto t1 = clk::now();
     QuantHook hook(h->src, o, 0.12 * step * step, 0.12 * step * step);
     av1g_encode_opts eo = {AV1G_ENC_FIX_RANGE | AV1G_ENC_PREFILTER_RECON, -1};

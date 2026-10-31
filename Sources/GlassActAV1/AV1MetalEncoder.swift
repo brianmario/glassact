@@ -36,6 +36,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var blocks: [av1g_block]
         /// Each block's luma tx type, from the analysis (for its largest tx size).
         public var lumaTxTypes: [UInt8]
+        /// Whether `blocks` carry chroma decisions too (`decidesLeaves`).
+        public var hasChroma: Bool
         public var tiles: av1g_tiles
     }
 
@@ -86,6 +88,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// The largest shape (in pixels) the thread-per-block kernel takes: av1gpu's 64, and 8x16 / 16x8.
     static let smallMaxPixels = 128
     let dp: any MTLComputePipelineState
+    let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
+    /// k_leaf's threadgroup: LEAF_NW SIMD-groups, one leaf each at a time.
+    static let leafThreads = 128
+    /// After the partition, also decide every leaf's chroma mode and CfL and
+    /// its luma tx type on the GPU, from the source (k_leaf): the partition's
+    /// blocks then carry them, for a closed loop that only quantizes.
+    public var decidesLeaves = false
     let recon: any MTLComputePipelineState
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
@@ -130,6 +139,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             small[bsize] = try Self.pipeline(function, threads: Self.smallThreads, device: device)
         }
         analysisSmall = small
+        guard let leafFunction = library.makeFunction(name: "k_leaf"),
+              let leafScanFunction = library.makeFunction(name: "k_leaf_scan")
+        else { throw Failure.metal("no k_leaf") }
+        leafScan = try Self.pipeline(leafScanFunction, threads: 1024, device: device)
+        leaf = try Self.pipeline(leafFunction, threads: Self.leafThreads, device: device)
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
@@ -240,7 +254,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex)
         try run.execute(closedLoop: false)
         let (blocks, types) = run.leafBlocks()
-        return Partition(blocks: blocks, lumaTxTypes: types, tiles: run.tiles)
+        return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
     }
 
     /// A picture's analysis and partition DP, running on the GPU: the caller
@@ -265,7 +279,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 run.encoder.lastGPUSeconds = stages.analysis
             }
             let (blocks, types) = run.leafBlocks()
-            return Partition(blocks: blocks, lumaTxTypes: types, tiles: run.tiles)
+            return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
         }
     }
 
@@ -300,6 +314,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let oCoeffs: any MTLBuffer
         /// The analysis's result per (shape, position), and each shape's grid.
         let blockResults: any MTLBuffer
+        let leafDecisions: any MTLBuffer
+        /// k_leaf's list of every SB's leaves, and its indirect dispatch.
+        let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer
+        let decidesLeaves: Bool
         var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
@@ -413,6 +431,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let sbImg = try make(nSb * 4)
             leaves = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
             leafCount = try make(nSb * 2)
+            leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
+            decidesLeaves = encoder.decidesLeaves
+            leafOffsets = try make(4 * (nSb + 1))
+            leafDispatch = try make(MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
             let sbJ = try make(nSb * 4)
             sbOut = try make(nSb * MemoryLayout<GpSbOut>.stride)
             oBlocks = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<av1g_block>.stride)
@@ -454,6 +476,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.oCoeffs = AV1MetalEncoder.address(oCoeffs)
             batch.stats = AV1MetalEncoder.address(stats)
             batch.bigScratch = UnsafeMutableRawPointer(bitPattern: UInt(scratch.gpuAddress))
+            batch.leafDec = AV1MetalEncoder.address(leafDecisions)
             tiles = tl
             buffers = made
         }
@@ -468,6 +491,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var commands: (any MTLCommandBuffer)?
             var compute: (any MTLComputeCommandEncoder)?
             var params = encoder.params
+            params.leafDecide = decidesLeaves ? 1 : 0
+            params.leafTxSearch = 1
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder()
@@ -514,6 +539,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             e.setComputePipelineState(encoder.dp)
             e.dispatchThreads(MTLSize(width: nSb, height: 1, depth: 1),
                               threadsPerThreadgroup: MTLSize(width: min(64, nSb), height: 1, depth: 1))
+            if decidesLeaves {
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.leafScan)
+                e.setBuffer(leafOffsets, offset: 0, index: 2)
+                e.setBuffer(leafDispatch, offset: 0, index: 3)
+                e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.leaf)
+                e.dispatchThreadgroups(indirectBuffer: leafDispatch, indirectBufferOffset: 0,
+                                       threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.leafThreads, height: 1, depth: 1))
+            }
             stages.partition = profiling ? try close() : 0
             if closedLoop {
                 e = try open()
@@ -562,6 +599,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var blocks: [av1g_block] = [], types: [UInt8] = []
             let leafPtr = leaves.contents().assumingMemoryBound(to: GpLeaf.self)
             let results = blockResults.contents().assumingMemoryBound(to: GpBlockRes.self)
+            let decisions = leafDecisions.contents().assumingMemoryBound(to: GpLeafDecision.self)
             let counts = leafCount.contents().assumingMemoryBound(to: UInt16.self)
             for sb in decodeOrder() {
                 let r = (sb / sbCols) * 16, c = (sb % sbCols) * 16
@@ -580,8 +618,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                         b.y_mode = UInt8(cand >> 3)
                         b.angle_delta_y = Int8((cand & 7) - 3)
                     }
+                    if decidesLeaves {
+                        let d = decisions[sb * Int(GP_MAX_LEAVES) + k]
+                        b.uv_mode = d.uvMode
+                        b.angle_delta_uv = d.angleUV
+                        b.cfl_alpha_u = d.cflU
+                        b.cfl_alpha_v = d.cflV
+                    }
                     blocks.append(b)
-                    types.append(res.ncand > 0 ? res.tx : 0)
+                    types.append(decidesLeaves ? decisions[sb * Int(GP_MAX_LEAVES) + k].lumaTx : (res.ncand > 0 ? res.tx : 0))
                 }
             }
             return (blocks, types)

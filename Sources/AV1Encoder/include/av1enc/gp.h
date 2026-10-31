@@ -38,6 +38,7 @@ typedef struct GpLeaf GpLeaf;
 typedef struct GpSbOut GpSbOut;
 typedef struct GpExtCand GpExtCand;
 typedef struct GpBatch GpBatch;
+typedef struct GpLeafDecision GpLeafDecision;
 
 #define GP_MAXK 6            // max top-K luma candidates kept per block by the analysis
 #define GP_NSHAPES 22        // indexed by AV1 bsize (13..15 = 128-sizes, unused)
@@ -83,6 +84,9 @@ struct GpParams {
     int txAllCL;         // 1: closed loop evaluates every tx type for every re-checked candidate (no separate pass 2)
     int poisonSmem;      // debug: fill k_recon shared memory with 0x7F at CTA start (GP_POISON_SMEM)
     float pruneFlat;     // > 0: skip shapes < 16x16 inside 16x16 regions whose 8x8 variances are all < pruneFlat * step_ac^2
+    // Glass Act: after the DP, decide every leaf's chroma mode / CfL and luma tx type open loop (k_leaf)
+    int leafDecide;      // 1: run k_leaf (AV1HybridEncoder)
+    int leafTxSearch;    // 1: k_leaf searches luma tx types (blocks up to 16x16); 0: DCT_DCT
 };
 
 // Per-image descriptor (device copy in an array; host fills it).
@@ -133,6 +137,15 @@ struct GpLeaf {
     uint8_t pad;
 };
 
+// Glass Act: a leaf's open-loop decisions after the DP (k_leaf), parallel to leaves[]: chroma from
+// the source (av1gpu's CPU reference engine's rule), luma tx type for the analysis's mode.
+struct GpLeafDecision {
+    uint8_t uvMode;
+    int8_t angleUV, cflU, cflV;
+    uint8_t lumaTx;
+    uint8_t pad[3];
+};
+
 // Closed-loop outputs per SB (fixed-capacity slots, compacted by k_pack).
 struct GpSbOut {
     uint32_t nBlocks, nTxb, nCoeffs;
@@ -174,6 +187,7 @@ struct GpBatch {
     GP_DEV uint64_t *prof;       // [16] k_recon phase cycles (GpParams::profile)
     GP_DEV uint32_t *sbCyc;           // [nSb] k_recon cycles per SB (profile only, may be null)
     GP_DEV void *bigScratch;          // [max CTAs per wavefront step] x GP_RC_BIG_BYTES (k_recon)
+    GP_DEV GpLeafDecision *leafDec;   // Glass Act: [nSb][GP_MAX_LEAVES] (k_leaf), may be null
 };
 
 #endif

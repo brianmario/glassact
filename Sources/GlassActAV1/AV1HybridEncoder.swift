@@ -86,9 +86,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.tiling = newValue }
     }
 
+    /// Decide chroma and the luma tx types on the GPU, up front and in parallel
+    /// (`AV1MetalEncoder.decidesLeaves`), so the CPU's closed loop only
+    /// quantizes and reconstructs; otherwise the CPU decides chroma and searches
+    /// the tx types in the closed loop. On by default.
+    public var gpuDecides: Bool {
+        get { metal.decidesLeaves }
+        set { metal.decidesLeaves = newValue }
+    }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
+        metal.decidesLeaves = true
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
@@ -148,9 +158,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
                     partition.blocks.withUnsafeBufferPointer { blocks in
-                        av1enc_hybrid_closed_loop(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
-                                                  UInt32(p.height), blocks.baseAddress, UInt32(blocks.count), Int32(qindex),
-                                                  Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &message, 256)
+                        partition.lumaTxTypes.withUnsafeBufferPointer { types in
+                            av1enc_hybrid_closed_loop(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
+                                                      UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
+                                                      gpuDecides ? types.baseAddress : nil,
+                                                      gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
+                                                      Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &message, 256)
+                        }
                     }
                 }
             }
