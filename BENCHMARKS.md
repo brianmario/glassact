@@ -305,6 +305,29 @@ Now, with reuse: typing-cc 720p ~208 fps (3×3), scroll-win 88, photos 44,
 typing-cc 1080p 151, 5K 50. Photos is GPU-bound, with every SB changing:
 analysis 18 ms, and the filters waiting behind it.
 
+**The leaf decisions on moving content (`av1seq --profile`, kept).**
+Stage by stage on photos at 720p, the leaf pass is the largest GPU stage (8.3
+ms; the shapes take 0.9–3 ms each).
+- *Tx search size:* each 16×16 tx type runs serially on one lane.
+  Searching only up to 128 pixels (`leafTxSearchPixels`) saves ~13 % for
+  +0.08–0.2 % bytes; up to 64 pixels, +0.5–1.3 %; none, +3.3–6.8 %.
+- *Chroma modes:* screening the seven plain modes, without the six angled
+  ones (`leafChromaAngledModes`), costs 0–0.3 % bytes for ~5–8 %.
+- *Small kernel:* the thread-per-block analysis of 8×16 / 16×8 stays. With
+  the SIMD-group kernel, photos is 46.2 fps against 48.6.
+
+The hybrid's defaults (prune 4, tx search ≤128 px, plain chroma modes),
+analyzing every SB at 720p, 3×3 tiles:
+
+| | before these | now | bytes |
+|---|---|---|---|
+| photos | 41.9 fps | **53.0 fps** | 128.8 KB (±0) |
+| typing-cc | 45.9 | **53.2** | 109.5 KB (+0.2 %) |
+| scroll-win | 46.8 | **54.2** | 92.3 KB (+0.3 %) |
+
+With reuse at 720p: typing-cc **254.6 fps**, scroll-win 95.5, photos 51.3.
+libaom realtime key frames run 47–56 fps there, with 30–40 % more bytes.
+
 ### Metal AV1: decisions up front on the GPU, and analysis kept across pictures (2026-10-30)
 
 `av1seq`, turbo, q20, overlapped, M4 Pro. Every stream decodes in libaom to

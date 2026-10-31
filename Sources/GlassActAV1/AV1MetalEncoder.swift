@@ -199,7 +199,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var p = params
         var key = withUnsafeBytes(of: &p) { Array($0) }
         for v in [width, height, qindex, tiling.columnsLog2, tiling.rowsLog2, decidesLeaves ? 1 : 0,
-                  Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0] {
+                  Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0, leafTxSearchPixels,
+                  leafChromaAngledModes ? 1 : 0] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -213,6 +214,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// its luma tx type on the GPU, from the source (k_leaf): the partition's
     /// blocks then carry them, for a closed loop that only quantizes.
     public var decidesLeaves = false
+    /// The largest block (in pixels) whose luma tx type `decidesLeaves`
+    /// searches; larger ones take DCT_DCT. Up to 256 (16×16), where an intra set
+    /// stops offering more. 256 is the most exact; 128 saves ~13 % of a moving
+    /// picture's GPU time for ~0.1–0.2 % of bytes (BENCHMARKS.md).
+    public var leafTxSearchPixels = 256
+    /// Whether `decidesLeaves` screens the six angled chroma modes too. Off
+    /// saves ~5–8 % of a moving picture's GPU time for 0–0.3 % of bytes.
+    public var leafChromaAngledModes = true
     let recon: any MTLComputePipelineState
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
@@ -224,6 +233,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var analysis = 0.0, partition = 0.0, closedLoop = 0.0, wall = 0.0
         /// Closed-loop dispatches that must run one after another.
         public var wavefrontSteps = 0
+        /// When profiling: each block shape's analysis (by bsize) and the leaf decisions, in seconds.
+        public var shapes: [Int: Double] = [:]
+        public var leaves = 0.0
     }
     /// Runs each stage in its own command buffer so it can be timed, which
     /// adds a little latency between stages. For measurement.
@@ -639,7 +651,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.leafDecide = decidesLeaves ? 1 : 0
             params.pruneVar = encoder.busyBlockPrune
             if !encoder.searchesAngleDeltas { params.deltas = 0; params.uvDeltas = 0 }
-            params.leafTxSearch = 1
+            params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
+            params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
@@ -676,6 +689,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     e.setBytes(&n, length: 4, index: 2)
                     e.dispatchThreads(MTLSize(width: Int(n), height: 1, depth: 1),
                                       threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.smallThreads, height: 1, depth: 1))
+                    if profiling {
+                        let t = try close()
+                        stages.shapes[s] = t
+                        stages.analysis += t
+                        e = try open()
+                    }
                     continue
                 }
                 guard let (pipeline, warps) = encoder.analysis[s] else { continue }
@@ -683,8 +702,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.setBytes(&n, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                if profiling {
+                    let t = try close()
+                    stages.shapes[s] = t
+                    stages.analysis += t
+                    e = try open()
+                }
             }
-            stages.analysis = profiling ? try close() : 0
+            if profiling { stages.analysis += try close() }
             e = try open()
             e.memoryBarrier(scope: .buffers)
             let nSb = sbCols * sbRows
@@ -695,6 +720,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                   threadsPerThreadgroup: MTLSize(width: min(64, dpThreads), height: 1, depth: 1))
             }
             if decidesLeaves {
+                if profiling { stages.partition = try close(); e = try open() }
                 e.memoryBarrier(scope: .buffers)
                 e.setComputePipelineState(encoder.leafScan)
                 e.setBuffer(leafOffsets, offset: 0, index: 2)
@@ -706,7 +732,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.dispatchThreadgroups(indirectBuffer: leafDispatch, indirectBufferOffset: 0,
                                        threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.leafThreads, height: 1, depth: 1))
             }
-            stages.partition = profiling ? try close() : 0
+            if profiling {
+                let t = try close()
+                if decidesLeaves { stages.leaves = t } else { stages.partition = t }
+            }
             if closedLoop {
                 e = try open()
                 e.setComputePipelineState(encoder.recon)
@@ -726,7 +755,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if let error = c.error { throw Failure.metal("\(error)") }
                 encoder.lastGPUSeconds = c.gpuEndTime - c.gpuStartTime
             } else {
-                encoder.lastGPUSeconds = stages.analysis + stages.partition + stages.closedLoop
+                encoder.lastGPUSeconds = stages.analysis + stages.partition + stages.leaves + stages.closedLoop
             }
             stages.wall = CACurrentMediaTime() - t0
             encoder.lastStages = stages

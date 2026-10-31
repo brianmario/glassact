@@ -86,7 +86,8 @@ struct GpParams {
     float pruneFlat;     // > 0: skip shapes < 16x16 inside 16x16 regions whose 8x8 variances are all < pruneFlat * step_ac^2
     // Glass Act: after the DP, decide every leaf's chroma mode / CfL and luma tx type open loop (k_leaf)
     int leafDecide;      // 1: run k_leaf (AV1HybridEncoder)
-    int leafTxSearch;    // 1: k_leaf searches luma tx types (blocks up to 16x16); 0: DCT_DCT
+    int leafTxSearch;    // k_leaf searches luma tx types of blocks up to this many pixels (<= 256); 0: DCT_DCT
+    int leafChromaAngled; // 1: k_leaf screens all 13 chroma modes; 0: not the six angled ones (D45 .. D67)
 };
 
 // Per-image descriptor (device copy in an array; host fills it).

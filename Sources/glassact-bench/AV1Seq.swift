@@ -22,8 +22,11 @@ let av1SeqCommand = Command(
         .string("preset", "<name>", "analysis preset: slow, base, fast, faster, turbo (default), turbo2, turbo3"),
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .int("repeat", "<n>", 1...1000, "encode the sequence n times over (for profiling; default 1)"),
+        .bool("profile", "afterwards, time the GPU's analysis of the last picture shape by shape (analyzing every SB)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
         .string("prune", "<v>", "skip 32x32-and-up analysis where variance > v quantizer steps squared (default 4; 0 off, 1 faster)"),
+        .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
+        .bool("chroma-angles", "screen the six angled chroma modes too (13 instead of 7)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
@@ -76,6 +79,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.gpuDecides = !opts.has("cpu-decides")
     encoder.reusesAnalysis = !opts.has("no-reuse")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
+    if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
+    if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
         guard let f = Float(v), f >= 0 else { throw BenchError("--prune \(v): not a number >= 0") }
         encoder.busyBlockPrune = f
@@ -113,6 +118,20 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %% · filtered %.0f %%",
                  mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },
                  mean { $0.kept } / 10, mean { $0.keptTiles } / 10, mean { $0.filtered } / 10))
+
+    if opts.has("profile") {
+        encoder.reusesAnalysis = false
+        encoder.profilesStages = true
+        _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
+        let st = encoder.lastStages
+        let names = ["4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32",
+                     "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
+        let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.1f", names[$0.key], $0.value * 1000) }
+        print(String(format: "  GPU, stage by stage (ms): analysis %.1f [%@] · partition %.1f · leaves %.1f",
+                     st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000))
+        encoder.profilesStages = false
+        encoder.reusesAnalysis = !opts.has("no-reuse")
+    }
 
     if opts.has("aom-speed") {
         let speed = opts.int("aom-speed", 9), threads = opts.int("aom-threads", 8)

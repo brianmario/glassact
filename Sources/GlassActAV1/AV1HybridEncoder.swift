@@ -127,12 +127,36 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.busyBlockPrune = newValue }
     }
 
+    /// The largest block whose luma tx type the GPU searches
+    /// (`AV1MetalEncoder.leafTxSearchPixels`; 128 by default, 256 for every one).
+    public var leafTxSearchPixels: Int {
+        get { metal.leafTxSearchPixels }
+        set { metal.leafTxSearchPixels = newValue }
+    }
+
+    /// Screen the angled chroma modes too (`AV1MetalEncoder.leafChromaAngledModes`; off).
+    public var leafChromaAngledModes: Bool {
+        get { metal.leafChromaAngledModes }
+        set { metal.leafChromaAngledModes = newValue }
+    }
+
+    /// Time the GPU's stages one by one (`AV1MetalEncoder.profilesStages`):
+    /// for measurement, as it serializes them.
+    public var profilesStages: Bool {
+        get { metal.profilesStages }
+        set { metal.profilesStages = newValue }
+    }
+    /// The last picture's GPU stages (with `profilesStages`).
+    public var lastStages: AV1MetalEncoder.StageTimes { metal.lastStages }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
         metal.busyBlockPrune = 4
+        metal.leafTxSearchPixels = 128
+        metal.leafChromaAngledModes = false
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu

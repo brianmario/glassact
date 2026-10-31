@@ -49,7 +49,7 @@ static uint8_t leaf_luma_tx(device const GpImage &I, constant GpParams &P, int x
                        : (W == 8 && H == 4) ? AV1G_TX_8X4 : (W == 4 && H == 16) ? AV1G_TX_4X16 : (W == 16 && H == 4) ? AV1G_TX_16X4
                        : (W == 8 && H == 16) ? AV1G_TX_8X16 : (W == 16 && H == 8) ? AV1G_TX_16X8 : AV1G_TX_16X16;
     const int set = av1g_get_tx_set_intra(txSz, 0);
-    if (set == AV1G_TX_SET_DCTONLY || !P.leafTxSearch) return AV1G_DCT_DCT;
+    if (set == AV1G_TX_SET_DCTONLY || W * H > P.leafTxSearch) return AV1G_DCT_DCT;  // largest block searched, in pixels
     const TileBox tb = tile_of(I, x, y);
     const int haveLeft = x > tb.x0, haveAbove = y > tb.y0;
     const int haveAR = ol_decoded(x + W, y - 1, x, y, 0, tb);
@@ -96,7 +96,7 @@ static uint8_t leaf_luma_tx(device const GpImage &I, constant GpParams &P, int x
 }
 
 // Decider::best_chroma, lanes over 4x4 sub-blocks
-static void leaf_chroma(device const GpImage &I, int x, int y, int bs, int qidx, threadgroup LeafSmem &S, uint lane,
+static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, threadgroup LeafSmem &S, uint lane,
                         thread GpLeafDecision &d) {
     const int txSz = av1g_uv_tx_size(bs);
     const int lw = AV1G_T(Tx_Width_Log2)[txSz], lh = AV1G_T(Tx_Height_Log2)[txSz];
@@ -117,9 +117,14 @@ static void leaf_chroma(device const GpImage &I, int x, int y, int bs, int qidx,
     // every (mode, plane, 4x4 sub-block) is an item; a lane's costs accumulate per mode
     float part[AV1G_INTRA_MODES];
     for (int m = 0; m < AV1G_INTRA_MODES; m++) part[m] = 0.f;
-    const int items = AV1G_INTRA_MODES * 2 * nsub;
+    // the modes screened: all 13, or the seven without an angle (cheaper per pixel)
+    constexpr int plain[7] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED, AV1G_SMOOTH_V_PRED,
+                              AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
+    const int nmodes = P.leafChromaAngled ? AV1G_INTRA_MODES : 7;
+    const int items = nmodes * 2 * nsub;
     for (int it = (int)lane; it < items; it += 32) {
-        const int m = it / (2 * nsub), pl = 1 + (it / nsub) % 2, sb = it % nsub;
+        const int mi = it / (2 * nsub), m = P.leafChromaAngled ? mi : plain[mi];
+        const int pl = 1 + (it / nsub) % 2, sb = it % nsub;
         const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
         device const uint8_t *s = I.src[pl] + (size_t)cy * I.spitch[pl] + cx;
         threadgroup uint8_t *A = S.ea[pl] + AV1G_EDGE_OFF, *L = S.el[pl] + AV1G_EDGE_OFF;
@@ -132,7 +137,8 @@ static void leaf_chroma(device const GpImage &I, int x, int y, int bs, int qidx,
     }
     float best = GP_INF;
     int bestMode = AV1G_DC_PRED;
-    for (int m = 0; m < AV1G_INTRA_MODES; m++) {
+    for (int mi = 0; mi < nmodes; mi++) {
+        const int m = P.leafChromaAngled ? mi : plain[mi];
         const float J = simd_sum(part[m]) + lambda * (av1g_is_directional(m) ? 5.0f : 3.5f);
         if (J < best) { best = J; bestMode = m; }
     }
@@ -257,7 +263,7 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
             default: break;
             }
         }
-        if (av1g_has_chroma(bs, y >> 2, x >> 2, I.mono)) leaf_chroma(I, x, y, bs, sb_qindex(I, x, y), S, lane, d);
+        if (av1g_has_chroma(bs, y >> 2, x >> 2, I.mono)) leaf_chroma(I, P, x, y, bs, sb_qindex(I, x, y), S, lane, d);
         if (lane == 0) B.leafDec[sb * GP_MAX_LEAVES + k] = d;
     }
 }
