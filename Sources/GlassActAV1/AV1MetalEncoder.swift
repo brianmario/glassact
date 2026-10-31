@@ -108,6 +108,24 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Superblocks kept from the previous picture in the last one.
     public private(set) var lastKeptSuperblocks = 0
     var cache: AnalysisCache?
+    /// Padded source planes of partitions already waited on, for the next picture of the same
+    /// geometry: making and clearing 22 MB of shared memory per 5K picture cost milliseconds.
+    var sourcePool: [[any MTLBuffer]] = []
+
+    func takeSource(_ lengths: [Int]) throws -> [any MTLBuffer] {
+        if let i = sourcePool.firstIndex(where: { $0.map(\.length) == lengths.map { max(16, $0) } }) {
+            return sourcePool.remove(at: i)
+        }
+        return try lengths.map {
+            guard let b = device.makeBuffer(length: max(16, $0), options: .storageModeShared)
+            else { throw Failure.metal("no buffer of \($0) bytes") }
+            return b
+        }
+    }
+
+    func recycleSource(_ planes: [any MTLBuffer]) {
+        if sourcePool.count < 2 { sourcePool.append(planes) }
+    }
 
     /// The buffers a picture's analysis leaves behind, and the source it read.
     final class AnalysisCache {
@@ -119,6 +137,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var staleCount = 0
         var previous: [[UInt8]]? = nil
         var keptCount = 0
+        /// Each SB's blocks and luma tx types as the last partition read them, for SBs kept since.
+        var sbBlocks: [[av1g_block]] = [], sbTypes: [[UInt8]] = []
 
         init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
             self.key = key
@@ -185,8 +205,21 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                 }
             }
+            // the rest of the previous source equals this one already
             for (p, (pixels, w, h)) in planes.enumerated() {
-                previous![p].withUnsafeMutableBufferPointer { $0.baseAddress!.update(from: pixels, count: w * h) }
+                let side = p == 0 ? 64 : 32
+                previous![p].withUnsafeMutableBufferPointer { old in
+                    for sr in 0..<sbRows {
+                        for sc in 0..<sbCols where changed[sr * sbCols + sc] {
+                            let x0 = sc * side, y0 = sr * side
+                            guard x0 < w, y0 < h else { continue }
+                            let n = min(side, w - x0)
+                            for row in y0..<min(y0 + side, h) {
+                                (old.baseAddress! + row * w + x0).update(from: pixels + row * w + x0, count: n)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -412,6 +445,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 run.encoder.lastGPUSeconds = stages.analysis
             }
             let (blocks, types) = run.leafBlocks()
+            if !run.source.isEmpty {  // the GPU is done with it (or never used it)
+                run.encoder.recycleSource(run.source)
+                run.source = []
+            }
             return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles)
         }
     }
@@ -442,6 +479,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var batch = GpBatch()
         var shTotal = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
         let rec: [any MTLBuffer]
+        /// The padded source planes (the encoder's pool's, returned once a partition is read).
+        var source: [any MTLBuffer] = []
         let leaves: any MTLBuffer, leafCount: any MTLBuffer
         let sbOut: any MTLBuffer, oBlocks: any MTLBuffer, oBlockTxb: any MTLBuffer, oTxb: any MTLBuffer
         let oCoeffs: any MTLBuffer
@@ -484,11 +523,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             // source planes, padded to whole superblocks by edge replication
             let planes = [(y, width, height), (u, (width + 1) / 2, (height + 1) / 2), (v, (width + 1) / 2, (height + 1) / 2)]
-            var src: [any MTLBuffer] = []
+            let src = try encoder.takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)])
+            made += src
+            source = src
             var recPlanes: [any MTLBuffer] = []
             for (p, (pixels, w, h)) in planes.enumerated() {
                 let pw = p == 0 ? aw : aw / 2, ph = p == 0 ? ah : ah / 2
-                let b = try make(pw * ph)
+                let b = src[p]
                 let d = b.contents().assumingMemoryBound(to: UInt8.self)
                 for row in 0..<ph {
                     let sr = min(row, h - 1)
@@ -496,7 +537,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     line.update(from: pixels + sr * w, count: w)
                     (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
                 }
-                src.append(b)
                 recPlanes.append(try make(closedLoop ? pw * ph : 16))
             }
             rec = recPlanes
@@ -676,6 +716,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 compute = nil
                 return c.gpuEndTime - c.gpuStartTime
             }
+            // every SB keeps the previous picture's analysis, and its results are in the cache
+            if !closedLoop, !profiling, staleSuperblocks == 0 {
+                encoder.lastGPUSeconds = 0
+                return nil
+            }
             let t0 = CACurrentMediaTime()
             var e = try open()
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
@@ -786,7 +831,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let results = blockResults.contents().assumingMemoryBound(to: GpBlockRes.self)
             let decisions = leafDecisions.contents().assumingMemoryBound(to: GpLeafDecision.self)
             let counts = leafCount.contents().assumingMemoryBound(to: UInt16.self)
+            // SBs whose analysis was kept have last picture's blocks
+            let cache = encoder.cache.flatMap { $0.blockResults === blockResults ? $0 : nil }
+            let kept = cache?.keep.contents().assumingMemoryBound(to: UInt8.self)
+            if let cache, cache.sbBlocks.count != sbCols * sbRows {
+                cache.sbBlocks = Array(repeating: [], count: sbCols * sbRows)
+                cache.sbTypes = Array(repeating: [], count: sbCols * sbRows)
+            }
             for sb in decodeOrder() {
+                if let cache, let kept, kept[sb] != 0, !cache.sbBlocks[sb].isEmpty {
+                    blocks += cache.sbBlocks[sb]
+                    types += cache.sbTypes[sb]
+                    continue
+                }
+                let first = blocks.count
                 let r = (sb / sbCols) * 16, c = (sb % sbCols) * 16
                 for k in 0..<Int(counts[sb]) {
                     let leaf = leafPtr[sb * Int(GP_MAX_LEAVES) + k]
@@ -812,6 +870,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                     blocks.append(b)
                     types.append(decidesLeaves ? decisions[sb * Int(GP_MAX_LEAVES) + k].lumaTx : (res.ncand > 0 ? res.tx : 0))
+                }
+                if let cache {
+                    cache.sbBlocks[sb] = Array(blocks[first...])
+                    cache.sbTypes[sb] = Array(types[first...])
                 }
             }
             return (blocks, types)

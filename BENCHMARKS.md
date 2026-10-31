@@ -259,9 +259,39 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: an exact deblocked frame, and no analysis work when nothing changed (2026-10-31)
+
+**A bug in the previous entry, fixed.** The preset-change path was *not* exact: 720p typing-cc decoded differently from the encoder's picture at frame 3.
+
+- *Cause:* region deblocking reloads the changed area, plus two 64×64s around it, and deblocks it in place. Near that region's edge it reads neighbours that are deblocked already. It also filters their samples a second time, because an edge's filter reaches 7 samples into both sides.
+- *Why it hadn't shown:* until now, nothing read those samples. CDEF only reran one 64×64 inside the region.
+- *Why it showed now:* when new presets rerun CDEF where a strength changed, those 64×64s are read, in that picture or a later one.
+
+Now the unchanged 64×64s within three of a change, outside the exactly recomputed inner area, are saved before the reload and restored after the deblock. Their deblocked samples are the previous picture's, so the deblocked frame stays exact everywhere.
+
+A new test, `HybridEncoderTests.regionFilteringStaysExactAcrossPresetChanges`, encodes 40 pictures of random grainy edits that change the presets. Each picture is compared with a fresh full encode. It fails on the half fix.
+
+200 frames of typing-cc, scroll-win, photos and cursor-drag at 720p, typing and scroll at 1080p, and typing at 5K now all decode exactly.
+
+**Analysis overhead with little or nothing to analyze (kept, exact):**
+- *The padded source planes are pooled.* Partitions already waited on return them, so 22 MB of shared memory isn't made and cleared per 5K picture. `begin` went 4.3 → 3.0 ms.
+- *Only the changed 64×64s* are copied into the previous-source copy.
+- *No GPU dispatch at all* when every SB keeps its analysis. The kept results are in the cache already.
+- *Kept SBs' blocks are reused,* in `leafBlocks`, from the previous partition.
+
+Interleaved against the Rust port's commit (f755b42); middle of three runs, identical bytes:
+
+| Sequence | Before | After |
+|---|---|---|
+| typing-cc 720p, 3×3 | 233 fps | **391 fps** |
+| scroll-win 720p | 239 | **299** |
+| photos 720p | 79 | **86** |
+| typing-cc 1080p | 135 | **233** |
+| typing-cc 5K, 4×4 | 47 | **80** (filters 9.8 → 3.6 ms) |
+
 ### Metal AV1: filters when the CDEF presets change; preset selection on the CPU (2026-10-31)
 
-`av1seq`, turbo, q20, 60 frames, M4 Pro. Interleaved A/B runs on a loaded machine; every byte is unchanged and every decode exact.
+`av1seq`, turbo, q20, 60 frames, M4 Pro. Interleaved A/B runs on a loaded machine; bytes unchanged. *Not exact as first committed:* see the entry above for the deblocking fix.
 
 **Presets that change no longer re-filter the frame (kept, exact).** With only changed tiles filtered, the whole frame was still filtered again whenever the joint search picked different CDEF presets. That happened often enough that 5K typing filtered 29 % of the frame on average.
 

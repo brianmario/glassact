@@ -237,6 +237,22 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         let inner = dilate(changed), outer = dilate(inner)
         let innerList = (0..<nsb).filter { inner[$0] != 0 }.map(UInt32.init)
         let outerList = (0..<nsb).filter { outer[$0] != 0 }.map(UInt32.init)
+        // Deblocking outer goes wrong near its edge: it reads neighbours that are deblocked
+        // already, and filters theirs a second time (an edge's filter reaches 7 samples into
+        // both sides). Those 64×64s, outer's that aren't inner's and the ones bordering outer,
+        // are unchanged, so their deblocked samples are the previous picture's: kept aside and
+        // put back, so the whole deblocked frame stays exact for whatever reads it later (CDEF
+        // where new presets change a strength, in this picture or a later one).
+        let around = dilate(outer)
+        let ringList = (0..<nsb).filter { around[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
+        let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", job.pw[$0] * job.ph[$0]) }
+        func copyRing(from: [any MTLBuffer], to: [any MTLBuffer]) {
+            for p in 0..<job.nPlanes {
+                Self.copy(from[p].contents().assumingMemoryBound(to: UInt8.self), stride: job.pw[p], into: to[p],
+                          width: job.pw[p], height: job.ph[p], superblocks: ringList, side: p == 0 ? 64 : 32, sbCols: sbCols)
+            }
+        }
+        copyRing(from: job.source, to: ring)
         try job.load(params: fp, blocks: blocks, planes: planes, only: outerList)
         let target = try (0..<3).map { try job.scratch("target\($0)", job.pw[$0] * job.ph[$0]) }
         for p in 0..<job.nPlanes {
@@ -284,6 +300,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                                              threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             }
         }
+        copyRing(from: ring, to: job.source)
         Self.select(lumaSSE, chromaSSE, nc: nc, nsb: nsb, mono: mono, levels: levels, totals: totals)
         let presetSSE = Array(UnsafeBufferPointer(start: totals.contents().assumingMemoryBound(to: UInt64.self), count: bitsCount))
         let lev = levels.contents().assumingMemoryBound(to: Int32.self)

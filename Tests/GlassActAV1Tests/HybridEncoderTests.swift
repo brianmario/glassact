@@ -1,6 +1,7 @@
 import AV1Core
 import Foundation
 import GlassActAV1
+import GlassActTestSupport
 import Metal
 import Testing
 import libaom
@@ -46,6 +47,56 @@ struct HybridEncoderTests {
 }
 
 extension HybridEncoderTests {
+    /// Filtering only around changes stays the decoder's picture over a long
+    /// sequence of small edits, including pictures whose CDEF presets change
+    /// (every 64×64's preset is redone then, and CDEF reruns where a strength
+    /// changed, on a deblocked frame that must be exact everywhere: an early
+    /// version re-filtered samples next to the changed area twice, which only
+    /// showed when a later picture's new presets reran CDEF there).
+    @available(macOS 27, *)
+    @Test func regionFilteringStaysExactAcrossPresetChanges() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (1280, 720)
+        let reusing = try AV1HybridEncoder(device: device), fresh = try AV1HybridEncoder(device: device)
+        fresh.reusesAnalysis = false
+        for e in [reusing, fresh] { e.tiling = (2, 2) }
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0xcdef_1234)
+        var pictures: [AV1HybridEncoder.Picture] = []
+        var y = base.y
+        for _ in 0..<40 {
+            // a word typed, a patch repainted: soft or grainy, so CDEF's best strengths move
+            for _ in 0..<Int.random(in: 1...3, using: &rng) {
+                let w = Int.random(in: 8...320, using: &rng), h = Int.random(in: 8...160, using: &rng)
+                let x0 = Int.random(in: 0..<width - w, using: &rng), y0 = Int.random(in: 0..<height - h, using: &rng)
+                let grain = Int.random(in: 0...48, using: &rng), level = Int.random(in: 40...200, using: &rng)
+                for r in y0..<y0 + h {
+                    for c in x0..<x0 + w {
+                        let v = level + (r - y0) / 2 + ((c / 3 + r / 5) % 7 == 0 ? 60 : 0) + Int.random(in: -grain...grain, using: &rng)
+                        y[r * width + c] = UInt8(clamping: v)
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        var presetChanges = 0
+        var last: av1g_frame_params?
+        try reusing.encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { i, frame in
+            let alone = try fresh.encode(pictures[i], qindex: 80)
+            #expect(frame.obu == alone.obu, "picture \(i) codes differently with kept analysis")
+            #expect(frame.planes == alone.planes, "picture \(i) filters differently around changes")
+            func presets(_ p: av1g_frame_params) -> [UInt8] {
+                [p.cdef_bits] + withUnsafeBytes(of: p.cdef_y_pri) { Array($0) } + withUnsafeBytes(of: p.cdef_y_sec) { Array($0) }
+                    + withUnsafeBytes(of: p.cdef_uv_pri) { Array($0) } + withUnsafeBytes(of: p.cdef_uv_sec) { Array($0) }
+            }
+            if let last, presets(last) != presets(frame.params) {
+                presetChanges += 1
+            }
+            last = frame.params
+        })
+        #expect(presetChanges > 0, "no picture changed the CDEF presets, so the case wasn't exercised")
+    }
+
     /// Kept analysis is the analysis: a sequence where only a little moves
     /// (a caret blinking, a word typed, a region scrolled) codes every picture
     /// exactly as an encoder that analyzes everything does.
