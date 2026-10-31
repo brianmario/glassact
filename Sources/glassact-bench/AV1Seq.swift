@@ -23,7 +23,7 @@ let av1SeqCommand = Command(
         .string("preset", "<name>", "analysis preset: slow, base, fast, faster, turbo (default), turbo2, turbo3"),
         .string("tiles", "<c>x<r>", "tiling, log2 of columns and rows (default 2x2)"),
         .int("repeat", "<n>", 1...1000, "encode the sequence n times over (for profiling; default 1)"),
-        .bool("profile", "afterwards, time the GPU's analysis of the last picture shape by shape (analyzing every SB)"),
+        .bool("profile", "afterwards, time the GPU's analysis of the last picture shape by shape (analyzing every SB; with --inter, as an inter frame after the one before)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
         .string("prune", "<v>", "skip 32x32-and-up analysis where variance > v quantizer steps squared (default 4; 0 off, 1 faster)"),
         .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
@@ -175,14 +175,21 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
 
     if opts.has("profile") {
-        encoder.reusesAnalysis = false
+        // an inter frame: its copies aren't analyzed, so the analysis of the rest is kept on
+        encoder.reusesAnalysis = inter
         encoder.profilesStages = true
         // isolated dispatches run at whatever clock the GPU is at, so take each stage's best of 10
         var st = AV1MetalEncoder.StageTimes()
         for run in 0..<10 {
-            _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
+            if inter, pictures.count > 1 {
+                try encoder.encode(count: 2, qindex: qindex, picture: { picture(pictures.count - 2 + $0) }, output: { _, _ in })
+            } else {
+                _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
+            }
             let s = encoder.lastStages
             if run == 0 { st = s; continue }
+            st.motionSearch = min(st.motionSearch, s.motionSearch)
+            st.interSearch = min(st.interSearch, s.interSearch)
             st.analysis = min(st.analysis, s.analysis)
             st.partition = min(st.partition, s.partition)
             st.leaves = min(st.leaves, s.leaves)
@@ -190,9 +197,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         }
         let names = ["4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32",
                      "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
-        let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.1f", names[$0.key], $0.value * 1000) }
-        print(String(format: "  GPU, stage by stage (ms): analysis %.1f [%@] · partition %.1f · leaves %.1f",
-                     st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000))
+        let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.2f", names[$0.key], $0.value * 1000) }
+        let motion = inter ? String(format: "motion search %.2f · inter candidates %.2f · ", st.motionSearch * 1000, st.interSearch * 1000) : ""
+        print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.1f",
+                     motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000))
         encoder.profilesStages = false
         encoder.reusesAnalysis = !opts.has("no-reuse")
     }

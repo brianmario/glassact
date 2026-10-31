@@ -310,6 +310,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// its wall-clock time from the first dispatch to the last completion.
     public struct StageTimes: Sendable {
         public var analysis = 0.0, partition = 0.0, closedLoop = 0.0, wall = 0.0
+        /// When profiling an inter frame: the motion search (k_proj and k_me) and the inter
+        /// candidates (k_inter, every shape), in seconds; not in `analysis`.
+        public var motionSearch = 0.0, interSearch = 0.0
         /// Closed-loop dispatches that must run one after another.
         public var wavefrontSteps = 0
         /// When profiling: each block shape's analysis (by bsize) and the leaf decisions, in seconds.
@@ -837,6 +840,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.setBytes(&cells, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                if profiling {
+                    stages.motionSearch = try close()
+                    e = try open()
+                }
             }
             if isInter, analyzed > 0 {  // the inter candidates, which the intra analysis then weighs
                 e.memoryBarrier(scope: .buffers)
@@ -848,6 +855,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     e.setBytes(&n, length: 4, index: 2)
                     e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
                                            threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                }
+                if profiling {
+                    stages.interSearch = try close()
+                    e = try open()
                 }
             }
             if isInter, analyzed > 0 { e.memoryBarrier(scope: .buffers) }
