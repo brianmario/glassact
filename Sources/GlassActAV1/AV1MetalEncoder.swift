@@ -292,6 +292,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Inter frames' motion search refines vectors to quarter samples (off: whole
     /// samples). The frame must then allow them (av1g_frame_params.mv_precision 1).
     public var searchesSubpelMotion = false
+    /// Tiles in 128×128-superblock units (the stream's are), so that the analysis's tiles are
+    /// the bitstream's; the analysis itself stays 64×64.
+    public var largeSuperblocks = false
     let recon: any MTLComputePipelineState
     var params: GpParams
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
@@ -607,8 +610,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             rec = recPlanes
             var tl = av1g_tiles()
-            guard av1g_tile_layout(UInt32(width), UInt32(height), Int32(encoder.tiling.columnsLog2),
-                                   Int32(encoder.tiling.rowsLog2), &tl) == AV1G_OK
+            guard av1g_tile_layout_ex(UInt32(width), UInt32(height), Int32(encoder.tiling.columnsLog2),
+                                      Int32(encoder.tiling.rowsLog2), encoder.largeSuperblocks ? 1 : 0, &tl) == AV1G_OK
             else { throw Failure.metal("tile layout \(encoder.tiling) for \(width)×\(height)") }
 
             var image = GpImage()

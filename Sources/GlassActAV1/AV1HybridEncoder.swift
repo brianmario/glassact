@@ -164,6 +164,18 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// few bits. Loss-safe as long as the reference is a frame the decoder has.
     public var carriesCDFs = true
 
+    /// With `interFrames`: 128×128 superblocks (on), so that four copied 64×64s at one
+    /// shift are one block. The GPU's analysis stays 64×64; the stream's sequence header
+    /// says 128, for every frame.
+    public var largeSuperblocks = true
+
+    /// With `interFrames`: inter frames carry no sequence header (on); the key frame's
+    /// applies.
+    public var omitsSequenceHeaders = true
+
+    /// The current stream's superblock size (set when it starts).
+    private var streamSB128 = false
+
     /// With `searchesMotion`: refine motion vectors to quarter samples (on). Scaled
     /// or animated content moves by fractions of a sample; captured scrolling and
     /// dragging at full size don't, and cost nothing more. Off: whole samples.
@@ -226,6 +238,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
+        streamSB128 = interFrames && largeSuperblocks
+        metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
         var current = try picture(0)
         var pending = try begin(current, after: nil, qindex: qindex)
@@ -307,6 +321,21 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let reference = sbMotionIn != nil ? previous : nil
         if interFrames {
             video.video = 1
+            video.sb128 = streamSB128 ? 1 : 0
+            if streamSB128, sbMotionIn == nil || reference == nil {
+                // a key frame: its blocks in the 128×128 superblocks' decode order
+                var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?
+                let n = partition.blocks.withUnsafeBufferPointer { b in
+                    partition.lumaTxTypes.withUnsafeBufferPointer { t in
+                        av1enc_motion_apply_ex(motion, nil, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil, nil,
+                                               Int32(p.width), Int32(p.height), 1, Int32(tiling.columnsLog2), Int32(tiling.rowsLog2),
+                                               &outBlocks, &outInter, &outTx)
+                    }
+                }
+                guard n > 0, let outBlocks, let outTx else { throw Failure.encode("128×128 order: no blocks") }
+                blocks = Array(UnsafeBufferPointer(start: outBlocks, count: Int(n)))
+                lumaTx = Array(UnsafeBufferPointer(start: outTx, count: Int(n)))
+            }
             if reference != nil, let sbMotionIn {
                 video.frame_type = UInt8(AV1G_FRAME_INTER)
                 video.refresh_frame_flags = 1  // slot 0: always the previous picture
@@ -320,9 +349,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 let n = partition.blocks.withUnsafeBufferPointer { b in
                     partition.lumaTxTypes.withUnsafeBufferPointer { t in
                         partition.inter.withUnsafeBufferPointer { searched in
-                            av1enc_motion_apply(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
-                                                searched.count == b.count ? searched.baseAddress : nil,
-                                                Int32(p.width), Int32(p.height), &outBlocks, &outInter, &outTx)
+                            av1enc_motion_apply_ex(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
+                                                   searched.count == b.count ? searched.baseAddress : nil,
+                                                   Int32(p.width), Int32(p.height), streamSB128 ? 1 : 0,
+                                                   Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &outBlocks, &outInter, &outTx)
                         }
                     }
                 }
@@ -404,7 +434,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
-                                           lfZero: inter.isEmpty ? nil : inter.map(\.is_inter))
+                                           lfZero: inter.isEmpty ? nil : inter.map { $0.is_inter != 0 ? 3 : 0 })
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
@@ -414,7 +444,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var bytes: UnsafeMutablePointer<UInt8>?
         var size = 0
         let wrc = search.superblockCDEF.withUnsafeBufferPointer { cdef in
-            av1enc_hybrid_write(cpu, &params, cdef.baseAddress, Int32(sbCols), &bytes, &size, &message, 256)
+            av1enc_hybrid_write_ex(cpu, &params, cdef.baseAddress, Int32(sbCols), headerFlags(params), &bytes, &size, &message, 256)
         }
         guard wrc == AV1G_OK, let bytes else {
             throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
@@ -427,6 +457,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let frame = Frame(obu: obu, planes: search.planes, params: search.params, timing: timing)
         remember(p, frame, sbMotion)
         return frame
+    }
+
+    /// The writer's flags for a frame: an inter frame of a stream without its sequence header.
+    private func headerFlags(_ fp: av1g_frame_params) -> UInt32 {
+        omitsSequenceHeaders && fp.frame_type == UInt8(AV1G_FRAME_INTER) ? UInt32(AV1G_ENC_NO_SEQ_HEADER) : 0
     }
 
     /// The picture the next inter frame references.
@@ -501,7 +536,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var message = [CChar](repeating: 0, count: 256)
         var bytes: UnsafeMutablePointer<UInt8>?
         var size = 0
-        let wrc = av1enc_hybrid_write(cpu, &params, nil, 0, &bytes, &size, &message, 256)
+        let wrc = av1enc_hybrid_write_ex(cpu, &params, nil, 0, headerFlags(params), &bytes, &size, &message, 256)
         guard wrc == AV1G_OK, let bytes else {
             throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
         }
