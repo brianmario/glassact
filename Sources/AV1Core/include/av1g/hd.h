@@ -39,8 +39,10 @@
 
 #if defined(__METAL_VERSION__)
 #define AV1G_CONST constant
+#define AV1G_DEV device  /* pointer members the host fills with GPU addresses */
 #else
 #define AV1G_CONST
+#define AV1G_DEV
 #endif
 
 #if defined(__METAL_VERSION__)

@@ -14,7 +14,10 @@
  * are independent.  8-bit, 4:2:0 or monochrome, no segmentation / delta-lf / lossless;
  * lfLevel[] are the effective levels (Y vertical, Y horizontal, U, V).
  *
- * Define AV1G_PF_STAT(kind) before including to count filter paths (tests only). */
+ * Define AV1G_PF_STAT(kind) before including to count filter paths (tests only).
+ *
+ * Glass Act: for Metal, the frame's pointers are device addresses (AV1G_DEV) and the filters
+ * read the frame from the `constant` address space (AV1G_CONST). */
 #ifndef AV1G_POSTFILTER_H
 #define AV1G_POSTFILTER_H
 
@@ -33,12 +36,12 @@ enum { AV1G_PF_LF_MASKED = 0, AV1G_PF_LF_NARROW_HEV, AV1G_PF_LF_NARROW, AV1G_PF_
 
 typedef struct av1g_pf_frame {
     int W, H, MiRows, MiCols, mono;
-    uint8_t *plane[3];          /* frame being deblocked in place / CDEF source */
+    AV1G_DEV uint8_t *plane[3];          /* frame being deblocked in place / CDEF source */
     int stride[3];
-    uint8_t *skip;              /* Skips, MiRows x MiCols, stride MiCols */
-    uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows/2) x (MiCols/2), stride MiCols/2 */
-    int8_t *cdefIdx;            /* per 64x64, raster, stride sbCols; -1 = no CDEF (no non-skip block in it) */
-    int32_t *cdefDirVar;        /* optional (GPU path): per 8x8, (var << 3) | yDir, stride MiCols/2 */
+    AV1G_DEV uint8_t *skip;              /* Skips, MiRows x MiCols, stride MiCols */
+    AV1G_DEV uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows/2) x (MiCols/2), stride MiCols/2 */
+    AV1G_DEV int8_t *cdefIdx;            /* per 64x64, raster, stride sbCols; -1 = no CDEF (no non-skip block in it) */
+    AV1G_DEV int32_t *cdefDirVar;        /* optional (GPU path): per 8x8, (var << 3) | yDir, stride MiCols/2 */
     int sbCols, sbRows;
     int lfLevel[4];             /* effective loop filter levels Y vert, Y horz, U, V (0..63); 0 = off */
     int sharpness;              /* 0..7 */
@@ -70,7 +73,7 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
 }
 
 /* Writes one block's entries into the maps (Skips / LoopfilterTxSizes / cdef_idx). */
-AV1G_HD void av1g_pf_mark_block(const av1g_pf_frame *f, const av1g_block *b) {
+AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_block *b) {
     const int r0 = b->mi_row, c0 = b->mi_col, bs = b->bsize;
     const int bw4 = av1g_bw4(bs), bh4 = av1g_bh4(bs);
     const int txY = av1g_luma_tx_size(bs, b->tx_depth);
@@ -158,7 +161,7 @@ AV1G_HD void av1g_lf_line(uint8_t *q0p, ptrdiff_t step, int plane, int filterSiz
 
 /* Edge loop filter process (7.14.2): plane, pass, luma 4x4 position (row, col) - the 4
  * lines of one edge segment.  Callers visit row/col in steps of 2 for chroma. */
-AV1G_HD void av1g_lf_edge(const av1g_pf_frame *f, int plane, int pass, int row, int col) {
+AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass, int row, int col) {
     const int sub = plane ? 1 : 0;
     const int x = col * 4, y = row * 4;
     if (x >= f->W || y >= f->H) return;
@@ -201,7 +204,7 @@ AV1G_HD void av1g_lf_edge(const av1g_pf_frame *f, int plane, int pass, int row, 
 }
 
 /* Whole-frame deblocking in the spec's order (host reference). */
-AV1G_HD void av1g_deblock_frame(const av1g_pf_frame *f) {
+AV1G_HD void av1g_deblock_frame(AV1G_CONST const av1g_pf_frame *f) {
     if (!f->lfLevel[0] && !f->lfLevel[1]) return;
     for (int p = 0; p < (f->mono ? 1 : 3); p++) {
         if (p > 0 && !f->lfLevel[1 + p]) continue;
@@ -290,7 +293,7 @@ typedef struct av1g_cdef_blk {
 
 /* cdef_idx of the 8x8 block at luma 4x4 position (r, c) (even), or -1 when CDEF leaves it
  * unchanged (no CDEF in its 64x64, or all four 4x4s skipped). */
-AV1G_HD int av1g_cdef_active_idx(const av1g_pf_frame *f, int r, int c) {
+AV1G_HD int av1g_cdef_active_idx(AV1G_CONST const av1g_pf_frame *f, int r, int c) {
     const int idx = f->cdefIdx[(size_t)(r >> 4) * f->sbCols + (c >> 4)];
     if (idx < 0) return -1;
     const uint8_t *sk = f->skip;
@@ -300,7 +303,7 @@ AV1G_HD int av1g_cdef_active_idx(const av1g_pf_frame *f, int r, int c) {
 }
 
 /* Strengths / directions of an active block from its direction-process outputs (7.15.1). */
-AV1G_HD av1g_cdef_blk av1g_cdef_params(const av1g_pf_frame *f, int idx, int yDir, int var) {
+AV1G_HD av1g_cdef_blk av1g_cdef_params(AV1G_CONST const av1g_pf_frame *f, int idx, int yDir, int var) {
     av1g_cdef_blk o;
     o.filtered = 1;
     const int pri = f->cdefYPri[idx];
@@ -316,7 +319,7 @@ AV1G_HD av1g_cdef_blk av1g_cdef_params(const av1g_pf_frame *f, int idx, int yDir
 }
 
 /* r, c: 8x8 block position in luma 4x4 units (even).  src0: deblocked luma plane. */
-AV1G_HD av1g_cdef_blk av1g_cdef_setup(const av1g_pf_frame *f, const uint8_t *src0, int stride0, int r, int c) {
+AV1G_HD av1g_cdef_blk av1g_cdef_setup(AV1G_CONST const av1g_pf_frame *f, const uint8_t *src0, int stride0, int r, int c) {
     av1g_cdef_blk o = {0, 0, 0, 0, 0, 0, 0};
     const int idx = av1g_cdef_active_idx(f, r, c);
     if (idx < 0) {
@@ -330,7 +333,7 @@ AV1G_HD av1g_cdef_blk av1g_cdef_setup(const av1g_pf_frame *f, const uint8_t *src
 
 /* CDEF filter process (7.15.3) for the sample at plane coordinates (x, y) of the deblocked
  * plane src.  damping: CdefDamping for luma, CdefDamping - 1 for chroma. */
-AV1G_HD int av1g_cdef_pixel(const av1g_pf_frame *f, const uint8_t *src, int sstride, int plane, int x, int y, int priStr,
+AV1G_HD int av1g_cdef_pixel(AV1G_CONST const av1g_pf_frame *f, const uint8_t *src, int sstride, int plane, int x, int y, int priStr,
                             int secStr, int damping, int dir) {
     const int sub = plane ? 1 : 0;
     const int8_t Dirs[8][2][2] = {{{-1, 1}, {-2, 2}}, {{0, 1}, {-1, 2}}, {{0, 1}, {0, 2}}, {{0, 1}, {1, 2}},  /* Cdef_Directions */
@@ -359,7 +362,7 @@ AV1G_HD int av1g_cdef_pixel(const av1g_pf_frame *f, const uint8_t *src, int sstr
 
 /* CDEF block process (7.15.1) for the 8x8 luma block at 4x4 position (r, c), all planes:
  * source = deblocked frame (f->plane / f->stride), dst = CdefFrame. */
-AV1G_HD void av1g_cdef_block(const av1g_pf_frame *f, uint8_t *const dst[3], const int dstride[3], int r, int c) {
+AV1G_HD void av1g_cdef_block(AV1G_CONST const av1g_pf_frame *f, uint8_t *const dst[3], const int dstride[3], int r, int c) {
     const av1g_cdef_blk o = av1g_cdef_setup(f, f->plane[0], f->stride[0], r, c);
     if (o.filtered) AV1G_PF_STAT(AV1G_PF_CDEF_FILTERED);
     for (int p = 0; p < (f->mono ? 1 : 3); p++) {
@@ -378,7 +381,7 @@ AV1G_HD void av1g_cdef_block(const av1g_pf_frame *f, uint8_t *const dst[3], cons
 }
 
 /* Whole-frame CDEF (host reference): f->plane = deblocked frame, dst = output frame. */
-AV1G_HD void av1g_cdef_frame(const av1g_pf_frame *f, uint8_t *const dst[3], const int dstride[3]) {
+AV1G_HD void av1g_cdef_frame(AV1G_CONST const av1g_pf_frame *f, uint8_t *const dst[3], const int dstride[3]) {
     for (int r = 0; r < f->MiRows; r += 2)
         for (int c = 0; c < f->MiCols; c += 2) av1g_cdef_block(f, dst, dstride, r, c);
 }

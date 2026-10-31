@@ -32,6 +32,19 @@ uint32_t av1enc_ent_plan(const av1g_frame_params *fp, uint32_t nBlocks, uint32_t
 int av1enc_assemble_obus(const av1g_frame_params *fp, const uint8_t *const *tileData, const size_t *tileSizes,
                          uint32_t nTiles, int temporalDelimiter, uint8_t **out, size_t *outSize);
 
+// GPU addresses of the post-filters' planes (being deblocked in place: MiCols*4 x MiRows*4,
+// >> 1 for chroma) and maps (Skips and luma LoopfilterTxSizes MiRows x MiCols, chroma ones
+// MiRows/2 x MiCols/2, cdef_idx per 64x64, direction and variance per 8x8).
+typedef struct GaPfAddrs {
+    uint64_t plane[3];
+    int32_t stride[3];
+    uint64_t skip, lfTx[3], cdefIdx, cdefDirVar;
+} GaPfAddrs;
+
+// The post-filters' frame for fp (av1core's av1g_pf_frame, opaque to Swift) pointing at
+// those addresses, written to out when cap holds it. Returns its size.
+size_t av1enc_pf_frame(const av1g_frame_params *fp, const GaPfAddrs *addrs, void *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
