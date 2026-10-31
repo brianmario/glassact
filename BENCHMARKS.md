@@ -308,6 +308,16 @@ What the lossy rows show:
   - coding each tile as a cold, standalone frame, with ~24 B of TD, sequence and frame headers;
   - its fast preset.
 - **Standalone tiles are slow on the GPU.** One at a time, a tile takes 2.7–4.6 ms, because each is a GPU round trip. Tiles belong in a frame.
+- **The colour format sets the ceiling.** The BGRA → 4:2:0 (video range) → BGRA conversion alone, with no coding at all, scores:
+
+  | Tiles | Mean | p10 |
+  |---|---|---|
+  | typing-cc | 91.2 | 90.6 |
+  | scroll-win | 92.3 | 86.0 |
+  | photos | 87.6 | 73.0 |
+  | cursor-drag | 86.5 | 70.2 |
+
+  That's below AVIF 4:4:4 q90. Most of the Metal encoder's gap is its 4:2:0 input, not its coding. Near-lossless tiles need 4:4:4 (AV1's high profile) and full range.
 
 **One-superblock tiles inside a frame,** i.e. coding the whole frame and cutting it into independently parseable 64×64 tiles. `av1seq` at 4096×2304, where AV1's 64-tile-column limit fits one 64-px superblock per tile column. 64×36 tiles against 4×4, 30 frames:
 
@@ -319,7 +329,15 @@ What the lossy rows show:
 
 Encoding the whole frame and cutting it isn't wasteful in work: unchanged superblocks cost next to nothing, and that's what makes these frame rates. Cutting it has these costs:
 - **Bytes:** independent tiles (fresh CDFs, no prediction across tiles) cost 4–11 %.
-- **The deblocking and CDEF filters cross tile edges.** A tile on its own decodes exactly only with them off, which hasn't been measured.
+- **The deblocking and CDEF filters cross tile edges,** so a tile on its own decodes exactly only with them off. Measured with `av1seq --no-filters` (`AV1HybridEncoder.postfilters = false`), 64×36 tiles:
+
+  | Sequence | Filters on | Filters off |
+  |---|---|---|
+  | typing-cc | 514.3 KB · 45.43 dB · 108 fps | 513.5 KB · 45.26 dB · **122 fps** |
+  | scroll-win | 433.7 KB · 46.94 dB | 432.5 KB · 46.68 dB |
+  | photos | 927.6 KB · 41.84 dB · 10.6 fps | 926.6 KB · 41.75 dB · **12.4 fps** |
+
+  Without the filters, the bytes stay the same and PSNR-Y drops 0.1–0.27 dB, with no filter search. Tiles that decode alone cost little.
 - **Wider than 4096 doesn't fit.** At 5K's 80 superblock columns, AV1's 64-tile-column limit forces 128-px tiles or two frames.
 - **Decoders decode frames, not tiles.** Independent tiles need libaom's large-scale-tile mode or a stitched frame.
 

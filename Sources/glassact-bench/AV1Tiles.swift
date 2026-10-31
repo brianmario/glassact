@@ -55,6 +55,20 @@ func cmdAV1Tiles(opts: Options) throws {
                      effort, Double(bytes) / Double(n), seconds / Double(n) * 1e6, raw > 0 ? " · \(raw) sent raw" : ""))
     }
 
+    // the 4:2:0 conversion alone (BT.709 video range, what the encoder codes): its ceiling
+    if let prefix = opts.string("out") {
+        var conv = [UInt8]()
+        conv.reserveCapacity(corpus.count)
+        var t = [UInt8](repeating: 0, count: tileBytes), back = t
+        for i in 0..<n {
+            t.withUnsafeMutableBytes { $0.copyMemory(from: UnsafeRawBufferPointer(rebasing: corpus.withUnsafeBytes { $0 }[i * tileBytes..<(i + 1) * tileBytes])) }
+            let yuv = try t.withUnsafeMutableBytes { try YUV420(bgra: $0, width: side, height: side) }
+            try back.withUnsafeMutableBytes { try yuv.bgra(into: $0) }
+            conv += back
+        }
+        try Data(conv).write(to: URL(fileURLWithPath: "\(prefix)-conv.raw"))
+    }
+
     // each tile as its own AV1 key frame (4:2:0, so lossy in colour even at the finest quantizer)
     let encoder = try AV1HybridEncoder(device: device)
     encoder.reusesAnalysis = false

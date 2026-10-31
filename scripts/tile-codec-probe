@@ -56,6 +56,7 @@ def decode(path, ext, out):
 
 def main():
     pool = ThreadPoolExecutor(max_workers=os.cpu_count())
+    only_metal = os.environ.get("ONLY_METAL") is not None
     for name in NAMES:
         raw = open(f"{D}/{name}.raw", "rb").read()
         n = len(raw) // TB
@@ -63,7 +64,7 @@ def main():
         refs = [f"{work}/t{i:04d}.png" for i in range(n)]
         list(pool.map(lambda i: png(refs[i], raw[i * TB:(i + 1) * TB]), range(n)))
         print(f"== {name}: {n} tiles")
-        for cname, cmd, ext, lossless in CONFIGS:
+        for cname, cmd, ext, lossless in ([] if only_metal else CONFIGS):
             tag = cname.replace(" ", "_")
             def one(i):
                 out = f"{work}/{tag}-{i:04d}.{ext}"
@@ -83,8 +84,8 @@ def main():
                 sc = sorted(r[2] for r in res)
                 line += f" · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}"
             print(line, flush=True)
-        for q in (8, 20, 32, 44):
-            path = f"{D}/{name}-q{q}.raw"
+        for q in ("conv", 8, 20, 32, 44):
+            path = f"{D}/{name}-q{q}.raw" if q != "conv" else f"{D}/{name}-conv.raw"
             if not os.path.exists(path): continue
             dec = open(path, "rb").read()
             def one(i):
@@ -92,6 +93,7 @@ def main():
                 png(p, dec[i * TB:(i + 1) * TB])
                 return score(refs[i], p)
             sc = sorted(pool.map(one, range(n)))
-            print(f"  Metal AV1 420 q{q:<2d}    (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}", flush=True)
+            label = "4:2:0 conversion only" if q == "conv" else f"Metal AV1 420 q{q:<2d}   "
+            print(f"  {label} (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}", flush=True)
 
 main()

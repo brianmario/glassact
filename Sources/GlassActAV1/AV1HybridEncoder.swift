@@ -140,6 +140,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.leafChromaAngledModes = newValue }
     }
 
+    /// Deblocking and CDEF (on). Off, the picture is the closed loop's
+    /// reconstruction as is, and a tile decodes to the same samples alone
+    /// as in its frame (the filters cross tile edges).
+    public var postfilters = true
+
     /// Time the GPU's stages one by one (`AV1MetalEncoder.profilesStages`):
     /// for measurement, as it serializes them.
     public var profilesStages: Bool {
@@ -248,6 +253,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(Int(stride))
         }
         let n = Int(record.pointee.n_blocks)
+        guard postfilters else { return try write(p, record: record, recon: recon, timing: timing, t0: t0, t1: t1) }
         let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
         let known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
@@ -275,5 +281,39 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.writer = t3 - t2
         timing.wall = t3 - t0
         return Frame(obu: obu, planes: search.planes, params: search.params, timing: timing)
+    }
+
+    /// The picture without post-filters: the record's parameters (no deblocking, no CDEF) and the
+    /// reconstruction, cropped.
+    private func write(_ p: Picture, record: UnsafeMutablePointer<av1g_decision_record>, recon: [UnsafePointer<UInt8>],
+                       timing: Timing, t0: Double, t1: Double) throws -> Frame {
+        var timing = timing
+        var params = record.pointee.fp
+        params.loop_filter_level = (0, 0, 0, 0)
+        params.enable_cdef = 0
+        params.cdef_bits = 0
+        var message = [CChar](repeating: 0, count: 256)
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var size = 0
+        let wrc = av1enc_hybrid_write(cpu, &params, nil, 0, &bytes, &size, &message, 256)
+        guard wrc == AV1G_OK, let bytes else {
+            throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
+        }
+        defer { free(bytes) }
+        let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
+        let paddedWidth = 2 * ((p.width + 7) >> 3) * 4
+        let planes = (0..<3).map { plane -> [UInt8] in
+            let w = plane == 0 ? p.width : (p.width + 1) / 2, h = plane == 0 ? p.height : (p.height + 1) / 2
+            let stride = plane == 0 ? paddedWidth : paddedWidth / 2
+            return [UInt8](unsafeUninitializedCapacity: w * h) { d, count in
+                for row in 0..<h { (d.baseAddress! + row * w).update(from: recon[plane] + row * stride, count: w) }
+                count = w * h
+            }
+        }
+        let t3 = CACurrentMediaTime()
+        timing.filters = 0
+        timing.writer = t3 - t1
+        timing.wall = t3 - t0
+        return Frame(obu: obu, planes: planes, params: params, timing: timing)
     }
 }

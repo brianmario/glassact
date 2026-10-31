@@ -28,6 +28,7 @@ let av1SeqCommand = Command(
         .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
         .bool("chroma-angles", "screen the six angled chroma modes too (13 instead of 7)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
+        .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
@@ -78,6 +79,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.tiling = (tileParts[0], tileParts[1])
     encoder.gpuDecides = !opts.has("cpu-decides")
     encoder.reusesAnalysis = !opts.has("no-reuse")
+    encoder.postfilters = !opts.has("no-filters")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
