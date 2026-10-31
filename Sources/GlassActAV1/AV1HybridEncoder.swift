@@ -84,6 +84,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     let postfilter: AV1MetalPostfilter
     let cpu: OpaquePointer
     let motion: OpaquePointer
+    private let copyFinder: CopyFinder
 
     /// The analysis's search effort; `turbo` by default.
     public var preset: AV1MetalEncoder.Preset {
@@ -236,6 +237,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
         self.motion = motion
+        copyFinder = try CopyFinder()
     }
 
     deinit {
@@ -262,8 +264,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
+        defer { copyFinder.drain() }
         var current = try picture(0)
-        var pending = try begin(current, after: nil, qindex: qindex)
+        var pending = try begin(current, Copies(), qindex: qindex)
+        // picture i + 1's copies are decided (on the CPU, from the two sources alone) while
+        // picture i - 1 is finished
+        var upcoming = count > 1 ? try picture(1) : nil
+        if interFrames, let upcoming { copyFinder.start(upcoming, after: current, searchesMotion: searchesMotion) }
         for i in 0..<count {
             let partition = try pending.partition.wait()
             let t0 = CACurrentMediaTime()
@@ -273,11 +280,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
             timing.motion = pending.motionSeconds
             let motion = pending.motion
-            var next: Picture?
-            if i + 1 < count {
-                let n = try picture(i + 1)
-                pending = try begin(n, after: current, qindex: qindex)
-                next = n
+            let next = upcoming
+            if let next {
+                pending = try begin(next, interFrames ? copyFinder.wait() : Copies(), qindex: qindex)
+                upcoming = i + 2 < count ? try picture(i + 2) : nil
+                if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
             }
             let frame = try finish(current, partition: partition, motion: motion, qindex: qindex, timing: timing, started: t0)
             try output(i, frame)
@@ -293,41 +300,87 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var motionSeconds = 0.0
     }
 
-    /// Starts picture `p`'s analysis. With `interFrames` and the picture before it (`prev`, of the
-    /// same size), its 64×64s that copy that picture are decided first and not analyzed.
-    private func begin(_ p: Picture, after prev: Picture?, qindex: Int) throws -> Pending {
-        var sbMotion: [Int32]?
-        var skip: [UInt8]?
-        var candidates: [Int32]?
-        let tm = CACurrentMediaTime()
-        if interFrames, let prev, prev.width == p.width, prev.height == p.height {
+    /// Decides inter frames' copies on a thread of its own, with a motion handle of its own (the
+    /// encoder's applies them, which doesn't read what classifying left in it).
+    private final class CopyFinder: @unchecked Sendable {
+        private let motion: OpaquePointer
+        private var result: Copies?
+        private var running = false
+        private let done = DispatchSemaphore(value: 0)
+
+        init() throws {
+            guard let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
+            self.motion = motion
+        }
+
+        deinit { av1enc_motion_destroy(motion) }
+
+        /// Starts deciding picture `p`'s 64×64s that copy `prev` (none unless they're the same size).
+        func start(_ p: Picture, after prev: Picture, searchesMotion: Bool) {
+            running = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.result = self.copies(of: p, after: prev, searchesMotion: searchesMotion)
+                self.done.signal()
+            }
+        }
+
+        /// The started picture's copies.
+        func wait() -> Copies {
+            guard running else { return Copies() }
+            done.wait()
+            running = false
+            defer { result = nil }
+            return result ?? Copies()
+        }
+
+        /// Waits for any started picture (an encode that threw).
+        func drain() { _ = wait() }
+
+        private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
+            guard prev.width == p.width, prev.height == p.height else { return Copies() }
+            let tm = CACurrentMediaTime()
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
             var m = [Int32](repeating: 0, count: 3 * nsb)
-            Self.planes(p) { cur in
-                Self.planes(prev) { before in
+            AV1HybridEncoder.planes(p) { cur in
+                AV1HybridEncoder.planes(prev) { before in
                     let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
                     _ = av1enc_motion_classify(motion, cur, strides, before, strides, Int32(p.width), Int32(p.height), 3, 8, &m)
                 }
             }
-            sbMotion = m
-            skip = (0..<nsb).map { UInt8(m[3 * $0]) }
+            var candidates: [Int32]?
             if searchesMotion {
                 var c = [Int32](repeating: 0, count: 2 * Int(GP_ME_CANDS))
                 c.removeLast(c.count - 2 * Int(av1enc_motion_candidates(motion, &c, GP_ME_CANDS)))
                 candidates = c
             }
+            return Copies(motion: m, skip: (0..<nsb).map { UInt8(m[3 * $0]) }, candidates: candidates,
+                          seconds: CACurrentMediaTime() - tm)
         }
-        let seconds = CACurrentMediaTime() - tm
+    }
+
+    /// An inter frame's copies, decided before its analysis (none: a key frame).
+    private struct Copies {
+        /// Per 64×64: copy, dx, dy.
+        var motion: [Int32]?
+        /// Per 64×64: nonzero where it's a copy (not analyzed).
+        var skip: [UInt8]?
+        /// The frame's shift candidates for the motion search.
+        var candidates: [Int32]?
+        var seconds = 0.0
+    }
+
+    /// Starts picture `p`'s analysis, without its copies.
+    private func begin(_ p: Picture, _ copies: Copies, qindex: Int) throws -> Pending {
         let partition = try p.y.withUnsafeBufferPointer { y in
             try p.u.withUnsafeBufferPointer { u in
                 try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
-                                             width: p.width, height: p.height, qindex: qindex, skip: skip,
-                                             motion: candidates)
+                                             width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
+                                             motion: copies.candidates)
                 }
             }
         }
-        return Pending(partition: partition, motion: sbMotion, motionSeconds: seconds)
+        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds)
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,

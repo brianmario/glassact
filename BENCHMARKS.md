@@ -260,6 +260,28 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the next picture's copies decided on their own thread (2026-10-31)
+
+**What changed:** the hybrid's thread used to decide picture i + 1's copies itself (`av1enc_motion_classify`, 3.8–4.6 ms at 5K photos), between waiting for picture i's analysis and finishing picture i.
+- Now a `CopyFinder` with its own motion handle decides them on another thread, one picture ahead, while picture i - 1 is finished.
+- Applying copies (`av1enc_motion_apply_ex`) takes the decisions as input and doesn't read what classifying left in its handle, so the two handles are independent.
+- Same bytes and PSNR.
+
+**Results** (5K, libaom's tiling, `--no-planes`, two or three runs each; steady-state inter frames a second):
+
+| Trace | before | after | libaom s9 |
+|---|---|---|---|
+| typing-cc | 204 | 222 | 225 |
+| scroll-win | 130 | 154 | 170 |
+| photos | 45 | 55 | 92 |
+| cursor-drag | 187 | 206 | |
+| photos 720p | 118 | 126 | ~500 |
+
+**Where 5K photos stands now:**
+- The hybrid's thread waits ~0.2 ms for each analysis, and the copies are always ready.
+- The cycle is `finish`, ~15–19 ms: the closed loop 5.5–6 ms, and the filters 6–10 ms.
+- Most of the filters' time is their first command buffer, which waits behind the next picture's analysis (~12.7 ms of GPU work, committed just before).
+
 ### Metal AV1: each inter candidate once; parallel post-filter copies; interPreset's shapes (2026-10-31)
 
 **What changed:**
