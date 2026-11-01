@@ -32,6 +32,14 @@ What we measured on `metal-av1` (2026-11-01, BENCHMARKS):
   heuristics.
 - A 5K typing frame's 8x8 blocks: 37 % flat, 24 % with 2–8 luma values, 39 % with more
   (antialiased text has many grey levels).
+- Palette in our own AV1 encoder, chosen by measured cost (each block's real bits and distortion):
+  exact palettes could save at most 0.05 % of a key frame's bits, because DCT codes few-colour
+  blocks in about 11 bits. Lossy palettes reach 0.1–0.7 % at our quality (q20), 1–5 % at q40. **The
+  bytes are in antialiased glyph edges and photos, not in few-colour blocks.**
+- AV2 is the counterpoint (BENCHMARKS "AV2 on screen text", 2026-10-25): AOM's reference encoder
+  AVM at 60 dB on typing-cc needs 38 KB for 30 frames, against 141 KB for AV1 (libaom good) and
+  233 KB for x265, at 0.09 fps. Whatever tools give AV2 that, the gain exists at very high
+  quality on text. Which tools it is, and whether it survives at our quality, is unmeasured.
 
 ## Goal and gate
 
@@ -70,7 +78,8 @@ in the decoder.
 ### Screen-content tools, all parallel
 
 - **Palette**, with the index map's contexts taken only from inside the block (HEVC SCC and VVC
-  palette, minus the cross-block predictor list). Chosen by real cost.
+  palette, minus the cross-block predictor list). Chosen by real cost. Low priority: measured in
+  AV1 on our traces, few-colour blocks are already nearly free (see above).
 - **Transform skip and block DPCM** (the residual coded as row or column differences) for sharp
   text and edges (HEVC SCC, VVC).
 - **A glyph and patch cache** that lasts across frames: a block that equals a cached one (by hash)
@@ -133,6 +142,10 @@ in the decoder.
 
 ## Plan
 
+0. **Attribute AV2's gain.** Run AVM on the reference traces with its screen-content and intra
+   tools switched off one at a time, at 60 dB and at our operating point (PSNR-Y 41–48 dB).
+   The tools that carry the gain, and how parallel they can be made, are the first candidates
+   for this codec (and some may be possible inside AV1's syntax).
 1. **Baselines.** Measure VideoToolbox HEVC (4:2:0 and 4:4:4, realtime) next to libaom realtime and
    `metal-av1` on every reference trace: BD-rate on SSIMULACRA2 and PSNR-Y, encode frames a second,
    decode cost. Record them in BENCHMARKS. (Hardware-encoder benches only while no one is
@@ -149,6 +162,10 @@ in the decoder.
    loss-repair tests with fixed seeds.
 
 ## Open questions
+
+- Where do a screen frame's bytes go, by block kind (glyph edges, photos, UI)? `ENC_BLOCK_BITS`
+  on `metal-av1` gives each block's bits: a map of them over the reference traces would rank what
+  to attack.
 
 - How many coarse levels, at what scale, and does predicting from a coarser layer lose much against
   neighbour intra prediction on photos?
