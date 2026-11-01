@@ -286,6 +286,20 @@ The leaf decisions (k_leaf: chroma mode, CfL and luma tx type for every leaf) ar
 
 **Results:** same streams (`--digest`, the four 720p checks). The partition stage (`--profile`, best of 10) is 0.3 → 0.1 ms on 720p key frames and 5K photos inter frames, and 0.3 ms either way on 5K key frames. That was measured with a Screen Sharing session open, and the stage sits on the GPU's critical path between the analysis and the leaves.
 
+**The leaf stage of a 5K key frame** (`--profile`, photos 17.8 ms, typing-cc 13.4 ms):
+
+| | photos | typing-cc |
+|---|---|---|
+| no luma tx search (`--leaf-tx 0`, chroma alone) | 7.7 | 7.5 |
+| up to 4×4 (`--leaf-tx 16`) | 9.2 | 10.6 |
+| up to 8×8 (`--leaf-tx 64`) | 14.4 | 12.9 |
+| up to 8×16 / 16×8 (128, the default) | 17.8 | 13.4 |
+
+**Rejected:**
+- **A larger `maxTotalThreadsPerThreadgroup` for the analysis kernels** (256, 512 or 1024, against the threadgroup's 128). Stage times didn't move on inter or key frames. On Apple GPUs the hint doesn't change how many registers the compiler allocates; k_dp has no hint (1024) and still allocates 156.
+- **k_leaf's chroma costs summed mode by mode,** instead of into a per-lane array indexed by mode. The output was identical, but the leaves went 17.5 → 26.2 ms at 5K. The array version packs every mode's items across the 32 lanes. Mode by mode, a small chroma block's 2–32 items leave most lanes idle.
+- **`LEAF_WARP_TX` 0** (a lane per tx type, scalar). The leaves are 38.2 against 17.5 ms at 5K and 4.0 against 2.0 at 720p, and the streams differ. The SIMD-group evaluation stays.
+
 ### Metal AV1: inter frames' 8×8 to 16×8 blocks on the SIMD-group kernel; fewer registers in the small kernel (2026-10-31)
 
 **What changed:**
