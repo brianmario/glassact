@@ -138,8 +138,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// block in the 64×64s around them). They're copied, not filtered.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
-                       sourceStrides: [Int]? = nil, changed: [UInt8]? = nil, direct: [UInt8]? = nil,
-                       lfZero: [UInt8]? = nil, cropsOutput: Bool = true) throws -> Search {
+                       sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
+                       direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -157,8 +157,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         if let changed, tf.cdef_mode != 0, let job = lastJob, job.width == Int(fp.width), job.height == Int(fp.height),
            job.nPlanes == (mono ? 1 : 3), job.previousKey == key, changed.count == job.sbCols * job.sbRows,
            let result = try searchChanged(job, fp: fp, tf: tf, blocks: blocks, planes: planes, source: source,
-                                          sourceStrides: sourceStrides, changed: changed, direct: direct, lfZero: lfZero,
-                                          cropsOutput: cropsOutput) {
+                                          sourceStrides: sourceStrides, sourceBuffers: sourceBuffers, changed: changed,
+                                          direct: direct, lfZero: lfZero, cropsOutput: cropsOutput) {
             return result
         }
         let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
@@ -179,6 +179,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
 
         let target = try (0..<3).map { p -> any MTLBuffer in
+            if let b = Self.target(sourceBuffers, sourceStrides, plane: p, job) { return b }
             let b = try job.scratch("target\(p)", job.pw[p] * job.ph[p])
             if p < job.nPlanes { Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: b, width: job.pw[p], height: job.ph[p]) }
             return b
@@ -239,7 +240,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// previous picture.
     private func searchChanged(_ job: Job, fp base: av1g_frame_params, tf: GaTuneiqFrame,
                                blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
-                               source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, changed: [UInt8],
+                               source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, sourceBuffers: [any MTLBuffer]?,
+                               changed: [UInt8],
                                direct: [UInt8]?, lfZero: [UInt8]?, cropsOutput: Bool) throws -> Search? {
         var fp = base
         let sbCols = job.sbCols, sbRows = job.sbRows, nsb = sbCols * sbRows, mono = fp.monochrome != 0
@@ -300,8 +302,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         copyRing(from: job.source, to: ring)
         try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero, only: outerList)
-        let target = try (0..<3).map { try job.scratch("target\($0)", job.pw[$0] * job.ph[$0]) }
-        for p in 0..<job.nPlanes {
+        let target = try (0..<3).map {
+            try Self.target(sourceBuffers, sourceStrides, plane: $0, job) ?? job.scratch("target\($0)", job.pw[$0] * job.ph[$0])
+        }
+        for p in 0..<job.nPlanes where target[p] !== sourceBuffers?[p] {
             Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: target[p], width: job.pw[p], height: job.ph[p],
                       superblocks: innerList, side: p == 0 ? 64 : 32, sbCols: sbCols)
         }
@@ -457,6 +461,14 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             && withUnsafeBytes(of: a.cdef_y_sec, { Array($0) }) == withUnsafeBytes(of: b.cdef_y_sec, { Array($0) })
             && withUnsafeBytes(of: a.cdef_uv_pri, { Array($0) }) == withUnsafeBytes(of: b.cdef_uv_pri, { Array($0) })
             && withUnsafeBytes(of: a.cdef_uv_sec, { Array($0) }) == withUnsafeBytes(of: b.cdef_uv_sec, { Array($0) })
+    }
+
+    /// The caller's source buffer for plane `p` when the CDEF search can read it as its target in
+    /// place (rows the job's plane width apart, and at least its height); nil otherwise.
+    static func target(_ buffers: [any MTLBuffer]?, _ strides: [Int]?, plane p: Int, _ job: Job) -> (any MTLBuffer)? {
+        guard let buffers, let strides, buffers.count == 3, strides.count == 3, strides[p] == job.pw[p],
+              buffers[p].length >= job.pw[p] * job.ph[p] else { return nil }
+        return buffers[p]
     }
 
     /// The listed 64×64s' rectangles of a plane (`side` pixels square) from rows

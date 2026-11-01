@@ -260,6 +260,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the filters' CDEF search reads the analysis's source in place; source buffers untracked (2026-11-01)
+
+**What changed:**
+- The CDEF search copied the source into target buffers, all of it for a full search and the changed 64×64s for a region. Now it binds the analysis's padded source buffers directly whenever their rows are the filters' plane width apart (widths that are a multiple of 64, such as 5K, 1080p and 720p). Other widths copy as before.
+
+**Finding: hazard tracking.**
+- Bound as is, the change was slower:
+
+  | Trace | before | after |
+  |---|---|---|
+  | photos 720p | 159.4 154.3 163.0 | 131.9 140.0 137.9 |
+  | scroll-win 720p | 416.7 427.4 438.8 | 360.6 363.1 349.4 |
+  | photos 5K | 76.6 76.3 76.8 | 73.2 72.9 73.2 |
+
+- The buffer is also the next picture's motion-search reference, so Metal's automatic hazard tracking orders the filters' command buffer and the next analysis behind one another (a bound buffer counts as written).
+- The source buffers are now made `.hazardTrackingModeUntracked`. The CPU writes one before its analysis is committed, and every GPU use only reads it.
+
+**Results:**
+- The streams are the same (`--digest`; a 1000-wide run, which copies, too).
+
+Inter frames a second, against the shared source alone:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 74.9 74.1 76.1 | 77.1 76.3 75.5 |
+| scroll-win 5K | 188.4 193.9 183.9 | 196.2 195.9 196.1 |
+| photos 720p | 159.2 156.1 160.0 | 158.3 162.1 164.2 |
+| typing-cc 5K | 276.1 282.8 284.3 | 286.1 264.8 286.6 |
+| scroll-win 720p | 426.4 425.7 419.8 | 416.1 408.4 426.2 |
+
+That's a little faster at 5K, and within noise elsewhere.
+
 ### Metal AV1: inter frames' closed loop reads the analysis's padded source (2026-11-01)
 
 The first step of the frame store (the owner's 2026-11-01 direction: every stage borrows one copy of each picture).

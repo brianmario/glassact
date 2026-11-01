@@ -142,8 +142,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         if let i = sourcePool.firstIndex(where: { $0.map(\.length) == lengths.map { max(16, $0) } }) {
             return sourcePool.remove(at: i)
         }
+        // Untracked: the CPU writes a source before the analysis that reads it is committed, and
+        // every GPU use only reads it (the next picture's motion search, the hybrid's filters),
+        // so Metal needn't order those command buffers behind one another.
         return try lengths.map {
-            guard let b = device.makeBuffer(length: max(16, $0), options: .storageModeShared)
+            guard let b = device.makeBuffer(length: max(16, $0), options: [.storageModeShared, .hazardTrackingModeUntracked])
             else { throw Failure.metal("no buffer of \($0) bytes") }
             return b
         }
