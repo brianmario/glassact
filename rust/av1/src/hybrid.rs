@@ -158,6 +158,8 @@ pub struct Hybrid {
     /// the last closed loop read its caller's padded source ([`Video::padded`]), not `src` (an
     /// inter frame's, so the next picture keeps no tiles)
     src_given: bool,
+    /// the last closed loop wrote its reconstruction into its caller's planes, not `outs`
+    recon_given: bool,
     /// video mode: each reference slot's saved CDFs, from the writes that refreshed it
     slot_cdfs: [Option<Box<FrameCdfs>>; 8],
 }
@@ -213,6 +215,7 @@ impl Hybrid {
             last_inter: false,
             slot_cdfs: Default::default(),
             src_given: false,
+            recon_given: false,
         }
     }
 
@@ -249,11 +252,18 @@ impl Hybrid {
             tile_cols_log2,
             tile_rows_log2,
             None,
+            None,
         )
     }
 
     /// av1enc_hybrid_closed_loop_ex: [`Hybrid::closed_loop`] for a frame of a stream. An inter
     /// frame's tiles are coded afresh, and the next picture's aren't kept from it.
+    ///
+    /// `recon_into`: planes (each at least [`Hybrid::recon`]'s size) the reconstruction goes
+    /// into as well: an inter frame writes it there in place of its own (no copy, and
+    /// [`Hybrid::recon`] gives `None`); any other frame keeps its own, which the next picture's
+    /// tiles are kept from, and copies it there. Samples past MiCols * 4 x MiRows * 4 (chroma half)
+    /// are left as they were.
     pub fn closed_loop_ex(
         &mut self,
         y: &[u8],
@@ -268,10 +278,12 @@ impl Hybrid {
         tile_cols_log2: i32,
         tile_rows_log2: i32,
         video: Option<&Video>,
+        recon_into: Option<[&mut [u8]; 3]>,
     ) -> Result<(), Error> {
         let (w, h) = (width as usize, height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let n = blocks.len();
+        let (rw, rh) = (mi_cols(width as i32) as usize * 4, mi_rows(height as i32) as usize * 4);
         if n == 0
             || w < 1
             || h < 1
@@ -282,6 +294,9 @@ impl Hybrid {
             || v.len() < cw * ch
             || luma_tx.is_some_and(|l| l.len() < n)
             || video.is_some_and(|v| !v.inter.is_empty() && v.inter.len() != n)
+            || recon_into.as_ref().is_some_and(|r| {
+                r.iter().enumerate().any(|(p, r)| r.len() < (rw >> (p > 0) as usize) * (rh >> (p > 0) as usize))
+            })
         {
             return Err(error(ERR_INVALID, "bad arguments"));
         }
@@ -296,6 +311,7 @@ impl Hybrid {
             tile_cols_log2,
             tile_rows_log2,
             video,
+            recon_into,
         );
         if r.is_err() {
             // the source and the records were overwritten: nothing is kept
@@ -319,6 +335,7 @@ impl Hybrid {
         tile_cols_log2: i32,
         tile_rows_log2: i32,
         video: Option<&Video>,
+        recon_into: Option<[&mut [u8]; 3]>,
     ) -> Result<(), Error> {
         let t0 = Instant::now();
         let given_chroma = flags & GIVEN_CHROMA != 0;
@@ -353,6 +370,7 @@ impl Hybrid {
             keep_chroma,
             slot_cdfs,
             src_given,
+            recon_given,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -670,7 +688,11 @@ impl Hybrid {
             record_syms: false,
             refs: inter_frame.then_some(&slots),
         };
-        writer.encode_with_hook(rec.as_mut(), &opts, Some(&hook), &extras, out)?;
+        // an inter frame's reconstruction straight into its caller's planes (no tile is kept from
+        // it); any other's kept here for the next picture's tiles, and copied there
+        let (direct, copy_to) = if inter_frame { (recon_into, None) } else { (None, recon_into) };
+        *recon_given = direct.is_some();
+        writer.encode_into(rec.as_mut(), &opts, Some(&hook), &extras, direct, out)?;
         if *reused_count > 0 {
             // kept tiles' reconstruction, into the picture's: by plane and tile row
             let recon_w = out.recon_w;
@@ -733,6 +755,11 @@ impl Hybrid {
             m.valid = true;
             m.payload_valid = false;
             m.cpu_chroma = !given_chroma;
+        }
+        if let Some(to) = copy_to {
+            for (to, from) in to.into_iter().zip(&out.recon) {
+                to[..from.len()].copy_from_slice(from);
+            }
         }
         prev_tile_first.clear();
         prev_tile_first.extend_from_slice(tile_first);
@@ -908,9 +935,9 @@ impl Hybrid {
 
     /// av1enc_hybrid_recon: plane `plane`'s pre-filter reconstruction of the last closed loop,
     /// `MiCols * 4 >> sub` wide and `MiRows * 4 >> sub` high (sub = 1 for chroma); empty after a
-    /// failure, `None` for a plane > 2.
+    /// failure, `None` for a plane > 2 or when the call wrote it into its caller's planes.
     pub fn recon(&self, plane: usize) -> Option<&[u8]> {
-        self.outs[self.cur].recon.get(plane).map(|p| &p[..])
+        (!self.recon_given).then(|| self.outs[self.cur].recon.get(plane).map(|p| &p[..])).flatten()
     }
 
     /// The last closed loop's output (its reconstruction's sizes, and the stats of its encode).

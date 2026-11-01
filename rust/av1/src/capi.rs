@@ -717,6 +717,7 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
     inter: *const BlockInter,
     reference: *const RefPlanesC,
     padded: *const *const u8,
+    recon: *const *mut u8,
     err: *mut c_char,
     errlen: usize,
 ) -> c_int {
@@ -771,6 +772,19 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         let len = |pl: usize| ((sb_cols * 64) >> (pl > 0) as usize) * ((sb_rows * 64) >> (pl > 0) as usize);
         given = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts(p[pl], len(pl))) });
     }
+    let mut recon_into = None;
+    if !recon.is_null() {
+        // SAFETY: three planes of av1enc_hybrid_recon's size, writable and not otherwise accessed
+        // until the call returns (av1enc.h)
+        let p = unsafe { slice::from_raw_parts(recon, 3) };
+        if p.iter().any(|q| q.is_null()) {
+            unsafe { set_error_raw(err, errlen, "recon: a plane is missing") };
+            return ERR_INVALID;
+        }
+        let (rw, rh) = (2 * w.div_ceil(8) as usize * 4, 2 * hgt.div_ceil(8) as usize * 4);
+        let len = |pl: usize| (rw >> (pl > 0) as usize) * (rh >> (pl > 0) as usize);
+        recon_into = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts_mut(p[pl], len(pl))) });
+    }
     let vid = (!video.is_null()).then(|| crate::hybrid::Video {
         fp: unsafe { *video },
         inter,
@@ -790,6 +804,7 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         tile_cols_log2,
         tile_rows_log2,
         vid.as_ref(),
+        recon_into,
     );
     hh.rec = hh.h.record_c();
     match r {

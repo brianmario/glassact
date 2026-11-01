@@ -561,6 +561,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let analysisSource: [UnsafePointer<UInt8>?] = partition.source.count == 3
             ? partition.source.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) } : []
         let padded = reference != nil && sbMotionIn != nil ? analysisSource : []
+        // a stream's reconstruction goes into the filters' buffers, which deblock it in place (an
+        // inter frame's straight there, a key frame's copied)
+        var geometry = av1g_frame_params()
+        (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
+        let store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
+        let into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
@@ -575,7 +581,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                                                  gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
                                                                  Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2),
                                                                  interFrames ? vp : nil, inter.isEmpty ? nil : inter.baseAddress,
-                                                                 ref, padded.isEmpty ? nil : padded, &message, 256)
+                                                                 ref, padded.isEmpty ? nil : padded, into.isEmpty ? nil : into,
+                                                                 &message, 256)
                                     }
                                 }
                             }
@@ -596,7 +603,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
         for plane in 0..<3 {
             var stride: Int32 = 0
-            guard let r = av1enc_hybrid_recon(cpu, Int32(plane)),
+            guard let r = store.isEmpty ? av1enc_hybrid_recon(cpu, Int32(plane)) : UnsafePointer(into[plane]),
                   let s = analysisSource.isEmpty ? av1enc_hybrid_source(cpu, Int32(plane), &stride) : analysisSource[plane]
             else { throw Failure.encode("no reconstruction") }
             recon.append(r)

@@ -434,14 +434,30 @@ impl Writer {
     /// per-tile symbol streams.
     pub fn encode_with_hook<H: TxbHook>(
         &mut self,
-        mut rec: RecordMut,
+        rec: RecordMut,
         opts: &EncodeOpts,
         hook: Option<&H>,
         extras: &Extras,
         out: &mut Output,
     ) -> Result<(), Error> {
+        self.encode_into(rec, opts, hook, extras, None, out)
+    }
+
+    /// [`Writer::encode_with_hook`] with [`ENC_PREFILTER_RECON`]'s reconstruction written into
+    /// the caller's planes (`recon_into`: each at least MiCols * 4 x MiRows * 4 samples, chroma half
+    /// each way, rows that wide), not `out.recon`, which stays empty (`recon_w` and `recon_h` are
+    /// set). The samples outside the decoded area are left as they were.
+    pub fn encode_into<H: TxbHook>(
+        &mut self,
+        mut rec: RecordMut,
+        opts: &EncodeOpts,
+        hook: Option<&H>,
+        extras: &Extras,
+        recon_into: Option<[&mut [u8]; 3]>,
+        out: &mut Output,
+    ) -> Result<(), Error> {
         out.clear();
-        let r = self.run(&mut rec, opts, hook, extras, out);
+        let r = self.run(&mut rec, opts, hook, extras, recon_into, out);
         r.map_err(|e| {
             out.clear();
             *e
@@ -454,6 +470,7 @@ impl Writer {
         opts: &EncodeOpts,
         hook: Option<&H>,
         extras: &Extras,
+        recon_into: Option<[&mut [u8]; 3]>,
         out: &mut Output,
     ) -> Res<()> {
         let fp = rec.fp;
@@ -863,6 +880,7 @@ impl Writer {
                 ntiles,
                 opts.flags & ENC_PREFILTER_RECON != 0,
                 self.threads,
+                recon_into,
                 out,
             );
         }
@@ -893,23 +911,32 @@ fn recon(
     ntiles: usize,
     prefilter: bool,
     threads: usize,
+    recon_into: Option<[&mut [u8]; 3]>,
     out: &mut Output,
 ) {
     let fp = &f.fp;
     let nplanes = if f.mono { 1 } else { 3 };
     if prefilter {
         // straight from the tiles: the decoded area up to MiCols * 4 x MiRows * 4 (the filters
-        // read it), in bands of rows on several threads (22 MB at 5K: 1.3 ms on one)
+        // read it), in bands of rows on several threads (22 MB at 5K: 1.3 ms on one), into
+        // `out.recon` or the caller's planes
         let tiles = &tiles[..ntiles];
         let mut bands: Vec<(usize, usize, &mut [u8])> = Vec::new();
+        let mut into = recon_into.map(|p| p.into_iter());
         for (p, o) in out.recon.iter_mut().enumerate().take(nplanes) {
             let sub = (p != 0) as usize;
             let (w, h) = ((f.mi_cols as usize * 4) >> sub, (f.mi_rows as usize * 4) >> sub);
-            o.resize(w * h, 0);
             out.recon_w[p] = w as u32;
             out.recon_h[p] = h as u32;
+            let plane: &mut [u8] = match into.as_mut().and_then(Iterator::next) {
+                Some(d) => &mut d[..w * h],
+                None => {
+                    o.resize(w * h, 0);
+                    o
+                }
+            };
             let rows = h.div_ceil(threads.clamp(1, 8)).max(16);
-            for (k, band) in o.chunks_mut(rows * w).enumerate() {
+            for (k, band) in plane.chunks_mut(rows * w).enumerate() {
                 bands.push((p, k * rows, band));
             }
         }

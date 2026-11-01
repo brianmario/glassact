@@ -136,6 +136,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// as they went in, though they differ from the previous picture's (an
     /// inter frame's copies: every block skipped and at level 0, and no intra
     /// block in the 64×64s around them). They're copied, not filtered.
+    ///
+    /// `planes` may be `reconstructionBuffers`' contents: then they're deblocked in place (and
+    /// hold the reconstruction no more), and with `direct` (whose 64×64s and the unchanged ones
+    /// come out of the filters as they went in) nothing of the previous picture's deblocking is
+    /// needed: the caller has put this picture's whole reconstruction there.
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
                        sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
@@ -243,6 +248,12 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                                source: [UnsafePointer<UInt8>], sourceStrides: [Int]?, sourceBuffers: [any MTLBuffer]?,
                                changed: [UInt8],
                                direct: [UInt8]?, lfZero: [UInt8]?, cropsOutput: Bool) throws -> Search? {
+        // the reconstruction in the deblocking buffers, which hold none of the previous picture's
+        // deblocking then: only `direct`'s promise (everything outside the changed 64×64s'
+        // surroundings is deblocked as it was reconstructed) makes that enough
+        let inPlace = planes.count >= job.nPlanes
+            && (0..<job.nPlanes).allSatisfy { planes[$0] == UnsafePointer(job.source[$0].contents().assumingMemoryBound(to: UInt8.self)) }
+        if inPlace, direct?.count != job.sbCols * job.sbRows { return nil }
         var fp = base
         let sbCols = job.sbCols, sbRows = job.sbRows, nsb = sbCols * sbRows, mono = fp.monochrome != 0
         let nc = Int(Self.candidates.npri * Self.candidates.nsec)
@@ -267,15 +278,18 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         // both sides). Those 64×64s, outer's that aren't inner's and the ones bordering outer,
         // are unchanged, so their deblocked samples are the previous picture's: kept aside and
         // put back, so the whole deblocked frame stays exact for whatever reads it later (CDEF
-        // where new presets change a strength, in this picture or a later one).
+        // where new presets change a strength, in this picture or a later one). In place, the
+        // whole buffer is this picture's reconstruction, which only outer's edges change: nothing
+        // is deblocked twice, and nothing needs keeping.
         let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
         let around = dilate(outer)
         // direct copies: their filtered and deblocked samples are their reconstruction, and their
         // SSE rows a full search's (CDEF is inactive in them: zero). Those the GPU's deblocking
-        // reads (around the changed ones) before it, the rest while it runs
+        // reads (around the changed ones) before it, the rest while it runs; in place, their
+        // deblocked samples are there already, and all their output's are written while it runs
         func copyDirect(_ list: [UInt32]) {
             for p in 0..<job.nPlanes {
-                for target in [job.source[p], job.output[p]] {
+                for target in inPlace ? [job.output[p]] : [job.source[p], job.output[p]] {
                     Self.copy(planes[p], stride: job.pw[p], into: target, width: job.pw[p], height: job.ph[p],
                               superblocks: list, side: p == 0 ? 64 : 32, sbCols: sbCols)
                 }
@@ -289,13 +303,17 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         var farDirect: [UInt32] = []
         if let direct, direct.count == nsb {
-            copyDirect((0..<nsb).filter { direct[$0] != 0 && around[$0] != 0 }.map(UInt32.init))
-            farDirect = (0..<nsb).filter { direct[$0] != 0 && around[$0] == 0 }.map(UInt32.init)
+            if inPlace {
+                farDirect = (0..<nsb).filter { direct[$0] != 0 }.map(UInt32.init)
+            } else {
+                copyDirect((0..<nsb).filter { direct[$0] != 0 && around[$0] != 0 }.map(UInt32.init))
+                farDirect = (0..<nsb).filter { direct[$0] != 0 && around[$0] == 0 }.map(UInt32.init)
+            }
         }
-        let ringList = (0..<nsb).filter { around[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
-        let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", job.pw[$0] * job.ph[$0]) }
+        let ringList = inPlace ? [] : (0..<nsb).filter { around[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
+        let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", inPlace ? 0 : job.pw[$0] * job.ph[$0]) }
         func copyRing(from: [any MTLBuffer], to: [any MTLBuffer]) {
-            for p in 0..<job.nPlanes {
+            for p in 0..<job.nPlanes where !ringList.isEmpty {
                 Self.copy(from[p].contents().assumingMemoryBound(to: UInt8.self), stride: job.pw[p], into: to[p],
                           width: job.pw[p], height: job.ph[p], superblocks: ringList, side: p == 0 ? 64 : 32, sbCols: sbCols)
             }
@@ -515,15 +533,27 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private var lastJob: Job?
     private func job(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                      planes: [UnsafePointer<UInt8>], lfZero: [UInt8]?) throws -> Job {
-        let job: Job
-        if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3) {
-            job = j
-        } else {
-            job = try Job(self, params: fp)
-            lastJob = job
-        }
+        let job = try job(geometry: fp)
         try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         return job
+    }
+
+    private func job(geometry fp: av1g_frame_params) throws -> Job {
+        if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3) {
+            return j
+        }
+        let job = try Job(self, params: fp)
+        lastJob = job
+        return job
+    }
+
+    /// The buffers `search` deblocks a picture of `fp`'s size (and monochrome) in: MiCols·4 ×
+    /// MiRows·4 (chroma half), tight. A closed loop that reconstructs into them saves `search`
+    /// copying its reconstruction there. They stay this geometry's until `search` filters
+    /// another.
+    public func reconstructionBuffers(params fp: av1g_frame_params) throws -> [any MTLBuffer] {
+        let job = try job(geometry: fp)
+        return Array(job.source.prefix(job.nPlanes))
     }
 
     /// Encodes `body`'s work and runs it, doing `meanwhile` (CPU work the GPU's doesn't touch)
@@ -588,11 +618,14 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             addrs.cdefDirVar = dirVar.gpuAddress
         }
 
-        /// A picture's reconstruction before the filters, blocks and parameters.
+        /// A picture's reconstruction before the filters (there already when `planes` are the
+        /// buffers' contents), blocks and parameters.
         func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                   lfZero: [UInt8]?) throws {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
-            for p in 0..<nPlanes { source[p].contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p]) }
+            for p in 0..<nPlanes where planes[p] != UnsafePointer(source[p].contents().assumingMemoryBound(to: UInt8.self)) {
+                source[p].contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p])
+            }
             try load(params: fp, blocks: blocks, lfZero: lfZero)
         }
 
@@ -600,7 +633,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                   lfZero: [UInt8]?, only superblocks: [UInt32]) throws {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
-            for p in 0..<nPlanes {
+            for p in 0..<nPlanes where planes[p] != UnsafePointer(source[p].contents().assumingMemoryBound(to: UInt8.self)) {
                 AV1MetalPostfilter.copy(planes[p], stride: pw[p], into: source[p], width: pw[p], height: ph[p],
                                         superblocks: superblocks, side: p == 0 ? 64 : 32, sbCols: sbCols)
             }

@@ -105,11 +105,15 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
 // place of padding its own copy (a key frame pads its own, which the next picture compares tiles
 // with); it must stay unchanged until the call returns, and av1enc_hybrid_source then gives
 // null.
+// recon (null, or 3 planes of av1enc_hybrid_recon's size: MiCols * 4 x MiRows * 4, chroma half
+// each way, tight) is where the reconstruction goes as well: an inter frame writes it there in
+// place of its own (av1enc_hybrid_recon then gives null), any other frame keeps its own (the next
+// picture's tiles are kept from it) and copies it there.
 int av1enc_hybrid_closed_loop_ex(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
                                  uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
                                  int qindex, int tile_cols_log2, int tile_rows_log2, const av1g_frame_params *video,
                                  const av1g_block_inter *inter, const av1g_ref_planes *ref,
-                                 const uint8_t *const *padded, char *err, size_t errlen);
+                                 const uint8_t *const *padded, uint8_t *const *recon, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
 // The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp, its
 // other fields as the closed loop's: video fields, sb128) and every 64x64's cdef_idx (raster,

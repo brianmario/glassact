@@ -260,6 +260,45 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames reconstruct into the filters' buffers, deblocked in place; copies on the GPU rejected (2026-11-01)
+
+**Before:** the copied 64×64s of an inter frame moved four times each picture:
+- the reference into the tile's buffer (inter prediction);
+- the tiles into the closed loop's frame-sized reconstruction, which `resize` also zero-filled first;
+- the reconstruction into the filters' deblocking buffer (the changed area's surroundings) and output buffer (the direct copies);
+- around the changed area, a ring of the deblocking buffer set aside and put back, because deblocking there filters the previous picture's already-deblocked samples a second time.
+
+**What changed:**
+- `av1enc_hybrid_closed_loop_ex` takes planes to reconstruct into (`recon`). An inter frame's tiles write there instead of into the closed loop's own buffer; any other frame keeps its own (the next picture's tiles come from it) and copies it there.
+- The encoder passes the filters' deblocking buffers (`AV1MetalPostfilter.reconstructionBuffers`).
+- When `search` gets those buffers' contents and the inter frame's `direct` map, it deblocks them in place.
+  - With `lf_inter_off`, the only edges deblocked are those at coded (intra) 64×64s, and the closed loop rewrites every sample of an inter frame.
+  - So the buffer starts each picture as the pure reconstruction. Nothing is filtered twice, and nothing needs loading or keeping.
+- The direct copies go to the output buffer only, all of them while the GPU deblocks.
+- Without `direct`, as for a key frame's tile-reuse regions, the region search needs the previous picture's deblocking, so `search` filters the whole picture.
+
+**Result:** the same streams (`--digest` on every trace, 720p and 5K). Interleaved, 3 rounds, inter frames a second (median):
+
+| Trace | before | after |
+|---|---|---|
+| 5K photos | 76.0 | 78.9 (+4 %) |
+| 5K scroll-win | 196.4 | 207.9 (+6 %) |
+| 5K typing-cc | 287.4 | 310.6 (+8 %) |
+| 720p photos | 164.2 | 172.0 (+5 %) |
+| 720p scroll-win | 441.3 | 473.5 (+7 %) |
+
+At 5K photos the filters' main-thread time went from 5.8 to 5.3 ms, and typing-cc's closed loop from 1.7 to 1.5 ms (the zero fill and the frame copy gone).
+
+**Rejected first: the same copies done by the GPU.** The reconstruction went in a buffer of its own, and a `p_copy_r` kernel moved the listed 64×64s in the filters' command buffer.
+
+| Variant | 5K photos | 5K scroll-win | 5K typing-cc |
+|---|---|---|---|
+| every copy on the GPU | 75.8 → 72.6 | 200.5 → 201.0 | 285.1 → 294.2 |
+| ring and load on the GPU, far direct copies on the CPU | 76.9 → 75.3 | 198.4 → 202.0 | 288.6 → 299.0 |
+
+- The direct copies are most of a moving picture: 87 % of photos' 64×64s are copies. On the CPU they overlapped the GPU's deblocking; on the GPU they queued in front of it.
+- The GPU is the busier side at 5K photos, shared with the next picture's analysis (the filters' first pass takes 2.4 ms there against 1.15 ms alone). Moving work there doesn't pay; removing it does.
+
 ### Metal AV1: a superblock-row wavefront for the closed loop, measured, not taken yet (2026-11-01)
 
 **The closed loop's limit (5K photos, `--tiles 3x0`, 100 frames):**

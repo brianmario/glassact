@@ -611,6 +611,7 @@ fn sb128_frames_from_motion() {
         reference: None,
         padded: None,
     };
+    let key_video = video;
     hy.closed_loop_ex(
         &pic0.y,
         &pic0.u,
@@ -624,6 +625,7 @@ fn sb128_frames_from_motion() {
         1,
         0,
         Some(&video),
+        None,
     )
     .unwrap();
     let wfp = wfp_of(&hy);
@@ -703,6 +705,7 @@ fn sb128_frames_from_motion() {
         1,
         0,
         Some(&video),
+        None,
     )
     .unwrap();
     let rw1 = hy.output().recon_w;
@@ -735,6 +738,62 @@ fn sb128_frames_from_motion() {
     assert_eq!((p.rec.fp.sb128, p.rec.fp.frame_type), (1, FRAME_INTER));
     assert_eq!(p.rec.blocks.len(), hy.record().blocks.len());
     assert_eq!(p.rec.inter, inter);
+
+    // ---- both again, the reconstruction into the caller's planes ----
+    let recon1: Vec<Vec<u8>> = (0..3).map(|k| hy.recon(k).unwrap().to_vec()).collect();
+    let mut store: Vec<Vec<u8>> = recon0.iter().map(|p| vec![7; p.len()]).collect();
+    let mut hz = Hybrid::new();
+    for (k, (pic, blocks, video, want)) in [
+        (&pic0, &key_blocks, &key_video, &recon0),
+        (&pic1, &blocks, &video, &recon1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let [a, b, c] = &mut store[..] else { unreachable!() };
+        hz.closed_loop_ex(
+            &pic.y,
+            &pic.u,
+            &pic.v,
+            w as u32,
+            h as u32,
+            blocks,
+            None,
+            0,
+            90,
+            1,
+            0,
+            Some(video),
+            Some([&mut a[..], &mut b[..], &mut c[..]]),
+        )
+        .unwrap();
+        assert_eq!(&store, want, "picture {k}");
+        // a key frame keeps its own (the next picture's tiles come from it), an inter frame doesn't
+        assert_eq!(hz.recon(0).is_some(), k == 0);
+        assert_eq!(hz.output().recon_w, hy.output().recon_w);
+    }
+    assert_eq!(hz.write_ex(&wfp, None, sb_cols, ENC_NO_SEQ_HEADER).unwrap(), &obu[..]);
+    // too small a plane
+    let mut small = vec![0u8; 16];
+    let (mut b, mut c) = (store[1].clone(), store[2].clone());
+    assert!(
+        hz.closed_loop_ex(
+            &pic1.y,
+            &pic1.u,
+            &pic1.v,
+            w as u32,
+            h as u32,
+            &blocks,
+            None,
+            0,
+            90,
+            1,
+            0,
+            Some(&video),
+            Some([&mut small[..], &mut b[..], &mut c[..]]),
+        )
+        .is_err()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
