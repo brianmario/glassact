@@ -595,6 +595,7 @@ fn parse_frame(
         context_tile,
         sb128: sq.sb128,
         palettes: fp.allow_screen_content_tools != 0,
+        block_bits: None,
     };
     // tile group
     let ntiles = (tiles.cols * tiles.rows) as usize;

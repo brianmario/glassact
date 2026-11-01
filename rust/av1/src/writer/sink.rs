@@ -14,6 +14,10 @@ pub(crate) trait Sink {
     /// split_or_horz / split_or_vert (spec 8.3.2), from the partition CDF `pc` (10 symbols, or the
     /// 128x128 node's 8)
     fn split_or(&mut self, pc: &[u16], vert: bool, b: i32) -> i32;
+    /// The bits coded so far (for differences; 0 where nothing is coded).
+    fn bits(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Writes with the range encoder.
@@ -24,6 +28,9 @@ pub(crate) struct EcSink<'a> {
 
 impl Sink for EcSink<'_> {
     const WRITE: bool = true;
+    fn bits(&self) -> f64 {
+        self.ec.tell_bits()
+    }
     #[inline(always)]
     fn sym<const L: usize>(&mut self, cdf: &mut [u16; L], s: i32) -> i32 {
         self.ec.symbol(s as u32, cdf);
@@ -73,6 +80,9 @@ pub(crate) struct TeeSink<'a> {
 
 impl Sink for TeeSink<'_> {
     const WRITE: bool = true;
+    fn bits(&self) -> f64 {
+        self.ec.bits()
+    }
     #[inline(always)]
     fn sym<const L: usize>(&mut self, cdf: &mut [u16; L], s: i32) -> i32 {
         self.out.push(sym_pack(

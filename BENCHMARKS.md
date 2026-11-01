@@ -196,6 +196,7 @@ the numbers and the reasoning.
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
+| Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
 
 **Rate control and transport**
 
@@ -259,6 +260,45 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: palette decisions measured, not taken (2026-11-01)
+
+**By colour count** (a block's visible source of 2 to N exact luma values, or (U, V) pairs, coded
+as a lossless palette; screen content tools on key frames too), 720p, 30 frames, q20:
+
+| Trace | N | key frame | inter frames | PSNR-Y |
+|---|---|---|---|---|
+| typing-cc | off / 2 / 4 / 8 | 107.0 / 110.1 / 117.0 / 131.6 KB | 92 / 93 / 95 / 97 B | 41.44 / 41.45 / 41.47 / 41.55 |
+| photos | off / 2 / 4 / 8 | 119.8 / 121.3 / 124.8 / 138.7 KB | 11.6 / 11.7 / 11.8 / 12.4 KB | 40.57 / 40.58 / 40.59 / 40.61 |
+
+Every stream decoded exactly (libaom). Bytes go up much faster than quality.
+
+**By cost, an upper bound.** One closed loop without palettes, then per intra block its measured
+bits (`ENC_BLOCK_BITS`) and SSE against a palette's (bits from the default CDFs and the real
+colour contexts; cost = SSE + λ · bits, the hook's λ = 0.12 step²; all the block's bits counted
+as luma where its chroma can't be a palette). Key frames:
+
+| Trace | size, q | exact palettes (2–8 values): candidates' share of bits → gain | lossy (k-means 2/4/8, no residual): share → gain |
+|---|---|---|---|
+| typing-cc | 720p q20 | 1.1 % → 0.00 % | 54.6 % → 0.17 % |
+| typing-cc | 720p q40 | 1.5 % → 0 | 52.5 % → 5.08 % |
+| typing-cc | 5K q20 | 2.1 % → 0.02 % | 46.3 % → 0.39 % |
+| typing-cc | 5K q40 | 3.0 % → 0.02 % | 38.9 % → 1.53 % |
+| scroll-win | 720p q20 | 2.3 % → 0.00 % | 42.9 % → 0.20 % |
+| scroll-win | 5K q20 | 3.5 % → 0.05 % | 32.9 % → 0.69 % |
+| scroll-win | 5K q40 | 4.7 % → 0.03 % | 31.0 % → 2.62 % |
+| photos | 5K q20 | 0.6 % → 0.00 % | 73.1 % → 0.16 % |
+| photos | 5K q40 | 0.8 % → 0.00 % | 73.8 % → 1.07 % |
+
+Blocks with a few exact colours are near-flat, and DCT codes them in about 11 bits. The expensive
+blocks are antialiased text and edges, with many levels. A lossy palette helps them only at low
+quality.
+
+**Decision:** no palette decisions at our operating point. Their best case is under 1 % at q20
+(a few % at q40), against a decision pass on every intra block. The writer's palette support stays
+(tested, free when unused), and `ENC_BLOCK_BITS` stays for cost experiments. Worth revisiting for
+a low-bandwidth mode. For a custom codec the lesson is that the bytes are in antialiased glyph
+edges, not few-colour blocks.
 
 ### Metal AV1: palette blocks in the writer and parser; libaom's palette measured (2026-11-01)
 

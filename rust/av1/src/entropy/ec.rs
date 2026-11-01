@@ -59,6 +59,13 @@ impl Ec {
         self.precarry.is_empty()
     }
 
+    /// The bits coded so far, fractions included (od_ec_enc_tell_frac's measure, up to a
+    /// constant): for differences.
+    #[inline]
+    pub fn tell_bits(&self) -> f64 {
+        (self.precarry.len() * 8) as f64 + (self.cnt + 24) as f64 - (self.rng as f64).log2()
+    }
+
     /// Renormalizes after coding a symbol. The window is 64 bits, so the bytes the 32-bit
     /// formulation would push one or two at a time leave in batches of 5 or 6, with the same
     /// precarry values summed into the same bytes; the flush branch is taken 5x less often.

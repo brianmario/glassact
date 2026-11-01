@@ -1118,3 +1118,68 @@ fn bench_inter_vs_key() {
         }
     }
 }
+
+/// ENC_BLOCK_BITS: a tile's blocks' bits add up to most of its payload (the rest: partition
+/// symbols and the range coder's flush).
+#[test]
+fn block_bits_add_up() {
+    let mut checked = 0;
+    for seed in 0..40u64 {
+        let Some(mut case) = FuzzCase::make(seed, 300, 10) else {
+            continue;
+        };
+        let mut rec = Record {
+            fp: case.fp,
+            blocks: core::mem::take(&mut case.blocks),
+            block_txb: core::mem::take(&mut case.block_txb),
+            txb: core::mem::take(&mut case.txb),
+            coeffs: core::mem::take(&mut case.coeffs),
+            ..Default::default()
+        };
+        rec.coeffs.truncate(case.n_coeffs as usize);
+        for threads in [1, 0] {
+            let mut w = Writer::with_threads(threads);
+            let opts = EncodeOpts {
+                flags: ENC_FIX_RANGE | ENC_BLOCK_BITS,
+                seq_level_idx: -1,
+            };
+            let mut out = Output::default();
+            if w.encode(rec.clone().as_mut(), &opts, &mut out).is_err() {
+                continue;
+            }
+            let tiles = tile_layout(
+                rec.fp.width,
+                rec.fp.height,
+                rec.fp.tile_cols_log2 as i32,
+                rec.fp.tile_rows_log2 as i32,
+            )
+            .unwrap();
+            let mut k = 0;
+            for (t, payload) in w.tile_payloads().iter().enumerate() {
+                let (tr, tc) = (t / tiles.cols as usize, t % tiles.cols as usize);
+                let (r0, r1) = (tiles.mi_row_starts[tr], tiles.mi_row_starts[tr + 1]);
+                let (c0, c1) = (tiles.mi_col_starts[tc], tiles.mi_col_starts[tc + 1]);
+                let mut sum = 0.0;
+                while k < rec.blocks.len() {
+                    let b = &rec.blocks[k];
+                    if (b.mi_row as u32) < r0
+                        || b.mi_row as u32 >= r1
+                        || (b.mi_col as u32) < c0
+                        || b.mi_col as u32 >= c1
+                    {
+                        break;
+                    }
+                    sum += w.block_bits(k) as f64;
+                    k += 1;
+                }
+                let bits = 8.0 * payload.len() as f64;
+                assert!(
+                    sum <= bits + 1.0 && sum >= 0.9 * bits - 24.0,
+                    "seed {seed} tile {t}: {sum} bits in blocks, {bits} coded"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 60, "{checked}");
+}

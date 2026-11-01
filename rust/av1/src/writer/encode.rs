@@ -21,6 +21,9 @@ pub const ENC_CHECK_EDGES: u32 = 0x20000;
 /// Internal: reconstruct each tile in its coding walk, even on several threads (where the blocks
 /// are otherwise reconstructed on all of them, apart from their coding: [`super::recon`]).
 pub const ENC_ONE_PASS: u32 = 0x40000;
+/// Internal: count each block's bits ([`Writer::block_bits`]; the partition symbols before it
+/// aren't its).
+pub const ENC_BLOCK_BITS: u32 = 0x80000;
 
 /// One tile thread's state. Reused.
 #[derive(Default)]
@@ -80,6 +83,8 @@ pub struct Writer {
     /// the tiles' reconstruction plans and the split pictures' task queue
     plans: Vec<TilePlan>,
     ready: Ready,
+    /// [`ENC_BLOCK_BITS`]
+    block_bits: Vec<AtomicU32>,
 }
 
 impl Default for Writer {
@@ -808,10 +813,16 @@ impl Writer {
             tile_order: Vec::new(),
             plans: Vec::new(),
             ready: Ready::default(),
+            block_bits: Vec::new(),
             seq: BitWriter::default(),
             fh: BitWriter::default(),
             threads,
         }
+    }
+
+    /// Block `k`'s bits in the last encode with [`ENC_BLOCK_BITS`].
+    pub fn block_bits(&self, k: usize) -> f32 {
+        f32::from_bits(self.block_bits[k].load(Ordering::Relaxed))
     }
 
     /// The tile payloads of the last successful encode (raster order; a skipped tile's as given).
@@ -1086,6 +1097,12 @@ impl Writer {
             context_tile,
             sb128,
             palettes: !rec.palette.is_empty(),
+            block_bits: (opts.flags & ENC_BLOCK_BITS != 0).then(|| {
+                if self.block_bits.len() < n_blocks {
+                    self.block_bits.resize_with(n_blocks, || AtomicU32::new(0));
+                }
+                &self.block_bits[..n_blocks]
+            }),
         };
 
         if self.tiles.len() < ntiles {

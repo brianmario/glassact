@@ -55,6 +55,9 @@ pub(crate) struct Frame<'a> {
     /// the picture may have palette blocks (writing: the record has palettes; parsing: with
     /// allow_screen_content_tools): the tiles keep [`TileBufs::pal_at`]
     pub palettes: bool,
+    /// [`super::ENC_BLOCK_BITS`]: each block's bits (f32, its partition symbols not included), by
+    /// record index
+    pub block_bits: Option<&'a [std::sync::atomic::AtomicU32]>,
 }
 
 impl Frame<'_> {
@@ -1743,6 +1746,23 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     /// decode_block (intra_frame_mode_info / inter_frame_mode_info, the prediction of inter
     /// blocks, the residual)
     fn block(&mut self, rec: &mut Rec, r: i32, c: i32, bsize: i32) -> Res<()> {
+        let bits0 = if self.f.block_bits.is_some() {
+            self.sk.bits()
+        } else {
+            0.0
+        };
+        self.block_syntax(rec, r, c, bsize)?;
+        if let Some(bb) = self.f.block_bits {
+            let k = self.st.b_idx as usize;
+            bb[k].store(
+                ((self.sk.bits() - bits0) as f32).to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(())
+    }
+
+    fn block_syntax(&mut self, rec: &mut Rec, r: i32, c: i32, bsize: i32) -> Res<()> {
         let f = self.f;
         let fp = &f.fp;
         let mut b;
