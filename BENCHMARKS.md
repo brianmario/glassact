@@ -260,6 +260,23 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: k_me's sub-sample refinement on every lane; staged windows rejected (2026-10-31)
+
+**What changed:**
+- `k_me` refines its best vector to half and then quarter samples, measuring the 8 neighbours at each step.
+- Before, lanes 0–8 each measured one neighbour's full 16×16, so 23 of the 32 lanes idled.
+- Now every lane measures 8 samples (half a row) of each neighbour, and `simd_sum` adds them. The sums are integers, so they're the same.
+
+**Results:**
+- The streams are the same (`--digest`, four 720p and two 5K runs).
+- A 5K photos inter frame's motion search (`k_proj` and `k_me`) is 2.53 → 1.75 ms of GPU.
+- Inter frames a second, mean of three interleaved runs: photos 5K 67.8 → 69.5. photos 720p, scroll-win 5K and typing-cc 5K were within noise (149 → 150, 162 → 162, 229 → 226).
+
+**Rejected: each search window's reference samples staged in threadgroup memory.**
+- The idea was to read each sample from the picture once per window instead of once per vector. It worked window by window (no motion's ±8, then each candidate's ±4).
+- The output was the same, but the motion search was slower: 2.53 → 3.02 ms.
+- The barriers and the windows' partly filled SIMD-group passes cost more than the cached device reads they replaced.
+
 ### Metal AV1: an exact inter match costed without a transform (2026-10-31)
 
 **What changed:**

@@ -215,28 +215,33 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     int2 best[2] = {b0 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b0 & 2047), sbv) * 8,
                     b1 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b1 & 2047), sbv) * 8};
     if (P.meSubpel && b0 != 0xFFFFFFFFu) {
-        // the best one to half, then quarter samples: the 8 neighbours at each step, every row
+        // the best one to half, then quarter samples: the 8 neighbours at each step, every row. Each
+        // lane measures 8 samples of each (a row's half), and the SIMD-group sums them
         uint bestSad = 0xFFFFFFFFu;
+        const int row = (int)lane >> 1, col0 = ((int)lane & 1) * 8;
         for (int step = 4; step >= 2; step >>= 1) {
             const int2 c = best[0];
-            // lanes 0..8: the centre (once, at the first step) and the 8 neighbours
-            uint sad = 0xFFFFFFFFu;
-            if (lane < 9 && (lane != 4 || step == 4)) {
-                const int2 v = c + int2(((int)lane % 3 - 1) * step, ((int)lane / 3 - 1) * step);
-                if (ga_ref_inside(I, x, y, v, 16, 16)) {
-                    sad = 0;
-                    for (int row = 0; row < 16; row++)
-                        for (int col = 0; col < 16; col++)
-                            sad += (uint)abs((int)cur[warp][row * 16 + col] - ga_ref_px(I.ref, sp, x + col, y + row, v));
+            uint top = 0xFFFFFFFFu;
+            for (int l = 0; l < 9; l++) {
+                // the centre once (at the first step) and the 8 neighbours
+                uint sad = 0xFFFFFFFFu;
+                if (l == 4 && step != 4) sad = bestSad;  // the centre, as the last step measured it
+                else {
+                    const int2 v = c + int2((l % 3 - 1) * step, (l / 3 - 1) * step);
+                    if (ga_ref_inside(I, x, y, v, 16, 16)) {
+                        uint part = 0;
+                        for (int col = col0; col < col0 + 8; col++)
+                            part += (uint)abs((int)cur[warp][row * 16 + col] - ga_ref_px(I.ref, sp, x + col, y + row, v));
+                        sad = simd_sum(part);
+                    }
                 }
+                const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (l == 4 ? 0u : (uint)l + 1);  // centre first on ties
+                top = min(top, key);
             }
-            if (lane == 4 && step != 4) sad = bestSad;  // the centre, as the last step measured it
-            const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (lane == 4 ? 0u : lane + 1);  // centre first on ties
-            const uint win = simd_min(lane < 9 ? key : 0xFFFFFFFFu);
-            if (win != 0xFFFFFFFFu) {
-                const uint l = (win & 15) == 0 ? 4 : (win & 15) - 1;
-                best[0] = c + int2(((int)l % 3 - 1) * step, ((int)l / 3 - 1) * step);
-                bestSad = win >> 4;
+            if (top != 0xFFFFFFFFu) {
+                const int l = (top & 15) == 0 ? 4 : (int)(top & 15) - 1;
+                best[0] = c + int2((l % 3 - 1) * step, (l / 3 - 1) * step);
+                bestSad = top >> 4;
             }
         }
     }
