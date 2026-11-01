@@ -86,8 +86,10 @@ pub struct Video<'a> {
     pub padded: Option<[&'a [u8]; 3]>,
 }
 
-/// The Metal encoder's dead zone (GpParams rnd, zbin).
-const QUANT_RND: f64 = 0.375;
+/// The closed loop's quantizer: the Metal analysis's dead zone (GpParams zbin) and a rounding
+/// offset above its 0.375 (GpParams rnd, the C++'s): 0.6-1.8 % smaller at equal quality on the
+/// reference traces (BENCHMARKS, 2026-11-01).
+const QUANT_RND: f64 = 0.45;
 const QUANT_ZBIN: f64 = 0.656;
 
 fn error(code: i32, msg: &str) -> Error {
@@ -130,6 +132,8 @@ impl Default for TileMem {
 /// and the padded source of the last closed loop live here until the next call, at stable
 /// addresses while the picture's geometry stays the same.
 pub struct Hybrid {
+    /// the closed loop's rounding offset ([`QUANT_RND`]; the C++ hybrid's 0.375 in its tests)
+    quant_rnd: f64,
     src: Src,
     /// per-tile reuse, for one geometry and quantizer
     mem: Vec<TileMem>,
@@ -194,6 +198,7 @@ impl Hybrid {
     /// av1enc_hybrid_create.
     pub fn new() -> Hybrid {
         Hybrid {
+            quant_rnd: QUANT_RND,
             src: Src::default(),
             mem: Vec::new(),
             reused: Vec::new(),
@@ -373,6 +378,7 @@ impl Hybrid {
             slot_cdfs,
             src_given,
             recon_given,
+            quant_rnd,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -664,7 +670,7 @@ impl Hybrid {
                 tx_types: true,
                 reduced_tx_set: false,
                 given_luma_tx: luma_tx.is_some() as i32,
-                rnd: QUANT_RND,
+                rnd: *quant_rnd,
                 zbin: QUANT_ZBIN,
                 double_fwd: false,
                 inter_rd_skip: true,
@@ -893,6 +899,12 @@ impl Hybrid {
 
     /// av1enc_hybrid_set_reuse: keep unchanged tiles' closed loop and bitstream from picture to
     /// picture (on by default).
+    /// The closed loop's rounding offset (tests: the C++ hybrid's 0.375).
+    #[cfg(test)]
+    pub(crate) fn set_quant_rnd(&mut self, rnd: f64) {
+        self.quant_rnd = rnd;
+    }
+
     pub fn set_reuse(&mut self, on: bool) {
         self.reuse = on;
         if !on {

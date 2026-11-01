@@ -261,6 +261,32 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the closed loop's rounding offset 0.375 → 0.45; a light RDOQ rejected (2026-11-01)
+
+The closed loop quantized with the Metal analysis's dead zone, q = |v| < zbin ? 0 : ⌊|v| + rnd⌋
+(rnd 0.375, zbin 0.656, from av1gpu). Swept on our encoder alone: typing-cc, scroll-win and photos,
+5K and 720p, q 8–32, first 100 frames, BD-rate by `vquality`'s RGB luma PSNR against the old
+constants (negative: smaller):
+
+| rnd / zbin | 5K typing | 5K scroll | 5K photos | 720p typing | 720p scroll | 720p photos |
+|---|---|---|---|---|---|---|
+| 0.25 / 0.75 | +4.7 % | +4.2 % | +4.1 % | +3.9 % | +6.8 % | +4.0 % |
+| 0.30 / 0.656 | +2.4 % | +2.5 % | +1.9 % | +1.8 % | +3.5 % | +1.7 % |
+| 0.42 / 0.656 | −0.9 % | −1.0 % | −0.4 % | −0.5 % | −1.2 % | −0.4 % |
+| **0.45 / 0.656** | **−1.3 %** | **−1.4 %** | **−0.6 %** | **−0.7 %** | **−1.8 %** | **−0.8 %** |
+| 0.45 / 0.60 | −1.1 % | −1.0 % | +0.1 % | −0.3 % | −0.6 % | +0.2 % |
+| 0.45 / 0.68 | −1.1 % | −1.1 % | −0.2 % | −0.6 % | −0.7 % | −0.6 % |
+| 0.50 / 0.656 | −1.6 % | −1.8 % | −0.3 % | −0.6 % | −0.5 % | −0.7 % |
+| 0.50 / 0.55 | −0.3 % | −0.4 % | +1.9 % | +1.4 % | +1.4 % | +1.9 % |
+
+- **Taken: rnd 0.45**, zbin unchanged. The C++ reference hybrid keeps 0.375, so the differential
+  tests set it (`Hybrid::set_quant_rnd`).
+- The GPU analysis at 0.45 too: no change (its decisions don't move), so it keeps 0.375.
+- **Rejected, a light RDOQ:** levels lowered by one, last first, where the added distortion (a
+  per-size pixel gain through the inverse transform) costs less than λ times the rate proxy's
+  saving. Alone ±0.1 %; on top of 0.45 / 0.60 it gave back most of the gain. The proxy's rates
+  aren't good enough to steer it.
+
 ### Metal AV1 re-baselined against hardware HEVC and libaom (2026-11-01)
 
 The sweep of "against hardware HEVC and libaom" (2026-10-31) again, after a day of speed work:

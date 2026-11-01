@@ -864,6 +864,14 @@ mod oracle {
         unsafe { core::slice::from_raw_parts(p, n) }
     }
 
+    impl Hybrid {
+        /// The C++ hybrid's rounding offset (0.375), to compare with it.
+        fn with_cpp_quant(mut self) -> Hybrid {
+            self.set_quant_rnd(0.375);
+            self
+        }
+    }
+
     impl CHybrid {
         pub fn new() -> CHybrid {
             // SAFETY: plain constructor.
@@ -1152,7 +1160,7 @@ mod oracle {
     #[test]
     fn closed_loop_and_write_match_cpp() {
         let mut r = Rng(0x00C0_FFEE_1234);
-        let (mut rs, mut cs) = (Hybrid::new(), CHybrid::new());
+        let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
         let mut coded = 0;
         for case in 0..240 {
             let (w, h) = random_size(&mut r);
@@ -1169,7 +1177,7 @@ mod oracle {
             };
             // a fresh pair now and then, else one stream of unrelated pictures
             if r.below(4) == 0 {
-                (rs, cs) = (Hybrid::new(), CHybrid::new());
+                (rs, cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
             }
             let flags = if given_chroma { GIVEN_CHROMA } else { 0 };
             let ok =
@@ -1210,7 +1218,7 @@ mod oracle {
             let mut blocks = partition(&p, &tiles, &mut r, Style::Random, given_chroma);
             let mut lt = (r.below(2) == 0).then(|| luma_types(&blocks, &mut r, false));
             let mut q = if r.below(2) == 0 { 80 } else { r.range(1, 255) };
-            let (mut rs, mut cs) = (Hybrid::new(), CHybrid::new());
+            let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
             let sb_cols = ((mi_cols(w as i32) + 15) >> 4) as usize;
             let sbs = sb_cols * ((mi_rows(h as i32) + 15) >> 4) as usize;
             let (mut f, mut sb) = random_pf(&rs.record().fp, sbs, &mut r);
@@ -1288,7 +1296,7 @@ mod oracle {
         let p = screen_pic(200, 120, 5, false);
         let tiles = tile_layout(200, 120, -1, -1).unwrap();
         let blocks = partition(&p, &tiles, &mut r, Style::Random, false);
-        let (mut rs, mut cs) = (Hybrid::new(), CHybrid::new());
+        let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
         // illegal tiling
         assert_eq!(
             closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, 6, 0),
@@ -1367,7 +1375,7 @@ mod oracle {
         });
         let flags = if gpu_decides { GIVEN_CHROMA } else { 0 };
         let lt = lt.as_deref();
-        let (mut rs, mut cs) = (Hybrid::new(), CHybrid::new());
+        let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
         // warm up, and check
         for p in [&a, &b] {
             assert_eq!(
