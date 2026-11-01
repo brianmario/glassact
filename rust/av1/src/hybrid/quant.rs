@@ -305,6 +305,8 @@ impl QuantHook<'_> {
 
 impl TxbHook for QuantHook<'_> {
     type Scratch = Option<Box<Scratch>>;
+    // a given type outside its set becomes DCT_DCT; searched ones are in it
+    const KEEPS_TX_SETS: bool = true;
 
     fn on_txb(&self, scratch: &mut Option<Box<Scratch>>, ctx: &TxbCtx<'_>, t: &mut Txb, coeffs: &mut [i16]) {
         let sc = &mut **scratch.get_or_insert_with(|| Box::new(Scratch::new()));

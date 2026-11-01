@@ -7,6 +7,7 @@
 //! availability, so tiles share nothing while they are coded.
 
 use super::mvstack::{MvMaps, MvStack, REF_UNSET, derive_mode, find_mv_stack, mv_class};
+use super::recon::TilePlan;
 use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
 use crate::blockinfo::*;
@@ -16,6 +17,7 @@ use crate::tables::*;
 use crate::types::*;
 
 /// The frame: shared and read only while its tiles are coded.
+#[derive(Clone, Copy)]
 pub(crate) struct Frame<'a> {
     pub fp: FrameParams,
     pub mi_cols: i32,
@@ -368,6 +370,306 @@ pub(crate) struct Walk<'a, S: Sink, H: TxbHook> {
     pub bufs: &'a mut TileBufs,
     pub hook: Option<&'a H>,
     pub hs: &'a mut H::Scratch,
+    /// planning ([`super::recon`]): no symbols are coded and nothing is reconstructed; the walk
+    /// records what the tile's reconstruction needs
+    pub plan: Option<&'a mut TilePlan>,
+}
+
+/// What an inter block's prediction reads of its tile's maps (sub-8x8 chroma: the motion of the
+/// blocks of its 8x8).
+pub(super) struct InterMaps<'a> {
+    pub ref0: &'a [u8],
+    pub mvs: &'a [[i16; 2]],
+    pub r0: i32,
+    pub c0: i32,
+    pub mw: i32,
+    pub stride: [usize; 3],
+}
+
+/// An inter block's motion-compensated prediction of every plane, into the tile's planes (at
+/// tile-local positions).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_inter_block(
+    f: &Frame,
+    refs: &[RefPlane; 3],
+    maps: &InterMaps,
+    planes: &mut [&mut [u8]; 3],
+    r: i32,
+    c: i32,
+    bsize: i32,
+    has_chroma: bool,
+    mc: &mut McScratch,
+) {
+    let mi = |y: i32, x: i32| ((y - maps.r0) * maps.mw + (x - maps.c0)) as usize;
+    for plane in 0..1 + 2 * has_chroma as usize {
+        let sub = (plane != 0) as i32;
+        let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
+        let (n4w, n4h) = (bw4(plane_sz), bh4(plane_sz));
+        let (base_x, base_y) = ((c >> sub) * 4, (r >> sub) * 4);
+        let (mut cand_r, mut cand_c) = ((r >> sub) << sub, (c >> sub) << sub);
+        let (mut pw, mut ph) = ((4 * bw4(bsize)) >> sub, (4 * bh4(bsize)) >> sub);
+        if sub != 0 {
+            // someUseIntra over the 8x8 unit (positions past the coded area are this block's)
+            let mut some_intra = false;
+            for y in cand_r..(cand_r + (n4h << sub)).min(f.mi_rows) {
+                for x in cand_c..(cand_c + (n4w << sub)).min(f.mi_cols) {
+                    some_intra |= maps.ref0[mi(y, x)] as i32 == INTRA_FRAME;
+                }
+            }
+            if !some_intra && (pw < 4 || ph < 4) {
+                inter_stat(8);
+            }
+            if some_intra {
+                (pw, ph) = (n4w * 4, n4h * 4);
+                (cand_r, cand_c) = (r, c);
+            }
+        }
+        let filters = [
+            subpel_filter(EIGHTTAP, pw as usize),
+            subpel_filter(EIGHTTAP, ph as usize),
+        ];
+        let (ox, oy) = ((maps.c0 * 4) >> sub, (maps.r0 * 4) >> sub);
+        let stride = maps.stride[plane];
+        let (w, h) = (pw as usize, ph as usize);
+        for (ri, y) in (0..n4h * 4).step_by(h).enumerate() {
+            for (ci, x) in (0..n4w * 4).step_by(w).enumerate() {
+                let (px, py) = (base_x + x, base_y + y);
+                let m = maps.mvs[mi(cand_r + ri as i32, cand_c + ci as i32)];
+                #[cfg(test)]
+                {
+                    let (qx, qy) = crate::dsp::mc_position(px, py, [m[0] as i32, m[1] as i32], sub);
+                    let k = INTER_STAT_PHASE + 32 * sub as usize;
+                    inter_stat(k + 16 * (filters[0] >= 4) as usize + (qx & 15) as usize);
+                    inter_stat(k + 16 * (filters[1] >= 4) as usize + (qy & 15) as usize);
+                }
+                // blocks wider or taller than MC_MAX (128-sample ones) in parts: a sample's
+                // prediction depends only on its position and the block's filters
+                for dy in (0..h).step_by(MC_MAX) {
+                    for dx in (0..w).step_by(MC_MAX) {
+                        let (qx, qy) = (px + dx as i32, py + dy as i32);
+                        let off = (qy - oy) as usize * stride + (qx - ox) as usize;
+                        predict_inter(
+                            &refs[plane],
+                            sub,
+                            qx,
+                            qy,
+                            (w - dx).min(MC_MAX),
+                            (h - dy).min(MC_MAX),
+                            [m[0] as i32, m[1] as i32],
+                            filters,
+                            &mut planes[plane][off..],
+                            stride,
+                            mc,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What an intra tx block's prediction reads: which neighbours are decoded (spec 7.11.2's
+/// haveLeft, haveAbove, haveAboveRight, haveBelowLeft) and the edge filter's type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TxbEdges {
+    pub left: bool,
+    pub above: bool,
+    pub above_right: bool,
+    pub below_left: bool,
+    /// get_filter_type (0 or 1)
+    pub filter_type: i32,
+}
+
+impl TxbEdges {
+    pub fn pack(self) -> u8 {
+        self.left as u8
+            | (self.above as u8) << 1
+            | (self.above_right as u8) << 2
+            | (self.below_left as u8) << 3
+            | (self.filter_type as u8) << 4
+    }
+    pub fn unpack(v: u8) -> TxbEdges {
+        TxbEdges {
+            left: v & 1 != 0,
+            above: v & 2 != 0,
+            above_right: v & 4 != 0,
+            below_left: v & 8 != 0,
+            filter_type: (v >> 4) as i32,
+        }
+    }
+}
+
+/// An intra tx block's prediction (with CfL, from the block's luma reconstructed so far: the
+/// luma extent `max_luma`) into `cur`, its plane, at tile-local sample (lx, ly); `luma` is the
+/// luma plane for a chroma tx block.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_intra_txb(
+    fp: &FrameParams,
+    b: &Block,
+    plane: usize,
+    tx_sz: i32,
+    e: TxbEdges,
+    (lx, ly): (i32, i32),
+    (max_x, max_y): (i32, i32),
+    cur: &mut [u8],
+    stride: usize,
+    luma: &[u8],
+    luma_stride: usize,
+    max_luma: (i32, i32),
+) {
+    let is_cfl = plane > 0 && b.uv_mode as i32 == UV_CFL_PRED;
+    let mode = if plane == 0 {
+        b.y_mode as i32
+    } else if is_cfl {
+        DC_PRED
+    } else {
+        b.uv_mode as i32
+    };
+    let log2w = t8(&Tx_Width_Log2, tx_sz);
+    let log2h = t8(&Tx_Height_Log2, tx_sz);
+    let mut edge_a: Edge = [0; EDGE_LEN];
+    let mut edge_l: Edge = [0; EDGE_LEN];
+    build_edges(
+        cur,
+        stride,
+        lx,
+        ly,
+        log2w,
+        log2h,
+        e.left,
+        e.above,
+        e.above_right,
+        e.below_left,
+        max_x,
+        max_y,
+        &mut edge_a,
+        &mut edge_l,
+    );
+    let angle = if plane == 0 { b.angle_delta_y } else { b.angle_delta_uv } as i32;
+    let fi = if plane == 0 && b.filter_intra != 0 {
+        b.filter_intra as i32 - 1
+    } else {
+        -1
+    };
+    let off = ly as usize * stride + lx as usize;
+    predict_intra_ex(
+        mode,
+        angle,
+        fi,
+        fp.enable_intra_edge_filter != 0,
+        e.filter_type,
+        e.left,
+        e.above,
+        log2w,
+        log2h,
+        lx,
+        ly,
+        max_x,
+        max_y,
+        &mut edge_a,
+        &mut edge_l,
+        &mut cur[off..],
+        stride,
+    );
+    if is_cfl {
+        cfl_predict(
+            cur,
+            stride,
+            luma,
+            luma_stride,
+            lx,
+            ly,
+            tx_sz,
+            1,
+            1,
+            max_luma.0,
+            max_luma.1,
+            if plane == 1 { b.cfl_alpha_u } else { b.cfl_alpha_v } as i32,
+        );
+    }
+}
+
+/// A coded tx block's levels (write mode): with a reconstruction, the closed-loop hook's (which
+/// may also pick the luma `tx_type`); the luma tx set check; and with a reconstruction the
+/// range-checked dequantization and inverse transform into `res` (with fix_range, levels that
+/// overflow it are halved until they don't, counted in `n_fixed`). Returns eob.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn levels<H: TxbHook>(
+    f: &Frame,
+    hook: Option<(&H, &mut H::Scratch)>,
+    ctx: &TxbCtx,
+    t: &mut Txb,
+    q: &mut [i16],
+    tx_type: &mut i32,
+    dq: &mut [i32; 1024],
+    res: &mut [i32; 4096],
+    n_fixed: &mut u64,
+) -> Res<i32> {
+    let fp = &f.fp;
+    let plane = t.plane as usize;
+    let tx_sz = t.tx_size as i32;
+    let n = tx_coeffs(tx_sz);
+    if f.do_recon
+        && let Some((h, hs)) = hook
+    {
+        h.on_txb(hs, ctx, t, q);
+        if plane == 0 {
+            *tx_type = t.tx_type as i32;
+        }
+    }
+    // eob, and whether any level is nonzero, from one pass (the scan of an invalid luma type is
+    // never used: that is an error then)
+    let mut eob = eob_of(&q[..n], get_iscan(tx_sz, *tx_type));
+    let mut nz = eob > 0;
+    if nz && plane == 0 {
+        let reduced = fp.reduced_tx_set != 0;
+        let (set, ok) = if ctx.is_inter {
+            let set = get_tx_set_inter(tx_sz, reduced);
+            (set, *tx_type < TX_TYPES && tx_type_in_set_inter(set, *tx_type))
+        } else {
+            let set = get_tx_set_intra(tx_sz, reduced);
+            (set, *tx_type < TX_TYPES && tx_type_in_set_intra(set, *tx_type))
+        };
+        if !ok {
+            fail!(
+                ERR_INVALID,
+                "block {}: luma tx_type {} not in {} tx set {set} of tx size {tx_sz}",
+                ctx.block_idx,
+                *tx_type,
+                if ctx.is_inter { "inter" } else { "intra" }
+            );
+        }
+    }
+    if nz && f.do_recon {
+        let m = qm(fp.using_qmatrix != 0, f.qm_level[plane], plane as i32, tx_sz, *tx_type);
+        loop {
+            dequant(q, &mut dq[..], tx_sz, ctx.dc_q, ctx.ac_q, m);
+            let err = inv_txfm2d(&dq[..], tx_sz, *tx_type, &mut res[..]);
+            if err == 0 {
+                break;
+            }
+            if !f.fix_range {
+                fail!(
+                    ERR_RANGE,
+                    "block {} plane {plane} tx ({},{}): coefficients overflow inverse transform range (flags {err})",
+                    ctx.block_idx,
+                    t.x4,
+                    t.y4
+                );
+            }
+            nz = false;
+            for v in &mut q[..n] {
+                *v /= 2;
+                nz |= *v != 0;
+            }
+            *n_fixed += 1;
+            if !nz {
+                break;
+            }
+        }
+        eob = eob_of(&q[..n], get_iscan(tx_sz, *tx_type));
+    }
+    Ok(eob)
 }
 
 /// The inverse of [`get_scan`]: the scan index of each coefficient position.
@@ -1193,75 +1495,29 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     /// block of its 8x8 unit, unless one of them is intra.
     #[inline(never)]
     fn predict_inter_block(&mut self, bsize: i32, has_chroma: bool) {
-        let f = self.f;
-        let Some(refs) = f.refs.as_ref() else { return };
+        let Some(refs) = self.f.refs.as_ref() else { return };
         let (st, bufs) = (&mut *self.st, &mut *self.bufs);
-        let (r, c) = (st.mi_row, st.mi_col);
-        for plane in 0..1 + 2 * has_chroma as usize {
-            let sub = (plane != 0) as i32;
-            let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
-            let (n4w, n4h) = (bw4(plane_sz), bh4(plane_sz));
-            let (base_x, base_y) = ((c >> sub) * 4, (r >> sub) * 4);
-            let (mut cand_r, mut cand_c) = ((r >> sub) << sub, (c >> sub) << sub);
-            let (mut pw, mut ph) = ((4 * bw4(bsize)) >> sub, (4 * bh4(bsize)) >> sub);
-            if sub != 0 {
-                // someUseIntra over the 8x8 unit (positions past the coded area are this block's)
-                let mut some_intra = false;
-                for y in cand_r..(cand_r + (n4h << sub)).min(f.mi_rows) {
-                    for x in cand_c..(cand_c + (n4w << sub)).min(f.mi_cols) {
-                        some_intra |= bufs.ref0[bufs.mi(y, x)] as i32 == INTRA_FRAME;
-                    }
-                }
-                if !some_intra && (pw < 4 || ph < 4) {
-                    inter_stat(8);
-                }
-                if some_intra {
-                    (pw, ph) = (n4w * 4, n4h * 4);
-                    (cand_r, cand_c) = (r, c);
-                }
-            }
-            let filters = [
-                subpel_filter(EIGHTTAP, pw as usize),
-                subpel_filter(EIGHTTAP, ph as usize),
-            ];
-            let (ox, oy) = ((bufs.c0 * 4) >> sub, (bufs.r0 * 4) >> sub);
-            let stride = bufs.stride[plane];
-            let (w, h) = (pw as usize, ph as usize);
-            for (ri, y) in (0..n4h * 4).step_by(h).enumerate() {
-                for (ci, x) in (0..n4w * 4).step_by(w).enumerate() {
-                    let (px, py) = (base_x + x, base_y + y);
-                    let m = bufs.mvs[bufs.mi(cand_r + ri as i32, cand_c + ci as i32)];
-                    #[cfg(test)]
-                    {
-                        let (qx, qy) = crate::dsp::mc_position(px, py, [m[0] as i32, m[1] as i32], sub);
-                        let k = INTER_STAT_PHASE + 32 * sub as usize;
-                        inter_stat(k + 16 * (filters[0] >= 4) as usize + (qx & 15) as usize);
-                        inter_stat(k + 16 * (filters[1] >= 4) as usize + (qy & 15) as usize);
-                    }
-                    // blocks wider or taller than MC_MAX (128-sample ones) in parts: a sample's
-                    // prediction depends only on its position and the block's filters
-                    for dy in (0..h).step_by(MC_MAX) {
-                        for dx in (0..w).step_by(MC_MAX) {
-                            let (qx, qy) = (px + dx as i32, py + dy as i32);
-                            let off = (qy - oy) as usize * stride + (qx - ox) as usize;
-                            predict_inter(
-                                &refs[plane],
-                                sub,
-                                qx,
-                                qy,
-                                (w - dx).min(MC_MAX),
-                                (h - dy).min(MC_MAX),
-                                [m[0] as i32, m[1] as i32],
-                                filters,
-                                &mut bufs.plane[plane][off..],
-                                stride,
-                                &mut st.mc,
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let maps = InterMaps {
+            ref0: &bufs.ref0,
+            mvs: &bufs.mvs,
+            r0: bufs.r0,
+            c0: bufs.c0,
+            mw: bufs.mw,
+            stride: bufs.stride,
+        };
+        let [a, b, c] = &mut bufs.plane;
+        let mut planes: [&mut [u8]; 3] = [a, b, c];
+        predict_inter_block(
+            self.f,
+            refs,
+            &maps,
+            &mut planes,
+            st.mi_row,
+            st.mi_col,
+            bsize,
+            has_chroma,
+            &mut st.mc,
+        );
     }
 
     /// check_block_fields for a block with an inter entry (kept out of the intra path).
@@ -1724,6 +1980,10 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 }
             }
         }
+        if let Some(p) = self.plan.as_deref_mut() {
+            let st = &*self.st;
+            p.block(st.b_idx, r, c, bsize, is_inter, has_chroma_, st.block_q);
+        }
         // ---- compute_prediction (inter blocks: the whole block, before its residual) ----
         if is_inter && f.do_recon {
             self.predict_inter_block(bsize, has_chroma_);
@@ -1813,6 +2073,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                             "block {b_idx}: coefficients of tx block {ti} outside the record"
                         );
                     };
+                    if let Some(p) = self.plan.as_deref_mut() {
+                        p.coeffs_at(off, n);
+                    }
                     self.st.cur_txb = ti as u32;
                     self.txb(&b, t, q, x, y)?;
                     ti += 1;
@@ -1856,8 +2119,92 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         Ok(())
     }
 
+    /// An intra tx block's [`TxbEdges`] (BlockDecoded; with ENC_CHECK_EDGES, checked against
+    /// av1g_txb_edges).
+    #[allow(clippy::too_many_arguments)]
+    fn intra_edges(&self, b: &Block, t: &Txb, xi: i32, yi: i32, sbr: i32, sbc: i32, step: (i32, i32)) -> Res<TxbEdges> {
+        let (f, st, bufs) = (self.f, &*self.st, &*self.bufs);
+        let plane = t.plane as usize;
+        let sub = (plane != 0) as i32;
+        let (step_x, step_y) = step;
+        let (bl, bu) = if plane == 0 {
+            (st.avail_l, st.avail_u)
+        } else {
+            (st.avail_lc, st.avail_uc)
+        };
+        let bd = &st.block_decoded[plane];
+        let e = TxbEdges {
+            left: bl || xi > 0,
+            above: bu || yi > 0,
+            above_right: bd[((sbr >> sub) - 1 + 1) as usize][((sbc >> sub) + step_x + 1) as usize] != 0,
+            below_left: bd[((sbr >> sub) + step_y + 1) as usize][((sbc >> sub) - 1 + 1) as usize] != 0,
+            filter_type: {
+                let mode = if plane == 0 {
+                    b.y_mode as i32
+                } else if b.uv_mode as i32 == UV_CFL_PRED {
+                    DC_PRED
+                } else {
+                    b.uv_mode as i32
+                };
+                if f.fp.enable_intra_edge_filter != 0 && is_directional(mode) {
+                    get_filter_type(
+                        plane as i32,
+                        st.mi_row - bufs.r0,
+                        st.mi_col - bufs.c0,
+                        bu,
+                        bl,
+                        &bufs.y_mode,
+                        &bufs.uv_mode,
+                        bufs.mw,
+                    )
+                } else {
+                    0
+                }
+            },
+        };
+        if f.check_edges && !f.sb128 {
+            let c = txb_edges(
+                plane as i32,
+                t.x4 as i32,
+                t.y4 as i32,
+                t.tx_size as i32,
+                st.cur_txb,
+                xi,
+                yi,
+                bl,
+                bu,
+                st.mi_row_end,
+                st.mi_col_end,
+                &f.ordmap[plane],
+                ((f.sb_cols * 16) >> sub) as usize,
+            );
+            if c.have_left != e.left
+                || c.have_above != e.above
+                || c.have_above_right != e.above_right
+                || c.have_below_left != e.below_left
+            {
+                fail!(
+                    ERR_INTERNAL,
+                    "block {} plane {plane} tx ({},{}): av1g_txb_edges {}{}{}{} != spec {}{}{}{}",
+                    st.b_idx,
+                    t.x4,
+                    t.y4,
+                    c.have_left as i32,
+                    c.have_above as i32,
+                    c.have_above_right as i32,
+                    c.have_below_left as i32,
+                    e.left as i32,
+                    e.above as i32,
+                    e.above_right as i32,
+                    e.below_left as i32
+                );
+            }
+        }
+        Ok(e)
+    }
+
     /// transform_block: prediction (write mode), the hook, the range check, coeffs(), the
-    /// reconstruction.
+    /// reconstruction. Planning, only the intra edges (and the maps).
     fn txb(&mut self, b: &Block, t: &mut Txb, q: &mut [i16], xi: i32, yi: i32) -> Res<()> {
         let f = self.f;
         let fp = &f.fp;
@@ -1871,9 +2218,6 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let (sbr, sbc) = (row & sb_mask, col & sb_mask);
         let step_x = t8(&Tx_Width, tx_sz) >> 2;
         let step_y = t8(&Tx_Height, tx_sz) >> 2;
-        let log2w = t8(&Tx_Width_Log2, tx_sz);
-        let log2h = t8(&Tx_Height_Log2, tx_sz);
-        let is_cfl = plane > 0 && b.uv_mode as i32 == UV_CFL_PRED;
         // tile-local sample position
         let (ox, oy) = ((self.bufs.c0 * 4) >> sub, (self.bufs.r0 * 4) >> sub);
         let (lx, ly) = (start_x - ox, start_y - oy);
@@ -1881,140 +2225,47 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let off = ly as usize * stride + lx as usize;
         let is_inter = self.st.is_inter;
 
-        if f.do_recon && !is_inter {
-            let st = &*self.st;
-            let mode = if plane == 0 {
-                b.y_mode as i32
-            } else if is_cfl {
-                DC_PRED
+        if plane == 0
+            && b.skip == 0
+            && let Some(p) = self.plan.as_deref_mut()
+        {
+            // a luma type outside its set fails coding (if the levels aren't all zero): such a
+            // record is coded in one pass
+            let (ty, reduced) = (t.tx_type as i32, fp.reduced_tx_set != 0);
+            p.ok &= ty < TX_TYPES
+                && if is_inter {
+                    tx_type_in_set_inter(get_tx_set_inter(tx_sz, reduced), ty)
+                } else {
+                    tx_type_in_set_intra(get_tx_set_intra(tx_sz, reduced), ty)
+                };
+        }
+        if (f.do_recon || self.plan.is_some()) && !is_inter {
+            let e = self.intra_edges(b, t, xi, yi, sbr, sbc, (step_x, step_y))?;
+            if let Some(p) = self.plan.as_deref_mut() {
+                p.edges[self.st.cur_txb as usize - p.txb_base] = e.pack();
             } else {
-                b.uv_mode as i32
-            };
-            let (bl, bu) = if plane == 0 {
-                (st.avail_l, st.avail_u)
-            } else {
-                (st.avail_lc, st.avail_uc)
-            };
-            let have_left = bl || xi > 0;
-            let have_above = bu || yi > 0;
-            let bd = &st.block_decoded[plane];
-            let have_above_right = bd[((sbr >> sub) - 1 + 1) as usize][((sbc >> sub) + step_x + 1) as usize] != 0;
-            let have_below_left = bd[((sbr >> sub) + step_y + 1) as usize][((sbc >> sub) - 1 + 1) as usize] != 0;
-            if f.check_edges && !f.sb128 {
-                let e = txb_edges(
-                    plane as i32,
-                    t.x4 as i32,
-                    t.y4 as i32,
+                let max = (((f.mi_cols * 4) >> sub) - 1 - ox, ((f.mi_rows * 4) >> sub) - 1 - oy);
+                let st = &*self.st;
+                let [l, u, v] = &mut self.bufs.plane;
+                let (cur, luma): (&mut [u8], &[u8]) = match plane {
+                    0 => (l, &[]),
+                    1 => (u, l),
+                    _ => (v, l),
+                };
+                let luma_stride = self.bufs.stride[0];
+                predict_intra_txb(
+                    fp,
+                    b,
+                    plane,
                     tx_sz,
-                    st.cur_txb,
-                    xi,
-                    yi,
-                    bl,
-                    bu,
-                    st.mi_row_end,
-                    st.mi_col_end,
-                    &f.ordmap[plane],
-                    ((f.sb_cols * 16) >> sub) as usize,
-                );
-                if e.have_left != have_left
-                    || e.have_above != have_above
-                    || e.have_above_right != have_above_right
-                    || e.have_below_left != have_below_left
-                {
-                    fail!(
-                        ERR_INTERNAL,
-                        "block {} plane {plane} tx ({},{}): av1g_txb_edges {}{}{}{} != spec {}{}{}{}",
-                        st.b_idx,
-                        t.x4,
-                        t.y4,
-                        e.have_left as i32,
-                        e.have_above as i32,
-                        e.have_above_right as i32,
-                        e.have_below_left as i32,
-                        have_left as i32,
-                        have_above as i32,
-                        have_above_right as i32,
-                        have_below_left as i32
-                    );
-                }
-            }
-            let max_x = ((f.mi_cols * 4) >> sub) - 1 - ox;
-            let max_y = ((f.mi_rows * 4) >> sub) - 1 - oy;
-            let mut edge_a: Edge = [0; EDGE_LEN];
-            let mut edge_l: Edge = [0; EDGE_LEN];
-            let bufs = &mut *self.bufs;
-            build_edges(
-                &bufs.plane[plane],
-                stride,
-                lx,
-                ly,
-                log2w,
-                log2h,
-                have_left,
-                have_above,
-                have_above_right,
-                have_below_left,
-                max_x,
-                max_y,
-                &mut edge_a,
-                &mut edge_l,
-            );
-            let edge_filter = fp.enable_intra_edge_filter != 0;
-            let filter_type = if edge_filter && is_directional(mode) {
-                get_filter_type(
-                    plane as i32,
-                    st.mi_row - bufs.r0,
-                    st.mi_col - bufs.c0,
-                    bu,
-                    bl,
-                    &bufs.y_mode,
-                    &bufs.uv_mode,
-                    bufs.mw,
-                )
-            } else {
-                0
-            };
-            let angle = if plane == 0 { b.angle_delta_y } else { b.angle_delta_uv } as i32;
-            let fi = if plane == 0 && b.filter_intra != 0 {
-                b.filter_intra as i32 - 1
-            } else {
-                -1
-            };
-            predict_intra_ex(
-                mode,
-                angle,
-                fi,
-                edge_filter,
-                filter_type,
-                have_left,
-                have_above,
-                log2w,
-                log2h,
-                lx,
-                ly,
-                max_x,
-                max_y,
-                &mut edge_a,
-                &mut edge_l,
-                &mut bufs.plane[plane][off..],
-                stride,
-            );
-            if is_cfl {
-                let [luma, u, v] = &mut bufs.plane;
-                let chroma = if plane == 1 { u } else { v };
-                cfl_predict(
-                    chroma,
+                    e,
+                    (lx, ly),
+                    max,
+                    cur,
                     stride,
                     luma,
-                    bufs.stride[0],
-                    lx,
-                    ly,
-                    tx_sz,
-                    1,
-                    1,
-                    st.max_luma_w,
-                    st.max_luma_h,
-                    if plane == 1 { b.cfl_alpha_u } else { b.cfl_alpha_v } as i32,
+                    luma_stride,
+                    (st.max_luma_w, st.max_luma_h),
                 );
             }
         }
@@ -2022,40 +2273,41 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             self.st.max_luma_w = lx + step_x * 4;
             self.st.max_luma_h = ly + step_y * 4;
         }
-        t.eob = 0;
-        let mut tx_type = if plane == 0 {
-            t.tx_type as i32
-        } else {
-            let tt = if is_inter {
-                // compute_tx_type: the luma type at Max(MiRow / MiCol, the chroma position << 1)
-                let st = &*self.st;
-                let (y4, x4) = (
-                    ((t.y4 as i32) << 1).max(st.mi_row) - st.mi_row,
-                    ((t.x4 as i32) << 1).max(st.mi_col) - st.mi_col,
-                );
-                chroma_tx_type_inter(
-                    tx_sz,
-                    st.tx_types[y4 as usize][x4 as usize] as i32,
-                    fp.reduced_tx_set != 0,
-                )
+        if self.plan.is_none() {
+            t.eob = 0;
+            let mut tx_type = if plane == 0 {
+                t.tx_type as i32
+            } else if is_inter && b.skip != 0 {
+                // unused: the spec derives an inter block's chroma type only where it codes one,
+                // from the luma types its coded luma left (a skip block's would be another block's)
+                DCT_DCT
             } else {
-                chroma_tx_type(tx_sz, b.uv_mode as i32, fp.reduced_tx_set != 0)
-            };
-            t.tx_type = tt as u8;
-            tt
-        };
-        if b.skip == 0 {
-            let n = tx_coeffs(tx_sz);
-            let mut eob = 0;
-            if S::WRITE {
-                if f.do_recon
-                    && let Some(h) = self.hook
-                {
+                let tt = if is_inter {
+                    // compute_tx_type: the luma type at Max(MiRow / MiCol, the chroma position << 1)
                     let st = &*self.st;
+                    let (y4, x4) = (
+                        ((t.y4 as i32) << 1).max(st.mi_row) - st.mi_row,
+                        ((t.x4 as i32) << 1).max(st.mi_col) - st.mi_col,
+                    );
+                    chroma_tx_type_inter(
+                        tx_sz,
+                        st.tx_types[y4 as usize][x4 as usize] as i32,
+                        fp.reduced_tx_set != 0,
+                    )
+                } else {
+                    chroma_tx_type(tx_sz, b.uv_mode as i32, fp.reduced_tx_set != 0)
+                };
+                t.tx_type = tt as u8;
+                tt
+            };
+            if b.skip == 0 {
+                let mut eob = 0;
+                if S::WRITE {
+                    let st = &mut *self.st;
                     let ctx = TxbCtx {
                         block: b,
                         block_idx: st.b_idx,
-                        recon: &self.bufs.plane[plane][off..],
+                        recon: self.bufs.plane[plane].get(off..).unwrap_or(&[]),
                         recon_stride: stride,
                         dc_q: st.dc_q[plane],
                         ac_q: st.ac_q[plane],
@@ -2063,79 +2315,33 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                         qm_level: if fp.using_qmatrix != 0 { f.qm_level[plane] } else { 15 },
                         is_inter,
                     };
-                    h.on_txb(self.hs, &ctx, t, q);
-                    if plane == 0 {
-                        tx_type = t.tx_type as i32;
-                    }
+                    let hook = self.hook.map(|h| (h, &mut *self.hs));
+                    eob = levels(
+                        f,
+                        hook,
+                        &ctx,
+                        t,
+                        q,
+                        &mut tx_type,
+                        &mut st.dq,
+                        &mut st.res,
+                        &mut st.n_fixed,
+                    )?;
                 }
-                // eob from one vectorized pass, which also says whether any level is nonzero (the
-                // scan of an invalid luma type is never used: it is an error then)
-                // eob, and whether any level is nonzero, from one pass (the scan of an invalid luma
-                // type is never used: that is an error then)
-                eob = eob_of(&q[..n], get_iscan(tx_sz, tx_type));
-                let mut nz = eob > 0;
-                if nz && plane == 0 {
-                    let reduced = fp.reduced_tx_set != 0;
-                    let (set, ok) = if is_inter {
-                        let set = get_tx_set_inter(tx_sz, reduced);
-                        (set, tx_type < TX_TYPES && tx_type_in_set_inter(set, tx_type))
-                    } else {
-                        let set = get_tx_set_intra(tx_sz, reduced);
-                        (set, tx_type < TX_TYPES && tx_type_in_set_intra(set, tx_type))
-                    };
-                    if !ok {
-                        fail!(
-                            ERR_INVALID,
-                            "block {}: luma tx_type {tx_type} not in {} tx set {set} of tx size {tx_sz}",
-                            self.st.b_idx,
-                            if is_inter { "inter" } else { "intra" }
-                        );
-                    }
+                eob = self.coeffs(b, plane, tx_sz, &mut tx_type, t.x4 as i32, t.y4 as i32, q, eob)?;
+                if plane == 0 {
+                    t.tx_type = tx_type as u8;
                 }
-                if nz && f.do_recon {
-                    let st = &mut *self.st;
-                    let m = qm(fp.using_qmatrix != 0, f.qm_level[plane], plane as i32, tx_sz, tx_type);
-                    loop {
-                        dequant(q, &mut st.dq[..], tx_sz, st.dc_q[plane], st.ac_q[plane], m);
-                        let err = inv_txfm2d(&st.dq[..], tx_sz, tx_type, &mut st.res[..]);
-                        if err == 0 {
-                            break;
-                        }
-                        if !f.fix_range {
-                            fail!(
-                                ERR_RANGE,
-                                "block {} plane {plane} tx ({},{}): coefficients overflow inverse transform range (flags {err})",
-                                st.b_idx,
-                                t.x4,
-                                t.y4
-                            );
-                        }
-                        nz = false;
-                        for v in &mut q[..n] {
-                            *v /= 2;
-                            nz |= *v != 0;
-                        }
-                        st.n_fixed += 1;
-                        if !nz {
-                            break;
-                        }
-                    }
-                    eob = eob_of(&q[..n], get_iscan(tx_sz, tx_type));
+                t.eob = eob as u16;
+                if eob > 0 && f.do_recon {
+                    add_residual(
+                        &mut self.bufs.plane[plane][off..],
+                        stride,
+                        &self.st.res[..],
+                        tx_sz,
+                        tx_type,
+                    );
                 }
-            }
-            eob = self.coeffs(b, plane, tx_sz, &mut tx_type, t.x4 as i32, t.y4 as i32, q, eob)?;
-            if plane == 0 {
-                t.tx_type = tx_type as u8;
-            }
-            t.eob = eob as u16;
-            if eob > 0 && f.do_recon {
-                add_residual(
-                    &mut self.bufs.plane[plane][off..],
-                    stride,
-                    &self.st.res[..],
-                    tx_sz,
-                    tx_type,
-                );
             }
         }
         let st = &mut *self.st;

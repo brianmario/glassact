@@ -7,7 +7,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 
 | Module | What |
 |---|---|
-| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); 64x64 or 128x128 superblocks; tiles on threads; the closed-loop hook; the parser |
+| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); 64x64 or 128x128 superblocks; tiles on threads, and with a reconstruction its blocks on every thread apart from their coding (`writer::recon`); the closed-loop hook; the parser |
 | `dsp`, `blockinfo` | the decoder-mirroring DSP: intra and inter prediction (motion compensation), inverse transforms, dequantization, block geometry |
 | `postfilter` | deblocking and CDEF, exactly as the decoder applies them |
 | `entropy` | the range encoder, CDF contexts, symbol streams |
@@ -50,9 +50,11 @@ libaom), and `cargo test --release -- --ignored --nocapture decoders` (dav1d and
   checked by differential tests with fixed seeds. An optimization that changes an output is a format
   change, not an optimization.
 - **No dependencies:** std only, no crates (AGENTS.md).
-- **Safe Rust by default.** `unsafe` is for the C API, SIMD intrinsics, measured hot loops and the
+- **Safe Rust by default.** `unsafe` is for the C API, SIMD intrinsics, measured hot loops, the
   worker pool's one lifetime erasure (`pool::run`, which std's scoped threads can't do without
-  starting threads each time), and every `unsafe` block gets a `// SAFETY:` comment.
+  starting threads each time) and the writer's block-parallel reconstruction (`writer::recon`:
+  tasks share a tile's planes and the record, kept apart by the dependency order). Every `unsafe`
+  block gets a `// SAFETY:` comment.
 - **SIMD where it pays**, in hot paths: transforms, prediction, filters, quantization, SSE.
   - On aarch64, use `core::arch::aarch64` NEON (baseline on every Apple-silicon Mac).
   - On x86_64, use SSE4.1/AVX2 behind `is_x86_feature_detected!`.

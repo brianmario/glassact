@@ -40,6 +40,7 @@ mod headers;
 mod layout;
 mod mvstack;
 mod parse;
+mod recon;
 pub(crate) mod sink;
 mod tiles;
 mod walk;
@@ -49,7 +50,7 @@ mod inter_tests;
 #[cfg(test)]
 mod tests;
 
-pub use encode::{ENC_CHECK_EDGES, ENC_SKIP_RECON, Extras, Writer, encode, validate};
+pub use encode::{ENC_CHECK_EDGES, ENC_ONE_PASS, ENC_SKIP_RECON, Extras, Writer, encode, validate};
 pub(crate) use headers::{BitWriter, frame_obus};
 pub use layout::{
     LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex, sb_grid,
@@ -343,9 +344,13 @@ pub struct TxbCtx<'a> {
 ///
 /// Tiles run on parallel threads and share the hook (`&self`, hence `Sync`), as the C++ shares its
 /// hook object; each thread has its own `Scratch` (what the C++ hooks keep in thread_locals),
-/// created with `Default` for each encode and reused for all the tiles that thread codes.
+/// created with `Default` for each encode and reused for all the tiles that thread codes. The
+/// blocks may also be reconstructed in any order their prediction allows, on several threads
+/// (writer::recon), when the hook can't make coding fail ([`TxbHook::KEEPS_TX_SETS`]).
 pub trait TxbHook: Sync {
     type Scratch: Default + Send;
+    /// Every luma tx_type the hook leaves is in its tx block's set, or is the one it was given.
+    const KEEPS_TX_SETS: bool = false;
     fn on_txb(&self, scratch: &mut Self::Scratch, ctx: &TxbCtx<'_>, txb: &mut Txb, coeffs: &mut [i16]);
 }
 
@@ -353,6 +358,7 @@ pub trait TxbHook: Sync {
 pub struct NoHook;
 impl TxbHook for NoHook {
     type Scratch = ();
+    const KEEPS_TX_SETS: bool = true;
     #[inline(always)]
     fn on_txb(&self, _: &mut (), _: &TxbCtx<'_>, _: &mut Txb, _: &mut [i16]) {}
 }

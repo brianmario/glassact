@@ -44,6 +44,25 @@ impl Sink for EcSink<'_> {
     }
 }
 
+/// Codes nothing: the values are the record's (the reconstruction's plan, [`super::recon`]).
+pub(crate) struct NullSink;
+
+impl Sink for NullSink {
+    const WRITE: bool = true;
+    #[inline(always)]
+    fn sym<const L: usize>(&mut self, _: &mut [u16; L], s: i32) -> i32 {
+        s
+    }
+    #[inline(always)]
+    fn bit(&mut self, b: i32) -> i32 {
+        b
+    }
+    #[inline(always)]
+    fn split_or(&mut self, _: &[u16], _: bool, b: i32) -> i32 {
+        b
+    }
+}
+
 /// Writes and records the packed symbol stream (symstream; the GPU entropy coder's reference).
 pub(crate) struct TeeSink<'a> {
     pub ec: EcSink<'a>,

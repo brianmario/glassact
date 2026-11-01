@@ -260,6 +260,51 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: blocks reconstructed on every thread apart from their coding (2026-11-01)
+
+**Before:** each tile's walk reconstructed and coded its blocks in one pass. Intra prediction reads
+decoded neighbours, so a tile is a chain. At 5K photos tile 0 holds a 1–2 superblock wide strip of
+intra blocks: 6–8 ms, while the other seven tiles take 2–3 ms. The closed loop waited for it.
+
+**What changed** (`writer/recon.rs`): the closed-loop hook reads no symbol state, so a tile with a
+reconstruction is coded in three passes, each picture one task graph on the worker pool:
+- **plan**: the walk with nothing coded or reconstructed. It records each intra tx block's edges
+  (BlockDecoded, the edge filter type), each block's quantizer, and the earlier blocks an intra
+  block may read (the row above to twice its width, the column left to twice its height, and the
+  same for its 8x8's chroma).
+- **reconstruct**: every block as soon as the blocks it reads are done (prediction, hook, inverse
+  transform, final levels and tx types into the record). A finishing block takes one newly ready
+  reader itself and queues the rest; the strip becomes a block-level wavefront.
+- **code**: the walk again with the final levels and no reconstruction, after the tile's last block.
+
+Tiles overlap: one tile plans while another reconstructs. Only reconstructions that can't fail are
+split: ENC_FIX_RANGE, a hook whose luma types stay in their sets (QuantHook), and a record the plan
+accepts. Anything else is coded in one pass, so errors and the record left behind are the walk's.
+The planes are shared by the block tasks through raw pointers; the dependency order keeps the
+samples they touch apart (`unsafe`, documented in the crate's rules).
+
+Also fixed: a skip inter block's chroma tx blocks got a tx type derived from whatever luma types the
+thread's previous block left. The record field depended on thread history. It is now DCT_DCT, as
+the spec never derives one there.
+
+**Result:** the same streams (`--digest`, 720p and 5K), and a test that split pictures equal
+ENC_ONE_PASS ones (outputs, payloads, record). Interleaved, 3 rounds, inter frames a second (median):
+
+| Trace | before | after |
+|---|---|---|
+| 5K photos | 82.6 | 84.4 (+2 %) |
+| 5K scroll-win | 211.6 | 213.5 (+1 %) |
+| 5K typing-cc | 312.5 | 304.4 (−3 %) |
+| 720p photos | 168.1 | 175.8 (+5 %) |
+| 720p scroll-win | 471.0 | 482.3 (+2 %) |
+
+**Why so little:** at 5K photos the closed loop went from 5.3 to 3.7 ms (−30 %). But it now uses
+every core, and the next picture's copy finder (4.4 → 5.5 ms) and the filters (5.5 → 6.6 ms) slowed
+by about as much. Summed over tiles, the closed loop is 24–36 ms of CPU per picture: half the
+hook's quantization trials, a quarter the copies' motion compensation. The chain no longer limits
+it; total CPU does. Typing loses 3 % to the plan pass, an extra walk over tiles that were already
+balanced. Next: less CPU per block, not more parallelism.
+
 ### Metal AV1: one persistent worker pool for the crate's parallel loops (2026-11-01)
 
 **Before:** each parallel loop started its own scoped threads, every picture:

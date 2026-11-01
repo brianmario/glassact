@@ -630,6 +630,7 @@ fn parse_frame(
             bufs: &mut bufs,
             hook: None,
             hs: &mut hs,
+            plan: None,
         };
         walk.tile(&mut Rec::Parse(&mut pr), tr, tc)?;
         out.tile_bytes.push(tsz as u32);

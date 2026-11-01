@@ -186,6 +186,75 @@ fn round_trip_seqs(n: u64, maxdim: i32, pick: impl Fn(&InterSeq) -> bool + Sync)
     frames.into_inner()
 }
 
+/// Reconstructed on every thread apart from their coding (writer::recon), random still pictures
+/// (both superblock sizes, several tiles) and inter sequences give the one-pass walk's outputs,
+/// tile payloads and record, bit for bit.
+#[test]
+fn split_reconstruction_is_the_walks() {
+    let before = super::recon::SPLIT.load(std::sync::atomic::Ordering::Relaxed);
+    seeds(240, |_, seed| {
+        // every thread: a block's reconstruction races the ones it doesn't read
+        let (w, mut one) = (&mut Writer::new(), Writer::with_threads(4));
+        let rec = if seed % 2 == 0 {
+            let Some(mut case) = FuzzCase::make(seed, 400, 20) else {
+                return;
+            };
+            let mut rec = Record {
+                fp: case.fp,
+                blocks: core::mem::take(&mut case.blocks),
+                block_txb: core::mem::take(&mut case.block_txb),
+                txb: core::mem::take(&mut case.txb),
+                coeffs: core::mem::take(&mut case.coeffs),
+                inter: Vec::new(),
+            };
+            rec.coeffs.truncate(case.n_coeffs as usize);
+            rec
+        } else {
+            let Some(rec) = sb128_still(seed, 400) else {
+                return;
+            };
+            rec
+        };
+        for flags in [ENC_FIX_RANGE, ENC_FIX_RANGE | ENC_PREFILTER_RECON] {
+            let (mut a, mut b) = (rec.clone(), rec.clone());
+            let opts = |f| EncodeOpts {
+                flags: f,
+                seq_level_idx: -1,
+            };
+            let (mut oa, mut ob) = (Output::default(), Output::default());
+            let ra = w.encode(a.as_mut(), &opts(flags), &mut oa);
+            let rb = one.encode(b.as_mut(), &opts(flags | ENC_ONE_PASS), &mut ob);
+            assert_eq!(ra.is_ok(), rb.is_ok(), "seed {seed}: result");
+            assert!(oa == ob, "seed {seed} flags {flags:#x}: outputs");
+            assert_eq!(w.tile_payloads(), one.tile_payloads(), "seed {seed}: tile payloads");
+            assert!(a.txb == b.txb && a.coeffs == b.coeffs, "seed {seed}: record");
+        }
+        let Some(mut seq) = InterSeq::make(seed, 300, 4) else {
+            return;
+        };
+        let mut again = seq.clone();
+        let split = encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD).unwrap();
+        let walk = encode_seq(&mut one, &mut again, ENC_FIX_RANGE | ENC_TD | ENC_ONE_PASS).unwrap();
+        assert!(split == walk, "seed {seed}: inter outputs");
+        for (k, (a, b)) in seq.frames.iter().zip(&again.frames).enumerate() {
+            if let Some(i) = (0..a.txb.len()).find(|&i| a.txb[i] != b.txb[i]) {
+                let bl = a.block_txb.partition_point(|&t| t as usize <= i) - 1;
+                panic!(
+                    "seed {seed} frame {k}: txb {i} {:?} vs {:?}; block {bl} {:?} {:?}",
+                    a.txb[i],
+                    b.txb[i],
+                    a.blocks[bl],
+                    a.inter.get(bl)
+                );
+            }
+            assert!(a.coeffs == b.coeffs, "seed {seed} frame {k}: coefficients");
+        }
+    });
+    let split = super::recon::SPLIT.load(std::sync::atomic::Ordering::Relaxed) - before;
+    eprintln!("{split} pictures split");
+    assert!(split > 300);
+}
+
 /// A key frame in video mode codes a still picture's tile data and reconstructs exactly as it.
 #[test]
 fn video_key_frames_are_still_pictures() {
@@ -235,6 +304,7 @@ struct McCheck<'a> {
 
 impl TxbHook for McCheck<'_> {
     type Scratch = Vec<u8>;
+    const KEEPS_TX_SETS: bool = true;
     fn on_txb(&self, want: &mut Vec<u8>, ctx: &TxbCtx<'_>, txb: &mut Txb, _: &mut [i16]) {
         use crate::blockinfo::{bh4, bw4};
         use crate::dsp::{RefPlane, predict_inter_ref, subpel_filter, tx_h, tx_w};
