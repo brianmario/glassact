@@ -267,10 +267,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         // put back, so the whole deblocked frame stays exact for whatever reads it later (CDEF
         // where new presets change a strength, in this picture or a later one).
         let lumaSSE = try job.scratch("lumaSSE", 4 * nsb * nc), chromaSSE = try job.scratch("chromaSSE", 4 * nsb * nc)
-        if let direct, direct.count == nsb {
-            // their filtered and deblocked samples are their reconstruction, and their SSE rows
-            // a full search's (CDEF is inactive in them: zero)
-            let list = (0..<nsb).filter { direct[$0] != 0 }.map(UInt32.init)
+        let around = dilate(outer)
+        // direct copies: their filtered and deblocked samples are their reconstruction, and their
+        // SSE rows a full search's (CDEF is inactive in them: zero). Those the GPU's deblocking
+        // reads (around the changed ones) before it, the rest while it runs
+        func copyDirect(_ list: [UInt32]) {
             for p in 0..<job.nPlanes {
                 for target in [job.source[p], job.output[p]] {
                     Self.copy(planes[p], stride: job.pw[p], into: target, width: job.pw[p], height: job.ph[p],
@@ -284,7 +285,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 (luv + Int(sb) * nc).update(repeating: 0, count: nc)
             }
         }
-        let around = dilate(outer)
+        var farDirect: [UInt32] = []
+        if let direct, direct.count == nsb {
+            copyDirect((0..<nsb).filter { direct[$0] != 0 && around[$0] != 0 }.map(UInt32.init))
+            farDirect = (0..<nsb).filter { direct[$0] != 0 && around[$0] == 0 }.map(UInt32.init)
+        }
         let ringList = (0..<nsb).filter { around[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
         let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", job.pw[$0] * job.ph[$0]) }
         func copyRing(from: [any MTLBuffer], to: [any MTLBuffer]) {
@@ -311,7 +316,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         var innerRegion = (UInt32(innerList.count), UInt32(sbCols)), outerRegion = (UInt32(outerList.count), UInt32(sbCols))
         var candidates = Self.candidates
         lastGPUSeconds = 0
-        try run { compute in
+        try run(meanwhile: { copyDirect(farDirect) }) { compute in
             job.mark(compute)
             job.normalizeCDEF(compute)
             for pass in Int32(0)..<2 where !outerList.isEmpty {
@@ -458,18 +463,27 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// `stride` apart into `buffer` (`width` × `height`, tight).
     static func copy(_ plane: UnsafePointer<UInt8>, stride: Int, into buffer: any MTLBuffer, width: Int, height: Int,
                      superblocks: [UInt32], side: Int, sbCols: Int) {
-        let d = buffer.contents().assumingMemoryBound(to: UInt8.self)
         // many 64×64s (a moving 5K picture's copies are tens of MB): in parallel
         let chunks = superblocks.count * side * side >= 1 << 20 ? min(8, superblocks.count / 64) : 1
         superblocks.withUnsafeBufferPointer { list in
-            DispatchQueue.concurrentPerform(iterations: chunks) { c in
-                for i in Swift.stride(from: c, to: list.count, by: chunks) {
-                    let sb = Int(list[i])
-                    let x0 = sb % sbCols * side, y0 = sb / sbCols * side
-                    guard x0 < width, y0 < height else { continue }
-                    let w = min(side, width - x0)
-                    for row in y0..<min(y0 + side, height) { (d + row * width + x0).update(from: plane + row * stride + x0, count: w) }
-                }
+            let job = CopyJob(plane: plane, stride: stride, into: buffer.contents().assumingMemoryBound(to: UInt8.self),
+                              width: width, height: height, superblocks: list, side: side, sbCols: sbCols, chunks: chunks)
+            DispatchQueue.concurrentPerform(iterations: chunks) { job.run($0) }
+        }
+    }
+
+    /// `copy(_:stride:into:width:height:superblocks:side:sbCols:)`'s work, a chunk at a time.
+    private struct CopyJob: @unchecked Sendable {
+        let plane: UnsafePointer<UInt8>, stride: Int, into: UnsafeMutablePointer<UInt8>, width: Int, height: Int
+        let superblocks: UnsafeBufferPointer<UInt32>, side: Int, sbCols: Int, chunks: Int
+
+        func run(_ c: Int) {
+            for i in Swift.stride(from: c, to: superblocks.count, by: chunks) {
+                let sb = Int(superblocks[i])
+                let x0 = sb % sbCols * side, y0 = sb / sbCols * side
+                guard x0 < width, y0 < height else { continue }
+                let w = min(side, width - x0)
+                for row in y0..<min(y0 + side, height) { (into + row * width + x0).update(from: plane + row * stride + x0, count: w) }
             }
         }
     }
@@ -500,13 +514,16 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         return job
     }
 
-    private func run(_ body: (any MTLComputeCommandEncoder) -> Void) throws {
+    /// Encodes `body`'s work and runs it, doing `meanwhile` (CPU work the GPU's doesn't touch)
+    /// while it runs.
+    private func run(meanwhile: () -> Void = {}, _ body: (any MTLComputeCommandEncoder) -> Void) throws {
         guard let commands = queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
         else { throw Failure.metal("no command encoder") }
         commands.label = "AV1 filters"  // for Instruments
         body(compute)
         compute.endEncoding()
         commands.commit()
+        meanwhile()
         commands.waitUntilCompleted()
         if let error = commands.error { throw Failure.metal("\(error)") }
         lastGPUSeconds += commands.gpuEndTime - commands.gpuStartTime

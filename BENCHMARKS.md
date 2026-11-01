@@ -260,6 +260,42 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the filters' far direct copies while the GPU deblocks; source padding in parallel, not taken (2026-11-01)
+
+**Where an inter frame's filters go (5K photos, ms a frame, `searchChanged`):**
+
+| Step | ms |
+|---|---|
+| direct copies and lists | 0.97 |
+| saving the ring | 0.24 |
+| loading the reconstruction around the changed 64×64s, and the source | 0.67 |
+| first GPU pass (deblocking, directions, SSE) | 2.44 |
+| restoring the ring | 0.21 |
+| CDEF preset search (CPU) | 0.50 |
+| assignment | 0.20 |
+| CDEF | 0.79 |
+
+- With the analysis finished first (a test hack), the first GPU pass is 1.15 ms. About 1.3 ms of it is waiting behind the next picture's analysis on the GPU.
+
+**What changed:**
+- About two thirds of the direct copies (1,387 of 2,098 64×64s a frame) lie outside the ring that the deblocking reads. Those are now copied while the first GPU pass runs.
+- The copy is 0.74 ms, but the GPU pass took about 0.6 ms longer meanwhile, presumably because they share memory bandwidth.
+- The filters are 6.05 → 5.9 ms. The streams are the same (`--digest`).
+
+Inter frames a second (three interleaved runs):
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 74.1 74.4 74.2 | 75.3 76.0 74.3 |
+| scroll-win 5K | 183.3 182.0 184.1 | 186.4 184.1 183.6 |
+| typing-cc 5K | 256.9 218.0 260.6 | 265.7 259.8 259.9 |
+
+The 720p traces were within noise.
+
+**Not taken: the analysis's source padded on 8 threads.**
+- `Run.init` pads the 22 MB source into Metal buffers in 1.22 ms, which delays the analysis's start.
+- On 8 threads, photos 5K was 75.6 75.6 75.3 against 75.3 76.0 74.3, and the rest within noise. The start isn't what the filters wait for.
+
 ### Metal AV1: the next analysis started on a thread of its own (2026-10-31)
 
 **What changed:**
