@@ -18,6 +18,7 @@ pub mod enc;
 pub mod entropy;
 pub mod hybrid;
 pub mod motion;
+mod pool;
 pub mod postfilter;
 #[allow(clippy::all)]
 pub mod tables;

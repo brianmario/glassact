@@ -768,7 +768,10 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
             unsafe { set_error_raw(err, errlen, "padded: a plane is missing") };
             return ERR_INVALID;
         }
-        let (sb_cols, sb_rows) = ((2 * w.div_ceil(8) as usize).div_ceil(16), (2 * hgt.div_ceil(8) as usize).div_ceil(16));
+        let (sb_cols, sb_rows) = (
+            (2 * w.div_ceil(8) as usize).div_ceil(16),
+            (2 * hgt.div_ceil(8) as usize).div_ceil(16),
+        );
         let len = |pl: usize| ((sb_cols * 64) >> (pl > 0) as usize) * ((sb_rows * 64) >> (pl > 0) as usize);
         given = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts(p[pl], len(pl))) });
     }

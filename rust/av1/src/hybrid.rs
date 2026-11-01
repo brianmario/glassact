@@ -295,7 +295,9 @@ impl Hybrid {
             || luma_tx.is_some_and(|l| l.len() < n)
             || video.is_some_and(|v| !v.inter.is_empty() && v.inter.len() != n)
             || recon_into.as_ref().is_some_and(|r| {
-                r.iter().enumerate().any(|(p, r)| r.len() < (rw >> (p > 0) as usize) * (rh >> (p > 0) as usize))
+                r.iter()
+                    .enumerate()
+                    .any(|(p, r)| r.len() < (rw >> (p > 0) as usize) * (rh >> (p > 0) as usize))
             })
         {
             return Err(error(ERR_INVALID, "bad arguments"));
@@ -690,7 +692,11 @@ impl Hybrid {
         };
         // an inter frame's reconstruction straight into its caller's planes (no tile is kept from
         // it); any other's kept here for the next picture's tiles, and copied there
-        let (direct, copy_to) = if inter_frame { (recon_into, None) } else { (None, recon_into) };
+        let (direct, copy_to) = if inter_frame {
+            (recon_into, None)
+        } else {
+            (None, recon_into)
+        };
         *recon_given = direct.is_some();
         writer.encode_into(rec.as_mut(), &opts, Some(&hook), &extras, direct, out)?;
         if *reused_count > 0 {
@@ -937,7 +943,9 @@ impl Hybrid {
     /// `MiCols * 4 >> sub` wide and `MiRows * 4 >> sub` high (sub = 1 for chroma); empty after a
     /// failure, `None` for a plane > 2 or when the call wrote it into its caller's planes.
     pub fn recon(&self, plane: usize) -> Option<&[u8]> {
-        (!self.recon_given).then(|| self.outs[self.cur].recon.get(plane).map(|p| &p[..])).flatten()
+        (!self.recon_given)
+            .then(|| self.outs[self.cur].recon.get(plane).map(|p| &p[..]))
+            .flatten()
     }
 
     /// The last closed loop's output (its reconstruction's sizes, and the stats of its encode).
@@ -984,12 +992,7 @@ fn par_for<T: Send, S>(
             f(&mut s, &mut c.lock().unwrap());
         }
     };
-    std::thread::scope(|sc| {
-        for _ in 1..n {
-            sc.spawn(work);
-        }
-        work();
-    });
+    crate::pool::run(n, |_| work());
 }
 
 /// `rest[b0 - at..b1 - at]`, with `rest` and `at` moved past it (ranges taken in order).

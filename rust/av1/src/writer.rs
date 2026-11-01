@@ -14,7 +14,7 @@
 //! - parsing: the sink decodes the element (spec 8.2 symbol decoder) and the walk stores it into a
 //!   record being built.
 //!
-//! Tiles are coded on parallel threads ([`std::thread::scope`]). Prediction never crosses a tile
+//! Tiles are coded on parallel threads (the crate's worker pool). Prediction never crosses a tile
 //! (is_inside() is tile-local), so each tile reconstructs into its own buffers (tile-local planes
 //! and mode-info maps), which are merged into the frame for the post-filters and the outputs.
 //!

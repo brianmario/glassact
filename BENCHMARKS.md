@@ -260,6 +260,44 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: one persistent worker pool for the crate's parallel loops (2026-11-01)
+
+**Before:** each parallel loop started its own scoped threads, every picture:
+- the closed loop's tiles;
+- the reconstruction's bands of rows (up to 24 threads);
+- the layout's two passes and the chroma decisions (up to 14 each);
+- source padding;
+- the copy finder's two loops.
+
+**Cost of starting threads (a loop of trivial tasks, M-series Mac):**
+
+| Tasks | scoped threads | GCD `dispatch_apply_f` | parked pool |
+|---|---|---|---|
+| 8 × 0 µs | 56 µs | 0.6 µs | 11 µs |
+| 14 × 50 µs | 159 µs | 241 µs | 118 µs |
+| 24 × 20 µs | 222 µs | 165 µs | 81 µs |
+| 14 × 500 µs | 691 µs | 657 µs | 562 µs |
+
+GCD is nearly free for tiny loops but takes on workers gradually, so it loses at the encoder's task sizes.
+
+**What changed:**
+- `pool.rs`: one pool of `available_parallelism - 1` threads, started on first use and parked on a condition variable between loops.
+- `pool::run(n, f)` calls `f(0..n)` on the caller and the workers and returns when all have, so `f` may borrow (one `unsafe`: the closure's lifetime erased, sound because nothing calls it after `run` returns).
+- Loops from several threads (the closed loop, the copy finder, the writer) share the pool: idle workers help whichever loop has tasks left. Nested loops work, and a panic is resumed in the caller once every task is done.
+- Every per-picture scope in the crate uses it.
+
+**Result:** the same streams (`--digest`, 720p and 5K). Interleaved, 3 rounds, inter frames a second (median):
+
+| Trace | before | after |
+|---|---|---|
+| 5K photos | 79.7 | 80.0 |
+| 5K scroll-win | 209.9 | 212.0 (+1 %) |
+| 5K typing-cc | 309.1 | 322.0 (+4 %) |
+| 720p photos | 166.8 | 171.0 (+2.5 %) |
+| 720p scroll-win | 469.4 | 493.9 (+5 %) |
+
+The light frames gain most: their loops are short, so starting threads was a larger part of them.
+
 ### Metal AV1: inter frames reconstruct into the filters' buffers, deblocked in place; copies on the GPU rejected (2026-11-01)
 
 **Before:** the copied 64×64s of an inter frame moved four times each picture:

@@ -819,8 +819,7 @@ impl Writer {
                     }
                 }
             };
-            let work = &work;
-            std::thread::scope(|s| launch(s, &mut self.workers[..nworkers], work));
+            crate::pool::each(&mut self.workers[..nworkers], work);
             // the first error in tile order: every tile before an erroneous one was taken (and
             // completed), so it is the one sequential coding reports
             for (_, task) in tasks {
@@ -888,20 +887,6 @@ impl Writer {
     }
 }
 
-/// Runs `work` on every worker: this thread takes the first, and starts two threads that do the
-/// same for the halves of the rest, so the last thread starts after log2(workers) spawns rather than
-/// after all of them.
-fn launch<'s, 'e: 's, F: Fn(&mut Worker) + Sync>(s: &'s std::thread::Scope<'s, 'e>, ws: &'e mut [Worker], work: &'e F) {
-    let (me, rest) = ws.split_first_mut().unwrap();
-    let (a, b) = rest.split_at_mut(rest.len() / 2);
-    for half in [b, a] {
-        if !half.is_empty() {
-            s.spawn(move || launch(s, half, work));
-        }
-    }
-    work(me);
-}
-
 /// The reconstruction outputs: the padded pre-filter frame, or the post-filtered, cropped one.
 fn recon(
     tiles: &mut [TileBufs],
@@ -956,11 +941,7 @@ fn recon(
         if threads <= 1 || bands.len() <= 1 {
             bands.iter_mut().for_each(copy);
         } else {
-            std::thread::scope(|sc| {
-                for b in bands.iter_mut() {
-                    sc.spawn(move || copy(b));
-                }
-            });
+            crate::pool::each(&mut bands, copy);
         }
         return;
     }

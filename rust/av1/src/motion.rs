@@ -179,39 +179,31 @@ impl ShiftFinder {
                 .map(|b| (false, b)),
         );
         let per = bands.len().div_ceil(self.threads.max(1)).max(1);
-        let mut found: Vec<(Shift, u32)> = std::thread::scope(|sc| {
-            let jobs: Vec<_> = bands
-                .chunks(per)
-                .map(|part| {
-                    sc.spawn(move || {
-                        let mut t = BandScratch::default();
-                        let mut out = Vec::new();
-                        for &(vertical, b) in part {
-                            if vertical {
-                                let (x0, x1) = (b * 64, w.min(b * 64 + 64));
-                                t.now.clear();
-                                t.now.extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
-                                t.before.clear();
-                                t.before
-                                    .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
-                                out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: 0, dy: s }, n)));
-                            } else {
-                                let (y0, y1) = (b * 64, h.min(b * 64 + 64));
-                                t.col_hashes(cur, y0, y1);
-                                t.now.clear();
-                                t.now.extend(t.col_hash.iter().map(|&k| k as u64));
-                                t.col_hashes(prev, y0, y1);
-                                t.before.clear();
-                                t.before.extend(t.col_hash.iter().map(|&k| k as u64));
-                                out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: s, dy: 0 }, n)));
-                            }
-                        }
-                        out
-                    })
-                })
-                .collect();
-            jobs.into_iter().flat_map(|j| j.join().unwrap()).collect()
+        let mut parts: Vec<_> = bands.chunks(per).map(|p| (p, Vec::<(Shift, u32)>::new())).collect();
+        crate::pool::each(&mut parts, |(part, out)| {
+            let mut t = BandScratch::default();
+            for &(vertical, b) in part.iter() {
+                if vertical {
+                    let (x0, x1) = (b * 64, w.min(b * 64 + 64));
+                    t.now.clear();
+                    t.now.extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
+                    t.before.clear();
+                    t.before
+                        .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
+                    out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: 0, dy: s }, n)));
+                } else {
+                    let (y0, y1) = (b * 64, h.min(b * 64 + 64));
+                    t.col_hashes(cur, y0, y1);
+                    t.now.clear();
+                    t.now.extend(t.col_hash.iter().map(|&k| k as u64));
+                    t.col_hashes(prev, y0, y1);
+                    t.before.clear();
+                    t.before.extend(t.col_hash.iter().map(|&k| k as u64));
+                    out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: s, dy: 0 }, n)));
+                }
+            }
         });
+        let mut found: Vec<(Shift, u32)> = parts.into_iter().flat_map(|(_, out)| out).collect();
         // merge: total support per shift, best first
         found.sort_by_key(|&(s, _)| (s.dx, s.dy));
         let mut merged: Vec<(Shift, u32)> = Vec::new();
@@ -336,14 +328,11 @@ impl Motion {
         }
         // unchanged, rows of superblocks on several threads
         let rows_per = sb_rows.div_ceil(self.threads.max(1)).max(1);
-        std::thread::scope(|sc| {
-            for (k, part) in self.sbs.chunks_mut(rows_per * sb_cols).enumerate() {
-                sc.spawn(move || {
-                    for (i, m) in part.iter_mut().enumerate() {
-                        let s = k * rows_per * sb_cols + i;
-                        m.copy = sb_matches(cur, prev, planes, s % sb_cols, s / sb_cols, Shift::default());
-                    }
-                });
+        let mut parts: Vec<_> = self.sbs.chunks_mut(rows_per * sb_cols).enumerate().collect();
+        crate::pool::each(&mut parts, |(k, part)| {
+            for (i, m) in part.iter_mut().enumerate() {
+                let s = *k * rows_per * sb_cols + i;
+                m.copy = sb_matches(cur, prev, planes, s % sb_cols, s / sb_cols, Shift::default());
             }
         });
         let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();

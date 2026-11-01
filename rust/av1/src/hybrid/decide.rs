@@ -138,19 +138,11 @@ pub(crate) fn pad_source(
         run(&mut jobs, changed);
         return;
     }
-    // each thread its own flags, merged after
+    // each task its own flags, merged after
     let per = jobs.len().div_ceil(threads);
-    let mut locals: Vec<Vec<bool>> = vec![vec![false; ntiles]; jobs.len().div_ceil(per) - 1];
-    std::thread::scope(|sc| {
-        let mut it = jobs.chunks_mut(per);
-        let first = it.next().unwrap();
-        for (j, l) in it.zip(locals.iter_mut()) {
-            let run = &run;
-            sc.spawn(move || run(j, l));
-        }
-        run(first, changed);
-    });
-    for l in &locals {
+    let mut parts: Vec<_> = jobs.chunks_mut(per).map(|j| (j, vec![false; ntiles])).collect();
+    crate::pool::each(&mut parts, |(j, l)| run(j, l));
+    for (_, l) in &parts {
         for (c, &l) in changed.iter_mut().zip(l) {
             *c |= l;
         }

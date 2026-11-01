@@ -15,6 +15,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 | `enc` | the Metal encoder's host half: derived tables as MSL, the GPU entropy plan, the post-filter frame, tune=iq and the CDEF search's host half |
 | `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided (and inter blocks) |
 | `motion` | inter frames' exact copies: 64x64s that equal the previous source, unchanged or shifted, as skip inter blocks (with 128x128 superblocks, a 128x128 of one shift as one block) |
+| `pool` | the worker threads every parallel loop shares, started once and parked between loops |
 | `testsupport` | random legal records and inter sequences, the reference engine, the GPU's DSP cases (tests only) |
 | `capi` | the C API Swift links (`Sources/AV1Core/include/av1g/av1g.h`, `Sources/AV1Encoder/include/av1enc.h`, `Sources/AV1CoreTestSupport/include/av1core_test.h`) |
 
@@ -49,8 +50,9 @@ libaom), and `cargo test --release -- --ignored --nocapture decoders` (dav1d and
   checked by differential tests with fixed seeds. An optimization that changes an output is a format
   change, not an optimization.
 - **No dependencies:** std only, no crates (AGENTS.md).
-- **Safe Rust by default.** `unsafe` is for the C API, SIMD intrinsics and measured hot loops, and
-  every `unsafe` block gets a `// SAFETY:` comment.
+- **Safe Rust by default.** `unsafe` is for the C API, SIMD intrinsics, measured hot loops and the
+  worker pool's one lifetime erasure (`pool::run`, which std's scoped threads can't do without
+  starting threads each time), and every `unsafe` block gets a `// SAFETY:` comment.
 - **SIMD where it pays**, in hot paths: transforms, prediction, filters, quantization, SSE.
   - On aarch64, use `core::arch::aarch64` NEON (baseline on every Apple-silicon Mac).
   - On x86_64, use SSE4.1/AVX2 behind `is_x86_feature_detected!`.
