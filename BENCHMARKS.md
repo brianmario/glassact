@@ -261,6 +261,26 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the closed loop searches luma tx types; edge filter and QMs rejected (2026-11-01)
+
+Intra coding (where the bytes are, entry below), BD-rate against the current encoder, same sweep as
+the rounding entry (RGB luma PSNR, q 8–32, 100 frames):
+
+| | 5K typing | 5K scroll | 5K photos | 720p typing | 720p scroll | 720p photos |
+|---|---|---|---|---|---|---|
+| **luma tx types searched** (the analysis's ignored) | **−1.1 %** | **−1.2 %** | **−1.5 %** | **−1.5 %** | **−1.2 %** | **−1.2 %** |
+| the analysis's type against DCT_DCT | −0.6 % | −0.6 % | −0.9 % | −0.7 % | −1.0 % | −0.5 % |
+| intra edge filter on | +0.5 % | +1.0 % | +0.7 % | +0.1 % | +0.2 % | +0.3 % |
+| quantizer matrices, level 8 | +2.7 % | +2.7 % | +4.8 % | +3.6 % | +0.9 % | +1.7 % |
+
+Speed of the search (interleaved, two runs, the AV2 job paused): 5K photos 82.4 → 80.0 inter frames
+a second (−3 %), the other traces and 720p within noise.
+
+- **Taken: the search** (`Hybrid::search_luma_tx`, on; the C++ hybrid kept the analysis's types,
+  as its differential tests now do with `Hybrid::as_cpp`).
+- The edge filter loses because the analysis decides without it. Quantizer matrices are
+  perceptual: PSNR undersells them, but they're no PSNR win.
+
 ### Metal AV1: where the bytes go, by kind of block (2026-11-01)
 
 `ENC_BLOCK_BITS` per block in the final write, totalled by kind (an experiment, `GA_BITMAP`, not

@@ -84,7 +84,7 @@ void av1enc_cdef_select_cpu(const uint32_t *my, const uint32_t *muv, int nc, int
 typedef struct av1enc_hybrid av1enc_hybrid;
 av1enc_hybrid *av1enc_hybrid_create(void);
 void av1enc_hybrid_destroy(av1enc_hybrid *h);
-// luma_tx (optional): every block's luma tx type, kept instead of searched. flags:
+// luma_tx (optional): every block's luma tx type from the analysis (the closed loop searches its own). flags:
 // AV1ENC_HYBRID_GIVEN_CHROMA: the blocks' uv_mode / angle_delta_uv / cfl_alpha_* are decided already.
 #define AV1ENC_HYBRID_GIVEN_CHROMA 1
 int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,

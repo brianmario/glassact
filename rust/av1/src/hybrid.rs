@@ -134,6 +134,9 @@ impl Default for TileMem {
 pub struct Hybrid {
     /// the closed loop's rounding offset ([`QUANT_RND`]; the C++ hybrid's 0.375 in its tests)
     quant_rnd: f64,
+    /// the closed loop searches the luma tx types even where the analysis gave one (the C++
+    /// hybrid keeps them: off in its tests): 1.1-1.5 % smaller (BENCHMARKS, 2026-11-01)
+    search_luma_tx: bool,
     src: Src,
     /// per-tile reuse, for one geometry and quantizer
     mem: Vec<TileMem>,
@@ -199,6 +202,7 @@ impl Hybrid {
     pub fn new() -> Hybrid {
         Hybrid {
             quant_rnd: QUANT_RND,
+            search_luma_tx: true,
             src: Src::default(),
             mem: Vec::new(),
             reused: Vec::new(),
@@ -227,7 +231,8 @@ impl Hybrid {
     /// av1enc_hybrid_closed_loop: the closed loop on blocks the Metal analysis decided (mi_row,
     /// mi_col, bsize, y_mode and angle_delta_y set; the rest is decided here), on 8-bit 4:2:0
     /// planes (tight: Y w x h, U and V ((w + 1) / 2) x ((h + 1) / 2)), with the given tiling.
-    /// `luma_tx`: every block's luma tx type, kept instead of searched. `flags`: [`GIVEN_CHROMA`].
+    /// `luma_tx`: every block's luma tx type from the analysis (the closed loop searches its own; it
+    /// keeps these only as the C++ hybrid did, in the tests). `flags`: [`GIVEN_CHROMA`].
     /// On success [`Hybrid::record`] has the record (chroma modes, coefficients, skip flags) and
     /// [`Hybrid::recon`] the exact pre-filter reconstruction.
     pub fn closed_loop(
@@ -379,6 +384,7 @@ impl Hybrid {
             src_given,
             recon_given,
             quant_rnd,
+            search_luma_tx,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -669,7 +675,7 @@ impl Hybrid {
             HookOpts {
                 tx_types: true,
                 reduced_tx_set: false,
-                given_luma_tx: luma_tx.is_some() as i32,
+                given_luma_tx: (luma_tx.is_some() && !*search_luma_tx) as i32,
                 rnd: *quant_rnd,
                 zbin: QUANT_ZBIN,
                 double_fwd: false,
@@ -899,10 +905,12 @@ impl Hybrid {
 
     /// av1enc_hybrid_set_reuse: keep unchanged tiles' closed loop and bitstream from picture to
     /// picture (on by default).
-    /// The closed loop's rounding offset (tests: the C++ hybrid's 0.375).
+    /// The C++ hybrid's closed loop, for the differential tests: its rounding offset (0.375),
+    /// and the analysis's luma tx types kept.
     #[cfg(test)]
-    pub(crate) fn set_quant_rnd(&mut self, rnd: f64) {
-        self.quant_rnd = rnd;
+    pub(crate) fn as_cpp(&mut self) {
+        self.quant_rnd = 0.375;
+        self.search_luma_tx = false;
     }
 
     pub fn set_reuse(&mut self, on: bool) {

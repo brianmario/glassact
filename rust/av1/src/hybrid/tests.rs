@@ -865,9 +865,9 @@ mod oracle {
     }
 
     impl Hybrid {
-        /// The C++ hybrid's rounding offset (0.375), to compare with it.
+        /// The C++ hybrid's closed loop, to compare with it.
         fn with_cpp_quant(mut self) -> Hybrid {
-            self.set_quant_rnd(0.375);
+            self.as_cpp();
             self
         }
     }
