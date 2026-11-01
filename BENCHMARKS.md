@@ -196,6 +196,7 @@ the numbers and the reasoning.
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
+| The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
 
 **Rate control and transport**
@@ -260,6 +261,46 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the filters' preset search on the GPU, one command buffer a picture (2026-11-01)
+
+The CDEF preset search (libaom's joint greedy search, `av1enc_cdef_select_cpu`) ran on the CPU
+between two GPU passes, so a picture's filters took two command buffers, and three when new presets
+changed strengths outside the changed region (2.6 on average at 720p). Now `l_select` runs the
+search on the GPU, a threadgroup per cdef_bits (the four levels' searches are independent), and
+`l_choose`, `l_assign_c` and `l_finish` do what followed it: cdef_bits, the presets into the frame
+(now a buffer, not `setBytes`), the assignment, and the list of 64×64s CDEF redoes, dispatched
+indirectly. The ring the region's deblocking gets wrong is put back on the GPU (`p_copy_r`). One
+command buffer a picture, two when far direct copies run meanwhile. Streams unchanged (`--digest`
+on the 720p and 5K traces); `PresetSearchTests` holds the GPU's search to the CPU's on random
+tables.
+
+The search alone, GPU time against the CPU's (Apple silicon, medians of 60):
+
+| | 720p (240 64×64s) | 1080p (510) | 5K (3600) |
+|---|---|---|---|
+| CPU (`select_rows`, NEON) | 23 µs | 56 µs | 490 µs |
+| GPU, one threadgroup, a thread per 64×64 (≤ 1024) | 445 µs | 519 µs | 1107 µs |
+| + reduction unrolled (no spills) | 207 µs | 189 µs | 707 µs |
+| + a threadgroup per cdef_bits | 120 µs | 109 µs | 399 µs |
+| + 128 or 256 threads | 67–96 µs | 58–89 µs | 340–350 µs |
+
+The GPU's search is slower than the CPU's at 720p, but the round trips it saves cost more. The
+first full encoder A/B, with the search at ~445 µs, was 0–13 % slower, which puts the round trips
+saved at roughly 0.3 ms a picture at 720p.
+
+**Inter frames a second,** interleaved against HEAD (three runs each, `--inter --no-planes`, 100
+frames, the session disconnected, the AV2 job paused):
+
+| | 720p | 5K |
+|---|---|---|
+| typing-cc | 1137 → 1184 (+4 %) | 293 → 346 (+18 %) |
+| scroll-win | 450 → 490 (+9 %) | 203 → 220 (+8 %) |
+| photos | 170 → 183 (+8 %) | 81.6 → 84.1 (+3 %) |
+| cursor-drag | 799 → 879 (+10 %) | 288 → 336 (+17 %) |
+
+Keeping up to four 64×64s a thread in registers, with 32-bit sums for the first halving, measured
+within noise (−1 to +5 % across 720p and 1080p traces); kept.
 
 ### Metal AV1: the closed loop searches luma tx types; edge filter and QMs rejected (2026-11-01)
 

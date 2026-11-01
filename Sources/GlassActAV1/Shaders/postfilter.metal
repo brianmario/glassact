@@ -220,12 +220,8 @@ kernel void l_cdef_sse(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand 
 }
 
 // every active 64x64's preset: the cheapest of the chosen ones (first on ties)
-kernel void l_assign(constant av1g_pf_frame &f [[buffer(0)]], device const uint32_t *my [[buffer(1)]],
-                     device const uint32_t *muv [[buffer(2)]], device const int32_t *lev [[buffer(3)]],
-                     constant int32_t *args [[buffer(4)]], uint sb [[thread_position_in_grid]]) {
-    const int nc = args[0], nsb = args[1], mono = args[2], nb = args[3];
-    if ((int)sb >= nsb) return;
-    if (f.cdefIdx[sb] < 0) return;
+static int lf_assign(device const uint32_t *my, device const uint32_t *muv, device const int32_t *lev, int nc, int mono,
+                     int nb, uint sb) {
     uint64_t b = ~(uint64_t)0;
     int bg = 0;
     for (int g = 0; g < nb; g++) {
@@ -233,7 +229,255 @@ kernel void l_assign(constant av1g_pf_frame &f [[buffer(0)]], device const uint3
         if (!mono) c += muv[sb * nc + lev[8 + g]];
         if (c < b) { b = c; bg = g; }
     }
-    f.cdefIdx[sb] = (int8_t)bg;
+    return bg;
+}
+
+// ---------------------------------------------------------------------------
+// Glass Act: the preset search and what follows it on the GPU, so that a picture's filters are
+// one command buffer. l_select is av1enc_cdef_select_cpu (its select_rows), av1enc_cdef_bits and
+// av1enc_cdef_presets, into the frame; l_assign gives every 64x64 its preset; a changed search's
+// l_assign_c also lists the 64x64s CDEF redoes, and l_finish sizes their dispatch.
+
+struct PfSelArgs {
+    int32_t nsb, mono, maxBits, refine, cdefMode, rdmult, nPlanes;
+};
+
+// the search's choice; tg and the region are p_cdef_r's over the redo list (an indirect dispatch's
+// threadgroups, and PfRegion)
+struct PfSel {
+    uint32_t tg[3];
+    uint32_t n, sbCols;
+    int32_t bits, same, active;
+};
+
+// the presets a picture applied, for the next picture's l_assign_c
+struct PfCdef {
+    int32_t bits;
+    int32_t yPri[8], ySec[8], uvPri[8], uvSec[8];
+};
+
+static uint64_t lf_shuffle_xor(uint64_t v, ushort m) {
+    return as_type<uint64_t>(simd_shuffle_xor(as_type<uint2>(v), m));
+}
+
+// lanes with `bit` clear keep their first M values and take their partner's, the others their last M
+template <int M>
+static void lf_halve(thread uint64_t (&v)[16], uint lane, ushort bit) {
+    const bool hi = (lane & bit) != 0;
+#pragma clang loop unroll(full)
+    for (int j = 0; j < M; j++) {
+        const uint64_t keep = hi ? v[j + M] : v[j], give = hi ? v[j] : v[j + M];
+        v[j] = keep + lf_shuffle_xor(give, bit);
+    }
+}
+
+#define LF_RESIDENT 4
+
+// adds every pair's cost of a 64x64 (luma y, chroma uv), bounded by the kept presets' least (mask:
+// the pairs kept), to u
+static void lf_cost_sum(thread uint (&u)[16], uint4 y, uint4 uv, uint mask) {
+    uint c[16];
+    for (int p = 0; p < 16; p++) c[p] = y[p >> 2] + uv[p & 3];
+    uint cur = 0xFFFFFFFFu;
+    for (int p = 0; p < 16; p++) cur = (mask >> p) & 1 ? min(cur, c[p]) : cur;
+    for (int p = 0; p < 16; p++) u[p] += min(c[p], cur);
+}
+
+// One threadgroup per cdef_bits (128 or 256 threads, each with a share of the 64x64s): the levels'
+// searches are independent (each sets its presets anew before reading them). Every step reduces the
+// 16 (luma, chroma) pairs' totals: within a SIMD-group by halving (each lane ends with one pair's
+// sum), across them through threadgroup memory that every SIMD-group sums for itself, so a step
+// has one barrier (the partial sums alternate between two arrays). Costs are 32-bit, as
+// select_rows's (a 64x64's luma and chroma SSE stay under 2^29); totals 64-bit. A monochrome
+// picture's chroma rows are zero, which makes its pairs' search luma's (ties go to chroma 0).
+kernel void l_select(constant av1g_pf_frame &f [[buffer(0)]], device const uint4 *my [[buffer(2)]],
+                     device const uint4 *muv [[buffer(3)]], device int32_t *levOut [[buffer(4)]],
+                     device uint64_t *totOut [[buffer(5)]], constant PfSelArgs &a [[buffer(6)]],
+                     device PfSel &sel [[buffer(7)]], uint level [[threadgroup_position_in_grid]],
+                     uint tid [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint warp [[simdgroup_index_in_threadgroup]], uint nthreads [[threads_per_threadgroup]],
+                     uint nwarps [[simdgroups_per_threadgroup]]) {
+    threadgroup uint64_t part[2][32][16];
+    const int nsb = a.nsb, mono = a.mono;
+    const int i = a.maxBits - (int)level;  // the longest search first
+    if (i == 0) {
+        // the 64x64s that code a cdef_idx (for l_choose)
+        threadgroup uint32_t act[32];
+        uint n = 0;
+        for (int sb = (int)tid; sb < nsb; sb += (int)nthreads) n += f.cdefIdx[sb] >= 0;
+        n = simd_sum(n);
+        if (lane == 0) act[warp] = n;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint t = 0;
+            for (uint s = 0; s < nwarps; s++) t += act[s];
+            sel.active = (int32_t)t;
+        }
+    }
+    // up to LF_RESIDENT 64x64s a thread are kept in registers (zero past the picture: they add 0)
+    const bool resident = nsb <= LF_RESIDENT * (int)nthreads;
+    uint4 ry[LF_RESIDENT], ruv[LF_RESIDENT];
+    for (int m = 0; m < LF_RESIDENT; m++) {
+        const int sb = (int)tid + m * (int)nthreads;
+        const bool in = resident && sb < nsb;
+        ry[m] = in ? my[sb] : uint4(0);
+        ruv[m] = in && !mono ? muv[sb] : uint4(0);
+    }
+    uint levp = 0;  // preset g's pair (luma * 4 + chroma) in bits 4g..4g+3
+    uint64_t best = 0;
+    const int nb = 1 << i, steps = nb + (mono ? 0 : a.refine * nb);
+    for (int st = 0; st < steps; st++) {
+        const int k = st < nb ? st : nb - 1;
+        if (st >= nb) levp >>= 4;  // drop the first preset (the ones past nb are 0)
+        uint mask = 0;
+        for (int g = 0; g < k; g++) mask |= 1u << ((levp >> (4 * g)) & 15);
+        uint64_t v[16];
+        if (resident) {
+            // a few 64x64s a thread, from registers: their sums fit 32 bits (under 2^31), and so
+            // does the first halving's
+            uint u[16];
+            for (int p = 0; p < 16; p++) u[p] = 0;
+            for (int m = 0; m < LF_RESIDENT; m++) lf_cost_sum(u, ry[m], ruv[m], mask);
+            const bool hi = (lane & 16) != 0;
+            for (int j = 0; j < 8; j++) {
+                const uint keep = hi ? u[j + 8] : u[j], give = hi ? u[j] : u[j + 8];
+                v[j] = (uint64_t)keep + simd_shuffle_xor(give, (ushort)16);
+            }
+        } else {
+            for (int p = 0; p < 16; p++) v[p] = 0;
+            for (int sb = (int)tid; sb < nsb; sb += (int)nthreads) {
+                uint u[16];
+                for (int p = 0; p < 16; p++) u[p] = 0;
+                lf_cost_sum(u, my[sb], mono ? uint4(0) : muv[sb], mask);
+                for (int p = 0; p < 16; p++) v[p] += u[p];
+            }
+            lf_halve<8>(v, lane, 16);
+        }
+        // 16 values a lane -> 8 -> 4 -> 2 -> 1: lane l holds pair l >> 1's sum over the SIMD-group
+        // (unrolled, so that v stays in registers)
+        lf_halve<4>(v, lane, 8);
+        lf_halve<2>(v, lane, 4);
+        lf_halve<1>(v, lane, 2);
+        v[0] += lf_shuffle_xor(v[0], 1);
+        threadgroup uint64_t (&w)[32][16] = part[st & 1];
+        if ((lane & 1) == 0) w[warp][lane >> 1] = v[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int p = (int)(lane & 15);
+        uint64_t t = 0;
+        for (uint s = lane >> 4; s < nwarps; s += 2) t += w[s][p];
+        t += lf_shuffle_xor(t, 16);
+        uint64_t key = (t << 4) | (uint64_t)p;  // the least total, the first pair on ties
+        for (ushort o = 8; o >= 1; o >>= 1) key = min(key, lf_shuffle_xor(key, o));
+        const uint bi = (uint)(key & 15);
+        levp = (levp & ~(15u << (4 * k))) | (bi << (4 * k));
+        best = key >> 4;
+    }
+    if (tid == 0) {
+        for (int j = 0; j < 8; j++) {
+            const uint q = (levp >> (4 * j)) & 15;
+            levOut[i * 16 + j] = (int32_t)(q >> 2);
+            levOut[i * 16 + 8 + j] = mono ? 0 : (int32_t)(q & 3);
+        }
+        totOut[i] = best;
+    }
+}
+
+// l_select's choice: av1enc_cdef_bits and av1enc_cdef_presets, into the frame, and whether the
+// presets are the previous picture's
+kernel void l_choose(device av1g_pf_frame &f [[buffer(0)]], constant LfCand &cd [[buffer(1)]],
+                     device const int32_t *levOut [[buffer(4)]], device const uint64_t *totOut [[buffer(5)]],
+                     constant PfSelArgs &a [[buffer(6)]], device PfSel &sel [[buffer(7)]],
+                     device const PfCdef &prev [[buffer(10)]]) {
+    const int mono = a.mono, active = sel.active;
+    // av1enc_cdef_bits, in integers: its doubles are exact for these (totals far below 2^42)
+    int bits = 0;
+    int64_t bestRd = 0;
+    for (int i = 0; i <= a.maxBits; i++) {
+        const int64_t nb = 1 << i, b = (int64_t)active * i + nb * 6 * (mono ? 1 : 2);
+        const int64_t rd = ((b * 512 * a.rdmult + 256) >> 9) + (int64_t)totOut[i] * 2048;
+        if (i == 0 || rd < bestRd) { bestRd = rd; bits = i; }
+    }
+    // av1enc_cdef_presets
+    bool same = prev.bits == bits;
+    for (int j = 0; j < 8; j++) {
+        int yp = 0, ys = 0, up = 0, us = 0;
+        if (j < (1 << bits)) {
+            const int jy = levOut[bits * 16 + j], juv = levOut[bits * 16 + 8 + j];
+            yp = cd.pri[jy / cd.nsec];
+            ys = cd.sec[jy % cd.nsec];
+            up = mono ? 0 : cd.pri[juv / cd.nsec];
+            us = mono ? 0 : cd.sec[juv % cd.nsec];
+            if (a.cdefMode == 1) {  // CDEF_ADAPTIVE: halve the signalled values
+                yp >>= 1;
+                up >>= 1;
+                ys = ys == 4 ? 3 : ys;
+                ys >>= 1;
+                ys = ys == 3 ? 4 : ys;
+                us = us == 4 ? 3 : us;
+                us >>= 1;
+                us = us == 3 ? 4 : us;
+            }
+        }
+        same = same && prev.yPri[j] == yp && prev.ySec[j] == ys && prev.uvPri[j] == up && prev.uvSec[j] == us;
+        f.cdefYPri[j] = yp;
+        f.cdefYSec[j] = ys;
+        f.cdefUVPri[j] = up;
+        f.cdefUVSec[j] = us;
+    }
+    sel.bits = bits;
+    sel.same = same;
+    sel.n = 0;
+}
+
+kernel void l_assign(constant av1g_pf_frame &f [[buffer(0)]], device const uint32_t *my [[buffer(1)]],
+                     device const uint32_t *muv [[buffer(2)]], device const int32_t *lev [[buffer(3)]],
+                     constant int32_t *args [[buffer(4)]], device const PfSel &sel [[buffer(7)]],
+                     uint sb [[thread_position_in_grid]]) {
+    const int nc = args[0], nsb = args[1], mono = args[2];
+    if ((int)sb >= nsb) return;
+    if (f.cdefIdx[sb] < 0) return;
+    f.cdefIdx[sb] = (int8_t)lf_assign(my, muv, lev + 16 * sel.bits, nc, mono, 1 << sel.bits, sb);
+}
+
+// A changed search's assignment: with the presets unchanged, the 64x64s outside the region take
+// the preset they had (their SSE rows, and so the assignment, are unchanged); with new ones every
+// 64x64 is assigned anew. CDEF redoes the region and every 64x64 whose strengths changed from what
+// the previous picture applied (prev: its cdef_idx; old: its presets).
+kernel void l_assign_c(constant av1g_pf_frame &f [[buffer(0)]], device const uint32_t *my [[buffer(1)]],
+                       device const uint32_t *muv [[buffer(2)]], device const int32_t *lev [[buffer(3)]],
+                       constant int32_t *args [[buffer(4)]], device PfSel &sel [[buffer(7)]],
+                       device uint32_t *redo [[buffer(9)]], device const PfCdef &old [[buffer(10)]],
+                       device const int8_t *prev [[buffer(11)]], device const uint8_t *inRegion [[buffer(12)]],
+                       uint sb [[thread_position_in_grid]]) {
+    const int nc = args[0], nsb = args[1], mono = args[2];
+    if ((int)sb >= nsb) return;
+    int now = f.cdefIdx[sb];
+    const int before = prev[sb];
+    if (now >= 0) {
+        now = sel.same && !inRegion[sb] ? before : lf_assign(my, muv, lev + 16 * sel.bits, nc, mono, 1 << sel.bits, sb);
+        f.cdefIdx[sb] = (int8_t)now;
+    }
+    const bool changed = now >= 0 && (before < 0 || f.cdefYPri[now] != old.yPri[before] || f.cdefYSec[now] != old.ySec[before]
+                                      || f.cdefUVPri[now] != old.uvPri[before] || f.cdefUVSec[now] != old.uvSec[before]);
+    if (inRegion[sb] || changed)
+        redo[atomic_fetch_add_explicit((device atomic_uint *)&sel.n, 1u, memory_order_relaxed)] = sb;
+}
+
+// p_cdef_r's dispatch over the redo list (64-thread threadgroups, 4096 threads a 64x64 and
+// plane), and the presets kept for the next picture
+kernel void l_finish(constant av1g_pf_frame &f [[buffer(0)]], constant PfSelArgs &a [[buffer(6)]],
+                     device PfSel &sel [[buffer(7)]], device PfCdef &keep [[buffer(10)]]) {
+    sel.tg[0] = sel.n * 64;
+    sel.tg[1] = 1;
+    sel.tg[2] = (uint32_t)a.nPlanes;
+    sel.sbCols = (uint32_t)f.sbCols;
+    keep.bits = sel.bits;
+    for (int j = 0; j < 8; j++) {
+        keep.yPri[j] = f.cdefYPri[j];
+        keep.ySec[j] = f.cdefYSec[j];
+        keep.uvPri[j] = f.cdefUVPri[j];
+        keep.uvSec[j] = f.cdefUVSec[j];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +544,25 @@ kernel void p_cdef_r(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *ou
     out[y * ss + x] = (uint8_t)v;
 }
 
+// the listed 64x64s of the planes from rows of the same strides (the ring the region's deblocking
+// went wrong in, put back)
+kernel void p_copy_r(constant av1g_pf_frame &f [[buffer(0)]], device const uint8_t *fromY [[buffer(3)]],
+                     device const uint8_t *fromU [[buffer(4)]], device const uint8_t *fromV [[buffer(5)]],
+                     constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
+                     uint3 g [[thread_position_in_grid]]) {
+    const int plane = (int)g.z, sub = plane ? 1 : 0;
+    const uint32_t j = g.x / 4096, k = g.x % 4096;
+    if (j >= R.n) return;
+    const int side = 64 >> sub;
+    if ((int)k >= side * side) return;
+    const uint32_t sb = list[j];
+    const int x = (int)(sb % R.sbCols) * side + (int)k % side, y = (int)(sb / R.sbCols) * side + (int)k / side;
+    if (x >= (f.MiCols * 4) >> sub || y >= (f.MiRows * 4) >> sub) return;
+    const int ss = f.stride[plane];
+    device const uint8_t *from = plane == 0 ? fromY : plane == 1 ? fromU : fromV;
+    f.plane[plane][y * ss + x] = from[y * ss + x];
+}
+
 kernel void l_cdef_sse_r(constant av1g_pf_frame &f [[buffer(0)]], constant LfCand &cd [[buffer(1)]],
                          device const uint8_t *s0 [[buffer(3)]], device const uint8_t *s1 [[buffer(4)]],
                          device const uint8_t *s2 [[buffer(5)]], device uint32_t *mse_y [[buffer(6)]],
@@ -310,30 +573,4 @@ kernel void l_cdef_sse_r(constant av1g_pf_frame &f [[buffer(0)]], constant LfCan
     threadgroup uint32_t red[8][LF_NC];
     if (tg >= R.n) return;
     lf_cdef_sse_sb(f, cd, s0, s1, s2, mse_y, mse_uv, list[tg], tid, lane, warp, red);
-}
-
-// the SBs outside the region take the preset they had (their SSE rows, and so the assignment, are
-// unchanged); the region's are assigned anew by l_assign_r
-kernel void l_restore_idx(constant av1g_pf_frame &f [[buffer(0)]], device const int8_t *prev [[buffer(1)]],
-                          device const uint8_t *inRegion [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if ((int)i >= f.sbCols * f.sbRows || inRegion[i]) return;
-    if (f.cdefIdx[i] >= 0) f.cdefIdx[i] = prev[i];
-}
-
-kernel void l_assign_r(constant av1g_pf_frame &f [[buffer(0)]], device const uint32_t *my [[buffer(1)]],
-                       device const uint32_t *muv [[buffer(2)]], device const int32_t *lev [[buffer(3)]],
-                       constant int32_t *args [[buffer(4)]], constant PfRegion &R [[buffer(8)]],
-                       device const uint32_t *list [[buffer(9)]], uint j [[thread_position_in_grid]]) {
-    const int nc = args[0], mono = args[2], nb = args[3];
-    if (j >= R.n) return;
-    const uint32_t sb = list[j];
-    if (f.cdefIdx[sb] < 0) return;
-    uint64_t b = ~(uint64_t)0;
-    int bg = 0;
-    for (int g = 0; g < nb; g++) {
-        uint64_t c = my[sb * nc + lev[g]];
-        if (!mono) c += muv[sb * nc + lev[8 + g]];
-        if (c < b) { b = c; bg = g; }
-    }
-    f.cdefIdx[sb] = (int8_t)bg;
 }
