@@ -260,6 +260,30 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: no intra below 8×8 where the 8×8's inter residual is nothing (2026-10-31)
+
+**What changed:**
+- Inter frames don't search 4×4, 4×8 or 8×4 intra blocks inside an 8×8 whose inter prediction quantizes to nothing.
+- Those shapes have no inter search of their own, so `interSkipsIntra` never applied to them.
+- With a zero-residual 8×8 inter block available, the partition keeps it. This is libaom realtime's rule one level up.
+
+**Results:**
+- A 5K photos inter frame's intra analysis is 5.4 → 3.2 ms of GPU (4×4 0.84 → 0.12, 4×8 0.97 → 0.21, 8×4 0.95 → 0.22).
+
+BD-rate (q 12/20/28, PSNR-Y) and inter frames a second (mean of the three):
+
+| Trace | BD-rate | before | after |
+|---|---|---|---|
+| photos 5K | +0.00 % | 60 | 64 |
+| photos 720p | +0.11 % | 141 | 145 |
+| scroll-win 720p | +0.00 % | 375 | 377 |
+| scroll-win 5K | +0.03 % | 164 | 164 |
+| typing-cc 720p | +0.00 % | 811 | 833 |
+| typing-cc 5K | +0.00 % | 208 | 224 |
+| cursor-drag 720p | +0.00 % | 754 | 726 (noise at this rate) |
+
+Within the 0.4 % a default may cost.
+
 ### Metal AV1: k_me measures each vector once (2026-10-31)
 
 **What changed:**

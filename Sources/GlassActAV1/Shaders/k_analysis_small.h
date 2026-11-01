@@ -116,6 +116,12 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) return;  // unchanged source
     device GpInterRes *ir = ga_inter_of<W, H>(B, I, BS, li);
     if (ir && P.interSkipsIntra && ir->zero && ir->J < GP_INF) { out.J = ir->J; out.ncand = 0; ir->isInter = 1; return; }  // no intra search
+    if (W * H < 64 && B.inter && P.interSkipsIntra && I.shNbx[AV1G_BLOCK_8X8] > 0) {
+        // Glass Act: below 8x8 (no inter of its own), none where the 8x8 around it predicts from the
+        // previous picture with nothing to code: the partition keeps that 8x8
+        device const GpInterRes &i8 = B.inter[I.shOff[AV1G_BLOCK_8X8] + (uint32_t)(y >> 3) * I.shNbx[AV1G_BLOCK_8X8] + (x >> 3)];
+        if (i8.zero && i8.J < GP_INF) { out.J = GP_INF; out.ncand = 0; return; }
+    }
     constexpr int txSz = (W == 4 && H == 4) ? AV1G_TX_4X4 : (W == 8 && H == 8) ? AV1G_TX_8X8 : (W == 4 && H == 8) ? AV1G_TX_4X8
                        : (W == 8 && H == 4) ? AV1G_TX_8X4 : (W == 4 && H == 16) ? AV1G_TX_4X16 : (W == 16 && H == 4) ? AV1G_TX_16X4
                        : (W == 8 && H == 16) ? AV1G_TX_8X16 : AV1G_TX_16X8;
