@@ -348,6 +348,7 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         const int bx8 = (x & 63) >> 3, by8 = (y & 63) >> 3;
         ulong tried = 0;
         float bestS = GP_INF;
+        uint bestSad = 1;
         int2 best = int2(0, 0);
         for (int c = 0; c < nc; c++) {
             int j = 0;
@@ -363,28 +364,35 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             uint sad = 0;
             for (int p = lane; p < (W / 8) * (H / 8); p += 32)
                 sad += S8[j * 64 + (by8 + p / (W / 8)) * 8 + bx8 + p % (W / 8)];
-            const float s = (float)simd_sum(sad) + lamS * ga_mv_bits(v, P.meSubpel);
-            if (s < bestS) { bestS = s; best = v; }
+            sad = simd_sum(sad);
+            const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
+            if (s < bestS) { bestS = s; bestSad = sad; best = v; }
         }
         // the best one's exact-rate RD, as the analysis costs an intra candidate
-        float en = 0.f;
-        for (int p = lane; p < W * H; p += 32) {
-            const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, best);
-            S.res[p] = (int16_t)d;
-            en += (float)(d * d);
-        }
-        __syncwarp();
         EvalIn e;
         e.txSz = txSz; e.plane = 0; e.txType = AV1G_DCT_DCT;
         e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
         e.rnd = P.rnd; e.zbin = P.zbin;
         e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = g_cost[I.qctx];
         e.qmDist = P.qmDist; e.qmRnd = P.qmRnd;
-        e.resEnergy = warp_sum(en);
         e.intraDir = AV1G_DC_PRED;
-        e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
         EvalOut o;
-        warp_eval<W, H>(S.res, S.tmp, S.q, e, o, lane);
+        if (bestSad == 0) {
+            // an exact match: no residual, so what warp_eval gives zeros (no distortion, the skip flag's
+            // bits) without the transform
+            o.D = 0.f; o.R = base_bits(e, 0); o.eob = 0;
+        } else {
+            float en = 0.f;
+            for (int p = lane; p < W * H; p += 32) {
+                const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, best);
+                S.res[p] = (int16_t)d;
+                en += (float)(d * d);
+            }
+            __syncwarp();
+            e.resEnergy = warp_sum(en);
+            e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
+            warp_eval<W, H>(S.res, S.tmp, S.q, e, o, lane);
+        }
         const int hasC = av1g_has_chroma(BS, y >> 2, x >> 2, I.mono);
         const float J = o.D + lambda * (o.R + ga_mv_bits(best, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
         if (lane == 0) {

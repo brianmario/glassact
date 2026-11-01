@@ -260,6 +260,26 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: an exact inter match costed without a transform (2026-10-31)
+
+**What changed:**
+- When `k_inter`'s best candidate has a SAD of zero, the residual is all zeros.
+- The transform and quantizer then give no distortion and the skip flag's bits. `k_inter` now writes those directly, without filling the residual or transforming it.
+- Screen content has many exact matches, both unchanged blocks and scrolled ones.
+
+**Results:**
+- The streams are the same (`--digest`, four 720p and two 5K runs).
+- A 5K photos inter frame's inter candidates are 2.36 → 1.86 ms of GPU.
+
+Inter frames a second, mean of three interleaved runs:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 65.2 | 66.8 |
+| photos 720p | 138.6 | 143.6 |
+| scroll-win 5K | 157.7 | 161.9 |
+| typing-cc 5K | 221.3 | 222.0 |
+
 ### Metal AV1: the closed loop's limits at 5K photos; two rejected tries (2026-10-31)
 
 At 5K photos the closed loop is ~5.6 ms of wall time for ~20 ms of CPU over 8 tile columns. Photos' changes cluster in a few columns, and the slowest tile sets the pace.
