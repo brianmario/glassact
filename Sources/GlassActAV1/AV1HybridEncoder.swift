@@ -256,9 +256,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// Pictures 0..<count: picture i + 1's analysis runs on the GPU while
     /// picture i is finished on the CPU. `output` gets them in order. With
     /// `interFrames`, they're one stream: the first a key frame and the rest
-    /// inter frames. Picture i's bitstream is written on another thread
-    /// while picture i + 2's analysis starts, so `output` gets it once that
-    /// has started (about a millisecond at 5K).
+    /// inter frames. Picture i's bitstream is written, and picture i + 2's
+    /// analysis started, on other threads; `output` gets picture i before
+    /// picture i + 1's closed loop.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
@@ -266,11 +266,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
-        // picture i - 1's bitstream, being written while picture i + 1's analysis starts
+        // picture i - 1's bitstream, being written while picture i + 1's analysis starts, which
+        // is also on a thread of its own (`starting`)
         var writing: Writing?
+        var starting: Later<Pending>?
         defer {
             copyFinder.drain()
             _ = try? writing?.wait()
+            _ = try? starting?.wait()
         }
         var current = try picture(0)
         var pending = try begin(current, Copies(), qindex: qindex)
@@ -279,6 +282,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var upcoming = count > 1 ? try picture(1) : nil
         if interFrames, let upcoming { copyFinder.start(upcoming, after: current, searchesMotion: searchesMotion) }
         for i in 0..<count {
+            if let s = starting {
+                starting = nil
+                pending = try s.wait()
+            }
             let partition = try pending.partition.wait()
             let t0 = CACurrentMediaTime()
             var timing = Timing()
@@ -289,7 +296,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let motion = pending.motion
             let next = upcoming
             if let next {
-                pending = try begin(next, interFrames ? copyFinder.wait() : Copies(), qindex: qindex)
+                let copies = interFrames ? copyFinder.wait() : Copies()
+                starting = Later { try self.begin(next, copies, qindex: qindex) }
                 upcoming = i + 2 < count ? try picture(i + 2) : nil
                 if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
             }
@@ -303,6 +311,25 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         if let w = writing {
             writing = nil
             try output(count - 1, try w.wait())
+        }
+    }
+
+    /// Work on a thread of its own, and its result.
+    private final class Later<T>: @unchecked Sendable {
+        private var result: Result<T, any Error>?
+        private let done = DispatchSemaphore(value: 0)
+
+        init(_ work: @escaping @Sendable () throws -> T) {
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.result = Result { try work() }
+                self.done.signal()
+            }
+        }
+
+        func wait() throws -> T {
+            done.wait()
+            done.signal()  // for a later wait (an encode that threw)
+            return try result!.get()
         }
     }
 

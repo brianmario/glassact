@@ -260,6 +260,27 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the next analysis started on a thread of its own (2026-10-31)
+
+**What changed:**
+- `begin` copies the next-but-one picture's source to the GPU and commits its analysis. It now runs on another thread, alongside the writer and the closed loop, instead of on the main thread. That was 0.96 ms at 5K.
+- It touches only the Metal encoder, which the closed loop and the filters don't use. The main thread waits for it before that picture's partition.
+
+**Results:**
+- The streams are the same (`--digest`).
+
+Inter frames a second, three interleaved runs each, against the threaded writer alone:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 74.2 74.7 74.3 | 74.8 75.5 74.9 (+0.8 %) |
+| photos 720p | 168.9 172.3 171.0 | 163.6 168.2 167.9 (−2 %) |
+| scroll-win 5K | 178.0 179.3 179.7 | 184.0 187.1 186.9 (+4 %) |
+| scroll-win 720p | 429.0 439.0 440.8 | 445.1 450.6 453.2 (+2.5 %) |
+| typing-cc 5K | 248.0 224.7 247.4 | 269.2 270.3 264.2 (+12 %) |
+
+photos 720p is within this machine's run-to-run noise.
+
 ### Metal AV1: the bitstream written on a thread of its own (2026-10-31)
 
 **Where the main thread's time went:**
