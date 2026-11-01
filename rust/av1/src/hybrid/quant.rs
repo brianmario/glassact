@@ -5,7 +5,7 @@
 //!
 //! The C++ computes every trial's cost and discards it where nothing compares it (chroma, a kept or
 //! DCT-only luma type); here those trials stop after the quantizer, with the same coefficients.
-use super::decide::Src;
+use super::decide::SrcView;
 use super::fmac;
 use super::fwd::{FWD_F_TMP, FWD_TMP, FwdTx, forward, forward_f, fwd};
 use crate::dsp::{
@@ -75,13 +75,13 @@ impl Scratch {
 }
 
 pub(crate) struct QuantHook<'a> {
-    pub src: &'a Src,
+    pub src: SrcView<'a>,
     pub o: HookOpts,
     pub f: &'static FwdTx,
 }
 
 impl<'a> QuantHook<'a> {
-    pub fn new(src: &'a Src, o: HookOpts) -> QuantHook<'a> {
+    pub fn new(src: SrcView<'a>, o: HookOpts) -> QuantHook<'a> {
         QuantHook { src, o, f: fwd() }
     }
 }

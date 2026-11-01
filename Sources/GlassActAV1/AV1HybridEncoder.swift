@@ -556,6 +556,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         let refPlanes = reference?.planes ?? []
         let gpuRef = reference != nil && previousOnGPU ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
+        // an inter frame's closed loop and filters read the analysis's padded source (a key
+        // frame's pads its own, which the next picture's compares tiles with)
+        let padded: [UnsafePointer<UInt8>?] = reference != nil && sbMotionIn != nil && partition.source.count == 3
+            ? partition.source.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) } : []
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
@@ -570,7 +574,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                                                  gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
                                                                  Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2),
                                                                  interFrames ? vp : nil, inter.isEmpty ? nil : inter.baseAddress,
-                                                                 ref, &message, 256)
+                                                                 ref, padded.isEmpty ? nil : padded, &message, 256)
                                     }
                                 }
                             }
@@ -591,11 +595,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
         for plane in 0..<3 {
             var stride: Int32 = 0
-            guard let r = av1enc_hybrid_recon(cpu, Int32(plane)), let s = av1enc_hybrid_source(cpu, Int32(plane), &stride)
+            guard let r = av1enc_hybrid_recon(cpu, Int32(plane)),
+                  let s = padded.isEmpty ? av1enc_hybrid_source(cpu, Int32(plane), &stride) : padded[plane]
             else { throw Failure.encode("no reconstruction") }
             recon.append(r)
             source.append(s)
-            strides.append(Int(stride))
+            strides.append(padded.isEmpty ? Int(stride) : partition.sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
         guard postfilters else {

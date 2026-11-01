@@ -260,6 +260,31 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames' closed loop reads the analysis's padded source (2026-11-01)
+
+The first step of the frame store (the owner's 2026-11-01 direction: every stage borrows one copy of each picture).
+
+**What changed:**
+- The Metal analysis pads each picture to whole 64×64s in shared memory. The Rust closed loop padded its own copy (`pad_source`, 22 MB at 5K, on the main thread), byte for byte the same.
+- An inter frame's closed loop now reads the analysis's buffers through a borrowed `SrcView` (`Video::padded`, `av1enc_hybrid_closed_loop_ex`'s `padded`). The filters take those buffers as their source too.
+- A key frame still pads its own: the next key frame compares tiles with it to keep unchanged ones.
+- The buffers stay the encoder's until the next picture's partition is read. The filters are done with them by then.
+
+**A false alarm along the way:**
+- At first, inter frames borrowed after a key frame that had borrowed too, and the next picture was made to keep no tiles.
+- The bench's warm-up encode of picture 0 then stopped the measured key frame keeping its tiles. Its bytes were the same, but the filters' history differed, so later frames' streams changed.
+- Borrowing only in inter frames keeps the streams the same (`--digest`, four 720p and two 5K runs; the Rust tests, oracle included, and the Swift AV1 tests pass).
+
+Inter frames a second (three interleaved runs):
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 70.9 75.1 75.5 | 76.7 76.9 76.9 (+4 %) |
+| scroll-win 5K | 175.8 186.6 174.3 | 198.5 194.4 198.4 (+10 %) |
+| typing-cc 5K | 264.2 260.1 262.5 | 291.2 281.8 281.2 (+9 %) |
+| photos 720p | 153.7 159.9 160.2 | 163.2 158.4 161.4 |
+| scroll-win 720p | 424.2 415.8 434.1 | 423.9 430.2 431.5 |
+
 ### Metal AV1: the filters' far direct copies while the GPU deblocks; source padding in parallel, not taken (2026-11-01)
 
 **Where an inter frame's filters go (5K photos, ms a frame, `searchChanged`):**

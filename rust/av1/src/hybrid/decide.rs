@@ -23,6 +23,30 @@ impl Src {
     pub fn at(&self, pl: usize, x: usize, y: usize) -> &[u8] {
         &self.p[pl][y * self.stride[pl] + x..]
     }
+
+    /// The planes, borrowed.
+    pub fn view(&self) -> SrcView<'_> {
+        SrcView {
+            stride: self.stride,
+            p: [&self.p[0], &self.p[1], &self.p[2]],
+        }
+    }
+}
+
+/// A source padded as [`pad_source`] pads one (to whole superblocks by edge replication; plane
+/// `pl`'s rows `stride[pl]` apart), borrowed: the encoder's own ([`Src::view`]) or its caller's.
+#[derive(Clone, Copy)]
+pub(crate) struct SrcView<'a> {
+    pub stride: [usize; 3],
+    pub p: [&'a [u8]; 3],
+}
+
+impl SrcView<'_> {
+    /// Plane `pl` from sample (x, y) on.
+    #[inline]
+    pub fn at(&self, pl: usize, x: usize, y: usize) -> &[u8] {
+        &self.p[pl][y * self.stride[pl] + x..]
+    }
 }
 
 /// What [`pad_source`] compares while it pads: the tiles, the coded area, and one flag per tile
@@ -201,7 +225,7 @@ pub(crate) struct DecOpts {
 /// The pre-pass: open loop on source pixels, edges from the source within the tile.
 #[derive(Clone)]
 pub(crate) struct Decider<'a> {
-    pub src: &'a Src,
+    pub src: SrcView<'a>,
     pub o: DecOpts,
     pub mi_cols: i32,
     pub mi_rows: i32,
@@ -218,7 +242,7 @@ pub(crate) struct Decider<'a> {
 }
 
 impl<'a> Decider<'a> {
-    pub fn new(src: &'a Src, o: DecOpts, mi_cols: i32, mi_rows: i32, mono: bool, step_y: f64, step_c: f64) -> Self {
+    pub fn new(src: SrcView<'a>, o: DecOpts, mi_cols: i32, mi_rows: i32, mono: bool, step_y: f64, step_c: f64) -> Self {
         Decider {
             src,
             o,
@@ -251,7 +275,7 @@ impl<'a> Decider<'a> {
         let max_y = ((self.mi_rows * 4) >> sub) - 1;
         let s = &self.src;
         build_edges(
-            &s.p[pl],
+            s.p[pl],
             s.stride[pl],
             x,
             y,

@@ -42,6 +42,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// An inter frame's (`beginPartition(motion:)`): every block's motion, parallel to
         /// `blocks` (an inter block's intra fields are 0); empty otherwise.
         public var inter: [av1g_block_inter] = []
+        /// The source the analysis read (`beginPartition`'s): Y, U and V padded to whole 64×64s
+        /// by edge replication, rows `sourceStrides` apart. It's the encoder's until the next
+        /// picture's partition is read, and then goes back to its pool (the picture after next
+        /// reuses it), so the caller may read it until then.
+        public var source: [any MTLBuffer] = []
+        public var sourceStrides: [Int] = []
     }
 
     /// An encoded picture: the decisions, ready for av1core's writer, and the
@@ -524,11 +530,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 run.encoder.lastGPUSeconds = stages.analysis
             }
             let (blocks, types, inter) = run.leafBlocks()
+            let source = run.source
             if !run.source.isEmpty {  // the GPU is done with it (or never used it)
                 run.encoder.keepSource(run.source)
                 run.source = []
             }
-            return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
+            return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter,
+                             source: source, sourceStrides: [run.aw, run.aw / 2, run.aw / 2])
         }
     }
 

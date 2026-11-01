@@ -716,6 +716,7 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
     video: *const FrameParams,
     inter: *const BlockInter,
     reference: *const RefPlanesC,
+    padded: *const *const u8,
     err: *mut c_char,
     errlen: usize,
 ) -> c_int {
@@ -758,10 +759,23 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         }
         pic = Some(p);
     }
+    let mut given = None;
+    if !padded.is_null() {
+        // SAFETY: three planes of the padded geometry (av1enc.h)
+        let p = unsafe { slice::from_raw_parts(padded, 3) };
+        if p.iter().any(|q| q.is_null()) {
+            unsafe { set_error_raw(err, errlen, "padded: a plane is missing") };
+            return ERR_INVALID;
+        }
+        let (sb_cols, sb_rows) = ((2 * w.div_ceil(8) as usize).div_ceil(16), (2 * hgt.div_ceil(8) as usize).div_ceil(16));
+        let len = |pl: usize| ((sb_cols * 64) >> (pl > 0) as usize) * ((sb_rows * 64) >> (pl > 0) as usize);
+        given = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts(p[pl], len(pl))) });
+    }
     let vid = (!video.is_null()).then(|| crate::hybrid::Video {
         fp: unsafe { *video },
         inter,
         reference: pic,
+        padded: given,
     });
     let r = hh.h.closed_loop_ex(
         y,

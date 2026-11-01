@@ -99,10 +99,17 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
 // tiles are coded afresh, and the next picture's aren't kept from it. With sb128 the blocks are in
 // 128x128-superblock decode order (av1enc_motion_apply_ex makes it from a 64x64 one), tiled as
 // av1g_tile_layout_ex(..., 1) gives it, and inter blocks may be 128x128, 128x64 or 64x128.
+// padded (null, or with video: 3 planes) is the source already padded to whole 64x64s by edge
+// replication, as the Metal analysis pads it: luma sb_cols * 64 x sb_rows * 64 (sb_cols =
+// (MiCols + 15) / 16), chroma half each way, tight. An inter frame's closed loop reads it in
+// place of padding its own copy (a key frame pads its own, which the next picture compares tiles
+// with); it must stay unchanged until the call returns, and av1enc_hybrid_source then gives
+// null.
 int av1enc_hybrid_closed_loop_ex(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
                                  uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
                                  int qindex, int tile_cols_log2, int tile_rows_log2, const av1g_frame_params *video,
-                                 const av1g_block_inter *inter, const av1g_ref_planes *ref, char *err, size_t errlen);
+                                 const av1g_block_inter *inter, const av1g_ref_planes *ref,
+                                 const uint8_t *const *padded, char *err, size_t errlen);
 av1g_decision_record *av1enc_hybrid_record(av1enc_hybrid *h);
 // The bitstream of the last closed loop's picture with the post-filter parameters chosen (fp, its
 // other fields as the closed loop's: video fields, sb128) and every 64x64's cdef_idx (raster,

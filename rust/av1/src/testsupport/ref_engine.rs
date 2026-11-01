@@ -240,7 +240,7 @@ pub fn ref_engine_encode(
         cfl: o.cfl,
         split_bias: o.split_bias,
     };
-    let mut dec = Decider::new(&src, dopts, mc, mr, img.mono, step_y, step_c);
+    let mut dec = Decider::new(src.view(), dopts, mc, mr, img.mono, step_y, step_c);
     // ---- delta-q: per-SB qindex from luma activity (log2 mean 8x8 variance vs frame mean) ----
     let mut sbq = Vec::new();
     if o.deltaq {
@@ -330,7 +330,7 @@ pub fn ref_engine_encode(
 
     // ---- closed loop ----
     let hook = QuantHook::new(
-        &src,
+        src.view(),
         HookOpts {
             tx_types: o.tx_types,
             reduced_tx_set: o.reduced_tx_set,

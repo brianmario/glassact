@@ -29,7 +29,7 @@ mod quant;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use decide::{DecOpts, Decider, Src, pad_source};
+pub(crate) use decide::{DecOpts, Decider, Src, SrcView, pad_source};
 pub(crate) use quant::{HookOpts, QuantHook};
 
 use crate::blockinfo::{bh4, bw4, for_each_txb_ex, has_chroma, max_tx_depth, mi_cols, mi_rows};
@@ -78,6 +78,12 @@ pub struct Video<'a> {
     pub inter: &'a [BlockInter],
     /// inter frames: LAST_FRAME's picture (the decoder's output of the frame in fp.ref_slot)
     pub reference: Option<RefPicture<'a>>,
+    /// The source already padded as the closed loop pads it (to whole 64x64s by edge
+    /// replication: luma sb_cols * 64 wide and sb_rows * 64 high, chroma half that each way),
+    /// for an inter frame's closed loop to read in place of its own copy (the Metal analysis's
+    /// source, say). A key frame pads its own, which the next one compares tiles with; the
+    /// picture after an inter frame keeps no tiles anyway.
+    pub padded: Option<[&'a [u8]; 3]>,
 }
 
 /// The Metal encoder's dead zone (GpParams rnd, zbin).
@@ -149,6 +155,9 @@ pub struct Hybrid {
     keep_chroma: Vec<bool>,
     /// the last closed loop coded an inter frame (its tiles aren't kept)
     last_inter: bool,
+    /// the last closed loop read its caller's padded source ([`Video::padded`]), not `src` (an
+    /// inter frame's, so the next picture keeps no tiles)
+    src_given: bool,
     /// video mode: each reference slot's saved CDFs, from the writes that refreshed it
     slot_cdfs: [Option<Box<FrameCdfs>>; 8],
 }
@@ -203,6 +212,7 @@ impl Hybrid {
             keep_chroma: Vec::new(),
             last_inter: false,
             slot_cdfs: Default::default(),
+            src_given: false,
         }
     }
 
@@ -342,6 +352,7 @@ impl Hybrid {
             src_changed,
             keep_chroma,
             slot_cdfs,
+            src_given,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -404,7 +415,25 @@ impl Hybrid {
             mi_rows: mru,
             changed: &mut src_changed[..],
         });
-        pad_source(planes, w, h, sb_cols, sb_rows, 3, src, pad_threads, cmp);
+        let theirs = video.and_then(|v| v.padded).filter(|p| {
+            inter_frame
+                && !compare
+                && (0..3).all(|pl| {
+                    let sub = (pl > 0) as usize;
+                    p[pl].len() >= ((sb_cols * 64) >> sub) * ((sb_rows * 64) >> sub)
+                })
+        });
+        *src_given = theirs.is_some();
+        let src: SrcView = match theirs {
+            Some(p) => SrcView {
+                stride: [sb_cols * 64, (sb_cols * 64) >> 1, (sb_cols * 64) >> 1],
+                p,
+            },
+            None => {
+                pad_source(planes, w, h, sb_cols, sb_rows, 3, src, pad_threads, cmp);
+                src.view()
+            }
+        };
 
         rec.blocks.clear();
         rec.blocks.extend_from_slice(given);
@@ -891,9 +920,9 @@ impl Hybrid {
 
     /// av1enc_hybrid_source: the source the last call coded, padded by edge replication to whole
     /// superblocks (at least the post-filters' MiCols * 4 x MiRows * 4, chroma half), and its
-    /// stride; `None` for a plane > 2.
+    /// stride; `None` for a plane > 2, or when the call read its caller's ([`Video::padded`]).
     pub fn source(&self, plane: usize) -> Option<(&[u8], usize)> {
-        (plane < 3).then(|| (&self.src.p[plane][..], self.src.stride[plane]))
+        (plane < 3 && !self.src_given).then(|| (&self.src.p[plane][..], self.src.stride[plane]))
     }
 
     /// av1enc_hybrid_seconds: the last call's seconds: 0 chroma decisions, 1 closed loop.

@@ -609,6 +609,7 @@ fn sb128_frames_from_motion() {
         fp,
         inter: &[],
         reference: None,
+        padded: None,
     };
     hy.closed_loop_ex(
         &pic0.y,
@@ -687,6 +688,7 @@ fn sb128_frames_from_motion() {
         fp,
         inter: &inter,
         reference: Some(reference),
+        padded: None,
     };
     hy.closed_loop_ex(
         &pic1.y,
