@@ -260,6 +260,28 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: where an inter frame's CPU time goes; copies on the GPU rejected (2026-10-31)
+
+**Time Profiler** (`xctrace record --template 'Time Profiler'`, 5K photos, 100 inter frames, the encode's window only; about 65 ms of CPU a frame across all threads):
+
+| Work | Share | Where |
+|---|---|---|
+| The closed loop's tiles (`writer::encode::code_tile`, `QuantHook::trial` its largest part) | 31 % | 8 tile threads, one of them the main thread |
+| Deciding the copies (`ShiftFinder::candidates`: `vote`, sort, `col_hashes`, `sb_matches`) | 22 % | the CopyFinder's thread and its bands |
+| `memmove` | 21 % | mostly `AV1MetalPostfilter.copy` (direct 64×64s, ~10 %), then the writer's reconstruction assembly, `predict_inter` of copies and source padding |
+
+The main thread is busy about 11 ms of a ~24 ms profiled frame:
+- 56 % is the closed loop;
+- 24 % is `memmove`, mostly the post-filters' 64×64 copies;
+- the rest of the frame, it waits on the GPU or the tile threads.
+
+**Rejected: the GPU making the post-filters' copied 64×64s** from the previous output at their shift, instead of the CPU copying them from the reconstruction.
+- The streams are the same (`--digest`, six checks). That needed the CPU-copied ones near the region to write their output only after the GPU pass, which reads the previous output.
+- But 5K photos went 58.5 → 54.2 inter frames a second (filters 8.2 → 9.8 ms; interleaved runs, a quiet machine), and 720p was even.
+- The copies go into the filters' first command buffer, which already waits behind the next picture's analysis on the GPU, so they lengthen the wait.
+- The CPU copy runs on 8 threads (~1 ms of wall time), so it costs less.
+- Lesson: at 5K photos, GPU work added to the filters is on the critical path. CPU work done in parallel isn't.
+
 ### Metal AV1: the partition search a SIMD-group per superblock; a key frame's GPU profile (2026-10-31)
 
 **Profile:**
