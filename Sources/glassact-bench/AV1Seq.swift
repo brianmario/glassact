@@ -34,6 +34,7 @@ let av1SeqCommand = Command(
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
+        .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
@@ -203,6 +204,31 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000))
         encoder.profilesStages = false
         encoder.reusesAnalysis = !opts.has("no-reuse")
+    }
+
+    if let path = opts.string("gpu-capture") {
+        let url = URL(fileURLWithPath: path)
+        try? FileManager.default.removeItem(at: url)
+        let capture = MTLCaptureManager.shared()
+        guard capture.supportsDestination(.gpuTraceDocument) else { throw BenchError("--gpu-capture: run with MTL_CAPTURE_ENABLED=1") }
+        let descriptor = MTLCaptureDescriptor()
+        descriptor.captureObject = device
+        descriptor.destination = .gpuTraceDocument
+        descriptor.outputURL = url
+        // the key frame first (not captured), then the inter frame alone
+        if inter, pictures.count > 1 {
+            var started = false
+            try encoder.encode(count: 2, qindex: qindex, picture: { i in
+                if i == 1 { try capture.startCapture(with: descriptor); started = true }
+                return picture(pictures.count - 2 + i)
+            }, output: { _, _ in })
+            if started { capture.stopCapture() }
+        } else {
+            try capture.startCapture(with: descriptor)
+            _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
+            capture.stopCapture()
+        }
+        print("  GPU capture: \(url.path)")
     }
 
     if opts.has("aom-speed") {

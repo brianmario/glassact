@@ -503,6 +503,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private func run(_ body: (any MTLComputeCommandEncoder) -> Void) throws {
         guard let commands = queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
         else { throw Failure.metal("no command encoder") }
+        commands.label = "AV1 filters"  // for Instruments
         body(compute)
         compute.endEncoding()
         commands.commit()

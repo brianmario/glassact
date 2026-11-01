@@ -1,0 +1,97 @@
+#!/usr/bin/env python3 -I
+"""The Metal AV1 encoder's GPU time from an Instruments Metal System Trace (BENCHMARKS, 2026-10-31).
+
+Record one (Instruments may ask for permission the first time), then read it:
+
+  xcrun xctrace record --template 'Metal System Trace' --output photos.trace --launch -- \\
+      "$(swift build -c release --show-bin-path)/glassact-bench" av1seq --trace <scap> --width 5120 \\
+      --tiles 3x0 --frames 40 --inter --no-planes
+  scripts/metal-trace photos.trace
+
+Prints the command buffers by label ("AV1 analysis", "AV1 filters"): GPU time a frame, how much of
+it the two overlap, and how busy the GPU is; then each kernel's share of the shader profiler's
+samples (a relative measure) and how long it ran a frame (kernels in one concurrent encoder overlap).
+"""
+import collections, os, re, subprocess, sys, tempfile
+import xml.etree.ElementTree as ET
+
+
+def table(trace, schema):
+    """An exported table's rows as {mnemonic: (text, fmt)}, with xctrace's id/ref values resolved."""
+    xpath = f'/trace-toc/run[@number="1"]/data/table[@schema="{schema}"]'
+    out = subprocess.run(["xcrun", "xctrace", "export", "--input", trace, "--xpath", xpath],
+                         check=True, capture_output=True).stdout
+    node = ET.fromstring(out).find("node")
+    if node is None or node.find("schema") is None:
+        return []
+    cols = [c.find("mnemonic").text for c in node.find("schema").findall("col")]
+    seen = {}
+
+    def value(e):
+        if "ref" in e.attrib:
+            return seen[e.attrib["ref"]]
+        v = (e.text or "", e.attrib.get("fmt", ""))
+        if "id" in e.attrib:
+            seen[e.attrib["id"]] = v
+        for child in e:  # nested values carry ids too
+            value(child)
+        return v
+
+    return [{c: None if e.tag == "sentinel" else value(e) for c, e in zip(cols, row)} for row in node.findall("row")]
+
+
+def union(intervals):
+    total, cur = 0, None
+    for s, e in sorted(intervals):
+        if cur is None or s > cur[1]:
+            total += cur[1] - cur[0] if cur else 0
+            cur = [s, e]
+        else:
+            cur[1] = max(cur[1], e)
+    return total + (cur[1] - cur[0] if cur else 0)
+
+
+def main(trace, skip=3):
+    events = []
+    for r in table(trace, "metal-gpu-intervals"):
+        label = r["event-label"][1]
+        kind = "analysis" if "AV1 analysis" in label else "filters" if "AV1 filters" in label else "other"
+        start, duration = int(r["start"][0]), int(r["duration"][0])
+        events.append((start, start + duration, kind))
+    analyses = sorted(e for e in events if e[2] == "analysis")
+    if len(analyses) <= skip + 1:
+        sys.exit(f"{trace}: {len(analyses)} labelled analyses (built before the labels, or too few frames)")
+    t0, t1 = analyses[skip][0], analyses[-1][1]
+    window = [e for e in events if e[0] >= t0 and e[1] <= t1]
+    n, span = len(analyses) - skip, (t1 - t0) / 1e6
+    print(f"{n} analyses after the first {skip}, over {span:.1f} ms: {span / n:.2f} ms a frame")
+    by = {k: [(s, e) for s, e, kk in window if kk == k] for k in ("analysis", "filters", "other")}
+    for k, iv in by.items():
+        if iv:
+            d = sorted(e - s for s, e in iv)
+            print(f"  {k:9s} {len(iv):4d} command buffers · median {d[len(d) // 2] / 1e6:6.2f} ms · {union(iv) / 1e6 / n:6.2f} ms a frame")
+    a, f = by["analysis"], by["filters"]
+    print(f"  both at once {(union(a) + union(f) - union(a + f)) / 1e6 / n:.2f} ms a frame · "
+          f"GPU busy {100 * union(a + f + by['other']) / 1e6 / span:.0f} %")
+
+    weighted, active = collections.Counter(), collections.Counter()
+    for r in table(trace, "metal-shader-profiler-intervals"):
+        start = int(r["start"][0])
+        if not t0 <= start <= t1 or not r["name"]:
+            continue
+        name = re.sub(r" \(\d+\)$", "", r["name"][1])
+        duration = int(r["duration"][0])
+        share = float(r["percent-of-kick"][0]) / 100 if r["percent-of-kick"] else 0
+        weighted[name] += duration * share
+        active[name] += duration
+    if weighted:
+        total = sum(weighted.values())
+        print("kernels: share of the shader profiler's samples · running, ms a frame")
+        for name, w in weighted.most_common(25):
+            print(f"  {100 * w / total:5.1f} %  {active[name] / 1e6 / n:6.3f}  {name}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    main(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 3)

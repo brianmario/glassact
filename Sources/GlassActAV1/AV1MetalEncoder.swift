@@ -802,6 +802,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
                 else { throw Failure.metal("no command encoder") }
+                c.label = "AV1 analysis"  // for Instruments
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
                 e.setBytes(&batch, length: MemoryLayout<GpBatch>.stride, index: 0)
                 e.setBytes(&params, length: MemoryLayout<GpParams>.stride, index: 1)
