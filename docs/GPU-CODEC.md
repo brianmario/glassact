@@ -17,7 +17,7 @@ decision the encoder makes. But some limits are in the format itself, not in our
 - **Hardware decode is 4:2:0.** AV1 Main profile (what Apple's decoders support) has half-resolution
   chroma, which smears coloured text and thin UI lines.
 - **References are whole frames.** Glass Act's model is a replica canvas of tiles, each
-  last-writer-wins and repaired by re-encoding (DESIGN §1). AV1's references are whole reference
+  last-writer-wins and repaired by re-encoding (DESIGN §0, INV-5). AV1's references are whole reference
   frames in slots, so a loss is repaired with a key frame or a new reference.
 
 What we measured on `metal-av1` (2026-11-01, BENCHMARKS):
@@ -114,7 +114,7 @@ in the decoder.
 
 - **References per tile, not per frame:** a block predicts from its tile's last state the Viewer
   acknowledged (the replica canvas), so loss is repaired by re-encoding the affected tiles, with no
-  key frames and no retransmission (DESIGN §1).
+  key frames and no retransmission (DESIGN §0, INV-5).
 - **Partial frames:** only dirty regions are coded, as the tile path does today.
 - **The wire:** a new message type behind a caps bit (DESIGN §3.8, §12). The HEVC and tile paths
   stay for peers without it.
