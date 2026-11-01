@@ -20,25 +20,34 @@ __device__ __forceinline__ float dp_blockJ(constant GpBatch &B, device const GpI
 
 struct DpNode { float J; int8_t p; };
 
-kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]], uint tid [[thread_position_in_grid]]) {
-    // Glass Act: with an SB list, thread i takes its i-th SB
+// Glass Act: a SIMD-group per SB (av1gpu's thread per SB held the 85-node tree in registers and
+// spilled; 12 SIMD-groups for a 720p picture). The tree is in threadgroup memory, the lanes take
+// a level's nodes, which only read the level below; each node's arithmetic is the same as before.
+constant constexpr int GA_DP_NW = 4;  // SIMD-groups (SBs) per threadgroup
+
+kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
+                 uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                 uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup DpNode nodes[GA_DP_NW][85];
+    const uint32_t tid = tg * GA_DP_NW + warp;
+    // Glass Act: with an SB list, SIMD-group i takes its i-th SB
     const uint32_t sb = B.sbList ? (tid < B.nSbList ? B.sbList[tid] : 0xFFFFFFFFu) : tid;
     if (sb >= B.nSb) return;
     if (B.sbKeep && B.sbKeep[sb]) return;  // Glass Act: unchanged source, so unchanged leaves
+    threadgroup DpNode *node = nodes[warp];
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
     const int sbx = (int)(local % I.sbCols) * 64, sby = (int)(local / I.sbCols) * 64;
     const int FW = I.MiCols * 4, FH = I.MiRows * 4;
     const float lambda = gp_lambda(sb_qindex(I, sbx, sby), P.lambdaMul);
-    DpNode node[85];
     const int lvBase[4] = {0, 1, 5, 21};
     for (int L = 3; L >= 0; L--) {
         const int n = 64 >> L, hf = n >> 1, q4 = n >> 2, per = 1 << L;
         const int bsl = L == 3 ? 1 : L == 2 ? 2 : L == 1 ? 3 : 4;
         const int pmask = n == 8 ? P.partMask8 : P.partMaskN;
-        for (int ny = 0; ny < per; ny++)
-            for (int nx = 0; nx < per; nx++) {
-                thread DpNode &nd = node[lvBase[L] + ny * per + nx];
+        for (int t = (int)lane; t < per * per; t += 32) {
+                const int nx = t % per, ny = t / per;
+                threadgroup DpNode &nd = node[lvBase[L] + ny * per + nx];
                 const int x = sbx + nx * n, y = sby + ny * n;
                 if (x >= FW || y >= FH) { nd.J = 0.f; nd.p = -1; continue; }
                 const bool hasRows = (y + hf) < FH, hasCols = (x + hf) < FW;
@@ -109,7 +118,9 @@ kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 nd.J = best;
                 nd.p = (int8_t)bp;
             }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
+    if (lane != 0) return;
     B.sbJ[sb] = node[0].J;
     // ---- leaves in decode order ----
     device GpLeaf *out = B.leaves + (size_t)sb * GP_MAX_LEAVES;
@@ -131,7 +142,7 @@ kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         sp--;
         const int L = stk[sp][0], nx = stk[sp][1], ny = stk[sp][2];
         const int n = 64 >> L, hf = n >> 1, q4 = n >> 2, per = 1 << L;
-        thread const DpNode &nd = node[lvBase[L] + ny * per + nx];
+        threadgroup const DpNode &nd = node[lvBase[L] + ny * per + nx];
         const int x = sbx + nx * n, y = sby + ny * n;
         if (nd.p < 0) continue;
         const int p = nd.p;

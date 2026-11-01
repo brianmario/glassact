@@ -260,6 +260,32 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the partition search a SIMD-group per superblock; a key frame's GPU profile (2026-10-31)
+
+**Profile:**
+- A 720p photos key frame (`av1seq --gpu-capture`, now with analysis reuse off for a key frame, as `--profile` has it), replayed in Xcode.
+- A 5K key frame's capture crashed Xcode 27.2's replay (EXC_BAD_ACCESS in Xcode), so it was 720p.
+
+Kernels by share of the capture (analysis 84 %, filters 16 %):
+
+| Kernel | Share | Registers | Spilled | SIMD-groups |
+|---|---|---|---|---|
+| k_leaf | 33.9 % | 192 | 288 B | 12,880 |
+| k_analysis_small_8x8 | 12.1 % | 192 | 1.77 KiB | 470 |
+| k_dp | 8.6 % | 156 | 1.42 KiB | 12 |
+| k_analysis_small_8x4 / 4x8 / 4x4 | 7.0 / 6.6 / 6.5 % | 192 | 1.06 KiB / 992 B / 864 B | 920 / 920 / 1290 |
+| k_analysis_32x16_w4 | 4.6 % | 192 | 416 B | 376 |
+| k_analysis_small_8x16 | 3.0 % | 192 | 2.69 KiB | 245 |
+
+The leaf decisions (k_leaf: chroma mode, CfL and luma tx type for every leaf) are a third of a key frame's GPU time.
+
+**What changed:**
+- k_dp ran a thread per superblock, holding its 85-node partition tree in registers, and spilled. A 720p picture was 12 SIMD-groups.
+- It now runs a SIMD-group per superblock, with the tree in threadgroup memory. The lanes take a level's nodes, which read only the level below, with each node's arithmetic as before.
+- Lane 0 writes the leaves in decode order, as before.
+
+**Results:** same streams (`--digest`, the four 720p checks). The partition stage (`--profile`, best of 10) is 0.3 → 0.1 ms on 720p key frames and 5K photos inter frames, and 0.3 ms either way on 5K key frames. That was measured with a Screen Sharing session open, and the stage sits on the GPU's critical path between the analysis and the leaves.
+
 ### Metal AV1: inter frames' 8×8 to 16×8 blocks on the SIMD-group kernel; fewer registers in the small kernel (2026-10-31)
 
 **What changed:**

@@ -230,9 +230,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             }, output: { _, _ in })
             if started { capture.stopCapture() }
         } else {
+            encoder.reusesAnalysis = false  // the run's analysis of this picture would be kept
             try capture.startCapture(with: descriptor)
             _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
             capture.stopCapture()
+            encoder.reusesAnalysis = !opts.has("no-reuse")
         }
         print("  GPU capture: \(url.path)")
     }

@@ -374,7 +374,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
-        dp = try device.makeComputePipelineState(function: dpFunction)
+        dp = try Self.pipeline(dpFunction, threads: 128, device: device)
         recon = try Self.pipeline(reconFunction, threads: Self.reconThreads, device: device)
         params = Self.defaultParams()
     }
@@ -910,9 +910,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let nSb = sbCols * sbRows
             let dpThreads = staleSuperblocks ?? nSb
             if dpThreads > 0 {
-                e.setComputePipelineState(encoder.dp)
-                e.dispatchThreads(MTLSize(width: dpThreads, height: 1, depth: 1),
-                                  threadsPerThreadgroup: MTLSize(width: min(64, dpThreads), height: 1, depth: 1))
+                e.setComputePipelineState(encoder.dp)  // a SIMD-group per SB, 4 to a threadgroup
+                e.dispatchThreadgroups(MTLSize(width: (dpThreads + 3) / 4, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
             }
             if decidesLeaves {
                 if profiling { stages.partition = try close(); e = try open() }
