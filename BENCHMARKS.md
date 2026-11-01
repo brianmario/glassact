@@ -260,6 +260,23 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the closed loop's limits at 5K photos; two rejected tries (2026-10-31)
+
+At 5K photos the closed loop is ~5.6 ms of wall time for ~20 ms of CPU over 8 tile columns. Photos' changes cluster in a few columns, and the slowest tile sets the pace.
+
+**Rejected: the hook's residual reused by the writer.**
+- For a coded inter or chroma txb, `QuantHook::trial` already dequantizes and inverse-transforms the levels (for the RD skip), and the writer did it again.
+- A `TxbHook::take_residual` let the writer copy the hook's residual instead. The streams were the same (`--digest`), but there was no gain: the closed loop stayed 5.60 ms at 5K photos, and the other traces were within noise.
+- NEON inverse transforms are a small part of the loop.
+
+**Not a default: more tiles.**
+- With 8 columns × 2 rows (`3x1`) or 16 columns (`4x0`) against libaom's 8 columns, the speed is ×1.05–1.06.
+- BD-rate (q 12/20/28):
+  - photos: +0.56 / +0.61 %;
+  - typing-cc: +0.00 / +1.44 %;
+  - scroll-win: +0.64 / +0.61 %.
+- That's over the 0.4 % a default may cost. Tiling is the caller's choice already.
+
 ### Metal AV1: no intra below 8×8 where the 8×8's inter residual is nothing (2026-10-31)
 
 **What changed:**
