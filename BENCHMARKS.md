@@ -269,6 +269,14 @@ which.
   - Key frames keep the thread-per-block kernel: there it's 2× faster (8×8 at 5K: 13.1 vs 26.7 ms).
   - 4×4, 4×8 and 8×4 keep it in inter frames too: the SIMD-group kernel is 4–7× slower for them (4×4: 6.3 vs 0.83 ms).
 - **The small kernel quantizes each coefficient as the forward transform makes it,** so no thread holds the whole transformed block. The distortion is summed in the same order, so the output is the same.
+  - Its spills, from Xcode's profile of the same frame:
+    - 4×8: 1.64 KiB → 992 B;
+    - 8×4: 1.73 → 1.06 KiB;
+    - 8×8: 3.41 → 1.77 KiB;
+    - 8×16: 3.66 → 2.69 KiB;
+    - 16×8: 3.64 → 2.62 KiB;
+    - 4×4: 864 B, unchanged.
+  - Every one still allocates 192 registers.
 - **`av1seq --digest`** prints a hash of the whole stream, to check that a change keeps it.
 
 **Results:**
