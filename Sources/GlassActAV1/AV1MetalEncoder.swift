@@ -94,6 +94,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
     /// Inter frames' motion search: k_me, and per block size of 8×8 and up k_inter and its warps.
     let motionSearch: any MTLComputePipelineState, projectionSearch: any MTLComputePipelineState
+    /// k_inter_sad: an SB's distinct inter candidates and its 8x8s' SAD at each, which k_inter sums.
+    let candidateSAD: any MTLComputePipelineState
+    /// k_inter_sad's tables (GpMeU and the SADs, per SB of the picture), kept across pictures: the
+    /// kernel writes every entry k_inter reads, so they're neither cleared nor reallocated.
+    private var interTables: (candidates: any MTLBuffer, sad: any MTLBuffer)?
+    func interTables(superblocks n: Int) throws -> (candidates: any MTLBuffer, sad: any MTLBuffer) {
+        let bytes = n * MemoryLayout<GpMeU>.stride, sadBytes = n * (1 + 16 * Int(GP_ME_KEEP)) * 64 * 2  // GP_ME_U per SB
+        if let t = interTables, t.candidates.length >= bytes, t.sad.length >= sadBytes { return t }
+        guard let c = device.makeBuffer(length: bytes, options: .storageModeShared),
+              let s = device.makeBuffer(length: sadBytes, options: .storageModeShared)
+        else { throw Failure.metal("no inter tables for \(n) SBs") }
+        interTables = (c, s)
+        return (c, s)
+    }
     let inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int)]
     /// Keep each superblock's analysis, partition and leaf decisions from the
     /// previous picture when the source they read hasn't changed (the
@@ -358,6 +372,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj")
         else { throw Failure.metal("no k_me / k_proj") }
         motionSearch = try Self.pipeline(meFunction, threads: 128, device: device)
+        guard let sadFunction = library.makeFunction(name: "k_inter_sad") else { throw Failure.metal("no k_inter_sad") }
+        candidateSAD = try Self.pipeline(sadFunction, threads: 128, device: device)
         projectionSearch = try Self.pipeline(projFunction, threads: 256, device: device)
         var small: [Int: any MTLComputePipelineState] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
@@ -688,6 +704,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 image.meBest = AV1MetalEncoder.address(me)
                 meBest = me
                 image.meSb = AV1MetalEncoder.address(try make(sbCols * sbRows * 4))
+                let tables = try encoder.interTables(superblocks: sbCols * sbRows)
+                made += [tables.candidates, tables.sad]
+                image.meU = AV1MetalEncoder.address(tables.candidates)
+                image.meSad = AV1MetalEncoder.address(tables.sad)
             } else {
                 meBest = nil
             }
@@ -840,6 +860,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.setComputePipelineState(encoder.motionSearch)
                 e.setBytes(&cells, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.candidateSAD)  // the SB's candidates, its 8x8s' SADs
+                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
                 if profiling {
                     stages.motionSearch = try close()

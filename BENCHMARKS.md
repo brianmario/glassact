@@ -260,6 +260,27 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter candidates' SADs from 8×8s measured once (2026-10-31)
+
+**What changed:**
+- k_inter measured every candidate vector's SAD over the whole block, for every shape. A 64×64 has up to 33 candidates over 4,096 samples, and the 64×32s, 32×32s and smaller shapes measured the same samples at the same vectors again.
+- A new kernel, k_inter_sad (one threadgroup per analyzed SB, after k_me), lists the SB's distinct candidates: no motion, then its 16×16s' k_me vectors. It measures every 8×8's SAD at each into a table kept across pictures (`GpImage.meU`, `meSad`).
+- k_inter sums a block's 8×8s. The SADs are of whole samples, as the float sums before were, so every choice and stream is the same.
+
+**Results:**
+- Same streams (`--digest`: the four 720p checks, 5K photos and scroll-win).
+- GPU stages of a 5K photos inter frame (`--profile --inter`): inter candidates 3.79 → 2.35 ms, and the motion search 2.52 → 2.73 ms (it now holds k_inter_sad).
+
+Steady-state inter frames a second, three interleaved runs each, a quiet machine:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 58.6 | 62.2 |
+| photos 720p | 137.0 | 141.9 |
+| scroll-win 720p | 356.9 | 376.4 |
+| scroll-win 5K | 160.1 | 156.9 (noise) |
+| typing-cc 5K | 228.3 | 225.2 (noise) |
+
 ### Metal AV1: where an inter frame's CPU time goes; copies on the GPU rejected (2026-10-31)
 
 **Time Profiler** (`xctrace record --template 'Time Profiler'`, 5K photos, 100 inter frames, the encode's window only; about 65 ms of CPU a frame across all threads):

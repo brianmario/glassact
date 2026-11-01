@@ -240,6 +240,55 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     }
 }
 
+// k_inter_sad: one threadgroup per listed SB, after k_me. Its distinct candidates (no motion, then
+// its 16x16s' k_me vectors in raster order, each once) into GpImage.meU, and every 8x8's SAD at each
+// into meSad (0xFFFF where the 8x8 at that vector would read outside the padded reference). k_inter
+// sums them: a block's SAD at a vector is its 8x8s' (whole samples, so exactly), so each sample is
+// measured once per vector instead of once per shape.
+#define GA_SAD_T 128
+kernel void k_inter_sad(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
+                        uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup int16_t u[2 * GP_ME_U];
+    threadgroup int nu;
+    device const GpImage &I = B.img[0];
+    const uint32_t sb = B.sbList ? B.sbList[tg] : tg;
+    const int sbx = (int)(sb % I.sbCols) * 64, sby = (int)(sb / I.sbCols) * 64;
+    device GpMeU &U = I.meU[sb];
+    if (tid == 0) {
+        int n = 1;
+        u[0] = 0; u[1] = 0;
+        for (int k = 0; k < 16; k++) {
+            device const int16_t *m = I.meBest + ((size_t)((sby >> 4) + k / 4) * (I.aw >> 4) + (sbx >> 4) + k % 4) * 2 * GP_ME_KEEP;
+            for (int kk = 0; kk < GP_ME_KEEP; kk++) {
+                const int16_t vx = m[2 * kk], vy = m[2 * kk + 1];
+                int j = 0;
+                while (j < n && (u[2 * j] != vx || u[2 * j + 1] != vy)) j++;
+                if (j == n) { u[2 * n] = vx; u[2 * n + 1] = vy; n++; }
+                U.idx[k * GP_ME_KEEP + kk] = (uint8_t)j;
+            }
+        }
+        nu = n;
+        U.n = (uint8_t)n;
+        for (int j = 0; j < 2 * n; j++) U.v[j] = u[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int sp = I.spitch[0];
+    device uint16_t *out = I.meSad + (size_t)sb * GP_ME_U * 64;
+    for (int it = (int)tid; it < nu * 64; it += GA_SAD_T) {
+        const int j = it / 64, s8 = it % 64;
+        const int x = sbx + (s8 % 8) * 8, y = sby + (s8 / 8) * 8;
+        const int2 v = int2(u[2 * j], u[2 * j + 1]);
+        uint sad = 0xFFFFu;
+        if (ga_ref_inside(I, x, y, v, 8, 8)) {
+            device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
+            sad = 0;
+            for (int r = 0; r < 8; r++)
+                for (int c = 0; c < 8; c++) sad += (uint)abs((int)src[r * sp + c] - ga_ref_px(I.ref, sp, x + c, y + r, v));
+        }
+        out[j * 64 + s8] = (uint16_t)sad;
+    }
+}
+
 template <int W, int H>
 constexpr int ga_tx_of() {
     return W == H ? (W == 4 ? AV1G_TX_4X4 : W == 8 ? AV1G_TX_8X8 : W == 16 ? AV1G_TX_16X16 : W == 32 ? AV1G_TX_32X32 : AV1G_TX_64X64)
@@ -280,32 +329,33 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         const int qidx = sb_qindex(I, x, y);
         const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
         const float lamS = P.satdLambda * sqrtf(lambda);
-        // candidates: no motion, and k_me's vectors of the 16x16s covered, each once
+        // candidates: no motion, and k_me's vectors of the 16x16s covered, each once; their SADs the
+        // sums of k_inter_sad's 8x8s (the same values as measuring the block)
         const int c0x = x >> 4, c0y = y >> 4, c1x = (x + W - 1) >> 4, c1y = (y + H - 1) >> 4;
         const int nc = 1 + (c1x - c0x + 1) * (c1y - c0y + 1) * GP_ME_KEEP;
-        constexpr int kMaxC = 1 + (W < 16 ? 1 : W / 16) * (H < 16 ? 1 : H / 16) * GP_ME_KEEP;
-        int2 tried[kMaxC];
-        int nTried = 0;
+        const int sbi = (y >> 6) * I.sbCols + (x >> 6);
+        device const GpMeU &U = I.meU[I.sbBase + sbi];
+        device const uint16_t *S8 = I.meSad + (size_t)(I.sbBase + sbi) * GP_ME_U * 64;
+        const int bx8 = (x & 63) >> 3, by8 = (y & 63) >> 3;
+        ulong tried = 0;
         float bestS = GP_INF;
         int2 best = int2(0, 0);
         for (int c = 0; c < nc; c++) {
-            int2 v = int2(0, 0);
+            int j = 0;
             if (c > 0) {
-                const int j = c - 1, cell = j / GP_ME_KEEP, kk = j % GP_ME_KEEP;
+                const int k = c - 1, cell = k / GP_ME_KEEP, kk = k % GP_ME_KEEP;
                 const int cx = c0x + cell % (c1x - c0x + 1), cy = c0y + cell / (c1x - c0x + 1);
-                device const int16_t *m = I.meBest + ((size_t)cy * (I.aw >> 4) + cx) * 2 * GP_ME_KEEP + 2 * kk;
-                v = int2(m[0], m[1]);
+                j = U.idx[((cy & 3) * 4 + (cx & 3)) * GP_ME_KEEP + kk];
             }
-            bool seen = false;
-            for (int t = 0; t < nTried; t++) seen = seen || all(tried[t] == v);
-            if (seen) continue;
-            if (nTried < kMaxC) tried[nTried++] = v;
+            if ((tried >> j) & 1) continue;
+            tried |= 1ul << j;
+            const int2 v = int2(U.v[2 * j], U.v[2 * j + 1]);
             if (!ga_ref_inside(I, x, y, v, W, H)) continue;
-            float sad = 0.f;
-            for (int p = lane; p < W * H; p += 32)
-                sad += (float)abs((int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, v));
-            sad = warp_sum(sad) + lamS * ga_mv_bits(v, P.meSubpel);
-            if (sad < bestS) { bestS = sad; best = v; }
+            uint sad = 0;
+            for (int p = lane; p < (W / 8) * (H / 8); p += 32)
+                sad += S8[j * 64 + (by8 + p / (W / 8)) * 8 + bx8 + p % (W / 8)];
+            const float s = (float)simd_sum(sad) + lamS * ga_mv_bits(v, P.meSubpel);
+            if (s < bestS) { bestS = s; best = v; }
         }
         // the best one's exact-rate RD, as the analysis costs an intra candidate
         float en = 0.f;

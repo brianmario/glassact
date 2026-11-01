@@ -40,6 +40,7 @@ typedef struct GpExtCand GpExtCand;
 typedef struct GpBatch GpBatch;
 typedef struct GpLeafDecision GpLeafDecision;
 typedef struct GpInterRes GpInterRes;
+typedef struct GpMeU GpMeU;
 
 #define GP_MAXK 6            // max top-K luma candidates kept per block by the analysis
 #define GP_NSHAPES 22        // indexed by AV1 bsize (13..15 = 128-sizes, unused)
@@ -50,6 +51,7 @@ typedef struct GpInterRes GpInterRes;
 #define GP_NCDF (sizeof(av1g_cdfs) / 2)
 #define GP_ME_CANDS 8        // Glass Act: shift candidates per inter frame (GpImage.meCand)
 #define GP_ME_KEEP 2         // Glass Act: motion vectors k_me keeps per 16x16
+#define GP_ME_U (1 + 16 * GP_ME_KEEP)  // Glass Act: an SB's distinct inter candidates at most (k_inter_sad)
 
 // Tunables (host -> kernels by value).
 struct GpParams {
@@ -139,6 +141,19 @@ struct GpImage {
     GP_DEV int16_t *meBest;
     // per SB (raster): k_proj's long-range vector (dx, dy), whole samples; k_me searches around it
     GP_DEV int16_t *meSb;
+    // Glass Act: per SB (raster), k_inter_sad's: its distinct candidates (no motion, then its 16x16s'
+    // k_me vectors), and every 8x8's SAD at each (meSad: GP_ME_U x 64 per SB, raster 8x8s)
+    GP_DEV GpMeU *meU;
+    GP_DEV uint16_t *meSad;
+};
+
+// Glass Act: an SB's distinct inter candidates (1/8 sample): v[0] is no motion; idx[16x16 * GP_ME_KEEP
+// + k] is where the 16x16's k-th k_me vector is in v
+struct GpMeU {
+    int16_t v[2 * GP_ME_U];
+    uint8_t idx[16 * GP_ME_KEEP];
+    uint8_t n;
+    uint8_t pad[3];
 };
 
 // Analysis result per (shape, position).
