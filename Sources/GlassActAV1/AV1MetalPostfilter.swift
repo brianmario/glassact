@@ -67,6 +67,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public private(set) var lastGPUSeconds: Double = 0
     /// The share of 64×64s the last `search` filtered anew (1 unless `changed` allowed less).
     public private(set) var lastFilteredShare = 1.0
+
+    /// av1g_frame_params up to its last field (the rest is padding).
+    private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.reserved)!
+        + MemoryLayout.size(ofValue: av1g_frame_params().reserved)
     /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, chroma half;
     /// the picture's samples at the top left), valid until the next call: what a caller that
     /// doesn't take `Search.planes` reads instead.
@@ -158,7 +162,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         fp.cdef_y_sec = (0, 0, 0, 0, 0, 0, 0, 0)
         fp.cdef_uv_pri = (0, 0, 0, 0, 0, 0, 0, 0)
         fp.cdef_uv_sec = (0, 0, 0, 0, 0, 0, 0, 0)
-        let key = withUnsafeBytes(of: fp) { Array($0) }
+        // the fields' bytes, not the struct's padding (the record's is whatever its writer left)
+        let key = withUnsafeBytes(of: fp) { Array($0.prefix(Self.keyBytes)) }
         if let changed, tf.cdef_mode != 0, let job = lastJob, job.width == Int(fp.width), job.height == Int(fp.height),
            job.nPlanes == (mono ? 1 : 3), job.previousKey == key, changed.count == job.sbCols * job.sbRows,
            let result = try searchChanged(job, fp: fp, tf: tf, blocks: blocks, planes: planes, source: source,
