@@ -216,6 +216,8 @@ fn code_tiles<H: TxbHook>(
         let mut r = Rec::Write {
             blocks: rec.blocks,
             inter: rec.inter,
+            palette: rec.palette,
+            palette_map: rec.palette_map,
             block_txb: rec.block_txb,
             txb: &mut *rec.txb,
             txb_base: 0,
@@ -276,6 +278,8 @@ fn code_tiles<H: TxbHook>(
                 rec: Rec::Write {
                     blocks: rec.blocks,
                     inter: rec.inter,
+                    palette: rec.palette,
+                    palette_map: rec.palette_map,
                     block_txb: rec.block_txb,
                     txb: tx,
                     txb_base: t0,
@@ -384,6 +388,8 @@ struct Split<'a, H: TxbHook> {
     hook: Option<&'a H>,
     blocks: &'a [Block],
     inter: &'a [BlockInter],
+    palette: &'a [BlockPalette],
+    palette_map: &'a [u8],
     block_txb: &'a [u32],
     txb: *mut Txb,
     coeffs: *mut i16,
@@ -417,6 +423,8 @@ impl<H: TxbHook> Split<'_, H> {
         Rec::Write {
             blocks: self.blocks,
             inter: self.inter,
+            palette: self.palette,
+            palette_map: self.palette_map,
             block_txb: self.block_txb,
             // SAFETY: (the caller's) the tile's ranges, inside the record (tile_ranges)
             txb: unsafe { core::slice::from_raw_parts_mut(self.txb.add(j.txb.0), j.txb.1 - j.txb.0) },
@@ -535,6 +543,8 @@ impl<H: TxbHook> Split<'_, H> {
         };
         let rec = ReconRec {
             blocks: self.blocks,
+            palette: self.palette,
+            palette_map: self.palette_map,
             block_txb: self.block_txb,
             txb: self.txb,
             coeffs: self.coeffs,
@@ -895,9 +905,22 @@ impl Writer {
         if !rec.inter.is_empty() && rec.inter.len() != n_blocks {
             fail!(ERR_INVALID, "{} inter entries for {n_blocks} blocks", rec.inter.len());
         }
+        if !rec.palette.is_empty() && rec.palette.len() != n_blocks {
+            fail!(
+                ERR_INVALID,
+                "{} palette entries for {n_blocks} blocks",
+                rec.palette.len()
+            );
+        }
         let inter = fp.frame_type == FRAME_INTER;
         if inter && extras.record_syms {
             fail!(ERR_INVALID, "symbol streams are for intra frames only");
+        }
+        if extras.record_syms && rec.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0) {
+            fail!(
+                ERR_INVALID,
+                "symbol streams have no palette syntax (the GPU entropy coder's)"
+            );
         }
         let sb128 = fp.sb128 != 0;
         if sb128 && extras.record_syms {
@@ -1062,6 +1085,7 @@ impl Writer {
             cdfs_out: (fp.video != 0).then_some(&self.saved),
             context_tile,
             sb128,
+            palettes: !rec.palette.is_empty(),
         };
 
         if self.tiles.len() < ntiles {
@@ -1166,6 +1190,8 @@ impl Writer {
                 hook,
                 blocks: rec.blocks,
                 inter: rec.inter,
+                palette: rec.palette,
+                palette_map: rec.palette_map,
                 block_txb: rec.block_txb,
                 txb,
                 coeffs,

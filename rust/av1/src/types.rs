@@ -105,6 +105,24 @@ pub const DECISIONS_VERSION: u32 = 2;
 pub const FRAME_KEY: u8 = 0;
 pub const FRAME_INTER: u8 = 1;
 
+/// A block's palettes (spec palette_mode_info, with allow_screen_content_tools): intra blocks of
+/// 8x8 to 64x64 with y_mode (luma) or uv_mode (chroma) DC_PRED. All zero: no palette.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockPalette {
+    /// the luma palette's colours: 0 (none) or 2..8
+    pub size_y: u8,
+    /// the chroma palettes' colours (U and V alike): 0 (none) or 2..8
+    pub size_uv: u8,
+    pub reserved: [u8; 2],
+    /// where the block's colour index maps start in the record's palette map: luma (the block's
+    /// width x height, row-major) if size_y, then chroma (half each way; 2 more where that is
+    /// below 4, for 4x16 and 16x4 blocks: the chroma of their 8x8) if size_uv
+    pub map_off: u32,
+    /// palette_colors_y (strictly increasing), palette_colors_u (non-decreasing), palette_colors_v
+    pub colors: [[u8; 8]; 3],
+}
+
 /// av1g_block_inter: an inter block's motion (decisions.h "Inter blocks"). All zero: intra.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

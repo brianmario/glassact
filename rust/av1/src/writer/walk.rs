@@ -6,6 +6,8 @@
 //! superblocks, at tile-local coordinates): every read of the walk is gated by tile-local
 //! availability, so tiles share nothing while they are coded.
 
+mod palette;
+
 use super::mvstack::{MvMaps, MvStack, REF_UNSET, derive_mode, find_mv_stack, mv_class};
 use super::recon::TilePlan;
 use super::sink::Sink;
@@ -15,6 +17,11 @@ use crate::dsp::*;
 use crate::entropy::{Cdfs, FrameCdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::*;
+use palette::PaletteMaps;
+pub(crate) use palette::{map_dims, map_origin, predict_palette};
+
+/// [`TileBufs::pal_at`]: a block without a palette.
+pub(crate) const NO_PALETTE: u32 = u32::MAX;
 
 /// The frame: shared and read only while its tiles are coded.
 #[derive(Clone, Copy)]
@@ -45,6 +52,9 @@ pub(crate) struct Frame<'a> {
     pub context_tile: usize,
     /// fp.sb128: 128x128 superblocks
     pub sb128: bool,
+    /// the picture may have palette blocks (writing: the record has palettes; parsing: with
+    /// allow_screen_content_tools): the tiles keep [`TileBufs::pal_at`]
+    pub palettes: bool,
 }
 
 impl Frame<'_> {
@@ -86,6 +96,10 @@ pub(crate) struct TileBufs {
     pub lf_uv: [Vec<u8>; 2],
     /// cdef_idx per 64x64 (-1: no non-skip block)
     pub sb_cdef: Vec<i8>,
+    /// the palette (in `pals`) of the block covering each 4x4, or [`NO_PALETTE`] (PaletteSizes and
+    /// PaletteColors of the spec), mh x mw; empty without [`Frame::palettes`] (none)
+    pub pal_at: Vec<u32>,
+    pub pals: Vec<BlockPalette>,
     /// inter frames: RefFrames[.][.][0] (0 intra, 1 LAST_FRAME, REF_UNSET not coded yet) and
     /// Mvs[.][.][0] (valid where LAST_FRAME), mh x mw
     pub ref0: Vec<u8>,
@@ -129,6 +143,11 @@ impl TileBufs {
         for m in &mut self.lf_uv {
             m.clear();
             m.resize(nuv, 0);
+        }
+        self.pals.clear();
+        self.pal_at.clear();
+        if f.palettes {
+            self.pal_at.resize(nmi, NO_PALETTE);
         }
         self.sb_cdef.clear();
         self.sb_cdef.resize((self.sb_cols * self.sb_rows) as usize, -1);
@@ -192,6 +211,9 @@ fn inter_stat(_k: usize) {
 pub(crate) struct ParseRec {
     /// inter frames: one entry per block
     pub inter: Vec<BlockInter>,
+    /// with allow_screen_content_tools: one entry per block, and the palette blocks' maps
+    pub palette: Vec<BlockPalette>,
+    pub palette_map: Vec<u8>,
     pub blocks: Vec<Block>,
     pub block_txb: Vec<u32>,
     pub txb: Vec<Txb>,
@@ -204,6 +226,9 @@ pub(crate) enum Rec<'a> {
         blocks: &'a [Block],
         /// one per block, or empty (all intra)
         inter: &'a [BlockInter],
+        /// one per block, or empty (no palettes), and their colour index maps
+        palette: &'a [BlockPalette],
+        palette_map: &'a [u8],
         block_txb: &'a [u32],
         /// this tile's tx blocks, the first being txb[txb_base]
         txb: &'a mut [Txb],
@@ -272,6 +297,9 @@ pub(crate) struct TileState {
     max_luma_w: i32,
     max_luma_h: i32,
     cur_txb: u32,
+    /// the current block's palettes and colour index maps
+    pal: BlockPalette,
+    maps: Option<Box<PaletteMaps>>,
 }
 
 impl Default for TileState {
@@ -319,6 +347,8 @@ impl Default for TileState {
             max_luma_w: 0,
             max_luma_h: 0,
             cur_txb: 0,
+            pal: BlockPalette::default(),
+            maps: None,
         }
     }
 }
@@ -1120,7 +1150,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let f = self.f;
         let fp = &f.fp;
         let st = &mut *self.st;
-        let (avail_u, avail_l, has_chroma_, b_idx) = (st.avail_u, st.avail_l, st.has_chroma, st.b_idx);
+        let (avail_u, avail_l, has_chroma_) = (st.avail_u, st.avail_l, st.has_chroma);
         let (bw, bh) = (st.bw4, st.bh4);
         let bufs = &*self.bufs;
         let cdf = &mut st.cdf;
@@ -1203,18 +1233,13 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 b.angle_delta_uv = (s - MAX_ANGLE_DELTA) as i8;
             }
         }
-        // palette_mode_info(): only present with allow_screen_content_tools; palette is never used
+        // palette_mode_info()
         if fp.allow_screen_content_tools != 0 && bsize >= BLOCK_8X8 && bw <= 16 && bh <= 16 {
-            let bsize_ctx = (t8(&Mi_Width_Log2, bsize) + t8(&Mi_Height_Log2, bsize) - 2) as usize;
-            if b.y_mode as i32 == DC_PRED && self.sk.sym(&mut cdf.palette_y_mode[bsize_ctx][0], 0) != 0 {
-                fail!(ERR_INVALID, "block {b_idx}: palette (has_palette_y) not supported");
-            }
-            if has_chroma_ && b.uv_mode as i32 == DC_PRED && self.sk.sym(&mut cdf.palette_uv_mode[0], 0) != 0 {
-                fail!(ERR_INVALID, "block {b_idx}: palette (has_palette_uv) not supported");
-            }
+            self.palette_mode_info(b, bsize)?;
         }
+        let cdf = &mut self.st.cdf;
         // filter_intra_mode_info()
-        if fp.enable_filter_intra != 0 && b.y_mode as i32 == DC_PRED && bw <= 8 && bh <= 8 {
+        if fp.enable_filter_intra != 0 && b.y_mode as i32 == DC_PRED && self.st.pal.size_y == 0 && bw <= 8 && bh <= 8 {
             b.filter_intra = if self
                 .sk
                 .sym(&mut cdf.filter_intra[bsize as usize], (b.filter_intra != 0) as i32)
@@ -1569,6 +1594,55 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         Ok(())
     }
 
+    /// A block's palettes (write mode): where palette_mode_info codes them, their sizes, colour
+    /// order and maps inside the record.
+    #[inline(never)]
+    fn check_palette(&self, rec: &Rec, b: &Block, bi: &BlockInter) -> Res<()> {
+        let (f, st) = (self.f, &*self.st);
+        let (p, b_idx) = (&st.pal, st.b_idx);
+        let bs = b.bsize as i32;
+        if f.fp.allow_screen_content_tools == 0 || bi.is_inter != 0 || bs < BLOCK_8X8 || bw4(bs) > 16 || bh4(bs) > 16 {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: a palette needs allow_screen_content_tools and an intra block of 8x8 to 64x64"
+            );
+        }
+        let ok_size = |n: u8| n == 0 || (2..=8).contains(&n);
+        if !ok_size(p.size_y) || !ok_size(p.size_uv) {
+            fail!(ERR_INVALID, "block {b_idx}: palette sizes {} {}", p.size_y, p.size_uv);
+        }
+        let mut len = 0;
+        if p.size_y != 0 {
+            let c = &p.colors[0][..p.size_y as usize];
+            if b.y_mode as i32 != DC_PRED || b.filter_intra != 0 || c.windows(2).any(|w| w[0] >= w[1]) {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: a luma palette needs y_mode DC_PRED, no filter intra and increasing colours"
+                );
+            }
+            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, false);
+            len += d.w * d.h;
+        }
+        if p.size_uv != 0 {
+            let c = &p.colors[1][..p.size_uv as usize];
+            if !st.has_chroma || b.uv_mode as i32 != DC_PRED || c.windows(2).any(|w| w[0] > w[1]) {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: a chroma palette needs chroma, uv_mode DC_PRED and non-decreasing U colours"
+                );
+            }
+            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, true);
+            len += d.w * d.h;
+        }
+        let Rec::Write { palette_map, .. } = rec else {
+            unreachable!()
+        };
+        if p.map_off as usize + len > palette_map.len() {
+            fail!(ERR_INVALID, "block {b_idx}: colour index maps outside the record");
+        }
+        Ok(())
+    }
+
     fn check_block_fields(&self, b: &Block, bi: &BlockInter) -> Res<()> {
         let fp = &self.f.fp;
         let (st, b_idx) = (&*self.st, self.st.b_idx);
@@ -1675,7 +1749,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let mut bi = BlockInter::default();
         let mut parse_txb0 = 0u32;
         match rec {
-            Rec::Write { blocks, inter, .. } => {
+            Rec::Write {
+                blocks, inter, palette, ..
+            } => {
                 let st = &mut *self.st;
                 if st.cursor >= st.tile_end {
                     fail!(ERR_INVALID, "block list ends early (expected block at mi {r},{c})");
@@ -1685,6 +1761,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 if let Some(x) = inter.get(st.cursor as usize) {
                     bi = *x;
                 }
+                st.pal = palette.get(st.cursor as usize).copied().unwrap_or_default();
                 if b.mi_row as i32 != r || b.mi_col as i32 != c || b.bsize as i32 != bsize {
                     fail!(
                         ERR_INVALID,
@@ -1704,6 +1781,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     bsize: bsize as u8,
                     ..Default::default()
                 };
+                self.st.pal = BlockPalette::default();
                 self.st.b_idx = p.blocks.len() as u32;
                 parse_txb0 = p.txb.len() as u32;
             }
@@ -1734,6 +1812,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let (bw, bh) = (st.bw4, st.bh4);
         if S::WRITE {
             self.check_block_fields(&b, &bi)?;
+            if self.st.pal != BlockPalette::default() {
+                self.check_palette(rec, &b, &bi)?;
+            }
         }
         // ---- intra_frame_mode_info / inter_frame_mode_info: skip, cdef, delta q ----
         {
@@ -1858,6 +1939,37 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             self.intra_mode_info(&mut b, r, c, bsize)?;
             b.y_mode
         };
+        // ---- palette_tokens ----
+        let pal = self.st.pal;
+        if pal.size_y != 0 || pal.size_uv != 0 {
+            match rec {
+                Rec::Write { palette_map, .. } => {
+                    let map = palette_map.get(pal.map_off as usize..).unwrap_or(&[]);
+                    self.palette_tokens(bsize, map)?;
+                }
+                Rec::Parse(p) => {
+                    self.palette_tokens(bsize, &[])?;
+                    // the maps as the record holds them: luma, then chroma
+                    self.st.pal.map_off = p.palette_map.len() as u32;
+                    let maps = self.st.maps.as_ref().unwrap();
+                    for (uv, n) in [(false, pal.size_y), (true, pal.size_uv)] {
+                        if n != 0 {
+                            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, uv);
+                            p.palette_map.extend_from_slice(&maps.map[uv as usize][..d.w * d.h]);
+                        }
+                    }
+                }
+            }
+            // PaletteSizes and PaletteColors of the block's 4x4s
+            let bufs = &mut *self.bufs;
+            let k = bufs.pals.len() as u32;
+            bufs.pals.push(self.st.pal);
+            let (r_end, c_end) = ((r + bh).min(f.mi_rows), (c + bw).min(f.mi_cols));
+            for y in r..r_end {
+                let i = bufs.mi(y, c);
+                bufs.pal_at[i..i + (c_end - c) as usize].fill(k);
+            }
+        }
 
         // ---- read_block_tx_size ----
         if fp.tx_mode_select != 0 && bsize > BLOCK_4X4 {
@@ -2102,6 +2214,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 });
                 p.blocks.push(b);
                 p.block_txb.push(parse_txb0);
+                if fp.allow_screen_content_tools != 0 {
+                    p.palette.push(self.st.pal);
+                }
                 if f.inter {
                     p.inter.push(bi);
                 }
@@ -2243,6 +2358,21 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             let e = self.intra_edges(b, t, xi, yi, sbr, sbc, (step_x, step_y))?;
             if let Some(p) = self.plan.as_deref_mut() {
                 p.edges[self.st.cur_txb as usize - p.txb_base] = e.pack();
+            } else if [self.st.pal.size_y, self.st.pal.size_uv][(plane > 0) as usize] != 0 {
+                // predict_palette (palette_tokens filled the maps)
+                let st = &*self.st;
+                let d = map_dims(st.mi_size, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, plane > 0);
+                let (bx, by) = map_origin(st.mi_row, st.mi_col, sub);
+                predict_palette(
+                    &mut self.bufs.plane[plane],
+                    off,
+                    stride,
+                    (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize),
+                    ((start_x - bx) as usize, (start_y - by) as usize),
+                    &st.pal.colors[plane],
+                    &st.maps.as_ref().unwrap().map[(plane > 0) as usize],
+                    d,
+                );
             } else {
                 let max = (((f.mi_cols * 4) >> sub) - 1 - ox, ((f.mi_rows * 4) >> sub) - 1 - oy);
                 let st = &*self.st;

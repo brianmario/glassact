@@ -159,4 +159,9 @@ AV1G_TABLE(uint8_t, Mag_Ref_Offset_With_Tx_Class, [3][3][2], {0, 1, 1, 0, 1, 1, 
 /* Filter_Intra_Mode_To_Intra_Dir : 09.parsing.process.md */
 AV1G_TABLE(uint8_t, Filter_Intra_Mode_To_Intra_Dir, [5], {0, 1, 2, 6, 0})
 
+/* Palette_Color_Context : 10.additional.tables.md (-1: never read) */
+AV1G_TABLE(int8_t, Palette_Color_Context, [9], {-1, -1, 0, -1, -1, 4, 3, 2, 1})
+/* Palette_Color_Hash_Multipliers : 10.additional.tables.md */
+AV1G_TABLE(uint8_t, Palette_Color_Hash_Multipliers, [3], {1, 2, 2})
+
 #endif

@@ -594,6 +594,7 @@ fn parse_frame(
         cdfs_out: (state.is_some() && end_update).then_some(&saved),
         context_tile,
         sb128: sq.sb128,
+        palettes: fp.allow_screen_content_tools != 0,
     };
     // tile group
     let ntiles = (tiles.cols * tiles.rows) as usize;
@@ -667,6 +668,12 @@ fn parse_frame(
         txb: pr.txb,
         coeffs: pr.coeffs,
         inter: pr.inter,
+        palette: if pr.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0) {
+            pr.palette
+        } else {
+            Vec::new()
+        },
+        palette_map: pr.palette_map,
     };
     Ok(())
 }

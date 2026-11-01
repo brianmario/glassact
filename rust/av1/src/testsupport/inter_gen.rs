@@ -491,6 +491,8 @@ impl InterSeq {
                 fp,
                 blocks,
                 inter: if key { Vec::new() } else { inter },
+                palette: Vec::new(),
+                palette_map: Vec::new(),
                 ..Default::default()
             };
             rec.layout().ok()?;

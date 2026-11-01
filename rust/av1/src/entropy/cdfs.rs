@@ -169,9 +169,10 @@ impl Cdfs {
     }
 }
 
-/// The CDFs inter frames add (spec init_non_coeff_cdfs; MvCtx 0 only: no intra block copy), and
-/// the 128x128 superblocks' partition CDF. Not part of [`Cdfs`], whose layout the GPU entropy
-/// kernels share: inter frames and 128x128 superblocks aren't coded there.
+/// The CDFs inter frames add (spec init_non_coeff_cdfs; MvCtx 0 only: no intra block copy), the
+/// 128x128 superblocks' partition CDF and palette's sizes and colours. Not part of [`Cdfs`], whose
+/// layout the GPU entropy kernels share: inter frames, 128x128 superblocks and palette blocks
+/// aren't coded there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterCdfs {
     /// YModeCdf (intra blocks of inter frames), by Size_Group
@@ -202,6 +203,12 @@ pub struct InterCdfs {
     pub inter_tx_set3: [[u16; 3]; 4],
     /// PartitionW128Cdf (fp.sb128: the 128x128 node; 8 partition types, no 4-way splits)
     pub partition_w128: [[u16; 9]; 4],
+    /// PaletteYSizeCdf, PaletteUVSizeCdf [bsizeCtx]
+    pub palette_y_size: [[u16; 8]; 7],
+    pub palette_uv_size: [[u16; 8]; 7],
+    /// PaletteSize{n}{Y,UV}ColorCdf [ctx], n = 2..8 colours
+    pub palette_y_color: PaletteColorCdfs,
+    pub palette_uv_color: PaletteColorCdfs,
 }
 
 impl Default for InterCdfs {
@@ -228,6 +235,26 @@ impl Default for InterCdfs {
             inter_tx_set2: Default_Inter_Tx_Type_Set2_Cdf,
             inter_tx_set3: Default_Inter_Tx_Type_Set3_Cdf,
             partition_w128: Default_Partition_W128_Cdf,
+            palette_y_size: Default_Palette_Y_Size_Cdf,
+            palette_uv_size: Default_Palette_Uv_Size_Cdf,
+            palette_y_color: PaletteColorCdfs {
+                c2: Default_Palette_Size_2_Y_Color_Cdf,
+                c3: Default_Palette_Size_3_Y_Color_Cdf,
+                c4: Default_Palette_Size_4_Y_Color_Cdf,
+                c5: Default_Palette_Size_5_Y_Color_Cdf,
+                c6: Default_Palette_Size_6_Y_Color_Cdf,
+                c7: Default_Palette_Size_7_Y_Color_Cdf,
+                c8: Default_Palette_Size_8_Y_Color_Cdf,
+            },
+            palette_uv_color: PaletteColorCdfs {
+                c2: Default_Palette_Size_2_Uv_Color_Cdf,
+                c3: Default_Palette_Size_3_Uv_Color_Cdf,
+                c4: Default_Palette_Size_4_Uv_Color_Cdf,
+                c5: Default_Palette_Size_5_Uv_Color_Cdf,
+                c6: Default_Palette_Size_6_Uv_Color_Cdf,
+                c7: Default_Palette_Size_7_Uv_Color_Cdf,
+                c8: Default_Palette_Size_8_Uv_Color_Cdf,
+            },
         }
     }
 }
@@ -266,7 +293,30 @@ impl InterCdfs {
         clear(core::slice::from_mut(&mut self.inter_tx_set2));
         clear(&mut self.inter_tx_set3);
         clear(&mut self.partition_w128);
+        clear(&mut self.palette_y_size);
+        clear(&mut self.palette_uv_size);
+        for c in [&mut self.palette_y_color, &mut self.palette_uv_color] {
+            clear(&mut c.c2);
+            clear(&mut c.c3);
+            clear(&mut c.c4);
+            clear(&mut c.c5);
+            clear(&mut c.c6);
+            clear(&mut c.c7);
+            clear(&mut c.c8);
+        }
     }
+}
+
+/// A plane type's palette colour index CDFs, by palette size (2..8 colours) and colour context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteColorCdfs {
+    pub c2: [[u16; 3]; 5],
+    pub c3: [[u16; 4]; 5],
+    pub c4: [[u16; 5]; 5],
+    pub c5: [[u16; 6]; 5],
+    pub c6: [[u16; 7]; 5],
+    pub c7: [[u16; 8]; 5],
+    pub c8: [[u16; 9]; 5],
 }
 
 /// A frame's saved CDFs (the spec's save_cdfs / load_cdfs, per reference slot): what a later frame

@@ -79,6 +79,8 @@ fn case(seed: u64, maxdim: i32, big_pct: i32) -> Option<Record> {
             txb: sl(r.txb as *const Txb, r.n_txb as usize),
             coeffs: sl(r.coeffs as *const i16, r.n_coeffs as usize),
             inter: Vec::new(),
+            palette: Vec::new(),
+            palette_map: Vec::new(),
         };
         av1t_case_free(c);
         Some(rec)
@@ -926,6 +928,8 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
                     core::slice::from_raw_parts(r.coeffs, r.n_coeffs as usize).to_vec()
                 },
                 inter: Vec::new(),
+                palette: Vec::new(),
+                palette_map: Vec::new(),
             };
             out.seq_level_idx = q.seq_level_idx;
             out.tile_bytes = core::slice::from_raw_parts(q.tile_bytes, q.n_tiles as usize).to_vec();
@@ -940,9 +944,14 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
 fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
     let (crc, c) = c_parse(obus);
     match parse(obus) {
-        Ok(r) if (r.rec.fp.frame_type == FRAME_INTER || r.rec.fp.sb128 != 0) && crc != OK => {
-            // an inter frame or 128x128 superblocks (a damaged frame_type or
-            // use_128x128_superblock): the C++ has neither
+        Ok(r)
+            if (r.rec.fp.frame_type == FRAME_INTER
+                || r.rec.fp.sb128 != 0
+                || r.rec.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0))
+                && crc != OK =>
+        {
+            // an inter frame, 128x128 superblocks or palette blocks (a damaged frame_type,
+            // use_128x128_superblock or has_palette_y/uv): the C++ has none of them
             Some(r)
         }
         Ok(r) => {

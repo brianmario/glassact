@@ -48,6 +48,8 @@ mod walk;
 #[cfg(test)]
 mod inter_tests;
 #[cfg(test)]
+mod palette_tests;
+#[cfg(test)]
 mod tests;
 
 pub use encode::{ENC_CHECK_EDGES, ENC_ONE_PASS, ENC_SKIP_RECON, Extras, Writer, encode, validate};
@@ -95,6 +97,10 @@ pub struct Record {
     pub coeffs: Vec<i16>,
     /// one entry per block, or empty: every block intra (decisions.h "Inter blocks")
     pub inter: Vec<BlockInter>,
+    /// one entry per block, or empty: no palette blocks
+    pub palette: Vec<BlockPalette>,
+    /// the palette blocks' colour index maps ([`BlockPalette::map_off`])
+    pub palette_map: Vec<u8>,
 }
 
 impl Record {
@@ -126,6 +132,8 @@ impl Record {
             txb: &mut self.txb,
             coeffs: &mut self.coeffs,
             inter: &self.inter,
+            palette: &self.palette,
+            palette_map: &self.palette_map,
         }
     }
 
@@ -162,6 +170,9 @@ pub struct RecordMut<'a> {
     pub coeffs: &'a mut [i16],
     /// `blocks.len()` entries, or empty: every block intra
     pub inter: &'a [BlockInter],
+    /// `blocks.len()` entries, or empty: no palette blocks
+    pub palette: &'a [BlockPalette],
+    pub palette_map: &'a [u8],
 }
 
 impl<'a> RecordMut<'a> {
@@ -200,6 +211,8 @@ impl<'a> RecordMut<'a> {
                 } else {
                     core::slice::from_raw_parts(rec.inter, rec.n_blocks as usize)
                 },
+                palette: &[],
+                palette_map: &[],
             })
         }
     }
@@ -213,6 +226,8 @@ impl<'a> RecordMut<'a> {
             txb: self.txb,
             coeffs: self.coeffs,
             inter: self.inter,
+            palette: self.palette,
+            palette_map: self.palette_map,
         }
     }
 }

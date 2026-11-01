@@ -7,7 +7,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 
 | Module | What |
 |---|---|
-| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); 64x64 or 128x128 superblocks; tiles on threads, and with a reconstruction its blocks on every thread apart from their coding (`writer::recon`); the closed-loop hook; the parser |
+| `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); 64x64 or 128x128 superblocks; palette blocks; tiles on threads, and with a reconstruction its blocks on every thread apart from their coding (`writer::recon`); the closed-loop hook; the parser |
 | `dsp`, `blockinfo` | the decoder-mirroring DSP: intra and inter prediction (motion compensation), inverse transforms, dequantization, block geometry |
 | `postfilter` | deblocking and CDEF, exactly as the decoder applies them |
 | `entropy` | the range encoder, CDF contexts, symbol streams |

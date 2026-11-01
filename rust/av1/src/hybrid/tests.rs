@@ -915,6 +915,8 @@ mod oracle {
                     txb: sl(r.txb, r.n_txb as usize).to_vec(),
                     coeffs: sl(r.coeffs, r.n_coeffs as usize).to_vec(),
                     inter: Vec::new(),
+                    palette: Vec::new(),
+                    palette_map: Vec::new(),
                 }
             }
         }

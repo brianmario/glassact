@@ -23,12 +23,15 @@
 //! split: with ENC_FIX_RANGE, a hook that [`TxbHook::KEEPS_TX_SETS`], and a record the plan
 //! accepts; anything else is coded in one pass, which fails where the walk would (and leaves the
 //! record as it does).
-use super::walk::{Frame, InterMaps, TileBufs, TxbEdges, levels, predict_inter_block, predict_intra_txb};
+use super::walk::{
+    Frame, InterMaps, TileBufs, TxbEdges, levels, map_dims, map_origin, predict_inter_block, predict_intra_txb,
+    predict_palette,
+};
 use super::{Res, TxbCtx, TxbHook};
 use crate::blockinfo::{bh4, bw4};
 use crate::dsp::{McScratch, ac_q, add_residual, chroma_tx_type, chroma_tx_type_inter, dc_q, tx_coeffs, tx_h, tx_w};
 use crate::tables::DCT_DCT;
-use crate::types::{Block, Txb};
+use crate::types::{Block, BlockPalette, Txb};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
@@ -228,6 +231,9 @@ pub(super) struct ReconTile<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct ReconRec<'a> {
     pub blocks: &'a [Block],
+    /// one per block, or empty; the colour index maps
+    pub palette: &'a [BlockPalette],
+    pub palette_map: &'a [u8],
     pub block_txb: &'a [u32],
     pub txb: *mut Txb,
     pub coeffs: *mut i16,
@@ -298,7 +304,30 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let (lx, ly) = (tx.x4 as i32 * 4 - ox, tx.y4 as i32 * 4 - oy);
         let stride = bufs.stride[plane];
         let off = ly as usize * stride + lx as usize;
-        if !is_inter {
+        let pal = rec.palette.get(k).copied().unwrap_or_default();
+        let pal_n = [pal.size_y, pal.size_uv][(plane > 0) as usize];
+        if !is_inter && pal_n != 0 {
+            // the maps start at map_off: luma, then chroma (the plan's walk checked them)
+            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, plane > 0);
+            let at = pal.map_off as usize
+                + if plane > 0 && pal.size_y != 0 {
+                    let l = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, false);
+                    l.w * l.h
+                } else {
+                    0
+                };
+            let (bx, by) = map_origin(r, c, sub);
+            predict_palette(
+                planes[plane],
+                off,
+                stride,
+                (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize),
+                ((tx.x4 as i32 * 4 - bx) as usize, (tx.y4 as i32 * 4 - by) as usize),
+                &pal.colors[plane],
+                &rec.palette_map[at..],
+                d,
+            );
+        } else if !is_inter {
             let e = TxbEdges::unpack(t.plan.edges[ti - t.plan.txb_base]);
             let max = (((f.mi_cols * 4) >> sub) - 1 - ox, ((f.mi_rows * 4) >> sub) - 1 - oy);
             let [l, u, v] = &mut planes;
@@ -321,9 +350,9 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
                 bufs.stride[0],
                 max_luma,
             );
-            if plane == 0 {
-                max_luma = (lx + tx_w(tx_sz), ly + tx_h(tx_sz));
-            }
+        }
+        if !is_inter && plane == 0 {
+            max_luma = (lx + tx_w(tx_sz), ly + tx_h(tx_sz));
         }
         if b.skip != 0 {
             continue;

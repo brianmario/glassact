@@ -260,6 +260,49 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: palette blocks in the writer and parser; libaom's palette measured (2026-11-01)
+
+**Before deciding to build it:** libaom realtime (speed 9, 720p, 6 quantizers 10–44, 20–30
+frames) with palette on and off (`AV1E_SET_ENABLE_PALETTE`, a temporary switch in the shim),
+BD-rate of palette on:
+
+| Trace | equal PSNR-Y, key / inter | equal RGB SSIM, key |
+|---|---|---|
+| typing-cc | +34.2 % / +32.5 % | +15.9 % |
+| scroll-win | +14.5 % / +14.4 % | +5.8 % |
+| photos | +32.6 % / +7.1 % | +15.9 % |
+
+libaom's realtime mode picks palette by counting colours, not by cost, and spends bytes on it.
+Intra block copy changed nothing (realtime never uses it). The vendored libaom is realtime-only,
+so its RD-searched palette couldn't be measured.
+
+Distinct luma values per block, a 5K typing-cc frame:
+
+| Block size | 1 (flat) | 2–4 | 5–8 | 9–16 | more |
+|---|---|---|---|---|---|
+| 8x8 | 37.1 % | 16.5 % | 7.1 % | 17.3 % | 22.0 % |
+| 16x16 | 29.4 % | 15.1 % | 4.1 % | 8.2 % | 43.1 % |
+| 32x32 | 21.5 % | 14.1 % | 2.4 % | 3.6 % | 58.5 % |
+
+A quarter of 8x8s could be exact palette blocks; antialiased text has many more levels.
+
+**What changed** (the writer and parser only; nothing decides palettes yet):
+- Record: `BlockPalette` per block (sizes, Y/U/V colours, where its colour index maps start) and
+  the maps, both optional, as the inter entries.
+- The walk: palette_mode_info (the palette cache, colours as literals and deltas, V by deltas or
+  literals, whichever is shorter), palette_tokens (anti-diagonal order, colour contexts), the
+  palette prediction, in the one-pass walk and the block-parallel reconstruction.
+- The CDFs for palette sizes and colours are in `InterCdfs`: `av1g_cdfs`, which the GPU entropy
+  coder shares, is unchanged, and symbol streams refuse palette blocks.
+- 4x16 and 16x4 blocks may have palettes (the spec compares the enum), and their chroma map is the
+  chroma of their 8x8 (2 more wide or tall). The first dav1d run caught that.
+
+**Result:** random records with half their eligible blocks turned into palette blocks (121,181 in
+the still pictures, both superblock sizes, plus inter sequences) round-trip through the parser,
+reconstruct the same split as in one pass, and decode exactly with dav1d and aomdec. Streams
+without palettes are unchanged (`--digest`). Inter frames a second, interleaved, 3 rounds: no change
+beyond noise (−1.8 % to +6.7 %, mixed signs).
+
 ### Metal AV1: blocks reconstructed on every thread apart from their coding (2026-11-01)
 
 **Before:** each tile's walk reconstructed and coded its blocks in one pass. Intra prediction reads

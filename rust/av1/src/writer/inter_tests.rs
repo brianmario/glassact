@@ -90,7 +90,7 @@ fn expect_parsed_blocks(want: &Record, got: &Record, what: &str) {
     }
 }
 
-fn seeds(n: u64, f: impl Fn(&mut Writer, u64) + Sync) {
+pub(super) fn seeds(n: u64, f: impl Fn(&mut Writer, u64) + Sync) {
     let next = std::sync::atomic::AtomicU64::new(0);
     std::thread::scope(|s| {
         for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(8) {
@@ -206,6 +206,8 @@ fn split_reconstruction_is_the_walks() {
                 txb: core::mem::take(&mut case.txb),
                 coeffs: core::mem::take(&mut case.coeffs),
                 inter: Vec::new(),
+                palette: Vec::new(),
+                palette_map: Vec::new(),
             };
             rec.coeffs.truncate(case.n_coeffs as usize);
             rec
@@ -269,6 +271,8 @@ fn video_key_frames_are_still_pictures() {
             txb: core::mem::take(&mut case.txb),
             coeffs: core::mem::take(&mut case.coeffs),
             inter: Vec::new(),
+            palette: Vec::new(),
+            palette_map: Vec::new(),
         };
         rec.coeffs.truncate(case.n_coeffs as usize);
         let opts = EncodeOpts {
@@ -606,7 +610,7 @@ fn sb128_still_pictures_round_trip() {
 }
 
 /// A still picture with 128x128 superblocks of `seed` (FuzzCase::make_ex), as a record.
-fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
+pub(super) fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
     let mut case = FuzzCase::make_ex(seed, maxdim, 4, true)?;
     let mut rec = Record {
         fp: case.fp,
@@ -615,6 +619,8 @@ fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
         txb: core::mem::take(&mut case.txb),
         coeffs: core::mem::take(&mut case.coeffs),
         inter: Vec::new(),
+        palette: Vec::new(),
+        palette_map: Vec::new(),
     };
     rec.coeffs.truncate(case.n_coeffs as usize);
     Some(rec)
@@ -797,7 +803,7 @@ fn decoders() {
 
 /// Each installed decoder of `tools` decodes the frames `outs` (of a stream with the first frame's
 /// `fp`) to exactly their reconstructions. `kinds`: what each frame is, for the messages.
-fn decode_check(
+pub(super) fn decode_check(
     dir: &std::path::Path,
     tools: &[(&str, Vec<&str>)],
     name: &str,
