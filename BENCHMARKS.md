@@ -260,6 +260,43 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: a superblock-row wavefront for the closed loop, measured, not taken yet (2026-11-01)
+
+**The closed loop's limit (5K photos, `--tiles 3x0`, 100 frames):**
+- Each of the 8 tiles is one task. Tile 0 takes 5.0 ms every frame; the others take 1.6–2.3 ms. The sum is 18.7 ms, so a perfect 8-way balance would be 2.3 ms.
+
+**Its range coding is discarded:**
+- The closed loop runs the writer's full walk, symbols included. The hybrid then writes the frame again once the filters have chosen CDEF.
+- A sink that codes nothing gives the same streams (`--digest`) in the same 5.5 ms. Coding is a negligible part of the work.
+- The quantization hook reads no entropy context, so the reconstruction depends on nothing the coder produces (delta-q aside, which the encoder doesn't use).
+
+**Experiment: a wavefront.**
+- A reconstruction-only walk of one superblock row (`Walk::sb_row`, that null sink), one task per (tile, superblock row), taken in row-major order.
+- Each row starts superblock c once the row above has done c + 1. The tile's buffers are shared through raw pointers, which isn't sound enough to keep.
+- The streams are the same in every case.
+
+Inter frames a second at 5K:
+
+| Trace | tiles, 8 columns | rows, 8 columns | rows, 4 columns |
+|---|---|---|---|
+| photos | 76.0 (closed loop 5.5 ms) | 80.1 (4.4 ms) | 76.7 (4.6 ms) |
+| scroll-win | 197 (2.2 ms) | 172 (3.1 ms) | 177 (2.6 ms) |
+| typing-cc | 293 (1.7 ms) | 230 (2.4 ms) | 281 (1.5 ms) |
+
+- 4 columns' streams are smaller: photos 26.3 against 26.4 KB, typing-cc 144 against 153 B.
+
+**Why it's no more than this:**
+- Streams use 128×128 superblocks, so a 640-wide tile is 5 superblocks wide. A lag of 2 lets about 2.5 of its rows run at once.
+- Photos' work lies in a vertical strip of tile 0. Each superblock there waits for the heavy one above it, so the strip stays serial however many threads there are.
+- 14 workers were slower than 8: rows on the efficiency cores stall the chain.
+- On light frames (scroll-win, typing-cc), the experiment's fixed costs outweigh its gain: threads spawned every frame, per-row setup, and spinning.
+
+**Where the closed loop's CPU goes (Time Profiler):**
+- `QuantHook::trial` (forward transform and quantizer, NEON already) is 26 % of its self time.
+- Next are the writer's coefficient coding, memmove and inter prediction.
+
+Not taken: a sound version needs the tile buffers restructured for shared access, and a persistent worker pool. It would be worth about 5 % on photos, plus fewer tiles' bytes at equal speed. The patch is kept with the session's notes.
+
 ### Metal AV1: the filters' CDEF search reads the analysis's source in place; source buffers untracked (2026-11-01)
 
 **What changed:**
