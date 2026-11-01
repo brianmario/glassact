@@ -261,6 +261,35 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: where the bytes go, by kind of block (2026-11-01)
+
+`ENC_BLOCK_BITS` per block in the final write, totalled by kind (an experiment, `GA_BITMAP`, not
+kept): inter copies, coded inter blocks, and intra blocks by their source luma: flat (≤ 2 values),
+few levels (≤ 8), edges (> 5 % of samples on a step > 48), texture (the rest). q20, first 100
+frames. Bits and pixels as shares of the frame type's totals:
+
+| | key frame | flat | few levels | edges | texture | inter frames | copies | coded inter | intra edges | intra texture | intra flat / few |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 5K typing-cc | 264 KB | 4 % / 42 % px | 20 / 15 | 29 / 3 | 47 / 40 | 0.1 KB | 5 / 100 | 16 / 0 | 40 / 0 | 3 / 0 | 35 / 0 |
+| 5K scroll-win | 224 KB | 6 / 61 | 29 / 16 | 35 / 3 | 30 / 19 | 3.3 KB | 2 / 99 | 21 / 1 | 32 / 0 | 2 / 0 | 44 / 0 |
+| 5K photos | 541 KB | 1 / 45 | 4 / 8 | 31 / 7 | 65 / 41 | 26.1 KB | 1 / 87 | 7 / 11 | 17 / 0 | **73 / 1** | 2 / 0 |
+| 5K cursor-drag | 244 KB | 4 / 41 | 21 / 18 | 28 / 3 | 47 / 39 | 0.2 KB | 3 / 100 | 11 / 0 | 50 / 0 | 7 / 0 | 29 / 0 |
+| 720p typing-cc | 53 KB | 1 / 12 | 4 / 23 | 45 / 13 | 50 / 52 | 0.1 KB | 2 / 99 | 39 / 1 | 44 / 0 | 10 / 0 | 5 / 0 |
+| 720p scroll-win | 43 KB | 1 / 29 | 8 / 31 | 57 / 14 | 34 / 26 | 1.9 KB | 0 / 91 | 52 / 8 | 37 / 0 | 3 / 0 | 8 / 0 |
+| 720p photos | 59 KB | 1 / 29 | 3 / 15 | 49 / 18 | 48 / 39 | 11.9 KB | 0 / 34 | 60 / 63 | 14 / 1 | 24 / 2 | 1 / 0 |
+
+(cells: % of bits / % of pixels)
+
+- **The bytes are in intra edges and texture,** in key frames and in the new content of inter
+  frames. On 5K photos, 73 % of an inter frame's bytes are intra texture blocks covering 1 % of
+  the picture: newly shown photo with nothing to copy.
+- On static traces the key frame is most of the BD sweeps' bytes (typing: 264 KB against 99 ×
+  0.1 KB), so those sweeps mostly measure intra coding.
+- Copies cost almost nothing; coded inter blocks matter at 720p (fractional motion of the
+  downscaled traces).
+- Next for bitrate: intra coding of edges and texture. AV2's tools are measured against exactly
+  that (the attribution under way on `gpu-codec`).
+
 ### Metal AV1: the closed loop's rounding offset 0.375 → 0.45; a light RDOQ rejected (2026-11-01)
 
 The closed loop quantized with the Metal analysis's dead zone, q = |v| < zbin ? 0 : ⌊|v| + rnd⌋
