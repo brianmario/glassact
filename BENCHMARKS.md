@@ -261,6 +261,45 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 re-baselined against hardware HEVC and libaom (2026-11-01)
+
+The sweep of "against hardware HEVC and libaom" (2026-10-31) again, after a day of speed work:
+first 100 frames, `vquality`'s RGB luma, hardware HEVC at five targets, the hybrid and libaom
+realtime s9 inter frames at q 8–32, libaom's tiling for both (3 × 0 at 5K, 2 × 0 at 720p).
+The session was disconnected throughout.
+
+**BD-rate, hybrid vs libaom / vs hardware HEVC, by PSNR (SSIM):**
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K vs libaom | −46 % (−44 %) | −24 % (−19 %) | −34 % (−31 %) | −46 % (−45 %) |
+| 5K vs HEVC | −60 % (−58 %) | no overlap (−74 %) | −83 % (−81 %) | −60 % (−57 %) |
+| 720p vs libaom | −30 % (−19 %) | −1 % (+16 %) | −13 % (−7 %) | −30 % (−20 %) |
+| 720p vs HEVC | −45 % (−45 %) | −40 % (−38 %) | −2 % (+16 %) | −42 % (−42 %) |
+
+Within a point of the 2026-10-31 sweep everywhere: the speed work since cost no bytes.
+
+**Inter frames a second at q20,** both encoders in the same runs (`--no-planes`, no scoring:
+`--score-rgb`'s scoring runs inside the hybrid's pipeline and slows it), two runs each:
+
+| | hybrid | libaom s9 | ratio |
+|---|---|---|---|
+| 5K typing-cc | 252 | 219 | 1.15 |
+| 5K scroll-win | 167 | 168 | 1.00 |
+| 5K photos | 79 | 90 | 0.88 |
+| 5K cursor-drag | 249 | 220 | 1.13 |
+| 720p typing-cc | 1150 | 1975 | 0.58 |
+| 720p scroll-win | 473 | 964 | 0.49 |
+| 720p photos | 182 | 492 | 0.37 |
+| 720p cursor-drag | 854 | 2020 | 0.42 |
+
+(The interleaved A/B runs earlier today, without libaom in the process, gave the hybrid ~300 on 5K
+typing; compare within one table only.)
+
+**Where we stand:** smaller than both everywhere at 5K. At 720p ahead on typing and drag, about
+even with libaom on scroll and with HEVC on photos. Speed: ahead at 5K except photos; at 720p at
+0.37–0.58× libaom, whose small-frame costs we don't have.
+
 ### Metal AV1: palette decisions measured, not taken (2026-11-01)
 
 **By colour count** (a block's visible source of 2 to N exact luma values, or (U, V) pairs, coded
