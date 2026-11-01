@@ -190,6 +190,15 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 11 | i): the lane's best two
     for (int i = (int)lane; i < n; i += 32) {
         const int2 v = ga_me_vector(I, i, sbv);
+        if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
+            bool seen = abs(v.x) <= 8 && abs(v.y) <= 8;
+            const int c = (i - GA_ME_ZERO) / 81;
+            for (int e = 0; e < c && !seen; e++) {
+                const int2 ce = e < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * e], I.meCand[2 * e + 1]) : sbv;
+                seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
+            }
+            if (seen) continue;
+        }
         const int rx = x + v.x, ry = y + v.y;
         if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
         device const uint8_t *r = I.ref + (size_t)ry * sp + rx;

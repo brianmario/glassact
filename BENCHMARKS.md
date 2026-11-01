@@ -260,6 +260,27 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: k_me measures each vector once (2026-10-31)
+
+**What changed:**
+- k_me searches no motion's ±8 window and ±4 around each of the frame's shift candidates and the SB's k_proj vector, and these overlap.
+- A position an earlier window has is now skipped.
+- The best vector can't change: a repeat has the same SAD and a larger index, so it loses the tie.
+- The second best is now always a different vector: before, it could repeat the best.
+
+**Results:**
+- The motion search stage of a 5K photos inter frame is 2.73 → 2.48 ms.
+- BD-rate (q 12/20/28, PSNR-Y): 0.00 % on photos 5K and 720p and on scroll-win 5K, +0.05 % on scroll-win 720p.
+
+Inter frames a second, mean of the three quantizers:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 60 | 61 |
+| photos 720p | 137 | 141 |
+| scroll-win 720p | 384 | 392 |
+| scroll-win 5K | 156 | 156 |
+
 ### Metal AV1: inter candidates' SADs from 8×8s measured once (2026-10-31)
 
 **What changed:**
