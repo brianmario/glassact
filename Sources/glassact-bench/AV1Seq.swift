@@ -34,6 +34,7 @@ let av1SeqCommand = Command(
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
+        .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
@@ -154,6 +155,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
     if let rgb { print(rgb.summary("hybrid")) }
+    if opts.has("digest") {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for f in frames { for b in f.obu { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 } }
+        print(String(format: "             stream digest %016llx (%d frames)", h, frames.count))
+    }
     // the trace's own timing: frames arrive when the screen changes, at most ~60 a second
     if let first = stamps.first, let last = stamps.last, last > first, stamps.count > 1 {
         let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)

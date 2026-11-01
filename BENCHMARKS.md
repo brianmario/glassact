@@ -260,6 +260,39 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: inter frames' 8×8 to 16×8 blocks on the SIMD-group kernel; fewer registers in the small kernel (2026-10-31)
+
+**What changed:**
+- **Inter frames analyze blocks of 64 samples and up (8×8, 8×16, 16×8) with the SIMD-group kernel** (`k_analysis_WxH_wN`), not the thread-per-block one.
+  - In an inter frame, a block whose inter residual is nothing skips the intra search. A thread-per-block SIMD-group then waits on its slowest block.
+  - The SIMD-group kernel spends one SIMD-group per block, so a skipped block costs almost nothing.
+  - Key frames keep the thread-per-block kernel: there it's 2× faster (8×8 at 5K: 13.1 vs 26.7 ms).
+  - 4×4, 4×8 and 8×4 keep it in inter frames too: the SIMD-group kernel is 4–7× slower for them (4×4: 6.3 vs 0.83 ms).
+- **The small kernel quantizes each coefficient as the forward transform makes it,** so no thread holds the whole transformed block. The distortion is summed in the same order, so the output is the same.
+- **`av1seq --digest`** prints a hash of the whole stream, to check that a change keeps it.
+
+**Results:**
+- Same streams on 720p photos, scroll-win and typing-cc inter, and on photos key frames (`--digest`).
+- BD-rate 0.00 % at 5K and 720p (q 12/20/28).
+
+GPU stages of a 5K photos inter frame (`--profile --inter`, best of 10, ms):
+
+| | 4×8 | 8×4 | 8×8 | 8×16 | 16×8 | intra analysis |
+|---|---|---|---|---|---|---|
+| before | 1.06 | 1.09 | 0.80 | 1.45 | 1.42 | 8.5 |
+| after | 0.96 | 0.95 | 0.29 | 0.25 | 0.25 | 5.3 |
+
+Steady-state inter frames a second (mean of q 12/20/28):
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 57 | 59 |
+| photos 720p | 132 | 137 |
+| scroll-win 720p | 361 | 372 |
+| scroll-win 5K | 160 | 160 |
+
+The GPU saving is 3.2 ms a 5K photos frame, but the frame rate moves only 3 %: the hybrid's thread (closed loop and filters) is the limit there now.
+
 ### Metal AV1: what Xcode's GPU profiler says about an inter frame (2026-10-31)
 
 **How:**

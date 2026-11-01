@@ -873,8 +873,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // the thread-per-block kernel has the throughput, but one block's chain of work on
                 // one thread takes ~1.5 ms: an inter frame analyzing little takes the SIMD-group one
                 // (whose float sums may order differently: kept analysis of a key frame stays the
-                // thread kernel, and so the same as fresh analysis)
-                let fewBlocks = isInter && n < 4096
+                // thread kernel, and so the same as fresh analysis). An inter frame's blocks of 64
+                // samples and up take it too: where inter prediction leaves nothing to code, a block
+                // skips the intra search, and a thread-per-block SIMD-group then waits on its
+                // slowest block (8x8 to 16x8 3-6x slower there; BENCHMARKS)
+                let size = AV1MetalEncoder.blockSizes[s]
+                let fewBlocks = isInter && (n < 4096 || size.w * size.h >= 64)
                 if params.smallKernel != 0, !fewBlocks, let pipeline = encoder.analysisSmall[s] {
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)

@@ -15,9 +15,11 @@ struct SmallTx {
     static constexpr constant int n = W * H;
 };
 
-// scalar forward transform: out[i][j] (H x W, row-major, no 32-clipping needed for these sizes)
-template <int W, int H>
-__device__ __forceinline__ void fwd_scalar(const int16_t *res, float *out, int txSz, int txType) {
+// scalar forward transform: emit(i * W + j, out[i][j]) in raster order (H x W, row-major, no 32-clipping
+// needed for these sizes). Glass Act: each coefficient goes to `emit` as it's made, so no thread holds
+// the whole output block (its registers spilled).
+template <int W, int H, typename Emit>
+__device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txType, Emit emit) {
     const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
     const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
     AV1G_CONST const float *Fc = g_fwd + g_fwdOff[ck][SmallTx<W, H>::lh];
@@ -49,20 +51,17 @@ __device__ __forceinline__ void fwd_scalar(const int16_t *res, float *out, int t
 #pragma unroll
                 for (int k = 0; k < W; k++) s = fmaf(__ldg(&Fr[j * W + k]), tmp[i * W + k], s);
             }
-            out[i * W + j] = s * scale;
+            emit(i * W + j, s * scale);
         }
 }
 
 template <int W, int H>
 __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const EvalIn &e) {
     constexpr int n = W * H;
-    float c[n];
     int16_t q[n];
-    fwd_scalar<W, H>(res, c, e.txSz, e.txType);
     const int den = av1g_dq_denom(e.txSz);
     float dist = 0.f;
-    for (int idx = 0; idx < n; idx++) {
-        const float v = c[idx];
+    fwd_scalar<W, H>(res, e.txSz, e.txType, [&](int idx, float v) {
         const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
         const float a = fabsf(v) * (float)den / (float)step;
         const float wr = e.qm ? 32.f / (float)e.qm[idx] : 1.f;
@@ -73,7 +72,7 @@ __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const 
         const float dq = l ? (float)av1g_dequant_coef(qv, step, den) : 0.f;
         const float d = v - dq;
         dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
-    }
+    });
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
     int eob = 0;
     for (int k = n - 1; k >= 0; k--)
