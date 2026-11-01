@@ -260,6 +260,31 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the bitstream written on a thread of its own (2026-10-31)
+
+**Where the main thread's time went:**
+- Timed step by step at 5K photos over 100 frames: `begin` 0.96 ms (the next-but-one picture's upload and commit), chroma and padding 0.7, the closed loop 5.3, the filters 6.0, the writer 0.9.
+- In steady state the main thread barely waits for the GPU. The 1.85 ms average wait was mostly the key frame's.
+- A Metal System Trace shows the GPU idle between pictures while the main thread writes and starts the next analysis.
+
+**What changed:**
+- `AV1HybridEncoder` writes picture i's bitstream (`av1enc_hybrid_write_ex`) on another thread, while the main thread waits for picture i + 1's partition and starts picture i + 2's analysis.
+- It waits for the write before the next closed loop, which uses the same CPU state.
+- `output` gets picture i once picture i + 2's analysis has started: about a millisecond later at 5K. The bytes are ready no later than before.
+
+**Results:**
+- The streams are the same (`--digest`, four 720p and two 5K runs).
+
+Inter frames a second, three interleaved runs each:
+
+| Trace | before | after |
+|---|---|---|
+| photos 5K | 68.3 68.2 68.9 | 71.8 73.2 74.0 (+6.6 %) |
+| photos 720p | 150.0 155.0 147.8 | 169.6 169.1 170.6 (+12.5 %) |
+| scroll-win 5K | 163.8 168.4 164.0 | 173.9 173.5 178.0 (+5.9 %) |
+| scroll-win 720p | 401.7 408.6 409.1 | 433.9 448.1 451.6 (+9.4 %) |
+| typing-cc 5K | 228.0 227.8 229.8 | 231.9 246.3 240.7 (+4.9 %) |
+
 ### Metal AV1: k_me's sub-sample refinement on every lane; staged windows rejected (2026-10-31)
 
 **What changed:**

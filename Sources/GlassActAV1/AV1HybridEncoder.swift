@@ -256,7 +256,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// Pictures 0..<count: picture i + 1's analysis runs on the GPU while
     /// picture i is finished on the CPU. `output` gets them in order. With
     /// `interFrames`, they're one stream: the first a key frame and the rest
-    /// inter frames.
+    /// inter frames. Picture i's bitstream is written on another thread
+    /// while picture i + 2's analysis starts, so `output` gets it once that
+    /// has started (about a millisecond at 5K).
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
@@ -264,7 +266,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
-        defer { copyFinder.drain() }
+        // picture i - 1's bitstream, being written while picture i + 1's analysis starts
+        var writing: Writing?
+        defer {
+            copyFinder.drain()
+            _ = try? writing?.wait()
+        }
         var current = try picture(0)
         var pending = try begin(current, Copies(), qindex: qindex)
         // picture i + 1's copies are decided (on the CPU, from the two sources alone) while
@@ -286,9 +293,84 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 upcoming = i + 2 < count ? try picture(i + 2) : nil
                 if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
             }
-            let frame = try finish(current, partition: partition, motion: motion, qindex: qindex, timing: timing, started: t0)
-            try output(i, frame)
+            if let w = writing {
+                writing = nil
+                try output(i - 1, try w.wait())
+            }
+            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, timing: timing, started: t0)
             if let next { current = next }
+        }
+        if let w = writing {
+            writing = nil
+            try output(count - 1, try w.wait())
+        }
+    }
+
+    /// A picture's bitstream, written on a thread of its own (`av1enc_hybrid_write_ex`) while
+    /// the main thread starts the next picture's analysis. It's waited for before the next
+    /// closed loop, which uses the same CPU state.
+    private final class Writing: @unchecked Sendable {
+        private let cpu: OpaquePointer?
+        private var params: av1g_frame_params
+        private let frameParams: av1g_frame_params
+        private let cdef: [Int8]
+        private let sbCols: Int, flags: UInt32
+        private let planes: [[UInt8]]
+        private var timing: Timing
+        private let t0: Double, t2: Double
+        private var result: Result<Frame, any Error>?
+        private let done = DispatchSemaphore(value: 0)
+
+        /// Starts writing the last closed loop's picture with the filters' choices.
+        init(cpu: OpaquePointer, search: AV1MetalPostfilter.Search, sbCols: Int, flags: UInt32, timing: Timing,
+             t0: Double, t2: Double) {
+            self.cpu = cpu
+            params = search.params
+            frameParams = search.params
+            cdef = search.superblockCDEF
+            self.sbCols = sbCols
+            self.flags = flags
+            planes = search.planes
+            self.timing = timing
+            self.t0 = t0
+            self.t2 = t2
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.result = Result { try self.write() }
+                self.done.signal()
+            }
+        }
+
+        /// A picture already written.
+        init(_ frame: Frame) {
+            (cpu, params, frameParams, cdef, sbCols, flags) = (nil, frame.params, frame.params, [], 0, 0)
+            (planes, timing, t0, t2) = (frame.planes, frame.timing, 0, 0)
+            result = .success(frame)
+            done.signal()
+        }
+
+        /// The picture's frame, once written.
+        func wait() throws -> Frame {
+            done.wait()
+            done.signal()  // for a later wait (an encode that threw)
+            return try result!.get()
+        }
+
+        private func write() throws -> Frame {
+            var message = [CChar](repeating: 0, count: 256)
+            var bytes: UnsafeMutablePointer<UInt8>?
+            var size = 0
+            let wrc = cdef.withUnsafeBufferPointer { cdef in
+                av1enc_hybrid_write_ex(cpu, &params, cdef.baseAddress, Int32(sbCols), flags, &bytes, &size, &message, 256)
+            }
+            guard wrc == AV1G_OK, let bytes else {
+                throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
+            }
+            defer { free(bytes) }
+            let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
+            let t3 = CACurrentMediaTime()
+            timing.writer = t3 - t2
+            timing.wall = t3 - t0
+            return Frame(obu: obu, planes: planes, params: frameParams, timing: timing)
         }
     }
 
@@ -384,7 +466,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,
-                        timing: Timing, started t0: Double) throws -> Frame {
+                        timing: Timing, started t0: Double) throws -> Writing {
         var timing = timing
         var message = [CChar](repeating: 0, count: 256)
         let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
@@ -491,8 +573,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let n = Int(record.pointee.n_blocks)
         guard postfilters else {
             let frame = try write(p, record: record, recon: recon, timing: timing, t0: t0, t1: t1)
-            remember(p, frame, sbMotion)
-            return frame
+            remember(p, frame.planes, sbMotion)
+            return Writing(frame)
         }
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
         var direct: [UInt8]?
@@ -516,23 +598,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.filters = t2 - t1
         timing.filtered = postfilter.lastFilteredShare
 
-        var params = search.params
-        var bytes: UnsafeMutablePointer<UInt8>?
-        var size = 0
-        let wrc = search.superblockCDEF.withUnsafeBufferPointer { cdef in
-            av1enc_hybrid_write_ex(cpu, &params, cdef.baseAddress, Int32(sbCols), headerFlags(params), &bytes, &size, &message, 256)
-        }
-        guard wrc == AV1G_OK, let bytes else {
-            throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
-        }
-        defer { free(bytes) }
-        let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
-        let t3 = CACurrentMediaTime()
-        timing.writer = t3 - t2
-        timing.wall = t3 - t0
-        let frame = Frame(obu: obu, planes: search.planes, params: search.params, timing: timing)
-        remember(p, frame, sbMotion)
-        return frame
+        remember(p, search.planes, sbMotion)
+        return Writing(cpu: cpu, search: search, sbCols: sbCols, flags: headerFlags(search.params), timing: timing, t0: t0, t2: t2)
     }
 
     /// The writer's flags for a frame: an inter frame of a stream without its sequence header.
@@ -541,9 +608,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The picture the next inter frame references.
-    private func remember(_ p: Picture, _ frame: Frame, _ sbMotion: [Int32]) {
-        previous = interFrames ? (p, frame.planes, sbMotion) : nil
-        previousOnGPU = interFrames && frame.planes.isEmpty
+    private func remember(_ p: Picture, _ planes: [[UInt8]], _ sbMotion: [Int32]) {
+        previous = interFrames ? (p, planes, sbMotion) : nil
+        previousOnGPU = interFrames && planes.isEmpty
     }
 
     /// Per 64×64 of an inter frame, how the post-filters treat it. `changed`: the coded ones
