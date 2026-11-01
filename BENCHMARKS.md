@@ -260,6 +260,41 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: what Xcode's GPU profiler says about an inter frame (2026-10-31)
+
+**How:**
+- `av1seq --gpu-capture` captured one 5K photos inter frame, the 12th; it needs `MTL_CAPTURE_ENABLED=1`.
+- It was replayed in Xcode 27.2 with "Profile after replay" on an M4 Pro.
+- The capture also holds the key frame's full-frame filters, which explains `p_cdef` and `p_deblock`'s share.
+
+**The inter frame's analysis encoder:**
+- Kernel occupancy is **16 %**, against the occupancy manager's target of 88 %.
+- ALU utilization is 18 %.
+- The compute shader launch limiter is at 61 %, and the instruction throughput limiter at 39 %.
+- 68 % of instructions are integer or conditional, and 12 % floating point.
+- L1 register residency is 23 % and threadgroup residency 3 %.
+
+So the analysis isn't compute-bound: few SIMD-groups fit on a core.
+
+**Why: registers.** Every analysis kernel allocates the full 192 registers, and most spill:
+
+| Kernel | Share of the capture | Registers | Spilled |
+|---|---|---|---|
+| k_me | 13.5 % | 92 | 0 |
+| k_inter_64x64_w1 | 5.6 % | 188 | 272 B |
+| k_analysis_small_8x4 / 4x8 / 4x4 | 5.1 / 4.4 / 4.0 % | 192 | 1.73 KiB / 1.64 KiB / 864 B |
+| k_inter_32x32_w3 | 3.6 % | 192 | 0 |
+| k_analysis_small_8x16 / 16x8 / 8x8 | 2.6 / 1.4 / 1.2 % | 192 | 3.66 / 3.64 / 3.41 KiB |
+| k_inter_16x32 / 8x8 / 8x16 / 16x8 / 16x16 / 32x16 | 0.97–1.9 % | 120–164 | 0 |
+| k_leaf | 1.1 % | 192 | 288 B |
+| k_dp | 1.1 % | 156 | 1.42 KiB (26 SIMD-groups in all) |
+| k_analysis_{16x16 … 64x64} | ≤ 1.05 % | 192 | 384–688 B |
+| k_proj | 0.9 % | 157 | 0 |
+
+**Next:** cut the analysis kernels' register use. Threadgroup memory is almost unused (3 % residency), so it could take the per-thread arrays that spill now.
+
+**Rejected:** sizing p_cdef_r's chroma dispatch to the chroma planes. Half of its threadgroups exit at once, but removing them changed nothing: the filters stayed at 8.5–8.8 ms a 5K photos frame.
+
 ### Metal AV1: the next picture's copies decided on their own thread (2026-10-31)
 
 **What changed:** the hybrid's thread used to decide picture i + 1's copies itself (`av1enc_motion_classify`, 3.8–4.6 ms at 5K photos), between waiting for picture i's analysis and finishing picture i.
