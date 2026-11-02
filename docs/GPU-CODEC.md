@@ -38,8 +38,13 @@ What we measured on `metal-av1` (2026-11-01, BENCHMARKS):
   bytes are in antialiased glyph edges and photos, not in few-colour blocks.**
 - AV2 is the counterpoint (BENCHMARKS "AV2 on screen text", 2026-10-25): AOM's reference encoder
   AVM at 60 dB on typing-cc needs 38 KB for 30 frames, against 141 KB for AV1 (libaom good) and
-  233 KB for x265, at 0.09 fps. Whatever tools give AV2 that, the gain exists at very high
-  quality on text. Which tools it is, and whether it survives at our quality, is unmeasured.
+  233 KB for x265, at 0.09 fps.
+- **That gain is intra block copy, and AV1 has it** (BENCHMARKS "AV2's gain on text attributed",
+  2026-11-01). With each AVM tool off in turn, intra block copy alone is 3.4× on typing and 1.6× on
+  scroll; no other tool is more than 15 %. libaom only searches intra block copy at speed 2 and
+  below. With it, libaom is within ~15 % of AV2 on text (typing 60 dB: 43 vs 37 KB, 131 KB
+  without), and a typing key frame is 2.9× smaller at ~45 dB. In AV1 it works only in key and
+  intra-only frames; AV2 also allows it in inter frames, which these clips didn't exercise.
 
 ## Goal and gate
 
@@ -142,10 +147,11 @@ in the decoder.
 
 ## Plan
 
-0. **Attribute AV2's gain.** Run AVM on the reference traces with its screen-content and intra
-   tools switched off one at a time, at 60 dB and at our operating point (PSNR-Y 41–48 dB).
-   The tools that carry the gain, and how parallel they can be made, are the first candidates
-   for this codec (and some may be possible inside AV1's syntax).
+0. **Attribute AV2's gain.** Done (2026-11-01): intra block copy, which AV1 has in key frames.
+   The next step is on `metal-av1`, not here: intra block copy in our AV1 encoder's key frames
+   (a hash search for matches is data-parallel, a good fit for the GPU), with Apple's AV1 decoder
+   checked first. For this codec, the open question is copies inside inter frames (new text that
+   repeats glyphs already on screen), which AV1 can't code: the glyph and patch cache above.
 1. **Baselines.** Measure VideoToolbox HEVC (4:2:0 and 4:4:4, realtime) next to libaom realtime and
    `metal-av1` on every reference trace: BD-rate on SSIMULACRA2 and PSNR-Y, encode frames a second,
    decode cost. Record them in BENCHMARKS. (Hardware-encoder benches only while no one is
