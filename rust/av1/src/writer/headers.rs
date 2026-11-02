@@ -73,6 +73,13 @@ pub(crate) fn write_headers(
     fh: &mut BitWriter,
 ) {
     let (w, h) = (fp.width as i32, fp.height as i32);
+    // the stream's size: the sequence header's largest frame and every frame's render size
+    let (sw, sh) = if fp.video != 0 && fp.stream_width != 0 {
+        (fp.stream_width as i32, fp.stream_height as i32)
+    } else {
+        (w, h)
+    };
+    let reduced = (w, h) != (sw, sh);
     let mono = fp.monochrome as u32;
     let video = fp.video != 0;
     let inter = video && fp.frame_type == crate::types::FRAME_INTER;
@@ -96,16 +103,16 @@ pub(crate) fn write_headers(
         seq.put(level as u32, 5); // seq_level_idx[0]
     }
     let (mut wb, mut hb) = (1, 1);
-    while wb < 32 && ((w - 1) as u32) >> wb != 0 {
+    while wb < 32 && ((sw - 1) as u32) >> wb != 0 {
         wb += 1;
     }
-    while hb < 32 && ((h - 1) as u32) >> hb != 0 {
+    while hb < 32 && ((sh - 1) as u32) >> hb != 0 {
         hb += 1;
     }
     seq.put((wb - 1) as u32, 4); // frame_width_bits_minus_1
     seq.put((hb - 1) as u32, 4);
-    seq.put((w - 1) as u32, wb); // max_frame_width_minus_1
-    seq.put((h - 1) as u32, hb);
+    seq.put((sw - 1) as u32, wb); // max_frame_width_minus_1
+    seq.put((sh - 1) as u32, hb);
     if video {
         seq.put(0, 1); // frame_id_numbers_present_flag
     }
@@ -160,7 +167,19 @@ pub(crate) fn write_headers(
             // force_integer_mv (SELECT; 0 without screen content tools); key frames: overridden to 1
             fh.put(force_integer_mv as u32, 1);
         }
-        fh.put(0, 1); // frame_size_override_flag
+        fh.put(reduced as u32, 1); // frame_size_override_flag
+        // frame_size() and render_size() of a reduced frame: its own size, shown at the stream's
+        let frame_size = |fh: &mut BitWriter| {
+            if reduced {
+                fh.put((w - 1) as u32, wb); // frame_width_minus_1
+                fh.put((h - 1) as u32, hb);
+                fh.put(1, 1); // render_and_frame_size_different
+                fh.put((sw - 1) as u32, 16); // render_width_minus_1
+                fh.put((sh - 1) as u32, 16);
+            } else {
+                fh.put(0, 1); // render_and_frame_size_different
+            }
+        };
         if inter {
             if fp.error_resilient_mode == 0 {
                 // primary_ref_frame: LAST_FRAME (ref_frame_idx[0]) for its saved CDFs, or NONE
@@ -177,7 +196,13 @@ pub(crate) fn write_headers(
             for _ in 0..REFS_PER_FRAME {
                 fh.put(fp.ref_slot as u32, 3); // ref_frame_idx[i]
             }
-            fh.put(0, 1); // render_and_frame_size_different
+            if reduced && fp.error_resilient_mode == 0 {
+                // frame_size_with_refs: no found_ref (the size is coded, whatever the reference's)
+                for _ in 0..REFS_PER_FRAME {
+                    fh.put(0, 1);
+                }
+            }
+            frame_size(fh);
             if !force_integer_mv {
                 fh.put((fp.mv_precision == 2) as u32, 1); // allow_high_precision_mv
             }
@@ -186,7 +211,7 @@ pub(crate) fn write_headers(
             fh.put(0, 1); // is_motion_mode_switchable
         } else {
             // key frame: refresh_frame_flags = allFrames, primary_ref_frame = NONE
-            fh.put(0, 1); // render_and_frame_size_different
+            frame_size(fh);
             if sct != 0 {
                 fh.put(abc as u32, 1); // allow_intrabc
             }

@@ -98,7 +98,12 @@ pub struct FrameParams {
     /// key frames: 1 = intra block copy (allow_intrabc; decisions.h "Intra block copy"): blocks
     /// with an inter entry copy the frame's own reconstruction, and the frame has no post-filters
     pub allow_intrabc: u8,
-    pub reserved: [u8; 5],
+    /// video: the stream's size (the sequence header's largest frame, and every frame's render
+    /// size) when this frame is coded smaller (frame_size_override_flag; decisions.h "Reduced
+    /// frames"). 0, or the frame's own size: the frame is the stream's size.
+    pub stream_width: u16,
+    pub stream_height: u16,
+    pub reserved: [u8; 1],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)

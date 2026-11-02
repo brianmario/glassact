@@ -131,6 +131,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Try each directional mode's angle deltas (the preset's choice). Off
     /// trades ~0.1–0.9 % of bytes for ~20–30 % of the analysis.
     public var searchesAngleDeltas = true
+    /// With `searchesAngleDeltas`: search them only in an inter frame that
+    /// codes (doesn't copy) at most this share of its superblocks; key frames
+    /// and still pictures count as all coded. A picture that changes all over
+    /// (a key frame, a full-screen change) then codes ~30 % faster at 5K for
+    /// 0.3–1.7 % more of its bytes, and one that changes in places keeps them:
+    /// whole streams +0.3 % at most (BENCHMARKS.md). 1: always. Superblocks kept
+    /// from earlier pictures keep the analysis they had, either way.
+    public var angleDeltasUpToShare = 0.5
     /// Superblocks kept from the previous picture in the last one.
     public private(set) var lastKeptSuperblocks = 0
     var cache: AnalysisCache?
@@ -867,7 +875,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var params = isInter && encoder.interPreset != nil ? AV1MetalEncoder.params(for: encoder.interPreset!) : encoder.params
             params.leafDecide = decidesLeaves ? 1 : 0
             params.pruneVar = encoder.busyBlockPrune
-            if !encoder.searchesAngleDeltas { params.deltas = 0; params.uvDeltas = 0 }
+            // the share of the picture coded (not copied): the same with kept analysis as without
+            let codedShare = skipped.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
+            if !encoder.searchesAngleDeltas || codedShare > encoder.angleDeltasUpToShare { params.deltas = 0; params.uvDeltas = 0 }
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
             params.meSubpel = encoder.searchesSubpelMotion ? 1 : 0

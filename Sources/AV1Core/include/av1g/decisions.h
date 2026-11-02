@@ -232,6 +232,14 @@
  *   prediction must be at most 2^14 each way.  It is coded with NEWMV against the spec's DV
  *   prediction (MV_INTRABC_CONTEXT, whole samples).  Its av1g_block fields are an inter
  *   block's (mode fields 0; residual, tx_depth and tx types as inter blocks).
+ *
+ * Reduced frames (video, fp.stream_width/height set and larger than width/height).  The frame
+ *   is coded at width x height in a stream of stream_width x stream_height: the sequence
+ *   header's largest frame is the stream's size, the frame header codes frame_size_override_flag
+ *   and the frame's own size (inter frames: frame_size_with_refs, no found_ref), and its render
+ *   size is the stream's, so a decoder shows it scaled up to the stream's size.  Every frame of
+ *   a stream must give the same stream size.  An inter frame's reference must be the frame's
+ *   own size: this writer doesn't code scaled prediction, which a decoder would apply.
  * ==============================================================================
  */
 #ifndef AV1G_DECISIONS_H
@@ -324,7 +332,9 @@ typedef struct av1g_frame_params {
     uint8_t  mv_precision;         /* inter: 0 whole samples, 1 quarter, 2 eighth (see "Video mode") */
     uint8_t  sb128;                /* 1: 128x128 superblocks (see "Superblocks"); 0: 64x64 */
     uint8_t  allow_intrabc;        /* key frames: 1 = intra block copy (see "Intra block copy") */
-    uint8_t  reserved[5];
+    uint16_t stream_width;         /* video: the stream's size when this frame is coded smaller */
+    uint16_t stream_height;        /*   (see "Reduced frames"); 0 or width/height: full size */
+    uint8_t  reserved[1];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {

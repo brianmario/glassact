@@ -29,6 +29,7 @@ let av1SeqCommand = Command(
         .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
         .bool("chroma-angles", "screen the six angled chroma modes too (13 instead of 7)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
+        .string("deltas-up-to", "<share>", "search angle deltas only in pictures that analyze at most this share of their superblocks (0–1; default 0.5; 1: always)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
@@ -47,6 +48,8 @@ let av1SeqCommand = Command(
         .int("aom-threads", "<n>", 1...64, "libaom worker threads (default 8)"),
         .bool("score-rgb", "also score every frame as vquality scores HEVC: BT.601 luma of the decoded picture in BGRA against the trace frame (SSIM on 8x8 blocks, PSNR)"),
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
+        .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
+        .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
     ],
     run: { opts in
         let trace = opts.required("trace")
@@ -104,6 +107,13 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     let serial = opts.has("serial"), inter = opts.has("inter")
     if serial && inter { throw BenchError("--serial codes every picture alone: not with --inter") }
+    // reduced frames: the stream's size, which the pictures are shown at
+    var stream: (width: Int, height: Int)?
+    if opts.has("stream-width") {
+        let w = opts.int("stream-width", width) & ~1
+        guard inter, crop == nil, w >= width else { throw BenchError("--stream-width: with --inter, at least --width, not with --crop") }
+        stream = (w, (srcH * w / srcW) & ~1)
+    }
     print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")\(opts.has("cpu-decides") ? ", CPU decides chroma and tx" : ", GPU decides chroma and tx")\(inter ? ", inter frames" : ", intra frames")")
 
     let encoder = try AV1HybridEncoder(device: device)
@@ -114,7 +124,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.postfilters = !opts.has("no-filters")
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
+    if let v = opts.string("deltas-up-to") {
+        guard let f = Double(v), (0...1).contains(f) else { throw BenchError("--deltas-up-to \(v): a share 0–1") }
+        encoder.angleDeltasUpToShare = f
+    }
     encoder.interFrames = inter
+    encoder.streamSize = stream
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
     encoder.returnsPlanes = !opts.has("no-planes")
@@ -154,7 +169,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 
     var psnr = 0.0
     let scoreRGB = opts.has("score-rgb")
-    let rgb = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: width, height: height) : nil
+    let rgb = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
+                                       coded: stream == nil ? nil : (width, height)) : nil
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
     defer { glassact_aom_dec_destroy(decoder) }
     for (i, f) in frames.enumerated() {
@@ -172,7 +188,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
-    if let rgb { print(rgb.summary("hybrid")) }
+    if let rgb { print(rgb.summary(stream.map { "hybrid at \(width)×\(height) shown at \($0.width)×\($0.height)" } ?? "hybrid")) }
+    if let path = opts.string("ivf") {
+        try writeIVF(frames.map(\.obu), width: stream?.width ?? width, height: stream?.height ?? height, to: path)
+        print("             stream written to \(path)")
+    }
     if opts.has("digest") {
         var h: UInt64 = 0xcbf2_9ce4_8422_2325
         for f in frames { for b in f.obu { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 } }
@@ -316,17 +336,22 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 final class RGBScorer {
     let reader: ScapReader
     let width: Int, height: Int
+    /// Reduced frames: the size they're coded at, scaled up to width × height to be scored.
+    let coded: (width: Int, height: Int)?
     let full: UnsafeMutableRawBufferPointer, reference: UnsafeMutableRawBufferPointer, shown: UnsafeMutableRawBufferPointer
+    let small: UnsafeMutableRawBufferPointer
     var rects: [DirtyRect] = []
     var ssim = 0.0, psnr = 0.0, frames = 0
 
-    init(trace: String, skip: Int, width: Int, height: Int) throws {
+    init(trace: String, skip: Int, width: Int, height: Int, coded: (width: Int, height: Int)? = nil) throws {
         reader = try openTrace(trace)
         self.width = width
         self.height = height
+        self.coded = coded
         full = .allocate(byteCount: reader.header.width * reader.header.height * 4, alignment: 64)
         reference = .allocate(byteCount: width * height * 4, alignment: 64)
         shown = .allocate(byteCount: width * height * 4, alignment: 64)
+        small = .allocate(byteCount: coded.map { $0.width * $0.height * 4 } ?? 0, alignment: 64)
         for _ in 0..<skip { _ = try reader.readFrame(rects: &rects, into: full) }
     }
 
@@ -334,12 +359,18 @@ final class RGBScorer {
         full.deallocate()
         reference.deallocate()
         shown.deallocate()
+        small.deallocate()
     }
 
     func add(_ decoded: YUV420) throws {
         guard try reader.readFrame(rects: &rects, into: full) != nil else { throw BenchError("--score-rgb: the trace ended early") }
         resample(full, reader.header.width, reader.header.height, into: reference, width, height)
-        try decoded.bgra(into: shown)
+        if let coded {
+            try decoded.bgra(into: small)
+            resample(small, coded.width, coded.height, into: shown, width, height)
+        } else {
+            try decoded.bgra(into: shown)
+        }
         let (s, p) = lumaQuality(UnsafeRawBufferPointer(reference), UnsafeRawBufferPointer(shown), width, height)
         ssim += s
         if p.isFinite { psnr += p }
@@ -350,4 +381,17 @@ final class RGBScorer {
         String(format: "             %@, scored as vquality: SSIM mean %.4f · PSNR mean %.2f dB", name,
                ssim / Double(max(1, frames)), psnr / Double(max(1, frames)))
     }
+}
+
+/// `--ivf`: frames (temporal units) in an IVF file, as dav1d, aomdec and ffmpeg read them.
+func writeIVF(_ frames: [[UInt8]], width: Int, height: Int, to path: String) throws {
+    var v: [UInt8] = Array("DKIF".utf8)
+    func le(_ x: UInt64, _ n: Int) { for i in 0..<n { v.append(UInt8(truncatingIfNeeded: x >> (8 * i))) } }
+    le(0, 2); le(32, 2); v += Array("AV01".utf8)
+    le(UInt64(width), 2); le(UInt64(height), 2); le(60, 4); le(1, 4); le(UInt64(frames.count), 4); le(0, 4)
+    for (k, f) in frames.enumerated() {
+        le(UInt64(f.count), 4); le(UInt64(k), 8)
+        v += f
+    }
+    try Data(v).write(to: URL(fileURLWithPath: path))
 }

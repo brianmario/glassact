@@ -201,6 +201,8 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
+| Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
+| Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 
 **Rate control and transport**
 
@@ -264,6 +266,97 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
+
+Following the entry below: a picture coded smaller than its stream and shown scaled up to it (AV1's
+`frame_size_override_flag` with the stream's render size; decisions.h "Reduced frames",
+`av1seq --stream-width`), to bring a full-screen change at 5K near hardware HEVC's latency.
+
+**Decoders.** libaom streams with random frame sizes (`--resize-mode=2`) and random superres
+(`--superres-mode=2`): VideoToolbox (through ffmpeg) decodes every superres frame exactly as dav1d
+does, and the full-size inter frames predicted from reduced references exactly too (scaled
+prediction works). A reduced frame comes out of VideoToolbox already scaled up to the render
+size, so the Viewer's decoder, which expects full-size buffers, gets one. (Frames of odd width or
+height also differ, the known odd-size mismatch.) The writer's reduced key and inter frames decode
+exactly in dav1d and aomdec (`decoders`, a third of its sequences reduced).
+
+**Speed and the quality ceiling** (`--no-reuse --no-deltas` key frames, 8 frames; the ceiling is
+q2, the reduced stream decoded and scaled up with vImage, scored at 5120×2880 as `vquality`
+scores):
+
+| coded at | photos | typing-cc | ceiling at 5K, PSNR (SSIM) |
+|---|---|---|---|
+| 5120×2880 | 127.7 ms · 1.03 MB | 109.6 ms · 420 KB | — (q20: 43.3 / 47.3 dB) |
+| 3840×2160 | 75.9 ms · 702 KB | 90.0 ms · 437 KB | photos 34.1 dB (0.973), typing 36.2 (0.988) |
+| 2560×1440 | **35.4 ms** · 378 KB | **34.8 ms** · 286 KB | photos 29.8 (0.931), typing 30.0 (0.966), scroll 30.3 (0.972) |
+
+- **Half size reaches HEVC's latency** (35–47 ms a picture, entry below) and inter frames run at
+  80–300 a second, but scaling Retina content down 2× and back loses more than any quantizer: about
+  30 dB at best. Hardware HEVC's lowest point on photos (7.9 Mbit/s) is 32.5 dB (SSIM 0.925), and on
+  typing 35–42 dB at 0.3–0.7 Mbit/s. So HEVC is better than a half-size AV1 stream at any rate.
+- **3/4 size** is slower than HEVC and still below it (34–36 dB). On typing it saves little time
+  and no bytes: text no longer repeats on whole samples, so fewer intra block copies.
+- Kept: the writer's and parser's reduced frames (tested, unused); `av1seq --stream-width` and
+  `--ivf`.
+
+### Metal AV1, every superblock changing at 5K: where the time goes, and angle deltas gated (2026-11-02)
+
+**Where the time goes.** typing-cc at 5120×2880, 10 key frames analyzed whole (`--no-reuse`):
+153.8 ms a picture, of which the GPU analysis is 143.4 ms. The CPU's chroma (18.7), closed loop
+(24.5) and writer (7.2) overlap it. The analysis's stages (`--profile`, ms):
+
+| | 4×4 | 4×8 | 8×4 | 8×8 | 8×16 | 16×8 | 16×16 | 16×32 | 32×16 | 32×32 | 64×64 | leaves | all |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| turbo | 5.2 | 5.7 | 5.6 | 12.5 | 13.3 | 13.0 | 9.1 | 13.7 | 10.1 | 21.1 | 22.6 | 12.8 | 145 |
+| no angle deltas | 5.1 | 5.7 | 5.6 | 6.8 | 7.4 | 6.9 | 6.8 | 9.1 | 6.6 | 12.9 | 12.9 | 12.9 | 99 |
+
+**The faster presets, on the same key frames** (8 frames, q20; typing-cc / photos):
+
+| | ms a picture | bytes a picture | PSNR-Y |
+|---|---|---|---|
+| turbo (default) | 154.5 / 170.2 | 416.5 KB / 1.01 MB | 47.21 / 43.26 |
+| turbo2 (no 4×4, 4×8, 8×4) | 131.5 / 145.1 | 465.2 KB / 1.02 MB | 46.62 / 43.16 |
+| turbo3 (turbo2 without angle deltas) | 87.0 / 101.1 | 472.4 KB / 1.04 MB | 46.64 / 43.14 |
+| turbo, `--prune 1` | 146.0 / 162.1 | 419.8 KB / 1.01 MB | 47.20 / 43.26 |
+| turbo, no angle deltas | 109.5 / 127.1 | 420.3 KB / 1.03 MB | 47.26 / 43.26 |
+
+The small shapes earn their time on text; the angle deltas mostly don't.
+
+**BD-rate against angle deltas always on** (q 8–32, RGB luma PSNR as `vquality` scores; whole
+streams: first 100 frames `--inter`; key frames: 10 from frame 100, `--no-reuse`; libaom's tiling):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K stream, deltas off | +0.1 % | −0.2 % | +1.1 % | +0.1 % |
+| 5K stream, deltas only up to half the picture | +0.1 % | −0.2 % | **+0.3 %** | +0.1 % |
+| 5K key frames, either | +0.4 % | +0.6 % | +1.7 % | +0.3 % |
+| 720p stream, deltas off / gated | −0.1 / −0.1 % | −0.2 / −0.2 % | +0.3 / +0.2 % | −0.2 / −0.2 % |
+| 720p key frames, either | −0.2 % | −0.2 % | +0.8 % | −0.3 % |
+| 5K stream, turbo3 | +45.2 % | +17.3 % | +3.2 % | +12.4 % |
+
+**Speed** (q20, no scoring, median of 3 interleaved runs; inter frames a second, and ms a key
+frame analyzed whole), always / off / gated:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K stream | 326 / 336 / 346 | 224 / 242 / 230 | 87 / 98 / 88 | 335 / 336 / 336 |
+| 5K key frames | 154.4 / 109.6 / 109.4 | 147.1 / 105.4 / 105.1 | 169.8 / 127.7 / 125.2 | 150.1 / 106.1 / 106.2 |
+| 720p key frames | 14.8 / 13.0 / 13.1 | 15.0 / 12.6 / 12.4 | 16.3 / 15.5 / 15.4 | 15.3 / 12.8 / 12.8 |
+
+At 720p typing, four interleaved runs more: always 1007–1331, gated 1268–1323, off 1409–1437
+inter frames a second. The gate's streams are byte-identical to always-on's there.
+
+**Kept: deltas only in an inter frame that codes at most half its superblocks** (the rest copies;
+key frames count as all coded; `AV1MetalEncoder.angleDeltasUpToShare` 0.5). A full-screen change or
+key frame at 5K codes ~30 % faster (150–170 → 105–127 ms) for 0.3–1.7 % more of its bytes; whole
+streams lose at most 0.3 %. Off everywhere would also speed partial inter frames by 7–13 % (5K
+photos, 720p), which already run far above 60 a second, for photos' +1.1 %: not taken, bitrate
+first. Superblocks kept from an earlier picture keep the analysis they had, so a big change doesn't
+reset the cache. A first version gated on the share the cache left to analyze; that made a reusing
+encoder code differently from a fresh one (`regionFilteringStaysExactAcrossPresetChanges`), so the
+gate reads the copy mask, which both see. Its streams are byte-identical to the measured ones
+(`--digest`, 720p typing and photos, 5K photos).
 
 ### Hardware HEVC's per-picture latency at 5K, against AV1 when every superblock changes (2026-11-02)
 

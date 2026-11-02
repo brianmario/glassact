@@ -429,6 +429,7 @@ impl Hybrid {
             (f.refresh_frame_flags, f.error_resilient_mode) = (v.fp.refresh_frame_flags, v.fp.error_resilient_mode);
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
             (f.mv_precision, f.sb128) = (v.fp.mv_precision, v.fp.sb128);
+            (f.stream_width, f.stream_height) = (v.fp.stream_width, v.fp.stream_height);
             // from the reference's saved CDFs, where the slot has them
             f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
         }

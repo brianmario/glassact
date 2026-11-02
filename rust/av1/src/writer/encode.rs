@@ -664,6 +664,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.cdf_from_ref,
         fp.mv_precision,
         fp.sb128,
+        (fp.stream_width | fp.stream_height != 0) as u8,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
@@ -676,6 +677,16 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     }
     if fp.video == 0 && fp.frame_type != FRAME_KEY {
         fail!(ERR_INVALID, "inter frames need video mode");
+    }
+    if (fp.stream_width != 0 || fp.stream_height != 0)
+        && (fp.video == 0
+            || (fp.stream_width as u32) < fp.width
+            || (fp.stream_height as u32) < fp.height)
+    {
+        fail!(
+            ERR_INVALID,
+            "stream_width/height (reduced frames) need video mode and a stream at least the frame's size"
+        );
     }
     if fp.frame_type == FRAME_KEY {
         if fp.ref_slot != 0

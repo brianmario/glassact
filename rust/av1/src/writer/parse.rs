@@ -351,17 +351,28 @@ fn parse_frame(
                 fp.ref_slot = idx; // LAST_FRAME's; the only reference blocks may use
             }
         }
-        need!(!override_ || err_res, "frame_size_with_refs not supported");
+        if override_ && !err_res {
+            for _ in 0..REFS_PER_FRAME {
+                need!(br.f(1)? == 0, "found_ref (a size taken from a reference) not supported");
+            }
+        }
     }
     let (mut fw, mut fh) = (sq.max_w, sq.max_h);
     if override_ {
         fw = br.f(sq.wbits)? + 1;
         fh = br.f(sq.hbits)? + 1;
     }
+    let (mut rw, mut rh) = (fw, fh);
     if br.b()? {
         // render size
-        br.f(16)?;
-        br.f(16)?;
+        rw = br.f(16)? + 1;
+        rh = br.f(16)? + 1;
+    }
+    if (fw, fh) != (sq.max_w, sq.max_h) && (rw, rh) == (sq.max_w, sq.max_h) && !sq.still {
+        // a reduced frame (decisions.h "Reduced frames"): shown at the stream's size. Other
+        // render sizes are only a display hint, which the record doesn't carry.
+        fp.stream_width = rw as u16;
+        fp.stream_height = rh as u16;
     }
     if inter {
         // fp.mv_precision: force_integer_mv (intra frames: 1), else allow_high_precision_mv

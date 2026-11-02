@@ -128,6 +128,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.searchesAngleDeltas }
         set { metal.searchesAngleDeltas = newValue }
     }
+    /// See `AV1MetalEncoder.angleDeltasUpToShare`.
+    public var angleDeltasUpToShare: Double {
+        get { metal.angleDeltasUpToShare }
+        set { metal.angleDeltasUpToShare = newValue }
+    }
 
     /// Skip 32×32-and-up analysis where the source is busy
     /// (`AV1MetalEncoder.busyBlockPrune`; 4 by default, 0 off, 1 faster).
@@ -156,6 +161,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// decoded picture, which the deblocking leaves alone; the rest is coded as
     /// before, as intra blocks. Each inter frame references the one before it.
     public var interFrames = false
+
+    /// With `interFrames`: the stream's size, when its pictures are coded
+    /// smaller (decisions.h "Reduced frames"). A decoder shows each frame scaled
+    /// up to this size. Every picture of the stream must then be the same size:
+    /// nothing here codes prediction from a reference of another size.
+    public var streamSize: (width: Int, height: Int)?
 
     /// With `interFrames`: search the coded 64×64s for motion too (on). A block
     /// predicted from the previous picture at a vector, with a residual, takes the
@@ -524,6 +535,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         if interFrames {
             video.video = 1
             video.sb128 = streamSB128 ? 1 : 0
+            if let streamSize {
+                (video.stream_width, video.stream_height) = (UInt16(streamSize.width), UInt16(streamSize.height))
+            }
             if streamSB128, sbMotionIn == nil || reference == nil {
                 // a key frame: its blocks in the 128×128 superblocks' decode order
                 var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?

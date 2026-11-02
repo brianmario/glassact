@@ -113,7 +113,7 @@ pub(super) fn seeds(n: u64, f: impl Fn(&mut Writer, u64) + Sync) {
 /// several.
 #[test]
 fn inter_sequences_round_trip() {
-    let frames = round_trip_seqs(160, 200, |_| true);
+    let frames = round_trip_seqs(160, 200, false, |_| true);
     eprintln!(
         "{frames} frames; {}; {}; {}",
         coverage(),
@@ -122,6 +122,24 @@ fn inter_sequences_round_trip() {
     );
     assert_phase_coverage(20);
     assert_intrabc_coverage(20);
+}
+
+/// Random sequences whose frames are all coded smaller than their stream (decisions.h "Reduced
+/// frames") round-trip as [`inter_sequences_round_trip`]'s do.
+#[test]
+fn reduced_frames_round_trip() {
+    let frames = round_trip_seqs(60, 200, true, |_| true);
+    eprintln!("{frames} reduced frames");
+}
+
+/// Makes every frame of `seq` a reduced frame: a stream wider (and some seeds taller) than the
+/// frames, the same for the whole stream.
+fn reduce(seq: &mut InterSeq, seed: u64) {
+    let fp = seq.frames[0].fp;
+    let (sw, sh) = (fp.width + 1 + (seed % 97) as u32 * 13, fp.height + (seed % 3) as u32 * 41);
+    for rec in &mut seq.frames {
+        (rec.fp.stream_width, rec.fp.stream_height) = (sw as u16, sh as u16);
+    }
 }
 
 /// What intra block copy coded so far (walk::INTRABC_STAT).
@@ -153,15 +171,16 @@ pub(super) fn assert_intrabc_coverage(n: u64) {
 /// 128x128 node, 128-sample intra and inter blocks, skip and coded.
 #[test]
 fn sb128_sequences_round_trip() {
-    let frames = round_trip_seqs(240, 420, |s| s.frames[0].fp.sb128 != 0);
+    let frames = round_trip_seqs(240, 420, false, |s| s.frames[0].fp.sb128 != 0);
     eprintln!("{frames} frames; {}", sb128_coverage());
     assert!(frames > 300);
     assert_sb128_coverage(10);
 }
 
 /// The round trips of [`inter_sequences_round_trip`] for the sequences of `n` seeds that `pick`
-/// takes, sides up to `maxdim`. Returns the frame count.
-fn round_trip_seqs(n: u64, maxdim: i32, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
+/// takes, sides up to `maxdim`; with `reduced`, every frame coded smaller than its stream
+/// ([`reduce`]). Returns the frame count.
+fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
     let frames = std::sync::atomic::AtomicU64::new(0);
     seeds(n, |w, seed| {
         let Some(mut seq) = InterSeq::make(seed, maxdim, 6) else {
@@ -169,6 +188,9 @@ fn round_trip_seqs(n: u64, maxdim: i32, pick: impl Fn(&InterSeq) -> bool + Sync)
         };
         if !pick(&seq) {
             return;
+        }
+        if reduced {
+            reduce(&mut seq, seed);
         }
         let outs = match encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD) {
             Ok(o) => o,
@@ -210,6 +232,9 @@ fn round_trip_seqs(n: u64, maxdim: i32, pick: impl Fn(&InterSeq) -> bool + Sync)
             let Some(mut again) = InterSeq::make(seed, maxdim, 6) else {
                 return;
             };
+            if reduced {
+                reduce(&mut again, seed);
+            }
             let one = encode_seq(&mut Writer::with_threads(1), &mut again, ENC_FIX_RANGE | ENC_TD).unwrap();
             assert!(one == outs, "seed {seed}: threads");
         }
@@ -515,6 +540,12 @@ fn inter_records_refused() {
     let mut r = key.clone();
     r.fp.refresh_frame_flags = 1;
     bad("key frame refresh flags", &mut w, r, &refs);
+    let mut r = key.clone();
+    (r.fp.video, r.fp.stream_width, r.fp.stream_height) = (0, key.fp.width as u16 + 8, key.fp.height as u16);
+    bad("a still picture smaller than a stream", &mut w, r, &refs);
+    let mut r = key.clone();
+    (r.fp.stream_width, r.fp.stream_height) = (key.fp.width as u16 + 8, key.fp.height as u16 - 1);
+    bad("a stream smaller than its frame", &mut w, r, &refs);
     let mut r = inter.clone();
     r.fp.mv_precision = 3;
     bad("mv_precision 3", &mut w, r, &refs);
@@ -785,6 +816,9 @@ fn decoders() {
         let Some(mut seq) = InterSeq::make(seed, maxdim, nframes) else {
             return;
         };
+        if seed % 3 == 1 {
+            reduce(&mut seq, seed);
+        }
         let count =
             |c: &std::sync::atomic::AtomicU64, k: usize| c.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
         count(&sb128_frames, seq.frames.iter().filter(|r| r.fp.sb128 != 0).count());

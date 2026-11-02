@@ -687,7 +687,8 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
             2 => fp.qm_v = 16,
             _ => fp.using_qmatrix = 2,
         },
-        28 => fp.reserved[r.below(5) as usize] = 1,
+        // (stream_width / stream_height: the C++ has no such fields; inter_records_refused)
+        28 => fp.reserved[0] = 1,
         29 => fp.allow_screen_content_tools = 2,
         30 => {
             fp.tile_cols_log2 = r.below(8) as i8 - 1;
@@ -956,9 +957,10 @@ fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
         }
         Ok(r) => {
             assert_eq!(crc, OK, "{what}: rust parsed what the C++ rejects");
-            // the C++ has no video mode: a stream that isn't a still picture parses as one
+            // the C++ has no video mode (a stream that isn't a still picture parses as one) and no
+            // reduced frames
             let mut fp = r.rec.fp;
-            fp.video = 0;
+            (fp.video, fp.stream_width, fp.stream_height) = (0, 0, 0);
             assert_eq!(c.rec.fp, fp, "{what}: frame params");
             assert!(
                 c.rec.blocks == r.rec.blocks,
