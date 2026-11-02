@@ -89,6 +89,7 @@ just test             # everything; must be green before landing
 just test-asan        # AddressSanitizer
 just bench <args>     # release glassact-bench (replay, synth, goldens)
 just install-cli      # glassact → ~/.local/bin
+scripts/train-pruner all   # retrain the AV1 encoder's learned pruning from scripts/pruner-traces.txt; then `install`
 just release [Host|Viewer]   # Developer ID archive → notarize → staple → zip
 xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build   # or Viewer; "(Release)" schemes for perf
 ```

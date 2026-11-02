@@ -201,7 +201,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
-| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels | kept, on at 2,000 superblocks and up | 5K key frames 25–32 % faster on screen content (photos 9 %), BD −0.6 to 0.0 % against the variance rule; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
+| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes | kept, on at 2,000 superblocks and up | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 
@@ -374,6 +374,46 @@ On the GPU (q 8–32; key frames: 10 from frame 100 analyzed whole; streams: fir
 - eps 0.05 still costs typing 1.3 dB though the offline DP calls it nearly free: the open-loop J
   understates what a forced big block costs on text. Stay at 0.02 or below without new data.
 - More varied training traces (video, maps, image-heavy pages, IDEs) are the next lever.
+
+**Third version: a mode model too, and retraining tooling (2026-11-02, evening).**
+- **Where the time went next.** Inside the shapes the level model keeps, every block screens all 13
+  luma modes. Screening only DC, V, H and D45 (an experiment) took typing's analysis from 56 to 26
+  ms and its picture from 82 to 63 ms for 1–2 % of bytes: the screening is most of the work.
+- **The model.** Per whole node, its 8 statistics, 8 bins of its gradients' orientations (central
+  differences, the angle mod π, weighted by magnitude) and its level give a softmax over the 13
+  modes (21-24-13); the node keeps its likeliest until all but eps is kept, and its own blocks
+  screen only those (no angle deltas where a mask applies; full-change pictures have none
+  anyway). Labels: every analyzed block's best mode (the dumps' MODE section). Each trace scored by
+  a model trained on the others, eps 0.02: 3.7–6.0 modes screened, 1.9–3.6 % of chosen leaves'
+  modes dropped (their runner-up then codes them).
+- **A NaN.** The first sweep had +11 % on typing: at q8 1–6 % of nodes kept no mode at all, so
+  their blocks screened nothing. Metal's fast-math tanh overflows to NaN (∞/∞) for large
+  arguments, which q8's statistics reach; it's now clamped, in both networks, and an empty set
+  falls back to everything.
+
+BD-rate against no learned pruning (5K, q 8–32, as the second version's), and speed (median of 2
+interleaved runs; the typing stream's outlier re-run three times):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| key frames, levels only | −0.5 % | −0.3 % | 0.0 % | −0.6 % |
+| key frames, levels and modes (eps 0.02) | −0.3 % | −0.2 % | 0.0 % | −0.6 % |
+| key frames, modes at eps 0.05 | −0.4 % | 0.0 % | +0.1 % | −0.6 % |
+| streams, levels and modes | 0.0 % | −0.1 % | 0.0 % | −0.8 % |
+| key frame ms: none / levels / both | 108.3 / 80.8 / **70.9** | 105.7 / 72.4 / **64.6** | 126.3 / 115.8 / 107.8 | 106.5 / 79.2 / **68.3** |
+| stream, inter frames a second: none / both | 350 / 352 | 229 / 230 | 89.5 / 89.8 | 331 / 337 |
+
+Kept, eps 0.02 (`AV1PrunerWeights.modeV1`; `av1seq --no-ml-modes`, `--ml-mode-eps`). A 5K
+full-screen change of text now codes in ~65–71 ms, from ~154 this morning.
+
+**Retraining.** `scripts/pruner-traces.txt` lists the traces with their training and test frames;
+`scripts/train-pruner` dumps the training pictures (to ~/Library/Caches/Glass Act/pruner: screen
+content stays out of the repo), scores both models leave-one-trace-out, trains and exports them,
+and compares new weights with the shipped ones on the test frames (BD-rate and speed, waiting while
+anyone is connected); `install` puts the new weights in Sources. From the manifest as committed,
+`dump` then `export` reproduces the shipped AV1PrunerWeights.swift byte for byte. The dumps are
+tagged sections (PICT, LEAF, NODE, MODE), so a new model's data is a new section that older
+readers skip.
 
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 

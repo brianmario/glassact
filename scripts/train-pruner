@@ -1,0 +1,218 @@
+#!/usr/bin/env python3 -I
+"""Retrains the Metal AV1 encoder's learned pruning (Sources/GlassActAV1/Shaders/k_ml.h) from the
+traces in scripts/pruner-traces.txt, and measures new weights against the shipped ones.
+
+  scripts/train-pruner dump       dump each trace's training pictures (skips ones already dumped)
+  scripts/train-pruner eval       each trace scored by models trained on the others
+  scripts/train-pruner export     train on everything: <work>/weights.bin and AV1PrunerWeights.swift
+  scripts/train-pruner compare    BD-rate and speed of <work>/weights.bin against the shipped
+                                  weights, on each trace's test frames (waits while anyone is
+                                  connected: timing a shared screen is meaningless)
+  scripts/train-pruner install    copy <work>/AV1PrunerWeights.swift into Sources/GlassActAV1
+  scripts/train-pruner all        dump, eval, export, compare
+
+Options: --manifest <file> (default scripts/pruner-traces.txt), --work <dir> (default
+~/Library/Caches/Glass Act/pruner: dumps are screen content, so never in the repo), --traces <dir>
+(default ~/Library/Application Support/Glass Act/traces), --redump. Training settings are the
+shipped weights' (SUB=3, STEPS=3000000): with the same dumps, export reproduces them exactly.
+
+After `install`, record what `compare` printed in BENCHMARKS ("learned pruning of the analysis")
+and run the AV1 tests (just test-fast).
+"""
+import argparse
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QUANTIZERS = (8, 20, 32)          # dump: each picture at these q
+SMALL_WIDTH = 1280                # dump: and at this width besides the trace's own
+SPREAD = 5                        # dump: pictures from a train range
+COMPARE_Q = (8, 14, 20, 26, 32)   # compare: BD-rate over these q
+TRAIN_ENV = {"SUB": "3", "STEPS": "3000000"}
+
+
+def sh(cmd, env=None, capture=False):
+    e = dict(os.environ, **(env or {}))
+    if capture:
+        return subprocess.run(cmd, env=e, check=True, capture_output=True, text=True).stdout
+    subprocess.run(cmd, env=e, check=True)
+
+
+def manifest(path, traces_dir):
+    out = []
+    for n, line in enumerate(open(path), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        f = line.split()
+        if len(f) != 4:
+            sys.exit(f"{path}:{n}: want <file> <train frames> <test frames> <name>")
+        file, train, test, name = f
+        if "-" in train and "," not in train:
+            a, b = map(int, train.split("-"))
+            frames = sorted({a + round(i * (b - a) / (SPREAD - 1)) for i in range(SPREAD)})
+        else:
+            frames = [int(x) for x in train.split(",")]
+        t0, t1 = map(int, test.split("-"))
+        if any(t0 <= x <= t1 for x in frames):
+            sys.exit(f"{path}:{n}: train frames overlap the test frames")
+        p = os.path.join(traces_dir, file)
+        if not os.path.exists(p):
+            print(f"train-pruner: {file} ({name}) isn't in {traces_dir}: skipped", file=sys.stderr)
+            continue
+        # the dumps' trace key: no '-' (the trainer groups by what's before the first one)
+        key = os.path.splitext(file)[0].replace("-", "_")
+        out.append(dict(file=p, frames=frames, test=(t0, t1), name=name, key=key))
+    if not out:
+        sys.exit("train-pruner: no traces")
+    return out
+
+
+def bench():
+    sh([os.path.join(ROOT, "scripts/build-rust")])
+    sh(["swift", "build", "-c", "release", "--product", "glassact-bench", "--package-path", ROOT])
+    return os.path.join(ROOT, ".build/release/glassact-bench")
+
+
+def trainer():
+    sh(["cargo", "build", "--quiet", "--release", "--example", "prune_train",
+        "--manifest-path", os.path.join(ROOT, "rust/av1/Cargo.toml")])
+    return os.path.join(ROOT, "rust/av1/target/release/examples/prune_train")
+
+
+def dump(args, traces, b):
+    os.makedirs(args.dumps, exist_ok=True)
+    n = 0
+    for t in traces:
+        widths = [t["width"], SMALL_WIDTH] if t["width"] != SMALL_WIDTH else [SMALL_WIDTH]
+        for frame in t["frames"]:
+            for q in QUANTIZERS:
+                for w in widths:
+                    d = os.path.join(args.dumps, f'{t["key"]}-{frame}-q{q}-w{w}')
+                    if os.path.exists(os.path.join(d, "p000.bin")) and not args.redump:
+                        continue
+                    sh([b, "av1seq", "--trace", t["file"], "--width", str(w), "--frames", "1", "--skip", str(frame),
+                        "--q", str(q), "--dump-partition", d], capture=True)
+                    n += 1
+        print(f'train-pruner: {t["name"]}: dumped')
+    print(f"train-pruner: {n} pictures dumped to {args.dumps}")
+
+
+def evaluate(args):
+    sh([trainer(), args.dumps], env={"SUB": "8", "STEPS": "3000000"})
+
+
+def export(args):
+    p = trainer()
+    sh([p, args.dumps], env=dict(TRAIN_ENV, EXPORT=os.path.join(args.work, "weights.bin")))
+    sh([p, args.dumps], env=dict(TRAIN_ENV, EXPORT=os.path.join(args.work, "AV1PrunerWeights.swift")))
+    print(f"train-pruner: {args.work}/weights.bin and AV1PrunerWeights.swift; `install` puts the latter in Sources")
+
+
+def install(args):
+    src = os.path.join(args.work, "AV1PrunerWeights.swift")
+    dst = os.path.join(ROOT, "Sources/GlassActAV1/AV1PrunerWeights.swift")
+    with open(src) as f, open(dst, "w") as g:
+        g.write(f.read())
+    print(f"train-pruner: installed {dst}")
+
+
+def connected():
+    out = subprocess.run(["ioreg", "-n", "Root", "-d1", "-a"], capture_output=True, text=True).stdout
+    m = re.search(r"<key>CGSSessionScreenIsLocked</key>\s*<(true|false)/>", out)
+    return not (m and m.group(1) == "true")
+
+
+def bd(a, b):
+    """BD-rate of b against a: points (bytes, PSNR), mean log-rate difference over the PSNR overlap."""
+    def interp(p, x):
+        p = sorted(p, key=lambda v: v[1])
+        for (r0, q0), (r1, q1) in zip(p, p[1:]):
+            if q0 <= x <= q1 and q1 > q0:
+                t = (x - q0) / (q1 - q0)
+                return math.log(r0) * (1 - t) + math.log(r1) * t
+        return None
+    lo = max(min(q for _, q in a), min(q for _, q in b))
+    hi = min(max(q for _, q in a), max(q for _, q in b))
+    xs = [lo + (hi - lo) * i / 60 for i in range(61)]
+    d = [interp(b, x) - interp(a, x) for x in xs if interp(a, x) is not None and interp(b, x) is not None]
+    return (math.exp(sum(d) / len(d)) - 1) * 100 if d else float("nan")
+
+
+def compare(args, traces, b):
+    weights = os.path.join(args.work, "weights.bin")
+    if not os.path.exists(weights):
+        sys.exit(f"train-pruner: no {weights}: run export first")
+    configs = [("shipped", []), ("new", ["--ml-prune", weights])]
+
+    def run(t, extra):
+        while connected():
+            print("train-pruner: someone is connected; waiting", file=sys.stderr)
+            time.sleep(60)
+        tiles = "3x0" if t["width"] >= 2560 else "2x0"  # libaom's tiling, as the benchmarks use
+        out = sh([b, "av1seq", "--trace", t["file"], "--width", str(t["width"]), "--tiles", tiles] + extra, capture=True)
+        ms = re.search(r"hybrid +[\d.]+ fps \(([\d.]+) ms a frame\) · ([\d.]+) ([KM]?B) a frame", out)
+        ps = re.search(r"scored as vquality: SSIM mean [\d.]+ · PSNR mean ([\d.]+)", out)
+        ifs = re.search(r"([\d.]+) inter frames a second", out)
+        size = float(ms.group(2)) * {"B": 1, "KB": 1024, "MB": 1048576}[ms.group(3)] if ms else None
+        return dict(ms=float(ms.group(1)) if ms else None, bytes=size, psnr=float(ps.group(1)) if ps else None,
+                    ifs=float(ifs.group(1)) if ifs else None)
+
+    print(f"{'trace':14} {'key frames BD':>14} {'stream BD':>10} {'key ms shipped→new':>20} {'inter/s shipped→new':>21}")
+    for t in traces:
+        t0, t1 = t["test"]
+        key = ["--frames", "10", "--skip", str(t0), "--no-reuse"]
+        stream = ["--frames", str(min(100, t1 - t0 + 1)), "--skip", str(t0), "--inter"]
+        pts = {}
+        for name, flags in configs:
+            for kind, extra in (("key", key), ("stream", stream)):
+                pts[(name, kind)] = [(r["bytes"], r["psnr"]) for q in COMPARE_Q
+                                     for r in [run(t, extra + flags + ["--q", str(q), "--score-rgb"])]]
+        speed = {}
+        for _ in range(3):  # interleaved, medians
+            for name, flags in configs:
+                speed.setdefault((name, "key"), []).append(run(t, key + flags + ["--q", "20"])["ms"])
+                speed.setdefault((name, "stream"), []).append(run(t, stream + flags + ["--q", "20", "--no-planes"])["ifs"])
+        med = {k: statistics.median(v) for k, v in speed.items()}
+        print(f'{t["name"]:14} {bd(pts[("shipped", "key")], pts[("new", "key")]):+13.2f}% '
+              f'{bd(pts[("shipped", "stream")], pts[("new", "stream")]):+9.2f}% '
+              f'{med[("shipped", "key")]:9.1f} → {med[("new", "key")]:6.1f} '
+              f'{med[("shipped", "stream")]:10.0f} → {med[("new", "stream")]:6.0f}')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["dump", "eval", "export", "compare", "install", "all"])
+    ap.add_argument("--manifest", default=os.path.join(ROOT, "scripts/pruner-traces.txt"))
+    ap.add_argument("--work", default=os.path.expanduser("~/Library/Caches/Glass Act/pruner"))
+    ap.add_argument("--traces", default=os.path.expanduser("~/Library/Application Support/Glass Act/traces"))
+    ap.add_argument("--redump", action="store_true", help="dump again pictures already dumped")
+    args = ap.parse_args()
+    args.dumps = os.path.join(args.work, "dumps")
+    os.makedirs(args.work, exist_ok=True)
+    if args.command == "install":
+        return install(args)
+    traces = manifest(args.manifest, args.traces)
+    if args.command in ("eval", "export"):
+        return evaluate(args) if args.command == "eval" else export(args)
+    b = bench()
+    for t in traces:
+        t["width"] = int(sh([b, "av1seq", "--trace", t["file"], "--print-size"], capture=True).split()[0])
+    if args.command == "dump":
+        dump(args, traces, b)
+    elif args.command == "compare":
+        compare(args, traces, b)
+    else:
+        dump(args, traces, b)
+        evaluate(args)
+        export(args)
+        compare(args, traces, b)
+
+
+if __name__ == "__main__":
+    main()

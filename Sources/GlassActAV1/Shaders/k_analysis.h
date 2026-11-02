@@ -296,13 +296,17 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             __syncwarp();
         } else {
         if (lane < 32) { S.satd[lane] = 0.f; S.cand[lane] = 0; }
-        if (lane < 13) S.cand[lane] = cand_pack(lane, 0);
         __syncwarp();
-        // ---- screening: 13 modes at delta 0 ----
+        // Glass Act: the modes learned mode pruning leaves (all 13 without it), packed in order
+        const uint mm = ml_mode_mask(I, x, y, W, H);
+        if (lane < 13 && (mm >> lane & 1)) S.cand[popcount(mm & ((1u << lane) - 1u))] = cand_pack(lane, 0);
+        __syncwarp();
+        // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
-        warp_screen<W, H>(src, sp, S.cand, 0, 13, S.satd, A, L, dcv, lane, ssub);
-        int ncand = 13;
-        const bool allowDelta = P.deltas && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
+        int ncand = (int)popcount(mm);
+        warp_screen<W, H>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
+        // (angle deltas read S.satd by mode: only with every mode screened)
+        const bool allowDelta = P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
         if (allowDelta) {
             // best two directional modes by screening cost
             int b0 = -1, b1 = -1;

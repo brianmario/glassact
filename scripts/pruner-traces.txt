@@ -1,0 +1,19 @@
+# The traces the Metal AV1 encoder's learned pruning trains and is tested on (scripts/train-pruner;
+# BENCHMARKS "learned pruning of the analysis"). One trace a line:
+#
+#   <file in ~/Library/Application Support/Glass Act/traces>  <train frames>  <test frames>  <name>
+#
+# Train frames are a range, first-last inclusive (`train-pruner dump` takes 5 pictures spread over
+# it), or a comma list of frames. Test frames are a range: `train-pruner compare` codes its first
+# frames (key frames: 10 of them; streams: up to 100). The two mustn't overlap. A trace without
+# its file is skipped with a warning, so this list can name traces only some Macs have.
+#
+# Record new ones with the Host's trace recorder; content the model hasn't seen (video, maps,
+# image-heavy pages, IDEs, other display sizes) helps most. Traces are screen captures: they
+# stay out of the repo (*.scap is ignored), and so do the dumps made from them.
+
+# (the frames the shipped weights were trained on)
+glassact-1786116323.scap  120,150,185,220,255  0-109  typing-cc
+glassact-1786116475.scap  150,240,330,420,510  0-109  scroll-win
+glassact-1786116654.scap  150,240,330,420,510  0-109  photos
+glassact-1786116861.scap  150,240,330,420,510  0-109  cursor-drag

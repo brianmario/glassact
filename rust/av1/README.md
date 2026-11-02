@@ -36,10 +36,11 @@ cargo test --release -- --ignored --nocapture bench            # micro-benchmark
 feature compiles it, together with the shims in `oracle/*.cpp`, and the tests compare the two
 output for output. It's never linked into the product.
 
-`examples/prune_train.rs` trains the Metal analysis's learned pruning (`Shaders/k_ml.h`) on
-pictures `glassact-bench av1seq --dump-partition` writes, and exports
-`Sources/GlassActAV1/AV1PrunerWeights.swift`. Its file comment has the commands; BENCHMARKS the
-data the shipped weights came from.
+`examples/prune_train.rs` trains the Metal analysis's learned pruning (`Shaders/k_ml.h`: a tree
+level model and a luma mode model) on pictures `glassact-bench av1seq --dump-partition` writes, and
+exports `Sources/GlassActAV1/AV1PrunerWeights.swift`. `scripts/train-pruner` runs it end to end
+from the traces listed in `scripts/pruner-traces.txt`: add a trace there and run
+`scripts/train-pruner all`, then `install`. BENCHMARKS has the data the shipped weights came from.
 
 `src/tables` is generated from the C table headers (`scripts/gen-av1-rust-tables`) so that the CPU
 and the GPU use the same values. Never edit it by hand. The inter frames' tables

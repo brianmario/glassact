@@ -42,8 +42,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// An inter frame's (`beginPartition(motion:)`): every block's motion, parallel to
         /// `blocks` (an inter block's intra fields are 0); empty otherwise.
         public var inter: [av1g_block_inter] = []
-        /// With `dumpsNodeCosts`: per SB (raster) GP_DP_DEBUG floats, as k_dp writes them.
+        /// With `dumpsTrainingData`: per SB (raster) GP_DP_DEBUG floats, as k_dp writes them.
         public var nodeCosts: [Float] = []
+        /// With `dumpsTrainingData`: per analyzed shape (bsize), its grid and each block's best
+        /// luma candidate (GpBlockRes.cand[0]: mode << 3 | delta + 3; 255: none).
+        public var blockModes: [(shape: Int, columns: Int, rows: Int, modes: [UInt8])] = []
         /// The source the analysis read (`beginPartition`'s): Y, U and V padded to whole 64×64s
         /// by edge replication, rows `sourceStrides` apart. It's the encoder's until the next
         /// picture's partition is read, and then goes back to its pool (the picture after next
@@ -362,7 +365,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     public var interPreset: Preset?
     let recon: any MTLComputePipelineState
     let mlStats: any MTLComputePipelineState, mlCell: any MTLComputePipelineState
-    let mlTree: any MTLComputePipelineState, mlList: any MTLComputePipelineState
+    let mlTree: any MTLComputePipelineState, mlList: any MTLComputePipelineState, mlMode: any MTLComputePipelineState
     var params: GpParams
 
     /// Learned pruning of the analysis (k_ml.h). A small network per 8×8
@@ -371,24 +374,45 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// will choose; the cell keeps its likeliest levels until all but `eps` of
     /// the probability is kept, and the analysis skips the shapes of levels no
     /// cell of a node keeps (repaired so each cell's levels stay reachable).
-    /// The variance rule then stands aside. Only in pictures of at least
+    /// The variance rule then stands aside. A second network per node (with
+    /// its gradients' orientations) picks the luma modes the node's blocks
+    /// screen, of the 13. Only in pictures of at least
     /// `learnedPruneMinSuperblocks` that code more than `overShare` of their
-    /// superblocks (key frames count as all). A 5K key frame then analyzes
-    /// ~25–32 % faster on screen content for no bytes (BENCHMARKS.md). nil: off
-    /// (the hybrid encoder turns it on).
-    public var learnedPrune: (weights: [Float], eps: Float, overShare: Double)? {
+    /// superblocks (key frames count as all). Retrain with scripts/train-pruner
+    /// (BENCHMARKS.md has what each model buys). nil: off (the hybrid encoder
+    /// turns it on).
+    public var learnedPrune: LearnedPrune? {
         didSet {
-            mlWeights = learnedPrune.flatMap { lp in
-                lp.weights.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
+            func buffer(_ w: [Float]) -> (any MTLBuffer)? {
+                w.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
             }
+            mlWeights = learnedPrune.flatMap { buffer($0.levelWeights) }
+            mlModeWeights = learnedPrune?.modeWeights.flatMap { buffer($0) }
         }
     }
-    var mlWeights: (any MTLBuffer)?
+    /// The learned pruning's models and settings (k_ml.h; AV1PrunerWeights has the shipped ones).
+    public struct LearnedPrune: Sendable {
+        /// The level model (ML_FLOATS): which tree levels each 8×8 cell keeps.
+        public var levelWeights: [Float]
+        /// A cell keeps its likeliest levels until all but this much probability is kept.
+        public var eps: Float
+        /// The mode model (ML_MODE_FLOATS), or nil: every node's blocks screen all 13 modes.
+        public var modeWeights: [Float]?
+        /// A node keeps its likeliest modes until all but this much probability is kept.
+        public var modeEps: Float
+        /// Only in pictures coding more than this share of their superblocks.
+        public var overShare: Double
+        public init(levelWeights: [Float], eps: Float, modeWeights: [Float]?, modeEps: Float, overShare: Double) {
+            (self.levelWeights, self.eps, self.modeWeights, self.modeEps, self.overShare) = (levelWeights, eps, modeWeights, modeEps, overShare)
+        }
+    }
+    var mlWeights: (any MTLBuffer)?, mlModeWeights: (any MTLBuffer)?
     /// Learned pruning's least picture: below it the passes cost more than they
     /// save (at 720p a moving picture codes up to ~20 % slower).
     public var learnedPruneMinSuperblocks = 2000
-    /// Research: `partition` also returns the DP's per-node costs (`Partition.nodeCosts`).
-    public var dumpsNodeCosts = false
+    /// Training data for the learned pruning (`glassact-bench av1seq --dump-partition`):
+    /// `partition` also returns the DP's per-node costs and every analyzed block's best mode.
+    public var dumpsTrainingData = false
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
     public private(set) var lastGPUSeconds: Double = 0
 
@@ -463,11 +487,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         else { throw Failure.metal("no k_leaf") }
         leafScan = try Self.pipeline(leafScanFunction, threads: 1024, device: device)
         leaf = try Self.pipeline(leafFunction, threads: Self.leafThreads, device: device)
-        let ml = try ["k_ml_stats", "k_ml_cell", "k_ml_tree", "k_ml_list"].map { name in
+        let ml = try ["k_ml_stats", "k_ml_cell", "k_ml_tree", "k_ml_list", "k_ml_mode"].map { name in
             guard let f = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }
             return try Self.pipeline(f, threads: 64, device: device)
         }
-        (mlStats, mlCell, mlTree, mlList) = (ml[0], ml[1], ml[2], ml[3])
+        (mlStats, mlCell, mlTree, mlList, mlMode) = (ml[0], ml[1], ml[2], ml[3], ml[4])
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
@@ -581,6 +605,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var part = Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
         if let b = run.nodeCostBuffer {
             part.nodeCosts = Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: Float.self), count: b.length / 4))
+            let results = run.blockResults.contents().assumingMemoryBound(to: GpBlockRes.self)
+            for s in 0..<Int(GP_NSHAPES) where run.shapeColumns[s] > 0 {
+                let columns = Int(run.shapeColumns[s]), count = Int(run.shTotal[s])
+                let modes = (0..<count).map { k -> UInt8 in
+                    let r = results[Int(run.shapeOffset[s]) + k]
+                    return r.ncand > 0 ? r.cand.0 : 255
+                }
+                part.blockModes.append((s, columns, count / columns, modes))
+            }
         }
         return part
     }
@@ -681,7 +714,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var mlMask: (any MTLBuffer)?
         var mlStatsBuffer: (any MTLBuffer)?, mlKeep: (any MTLBuffer)?, mlListBuffer: (any MTLBuffer)?, mlCounts: (any MTLBuffer)?
         var mlBases: [UInt32] = []
-        /// `dumpsNodeCosts`: the DP's per-node costs (GP_DP_DEBUG floats per SB).
+        /// The mode model's per-node masks (from `mlModeBases` per level), when it runs.
+        var mlModes: (any MTLBuffer)?
+        var mlModeBases: [UInt32] = []
+        /// `dumpsTrainingData`: the DP's per-node costs (GP_DP_DEBUG floats per SB).
         var nodeCostBuffer: (any MTLBuffer)?
         var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
@@ -763,13 +799,21 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 mlMask = mask
                 image.mlSkip = AV1MetalEncoder.address(mask)
                 image.cols8 = Int32(aw / 8)
-                var base: UInt32 = 0
+                var base: UInt32 = 0, nodes: UInt32 = 0
                 for level in 0..<4 {
                     let n = 8 << level
                     mlBases.append(base)
-                    base += UInt32((width / n) * (height / n) * 8)
+                    mlModeBases.append(nodes)
+                    base += UInt32((width / n) * (height / n) * 16)  // ML_STRIDE floats a node
+                    nodes += UInt32((width / n) * (height / n))
                 }
                 mlStatsBuffer = try make(Int(max(base, 1)) * 4)
+                if encoder.mlModeWeights != nil {
+                    let modes = try make(Int(max(nodes, 1)) * 2)
+                    mlModes = modes
+                    image.mlModes = AV1MetalEncoder.address(modes)
+                    image.mlModeBase = (mlModeBases[0], mlModeBases[1], mlModeBases[2], mlModeBases[3])
+                }
                 mlKeep = try make(aw / 8 * (ah / 8))
                 mlCounts = try make(Int(GP_NSHAPES) * 4)
             }
@@ -928,7 +972,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 batch.mlList = AV1MetalEncoder.address(list)
                 batch.mlCount = AV1MetalEncoder.address(counts)
             }
-            if encoder.dumpsNodeCosts {
+            if encoder.dumpsTrainingData {
                 let debug = try make(sbCols * sbRows * Int(GP_DP_DEBUG) * 4)
                 nodeCostBuffer = debug
                 batch.dpDebug = AV1MetalEncoder.address(debug)
@@ -1014,6 +1058,23 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     e.dispatchThreads(g, threadsPerThreadgroup: t)
                 }
                 e.memoryBarrier(scope: .buffers)
+                if let modes = mlModes, let modeWeights = encoder.mlModeWeights {
+                    // each whole node's modes, beside the cells' network
+                    var modeEps = lp.modeEps
+                    e.setComputePipelineState(encoder.mlMode)
+                    e.setBuffer(stats, offset: 0, index: 3)
+                    e.setBuffer(modeWeights, offset: 0, index: 5)
+                    e.setBytes(&modeEps, length: 4, index: 7)
+                    e.setBuffer(modes, offset: 0, index: 10)
+                    for level in 0..<4 {
+                        var lv = UInt32(level), base = mlBases[level]
+                        let n = 8 << level
+                        e.setBytes(&lv, length: 4, index: 2)
+                        e.setBytes(&base, length: 4, index: 4)
+                        let (g, t) = threads((width / n) * (height / n))
+                        e.dispatchThreads(g, threadsPerThreadgroup: t)
+                    }
+                }
                 var eps = lp.eps
                 e.setComputePipelineState(encoder.mlCell)
                 e.setBytes(mlBases, length: 16, index: 4)

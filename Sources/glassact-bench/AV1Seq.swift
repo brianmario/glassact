@@ -50,7 +50,10 @@ let av1SeqCommand = Command(
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
-        .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export)"),
+        .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export: the level model, then the mode model's if present)"),
+        .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
+        .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
+        .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
         .string("ml-eps", "<p>", "learned pruning: a cell keeps its likeliest levels until all but this much probability is kept (default 0.02)"),
         .bool("no-ml-prune", "no learned pruning (the variance rule instead)"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
@@ -63,6 +66,10 @@ let av1SeqCommand = Command(
 )
 
 func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
+    if opts.has("print-size") {
+        print("\(reader.header.width) \(reader.header.height)")
+        return
+    }
     guard #available(macOS 27, *) else { throw BenchError("av1seq needs macOS 27 (MSL 4.1)") }
     guard glassact_aom_available() != 0 else { throw BenchError("av1seq needs libaom (Apple silicon)") }
     guard let device = MTLCreateSystemDefaultDevice() else { throw BenchError("no Metal device") }
@@ -135,15 +142,22 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("no-ml-prune") {
         encoder.learnedPrune = nil
-    } else if opts.has("ml-prune") || opts.has("ml-eps") || opts.has("ml-over") {
-        var weights = AV1PrunerWeights.cellV1
+    } else {
+        var lp = AV1HybridEncoder.defaultLearnedPrune
         if let path = opts.string("ml-prune") {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
-            weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            guard weights.count == 982 else { throw BenchError("--ml-prune: \(weights.count) floats, not 982 (k_ml.h ML_FLOATS)") }
+            let weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            let (level, mode) = (AV1PrunerWeights.cellV1.count, AV1PrunerWeights.modeV1.count)
+            guard weights.count == level || weights.count == level + mode
+            else { throw BenchError("--ml-prune: \(weights.count) floats, not \(level) (levels) or \(level + mode) (levels and modes)") }
+            lp.levelWeights = Array(weights.prefix(level))
+            lp.modeWeights = weights.count > level ? Array(weights.suffix(mode)) : nil
         }
-        encoder.learnedPrune = (weights, Float(opts.string("ml-eps").flatMap(Float.init) ?? 0.02),
-                                Double(opts.string("ml-over").flatMap(Double.init) ?? 0.5))
+        if let v = opts.string("ml-eps").flatMap(Float.init) { lp.eps = v }
+        if let v = opts.string("ml-mode-eps").flatMap(Float.init) { lp.modeEps = v }
+        if let v = opts.string("ml-over").flatMap(Double.init) { lp.overShare = v }
+        if opts.has("no-ml-modes") { lp.modeWeights = nil }
+        encoder.learnedPrune = lp
     }
     if let v = opts.string("deltas-up-to") {
         guard let f = Double(v), (0...1).contains(f) else { throw BenchError("--deltas-up-to \(v): a share 0–1") }
@@ -419,9 +433,10 @@ func writeIVF(_ frames: [[UInt8]], width: Int, height: Int, to path: String) thr
     try Data(v).write(to: URL(fileURLWithPath: path))
 }
 
-/// `--dump-partition`: for each picture, `<dir>/pNNN.bin`: width, height, qindex (UInt32 each), the
-/// luma plane, the leaf count (UInt32) and the leaves as av1g_block records, then the DP's node
-/// costs (count, floats: GP_DP_DEBUG per 64x64, raster).
+/// `--dump-partition`: for each picture, `<dir>/pNNN.bin`, the learned pruning's training data
+/// (rust/av1/examples/prune_train.rs reads it): "GAML", version 2, then tagged sections: PICT
+/// (size, qindex, luma), LEAF (the full search's leaves), NODE (the DP's node costs), MODE (each
+/// analyzed block's best luma candidate).
 @available(macOS 27, *)
 func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, preset: AV1MetalEncoder.Preset,
                     device: any MTLDevice, to dir: String) throws {
@@ -432,17 +447,33 @@ func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, 
     metal.busyBlockPrune = 0
     metal.searchesAngleDeltas = false
     metal.tiling = (2, 0)
-    metal.dumpsNodeCosts = true
+    metal.dumpsTrainingData = true
     for (i, p) in pictures.enumerated() {
         let part = try metal.partition(y: p.planes[0], u: p.planes[1], v: p.planes[2], width: width, height: height, qindex: qindex)
-        var data = Data()
-        for v in [width, height, qindex] { withUnsafeBytes(of: UInt32(v)) { data.append(contentsOf: $0) } }
-        data.append(contentsOf: p.planes[0].prefix(width * height))
-        withUnsafeBytes(of: UInt32(part.blocks.count)) { data.append(contentsOf: $0) }
-        part.blocks.withUnsafeBytes { data.append(contentsOf: $0) }
-        // then the DP's node costs: their count (UInt32) and the floats
-        withUnsafeBytes(of: UInt32(part.nodeCosts.count)) { data.append(contentsOf: $0) }
-        part.nodeCosts.withUnsafeBytes { data.append(contentsOf: $0) }
+        // "GAML", version 2, then tagged sections (4-byte tag, UInt32 length, payload); readers
+        // skip tags they don't know, so a new model's data is a new section
+        var data = Data("GAML".utf8)
+        func u32(_ v: Int, into d: inout Data) { withUnsafeBytes(of: UInt32(v)) { d.append(contentsOf: $0) } }
+        u32(2, into: &data)
+        func section(_ tag: String, _ body: (inout Data) -> Void) {
+            var payload = Data()
+            body(&payload)
+            data.append(contentsOf: Data(tag.utf8))
+            u32(payload.count, into: &data)
+            data.append(payload)
+        }
+        section("PICT") { d in  // width, height, qindex, the luma plane
+            for v in [width, height, qindex] { u32(v, into: &d) }
+            d.append(contentsOf: p.planes[0].prefix(width * height))
+        }
+        section("LEAF") { d in part.blocks.withUnsafeBytes { d.append(contentsOf: $0) } }  // av1g_block records
+        section("NODE") { d in part.nodeCosts.withUnsafeBytes { d.append(contentsOf: $0) } }  // GP_DP_DEBUG floats per SB
+        section("MODE") { d in  // per shape: bsize, columns, rows, each block's best candidate
+            for m in part.blockModes {
+                for v in [m.shape, m.columns, m.rows] { u32(v, into: &d) }
+                d.append(contentsOf: m.modes)
+            }
+        }
         try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(String(format: "p%03d.bin", i)))
     }
     print("av1seq: \(pictures.count) partitions written to \(dir)")

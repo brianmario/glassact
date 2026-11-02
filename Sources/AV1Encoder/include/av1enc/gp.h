@@ -150,6 +150,11 @@ struct GpImage {
     // it. NULL: off.
     GP_DEV const uint8_t *mlSkip;
     int cols8;
+    // Glass Act: learned mode pruning (k_ml_mode). Per whole node of each level (8 << level; its
+    // grid W / n x H / n, raster from mlModeBase[level]) the luma modes its own blocks screen
+    // (bit m: mode m). NULL: every mode.
+    GP_DEV const uint16_t *mlModes;
+    uint32_t mlModeBase[4];
 };
 
 // Glass Act: an SB's distinct inter candidates (1/8 sample): v[0] is no motion; idx[16x16 * GP_ME_KEEP

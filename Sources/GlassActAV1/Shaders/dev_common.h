@@ -164,6 +164,16 @@ __device__ __forceinline__ float ssim_scale(const GpImage &I, int x, int y, int 
     return n ? __expf(s / n) : 1.f;
 }
 
+// Glass Act: the luma modes learned mode pruning leaves a block (its node's, k_ml.h); all 13 off
+// the grid of whole nodes or without it
+__device__ __forceinline__ uint ml_mode_mask(const GpImage &I, int x, int y, int W, int H) {
+    if (!I.mlModes) return 0x1FFFu;
+    const int m = max(W, H), level = m <= 8 ? 0 : m <= 16 ? 1 : m <= 32 ? 2 : 3, n = 8 << level;
+    const int cols = I.W / n, nx = x / n, ny = y / n;
+    if (nx >= cols || ny >= I.H / n) return 0x1FFFu;
+    return I.mlModes[I.mlModeBase[level] + ny * cols + nx];
+}
+
 // flat-area pruning of shapes below 16x16 (GpParams::pruneFlat)
 __device__ __forceinline__ bool prune_flat(const GpImage &I, constant GpParams &P, int x, int y, int W, int H, int qidx) {
     if (I.mlSkip) {  // Glass Act: learned pruning (k_ml.h): the node this shape belongs to

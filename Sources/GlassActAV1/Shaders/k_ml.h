@@ -14,14 +14,28 @@
 // SIMD-groups don't idle on skipped neighbours (a skipped block gets its pruned result here).
 #pragma once
 
+// tanh of a clamped argument: fast-math tanh overflows to NaN (inf / inf) for large ones, which
+// would leave a cell or node keeping nothing
+#define ML_TANH(a) tanh(clamp((a), -15.f, 15.f))
+
 #define ML_PF 8
 #define ML_NF (4 * ML_PF + 1)
 #define ML_H 24
 #define ML_C 4
 #define ML_FLOATS (2 * ML_NF + ML_H * ML_NF + ML_H + ML_C * ML_H + ML_C)
+// The mode model: per whole node, its statistics, its gradients' orientations (ML_OB bins), its
+// level (one-hot) and a bias; ML_MODE_H hidden; the 13 luma modes. A node keeps its likeliest
+// modes until all but its eps of the probability is kept, and the analysis screens only those for
+// the node's own blocks (k_analysis*.h, ml_mode_mask).
+#define ML_OB 8
+#define ML_STRIDE (ML_PF + ML_OB)  // a node's record in the statistics buffer
+#define ML_MODE_NF (ML_PF + ML_OB + 4 + 1)
+#define ML_MODE_H 24
+#define ML_MODES 13
+#define ML_MODE_FLOATS (2 * ML_MODE_NF + ML_MODE_H * ML_MODE_NF + ML_MODE_H + ML_MODES * ML_MODE_H + ML_MODES)
 
 static inline void ga_ml_node_features(device const uint8_t *src, int sp, int x0, int y0, int n, float st2,
-                                       device float *out) {
+                                       device float *out, bool orientations) {
     float s1 = 0.f, s2 = 0.f, dx = 0.f, dy = 0.f, q1[4] = {0, 0, 0, 0}, q2[4] = {0, 0, 0, 0};
     uint bits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint lo = 255, hi = 0;
@@ -64,18 +78,37 @@ static inline void ga_ml_node_features(device const uint8_t *src, int sp, int x0
     out[5] = log((float)distinct);
     out[6] = l(range * range);
     out[7] = fabs(log((dx + 0.5f) / (dy + 0.5f)));
+    if (!orientations) return;  // only the mode model reads them
+    // orientations: central differences on the interior samples, the angle mod pi in ML_OB bins,
+    // weighted by the L1 magnitude, as shares (all 0 on a flat node)
+    float ob[ML_OB] = {0, 0, 0, 0, 0, 0, 0, 0}, total = 0.f;
+    for (int r = 1; r < n - 1; r++) {
+        device const uint8_t *row = src + (size_t)(y0 + r) * sp + x0;
+        for (int c = 1; c < n - 1; c++) {
+            const float gx = (float)row[c + 1] - (float)row[c - 1], gy = (float)row[c + sp] - (float)row[c - sp];
+            const float mag = fabs(gx) + fabs(gy);
+            if (mag == 0.f) continue;
+            float ang = atan2(gy, gx);
+            if (ang < 0.f) ang += M_PI_F;
+            const int k = min((int)(ang / M_PI_F * (float)ML_OB), ML_OB - 1);
+            ob[k] += mag;
+            total += mag;
+        }
+    }
+    for (int k = 0; k < ML_OB; k++) out[ML_PF + k] = total > 0.f ? ob[k] / total : 0.f;
 }
 
 // One thread per whole node of the level (n = 8 << level) inside the visible picture.
 kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], constant uint32_t &level [[buffer(2)]],
                        device float *stats [[buffer(3)]], constant uint32_t &base [[buffer(4)]],
                        uint gid [[thread_position_in_grid]]) {
+    const bool orientations = B.img[0].mlModes != nullptr;
     device const GpImage &I = B.img[0];
     const int n = 8 << level, cols = I.W / n, rows = I.H / n;
     if ((int)gid >= cols * rows) return;
     const int x0 = (int)(gid % cols) * n, y0 = (int)(gid / cols) * n;
     const float step = (float)av1g_ac_q(sb_qindex(I, x0, y0)) / 8.f;
-    ga_ml_node_features(I.src[0], I.spitch[0], x0, y0, n, step * step, stats + base + gid * ML_PF);
+    ga_ml_node_features(I.src[0], I.spitch[0], x0, y0, n, step * step, stats + base + gid * ML_STRIDE, orientations);
 }
 
 // One thread per 8x8 cell of the padded picture: the levels it keeps (bit L = level L), all four
@@ -93,7 +126,7 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
     float f[ML_NF];
     for (int lv = 0; lv < 4; lv++) {
         const int n = 8 << lv, cols = I.W / n;
-        device const float *s = stats + bases[lv] + ((cy * 8 / n) * cols + cx * 8 / n) * ML_PF;
+        device const float *s = stats + bases[lv] + ((cy * 8 / n) * cols + cx * 8 / n) * ML_STRIDE;
         for (int k = 0; k < ML_PF; k++) f[lv * ML_PF + k] = s[k];
     }
     f[ML_NF - 1] = 1.f;
@@ -104,7 +137,7 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
     for (int j = 0; j < ML_H; j++) {
         float a = b1[j];
         for (int k = 0; k < ML_NF; k++) a += w1[j * ML_NF + k] * x[k];
-        h[j] = tanh(a);
+        h[j] = ML_TANH(a);
     }
     float mx = -1e30f, sum = 0.f;
     for (int c = 0; c < ML_C; c++) {
@@ -124,7 +157,7 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
         bits |= (uint8_t)(1 << best);
         kept += p[best];
     }
-    keep[gid] = bits;
+    keep[gid] = bits ? bits : 0xF;  // (never empty)
 }
 
 // One thread per 64x64 SB: each node's own shapes are searched where a cell in it keeps the node's
@@ -191,6 +224,49 @@ kernel void k_ml_tree(constant GpBatch &B [[buffer(0)]], device const uint8_t *k
             mask[(r * cols8 + c) * 4 + (3 - d)] = o ? 0 : 1;
         }
     }
+}
+
+// One thread per whole node of the level: the luma modes its own blocks screen (13 bits), on the
+// level's grid of whole nodes (GpImage.mlModes from mlModeBase[level]; other nodes screen all).
+kernel void k_ml_mode(constant GpBatch &B [[buffer(0)]], constant uint32_t &level [[buffer(2)]],
+                      device const float *stats [[buffer(3)]], constant uint32_t &base [[buffer(4)]],
+                      device const float *wts [[buffer(5)]], constant float &eps [[buffer(7)]],
+                      device uint16_t *modes [[buffer(10)]], uint gid [[thread_position_in_grid]]) {
+    device const GpImage &I = B.img[0];
+    const int n = 8 << level, cols = I.W / n, rows = I.H / n;
+    if ((int)gid >= cols * rows) return;
+    float f[ML_MODE_NF];
+    device const float *s = stats + base + gid * ML_STRIDE;
+    for (int k = 0; k < ML_STRIDE; k++) f[k] = s[k];
+    for (int k = 0; k < 4; k++) f[ML_STRIDE + k] = k == (int)level ? 1.f : 0.f;
+    f[ML_MODE_NF - 1] = 1.f;
+    device const float *mu = wts, *sd = wts + ML_MODE_NF, *w1 = sd + ML_MODE_NF, *b1 = w1 + ML_MODE_H * ML_MODE_NF,
+                       *w2 = b1 + ML_MODE_H, *b2 = w2 + ML_MODES * ML_MODE_H;
+    float x[ML_MODE_NF], h[ML_MODE_H], p[ML_MODES];
+    for (int k = 0; k < ML_MODE_NF; k++) x[k] = (f[k] - mu[k]) / sd[k];
+    for (int j = 0; j < ML_MODE_H; j++) {
+        float a = b1[j];
+        for (int k = 0; k < ML_MODE_NF; k++) a += w1[j * ML_MODE_NF + k] * x[k];
+        h[j] = ML_TANH(a);
+    }
+    float mx = -1e30f, sum = 0.f;
+    for (int c = 0; c < ML_MODES; c++) {
+        float z = b2[c];
+        for (int j = 0; j < ML_MODE_H; j++) z += w2[c * ML_MODE_H + j] * h[j];
+        p[c] = z;
+        mx = max(mx, z);
+    }
+    for (int c = 0; c < ML_MODES; c++) { p[c] = exp(p[c] - mx); sum += p[c]; }
+    uint bits = 0;
+    float kept = 0.f;
+    for (int i = 0; i < ML_MODES && kept < (1.f - eps) * sum; i++) {
+        int best = -1;
+        for (int c = 0; c < ML_MODES; c++)
+            if (!(bits >> c & 1) && (best < 0 || p[c] > p[best])) best = c;
+        bits |= 1u << best;
+        kept += p[best];
+    }
+    modes[I.mlModeBase[level] + gid] = (uint16_t)(bits ? bits : 0x1FFFu);  // (never empty)
 }
 
 // One thread per block of shape `bs` (the thread-per-block kernel's): the blocks it must still

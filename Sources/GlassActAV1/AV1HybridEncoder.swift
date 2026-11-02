@@ -128,9 +128,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.searchesAngleDeltas }
         set { metal.searchesAngleDeltas = newValue }
     }
-    /// See `AV1MetalEncoder.learnedPrune` (on: the shipped weights, eps 0.02,
-    /// in pictures coding more than half their superblocks).
-    public var learnedPrune: (weights: [Float], eps: Float, overShare: Double)? {
+    /// The learned pruning the encoder starts with: the shipped level and mode
+    /// models (AV1PrunerWeights), eps 0.02 for levels and MODE_EPS for modes, in
+    /// pictures coding more than half their superblocks.
+    public static let defaultLearnedPrune = AV1MetalEncoder.LearnedPrune(
+        levelWeights: AV1PrunerWeights.cellV1, eps: 0.02, modeWeights: AV1PrunerWeights.modeV1, modeEps: 0.02, overShare: 0.5)
+    /// See `AV1MetalEncoder.learnedPrune` (on: `defaultLearnedPrune`).
+    public var learnedPrune: AV1MetalEncoder.LearnedPrune? {
         get { metal.learnedPrune }
         set { metal.learnedPrune = newValue }
     }
@@ -263,7 +267,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
         metal.busyBlockPrune = 4
-        metal.learnedPrune = (AV1PrunerWeights.cellV1, 0.02, 0.5)
+        metal.learnedPrune = Self.defaultLearnedPrune
         metal.leafTxSearchPixels = 128
         metal.leafChromaAngledModes = false
         metal.searchesSubpelMotion = true

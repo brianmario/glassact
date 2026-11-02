@@ -195,13 +195,15 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
                 topJ[k] = j; cands[k] = c;
             }
         };
+        const uint mm = ml_mode_mask(I, x, y, W, H);  // Glass Act: learned mode pruning's modes
         for (int m = 0; m < 13; m++) {
+            if (!(mm >> m & 1)) continue;
             const int c = cand_pack(m, 0);
             const float j = satd_of(c) + lamS * mbits(c);
             if (m >= AV1G_V_PRED && m <= AV1G_D67_PRED) dirJ[m - AV1G_V_PRED] = j;
             insert(c, j);
         }
-        if (P.deltas && BS >= AV1G_BLOCK_8X8) {
+        if (P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8) {
             int b0 = 0, b1 = 1;
             if (dirJ[b1] < dirJ[b0]) { b0 = 1; b1 = 0; }
             for (int k = 2; k < 8; k++) {
