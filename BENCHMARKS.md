@@ -453,6 +453,20 @@ search: 1.5 ms without it, though without copies the picture is 547 KB, not 412,
 filters), the closed loop 27.3, the writer 9.4. The two sides are even, ~55 ms each, so further
 gains need both: the GPU's analysis and the CPU's copy search and closed loop.
 
+**More tiles, to spread the CPU side** (5K key frames, 8 from frame 100; tiles as log2 columns x rows):
+
+| | 3x0 (8 x 1, as now) | 3x1 (8 x 2) | 4x0, 4x1, 3x2 (16+ columns or 32 tiles) |
+|---|---|---|---|
+| typing-cc: ms / bytes | 68.7 / 412 KB | 65.6 / 420 KB (+1.9 %) | ~79 / ~552 KB (+34 %: no intra block copies) |
+| typing-cc CPU: copy search / closed loop / writer | 19.0 / 27.3 / 9.7 | 13.4 / 23.1 / 6.9 | — |
+| photos: ms / bytes | 102.6 / 1.02 MB | 99.5 / 1.02 MB | 98.6–100.5 / 1.02–1.03 MB |
+
+8 x 2 frees ~12 ms of CPU but the picture only ~3 ms: the GPU (55 ms) is then the limit. Not
+taken (+1.9 % on text); with 16 tile columns and more, key frames stop copying (not looked into).
+With the GPU the limit (3x1), the chroma model does pay: 65.1–66.0 → 64.2–64.3 ms over three
+interleaved pairs, +0.05 % of bytes; it stays off while the CPU side is the limit.
+
+
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 
 Following the entry below: a picture coded smaller than its stream and shown scaled up to it (AV1's
