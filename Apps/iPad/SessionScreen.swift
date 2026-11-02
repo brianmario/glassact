@@ -23,6 +23,11 @@ struct SessionScreen: View {
                                 generation: model.gridGeneration, handle: canvas)
                 .ignoresSafeArea()
                 .accessibilityLabel("Screen of \(model.sessionName)")
+                // The Mac's screen is pixels, not elements: with VoiceOver on,
+                // touches go straight to it (the Mac's own VoiceOver can read
+                // it), while the controls stay VoiceOver elements.
+                .accessibilityAddTraits(.allowsDirectInteraction)
+                .accessibilityHint("Touches go to the Mac.")
             if let notice = model.hostNotice {
                 Label(notice, systemImage: "person.2.slash")
                     .font(.headline)
@@ -38,6 +43,10 @@ struct SessionScreen: View {
         }
         .statusBarHidden()
         .persistentSystemOverlays(.hidden)
+        .focusedSceneValue(\.sessionActions, SessionActions(
+            showKeyboard: { canvas.view?.keyboard.becomeFirstResponder() },
+            actualSize: { canvas.view?.resetZoom() },
+            showInfo: { controlsShown = true; showingInfo = true }))
         .animation(.smooth(duration: 0.35), value: controlsShown)
         .animation(.smooth, value: model.hostNotice)
         .onAppear { scheduleHide() }
@@ -53,7 +62,6 @@ struct SessionScreen: View {
                         canvas.view?.keyboard.becomeFirstResponder()
                         scheduleHide()
                     }
-                    .keyboardShortcut("k", modifiers: [.command, .control])
                     PasteToMac { text in model.sendClipboard(text) }
                         .frame(width: 44, height: 44)
                         .help("Paste to Mac: copies this iPad’s clipboard to the Mac, ready for ⌘V")
@@ -68,7 +76,6 @@ struct SessionScreen: View {
                     .popover(isPresented: $showingInfo) { info }
                     Divider().frame(height: 24)
                     Button("Disconnect", systemImage: "xmark", role: .destructive) { model.disconnect() }
-                        .keyboardShortcut("w", modifiers: [.command, .control])
                 }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
@@ -132,6 +139,18 @@ struct SessionScreen: View {
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
     }
+}
+
+/// What the Session menu does in the window in front. Its shortcuts work
+/// whether or not the controls are showing, and holding ⌘ lists them.
+struct SessionActions {
+    let showKeyboard: () -> Void
+    let actualSize: () -> Void
+    let showInfo: () -> Void
+}
+
+extension FocusedValues {
+    @Entry var sessionActions: SessionActions?
 }
 
 /// The canvas view, for SwiftUI buttons that act on it.

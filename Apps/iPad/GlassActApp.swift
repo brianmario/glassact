@@ -6,28 +6,83 @@ import SwiftUI
 /// touch, pointer and keyboard input around them.
 @main
 struct GlassActApp: App {
+    var body: some Scene {
+        WindowGroup {
+            SessionWindow()
+        }
+        .commands { SessionCommands() }
+    }
+}
+
+/// One window, one session: each window connects on its own, so two Macs
+/// can sit side by side in Split View or Stage Manager.
+struct SessionWindow: View {
     @State private var model = SessionModel()
     @Environment(\.scenePhase) private var scenePhase
 
-    var body: some Scene {
-        WindowGroup {
-            RootView(model: model)
-                .tint(.green)
-        }
-        .onChange(of: scenePhase) { old, new in
-            switch new {
-            case .background: model.didEnterBackground()
-            case .active where old == .background || old == .inactive: model.willEnterForeground()
-            default: break
+    var body: some View {
+        RootView(model: model)
+            .tint(.green)
+            .focusedSceneValue(\.sessionModel, model)
+            .background(SceneTitle(title: model.phase == .inSession ? model.sessionName : nil))
+            .onChange(of: scenePhase) { old, new in
+                switch new {
+                case .background: model.didEnterBackground()
+                case .active where old == .background || old == .inactive: model.willEnterForeground()
+                default: break
+                }
             }
-        }
-        .commands {
-            CommandMenu("Session") {
-                Button("Disconnect") { model.disconnect() }
-                    .disabled(model.controller == nil)
-            }
+            .onDisappear { model.windowClosed() }
+    }
+}
+
+/// The menu bar's Session menu acts on the window in front. Its shortcuts
+/// are ⌃⌘ ones: plain ⌘ shortcuts belong to the Mac.
+struct SessionCommands: Commands {
+    @FocusedValue(\.sessionModel) private var model
+    @FocusedValue(\.sessionActions) private var actions
+
+    var body: some Commands {
+        CommandMenu("Session") {
+            Button("Show Keyboard", systemImage: "keyboard") { actions?.showKeyboard() }
+                .keyboardShortcut("k", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Button("Actual Size", systemImage: "arrow.down.right.and.arrow.up.left") { actions?.actualSize() }
+                .keyboardShortcut("0", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Button("Connection", systemImage: "antenna.radiowaves.left.and.right") { actions?.showInfo() }
+                .keyboardShortcut("i", modifiers: [.command, .control])
+                .disabled(actions == nil)
+            Divider()
+            Button("Disconnect", systemImage: "xmark") { model?.disconnect() }
+                .keyboardShortcut("w", modifiers: [.command, .control])
+                .disabled(model?.controller == nil)
         }
     }
+}
+
+extension FocusedValues {
+    @Entry var sessionModel: SessionModel?
+}
+
+/// Names the window after its Mac, in the app switcher and Stage Manager.
+private struct SceneTitle: UIViewRepresentable {
+    let title: String?
+
+    final class Probe: UIView {
+        var title: String? { didSet { apply() } }
+        override func didMoveToWindow() { apply() }
+        private func apply() { window?.windowScene?.title = title }
+    }
+
+    func makeUIView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.isUserInteractionEnabled = false
+        probe.isAccessibilityElement = false
+        return probe
+    }
+
+    func updateUIView(_ probe: Probe, context: Context) { probe.title = title }
 }
 
 struct RootView: View {

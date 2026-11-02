@@ -13,8 +13,10 @@ import GlassActWire
 // keeps a video region busy (`--still` turns it off).
 //
 // It shows no real pixels and injects no input, so by default it admits any
-// viewer key; `--sign-in-password P` instead makes new keys sign in (user
-// `test`), to exercise a viewer's sign-in flow. Mac only.
+// viewer key. To exercise a viewer's other ways in: `--sign-in-password P`
+// makes new keys sign in (user `test`), and `--ask-after S` asks for them as
+// a Host's user would, printing the code both screens show, then approves
+// each key S seconds after its first refused dial. Mac only.
 
 struct Options {
     var port: UInt16 = 4533
@@ -22,6 +24,8 @@ struct Options {
     var video = true
     var motion = true
     var signInPassword: String?
+    /// Ask for new keys, approving each this long after its first dial.
+    var askAfter: Double?
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -36,10 +40,11 @@ struct Options {
             case "--tiles-only": o.video = false
             case "--still": o.motion = false
             case "--sign-in-password": o.signInPassword = next()
+            case "--ask-after": o.askAfter = next().flatMap(Double.init)
             case "-h", "--help":
                 print("""
                     usage: glassact-testhost [--port 4533] [--size 1600x1000] [--tiles-only] [--still]
-                                             [--sign-in-password P]
+                                             [--sign-in-password P | --ask-after SECONDS]
                     A Glass Act host with a synthetic screen, for developing viewers.
                     """)
                 exit(0)
@@ -300,14 +305,32 @@ final class TestHost: @unchecked Sendable {
     var engine: HostEngine?
     var transport: QUICTransport?
     var server: QUICServer?
-    /// Keys that signed in (with `--sign-in-password`). `queue`.
+    /// Keys that signed in (`--sign-in-password`) or were approved
+    /// (`--ask-after`). `queue`.
     var approved = Set<String>()
+    /// `--ask-after`: when each key was first refused. `queue`.
+    var asked: [String: Date] = [:]
     var geometrySettled = false
     var lastPointer: (x: Int, y: Int) = (-1, -1)
 
     init(options: Options) {
         self.options = options
         scene = Scene(width: options.width, height: options.height, motion: options.motion)
+    }
+
+    /// `--ask-after`: refuse `fp` until `wait` seconds after its first dial,
+    /// as a Host does while its user decides. `queue`.
+    func ask(_ fp: String, approvingAfter wait: Double, host: String) -> Bool {
+        guard let first = asked[fp] else {
+            asked[fp] = Date()
+            let code = QUICIdentity.verificationCode(hostFingerprint: host, viewerFingerprint: fp)
+            print("glassact-testhost: asking for \(fp.prefix(16))… — code \(code)")
+            return false
+        }
+        guard Date().timeIntervalSince(first) >= wait else { return false }
+        approved.insert(fp)
+        print("glassact-testhost: approved \(fp.prefix(16))…")
+        return true
     }
 
     func start() throws {
@@ -317,7 +340,12 @@ final class TestHost: @unchecked Sendable {
                                                      commonName: "glassact-testhost")
         let fingerprint = try QUICIdentity.fingerprint(of: identity)
         var gate: SignInGate?
-        if let password = options.signInPassword {
+        if options.askAfter != nil {
+            gate = SignInGate(
+                verifier: FixedAccount(password: UUID().uuidString), policy: { .ask },
+                isApproved: { [weak self] fp in self?.queue.sync { self?.approved.contains(fp) ?? false } ?? false },
+                approve: { _ in false })
+        } else if let password = options.signInPassword {
             gate = SignInGate(
                 verifier: FixedAccount(password: password),
                 policy: { .signIn },
@@ -339,13 +367,17 @@ final class TestHost: @unchecked Sendable {
             authorizeViewer: { [weak self] fp in
                 guard let self else { return false }
                 // Called on `queue` (the server's own).
-                return self.options.signInPassword == nil || self.approved.contains(fp)
+                if self.approved.contains(fp) { return true }
+                if let wait = self.options.askAfter { return self.ask(fp, approvingAfter: wait, host: fingerprint) }
+                return self.options.signInPassword == nil
             },
             signIn: signIn)
         server.onReady = { [options] in
             print("glassact-testhost: listening on \(options.port) · key \(QUICIdentity.keyString(fingerprint))")
             if let password = options.signInPassword {
                 print("glassact-testhost: new viewers sign in as \"test\" with password \"\(password)\"")
+            } else if let wait = options.askAfter {
+                print("glassact-testhost: new viewers are asked for, and approved after \(wait) s")
             }
         }
         server.onFailed = { reason in

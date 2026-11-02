@@ -37,6 +37,10 @@ public final class HeadlessAgent {
         case awaitingApproval(code: String)
         case connected
         case failed(String)
+
+        var approvalCode: String? {
+            if case let .awaitingApproval(code) = self { code } else { nil }
+        }
     }
 
     public let config: Config
@@ -52,6 +56,8 @@ public final class HeadlessAgent {
     private var driver: AgentDriver?
     private var reconnect = ReconnectPolicy()
     private var approvalStarted: Date?
+    /// The host was asked how new keys get in (once per run).
+    private var askedHowToJoin = false
     private var pinned = ""
     private var stopped = false
     private var pollTimer: Timer?
@@ -167,8 +173,53 @@ public final class HeadlessAgent {
         guard !stopped, let session else { return }
         driver?.endAgentSession()
         driverBox.set(nil, phase: phase)
-        let awaiting = session.lastFailureAwaitsApproval
-        if awaiting, let code = session.verificationCode() {
+        // A refused redial usually fails before the host's key is seen, so
+        // without a code: while its user is still deciding, it's the same
+        // code (same host, same key).
+        let code = session.lastFailureAwaitsApproval ? session.verificationCode() : phase.approvalCode
+        // A first refusal may be the host asking its user: ask the host, as
+        // the Viewers do (§3.9), so the code shows from the start, and a host
+        // that takes no new viewers ends the wait now, not after the retries.
+        if code == nil, phase == .dialing, !askedHowToJoin {
+            askedHowToJoin = true
+            askHowToJoin(presentedKey: session.observedHostFingerprint)
+            return
+        }
+        continueAfterFailure(code: code, reason: session.lastFailureReason)
+    }
+
+    private func askHowToJoin(presentedKey: String?) {
+        let pin = pinned.isEmpty ? (presentedKey ?? "") : pinned
+        onStatus("asking how new viewers join…")
+        SignInClient.send(SignInRequest(op: .query, device: config.label), host: config.host, port: config.port,
+                          pinnedFingerprint: pin, identity: identity, timeout: 5) { [weak self] outcome in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.handleHowToJoin(outcome, pin: pin) }
+            }
+        }
+    }
+
+    private func handleHowToJoin(_ outcome: SignInClient.Outcome, pin: String) {
+        guard !stopped, let session else { return }
+        let reason = session.lastFailureReason
+        switch outcome.response?.status {
+        case .askOnHost?:
+            let hostKey = outcome.hostFingerprint ?? (pin.isEmpty ? nil : pin)
+            let code = hostKey.map {
+                QUICIdentity.verificationCode(hostFingerprint: $0, viewerFingerprint: agentFingerprint)
+            }
+            continueAfterFailure(code: code, reason: reason)
+        case .closed?:
+            onStatus("\(config.host) isn't accepting new viewers: on that Mac, choose who can connect in "
+                     + "Glass Act Host › Options › New Viewers")
+            stop("host isn't accepting new viewers")
+        default: // approved (the failure was something else), or no answer
+            continueAfterFailure(code: nil, reason: reason)
+        }
+    }
+
+    private func continueAfterFailure(code: String?, reason: String) {
+        if let code {
             if approvalStarted == nil {
                 approvalStarted = Date()
                 onStatus("waiting for approval on \(config.host): its user should see the code \(code)")
@@ -186,7 +237,7 @@ public final class HeadlessAgent {
         phase = .dialing
         driverBox.set(nil, phase: phase)
         guard let attempt = reconnect.nextAttempt() else {
-            stop("couldn't reach \(config.host): \(session.lastFailureReason)")
+            stop("couldn't reach \(config.host): \(reason)")
             return
         }
         onStatus("reconnecting (attempt \(attempt))…")

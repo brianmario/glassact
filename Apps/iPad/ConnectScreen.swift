@@ -14,6 +14,8 @@ struct ConnectScreen: View {
     @FocusState private var addressFocused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 16)]
+    /// The Mac side, for anyone who doesn't have it yet.
+    private static let hostDownload = URL(string: "https://github.com/brianmario/glassact/releases/latest")!
 
     var body: some View {
         NavigationStack {
@@ -89,6 +91,9 @@ struct ConnectScreen: View {
                         Text("Open Glass Act Host on a Mac on this network, or type its address below.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        Link("Get Glass Act Host for Mac", destination: Self.hostDownload)
+                            .font(.subheadline.weight(.medium))
+                            .padding(.top, 4)
                     }
                 }
                 .padding(20)
@@ -320,10 +325,15 @@ private struct ProgressCard: View {
             Text("On the Mac, click Allow. Check that it shows this code:")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-            Text(code)
-                .font(.system(size: 44, weight: .semibold, design: .monospaced))
-                .tracking(6)
-                .accessibilityLabel("Code \(code.map(String.init).joined(separator: " "))")
+            // One line when it fits, else two groups a line: never broken
+            // inside a group, so it reads like the Mac's.
+            ViewThatFits(in: .horizontal) {
+                Text(code)
+                Text(Self.halves(of: code)).multilineTextAlignment(.center)
+            }
+            .font(.system(size: 44, weight: .semibold, design: .monospaced))
+            .tracking(6)
+            .accessibilityLabel("Code \(code.map(String.init).joined(separator: " "))")
             cancelButton
         case .signingIn:
             Image(systemName: "lock.laptopcomputer")
@@ -402,6 +412,14 @@ private struct ProgressCard: View {
             }
             cancelButton
         }
+    }
+
+    /// "ABCD-EFGH-IJKL-MNOP" → "ABCD-EFGH\nIJKL-MNOP".
+    static func halves(of code: String) -> String {
+        let groups = code.split(separator: "-")
+        guard groups.count > 1 else { return code }
+        let mid = (groups.count + 1) / 2
+        return groups[..<mid].joined(separator: "-") + "\n" + groups[mid...].joined(separator: "-")
     }
 
     private var cancelButton: some View {

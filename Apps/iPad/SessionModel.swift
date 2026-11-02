@@ -78,6 +78,10 @@ final class SessionModel {
         case inSession
 
         var isBusy: Bool { self != .idle && self != .inSession }
+
+        var approvalCode: String? {
+            if case let .awaitingApproval(code) = self { code } else { nil }
+        }
     }
 
     struct Notice: Equatable {
@@ -170,15 +174,16 @@ final class SessionModel {
         nearby.start()
     }
 
-    private var headerWritten = false
+    /// One log for the app: its header names the first window's size.
+    private static var headerWritten = false
 
     /// The window's first size: the log's header names it as this
     /// device's display.
     func noteScreen(size: CGSize, scale: CGFloat) {
         viewport = size
         screenScale = scale
-        guard !headerWritten else { return }
-        headerWritten = true
+        guard !Self.headerWritten else { return }
+        Self.headerWritten = true
         SessionLog.shared.writeHeader(arguments: CommandLine.arguments,
                                       displays: ["\(Int(size.width))x\(Int(size.height))@\(Int(scale))x"])
         SessionLog.shared.write("identity", "viewer_fp=\(viewerFingerprint)")
@@ -197,6 +202,8 @@ final class SessionModel {
     /// Scriptable runs (the Simulator, demos): `--host H [--port P]
     /// [--fingerprint F] [--resolution fit|scale|native] --connect`.
     func applyLaunchArguments(_ args: [String]) {
+        guard !Self.launchArgumentsApplied else { return } // the first window only
+        Self.launchArgumentsApplied = true
         func value(_ flag: String) -> String? {
             guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
             return args[i + 1]
@@ -212,6 +219,8 @@ final class SessionModel {
         }
         if args.contains("--connect"), phase == .idle { connect() }
     }
+
+    private static var launchArgumentsApplied = false
 
     // MARK: - Persistence
 
@@ -235,6 +244,10 @@ final class SessionModel {
     }
 
     private func remember(_ address: String) {
+        // Other windows may have added theirs since this one loaded.
+        if let stored = UserDefaults.standard.dictionary(forKey: Self.defaultsKey)?["recents"] as? [String] {
+            recents = stored
+        }
         recents.removeAll { $0 == address }
         recents.insert(address, at: 0)
         if recents.count > 6 { recents.removeLast(recents.count - 6) }
@@ -391,7 +404,7 @@ final class SessionModel {
             self.gridGeneration += 1
             self.phase = .inSession
             self.connectHint = nil
-            UIApplication.shared.isIdleTimerDisabled = true
+            self.holdsAwake = true
             SessionLog.shared.write("presenting", "canvas=\(grid.width)x\(grid.height)")
             self.startThroughput()
         }
@@ -463,7 +476,26 @@ final class SessionModel {
         connectHint = nil
         requestedGeometry = nil
         phase = .idle
-        UIApplication.shared.isIdleTimerDisabled = false
+        holdsAwake = false
+    }
+
+    /// The window went away (closed in the app switcher): so does its session.
+    func windowClosed() {
+        endBackgroundTask()
+        guard controller != nil || phase != .idle else { return }
+        note("window closed")
+        endSession()
+    }
+
+    /// Windows in a session keep the screen awake; the last one out lets it
+    /// sleep again.
+    private static var awakeHolders = 0
+    @ObservationIgnored private var holdsAwake = false {
+        didSet {
+            guard holdsAwake != oldValue else { return }
+            Self.awakeHolders += holdsAwake ? 1 : -1
+            UIApplication.shared.isIdleTimerDisabled = Self.awakeHolders > 0
+        }
     }
 
     // MARK: - Failures
@@ -472,7 +504,9 @@ final class SessionModel {
         guard let failed = controller else { return }
         let wasInSession = phase == .inSession
         let awaitingApproval = failed.lastFailureAwaitsApproval && !wasInSession
-        let code = awaitingApproval ? failed.verificationCode() : nil
+        // A redial can fail before the host's key is seen, without a code;
+        // while its user is still deciding, the code is the one shown.
+        let code = awaitingApproval ? failed.verificationCode() : phase.approvalCode
         let presentedKey = failed.observedHostFingerprint
         let reason = failed.lastFailureReason
         stopPolling()
