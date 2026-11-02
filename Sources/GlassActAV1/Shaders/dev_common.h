@@ -166,6 +166,10 @@ __device__ __forceinline__ float ssim_scale(const GpImage &I, int x, int y, int 
 
 // flat-area pruning of shapes below 16x16 (GpParams::pruneFlat)
 __device__ __forceinline__ bool prune_flat(const GpImage &I, constant GpParams &P, int x, int y, int W, int H, int qidx) {
+    if (I.mlSkip) {  // Glass Act: learned pruning (k_ml.h): the node this shape belongs to
+        const int m = max(W, H), level = m <= 8 ? 0 : m <= 16 ? 1 : m <= 32 ? 2 : 3;
+        if (I.mlSkip[((y >> 3) * I.cols8 + (x >> 3)) * 4 + level]) return true;
+    }
     if (P.pruneFlat <= 0.f || !I.var16 || W * H >= 256) return false;
     const int cx = x >> 4, cy = y >> 4;
     if ((cx + 1) * 16 > I.MiCols * 4 || (cy + 1) * 16 > I.MiRows * 4) return false;   // incomplete region: keep

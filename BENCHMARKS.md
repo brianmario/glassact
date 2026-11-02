@@ -201,6 +201,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
+| Learned pruning of the analysis (a small network per tree level, `metal-av1`) | measured, kept off | offline it skipped 53–63 % at ~2 % misses on screen content; on the GPU ×1.13–1.21 for +2–6 % on 5K key frames; needs cost-weighted labels and compacted small-shape dispatch | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 
@@ -297,6 +298,35 @@ A logistic model on the same features reaches 37–41 % at 3 % misses on the scr
   generalize to a fourth kind of content. More, and more varied, traces are the first need.
 - Not yet measured: bytes, which only the encoder with the pruning on can tell, and the model's
   cost on the GPU (13 features and 16 tanh units a node: small beside the search).
+
+**On the GPU (first version, kept off).** `k_ml.h`: one thread per node and level computes the
+features (the commonest-value share dropped: it needs a histogram, and the model barely uses it)
+and the network, writing a skip byte per 8×8 cell and level; a fix-up keeps a cell's 8 node when its
+16, 32 and 64 are all skipped, so every area keeps a partition. The analysis skips a shape whose
+node is flagged (`prune_flat`), and the variance rule stands aside. `AV1MetalEncoder.learnedPrune`,
+`av1seq --ml-prune <weights> --ml-threshold <p>`; only in pictures coding more than half their
+superblocks. Weights trained on 120 other pictures (frames 120 on, so none the test uses): the four
+traces at q8 / q20 / q32, 5K and 720p. Threshold 0 is byte-identical to the variance rule off, and
+every picture decodes exactly. The network costs 2.0 ms a 5K picture.
+
+5K key frames analyzed whole (10 from frame 100, q 8–32), BD-rate and speed against today's default:
+
+| threshold | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 0.005 | +2.2 % (×1.19) | +4.7 % (×1.13) | +0.8 % (×1.01) | +2.0 % (×1.15) |
+| 0.01 | +2.7 % (×1.21) | +5.6 % (×1.21) | +1.3 % (×1.05) | +2.7 % (×1.18) |
+| 0.02 | +6.4 % (×1.25) | +11.0 % (×1.25) | +3.1 % (×1.07) | +5.9 % (×1.21) |
+
+Not worth its bytes (angle deltas gated: ×1.3–1.4 for 0.3–1.7 %). Why it falls short of the offline
+numbers:
+- **Misses cost more than the variance rule's.** That rule skips big shapes in busy areas, where
+  they rarely win anyway; the network also skips small shapes along text, where the runner-up is
+  much worse. "Did the search pick it" is the wrong label: what a skip costs (the J lost) is.
+- **Skips save less than their share.** Shapes up to 128 samples (4×4 to 16×8, ~37 ms of the 86)
+  run a block per thread, 32 along a row in lockstep: a skip saves nothing unless its 31 neighbours
+  skip too. The 16×16 stage, a SIMD group per block, fell 51 % at threshold 0.05; 4×4 only 35 %.
+A second version would need both: labels weighted by the cost a skip adds (the analysis's J per
+shape, dumped), and the surviving blocks compacted into a list before the small shapes' dispatch.
 
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 

@@ -50,6 +50,9 @@ let av1SeqCommand = Command(
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
+        .string("ml-prune", "<weights.bin>", "research: learned pruning of the analysis with these weights (k_ml.h; the offline trainer's export)"),
+        .string("ml-threshold", "<p>", "with --ml-prune: skip a node's shapes below this likelihood (default 0.05)"),
+        .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
     run: { opts in
@@ -129,6 +132,13 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.postfilters = !opts.has("no-filters")
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
+    if let path = opts.string("ml-prune") {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        guard weights.count == 4 * (2 * 13 + 16 * 13 + 2 * 16 + 1) else { throw BenchError("--ml-prune: \(weights.count) floats, not 4 levels' 267") }
+        encoder.learnedPrune = (weights, Float(opts.string("ml-threshold").flatMap(Float.init) ?? 0.05),
+                                Double(opts.string("ml-over").flatMap(Double.init) ?? 0.5))
+    }
     if let v = opts.string("deltas-up-to") {
         guard let f = Double(v), (0...1).contains(f) else { throw BenchError("--deltas-up-to \(v): a share 0–1") }
         encoder.angleDeltasUpToShare = f
@@ -250,14 +260,16 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             st.analysis = min(st.analysis, s.analysis)
             st.partition = min(st.partition, s.partition)
             st.leaves = min(st.leaves, s.leaves)
+            st.mlPrune = min(st.mlPrune, s.mlPrune)
             st.shapes.merge(s.shapes, uniquingKeysWith: min)
         }
         let names = ["4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32",
                      "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
         let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.2f", names[$0.key], $0.value * 1000) }
         let motion = inter ? String(format: "motion search %.2f · inter candidates %.2f · ", st.motionSearch * 1000, st.interSearch * 1000) : ""
-        print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.1f",
-                     motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000))
+        print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.1f%@",
+                     motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000,
+                     st.mlPrune > 0 ? String(format: " · learned pruning %.2f", st.mlPrune * 1000) : ""))
         encoder.profilesStages = false
         encoder.reusesAnalysis = !opts.has("no-reuse")
     }

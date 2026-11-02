@@ -128,6 +128,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.searchesAngleDeltas }
         set { metal.searchesAngleDeltas = newValue }
     }
+    /// See `AV1MetalEncoder.learnedPrune` (research).
+    public var learnedPrune: (weights: [Float], threshold: Float, overShare: Double)? {
+        get { metal.learnedPrune }
+        set { metal.learnedPrune = newValue }
+    }
     /// See `AV1MetalEncoder.angleDeltasUpToShare`.
     public var angleDeltasUpToShare: Double {
         get { metal.angleDeltasUpToShare }

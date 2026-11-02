@@ -98,5 +98,8 @@ GA_SMALL(16, 8, AV1G_BLOCK_16X8)
 // The leaves' open-loop decisions after the DP (AV1HybridEncoder): one thread per leaf.
 #include "k_leaf.h"
 
+// Learned pruning of the analysis (research).
+#include "k_ml.h"
+
 // Closed loop: one threadgroup of RC_NT (128) threads per 64x64, in wavefront steps.
 #include "k_recon.h"

@@ -145,6 +145,11 @@ struct GpImage {
     // k_me vectors), and every 8x8's SAD at each (meSad: GP_ME_U x 64 per SB, raster 8x8s)
     GP_DEV GpMeU *meU;
     GP_DEV uint16_t *meSad;
+    // Glass Act: learned pruning (k_ml_prune, research). Per 8x8 cell of the padded picture
+    // (cols8 x ah / 8, raster), 4 bytes: 1 = skip the shapes of the 8 / 16 / 32 / 64 node holding
+    // it. NULL: off.
+    GP_DEV const uint8_t *mlSkip;
+    int cols8;
 };
 
 // Glass Act: an SB's distinct inter candidates (1/8 sample): v[0] is no motion; idx[16x16 * GP_ME_KEEP
