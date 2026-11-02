@@ -415,6 +415,27 @@ anyone is connected); `install` puts the new weights in Sources. From the manife
 tagged sections (PICT, LEAF, NODE, MODE), so a new model's data is a new section that older
 readers skip.
 
+### Metal AV1: the leaves' luma tx search dropped, unused (2026-11-02)
+
+Timing the leaf stage (`k_leaf`, 13–15 ms of a 5K key frame after learned pruning): half of it was
+each leaf's luma tx type search, whose result nothing keeps. The closed loop searches every luma tx
+type itself (`Hybrid::search_luma_tx`, on since it measured 1.1–1.5 % smaller; only the C++
+comparison tests keep the analysis's), and the analysis's types otherwise only key tile reuse,
+which they don't change. With the search off (`leafTxSearchPixels` 0) the streams are
+byte-identical (`--digest`: 5K typing key frames at q8 and q32, 5K photos and scroll, 720p typing
+and drag streams). Interleaved, 3 runs each:
+
+| | search on (128) | off |
+|---|---|---|
+| 5K key frame, typing-cc | 68.7–68.9 ms | **64.6–65.3 ms** |
+| 5K key frame, photos | 105.8–107.9 ms | **97.1–99.0 ms** |
+| 720p typing-cc stream (inter frames a second) | 972–1277 | **1303–1358** |
+| 720p photos stream | 190–200 | **198–204** |
+
+The chroma half (7 modes screened per leaf, then CfL): DC only and no CfL took the stage from 13.0
+to 6.5 ms on typing and 15.4 to 8.4 on photos, for +3.7 % and +2 % of bytes: a candidate for a
+learned model, at most ~4 ms of a 5K picture.
+
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 
 Following the entry below: a picture coded smaller than its stream and shown scaled up to it (AV1's

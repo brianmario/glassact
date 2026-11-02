@@ -152,7 +152,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The largest block whose luma tx type the GPU searches
-    /// (`AV1MetalEncoder.leafTxSearchPixels`; 128 by default, 256 for every one).
+    /// (`AV1MetalEncoder.leafTxSearchPixels`; 256 for every one). 0 by default: the
+    /// closed loop searches every luma tx type itself and keeps none of these, so the
+    /// search was only GPU time (4–8 ms a 5K key frame; BENCHMARKS.md).
     public var leafTxSearchPixels: Int {
         get { metal.leafTxSearchPixels }
         set { metal.leafTxSearchPixels = newValue }
@@ -268,7 +270,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.reusesAnalysis = true
         metal.busyBlockPrune = 4
         metal.learnedPrune = Self.defaultLearnedPrune
-        metal.leafTxSearchPixels = 128
+        metal.leafTxSearchPixels = 0
         metal.leafChromaAngledModes = false
         metal.searchesSubpelMotion = true
         postfilter = try AV1MetalPostfilter(device: device)

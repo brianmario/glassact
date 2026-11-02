@@ -26,7 +26,7 @@ let av1SeqCommand = Command(
         .bool("profile", "afterwards, time the GPU's analysis of the last picture shape by shape (analyzing every SB; with --inter, as an inter frame after the one before)"),
         .bool("serial", "finish every picture before starting the next one's analysis (no overlap)"),
         .string("prune", "<v>", "skip 32x32-and-up analysis where variance > v quantizer steps squared (default 4; 0 off, 1 faster)"),
-        .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 128)"),
+        .int("leaf-tx", "<px>", 0...256, "largest block whose luma tx type the GPU searches (default 0: the closed loop searches its own)"),
         .bool("chroma-angles", "screen the six angled chroma modes too (13 instead of 7)"),
         .bool("no-deltas", "don't search angle deltas (faster on moving content, a little more bytes)"),
         .string("deltas-up-to", "<share>", "search angle deltas only in pictures that analyze at most this share of their superblocks (0–1; default 0.5; 1: always)"),
@@ -174,7 +174,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.interPreset = p
     }
     encoder.searchesSubpelMotion = !opts.has("no-subpel")
-    if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 128) }
+    if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 0) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
         guard let f = Float(v), f >= 0 else { throw BenchError("--prune \(v): not a number >= 0") }
