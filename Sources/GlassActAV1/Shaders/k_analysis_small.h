@@ -151,6 +151,12 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     for (int i = 0; i < H; i++)
 #pragma unroll
         for (int j = 0; j < W; j++) s[i * W + j] = src[i * sp + j];
+    // Glass Act: a flat block whose prediction edges are flat too is predicted exactly by every
+    // mode: every candidate screens at 0 and its RD is an all-zero block's (k_analysis.h)
+    bool flat = true;
+    for (int i = 0; i < W * H; i++) flat = flat && s[i] == s[0];
+    for (int i = -1; i < W + H; i++) flat = flat && A[i] == s[0];
+    for (int i = 0; i < W + H; i++) flat = flat && L[i] == s[0];
     auto mbits = [&](int c) -> float {
         const int m = cand_mode(c);
         float b = g_avgYMode[m];
@@ -158,6 +164,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         return b;
     };
     auto satd_of = [&](int c) -> float {
+        if (flat) return 0.f;
         const PredCand pc = pred_cand(c, T::lw, T::lh);
         float t = 0.f;
         for (int sy = 0; sy < H; sy += 4)
@@ -253,8 +260,14 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     };
     float bestJ = GP_INF;
     int bestK = 0, bestTx = AV1G_DCT_DCT;
+    const float flatR = flat ? base_bits(e, 0) : 0.f;  // (e's type and direction don't enter it)
     for (int k = 0; k < nc && k < K; k++) {
         const int c = cands[k];
+        if (flat) {
+            const float J = 0.f + lambda * (flatR + mbits(c) + overhead);
+            if (J < bestJ) { bestJ = J; bestK = k; }
+            continue;
+        }
         residual(c);
         e.txType = AV1G_DCT_DCT;
         e.intraDir = cand_mode(c);
@@ -263,7 +276,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         const float J = o.D + lambda * (o.R + mbits(c) + overhead);
         if (J < bestJ) { bestJ = J; bestK = k; }
     }
-    if (nc > 0 && P.txSearch && set != AV1G_TX_SET_DCTONLY) {
+    if (nc > 0 && P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
         const int c = cands[bestK];
         residual(c);
         e.intraDir = cand_mode(c);

@@ -271,6 +271,18 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         if (lane == 0) S.dcv = av1g_dc_value(A, L, haveLeft, haveAbove, T::lw, T::lh);
         __syncwarp();
         const int dcv = S.dcv;
+        // Glass Act: a flat block whose prediction edges are flat too (common on screens) is
+        // predicted exactly by every mode, so every candidate screens at 0 and its RD is an
+        // all-zero block's: the same results, without the predictions and transforms
+        bool flat;
+        {
+            const uint8_t v = src[0];
+            int bad = 0;
+            for (int p = lane; p < W * H; p += 32) bad |= src[(p / W) * sp + p % W] != v;
+            for (int i = lane - 1; i < W + H; i += 32) bad |= A[i] != v;
+            for (int i = lane; i < W + H; i += 32) bad |= L[i] != v;
+            flat = warp_max(bad) == 0;
+        }
         device const GpExtCand *ext = (device const GpExtCand *)B.extCand[BS];
         int K = min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
         int top[GP_MAXK];
@@ -304,7 +316,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
         int ncand = (int)popcount(mm);
-        warp_screen<W, H>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
+        if (!flat) warp_screen<W, H>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
         // (angle deltas read S.satd by mode: only with every mode screened)
         const bool allowDelta = P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
         if (allowDelta) {
@@ -323,7 +335,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 S.cand[13 + lane] = cand_pack(m, d);
             }
             __syncwarp();
-            warp_screen<W, H>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, lane, ssub);
+            if (!flat) warp_screen<W, H>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, lane, ssub);
             ncand = 25;
         }
         // ---- top-K by screening cost (every lane computes the same selection) ----
@@ -349,9 +361,16 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         e.qmDist = P.qmDist; e.qmRnd = P.qmRnd;
         float bestJ = GP_INF;
         int bestK = 0, bestTx = AV1G_DCT_DCT;
+        // (a flat block's: no distortion, and an all-zero block's bits whatever the mode or type)
+        const float flatR = flat ? base_bits(e, 0) : 0.f;
         for (int k = 0; k < K; k++) {
             if (top[k] < 0) break;
             const int c = S.cand[top[k]];
+            if (flat) {
+                const float J = 0.f + lambda * (flatR + mbits(c) + overhead);
+                if (J < bestJ) { bestJ = J; bestK = k; }
+                continue;
+            }
             e.resEnergy = warp_residual<W, H>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY);
             e.txType = AV1G_DCT_DCT;
             e.intraDir = cand_mode(c);
@@ -362,7 +381,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             if (J < bestJ) { bestJ = J; bestK = k; }
         }
         // ---- tx-type search for the winner ----
-        if (P.txSearch && set != AV1G_TX_SET_DCTONLY) {
+        if (P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
             const int c = S.cand[top[bestK]];
             e.resEnergy = warp_residual<W, H>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY);
             e.intraDir = cand_mode(c);

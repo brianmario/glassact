@@ -206,6 +206,7 @@ the numbers and the reasoning.
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
 | The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. The next analysis set up a picture earlier, kept: no faster today (the GPU bounds a 5K key frame of text), up to 3–4 ms once the GPU catches up | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
+| Flat blocks with flat edges skip their analysis search (`metal-av1`) | kept | the same results; 720p scroll-win's analysis 7.4 → 6.9 ms, 5K ±noise (learned pruning already leaves few flat blocks to the search) | [entry](#metal-av1-flat-blocks-with-flat-edges-skip-their-search-results-unchanged-2026-11-02) |
 
 **Rate control and transport**
 
@@ -269,6 +270,30 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: flat blocks with flat edges skip their search, results unchanged (2026-11-02)
+
+A block whose source is one value, with the edges it predicts from (above and above-right, left
+and below-left, the corner) that value too, is predicted exactly by every intra mode: each
+candidate screens at SATD 0, and its RD is an all-zero block's (distortion 0, the txb_skip bits,
+whatever the mode or tx type, so the tx type search can't beat DCT_DCT). Both analysis kernels
+(k_analysis.h, k_analysis_small.h) now compute exactly that without the predictions and
+transforms. Every stream is the same (`--digest`, four traces).
+
+Share of such blocks at 5K, of all positions (8x8 / 16x16 / 32x32 / 64x64): typing-cc 30 / 22 /
+13 / 6 %, scroll-win 52 / 43 / 33 / 26 %, photos 35 / 28 / 19 / 8 %, cursor-drag 31 / 22 / 12 / 4 %.
+Fewer reach the kernels: with learned pruning (5K), flat areas keep only their large level, so
+the small shapes' lists hardly hold any, and most of a large shape's time is its other blocks.
+
+`--profile`, the GPU's analysis (ms), before → after:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K | 44.3 → 44.6 | 36.0 → 35.6 (64x64 6.76 → 6.38) | 60.9 → 61.5 | 43.8 → 44.2 |
+| 720p (no learned pruning) | 7.4 → 7.3 | 7.4 → **6.9** | 6.6 → 6.7 | |
+
+Kept: a small, byte-identical gain where screens are flat (scroll-win 720p −7 %), nothing lost
+elsewhere.
 
 ### Metal AV1: the closed loop stops coding its tiles; learned pruning's buffers kept (2026-11-02)
 
