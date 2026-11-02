@@ -267,6 +267,37 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: learned pruning of the analysis, offline feasibility (2026-11-02)
+
+Could a small model tell the GPU which block shapes to skip, as libaom's neural nets prune its
+partition search? Offline only, nothing in the encoder yet. 32 pictures at 5120×2880, q20, 8 spread
+over each of typing-cc, scroll-win, photos and cursor-drag, each dumped with the full search's
+leaves (`av1seq --dump-partition`: turbo, no variance prune, no angle deltas). For every square
+node (8, 16, 32, 64; 9.8 M nodes) the label is whether the search picked one of the node's own
+shapes (NONE, HORZ, VERT; 4×4 counts at 8), and 13 cheap features of its luma: log variance against
+the quantizer step², its quadrants' least, greatest and mean variance, its parent's, mean |dx| and
+|dy|, distinct values, the commonest value's share, range, and the gradients' balance. A node
+predicted unneeded skips its shapes; what that saves is the node's share of its level's 5K stage
+time (8: 23.2 ms, 16: 21.1, 32: 28.6, 64: 12.9, from the entry below). "Miss": the share of the
+search's chosen area whose node was skipped. Each trace is scored by models trained on the other
+three (a model per level).
+
+| | skip / miss, small MLP (13-16-1), p < 0.05 | p < 0.1 | today's variance rule (32 and up, var > 4 step²) | a perfect oracle skips |
+|---|---|---|---|---|
+| typing-cc | 54 % / 1.8 % | 61 % / 3.6 % | 13.5 % / 6.1 % | 77 % |
+| scroll-win | 63 % / 1.9 % | 67 % / 4.0 % | 14.2 % / 5.0 % | 78 % |
+| cursor-drag | 53 % / 2.1 % | 60 % / 3.7 % | 12.3 % / 5.7 % | 78 % |
+| photos | 67 % / 25.7 % | 71 % / 29.0 % | 20.4 % / 9.9 % | 75 % |
+
+A logistic model on the same features reaches 37–41 % at 3 % misses on the screen traces.
+- **On screen content it skips ~4× what the variance rule does at a third of its misses**, and the
+  variance rule's misses cost at most 0.4 % of bytes (the runner-up shape is nearly as good). If
+  that holds, a 5K full-change picture's ~86 ms of shape stages would lose ~45–50 ms.
+- **Photos, unseen in training, it gets wrong**: a model trained on three screen traces doesn't
+  generalize to a fourth kind of content. More, and more varied, traces are the first need.
+- Not yet measured: bytes, which only the encoder with the pruning on can tell, and the model's
+  cost on the GPU (13 features and 16 tanh units a node: small beside the search).
+
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 
 Following the entry below: a picture coded smaller than its stream and shown scaled up to it (AV1's

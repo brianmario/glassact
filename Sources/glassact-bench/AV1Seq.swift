@@ -50,6 +50,7 @@ let av1SeqCommand = Command(
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
+        .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
     run: { opts in
         let trace = opts.required("trace")
@@ -116,6 +117,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")\(opts.has("cpu-decides") ? ", CPU decides chroma and tx" : ", GPU decides chroma and tx")\(inter ? ", inter frames" : ", intra frames")")
 
+    if let dir = opts.string("dump-partition") {
+        try dumpPartitions(pictures, width: width, height: height, qindex: qindex, preset: preset, device: device, to: dir)
+        return
+    }
     let encoder = try AV1HybridEncoder(device: device)
     encoder.preset = preset
     encoder.tiling = (tileParts[0], tileParts[1])
@@ -394,4 +399,28 @@ func writeIVF(_ frames: [[UInt8]], width: Int, height: Int, to path: String) thr
         v += f
     }
     try Data(v).write(to: URL(fileURLWithPath: path))
+}
+
+/// `--dump-partition`: for each picture, `<dir>/pNNN.bin`: width, height, qindex (UInt32 each), the
+/// luma plane, the leaf count (UInt32) and the leaves as av1g_block records.
+@available(macOS 27, *)
+func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, preset: AV1MetalEncoder.Preset,
+                    device: any MTLDevice, to dir: String) throws {
+    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let metal = try AV1MetalEncoder(device: device)
+    metal.preset = preset
+    metal.decidesLeaves = true
+    metal.busyBlockPrune = 0
+    metal.searchesAngleDeltas = false
+    metal.tiling = (2, 0)
+    for (i, p) in pictures.enumerated() {
+        let part = try metal.partition(y: p.planes[0], u: p.planes[1], v: p.planes[2], width: width, height: height, qindex: qindex)
+        var data = Data()
+        for v in [width, height, qindex] { withUnsafeBytes(of: UInt32(v)) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: p.planes[0].prefix(width * height))
+        withUnsafeBytes(of: UInt32(part.blocks.count)) { data.append(contentsOf: $0) }
+        part.blocks.withUnsafeBytes { data.append(contentsOf: $0) }
+        try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(String(format: "p%03d.bin", i)))
+    }
+    print("av1seq: \(pictures.count) partitions written to \(dir)")
 }
