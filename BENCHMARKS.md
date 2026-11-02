@@ -265,6 +265,40 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 re-baselined after intra block copy (2026-11-01, evening)
+
+The morning's re-baseline (entry below, same script) on the encoder with exact and lossy intra block
+copies, the rounding offset 0.45, and luma tx types searched for intra and inter blocks. The AV1
+runs (ours and libaom realtime speed 9 with inter frames, in the same runs) were re-run; the
+hardware HEVC points are the morning's (VideoToolbox as the Host configures it: unchanged). First
+100 frames, RGB luma PSNR as `vquality` scores it, q 8–32; BD-rate, negative = ours smaller:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K: ours vs HEVC | **−70 %** (morning −60 %) | −76 % by SSIM (−74 %; by PSNR no overlap) | **−84 %** (−83 %) | **−68 %** (−60 %) |
+| 5K: ours vs libaom | **−58 %** (−46 %) | −33 % (−24 %) | −35 % (−34 %) | **−56 %** (−46 %) |
+| 720p: ours vs HEVC | −47 % (−45 %) | −42 % (−40 %) | −7 % (−2 %) | −44 % (−42 %) |
+| 720p: ours vs libaom | −32 % (−30 %) | −6 % (−1 %) | −16 % (−13 %) | −32 % (−30 %) |
+
+By SSIM: 720p scroll vs libaom +9 % (morning +16 %), 720p photos vs HEVC +10 % (+16 %).
+
+At q20 the 5K streams are 0.30 / 1.18 / 6.66 / 0.64 Mbit/s at the traces' timing (typing / scroll
+/ photos / drag), 720p 0.08 / 0.48 / 2.36 / 0.16.
+
+Speed, inter frames a second at q20 (`--no-planes`, no scoring; ours alone, and ours beside libaom
+in the same process with libaom's own figure):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K, ours alone | 357 | 229 | 87 | 340 |
+| 5K, ours / libaom s9 | 356 / 233 | 229 / 174 | 87 / 93 | 343 / 233 |
+| 720p, ours alone | 1252 | 523 | 180 | 886 |
+| 720p, ours / libaom s9 | 1263 / 2030 | 518 / 969 | 181 / 508 | 957 / 2040 |
+
+Against the morning (ours alone after the CDEF move: 346 / 220 / 84 / 336 and 1184 / 490 / 183 /
+879) the inter tx type search costs nothing measurable here; run to run, these move by ±5–10 %.
+Beside libaom ours ran as fast as alone this time (the morning's table had ours slower beside it).
+
 ### Metal AV1: lossy intra block copies, and inter blocks' tx types (2026-11-01)
 
 Where the bytes went after exact intra block copies (an experiment, not kept: every block's bits
