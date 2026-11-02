@@ -207,6 +207,8 @@ the numbers and the reasoning.
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
 | The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. The next analysis set up a picture earlier, kept: no faster today (the GPU bounds a 5K key frame of text), up to 3–4 ms once the GPU catches up | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
 | Flat blocks with flat edges skip their analysis search (`metal-av1`) | kept | the same results; 720p scroll-win's analysis 7.4 → 6.9 ms, 5K ±noise (learned pruning already leaves few flat blocks to the search) | [entry](#metal-av1-flat-blocks-with-flat-edges-skip-their-search-results-unchanged-2026-11-02) |
+| Learned pruning's statistics in one pass per SB from whole-number sums (`metal-av1`) | kept | 3.85 → 2.02 ms of GPU a 5K picture; key frames −0.4 to −1.9 ms; BD 0.0 % (8x8 and 16x16 features bit-identical) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
+| A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
 
@@ -270,6 +272,39 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: learned pruning's statistics in one pass per SB, from whole-number sums (2026-11-02)
+
+The node statistics were 3.1 of learned pruning's ~3.9 ms on a 5K picture: a thread per node per
+level, each walking all its node's samples (4,096, twice, for a 64x64), with neighbouring threads
+far apart in memory. Every statistic but the variance is a sum of whole numbers that a node's four
+children add up to: the sums and the quadrants' (its children's), the values held and their range,
+the neighbour differences (with the pairs across its middle row and column), and the orientation
+bins of its interior (with the samples on those middle rows and columns). **Now one threadgroup of
+64 per SB visits each sample once:** a thread per 8x8 cell takes its samples; a pair of neighbours
+goes to the smallest node holding both, and a sample's orientation to the smallest node it's inside
+the border of (by threadgroup atomics above the cells: whole numbers, so their order doesn't
+matter); a node above the cells is its children's sums with its seams'.
+
+- The 8x8 and 16x16 nodes' features are bit-identical (compared on scroll-win and photos: all
+  288,000 nodes). At 32x32 and 64x64 the variance features differ (log variance at both, the
+  quadrants' least and greatest at 64x64; up to 0.02): the sum of squares is now exact, where a
+  float sum rounded past 2^24 (closer to the trainer's f64 features than before).
+- 2 of 16 checked streams changed; BD-rate over q 8–32, 5K key frames and streams, every trace:
+  **0.0 %** by PSNR and SSIMULACRA2, every point the same size to the reported precision.
+- `--profile`, typing-cc 5K: learned pruning 3.85 → **2.02 ms**. A 5K key frame over 30 frames,
+  median of 2 alternated runs: typing-cc 58.6 → **56.8**, scroll-win 50.4 → 50.0, photos 89.5 →
+  **87.7**, cursor-drag 57.0 → **55.3** ms.
+- A first version, a threadgroup per SB with one thread per node climbing the levels (16, 4, then
+  1 thread doing a 64x64's seams), was slower (6.6 ms): too few threads up top, and its
+  threadgroup memory capped occupancy.
+
+**Measured and rejected, a time context for the models** (the transformer question's cheap
+version): in a stream, what the search chose at the same place in the previous picture. On pairs of
+consecutive frames (5K q20, four pairs a trace, every picture analyzed whole), a changed 8x8 cell
+keeps its level no more often than the most common level alone would predict it: photos 30–35 %
+against 32–34 %, cursor-drag 46 % against 44 %, scroll-win 51 % against 58 %. The level model
+misses 2–3 %. Changed content isn't the content that was there.
 
 ### Metal AV1: flat blocks with flat edges skip their search, results unchanged (2026-11-02)
 

@@ -1095,14 +1095,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 func threads(_ n: Int) -> (MTLSize, MTLSize) { (MTLSize(width: max(n, 1), height: 1, depth: 1), MTLSize(width: 64, height: 1, depth: 1)) }
                 e.setComputePipelineState(encoder.mlStats)
                 e.setBuffer(stats, offset: 0, index: 3)
-                for level in 0..<4 {
-                    var lv = UInt32(level), base = mlBases[level]
-                    let n = 8 << level
-                    e.setBytes(&lv, length: 4, index: 2)
-                    e.setBytes(&base, length: 4, index: 4)
-                    let (g, t) = threads((width / n) * (height / n))
-                    e.dispatchThreads(g, threadsPerThreadgroup: t)
-                }
+                e.setBytes(mlBases, length: 16, index: 4)
+                e.dispatchThreadgroups(MTLSize(width: sbCols * sbRows, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)
                 if let modes = mlModes, let modeWeights = encoder.mlModeWeights {
                     // each whole node's modes, beside the cells' network

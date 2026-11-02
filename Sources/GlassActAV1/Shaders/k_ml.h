@@ -8,10 +8,11 @@
 // everything. Weights are trained offline on the full search's choices (ML_FLOATS of them: means,
 // deviations, ML_H x ML_NF first layer, ML_H biases, ML_C x ML_H output layer, ML_C biases).
 //
-// Passes: k_ml_stats per level (node statistics), k_ml_cell (the network, per cell), k_ml_node
-// per level (each 8x8 cell's skip byte for the level: GpImage.mlSkip), then for the shapes the
-// thread-per-block kernel takes, k_ml_list: the blocks still analyzed, front-packed, so its
-// SIMD-groups don't idle on skipped neighbours (a skipped block gets its pruned result here).
+// Passes: k_ml_stats (node statistics, every level, a threadgroup per SB), k_ml_cell (the
+// network, per cell), k_ml_tree (each 8x8 cell's skip byte per level: GpImage.mlSkip), then for
+// the shapes the thread-per-block kernel takes, k_ml_list: the blocks still analyzed,
+// front-packed, so its SIMD-groups don't idle on skipped neighbours (a skipped block gets its
+// pruned result here).
 #pragma once
 
 // tanh of a clamped argument: fast-math tanh overflows to NaN (inf / inf) for large ones, which
@@ -42,41 +43,49 @@
 #define ML_CHROMA_C 8
 #define ML_CHROMA_FLOATS (2 * ML_CHROMA_NF + ML_CHROMA_H * ML_CHROMA_NF + ML_CHROMA_H + ML_CHROMA_C * ML_CHROMA_H + ML_CHROMA_C)
 
-static inline void ga_ml_node_features(device const uint8_t *src, int sp, int x0, int y0, int n, float st2,
-                                       device float *out, bool orientations) {
-    float s1 = 0.f, s2 = 0.f, dx = 0.f, dy = 0.f, q1[4] = {0, 0, 0, 0}, q2[4] = {0, 0, 0, 0};
-    uint bits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    uint lo = 255, hi = 0;
-    const int h2 = n / 2;
-    for (int r = 0; r < n; r++) {
-        device const uint8_t *row = src + (size_t)(y0 + r) * sp + x0;
-        for (int c = 0; c < n; c++) {
-            const uint v = row[c];
-            const float f = (float)v;
-            s1 += f;
-            s2 += f * f;
-            const int q = (r >= h2 ? 2 : 0) + (c >= h2 ? 1 : 0);
-            q1[q] += f;
-            q2[q] += f * f;
-            bits[v >> 5] |= 1u << (v & 31);
-            lo = min(lo, v);
-            hi = max(hi, v);
-            if (c + 1 < n) dx += fabs((float)row[c + 1] - f);
-            if (r + 1 < n) dy += fabs((float)row[c + sp] - f);
-        }
-    }
-    const float a = (float)(n * n), m = s1 / a, var = s2 / a - m * m, qa = a / 4.f;
+// A node's statistics as whole-number sums, which a node's four children add up to exactly (with
+// the terms their seams add): its sum and sum of squares, its quadrants' (its children's), the
+// values it holds (bits) and their range, its neighbour differences across and down, and its
+// interior samples' gradient orientations (ML_OB bins of L1 magnitude) and their total.
+struct MlSums {
+    uint s1, s2, q1[4], q2[4], bits[8], lo, hi, dx, dy, ob[ML_OB], total;
+};
+
+// A sample's gradient orientation for the mode model, from central differences: its L1 magnitude
+// (0 where flat), and in `bin` the angle mod pi in ML_OB bins.
+static inline uint ga_ml_orient(device const uint8_t *p, int sp, thread int &bin) {
+    const float gx = (float)p[1] - (float)p[-1], gy = (float)p[sp] - (float)p[-sp];
+    const float mag = fabs(gx) + fabs(gy);
+    if (mag == 0.f) return 0;
+    float ang = atan2(gy, gx);
+    if (ang < 0.f) ang += M_PI_F;
+    bin = min((int)(ang / M_PI_F * (float)ML_OB), ML_OB - 1);
+    return (uint)mag;
+}
+
+static inline void ga_ml_sums_clear(thread MlSums &m) {
+    m.s1 = m.s2 = m.hi = m.dx = m.dy = m.total = 0;
+    m.lo = 255;
+    for (int k = 0; k < 4; k++) m.q1[k] = m.q2[k] = 0;
+    for (int k = 0; k < 8; k++) m.bits[k] = 0;
+    for (int k = 0; k < ML_OB; k++) m.ob[k] = 0;
+}
+
+// A node's features (ML_STRIDE floats) from its sums: log variance, the quadrants' least and
+// greatest variance, horizontal and vertical activity, log distinct values, log range and the
+// activity's direction, then (with the mode model) the orientations as shares.
+static inline void ga_ml_features(thread const MlSums &m, int n, float st2, bool orientations, device float *out) {
+    const float a = (float)(n * n), mean = (float)m.s1 / a, var = (float)m.s2 / a - mean * mean, qa = a / 4.f;
     float qmin = 1e30f, qmax = 0.f;
     for (int q = 0; q < 4; q++) {
-        const float qm = q1[q] / qa, v = q2[q] / qa - qm * qm;
+        const float qm = (float)m.q1[q] / qa, v = (float)m.q2[q] / qa - qm * qm;
         qmin = min(qmin, v);
         qmax = max(qmax, v);
     }
     uint distinct = 0;
-    for (int k = 0; k < 8; k++) distinct += popcount(bits[k]);
-    dx /= a - (float)n;
-    dy /= a - (float)n;
-    const float range = (float)(hi - lo);
+    for (int k = 0; k < 8; k++) distinct += popcount(m.bits[k]);
+    const float dx = (float)m.dx / (a - (float)n), dy = (float)m.dy / (a - (float)n);
+    const float range = (float)(m.hi - m.lo);
     auto l = [&](float v) { return log(1.f + max(v, 0.f) / st2); };
     out[0] = l(var);
     out[1] = l(qmin);
@@ -87,36 +96,128 @@ static inline void ga_ml_node_features(device const uint8_t *src, int sp, int x0
     out[6] = l(range * range);
     out[7] = fabs(log((dx + 0.5f) / (dy + 0.5f)));
     if (!orientations) return;  // only the mode model reads them
-    // orientations: central differences on the interior samples, the angle mod pi in ML_OB bins,
-    // weighted by the L1 magnitude, as shares (all 0 on a flat node)
-    float ob[ML_OB] = {0, 0, 0, 0, 0, 0, 0, 0}, total = 0.f;
-    for (int r = 1; r < n - 1; r++) {
-        device const uint8_t *row = src + (size_t)(y0 + r) * sp + x0;
-        for (int c = 1; c < n - 1; c++) {
-            const float gx = (float)row[c + 1] - (float)row[c - 1], gy = (float)row[c + sp] - (float)row[c - sp];
-            const float mag = fabs(gx) + fabs(gy);
-            if (mag == 0.f) continue;
-            float ang = atan2(gy, gx);
-            if (ang < 0.f) ang += M_PI_F;
-            const int k = min((int)(ang / M_PI_F * (float)ML_OB), ML_OB - 1);
-            ob[k] += mag;
-            total += mag;
-        }
-    }
-    for (int k = 0; k < ML_OB; k++) out[ML_PF + k] = total > 0.f ? ob[k] / total : 0.f;
+    for (int k = 0; k < ML_OB; k++) out[ML_PF + k] = m.total > 0 ? (float)m.ob[k] / (float)m.total : 0.f;
 }
 
-// One thread per whole node of the level (n = 8 << level) inside the visible picture.
-kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], constant uint32_t &level [[buffer(2)]],
-                       device float *stats [[buffer(3)]], constant uint32_t &base [[buffer(4)]],
-                       uint gid [[thread_position_in_grid]]) {
-    const bool orientations = B.img[0].mlModes != nullptr;
+// The smallest node level (0: 8x8 ... 3: 64x64) holding both of two adjacent SB coordinates a
+// and a + 1 (a % 64 < 63), and the smallest level whose node has coordinate a inside its border.
+static inline int ga_ml_pair_level(int a) { return (a & 7) != 7 ? 0 : (a & 15) != 15 ? 1 : (a & 31) != 31 ? 2 : 3; }
+static inline int ga_ml_inner_level(int a) {
+    for (int l = 0; l < 4; l++) {
+        const int r = a & ((8 << l) - 1);
+        if (r >= 1 && r <= (8 << l) - 2) return l;
+    }
+    return 4;  // on the SB's own border
+}
+
+// One threadgroup of 64 per 64x64 SB, a thread per 8x8 cell. Each sample is visited once: its
+// cell's sums take its value; a pair of neighbours goes to the smallest node holding both, and
+// a sample's orientation to the smallest node it's inside the border of (above the cells, by
+// threadgroup atomics: whole numbers, so the order doesn't matter). A node above the cells is then
+// its children's sums with its own seams'. Each whole node inside the visible picture
+// (n = 8 << level) gets its features at its level's base, raster within the level's grid.
+kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[buffer(3)]],
+                       constant uint32_t *bases [[buffer(4)]], uint sb [[threadgroup_position_in_grid]],
+                       uint t [[thread_position_in_threadgroup]]) {
     device const GpImage &I = B.img[0];
-    const int n = 8 << level, cols = I.W / n, rows = I.H / n;
-    if ((int)gid >= cols * rows) return;
-    const int x0 = (int)(gid % cols) * n, y0 = (int)(gid / cols) * n;
-    const float step = (float)av1g_ac_q(sb_qindex(I, x0, y0)) / 8.f;
-    ga_ml_node_features(I.src[0], I.spitch[0], x0, y0, n, step * step, stats + base + gid * ML_STRIDE, orientations);
+    if ((int)sb >= I.sbCols * I.sbRows) return;  // (the whole threadgroup)
+    // the 85 nodes' sums (cells, then 16, 4, 1), and the seams of the 21 above the cells
+    threadgroup MlSums sums[85];
+    threadgroup atomic_uint seam[21][2 + ML_OB + 1];  // dx, dy, the bins, their total
+    const bool orientations = I.mlModes != nullptr;
+    const int sbx = (int)sb % I.sbCols * 64, sby = (int)sb / I.sbCols * 64, sp = I.spitch[0];
+    const float step = (float)av1g_ac_q(sb_qindex(I, sbx, sby)) / 8.f, st2 = step * step;
+    if (t < 21)
+        for (int k = 0; k < 2 + ML_OB + 1; k++) atomic_store_explicit(&seam[t][k], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int first[4] = {0, 64, 80, 84};
+    // a level's node index among the 21 above the cells, from SB coordinates
+    auto upper = [&](int l, int x, int y) { const int per = 8 >> l; return first[l] - 64 + (y >> (3 + l)) * per + (x >> (3 + l)); };
+    // only whole nodes inside the visible picture count (their samples may still be read)
+    const int vw = I.W - sbx, vh = I.H - sby;
+    {
+        const int cx = (int)t % 8 * 8, cy = (int)t / 8 * 8;
+        MlSums m;
+        ga_ml_sums_clear(m);
+        device const uint8_t *src = I.src[0] + (size_t)(sby + cy) * sp + sbx + cx;
+        for (int r = 0; r < 8; r++) {
+            device const uint8_t *row = src + (size_t)r * sp;
+            const int y = cy + r;
+            for (int c = 0; c < 8; c++) {
+                const int x = cx + c;
+                const uint v = row[c], v2 = v * v;
+                m.s1 += v;
+                m.s2 += v2;
+                const int q = (r >= 4 ? 2 : 0) + (c >= 4 ? 1 : 0);
+                m.q1[q] += v;
+                m.q2[q] += v2;
+                m.bits[v >> 5] |= 1u << (v & 31);
+                m.lo = min(m.lo, v);
+                m.hi = max(m.hi, v);
+                if (x < 63 && x + 1 < vw) {
+                    const uint d = (uint)abs((int)row[c + 1] - (int)v);
+                    const int l = ga_ml_pair_level(x);
+                    if (l == 0) m.dx += d;
+                    else if (d) atomic_fetch_add_explicit(&seam[upper(l, x, y)][0], d, memory_order_relaxed);
+                }
+                if (y < 63 && y + 1 < vh) {
+                    const uint d = (uint)abs((int)row[c + sp] - (int)v);
+                    const int l = ga_ml_pair_level(y);
+                    if (l == 0) m.dy += d;
+                    else if (d) atomic_fetch_add_explicit(&seam[upper(l, x, y)][1], d, memory_order_relaxed);
+                }
+                if (orientations && x + 1 < vw && y + 1 < vh) {
+                    const int l = max(ga_ml_inner_level(x), ga_ml_inner_level(y));
+                    int k = 0;
+                    const uint mag = l < 4 ? ga_ml_orient(row + c, sp, k) : 0;
+                    if (mag && l == 0) {
+                        m.ob[k] += mag;
+                        m.total += mag;
+                    } else if (mag) {
+                        atomic_fetch_add_explicit(&seam[upper(l, x, y)][2 + k], mag, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&seam[upper(l, x, y)][2 + ML_OB], mag, memory_order_relaxed);
+                    }
+                }
+            }
+        }
+        sums[t] = m;
+        if (sbx + cx + 8 <= I.W / 8 * 8 && sby + cy + 8 <= I.H / 8 * 8)
+            ga_ml_features(m, 8, st2, orientations, stats + bases[0] + ((sby + cy) / 8 * (I.W / 8) + (sbx + cx) / 8) * ML_STRIDE);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int level = 1; level < 4; level++) {
+        const int n = 8 << level, per = 8 >> level;
+        if ((int)t < per * per) {
+            const int nx = (int)t % per, ny = (int)t / per, i = first[level] - 64 + (int)t;
+            const int cp = per * 2, c0 = first[level - 1] + ny * 2 * cp + nx * 2;
+            const int at[4] = {c0, c0 + 1, c0 + cp, c0 + cp + 1};
+            MlSums m;
+            ga_ml_sums_clear(m);
+            for (int k = 0; k < 4; k++) {
+                threadgroup const MlSums &c = sums[at[k]];
+                m.s1 += c.s1;
+                m.s2 += c.s2;
+                m.q1[k] = c.s1;
+                m.q2[k] = c.s2;
+                for (int b = 0; b < 8; b++) m.bits[b] |= c.bits[b];
+                m.lo = min(m.lo, c.lo);
+                m.hi = max(m.hi, c.hi);
+                m.dx += c.dx;
+                m.dy += c.dy;
+                for (int b = 0; b < ML_OB; b++) m.ob[b] += c.ob[b];
+                m.total += c.total;
+            }
+            m.dx += atomic_load_explicit(&seam[i][0], memory_order_relaxed);
+            m.dy += atomic_load_explicit(&seam[i][1], memory_order_relaxed);
+            for (int b = 0; b < ML_OB; b++) m.ob[b] += atomic_load_explicit(&seam[i][2 + b], memory_order_relaxed);
+            m.total += atomic_load_explicit(&seam[i][2 + ML_OB], memory_order_relaxed);
+            sums[first[level] + (int)t] = m;
+            const int x0 = sbx + nx * n, y0 = sby + ny * n, cols = I.W / n;
+            if (x0 / n < cols && y0 / n < I.H / n)
+                ga_ml_features(m, n, st2, orientations, stats + bases[level] + ((y0 / n) * cols + x0 / n) * ML_STRIDE);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 // One thread per 8x8 cell of the padded picture: the levels it keeps (bit L = level L), all four
