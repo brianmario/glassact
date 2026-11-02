@@ -342,7 +342,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// picture i is finished on the CPU. `output` gets them in order. With
     /// `interFrames`, they're one stream: the first a key frame and the rest
     /// inter frames. Picture i's bitstream is written, and picture i + 1's
-    /// analysis set up and committed (while picture i's still runs), on other
+    /// analysis set up and committed (while picture i - 1 is finished), on other
     /// threads; `output` gets picture i before picture i + 1's closed loop.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        output: (Int, Frame) throws -> Void) throws {
@@ -352,35 +352,44 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
         // picture i - 1's bitstream, being written while picture i + 1's analysis starts, which
-        // is also on a thread of its own (`starting`)
+        // is also on a thread of its own (`starting`), as is picture i + 2's after it (`following`)
         var writing: Writing?
-        var starting: Later<Pending>?
+        var starting: Later<Pending>?, following: Later<Pending>?
         defer {
             copyFinder.drain()
             _ = try? writing?.wait()
             _ = try? starting?.wait()
+            _ = try? following?.wait()
         }
         var current = try picture(0)
         var pending = try begin(current, Copies(), qindex: qindex)
-        // picture i + 1's copies are decided (on the CPU, from the two sources alone) while
-        // picture i - 1 is finished
-        var upcoming = count > 1 ? try picture(1) : nil
-        if interFrames, let upcoming { copyFinder.start(upcoming, after: current, searchesMotion: searchesMotion) }
+        // picture i + 1's analysis is set up while picture i - 1 is finished, and committed: its
+        // command buffer waits on the GPU until picture i's results are read
+        // (AV1MetalEncoder.readEvent), so its GPU work starts as soon as they are. Its copies are
+        // decided (on the CPU, from the two sources alone) before that.
+        var next = count > 1 ? try picture(1) : nil
+        if let next {
+            if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
+            let copies = interFrames ? copyFinder.wait() : Copies()
+            starting = Later { try self.begin(next, copies, qindex: qindex) }
+        }
+        var upcoming = count > 2 ? try picture(2) : nil
+        if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
         for i in 0..<count {
-            if let s = starting {
-                starting = nil
-                pending = try s.wait()
-            }
-            // picture i + 1's analysis is set up and committed while picture i's runs: its command
-            // buffer waits on the GPU until picture i's results are read (AV1MetalEncoder.readEvent)
-            let next = upcoming
-            if let next {
-                let copies = interFrames ? copyFinder.wait() : Copies()
-                starting = Later { try self.begin(next, copies, qindex: qindex) }
-                upcoming = i + 2 < count ? try picture(i + 2) : nil
-                if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
-            }
             let partition = try pending.partition.wait()
+            // picture i + 2's analysis, set up after picture i + 1's (two at most are set up and not
+            // yet read: their kept-analysis buffers alternate)
+            let afterNext = upcoming
+            if let up = upcoming {
+                let copies = interFrames ? copyFinder.wait() : Copies()
+                let before = starting
+                following = Later {
+                    _ = try before?.wait()
+                    return try self.begin(up, copies, qindex: qindex)
+                }
+                upcoming = i + 3 < count ? try picture(i + 3) : nil
+                if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
+            }
             let t0 = CACurrentMediaTime()
             var timing = Timing()
             timing.analysis = metal.lastGPUSeconds
@@ -393,7 +402,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 try output(i - 1, try w.wait())
             }
             writing = try finish(current, partition: partition, motion: motion, qindex: qindex, qmap: pending.qmap, timing: timing, started: t0)
-            if let next { current = next }
+            if let s = starting {
+                starting = following
+                following = nil
+                pending = try s.wait()
+            }
+            if let n = next {
+                current = n
+                next = afterNext
+            }
         }
         if let w = writing {
             writing = nil

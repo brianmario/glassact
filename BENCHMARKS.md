@@ -205,7 +205,7 @@ the numbers and the reasoning.
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
-| The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. Setting the next analysis up a picture earlier: no faster (the GPU bounds a 5K key frame of text now) | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
+| The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. The next analysis set up a picture earlier, kept: no faster today (the GPU bounds a 5K key frame of text), up to 3–4 ms once the GPU catches up | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
 
 **Rate control and transport**
 
@@ -311,10 +311,13 @@ key frames, which spreads the first picture's unpipelined latency thinner, the p
 its results (`leafBlocks`, ~1.2 ms) before the next picture's analysis may start (`readEvent`),
 then ~0.7 ms of event latency.
 
-- **Rejected: setting picture i + 1's analysis up while picture i − 1 is finished**, so its GPU
-  work starts the moment picture i's results are read. The same bytes and no faster (typing-cc
-  58.1 → 58.4 ms, scroll-win 51.1 → 51.0, photos 90.6 → 90.0, over 30 frames). With the CPU's
-  finish (~49 ms) shorter than the GPU's analysis, the setup already fits inside the wait.
+- **Kept: setting picture i + 1's analysis up while picture i − 1 is finished** (it waits on the
+  GPU for picture i's results to be read, as before), so its GPU work starts the moment they are.
+  The same bytes, and no faster today (typing-cc 58.1 → 58.4 ms, scroll-win 51.1 → 51.0, photos
+  90.6 → 90.0, over 30 frames): with the CPU's finish (~49 ms) shorter than the GPU's analysis,
+  the setup (3–4 ms at 5K) already fits inside the wait. It pays once the GPU's analysis comes
+  within the setup's time of the CPU's finish, which is where the GPU work is going: up to the
+  setup's 3–4 ms a picture then, nothing left to find later.
 - **The GPU's 55 ms** (`--profile`, typing-cc / photos): the shapes' analysis 44.3 / 60.9 ms
   (64x64 9.4 / 10.2, 32x32 8.5 / 11.2), leaves 6.6 / 7.0, learned pruning ~3.9, partition 0.3.
   Learned pruning pass by pass: the node statistics 3.1 ms, the mode network 0.4–0.5, the cells'
