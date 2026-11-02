@@ -3,21 +3,24 @@
 //! - level: per 8x8 cell, which tree level (8/16/32/64) the full search chooses, from statistics
 //!   of the cell's four nested nodes;
 //! - mode: per tree node, which luma modes its own blocks choose, from the node's statistics and
-//!   its gradients' orientations.
+//!   its gradients' orientations;
+//! - chroma: per leaf, which of the 7 chroma modes k_leaf screens, and CfL, it chooses, from its
+//!   chroma's statistics, how much each plane follows luma, its size and its luma mode.
 //!
 //! Data: pictures dumped by `glassact-bench av1seq --dump-partition <dir>/<trace>-<anything>`, one
 //! directory each (the trace id before the first '-'; `scripts/train-pruner` makes them from
-//! `scripts/pruner-traces.txt`): the "GAML" sections PICT (luma), LEAF (the full search's leaves),
-//! NODE (the partition DP's node costs) and MODE (each analyzed block's best mode).
+//! `scripts/pruner-traces.txt`): the "GAML" sections PICT (luma), CHRO (chroma), LEAF (the full
+//! search's leaves, with k_leaf's chroma), NODE (the partition DP's node costs) and MODE (each
+//! analyzed block's best mode).
 //!
 //! cargo run --release --example prune_train -- <dumps>
 //!     each trace scored by models trained on the others: for the level model, the analysis
 //!     skipped and the cost the skips add, all at once (the DP over the GPU's node costs, with
 //!     k_ml_tree's repair); for the mode model, the modes screened and how many chosen leaves'
-//!     modes they miss. MODEL=level or MODEL=mode for one.
+//!     modes they miss; for the chroma model, likewise. MODEL=level, mode or chroma for one.
 //! SUB=3 STEPS=3000000 EXPORT=<file.swift> cargo run --release --example prune_train -- <dumps>
-//!     train both on everything and write Sources/GlassActAV1/AV1PrunerWeights.swift (any other
-//!     name: the level model's raw f32s, then the mode model's)
+//!     train all three on everything and write Sources/GlassActAV1/AV1PrunerWeights.swift (any
+//!     other name: the level model's raw f32s, then the mode model's, then the chroma model's)
 //! EVAL=<raw weights> cargo run --release --example prune_train -- <dumps>
 //!     score raw weights (as EXPORT writes them) on the dumps
 use std::collections::HashMap;
@@ -35,6 +38,14 @@ const LEVEL_H: usize = 24;
 const MODE_NF: usize = PF + OB + 4 + 1;
 const MODE_H: usize = 24;
 const MODES: usize = 13;
+/// The chroma model: per plane (U, V) its log variance, gradients and squared correlation with luma;
+/// the chroma block's log2 size; the luma mode's family (one-hot: DC, V, H, smooth, Paeth, another
+/// angle); a bias. 8 classes: k_leaf's 7 plain modes (CHROMA_MODES' order), then CfL.
+const CHROMA_NF: usize = 8 + 1 + 6 + 1;
+const CHROMA_H: usize = 16;
+const CHROMA_C: usize = 8;
+/// k_leaf's plain chroma modes, in its order (DC, V, H, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH).
+const CHROMA_MODES: [u8; 7] = [0, 1, 2, 9, 10, 11, 12];
 
 /// One dumped picture.
 struct Pic {
@@ -49,6 +60,66 @@ struct Pic {
     nodes: Vec<(Vec<f32>, u8)>,
     /// chosen leaves: (their node's features, their mode)
     leaves: Vec<(Vec<f32>, u8)>,
+    /// chroma model samples: (a chroma-carrying leaf's features, its class)
+    chroma: Vec<(Vec<f32>, u8)>,
+}
+
+/// The chroma model's features of a leaf whose chroma block is cw x ch at (cx, cy) (k_leaf's).
+fn chroma_features(y: &[u8], w: usize, uv: [&[u8]; 2], cwp: usize, cx: usize, cy: usize, cw: usize, ch: usize, st2: f64, y_mode: u8) -> Vec<f32> {
+    let luma = |i: usize, j: usize| {
+        let (r, c) = ((cy + i) * 2, (cx + j) * 2);
+        (y[r * w + c] as f64 + y[r * w + c + 1] as f64 + y[(r + 1) * w + c] as f64 + y[(r + 1) * w + c + 1] as f64) / 4.0
+    };
+    let n = (cw * ch) as f64;
+    let (mut l1, mut l2) = (0f64, 0f64);
+    for i in 0..ch {
+        for j in 0..cw {
+            let l = luma(i, j);
+            l1 += l;
+            l2 += l * l;
+        }
+    }
+    let lvar = l2 / n - (l1 / n) * (l1 / n);
+    let mut f = Vec::with_capacity(CHROMA_NF);
+    for p in uv {
+        let (mut s1, mut s2, mut sl, mut dx, mut dy) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for i in 0..ch {
+            for j in 0..cw {
+                let v = p[(cy + i) * cwp + cx + j] as f64;
+                s1 += v;
+                s2 += v * v;
+                sl += v * luma(i, j);
+                if j + 1 < cw {
+                    dx += (p[(cy + i) * cwp + cx + j + 1] as f64 - v).abs();
+                }
+                if i + 1 < ch {
+                    dy += (p[(cy + i + 1) * cwp + cx + j] as f64 - v).abs();
+                }
+            }
+        }
+        let var = s2 / n - (s1 / n) * (s1 / n);
+        let cov = sl / n - (s1 / n) * (l1 / n);
+        let corr2 = if var * lvar > 1e-6 { (cov * cov / (var * lvar)).min(1.0) } else { 0.0 };
+        let (dx, dy) = (dx / (n - ch as f64).max(1.0), dy / (n - cw as f64).max(1.0));
+        f.push((1.0 + var.max(0.0) / st2).ln() as f32);
+        f.push((1.0 + dx * dx / st2).ln() as f32);
+        f.push((1.0 + dy * dy / st2).ln() as f32);
+        f.push(corr2 as f32);
+    }
+    f.push(((cw * ch) as f32).log2() / 10.0);
+    let family = match y_mode {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        9..=11 => 3,
+        12 => 4,
+        _ => 5,
+    };
+    for k in 0..6 {
+        f.push((k == family) as u8 as f32);
+    }
+    f.push(1.0);
+    f
 }
 
 fn stats(y: &[u8], w: usize, x0: usize, y0: usize, n: usize, st2: f64) -> [f32; PF] {
@@ -212,6 +283,9 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
         let (mc, mr) = (w / 4, h / 4);
         let mut lvl = vec![0u8; mc * mr];
         let mut leaf_list = vec![];
+        let mut chroma = vec![];
+        let cwp = w.div_ceil(2);
+        let chro = s.get("CHRO").map(|c| [&c[..cwp * h.div_ceil(2)], &c[cwp * h.div_ceil(2)..]]);
         for r in leaf.chunks(16) {
             let (mi_row, mi_col, bs) =
                 (u16::from_le_bytes([r[0], r[1]]) as usize, u16::from_le_bytes([r[2], r[3]]) as usize, r[4]);
@@ -223,6 +297,23 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
                 }
             }
             leaf_list.push((mi_col * 4, mi_row * 4, l as usize, r[7]));
+            // a leaf with chroma (sub-8x8: the 8x8's last), k_leaf's chroma block
+            let has_chroma = (bw > 4 || mi_col & 1 == 1) && (bh > 4 || mi_row & 1 == 1);
+            if let Some(uv) = chro
+                && has_chroma
+                && (sub <= 1 || (mi_row * 7 + mi_col * 13) % sub == 0)
+            {
+                let (cx, cy) = ((mi_col >> 1) * 4, (mi_row >> 1) * 4);
+                let (cw, ch) = ((bw / 2).clamp(4, 32), (bh / 2).clamp(4, 32));
+                let class = if r[9] == 13 { Some(7) } else { CHROMA_MODES.iter().position(|&m| m == r[9]) };
+                if let Some(class) = class
+                    && (cy + ch) * 2 <= h
+                    && (cx + cw) * 2 <= w
+                {
+                    let st = glassact_av1::dsp::ac_q(q as i32) as f64 / 8.0;
+                    chroma.push((chroma_features(y, w, uv, cwp, cx, cy, cw, ch, st * st, r[7]), class as u8));
+                }
+            }
         }
         let st = glassact_av1::dsp::ac_q(q as i32) as f64 / 8.0;
         let st2 = st * st;
@@ -297,7 +388,7 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
             })
             .map(|&(x, y0, li, m)| (node_features(li, x / (8 << li), y0 / (8 << li)), m))
             .collect();
-        pics.push(Pic { trace: ti, w, h, sbc, costs, cells, nodes, leaves });
+        pics.push(Pic { trace: ti, w, h, sbc, costs, cells, nodes, leaves, chroma });
     }
     (traces, pics)
 }
@@ -570,6 +661,33 @@ fn report_mode(m: &Mlp, pics: &[&Pic]) -> String {
     out
 }
 
+fn report_chroma(m: &Mlp, pics: &[&Pic]) -> String {
+    let (mut h, mut p) = (vec![0f32; m.h], vec![0f32; m.c]);
+    let mut out = String::new();
+    for &eps in &EPSS {
+        let (mut kept, mut cfl, mut miss, mut n) = (0f64, 0f64, 0f64, 0f64);
+        for pic in pics {
+            for (f, class) in &pic.chroma {
+                m.fwd(f, &mut h, &mut p);
+                let k = keep_classes(&p, eps);
+                kept += (k & 0x7F).count_ones() as f64;
+                cfl += (k >> 7 & 1) as f64;
+                if k >> class & 1 == 0 {
+                    miss += 1.0;
+                }
+                n += 1.0;
+            }
+        }
+        out += &format!(
+            " eps {eps}: {:.1} modes, CfL {:.0} %, leaves missed {:.1} % |",
+            kept / n.max(1.0),
+            cfl / n.max(1.0) * 100.,
+            miss / n.max(1.0) * 100.
+        );
+    }
+    out
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: prune_train <dumps> (see the file comment)");
     let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
@@ -597,6 +715,11 @@ fn main() {
         if v.len() > nl {
             let mode = Mlp::from_floats(&v[nl..], MODE_NF, MODE_H, MODES);
             println!("mode:{}", report_mode(&mode, &all));
+            let nm = mode.floats().len();
+            if v.len() > nl + nm {
+                let chroma = Mlp::from_floats(&v[nl + nm..], CHROMA_NF, CHROMA_H, CHROMA_C);
+                println!("chroma:{}", report_chroma(&chroma, &all));
+            }
         }
         return;
     }
@@ -606,7 +729,9 @@ fn main() {
         let level = train(&level_all, LEVEL_NF, LEVEL_H, 4, steps, 5);
         let mode_all = mode_data(&|_| true);
         let mode = train(&mode_all, MODE_NF, MODE_H, MODES, steps, 7);
-        let (lv, mv) = (level.floats(), mode.floats());
+        let chroma_all: Vec<(&[f32], u8)> = pics.iter().flat_map(|p| p.chroma.iter().map(|c| (c.0.as_slice(), c.1))).collect();
+        let chroma = train(&chroma_all, CHROMA_NF, CHROMA_H, CHROMA_C, steps, 11);
+        let (lv, mv, cv) = (level.floats(), mode.floats(), chroma.floats());
         if out.ends_with(".swift") {
             let array = |v: &[f32]| -> String {
                 v.chunks(6).map(|row| format!("        {},\n", row.iter().map(|x| format!("{x:e}")).collect::<Vec<_>>().join(", "))).collect()
@@ -617,19 +742,31 @@ fn main() {
                  // layer, its biases, output layer, its biases.\n\n\
                  /// See `AV1MetalEncoder.learnedPrune`.\npublic enum AV1PrunerWeights {{\n\
                  \x20   /// The level model (ML_FLOATS): {} cells of {} pictures.\n    public static let cellV1: [Float] = [\n{}    ]\n\
-                 \x20   /// The mode model (ML_MODE_FLOATS): {} blocks of {} pictures.\n    public static let modeV1: [Float] = [\n{}    ]\n}}\n",
+                 \x20   /// The mode model (ML_MODE_FLOATS): {} blocks of {} pictures.\n    public static let modeV1: [Float] = [\n{}    ]\n\
+                 \x20   /// The chroma model (ML_CHROMA_FLOATS): {} leaves of {} pictures.\n    public static let chromaV1: [Float] = [\n{}    ]\n}}\n",
                 level_all.len(),
                 pics.len(),
                 array(&lv),
                 mode_all.len(),
                 pics.len(),
-                array(&mv)
+                array(&mv),
+                chroma_all.len(),
+                pics.len(),
+                array(&cv)
             );
             fs::write(&out, t).unwrap();
         } else {
-            fs::write(&out, lv.iter().chain(&mv).flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            fs::write(&out, lv.iter().chain(&mv).chain(&cv).flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
         }
-        println!("{} + {} floats written to {out} ({} cells, {} blocks)", lv.len(), mv.len(), level_all.len(), mode_all.len());
+        println!(
+            "{} + {} + {} floats written to {out} ({} cells, {} blocks, {} leaves)",
+            lv.len(),
+            mv.len(),
+            cv.len(),
+            level_all.len(),
+            mode_all.len(),
+            chroma_all.len()
+        );
         return;
     }
     for t in 0..traces.len() {
@@ -637,6 +774,12 @@ fn main() {
         if model.is_empty() || model == "level" {
             let m = train(&level_data(&|p| p.trace != t), LEVEL_NF, LEVEL_H, 4, steps, 5 + t as u64);
             println!("{} level:{}", traces[t], report_level(&m, &test));
+        }
+        if model.is_empty() || model == "chroma" {
+            let data: Vec<(&[f32], u8)> =
+                pics.iter().filter(|p| p.trace != t).flat_map(|p| p.chroma.iter().map(|c| (c.0.as_slice(), c.1))).collect();
+            let m = train(&data, CHROMA_NF, CHROMA_H, CHROMA_C, steps, 11 + t as u64);
+            println!("{} chroma: {} leaves trained on |{}", traces[t], data.len(), report_chroma(&m, &test));
         }
         if model.is_empty() || model == "mode" {
             let data = mode_data(&|p| p.trace != t);

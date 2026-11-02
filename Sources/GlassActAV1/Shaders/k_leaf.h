@@ -127,9 +127,78 @@ static uint8_t leaf_luma_tx(device const GpImage &I, constant GpParams &P, int x
 #endif
 }
 
+// Glass Act: the chroma model (k_ml.h ML_CHROMA_*) on a leaf whose chroma block is w x h at (cx, cy):
+// bit k of the result keeps k_leaf's k-th plain chroma mode, bit 7 CfL. The lanes share the sums
+// and the hidden layer; every lane returns the same bits.
+static uint leaf_chroma_model(device const GpImage &I, int ym, int cx, int cy, int w, int h, float step, uint lane) {
+    device const uint8_t *Y = I.src[0];
+    const int ys = I.spitch[0], cs = I.spitch[1];
+    float l1 = 0.f, l2 = 0.f, s1[2] = {0, 0}, s2[2] = {0, 0}, sl[2] = {0, 0}, dx[2] = {0, 0}, dy[2] = {0, 0};
+    for (int p = (int)lane; p < w * h; p += 32) {
+        const int i = p / w, j = p % w;
+        device const uint8_t *ly = Y + (size_t)((cy + i) * 2) * ys + (cx + j) * 2;
+        const float l = (float)((int)ly[0] + ly[1] + ly[ys] + ly[ys + 1]) / 4.f;
+        l1 += l;
+        l2 += l * l;
+        for (int pl = 0; pl < 2; pl++) {
+            device const uint8_t *s = I.src[1 + pl] + (size_t)(cy + i) * cs + cx + j;
+            const float v = (float)s[0];
+            s1[pl] += v;
+            s2[pl] += v * v;
+            sl[pl] += v * l;
+            if (j + 1 < w) dx[pl] += fabs((float)s[1] - v);
+            if (i + 1 < h) dy[pl] += fabs((float)s[cs] - v);
+        }
+    }
+    const float n = (float)(w * h), st2 = step * step;
+    l1 = simd_sum(l1);
+    l2 = simd_sum(l2);
+    const float lvar = l2 / n - (l1 / n) * (l1 / n);
+    float f[ML_CHROMA_NF];
+    for (int pl = 0; pl < 2; pl++) {
+        const float a = simd_sum(s1[pl]), b = simd_sum(s2[pl]), c = simd_sum(sl[pl]);
+        const float gx = simd_sum(dx[pl]) / max(n - (float)h, 1.f), gy = simd_sum(dy[pl]) / max(n - (float)w, 1.f);
+        const float var = b / n - (a / n) * (a / n), cov = c / n - (a / n) * (l1 / n);
+        f[pl * 4 + 0] = log(1.f + max(var, 0.f) / st2);
+        f[pl * 4 + 1] = log(1.f + gx * gx / st2);
+        f[pl * 4 + 2] = log(1.f + gy * gy / st2);
+        f[pl * 4 + 3] = var * lvar > 1e-6f ? min(cov * cov / (var * lvar), 1.f) : 0.f;
+    }
+    f[8] = log2(n) / 10.f;
+    // the leaf's luma mode's family
+    const int family = ym == AV1G_DC_PRED ? 0 : ym == AV1G_V_PRED ? 1 : ym == AV1G_H_PRED ? 2
+                       : (ym >= AV1G_SMOOTH_PRED && ym <= AV1G_SMOOTH_H_PRED) ? 3 : ym == AV1G_PAETH_PRED ? 4 : 5;
+    for (int k = 0; k < 6; k++) f[9 + k] = k == family ? 1.f : 0.f;
+    f[15] = 1.f;
+    device const float *W = I.mlChroma, *mu = W, *sd = W + ML_CHROMA_NF, *w1 = sd + ML_CHROMA_NF,
+                       *b1 = w1 + ML_CHROMA_H * ML_CHROMA_NF, *w2 = b1 + ML_CHROMA_H, *b2 = w2 + ML_CHROMA_C * ML_CHROMA_H;
+    float hj = 0.f;
+    if (lane < ML_CHROMA_H) {
+        float a = b1[lane];
+        for (int k = 0; k < ML_CHROMA_NF; k++) a += w1[lane * ML_CHROMA_NF + k] * (f[k] - mu[k]) / sd[k];
+        hj = ML_TANH(a);
+    }
+    float p[ML_CHROMA_C], mx = -1e30f, sum = 0.f;
+    for (int c = 0; c < ML_CHROMA_C; c++) {
+        p[c] = b2[c] + simd_sum(lane < ML_CHROMA_H ? w2[c * ML_CHROMA_H + lane] * hj : 0.f);
+        mx = max(mx, p[c]);
+    }
+    for (int c = 0; c < ML_CHROMA_C; c++) { p[c] = exp(p[c] - mx); sum += p[c]; }
+    uint bits = 0;
+    float keptP = 0.f;
+    for (int i = 0; i < ML_CHROMA_C && keptP < (1.f - I.mlChromaEps) * sum; i++) {
+        int best = -1;
+        for (int c = 0; c < ML_CHROMA_C; c++)
+            if (!(bits >> c & 1) && (best < 0 || p[c] > p[best])) best = c;
+        bits |= 1u << best;
+        keptP += p[best];
+    }
+    return bits ? bits : 0xFFu;
+}
+
 // Decider::best_chroma, lanes over 4x4 sub-blocks
-static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, threadgroup LeafSmem &S, uint lane,
-                        thread GpLeafDecision &d) {
+static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, int lumaMode,
+                        threadgroup LeafSmem &S, uint lane, thread GpLeafDecision &d) {
     const int txSz = av1g_uv_tx_size(bs);
     const int lw = AV1G_T(Tx_Width_Log2)[txSz], lh = AV1G_T(Tx_Height_Log2)[txSz];
     const int w = 1 << lw, h = 1 << lh, nsx = w / 4, nsub = (w / 4) * (h / 4);
@@ -152,10 +221,16 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
     // the modes screened: all 13, or the seven without an angle (cheaper per pixel)
     constexpr int plain[7] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED, AV1G_SMOOTH_V_PRED,
                               AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
-    const int nmodes = P.leafChromaAngled ? AV1G_INTRA_MODES : 7;
+    // Glass Act: learned chroma pruning (k_ml.h): the plain modes, and CfL, the chroma model keeps
+    const uint kept = I.mlChroma && !P.leafChromaAngled ? leaf_chroma_model(I, lumaMode, cx, cy, w, h, step, lane) : 0xFFu;
+    int keptModes[7], nkept = 0;
+    for (int k = 0; k < 7; k++)
+        if (kept >> k & 1) keptModes[nkept++] = plain[k];
+    if (!nkept) keptModes[nkept++] = AV1G_DC_PRED;
+    const int nmodes = P.leafChromaAngled ? AV1G_INTRA_MODES : nkept;
     const int items = nmodes * 2 * nsub;
     for (int it = (int)lane; it < items; it += 32) {
-        const int mi = it / (2 * nsub), m = P.leafChromaAngled ? mi : plain[mi];
+        const int mi = it / (2 * nsub), m = P.leafChromaAngled ? mi : keptModes[mi];
         const int pl = 1 + (it / nsub) % 2, sb = it % nsub;
         const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
         device const uint8_t *s = I.src[pl] + (size_t)cy * I.spitch[pl] + cx;
@@ -170,14 +245,14 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
     float best = GP_INF;
     int bestMode = AV1G_DC_PRED;
     for (int mi = 0; mi < nmodes; mi++) {
-        const int m = P.leafChromaAngled ? mi : plain[mi];
+        const int m = P.leafChromaAngled ? mi : keptModes[mi];
         const float J = simd_sum(part[m]) + lambda * (av1g_is_directional(m) ? 5.0f : 3.5f);
         if (J < best) { best = J; bestMode = m; }
     }
     d.uvMode = (uint8_t)bestMode;
     d.angleUV = 0;
     d.cflU = d.cflV = 0;
-    if (!av1g_cfl_allowed(bs)) return;
+    if (!av1g_cfl_allowed(bs) || !(kept >> 7 & 1)) return;
     // least-squares alpha against source luma (3 fractional bits, as in the spec)
     device const uint8_t *Y = I.src[0];
     const int ys = I.spitch[0];
@@ -303,7 +378,8 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
             default: break;
             }
         }
-        if (av1g_has_chroma(bs, y >> 2, x >> 2, I.mono)) leaf_chroma(I, P, x, y, bs, sb_qindex(I, x, y), S, lane, d);
+        if (av1g_has_chroma(bs, y >> 2, x >> 2, I.mono))
+            leaf_chroma(I, P, x, y, bs, sb_qindex(I, x, y), r.ncand > 0 ? cand_mode(r.cand[0]) : AV1G_DC_PRED, S, lane, d);
         if (lane == 0) B.leafDec[sb * GP_MAX_LEAVES + k] = d;
     }
 }

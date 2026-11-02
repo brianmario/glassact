@@ -129,8 +129,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.searchesAngleDeltas = newValue }
     }
     /// The learned pruning the encoder starts with: the shipped level and mode
-    /// models (AV1PrunerWeights), eps 0.02 for levels and MODE_EPS for modes, in
-    /// pictures coding more than half their superblocks.
+    /// models (AV1PrunerWeights), eps 0.02 each, in pictures coding more than half
+    /// their superblocks. Not the chroma model: it saves ~1 ms of the leaf stage and
+    /// none of a picture (BENCHMARKS.md).
     public static let defaultLearnedPrune = AV1MetalEncoder.LearnedPrune(
         levelWeights: AV1PrunerWeights.cellV1, eps: 0.02, modeWeights: AV1PrunerWeights.modeV1, modeEps: 0.02, overShare: 0.5)
     /// See `AV1MetalEncoder.learnedPrune` (on: `defaultLearnedPrune`).

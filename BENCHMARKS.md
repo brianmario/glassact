@@ -406,6 +406,17 @@ interleaved runs; the typing stream's outlier re-run three times):
 Kept, eps 0.02 (`AV1PrunerWeights.modeV1`; `av1seq --no-ml-modes`, `--ml-mode-eps`). A 5K
 full-screen change of text now codes in ~65–71 ms, from ~154 this morning.
 
+**A chroma model, measured and kept off** (`av1seq --ml-chroma`). Per leaf with chroma, for U and
+V its log variance, gradients and squared correlation with luma (what CfL exploits), the chroma
+block's size and the leaf's luma mode's family give a softmax over k_leaf's 7 plain chroma modes and
+CfL (16-16-8, computed by the leaf's lanes together); the leaf screens only the kept ones. Each
+trace scored by a model trained on the others, eps 0.02: 4.0–5.1 modes screened, CfL tried on
+17–41 % of leaves, 0.7–1.9 % of leaves' choices dropped. On the GPU (5K key frames, 8 from frame
+100): the leaf stage 7.6 → 6.6 ms on typing-cc and 7.8 → 7.5 on photos, the picture 65.9 → 65.5 and
+98.7 → 98.6 ms (noise), bytes +0.05 %. Its features cost about what it saves, as the leaf stage's
+split predicted (entry above). The dumps carry chroma (CHRO) and the trainer exports chromaV1, so
+it can be re-measured on more data.
+
 **Retraining.** `scripts/pruner-traces.txt` lists the traces with their training and test frames;
 `scripts/train-pruner` dumps the training pictures (to ~/Library/Caches/Glass Act/pruner: screen
 content stays out of the repo), scores both models leave-one-trace-out, trains and exports them,

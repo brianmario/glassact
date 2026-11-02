@@ -33,6 +33,14 @@
 #define ML_MODE_H 24
 #define ML_MODES 13
 #define ML_MODE_FLOATS (2 * ML_MODE_NF + ML_MODE_H * ML_MODE_NF + ML_MODE_H + ML_MODES * ML_MODE_H + ML_MODES)
+// The chroma model (k_leaf.h, leaf_chroma): per leaf with chroma, for U and V its log variance,
+// gradients and squared correlation with luma, the chroma block's log2 size / 10, its luma mode's
+// family (one-hot: DC, V, H, smooth, Paeth, another angle) and a bias; ML_CHROMA_H hidden; 8 classes:
+// k_leaf's 7 plain modes, then CfL.
+#define ML_CHROMA_NF 16
+#define ML_CHROMA_H 16
+#define ML_CHROMA_C 8
+#define ML_CHROMA_FLOATS (2 * ML_CHROMA_NF + ML_CHROMA_H * ML_CHROMA_NF + ML_CHROMA_H + ML_CHROMA_C * ML_CHROMA_H + ML_CHROMA_C)
 
 static inline void ga_ml_node_features(device const uint8_t *src, int sp, int x0, int y0, int n, float st2,
                                        device float *out, bool orientations) {

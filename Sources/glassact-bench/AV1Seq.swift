@@ -54,6 +54,8 @@ let av1SeqCommand = Command(
         .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
         .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
+        .bool("ml-chroma", "learned chroma pruning too, with the shipped chroma model (AV1PrunerWeights.chromaV1; off by default)"),
+        .string("ml-chroma-eps", "<p>", "learned chroma pruning: a leaf keeps its likeliest chroma modes until all but this much probability is kept (default: the encoder's)"),
         .string("ml-eps", "<p>", "learned pruning: a cell keeps its likeliest levels until all but this much probability is kept (default 0.02)"),
         .bool("no-ml-prune", "no learned pruning (the variance rule instead)"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
@@ -147,16 +149,19 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         if let path = opts.string("ml-prune") {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             let weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-            let (level, mode) = (AV1PrunerWeights.cellV1.count, AV1PrunerWeights.modeV1.count)
-            guard weights.count == level || weights.count == level + mode
-            else { throw BenchError("--ml-prune: \(weights.count) floats, not \(level) (levels) or \(level + mode) (levels and modes)") }
+            let (level, mode, chroma) = (AV1PrunerWeights.cellV1.count, AV1PrunerWeights.modeV1.count, AV1PrunerWeights.chromaV1.count)
+            guard [level, level + mode, level + mode + chroma].contains(weights.count)
+            else { throw BenchError("--ml-prune: \(weights.count) floats, not \(level), \(level + mode) or \(level + mode + chroma) (levels, modes, chroma)") }
             lp.levelWeights = Array(weights.prefix(level))
-            lp.modeWeights = weights.count > level ? Array(weights.suffix(mode)) : nil
+            lp.modeWeights = weights.count > level ? Array(weights[level..<(level + mode)]) : nil
+            lp.chromaWeights = weights.count > level + mode ? Array(weights.suffix(chroma)) : nil
         }
         if let v = opts.string("ml-eps").flatMap(Float.init) { lp.eps = v }
         if let v = opts.string("ml-mode-eps").flatMap(Float.init) { lp.modeEps = v }
         if let v = opts.string("ml-over").flatMap(Double.init) { lp.overShare = v }
         if opts.has("no-ml-modes") { lp.modeWeights = nil }
+        if let v = opts.string("ml-chroma-eps").flatMap(Float.init) { lp.chromaEps = v }
+        if opts.has("ml-chroma"), lp.chromaWeights == nil { lp.chromaWeights = AV1PrunerWeights.chromaV1 }
         encoder.learnedPrune = lp
     }
     if let v = opts.string("deltas-up-to") {
@@ -435,8 +440,8 @@ func writeIVF(_ frames: [[UInt8]], width: Int, height: Int, to path: String) thr
 
 /// `--dump-partition`: for each picture, `<dir>/pNNN.bin`, the learned pruning's training data
 /// (rust/av1/examples/prune_train.rs reads it): "GAML", version 2, then tagged sections: PICT
-/// (size, qindex, luma), LEAF (the full search's leaves), NODE (the DP's node costs), MODE (each
-/// analyzed block's best luma candidate).
+/// (size, qindex, luma), CHRO (chroma), LEAF (the full search's leaves, with the GPU's chroma
+/// decisions), NODE (the DP's node costs), MODE (each analyzed block's best luma candidate).
 @available(macOS 27, *)
 func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, preset: AV1MetalEncoder.Preset,
                     device: any MTLDevice, to dir: String) throws {
@@ -465,6 +470,11 @@ func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, 
         section("PICT") { d in  // width, height, qindex, the luma plane
             for v in [width, height, qindex] { u32(v, into: &d) }
             d.append(contentsOf: p.planes[0].prefix(width * height))
+        }
+        section("CHRO") { d in  // the U and V planes, ((width + 1) / 2) x ((height + 1) / 2) each
+            let n = ((width + 1) / 2) * ((height + 1) / 2)
+            d.append(contentsOf: p.planes[1].prefix(n))
+            d.append(contentsOf: p.planes[2].prefix(n))
         }
         section("LEAF") { d in part.blocks.withUnsafeBytes { d.append(contentsOf: $0) } }  // av1g_block records
         section("NODE") { d in part.nodeCosts.withUnsafeBytes { d.append(contentsOf: $0) } }  // GP_DP_DEBUG floats per SB

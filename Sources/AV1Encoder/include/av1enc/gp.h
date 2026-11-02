@@ -155,6 +155,10 @@ struct GpImage {
     // (bit m: mode m). NULL: every mode.
     GP_DEV const uint16_t *mlModes;
     uint32_t mlModeBase[4];
+    // Glass Act: learned chroma pruning (k_leaf, leaf_chroma): the chroma model's weights
+    // (k_ml.h ML_CHROMA_FLOATS) and its eps. NULL: every chroma mode, and CfL.
+    GP_DEV const float *mlChroma;
+    float mlChromaEps;
 };
 
 // Glass Act: an SB's distinct inter candidates (1/8 sample): v[0] is no motion; idx[16x16 * GP_ME_KEEP

@@ -388,6 +388,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             mlWeights = learnedPrune.flatMap { buffer($0.levelWeights) }
             mlModeWeights = learnedPrune?.modeWeights.flatMap { buffer($0) }
+            mlChromaWeights = learnedPrune?.chromaWeights.flatMap { buffer($0) }
         }
     }
     /// The learned pruning's models and settings (k_ml.h; AV1PrunerWeights has the shipped ones).
@@ -400,13 +401,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var modeWeights: [Float]?
         /// A node keeps its likeliest modes until all but this much probability is kept.
         public var modeEps: Float
+        /// The chroma model (ML_CHROMA_FLOATS), or nil: every leaf screens all its chroma modes, and CfL.
+        public var chromaWeights: [Float]?
+        /// A leaf keeps its likeliest chroma modes (and CfL) until all but this much is kept.
+        public var chromaEps: Float
         /// Only in pictures coding more than this share of their superblocks.
         public var overShare: Double
-        public init(levelWeights: [Float], eps: Float, modeWeights: [Float]?, modeEps: Float, overShare: Double) {
-            (self.levelWeights, self.eps, self.modeWeights, self.modeEps, self.overShare) = (levelWeights, eps, modeWeights, modeEps, overShare)
+        public init(levelWeights: [Float], eps: Float, modeWeights: [Float]?, modeEps: Float,
+                    chromaWeights: [Float]? = nil, chromaEps: Float = 0.02, overShare: Double) {
+            (self.levelWeights, self.eps, self.modeWeights, self.modeEps) = (levelWeights, eps, modeWeights, modeEps)
+            (self.chromaWeights, self.chromaEps, self.overShare) = (chromaWeights, chromaEps, overShare)
         }
     }
-    var mlWeights: (any MTLBuffer)?, mlModeWeights: (any MTLBuffer)?
+    var mlWeights: (any MTLBuffer)?, mlModeWeights: (any MTLBuffer)?, mlChromaWeights: (any MTLBuffer)?
     /// Learned pruning's least picture: below it the passes cost more than they
     /// save (at 720p a moving picture codes up to ~20 % slower).
     public var learnedPruneMinSuperblocks = 2000
@@ -808,6 +815,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     nodes += UInt32((width / n) * (height / n))
                 }
                 mlStatsBuffer = try make(Int(max(base, 1)) * 4)
+                if let chroma = encoder.mlChromaWeights {
+                    made.append(chroma)
+                    image.mlChroma = AV1MetalEncoder.address(chroma)
+                    image.mlChromaEps = lp.chromaEps
+                }
                 if encoder.mlModeWeights != nil {
                     let modes = try make(Int(max(nodes, 1)) * 2)
                     mlModes = modes
