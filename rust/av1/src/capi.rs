@@ -888,6 +888,12 @@ pub unsafe extern "C" fn av1enc_hybrid_set_reuse(h: *mut HybridHandle, on: c_int
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_intrabc(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_intrabc(on != 0) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_reused_tiles(h: *const HybridHandle) -> u32 {
     // SAFETY: the handle
     unsafe { (*h).h.reused_tiles() }

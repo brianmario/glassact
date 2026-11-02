@@ -210,3 +210,68 @@ extension HybridEncoderTests {
         #expect(searched > 0, "\(label): no block was motion-searched")
     }
 }
+
+extension HybridEncoderTests {
+    /// Intra block copy: pictures whose text repeats (at even and odd offsets) copy it, with no
+    /// post-filters, and decode in libaom to exactly the pictures the encoder reports: as still
+    /// pictures (the same one again, keeping its tiles; a photo after it, which doesn't copy and
+    /// is filtered whole; then the text again, partly changed) and as a stream, whose inter frames
+    /// reference the copying key frame.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [false, true])
+    func intraBlockCopyFramesDecodeToTheirPictures(stream: Bool) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (1, 0)
+        encoder.intraBlockCopy = true
+        encoder.interFrames = stream
+        let (width, height) = (1280, 720)
+        let cw = width / 2
+        var rng = SplitMix64(seed: 0x1bc)
+        let base = PartitionTests.Picture(width: width, height: height)
+        // a block of glyphs, repeated down each half of the picture (a tile each; the right half's
+        // copies come from its own first one)
+        var text = base
+        let (bw, bh) = (200, 48)
+        for r in 0..<bh { for c in 0..<bw where rng.int(0..<3) == 0 { text.y[(8 + r) * width + 8 + c] = UInt8(rng.int(20..<90)) } }
+        for half in [0, width / 2] {
+            for k in 0..<8 {
+                let (dx, dy) = (half + 8 + (k % 2) * 250 + k % 3, 70 + k * 80 + k % 2)
+                guard dx + bw <= width, dy + bh <= height else { continue }
+                for r in 0..<bh { for c in 0..<bw { text.y[(dy + r) * width + dx + c] = text.y[(8 + r) * width + 8 + c] } }
+                for r in 0..<bh / 2 { for c in 0..<bw / 2 { text.u[(dy / 2 + r) * cw + dx / 2 + c] = text.u[(4 + r) * cw + 4 + c] } }
+            }
+        }
+        var photo = base
+        for k in photo.y.indices { photo.y[k] = UInt8(clamping: 90 + (k % 37) + rng.int(0..<40)) }
+        var changed = text
+        for r in 300..<340 { for c in 900..<1000 where rng.int(0..<2) == 0 { changed.y[r * width + c] = 30 } }
+        let order = stream ? [text, changed, changed, text] : [text, text, photo, changed]
+        let pictures = order.map { AV1HybridEncoder.Picture(y: $0.y, u: $0.u, v: $0.v, width: width, height: height) }
+        let label = stream ? "stream" : "still pictures"
+        var copying = 0
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        try encoder.encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { i, f in
+            if f.timing.intraCopied > 0 {
+                copying += 1
+                #expect(f.params.allow_intrabc == 1 && f.params.loop_filter_level == (0, 0, 0, 0), "\(label): frame \(i)")
+            }
+            // a still picture decodes alone (the decoder owns the planes until it's destroyed)
+            let alone = stream ? nil : glassact_aom_dec_create(1)
+            defer { if let alone { glassact_aom_dec_destroy(alone) } }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(alone ?? decoder, f.obu, f.obu.count, &frame) == 0,
+                         "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), (cw, height / 2), (cw, height / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        #expect(copying >= (stream ? 1 : 3), "\(label): \(copying) frames copied")
+    }
+}

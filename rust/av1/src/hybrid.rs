@@ -4,7 +4,9 @@
 //! which gets each tx block's exact prediction and chooses its coefficients (the GPU's dead-zone
 //! quantizer, luma tx types by exact reconstruction error), reconstructing as it goes, tiles on
 //! parallel threads; then skip flags for all-zero blocks. The caller filters the reconstruction and
-//! writes the bitstream ([`Hybrid::write`]).
+//! writes the bitstream ([`Hybrid::write`]). With [`Hybrid::set_intrabc`], a key frame's blocks go
+//! through the intra block copy search first ([`intrabc`]), and a frame that copies is written
+//! without post-filters.
 //!
 //! From av1gpu's CPU reference engine (BSD-2): its forward transform (here also in float), padded
 //! source, Hadamard cost proxy, chroma decisions and quantization hook, which the reference engine
@@ -25,6 +27,7 @@ mod decide;
 mod fwd;
 #[cfg(target_arch = "aarch64")]
 mod fwd_neon;
+mod intrabc;
 mod quant;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -112,6 +115,8 @@ struct TileMem {
     /// its blocks' cdef_idx when `payload` was written
     cdef: Vec<i8>,
     cdef_bits: i32,
+    /// `payload` codes use_intrabc (the frame had intra block copies)
+    abc: bool,
 }
 
 impl Default for TileMem {
@@ -124,6 +129,7 @@ impl Default for TileMem {
             payload: Vec::new(),
             cdef: Vec::new(),
             cdef_bits: -1,
+            abc: false,
         }
     }
 }
@@ -137,6 +143,9 @@ pub struct Hybrid {
     /// the closed loop searches the luma tx types even where the analysis gave one (the C++
     /// hybrid keeps them: off in its tests): 1.1-1.5 % smaller (BENCHMARKS, 2026-11-01)
     search_luma_tx: bool,
+    /// key frames search for intra block copies ([`intrabc`]; off by default)
+    intrabc: bool,
+    ibc: intrabc::IntraBc,
     src: Src,
     /// per-tile reuse, for one geometry and quantizer
     mem: Vec<TileMem>,
@@ -203,6 +212,8 @@ impl Hybrid {
         Hybrid {
             quant_rnd: QUANT_RND,
             search_luma_tx: true,
+            intrabc: false,
+            ibc: intrabc::IntraBc::default(),
             src: Src::default(),
             mem: Vec::new(),
             reused: Vec::new(),
@@ -385,10 +396,11 @@ impl Hybrid {
             recon_given,
             quant_rnd,
             search_luma_tx,
+            intrabc,
+            ibc,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
-        let is_inter = |b: usize| inter.get(b).is_some_and(|i| i.is_inter != 0);
         let reuse = *reuse;
         let [r0, r1] = recs;
         let (rec, prev) = if cur == 0 { (r0, &*r1) } else { (r1, &*r0) };
@@ -466,6 +478,30 @@ impl Hybrid {
                 src.view()
             }
         };
+        // a key frame's intra block copies: from here on its blocks, inter entries and luma tx
+        // types are the search's (a copy reads only its tile, so a tile is kept as before, when its
+        // inter entries are the same too)
+        // (a picture whose source and blocks are the last one's: the last search's answer)
+        let searches = *intrabc && !inter_frame && inter.is_empty();
+        if !searches {
+            ibc.forget();
+        }
+        let abc = searches
+            && match ibc.again(width, height, sb128, &tiles, given, luma_tx) {
+                Some(copied) if compare && !src_changed.iter().any(|&c| c) => copied,
+                _ => ibc.search(src, width, height, sb128, false, &tiles, given, luma_tx, *threads),
+            };
+        let (given, inter, luma_tx) = if abc {
+            (&ibc.blocks[..], &ibc.inter[..], luma_tx.map(|_| &ibc.tx[..]))
+        } else {
+            (given, inter, luma_tx)
+        };
+        let is_inter = |b: usize| inter.get(b).is_some_and(|i| i.is_inter != 0);
+        if abc {
+            (rec.fp.allow_intrabc, rec.fp.allow_screen_content_tools) = (1, 1);
+            rec.inter.clear();
+            rec.inter.extend_from_slice(inter);
+        }
 
         rec.blocks.clear();
         rec.blocks.extend_from_slice(given);
@@ -614,6 +650,14 @@ impl Hybrid {
         *reused_count = 0;
         if reuse && have_prev && tile_first[ntiles] as usize == n {
             let pn_txb = prev.txb.len();
+            // per tile: its blocks' inter entries (intra block copies) are the previous picture's
+            let entry = |r: &Record, k: usize| r.inter.get(k).copied().unwrap_or_default();
+            let same_inter: Vec<bool> = (0..ntiles)
+                .map(|i| {
+                    let ((b0, b1), (p0, p1)) = (range(i), prange(i));
+                    b1 - b0 == p1 - p0 && (0..b1 - b0).all(|k| entry(rec, b0 + k) == entry(prev, p0 + k))
+                })
+                .collect();
             let mut parts = split_tiles(rec, tile_first);
             par_for(
                 (n / 2048).clamp(1, *threads),
@@ -622,7 +666,7 @@ impl Hybrid {
                 |_, t| {
                     let i = t.i;
                     let m = &mem[i];
-                    if !m.valid || src_changed[i] {
+                    if !m.valid || src_changed[i] || !same_inter[i] {
                         return;
                     }
                     let (p0, p1) = prange(i);
@@ -820,7 +864,15 @@ impl Hybrid {
             ..
         } = self;
         let rec = &mut recs[*cur];
+        // a frame with intra block copies stays one: no post-filters, every cdef_idx 0
+        let abc = rec.fp.allow_intrabc != 0;
         rec.fp = *fp;
+        if abc {
+            (rec.fp.allow_intrabc, rec.fp.allow_screen_content_tools) = (1, 1);
+            rec.fp.loop_filter_level = [0; 4];
+            (rec.fp.cdef_bits, rec.fp.loop_filter_sharpness) = (0, 0);
+        }
+        let sb_cdef = sb_cdef.filter(|_| !abc);
         for k in &mut rec.blocks {
             let c = match sb_cdef {
                 Some(s) => match s.get((k.mi_row as usize >> 4) * sb_cols + (k.mi_col as usize >> 4)) {
@@ -841,6 +893,7 @@ impl Hybrid {
                     && reused.get(i).is_some_and(|&r| r)
                     && m.payload_valid
                     && m.cdef_bits == cdef_bits
+                    && m.abc == abc
                     && tile_first.len() > i + 1
                     && {
                         let (b0, b1) = (tile_first[i] as usize, tile_first[i + 1] as usize);
@@ -898,6 +951,7 @@ impl Hybrid {
             m.cdef.clear();
             m.cdef.extend(rec.blocks[b0..b1].iter().map(|b| b.cdef_idx));
             m.cdef_bits = cdef_bits;
+            m.abc = abc;
             m.payload_valid = true;
         }
         Ok(&obu.obu)
@@ -911,6 +965,12 @@ impl Hybrid {
     pub(crate) fn as_cpp(&mut self) {
         self.quant_rnd = 0.375;
         self.search_luma_tx = false;
+    }
+
+    /// av1enc_hybrid_set_intrabc: key frames search for intra block copies (off by default): a
+    /// frame where blocks copy has no post-filters (the record's fp.allow_intrabc says so).
+    pub fn set_intrabc(&mut self, on: bool) {
+        self.intrabc = on;
     }
 
     pub fn set_reuse(&mut self, on: bool) {

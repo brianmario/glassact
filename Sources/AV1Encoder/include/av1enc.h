@@ -129,6 +129,10 @@ int av1enc_hybrid_write_ex(av1enc_hybrid *h, const av1g_frame_params *fp, const 
                            uint32_t flags, uint8_t **obu, size_t *size, char *err, size_t errlen);
 // Keep unchanged tiles' closed loop and bitstream from picture to picture (on by default).
 void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
+// Key frames search for intra block copies (off by default). A frame where blocks copy has no
+// post-filters: the record's fp.allow_intrabc is 1, and av1enc_hybrid_write_ex keeps it so (no
+// deblocking, every cdef_idx 0) whatever fp it's given.
+void av1enc_hybrid_set_intrabc(av1enc_hybrid *h, int on);
 // Tiles the last closed loop kept.
 uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h);
 // Per 64x64 (raster), nonzero where the last closed loop re-coded the tile: elsewhere the

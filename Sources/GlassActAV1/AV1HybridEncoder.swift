@@ -65,6 +65,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var copied = 0.0, shifted = 0.0, motion = 0.0
         /// Inter frames: the share of the picture in blocks the motion search predicts (with a residual).
         public var searched = 0.0
+        /// Key frames with `intraBlockCopy`: the share of the picture in blocks that copy the frame itself.
+        public var intraCopied = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
     }
@@ -198,6 +200,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The current stream's superblock size (set when it starts).
     private var streamSB128 = false
 
+    /// The post-filters' output is the last picture's (false after a picture with intra block
+    /// copies, which has none: the next one is filtered whole).
+    private var filteredLast = true
+
     /// With `searchesMotion`: refine motion vectors to quarter samples (on). Scaled
     /// or animated content moves by fractions of a sample; captured scrolling and
     /// dragging at full size don't, and cost nothing more. Off: whole samples.
@@ -209,6 +215,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The last picture, for the next inter frame: its source, decoded
     /// output and per-64×64 decisions (copy, dx, dy).
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
+
+    /// Key frames copy what repeats inside them (AV1 intra block copy; on): a block whose source
+    /// appears exactly where the decoder has it already (spec is_mv_valid: at least 256 samples
+    /// back, in the tile) copies it. A frame with copies has no deblocking or CDEF, which the
+    /// format turns off for it, so a key frame copies only where its copies cover enough of it
+    /// (text at full size: at 5K, typing -18 %, cursor-drag -14 %, scroll -7 % BD-rate; photos and
+    /// downscaled text don't copy).
+    public var intraBlockCopy = true {
+        didSet { av1enc_hybrid_set_intrabc(cpu, intraBlockCopy ? 1 : 0) }
+    }
 
     /// Deblocking and CDEF (on). Off, the picture is the closed loop's
     /// reconstruction as is, and a tile decodes to the same samples alone
@@ -237,6 +253,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
         self.motion = motion
+        av1enc_hybrid_set_intrabc(cpu, 1)
         copyFinder = try CopyFinder()
     }
 
@@ -600,10 +617,21 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.keptTiles = Double(av1enc_hybrid_reused_tiles(cpu)) / Double(tileCount)
 
         let t1 = CACurrentMediaTime()
+        // a key frame with intra block copies has no post-filters (its reconstruction is its own, not
+        // the filters' buffers)
+        let copies = record.pointee.fp.allow_intrabc != 0
+        if copies, let inter = record.pointee.inter {
+            var area = 0
+            for k in 0..<Int(record.pointee.n_blocks) where inter[k].is_inter != 0 {
+                let size = AV1MetalEncoder.blockSizes[Int(record.pointee.blocks[k].bsize)]
+                area += size.w * size.h
+            }
+            timing.intraCopied = Double(area) / Double(p.width * p.height)
+        }
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
         for plane in 0..<3 {
             var stride: Int32 = 0
-            guard let r = store.isEmpty ? av1enc_hybrid_recon(cpu, Int32(plane)) : UnsafePointer(into[plane]),
+            guard let r = store.isEmpty || copies ? av1enc_hybrid_recon(cpu, Int32(plane)) : UnsafePointer(into[plane]),
                   let s = analysisSource.isEmpty ? av1enc_hybrid_source(cpu, Int32(plane), &stride) : analysisSource[plane]
             else { throw Failure.encode("no reconstruction") }
             recon.append(r)
@@ -611,8 +639,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(analysisSource.isEmpty ? Int(stride) : partition.sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
-        guard postfilters else {
-            let frame = try write(p, record: record, recon: recon, timing: timing, t0: t0, t1: t1)
+        guard postfilters, !copies else {
+            // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
+            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames, timing: timing,
+                                  t0: t0, t1: t1)
+            filteredLast = false
             remember(p, frame.planes, sbMotion)
             return Writing(frame)
         }
@@ -625,8 +656,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                                          sbRows: sbRows0, changed: &changed, direct: &d)
             direct = d
         } else {
-            known = reusesAnalysis && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
+            known = reusesAnalysis && filteredLast
+                && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
         }
+        filteredLast = true
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
@@ -717,13 +750,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The picture without post-filters: the record's parameters (no deblocking, no CDEF) and the
-    /// reconstruction, cropped.
+    /// reconstruction, cropped. `sequenceCDEF`: the sequence header enables CDEF all the same (a
+    /// frame with intra block copies, which codes none, of a stream whose other frames filter).
     private func write(_ p: Picture, record: UnsafeMutablePointer<av1g_decision_record>, recon: [UnsafePointer<UInt8>],
-                       timing: Timing, t0: Double, t1: Double) throws -> Frame {
+                       sequenceCDEF: Bool, timing: Timing, t0: Double, t1: Double) throws -> Frame {
         var timing = timing
         var params = record.pointee.fp
         params.loop_filter_level = (0, 0, 0, 0)
-        params.enable_cdef = 0
+        params.enable_cdef = sequenceCDEF && params.allow_intrabc != 0 ? 1 : 0
         params.cdef_bits = 0
         var message = [CChar](repeating: 0, count: 256)
         var bytes: UnsafeMutablePointer<UInt8>?

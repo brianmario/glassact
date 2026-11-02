@@ -95,7 +95,10 @@ pub struct FrameParams {
     /// 1: 128x128 superblocks (use_128x128_superblock; a sequence header field: the same in every
     /// frame of a stream); 0: 64x64
     pub sb128: u8,
-    pub reserved: [u8; 6],
+    /// key frames: 1 = intra block copy (allow_intrabc; decisions.h "Intra block copy"): blocks
+    /// with an inter entry copy the frame's own reconstruction, and the frame has no post-filters
+    pub allow_intrabc: u8,
+    pub reserved: [u8; 5],
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
@@ -370,7 +373,7 @@ mod tests {
         check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
                refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
         check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref",
-               mv_precision: "mv_precision", sb128: "sb128");
+               mv_precision: "mv_precision", sb128: "sb128", allow_intrabc: "allow_intrabc");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
         check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
                inter: "inter");

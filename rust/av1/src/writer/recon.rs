@@ -9,7 +9,8 @@
 //!   reconstruction needs that only the walk knows: each block's quantizer, each intra tx block's
 //!   [`TxbEdges`] (BlockDecoded, the edge filter's type), and the earlier blocks each intra block
 //!   may read (the row above it to twice its width, the column left of it to twice its height,
-//!   and those of its 8x8's chroma). It also checks the record as coding does.
+//!   and those of its 8x8's chroma), or an intra block copy block copies (its source area). It
+//!   also checks the record as coding does.
 //! - **reconstruct**: the tile's blocks on every thread, each once the blocks it reads are done:
 //!   prediction, the hook, the inverse transform, the final levels and tx types into the record.
 //!   A one-superblock-wide strip of intra blocks, which a tile codes alone, is a wavefront here.
@@ -25,7 +26,7 @@
 //! record as it does).
 use super::walk::{
     Frame, InterMaps, TileBufs, TxbEdges, levels, map_dims, map_origin, predict_inter_block, predict_intra_txb,
-    predict_palette,
+    predict_intrabc_block, predict_palette,
 };
 use super::{Res, TxbCtx, TxbHook};
 use crate::blockinfo::{bh4, bw4};
@@ -107,9 +108,20 @@ impl TilePlan {
     }
 
     /// Block `b_idx` (a record index) of the walk at mi (r, c): its flags, quantizer and the
-    /// earlier blocks an intra one reads.
+    /// earlier blocks an intra one reads, or an intra block copy block at displacement `dv` (1/8
+    /// luma sample, whole samples) copies.
     #[allow(clippy::too_many_arguments)]
-    pub fn block(&mut self, b_idx: u32, r: i32, c: i32, bsize: i32, is_inter: bool, has_chroma: bool, q: i32) {
+    pub fn block(
+        &mut self,
+        b_idx: u32,
+        r: i32,
+        c: i32,
+        bsize: i32,
+        is_inter: bool,
+        has_chroma: bool,
+        q: i32,
+        dv: Option<[i32; 2]>,
+    ) {
         let j = b_idx as usize - self.first;
         self.flags[j] = if is_inter { PLAN_INTER } else { 0 } | if has_chroma { PLAN_CHROMA } else { 0 };
         self.q[j] = q as u8;
@@ -120,6 +132,32 @@ impl TilePlan {
             if has_chroma && (bw == 1 || bh == 1) {
                 // the chroma of a sub-8x8 block covers its 8x8
                 self.ring(r & !1, c & !1, bh.max(2), bw.max(2));
+            }
+            self.near.sort_unstable();
+            self.near.dedup();
+            self.pairs.extend(self.near.iter().map(|&d| (j as u32, d)));
+        } else if let Some(dv) = dv {
+            // the source's 4x4s, which is_mv_valid keeps inside the tile and before the block, to
+            // whole 8x8s: a sub-8x8 block's chroma is its 8x8's last block's
+            let (y0, x0) = (r * 4 + (dv[0] >> 3), c * 4 + (dv[1] >> 3));
+            // (and 2 luma samples more along an odd component: the bilinear chroma reads them)
+            let (y1, x1) = (
+                y0 + 4 * bh + 2 * ((dv[0] >> 3) & 1),
+                x0 + 4 * bw + 2 * ((dv[1] >> 3) & 1),
+            );
+            let ((ry0, ry1), (rx0, rx1)) = (
+                ((y0 >> 3) << 1, (((y1 + 7) >> 3) << 1).min(self.r0 + self.mh)),
+                ((x0 >> 3) << 1, (((x1 + 7) >> 3) << 1).min(self.c0 + self.mw)),
+            );
+            self.near.clear();
+            for y in ry0..ry1 {
+                let row = ((y - self.r0) * self.mw - self.c0) as isize;
+                for x in rx0..rx1 {
+                    let o = self.owner[(row + x as isize) as usize];
+                    if o != NONE && self.near.last() != Some(&o) {
+                        self.near.push(o);
+                    }
+                }
             }
             self.near.sort_unstable();
             self.near.dedup();
@@ -282,7 +320,11 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
     // through two at once.
     let mut planes: [&mut [u8]; 3] =
         core::array::from_fn(|p| unsafe { core::slice::from_raw_parts_mut(t.planes[p], t.lens[p]) });
-    if is_inter && let Some(refs) = f.refs.as_ref() {
+    if is_inter && f.intrabc {
+        let dv = bufs.mvs[((r - bufs.r0) * bufs.mw + c - bufs.c0) as usize];
+        let dv = [dv[0] as i32, dv[1] as i32];
+        predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma, dv);
+    } else if is_inter && let Some(refs) = f.refs.as_ref() {
         let maps = InterMaps {
             ref0: &bufs.ref0,
             mvs: &bufs.mvs,

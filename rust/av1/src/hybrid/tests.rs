@@ -546,6 +546,187 @@ fn rust_only_sequence_is_deterministic() {
     assert!(kept > 0);
 }
 
+/// Key frames with intra block copies: a screen picture with areas repeated (at even and odd
+/// offsets), on one tile and on several, random and variance partitions. Blocks copy, the frame
+/// has no post-filters, it parses back to its record, it codes the same on one thread as on all,
+/// and (with dav1d installed) decodes to exactly the closed loop's reconstruction. A photo codes as
+/// without the search (too few copies).
+#[test]
+fn intrabc_key_frames() {
+    use crate::writer::parse_with;
+    for (seed, (w, h), (cl, rl), style, repeats) in [
+        (1u64, (600usize, 400usize), (0, 0), Style::Variance, 6),
+        (2, (600, 400), (1, 0), Style::Random, 12),
+        (3, (333, 517), (0, 1), Style::Variance, 6),
+        (4, (600, 400), (0, 0), Style::Variance, 0),
+    ] {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut pic = screen_pic(w, h, seed, seed == 3);
+        let mut rng = Rng(seed * 7 + 1);
+        if repeats == 0 {
+            // a photo: nothing repeats exactly
+            pic.noise(&mut rng, 0, 0, w, h, 30);
+        }
+        // repeats: a source rectangle copied (luma and chroma) to even positions below and right
+        let (sx, sy, rw, rh) = (w * 2 / 5 + 8, 8usize, 96usize, 80usize);
+        for _ in 0..repeats {
+            let dx = (rng.below((w - rw) as u32) as usize) & !1;
+            let dy = ((80 + rng.below((h - rh - 80) as u32)) as usize) & !1;
+            for y in 0..rh {
+                for x in 0..rw {
+                    pic.y[(dy + y) * w + dx + x] = pic.y[(sy + y) * w + sx + x];
+                }
+            }
+            for y in 0..rh / 2 {
+                for x in 0..rw / 2 {
+                    let (d, s) = ((dy / 2 + y) * cw + dx / 2 + x, (sy / 2 + y) * cw + sx / 2 + x);
+                    (pic.u[d], pic.v[d]) = (pic.u[s], pic.v[s]);
+                }
+            }
+        }
+        let tiles = tile_layout(w as u32, h as u32, cl, rl).unwrap();
+        let blocks = partition(&pic, &tiles, &mut rng, style, false);
+        let run = |threads: usize| {
+            let mut hy = Hybrid::new();
+            hy.threads = threads;
+            hy.set_intrabc(true);
+            hy.closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+                .unwrap();
+            hy
+        };
+        let mut hy = run(Hybrid::new().threads);
+        let rec = hy.record().clone();
+        let copies = rec.inter.iter().filter(|i| i.is_inter != 0).count();
+        if repeats == 0 {
+            let mut plain = Hybrid::new();
+            plain
+                .closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+                .unwrap();
+            assert!(
+                copies == 0 && rec == *plain.record(),
+                "seed {seed}: copies without repeats ({copies}; {} of {} non-flat 8x8s)",
+                hy.ibc.busy_copied,
+                hy.ibc.busy
+            );
+            continue;
+        }
+        assert!(copies > 0 && rec.fp.allow_intrabc == 1, "seed {seed}: no copies");
+        let one = run(1);
+        assert!(
+            one.record() == &rec && one.output().recon == hy.output().recon,
+            "seed {seed}: threads"
+        );
+        let recon: Vec<Vec<u8>> = (0..3).map(|k| hy.recon(k).unwrap().to_vec()).collect();
+        // whatever filters the caller asks for, the frame has none
+        let mut wfp = rec.fp;
+        (wfp.loop_filter_level, wfp.enable_cdef, wfp.cdef_bits) = ([10, 10, 5, 5], 1, 1);
+        let sb_cdef = vec![1i8; w.div_ceil(64) * h.div_ceil(64)];
+        let obu = hy.write(&wfp, Some(&sb_cdef), w.div_ceil(64)).unwrap().to_vec();
+        let p = parse_with(&obu, None).unwrap();
+        assert_eq!(p.rec.fp.allow_intrabc, 1);
+        assert_eq!(p.rec.fp.loop_filter_level, [0; 4]);
+        assert_eq!(p.rec.blocks.len(), rec.blocks.len(), "seed {seed}");
+        for (i, (a, b)) in rec.inter.iter().zip(&p.rec.inter).enumerate() {
+            assert_eq!(a, b, "seed {seed}: inter entry {i}");
+        }
+        eprintln!(
+            "seed {seed}: {copies} of {} blocks copy, {} bytes",
+            rec.blocks.len(),
+            obu.len()
+        );
+        let dav1d = "/opt/homebrew/bin/dav1d";
+        if std::path::Path::new(dav1d).exists() {
+            let dir = std::env::temp_dir().join(format!("glassact-intrabc-{}-{seed}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (inp, out) = (dir.join("f.obu"), dir.join("f.yuv"));
+            std::fs::write(&inp, &obu).unwrap();
+            let st = std::process::Command::new(dav1d)
+                .args(["-q", "--demuxer", "section5", "-i"])
+                .arg(&inp)
+                .arg("-o")
+                .arg(&out)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "dav1d: {}", String::from_utf8_lossy(&st.stderr));
+            let d = std::fs::read(&out).unwrap();
+            // the reconstruction cropped to the picture (its planes are MiCols * 4 wide)
+            let rw = hy.output().recon_w;
+            let mut want = Vec::new();
+            for (k, r) in recon.iter().enumerate() {
+                let (pw, ph) = if k == 0 { (w, h) } else { (cw, ch) };
+                for y in 0..ph {
+                    want.extend_from_slice(&r[y * rw[k] as usize..][..pw]);
+                }
+            }
+            assert_eq!(d.len(), want.len(), "seed {seed}: dav1d output size");
+            assert!(d == want, "seed {seed}: dav1d decodes another picture");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Still pictures with intra block copies, one after another: a tile whose source, blocks and
+/// copies are unchanged keeps its closed loop and its bytes, and every picture codes as a fresh
+/// closed loop codes it (record, reconstruction and bytes), the picture unchanged and then partly
+/// re-typed (on several tiles).
+#[test]
+fn intrabc_tiles_kept() {
+    let (w, h) = (640usize, 384usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut pic = screen_pic(w, h, 11, false);
+    let mut rng = Rng(5);
+    // in every tile (2 x 2, 320 x 192), its top-left text repeated below (a copy reads its tile)
+    let (rw, rh) = (96usize, 56usize);
+    for (tx, ty) in [(0usize, 0usize), (320, 0), (0, 192), (320, 192)] {
+        let (sx, sy) = (tx + 8, ty + 4);
+        for (dx, dy) in [
+            (tx + 8, ty + 70),
+            (tx + 120, ty + 70),
+            (tx + 200, ty + 130),
+            (tx + 40, ty + 130),
+        ] {
+            for y in 0..rh {
+                pic.y
+                    .copy_within((sy + y) * w + sx..(sy + y) * w + sx + rw, (dy + y) * w + dx);
+            }
+            for y in 0..rh / 2 {
+                let (d, s) = ((dy / 2 + y) * cw + dx / 2, (sy / 2 + y) * cw + sx / 2);
+                pic.u.copy_within(s..s + rw / 2, d);
+                pic.v.copy_within(s..s + rw / 2, d);
+            }
+        }
+    }
+    let _ = ch;
+    let (cl, rl) = (1, 1);
+    let tiles = tile_layout(w as u32, h as u32, cl, rl).unwrap();
+    let mut kept = 0;
+    let mut a = Hybrid::new();
+    a.set_intrabc(true);
+    for k in 0..3 {
+        if k == 2 {
+            retype(&mut pic, &mut rng, 1);
+        }
+        let blocks = partition(&pic, &tiles, &mut Rng(9), Style::Variance, false);
+        let mut b = Hybrid::new();
+        b.set_intrabc(true);
+        for hy in [&mut a, &mut b] {
+            hy.closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 80, cl, rl)
+                .unwrap();
+        }
+        assert_eq!(a.record().fp.allow_intrabc, 1, "picture {k}: no copies");
+        assert!(a.record() == b.record(), "picture {k}: record");
+        assert!(a.output().recon == b.output().recon, "picture {k}: reconstruction");
+        let fp = a.record().fp;
+        let (wa, wb) = (
+            a.write(&fp, None, 0).unwrap().to_vec(),
+            b.write(&fp, None, 0).unwrap().to_vec(),
+        );
+        assert!(wa == wb, "picture {k}: bytes");
+        kept += a.reused_tiles();
+    }
+    assert!(kept >= 4, "{kept} tiles kept");
+}
+
 /// 128x128 superblocks through the hybrid encoder: a key frame whose 64x64-superblock partition
 /// Motion::apply_ex puts in 128x128 decode order, then an inter frame of the next picture (the top
 /// unchanged, the rest scrolled) whose copies apply_ex covers (one 128x128 skip inter block where
@@ -1455,5 +1636,113 @@ mod oracle {
     fn bench_closed_loop_5k() {
         bench(5120, 2880, 4, true);
         bench(5120, 2880, 4, false);
+    }
+}
+
+/// How many non-flat blocks of a fixed grid have exact intra block copies (a y4m's first frame):
+/// `Y4M=... cargo test --release -- --ignored --nocapture intrabc_grid_matches`.
+#[test]
+#[ignore]
+fn intrabc_grid_matches() {
+    let path = std::env::var("Y4M").unwrap();
+    let data = std::fs::read(path).unwrap();
+    let hdr_end = data.iter().position(|&b| b == b'\n').unwrap();
+    let hdr = String::from_utf8_lossy(&data[..hdr_end]).to_string();
+    let get = |k: char| -> usize { hdr.split(' ').find(|t| t.starts_with(k)).unwrap()[1..].parse().unwrap() };
+    let (w, h) = (get('W'), get('H'));
+    let f0 = hdr_end + 1 + data[hdr_end + 1..].iter().position(|&b| b == b'\n').unwrap() + 1;
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let y = data[f0..f0 + w * h].to_vec();
+    let u = data[f0 + w * h..f0 + w * h + cw * ch].to_vec();
+    let v = data[f0 + w * h + cw * ch..f0 + w * h + 2 * cw * ch].to_vec();
+    // one tile column up to 4096 samples, else two (a tile is at most 4096 wide)
+    let cl = (w > 4096) as i32;
+    let tiles = tile_layout(w as u32, h as u32, cl, 0).unwrap();
+    for size in [8usize, 16, 32, 64] {
+        // a uniform grid of size x size blocks (64x64 SBs split down to it)
+        let bs = match size {
+            8 => BLOCK_8X8,
+            16 => BLOCK_16X16,
+            32 => BLOCK_32X32,
+            _ => BLOCK_64X64,
+        };
+        let mut blocks = Vec::new();
+        let (mc, mr) = (mi_cols(w as i32) as usize, mi_rows(h as i32) as usize);
+        let sbs: Vec<(usize, usize)> = (0..tiles.rows as usize)
+            .flat_map(|tr| (0..tiles.cols as usize).map(move |tc| (tr, tc)))
+            .flat_map(|(tr, tc)| {
+                let (r0, r1) = (tiles.mi_row_starts[tr] as usize, tiles.mi_row_starts[tr + 1] as usize);
+                let (c0, c1) = (tiles.mi_col_starts[tc] as usize, tiles.mi_col_starts[tc + 1] as usize);
+                (r0..r1)
+                    .step_by(16)
+                    .flat_map(move |r| (c0..c1).step_by(16).map(move |c| (r, c)))
+            })
+            .collect();
+        for &(sr, sc) in &sbs {
+            {
+                fn rec(
+                    blocks: &mut Vec<Block>,
+                    r: usize,
+                    c: usize,
+                    n: usize,
+                    size: usize,
+                    bs: i32,
+                    mr: usize,
+                    mc: usize,
+                ) {
+                    if r >= mr || c >= mc {
+                        return;
+                    }
+                    if n == size / 4 && r + n <= mr && c + n <= mc {
+                        blocks.push(Block {
+                            mi_row: r as u16,
+                            mi_col: c as u16,
+                            bsize: bs as u8,
+                            ..Default::default()
+                        });
+                        return;
+                    }
+                    if n == 2 {
+                        for (dr, dc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                            if r + dr < mr && c + dc < mc {
+                                blocks.push(Block {
+                                    mi_row: (r + dr) as u16,
+                                    mi_col: (c + dc) as u16,
+                                    bsize: BLOCK_4X4 as u8,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        return;
+                    }
+                    let hlf = n / 2;
+                    for (dr, dc) in [(0, 0), (0, hlf), (hlf, 0), (hlf, hlf)] {
+                        rec(blocks, r + dr, c + dc, hlf, size, bs, mr, mc);
+                    }
+                }
+                rec(&mut blocks, sr, sc, 16, size, bs, mr, mc);
+            }
+        }
+        let mut hy = Hybrid::new();
+        hy.set_intrabc(true);
+        hy.closed_loop(&y, &u, &v, w as u32, h as u32, &blocks, None, 0, 80, cl, 0)
+            .unwrap();
+        let src = hy.src.view();
+        let flat = blocks
+            .iter()
+            .filter(|b| b.bsize as i32 == bs)
+            .filter(|b| {
+                let (x, yy) = (b.mi_col as usize * 4, b.mi_row as usize * 4);
+                let v0 = src.at(0, x, yy)[0];
+                (0..size).all(|i| src.at(0, x, yy + i)[..size].iter().all(|&s| s == v0))
+            })
+            .count();
+        let n = blocks.iter().filter(|b| b.bsize as i32 == bs).count();
+        eprintln!(
+            "{size}x{size}: {n} blocks, {flat} flat luma, {} copy ({:.1} % of the non-flat), {:.1} % of the picture",
+            hy.ibc.copies,
+            hy.ibc.copies as f64 * 100.0 / (n - flat).max(1) as f64,
+            hy.ibc.area as f64 * 100.0 / (w * h) as f64
+        );
     }
 }

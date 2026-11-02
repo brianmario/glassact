@@ -143,6 +143,8 @@ pub(crate) fn write_headers(
 
     // ---- uncompressed_header ----
     let sct = fp.allow_screen_content_tools as u32;
+    // allow_intrabc (key frames, with screen content tools): no loop filter, CDEF or delta-LF syntax
+    let abc = fp.allow_intrabc != 0;
     // inter frames: force_integer_mv (mv_precision 0, which needs allow_screen_content_tools)
     let force_integer_mv = inter && fp.mv_precision == 0;
     if video {
@@ -186,7 +188,7 @@ pub(crate) fn write_headers(
             // key frame: refresh_frame_flags = allFrames, primary_ref_frame = NONE
             fh.put(0, 1); // render_and_frame_size_different
             if sct != 0 {
-                fh.put(0, 1); // allow_intrabc
+                fh.put(abc as u32, 1); // allow_intrabc
             }
         }
         fh.put(0, 1); // disable_frame_end_update_cdf: every frame saves its CDFs
@@ -198,7 +200,7 @@ pub(crate) fn write_headers(
         }
         fh.put(0, 1); // render_and_frame_size_different
         if sct != 0 {
-            fh.put(0, 1); // allow_intrabc
+            fh.put(abc as u32, 1); // allow_intrabc
         }
     }
     // tile_info
@@ -257,42 +259,46 @@ pub(crate) fn write_headers(
     fh.put(fp.delta_q_present as u32, 1); // delta_q_present (base_q_idx > 0)
     if fp.delta_q_present != 0 {
         fh.put(fp.delta_q_res as u32, 2);
-        fh.put(0, 1); // delta_lf_present
-    }
-    // loop_filter_params (effective levels; ref deltas off)
-    let lf = fp.loop_filter_level;
-    fh.put(lf[0] as u32, 6);
-    fh.put(lf[1] as u32, 6);
-    if mono == 0 && (lf[0] != 0 || lf[1] != 0) {
-        fh.put(lf[2] as u32, 6);
-        fh.put(lf[3] as u32, 6);
-    }
-    fh.put(fp.loop_filter_sharpness as u32, 3);
-    if fp.lf_inter_off != 0 {
-        // loop_filter_delta_enabled, _update; from setup_past_independence's ref deltas
-        // (INTRA_FRAME 1, LAST_FRAME 0): INTRA_FRAME 0 (the levels as given), LAST_FRAME -63
-        // (inter blocks at level 0); the mode deltas stay 0
-        fh.put(1, 1);
-        fh.put(1, 1);
-        for i in 0..8 {
-            match i {
-                0 => {
-                    fh.put(1, 1);
-                    fh.su(0, 7);
-                }
-                1 => {
-                    fh.put(1, 1);
-                    fh.su(-63, 7);
-                }
-                _ => fh.put(0, 1),
-            }
+        if !abc {
+            fh.put(0, 1); // delta_lf_present
         }
-        fh.put(0, 1);
-        fh.put(0, 1);
-    } else {
-        fh.put(0, 1); // loop_filter_delta_enabled
     }
-    if fp.enable_cdef != 0 {
+    // loop_filter_params (effective levels; ref deltas off); none with allow_intrabc
+    let lf = fp.loop_filter_level;
+    if !abc {
+        fh.put(lf[0] as u32, 6);
+        fh.put(lf[1] as u32, 6);
+        if mono == 0 && (lf[0] != 0 || lf[1] != 0) {
+            fh.put(lf[2] as u32, 6);
+            fh.put(lf[3] as u32, 6);
+        }
+        fh.put(fp.loop_filter_sharpness as u32, 3);
+        if fp.lf_inter_off != 0 {
+            // loop_filter_delta_enabled, _update; from setup_past_independence's ref deltas
+            // (INTRA_FRAME 1, LAST_FRAME 0): INTRA_FRAME 0 (the levels as given), LAST_FRAME -63
+            // (inter blocks at level 0); the mode deltas stay 0
+            fh.put(1, 1);
+            fh.put(1, 1);
+            for i in 0..8 {
+                match i {
+                    0 => {
+                        fh.put(1, 1);
+                        fh.su(0, 7);
+                    }
+                    1 => {
+                        fh.put(1, 1);
+                        fh.su(-63, 7);
+                    }
+                    _ => fh.put(0, 1),
+                }
+            }
+            fh.put(0, 1);
+            fh.put(0, 1);
+        } else {
+            fh.put(0, 1); // loop_filter_delta_enabled
+        }
+    }
+    if fp.enable_cdef != 0 && !abc {
         // cdef_params
         fh.put(fp.cdef_damping_minus_3 as u32, 2);
         fh.put(fp.cdef_bits as u32, 2);

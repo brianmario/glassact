@@ -179,6 +179,7 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| Intra block copy in key frames (`metal-av1`, on by default) | kept | 5K BD-rate typing −18 %, cursor-drag −14 %, scroll −7 %; photos and 720p unchanged (a frame copies only when copies cover ≥ 6 % of its non-flat 8×8s: no filters then); ~10 ms of search per 5K key frame | [entry](#metal-av1-intra-block-copy-in-key-frames-2026-11-01) |
 | AV2's 3.7× on text, attributed (AVM, each tool off in turn) | measured; intra block copy is next for `metal-av1` | intra block copy alone is 3.4× on typing; libaom at speed 2 with it gets within ~15 % of AV2 (typing 60 dB: 43 vs 37 KB, 131 KB without); key frames 2.9× smaller at ~45 dB | [entry](#av2s-gain-on-text-attributed-intra-block-copy-which-av1-has-too-2026-11-01) |
 | Prefer smooth motion: frame-QP ceiling 38 while the link has no room (Viewer opt-in) | kept, opt-in | 2M photos 20 → 48 frames, 3M scroll-win queue p95 423 → 344 ms; text p5 SSIMULACRA2 −5 to −18 at caps ≤ 1 Mbit/s, about even above | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | Frame-QP ceiling 42 on thin links | rejected | photos frames 4–8× but SSIMULACRA2 near zero | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
@@ -262,6 +263,59 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: intra block copy in key frames (2026-11-01)
+
+The AV2 attribution (entry below) found intra block copy carrying AV2's gain on text, and AV1 has it
+in key frames. Now the writer codes it (use_intrabc, the DV prediction from find_mv_stack for
+INTRA_FRAME, MV_INTRABC_CONTEXT, no loop filter, CDEF or delta-LF syntax in the frame), and the
+hybrid encoder's closed loop searches for it (`hybrid::intrabc`, on by default in
+`AV1HybridEncoder.intraBlockCopy`):
+
+- **Exact copies, at the analysis's partition.** A block, or a square node the analysis split into
+  several (then one block: the copies of whole nodes, down to an 8×8 in place of its 4×4s, are most
+  of the gain), copies where its luma and chroma repeat exactly at a whole-sample displacement that
+  is_mv_valid allows (in the tile, 256 samples behind). Odd displacements too: 4:2:0 chroma is then
+  the decoder's bilinear average, and the writer also asks that the 2 samples it reads beyond the
+  source be valid.
+- **Found by hashing** every non-flat 8×8 at even positions, per tile on every thread, added as the
+  search passes them (nearest rows first, the superblock row's own once 256 samples behind). The
+  previous copy's displacement is tried first (the stack's: cheapest to code).
+- **Only where it pays.** A frame with copies has no deblocking or CDEF (the format turns them
+  off), so it copies only when its copies cover at least 6 % of its non-flat 8×8s; otherwise it is
+  coded exactly as before.
+- Tiles whose source, blocks and copies are unchanged are kept, as for other key frames.
+
+Tested: random key frames with copies (odd and even displacements) in the inter sequences round-trip
+through the parser and decode exactly in dav1d, aomdec and the vendored libaom (3,200 frames, 3,000+
+copies); the hybrid's pictures with copies decode exactly in dav1d and libaom; Apple's hardware
+AV1 decoder (VideoToolbox, through ffmpeg) decodes them exactly too. (An odd-sized picture's last
+row and column decode differently there, with or without copies: a separate issue.)
+
+BD-rate against intra block copy off, same sweep as the rounding entry (RGB-scored PSNR, q 8–32,
+100 frames: a key frame, then inter frames):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K | **−18.3 %** (key frame −18.4 %) | **−6.7 %** (−12.7 %) | 0.0 % | **−14.3 %** (−14.7 %) |
+| 720p | 0.0 % | 0.0 % | 0.0 % | 0.0 % |
+
+- At 5K, 18–24 % of the key frame copies. At q20 the typing key frame is 539 → 428 KB.
+- **At 720p nothing repeats exactly enough:** the trace is downscaled from 5K, so the same glyph
+  lands at different sub-sample phases. Before the 6 % rule, copying 0.6–5 % of their non-flat
+  8×8s, 720p frames lost +0.3–1.0 % to the missing filters, and photos at 5K (1.1 %) +0.1 %; with it
+  they are coded as before, byte for byte.
+- On the 1080p crop of typing-cc's terminal that AV2 and libaom were measured on: 98.1 → 43.4 KB at
+  q20 (47 % of the picture copies), about 2.2× smaller at equal PSNR-Y, against libaom speed 2's 2.9×.
+- Cost: the search takes about 10 ms per 5K key frame (2.6 ms at 720p) on top of the closed loop. An
+  unchanged picture reuses the last search's answer.
+
+Measured and dropped: splitting an analysis block that doesn't copy into quadrants that copy (and
+intra ones with its modes): no gain at any threshold (5K typing key frame 422.6 KB not splitting,
+423.0 at half its non-flat area copying, 425.9 splitting nearly always).
+
+Next for text: copies with a residual (glyphs at another sub-sample phase), 4×4 copies, and copies
+inside inter frames (which AV1 doesn't have: the custom codec's glyph cache).
 
 ### AV2's gain on text attributed: intra block copy, which AV1 has too (2026-11-01)
 

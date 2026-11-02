@@ -213,6 +213,25 @@
  *   of get_tx_set() (16 types up to 16x16, 12 at 16x16, IDTX / DCT at 32 or with
  *   reduced_tx_set, DCT only at 64).  Chroma tx_type is derived (output): the co-located
  *   luma tx block's type if it is in the chroma size's inter set, else DCT_DCT.
+ *
+ * Intra block copy (fp.allow_intrabc = 1).  A key frame (or still picture) whose blocks may
+ *   copy the frame's own reconstruction: allow_intrabc in the frame header, which needs
+ *   allow_screen_content_tools = 1.  The frame has no post-filters: loop_filter_level all 0
+ *   and every cdef_idx 0 (its loop filter, CDEF and delta-LF syntax isn't coded; fp.enable_cdef
+ *   still sets the sequence header's enable_cdef, for the stream's later frames).
+ *   rec.inter: is_inter = 1 is an intra block copy block (use_intrabc).  mv_row/mv_col: the
+ *   displacement in 1/8 luma sample, whole samples (multiples of 8), |mv| < 2^14, that spec
+ *   is_mv_valid accepts: the source inside the tile, already decoded and at least 256 samples
+ *   behind (INTRABC_DELAY).  bsize at least 8 samples both ways.  Its prediction is the
+ *   source area of the reconstruction before any filter: luma copied; 4:2:0 chroma copied
+ *   where the component is even, else at the half sample (BILINEAR: the average of two
+ *   samples, of four where both are odd), which reads one chroma sample (2 luma) beyond the
+ *   source that way.  This writer's toolset also asks, so that every sample a decoder reads
+ *   is decoded and in the tile, that with chroma and an odd component the source 2 luma
+ *   samples larger that way passes is_mv_valid too.  The difference to the DV
+ *   prediction must be at most 2^14 each way.  It is coded with NEWMV against the spec's DV
+ *   prediction (MV_INTRABC_CONTEXT, whole samples).  Its av1g_block fields are an inter
+ *   block's (mode fields 0; residual, tx_depth and tx types as inter blocks).
  * ==============================================================================
  */
 #ifndef AV1G_DECISIONS_H
@@ -304,7 +323,8 @@ typedef struct av1g_frame_params {
     uint8_t  cdf_from_ref;         /* inter: 1 = start from the reference's saved CDFs (see "Video mode") */
     uint8_t  mv_precision;         /* inter: 0 whole samples, 1 quarter, 2 eighth (see "Video mode") */
     uint8_t  sb128;                /* 1: 128x128 superblocks (see "Superblocks"); 0: 64x64 */
-    uint8_t  reserved[6];
+    uint8_t  allow_intrabc;        /* key frames: 1 = intra block copy (see "Intra block copy") */
+    uint8_t  reserved[5];
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {

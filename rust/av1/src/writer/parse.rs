@@ -380,8 +380,9 @@ fn parse_frame(
             "inter-intra prediction (enable_interintra_compound) not supported"
         );
     } else if sct != 0 {
-        need!(br.f(1)? == 0, "allow_intrabc=1 not supported");
+        fp.allow_intrabc = br.f(1)? as u8;
     }
+    let abc = fp.allow_intrabc != 0;
     let end_update = !sq.reduced && br.f(1)? == 0; // !disable_frame_end_update_cdf
     fp.width = fw;
     fp.height = fh;
@@ -445,61 +446,66 @@ fn parse_frame(
     fp.delta_q_present = br.f(1)? as u8;
     if fp.delta_q_present != 0 {
         fp.delta_q_res = br.f(2)? as u8;
-        need!(br.f(1)? == 0, "delta_lf_present (M5) not supported");
+        need!(abc || br.f(1)? == 0, "delta_lf_present (M5) not supported");
     }
-    // loop_filter_params -> effective levels (intra frame: only the INTRA ref delta applies)
+    // loop_filter_params -> effective levels (intra frame: only the INTRA ref delta applies); none
+    // with allow_intrabc
     let mut lvl = [0i32; 4];
-    lvl[0] = br.f(6)? as i32;
-    lvl[1] = br.f(6)? as i32;
-    if !sq.mono && (lvl[0] != 0 || lvl[1] != 0) {
-        lvl[2] = br.f(6)? as i32;
-        lvl[3] = br.f(6)? as i32;
-    }
-    fp.loop_filter_sharpness = br.f(3)? as u8;
-    // setup_past_independence's defaults (primary_ref_frame is NONE)
-    let mut ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
-    let mut mode_deltas = [0, 0];
-    let delta_enabled = br.b()?;
-    if delta_enabled && br.b()? {
-        for d in &mut ref_deltas {
-            if br.b()? {
-                *d = br.su(7)?;
+    if !abc {
+        lvl[0] = br.f(6)? as i32;
+        lvl[1] = br.f(6)? as i32;
+        if !sq.mono && (lvl[0] != 0 || lvl[1] != 0) {
+            lvl[2] = br.f(6)? as i32;
+            lvl[3] = br.f(6)? as i32;
+        }
+        fp.loop_filter_sharpness = br.f(3)? as u8;
+        // setup_past_independence's defaults (primary_ref_frame is NONE)
+        let mut ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
+        let mut mode_deltas = [0, 0];
+        let delta_enabled = br.b()?;
+        if delta_enabled && br.b()? {
+            for d in &mut ref_deltas {
+                if br.b()? {
+                    *d = br.su(7)?;
+                }
+            }
+            for d in &mut mode_deltas {
+                if br.b()? {
+                    *d = br.su(7)?;
+                }
             }
         }
-        for d in &mut mode_deltas {
-            if br.b()? {
-                *d = br.su(7)?;
-            }
+        let ref_delta_intra = ref_deltas[0];
+        if inter && delta_enabled {
+            // only lf_inter_off's deltas: the levels as given for intra blocks, 0 for inter ones
+            need!(
+                ref_deltas[0] == 0 && ref_deltas[1] == -63 && mode_deltas == [0, 0],
+                "loop filter deltas in inter frames other than lf_inter_off's not supported"
+            );
+            fp.lf_inter_off = 1;
         }
-    }
-    let ref_delta_intra = ref_deltas[0];
-    if inter && delta_enabled {
-        // only lf_inter_off's deltas: the levels as given for intra blocks, 0 for inter ones
-        need!(
-            ref_deltas[0] == 0 && ref_deltas[1] == -63 && mode_deltas == [0, 0],
-            "loop filter deltas in inter frames other than lf_inter_off's not supported"
-        );
-        fp.lf_inter_off = 1;
-    }
-    if lvl[0] != 0 || lvl[1] != 0 {
-        for i in 0..4 {
-            if i >= 2 && lvl[i] == 0 {
-                continue; // chroma plane not filtered at all
+        if lvl[0] != 0 || lvl[1] != 0 {
+            for i in 0..4 {
+                if i >= 2 && lvl[i] == 0 {
+                    continue; // chroma plane not filtered at all
+                }
+                let mut e = lvl[i];
+                if delta_enabled {
+                    e = clip3(0, 63, e + ref_delta_intra * (1 << (e >> 5)));
+                }
+                fp.loop_filter_level[i] = e as u8;
             }
-            let mut e = lvl[i];
-            if delta_enabled {
-                e = clip3(0, 63, e + ref_delta_intra * (1 << (e >> 5)));
-            }
-            fp.loop_filter_level[i] = e as u8;
+            let l = fp.loop_filter_level;
+            need!(
+                l[0] != 0 || l[1] != 0 || (l[2] == 0 && l[3] == 0),
+                "loop filter delta combination not representable"
+            );
         }
-        let l = fp.loop_filter_level;
-        need!(
-            l[0] != 0 || l[1] != 0 || (l[2] == 0 && l[3] == 0),
-            "loop filter delta combination not representable"
-        );
     }
     if sq.cdef {
         fp.enable_cdef = 1;
+    }
+    if sq.cdef && !abc {
         fp.cdef_damping_minus_3 = br.f(2)? as u8;
         fp.cdef_bits = br.f(2)? as u8;
         let sec = |v: u32| if v == 3 { 4 } else { v as u8 };
@@ -589,6 +595,7 @@ fn parse_frame(
         check_edges: false,
         ordmap: &ordmap,
         inter,
+        intrabc: fp.allow_intrabc != 0,
         refs: None,
         cdfs_in: cdfs_in.as_deref(),
         cdfs_out: (state.is_some() && end_update).then_some(&saved),

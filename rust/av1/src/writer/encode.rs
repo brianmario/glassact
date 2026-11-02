@@ -644,6 +644,15 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     if fp.allow_screen_content_tools > 1 {
         fail!(ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
+    if fp.allow_intrabc > 1
+        || (fp.allow_intrabc != 0
+            && (fp.frame_type != FRAME_KEY || fp.allow_screen_content_tools != 1 || fp.loop_filter_level != [0; 4]))
+    {
+        fail!(
+            ERR_INVALID,
+            "allow_intrabc must be 0/1, and 1 only in a key frame with allow_screen_content_tools and no deblocking"
+        );
+    }
     // v2: video mode (in v1 these were reserved bytes, which must be 0)
     let v2 = [
         fp.video,
@@ -924,8 +933,12 @@ impl Writer {
             );
         }
         let inter = fp.frame_type == FRAME_INTER;
-        if inter && extras.record_syms {
-            fail!(ERR_INVALID, "symbol streams are for intra frames only");
+        let intrabc = fp.allow_intrabc != 0;
+        if (inter || intrabc) && extras.record_syms {
+            fail!(
+                ERR_INVALID,
+                "symbol streams are for intra frames without intra block copy only"
+            );
         }
         if extras.record_syms && rec.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0) {
             fail!(
@@ -1091,6 +1104,7 @@ impl Writer {
             check_edges,
             ordmap: &self.ordmap,
             inter,
+            intrabc,
             refs,
             cdfs_in,
             cdfs_out: (fp.video != 0).then_some(&self.saved),
@@ -1457,7 +1471,7 @@ fn recon(
         let mut pl: [&mut [u8]; 3] = [p0, p1, p2];
         deblock_frame(&pf, &m, &mut pl, &pstride);
     }
-    let result: &[Vec<u8>; 3] = if fp.enable_cdef != 0 {
+    let result: &[Vec<u8>; 3] = if fp.enable_cdef != 0 && fp.allow_intrabc == 0 {
         for p in 0..nplanes {
             cdef_out[p].resize(planes[p].len(), 0);
         }

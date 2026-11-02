@@ -114,8 +114,39 @@ pub(super) fn seeds(n: u64, f: impl Fn(&mut Writer, u64) + Sync) {
 #[test]
 fn inter_sequences_round_trip() {
     let frames = round_trip_seqs(160, 200, |_| true);
-    eprintln!("{frames} frames; {}; {}", coverage(), sb128_coverage());
+    eprintln!(
+        "{frames} frames; {}; {}; {}",
+        coverage(),
+        sb128_coverage(),
+        intrabc_coverage()
+    );
     assert_phase_coverage(20);
+    assert_intrabc_coverage(20);
+}
+
+/// What intra block copy coded so far (walk::INTRABC_STAT).
+pub(super) fn intrabc_coverage() -> String {
+    let s: Vec<u64> = super::walk::INTRABC_STAT
+        .iter()
+        .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        .collect();
+    format!(
+        "intra block copy blocks {} (DV prediction from the stack's first {}, second {}, the default {}; zero difference {}; skip {}; var-tx split {})",
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6]
+    )
+}
+
+/// At least `n` of each kind of intra block copy block (but a prediction from the stack's second
+/// entry, which needs a zero first one: no DV is zero, so the stack is empty then).
+pub(super) fn assert_intrabc_coverage(n: u64) {
+    let s = &super::walk::INTRABC_STAT;
+    for (i, a) in s.iter().enumerate().filter(|&(i, _)| i != 2) {
+        assert!(
+            a.load(std::sync::atomic::Ordering::Relaxed) >= n,
+            "intra block copy coverage {i}: {}",
+            intrabc_coverage()
+        );
+    }
 }
 
 /// [`inter_sequences_round_trip`] of larger sequences with 128x128 superblocks: every type of the
@@ -788,16 +819,18 @@ fn decoders() {
     });
     eprintln!(
         "{} frames decode exactly ({} with 128x128 superblocks, {} without a sequence header), and {} \
-         still pictures with 128x128 superblocks; {}; {}",
+         still pictures with 128x128 superblocks; {}; {}; {}",
         frames.into_inner(),
         sb128_frames.into_inner(),
         headerless.into_inner(),
         stills.into_inner(),
         coverage(),
-        sb128_coverage()
+        sb128_coverage(),
+        intrabc_coverage()
     );
     assert_phase_coverage(1);
     assert_sb128_coverage(1);
+    assert_intrabc_coverage(1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

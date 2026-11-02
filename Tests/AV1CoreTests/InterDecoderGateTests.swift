@@ -13,8 +13,8 @@ import libaom
 /// last refreshed its slots. The vendored libaom decodes the stream, and every
 /// frame must decode to exactly av1core's reconstruction of it: the ground an
 /// inter encoder on av1core stands on. Some sequences have 128x128
-/// superblocks, and some frames after the first leave the sequence header out
-/// (av1t_inter_case_flags).
+/// superblocks, some frames after the first leave the sequence header out
+/// (av1t_inter_case_flags), and some key frames have intra block copies.
 @Suite(.enabled(if: glassact_aom_available() != 0, "libaom is arm64 only"))
 struct InterDecoderGateTests {
     static let framesPerSequence: Int32 = 8

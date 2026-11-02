@@ -209,6 +209,15 @@ pub struct InterCdfs {
     /// PaletteSize{n}{Y,UV}ColorCdf [ctx], n = 2..8 colours
     pub palette_y_color: PaletteColorCdfs,
     pub palette_uv_color: PaletteColorCdfs,
+    /// IntrabcCdf (use_intrabc, frames with allow_intrabc)
+    pub intrabc: [u16; 3],
+    /// MV_INTRABC_CONTEXT's MV CDFs, the displacements of intra block copy (whole samples: no fr
+    /// or hp bits), as `mv_joint` .. `mv_bit`
+    pub dv_joint: [u16; 5],
+    pub dv_class: [[u16; 12]; 2],
+    pub dv_class0_bit: [[u16; 3]; 2],
+    pub dv_sign: [[u16; 3]; 2],
+    pub dv_bit: [[[u16; 3]; 10]; 2],
 }
 
 impl Default for InterCdfs {
@@ -255,9 +264,18 @@ impl Default for InterCdfs {
                 c7: Default_Palette_Size_7_Uv_Color_Cdf,
                 c8: Default_Palette_Size_8_Uv_Color_Cdf,
             },
+            intrabc: INTRABC_CDF,
+            dv_joint: Default_Mv_Joint_Cdf,
+            dv_class: Default_Mv_Class_Cdf,
+            dv_class0_bit: [Default_Mv_Class0_Bit_Cdf; 2],
+            dv_sign: [Default_Mv_Sign_Cdf; 2],
+            dv_bit: [Default_Mv_Bit_Cdf; 2],
         }
     }
 }
+
+/// Default_Intrabc_Cdf (spec 10.3; not among the generated tables).
+const INTRABC_CDF: [u16; 3] = [30531, 32768, 0];
 
 impl InterCdfs {
     /// The defaults, in place.
@@ -295,6 +313,12 @@ impl InterCdfs {
         clear(&mut self.partition_w128);
         clear(&mut self.palette_y_size);
         clear(&mut self.palette_uv_size);
+        clear(core::slice::from_mut(&mut self.intrabc));
+        clear(core::slice::from_mut(&mut self.dv_joint));
+        clear(&mut self.dv_class);
+        clear(&mut self.dv_class0_bit);
+        clear(&mut self.dv_sign);
+        clear(self.dv_bit.as_flattened_mut());
         for c in [&mut self.palette_y_color, &mut self.palette_uv_color] {
             clear(&mut c.c2);
             clear(&mut c.c3);

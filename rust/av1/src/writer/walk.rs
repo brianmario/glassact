@@ -8,7 +8,9 @@
 
 mod palette;
 
-use super::mvstack::{MvMaps, MvStack, REF_UNSET, derive_mode, find_mv_stack, mv_class};
+use super::mvstack::{
+    MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack, find_mv_stack_ref, mv_class,
+};
 use super::recon::TilePlan;
 use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
@@ -42,6 +44,9 @@ pub(crate) struct Frame<'a> {
     pub ordmap: &'a [Vec<u32>; 3],
     /// an inter frame (video mode, frame_type INTER): inter_frame_mode_info
     pub inter: bool,
+    /// fp.allow_intrabc (an intra frame): use_intrabc, and the tiles keep [`TileBufs::ref0`] and
+    /// [`TileBufs::mvs`]
+    pub intrabc: bool,
     /// an inter frame with a reconstruction: LAST_FRAME's planes
     pub refs: Option<[RefPlane<'a>; 3]>,
     /// the CDFs every tile starts from (primary_ref_frame's saved ones); `None`: the defaults
@@ -103,8 +108,9 @@ pub(crate) struct TileBufs {
     /// PaletteColors of the spec), mh x mw; empty without [`Frame::palettes`] (none)
     pub pal_at: Vec<u32>,
     pub pals: Vec<BlockPalette>,
-    /// inter frames: RefFrames[.][.][0] (0 intra, 1 LAST_FRAME, REF_UNSET not coded yet) and
-    /// Mvs[.][.][0] (valid where LAST_FRAME), mh x mw
+    /// inter frames and frames with intra block copy: RefFrames[.][.][0] (0 intra, 1 LAST_FRAME,
+    /// [`REF_INTRABC`] an intra block copy block, REF_UNSET not coded yet) and Mvs[.][.][0] (valid
+    /// where LAST_FRAME or REF_INTRABC), mh x mw
     pub ref0: Vec<u8>,
     pub mvs: Vec<[i16; 2]>,
 }
@@ -154,7 +160,7 @@ impl TileBufs {
         }
         self.sb_cdef.clear();
         self.sb_cdef.resize((self.sb_cols * self.sb_rows) as usize, -1);
-        if f.inter {
+        if f.inter || f.intrabc {
             self.ref0.clear();
             self.ref0.resize(nmi, REF_UNSET);
             self.mvs.resize(nmi, [0; 2]);
@@ -198,6 +204,16 @@ pub(crate) const INTER_STAT_PHASE: usize = 11;
 /// (13), coded (14), inter and coded (15).
 #[cfg(test)]
 pub(crate) static SB128_STAT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+/// What intra block copy coded, for the tests' coverage reports: blocks; of those with the DV
+/// prediction from the candidate stack's first entry, its second, the default; with a zero
+/// difference; skip ones; ones with a var-tx split.
+#[cfg(test)]
+pub(crate) static INTRABC_STAT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+#[inline(always)]
+fn intrabc_stat(_k: usize) {
+    #[cfg(test)]
+    INTRABC_STAT[_k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 #[inline(always)]
 fn sb128_stat(_k: usize) {
     #[cfg(test)]
@@ -395,6 +411,12 @@ impl TileState {
     }
 }
 
+/// IsInters of a RefFrames[.][.][0] map entry: LAST_FRAME, or an intra block copy block.
+#[inline(always)]
+pub(super) fn is_inter_ref(v: u8) -> bool {
+    v == LAST_FRAME as u8 || v == REF_INTRABC
+}
+
 /// One tile's walk.
 pub(crate) struct Walk<'a, S: Sink, H: TxbHook> {
     pub st: &'a mut TileState,
@@ -494,6 +516,66 @@ pub(super) fn predict_inter_block(
                             stride,
                             mc,
                         );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An intra block copy block's prediction (spec 7.11.3 with use_intrabc), the whole block: luma
+/// copies the tile's reconstruction at the displacement `dv` ([row, col], 1/8 luma sample, whole
+/// samples; the BILINEAR filter at position 0 is a copy), and 4:2:0 chroma does too where the
+/// displacement is even, or averages two samples along an odd component (the BILINEAR filter at
+/// the half position: Round2(a + b, 1)), four where both are (Round2(a + b + c + d, 2)). The source
+/// (spec is_mv_valid, and with an odd component that one more chroma sample) is inside the tile,
+/// decoded and apart from the block.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_intrabc_block(
+    planes: &mut [&mut [u8]; 3],
+    stride: [usize; 3],
+    r0: i32,
+    c0: i32,
+    r: i32,
+    c: i32,
+    bsize: i32,
+    has_chroma: bool,
+    dv: [i32; 2],
+) {
+    for plane in 0..1 + 2 * has_chroma as usize {
+        let sub = (plane != 0) as i32;
+        let (w, h) = (((4 * bw4(bsize)) >> sub) as usize, ((4 * bh4(bsize)) >> sub) as usize);
+        let (x, y) = (((c - c0) * 4) >> sub, ((r - r0) * 4) >> sub);
+        let (sx, sy) = (x + ((dv[1] >> 3) >> sub), y + ((dv[0] >> 3) >> sub));
+        let (hx, hy) = if sub != 0 {
+            ((dv[1] >> 3) & 1 != 0, (dv[0] >> 3) & 1 != 0)
+        } else {
+            (false, false)
+        };
+        let s = stride[plane];
+        let p = &mut *planes[plane];
+        let (src0, dst0) = (sy as usize * s + sx as usize, y as usize * s + x as usize);
+        for i in 0..h {
+            let (src, dst) = (src0 + i * s, dst0 + i * s);
+            match (hx, hy) {
+                (false, false) => p.copy_within(src..src + w, dst),
+                (true, false) => {
+                    for j in 0..w {
+                        p[dst + j] = ((p[src + j] as u32 + p[src + j + 1] as u32 + 1) >> 1) as u8;
+                    }
+                }
+                (false, true) => {
+                    for j in 0..w {
+                        p[dst + j] = ((p[src + j] as u32 + p[src + s + j] as u32 + 1) >> 1) as u8;
+                    }
+                }
+                (true, true) => {
+                    for j in 0..w {
+                        let (a, b) = (
+                            p[src + j] as u32 + p[src + j + 1] as u32,
+                            p[src + s + j] as u32 + p[src + s + j + 1] as u32,
+                        );
+                        p[dst + j] = ((a + b + 2) >> 2) as u8;
                     }
                 }
             }
@@ -1446,6 +1528,148 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         if sign != 0 { -mag } else { mag }
     }
 
+    /// The intra block copy branch of intra_frame_mode_info (use_intrabc = 1): find_mv_stack for
+    /// INTRA_FRAME, assign_mv's DV prediction and read_mv with MV_INTRABC_CONTEXT (whole samples).
+    #[inline(never)]
+    fn intrabc_mode_info(&mut self, r: i32, c: i32, bsize: i32, bi: &mut BlockInter) -> Res<()> {
+        let b_idx = self.st.b_idx;
+        let s = find_mv_stack_ref(&self.mv_maps(), r, c, bsize, REF_INTRABC);
+        let mut pred = s.mv[0];
+        let mut from = 1;
+        if pred == [0, 0] {
+            (pred, from) = (s.mv[1], 2);
+        }
+        if pred == [0, 0] {
+            from = 3;
+            let sb4 = self.f.sb_size4();
+            pred = if r - sb4 < self.st.mi_row_start {
+                [0, -(sb4 * MI_SIZE + INTRABC_DELAY_PIXELS) * 8]
+            } else {
+                [-(sb4 * MI_SIZE * 8), 0]
+            };
+        }
+        let mv_w = [bi.mv_row as i32, bi.mv_col as i32];
+        let dw = [mv_w[0] - pred[0], mv_w[1] - pred[1]];
+        if S::WRITE && (dw[0].abs() > 1 << 14 || dw[1].abs() > 1 << 14) {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: dv ({},{}) is too far from its prediction ({},{}) to code (difference > 2^14)",
+                mv_w[0],
+                mv_w[1],
+                pred[0],
+                pred[1]
+            );
+        }
+        let joint = self.sk.sym(
+            &mut self.st.icdf.dv_joint,
+            ((dw[0] != 0) as i32) * 2 + (dw[1] != 0) as i32,
+        );
+        let dr = if joint == 2 || joint == 3 {
+            self.dv_component(0, dw[0])
+        } else {
+            0
+        };
+        let dc = if joint == 1 || joint == 3 {
+            self.dv_component(1, dw[1])
+        } else {
+            0
+        };
+        let mv = [pred[0] + dr, pred[1] + dc];
+        if S::WRITE && mv != mv_w {
+            fail!(
+                ERR_INTERNAL,
+                "block {b_idx}: dv ({},{}) coded as ({},{})",
+                mv_w[0],
+                mv_w[1],
+                mv[0],
+                mv[1]
+            );
+        }
+        (bi.mv_row, bi.mv_col) = (mv[0] as i16, mv[1] as i16);
+        if S::WRITE {
+            intrabc_stat(0);
+            intrabc_stat(from);
+            if dw == [0, 0] {
+                intrabc_stat(4);
+            }
+        }
+        if !S::WRITE && !self.dv_valid(r, c, bsize, mv) {
+            fail!(ERR_INVALID, "block {b_idx}: invalid dv ({},{})", mv[0], mv[1]);
+        }
+        Ok(())
+    }
+
+    /// read_mv_component with MV_INTRABC_CONTEXT (whole samples: mv_class0_fr / mv_fr are 3,
+    /// mv_class0_hp / mv_hp 1) of the difference `v` (nonzero, |v| <= 2^14, a multiple of 8).
+    fn dv_component(&mut self, comp: usize, v: i32) -> i32 {
+        let ic = &mut self.st.icdf;
+        let sign = self.sk.sym(&mut ic.dv_sign[comp], (v < 0) as i32);
+        let a = v.unsigned_abs().max(1);
+        let cls = self.sk.sym(&mut ic.dv_class[comp], mv_class(a) as i32);
+        let base = if cls == 0 { 0 } else { CLASS0_SIZE << (cls + 2) };
+        let off_w = a as i32 - 1 - base;
+        let d = if cls == 0 {
+            self.sk.sym(&mut ic.dv_class0_bit[comp], (off_w >> 3) & 1)
+        } else {
+            let mut d = 0;
+            for i in 0..cls as usize {
+                d |= self.sk.sym(&mut ic.dv_bit[comp][i], (off_w >> (3 + i)) & 1) << i;
+            }
+            d
+        };
+        let mag = base + ((d << 3) | (3 << 1) | 1) + 1;
+        if sign != 0 { -mag } else { mag }
+    }
+
+    /// is_mv_valid (spec 6.10.25) of an intra block copy block at (r, c) with displacement `dv`,
+    /// within the writer's toolset: a whole-sample displacement and a block of at least 8x8 (so the
+    /// chroma special case never applies); with chroma and an odd component, the source one more
+    /// chroma sample that way (2 luma samples: what the BILINEAR filter's half position reads
+    /// beyond it) valid too, so that every sample the prediction reads is decoded, in the tile.
+    fn dv_valid(&self, r: i32, c: i32, bsize: i32, dv: [i32; 2]) -> bool {
+        let (bw, bh) = (4 * bw4(bsize), 4 * bh4(bsize));
+        if dv[0].abs() >= 1 << 14 || dv[1].abs() >= 1 << 14 || (dv[0] | dv[1]) & 7 != 0 || bw < 8 || bh < 8 {
+            return false;
+        }
+        let chroma = !self.f.mono;
+        let (ey, ex) = (
+            2 * (chroma && (dv[0] >> 3) & 1 != 0) as i32,
+            2 * (chroma && (dv[1] >> 3) & 1 != 0) as i32,
+        );
+        self.src_valid(r, c, bw, bh, dv, 0, 0) && (ey | ex == 0 || self.src_valid(r, c, bw, bh, dv, ey, ex))
+    }
+
+    /// is_mv_valid's source checks for a block (r, c, bw x bh luma samples) at `dv`, the source
+    /// `ey` / `ex` luma samples larger down / right.
+    #[allow(clippy::too_many_arguments)]
+    fn src_valid(&self, r: i32, c: i32, bw: i32, bh: i32, dv: [i32; 2], ey: i32, ex: i32) -> bool {
+        let st = &*self.st;
+        // MiRowEnd, MiColEnd
+        let (row_end, col_end) = (st.mi_row_end.min(self.f.mi_rows), st.mi_col_end.min(self.f.mi_cols));
+        let top = r * MI_SIZE + (dv[0] >> 3);
+        let left = c * MI_SIZE + (dv[1] >> 3);
+        let (bottom, right) = (top + bh + ey, left + bw + ex);
+        if top < st.mi_row_start * MI_SIZE
+            || left < st.mi_col_start * MI_SIZE
+            || bottom > row_end * MI_SIZE
+            || right > col_end * MI_SIZE
+        {
+            return false;
+        }
+        let sb_h = 4 * self.f.sb_size4();
+        let active_row = (r * MI_SIZE) / sb_h;
+        let active_col64 = (c * MI_SIZE) >> 6;
+        let src_row = (bottom - 1) / sb_h;
+        let src_col64 = (right - 1) >> 6;
+        let per_row = ((col_end - st.mi_col_start - 1) >> 4) + 1;
+        if src_row * per_row + src_col64 >= active_row * per_row + active_col64 - INTRABC_DELAY_SB64 {
+            return false;
+        }
+        let gradient = 1 + INTRABC_DELAY_SB64 + self.f.sb128 as i32;
+        let wf_offset = gradient * (active_row - src_row);
+        src_row <= active_row && src_col64 < active_col64 - INTRABC_DELAY_SB64 + wf_offset
+    }
+
     /// read_var_tx_size: the txfm_split tree of an inter block (write: split down to `want`
     /// levels everywhere). Leaves set InterTxSizes (the tile's tx_size map); `leaf` gets their
     /// depth, which must be the same for all (the record has one tx_depth per block).
@@ -1465,7 +1689,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 64
             } else {
                 let k = bufs.mi(row - 1, col);
-                if row == st.mi_row && bufs.skip[k] != 0 && bufs.ref0[k] as i32 == LAST_FRAME {
+                if row == st.mi_row && bufs.skip[k] != 0 && is_inter_ref(bufs.ref0[k]) {
                     4 * bw4(bufs.mi_size[k] as i32)
                 } else {
                     t8(&Tx_Width, bufs.tx_size[k] as i32)
@@ -1475,7 +1699,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 64
             } else {
                 let k = bufs.mi(row, col - 1);
-                if col == st.mi_col && bufs.skip[k] != 0 && bufs.ref0[k] as i32 == LAST_FRAME {
+                if col == st.mi_col && bufs.skip[k] != 0 && is_inter_ref(bufs.ref0[k]) {
                     4 * bh4(bufs.mi_size[k] as i32)
                 } else {
                     t8(&Tx_Height, bufs.tx_size[k] as i32)
@@ -1559,12 +1783,22 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             );
         }
         if bi.is_inter != 0 {
-            if !self.f.inter {
-                fail!(ERR_INVALID, "block {b_idx}: inter block outside an inter frame");
+            if !self.f.inter && !self.f.intrabc {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: inter block outside an inter frame or a frame with intra block copy"
+                );
             }
             let (mr, mc) = (bi.mv_row as i32, bi.mv_col as i32);
+            let st = &*self.st;
+            if self.f.intrabc && !self.dv_valid(st.mi_row, st.mi_col, b.bsize as i32, [mr, mc]) {
+                fail!(
+                    ERR_INVALID,
+                    "block {b_idx}: intra block copy needs a block of 8x8 or more and a dv ({mr},{mc}) of whole even samples that is_mv_valid accepts"
+                );
+            }
             // fp.mv_precision: whole samples (multiples of 8), quarter (even), eighth (any)
-            let (mask, what) = match self.f.fp.mv_precision {
+            let (mask, what) = match if self.f.intrabc { 0 } else { self.f.fp.mv_precision } {
                 0 => (7, "whole samples: multiples of 8"),
                 1 => (1, "quarter samples: even"),
                 _ => (0, "eighth samples"),
@@ -1683,7 +1917,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         } else if b.tx_depth != 0 {
             fail!(ERR_INVALID, "block {b_idx}: tx_depth must be 0 (TX_MODE_LARGEST)");
         }
-        let cdef_bad = if fp.enable_cdef != 0 {
+        let cdef_bad = if fp.enable_cdef != 0 && !self.f.intrabc {
             b.cdef_idx < 0 || b.cdef_idx as i32 >= (1 << fp.cdef_bits)
         } else {
             b.cdef_idx != 0
@@ -1844,7 +2078,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             b.skip = self.sk.sym(&mut self.st.cdf.skip[ctx as usize], b.skip as i32) as u8;
         }
         // ---- read_cdef: per 64x64 (a block larger than 64x64 sets every one it covers) ----
-        if fp.enable_cdef != 0 && b.skip == 0 {
+        if fp.enable_cdef != 0 && !f.intrabc && b.skip == 0 {
             let (r64, c64) = (r & !15, c & !15);
             let sbi = self.bufs.cdef_at(r64, c64).unwrap();
             let sb = self.bufs.sb_cdef[sbi];
@@ -1947,13 +2181,20 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 0
             };
             self.sk.sym(&mut self.st.icdf.is_inter[ctx], bi.is_inter as i32) != 0
+        } else if f.intrabc {
+            // use_intrabc
+            self.sk.sym(&mut self.st.icdf.intrabc, bi.is_inter as i32) != 0
         } else {
             false
         };
         bi.is_inter = is_inter as u8;
         self.st.is_inter = is_inter;
-        // the YModes value of the block: its intra mode, or its inter mode
-        let y_mode_map = if is_inter {
+        // the YModes value of the block: its intra mode, its inter mode, or an intra block copy
+        // block's DC_PRED
+        let y_mode_map = if is_inter && f.intrabc {
+            self.intrabc_mode_info(r, c, bsize, &mut bi)?;
+            DC_PRED as u8
+        } else if is_inter {
             self.inter_block_mode_info(r, c, bsize, &mut bi)? as u8
         } else {
             self.intra_mode_info(&mut b, r, c, bsize)?;
@@ -2014,7 +2255,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 let cdf = &mut self.st.cdf;
                 let max_rect = t8(&Max_Tx_Size_Rect, bsize);
                 let max_tx_depth = t8(&Max_Tx_Depth, bsize);
-                let inter_at = |k: usize| f.inter && bufs.ref0[k] as i32 == LAST_FRAME;
+                let inter_at = |k: usize| (f.inter || f.intrabc) && is_inter_ref(bufs.ref0[k]);
                 let above_w = if !avail_u {
                     0
                 } else {
@@ -2053,6 +2294,13 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 inter_stat(6);
             } else if b.tx_depth > 0 {
                 inter_stat(7);
+            }
+        }
+        if S::WRITE && f.intrabc && is_inter {
+            if b.skip != 0 {
+                intrabc_stat(5);
+            } else if b.tx_depth > 0 {
+                intrabc_stat(6);
             }
         }
         if S::WRITE && (bw > 16 || bh > 16) {
@@ -2095,17 +2343,24 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             for y in r..r_end {
                 let k = bufs.mi(y, c);
                 fill_small(&mut bufs.y_mode[k..k + n], y_mode_map);
-                if is_inter {
+                if is_inter && !f.intrabc {
                     // UVModes is only read for intra blocks (is_smooth checks RefFrames first)
                     fill_small(&mut bufs.uv_mode[k..k + n], 0xFF);
+                } else if is_inter {
+                    // an intra block copy block's UVMode, DC_PRED (its RefFrame is INTRA_FRAME)
+                    if has_chroma_ {
+                        fill_small(&mut bufs.uv_mode[k..k + n], DC_PRED as u8);
+                    }
                 } else if has_chroma_ {
                     fill_small(&mut bufs.uv_mode[k..k + n], b.uv_mode);
                 }
-                if f.inter {
-                    fill_small(
-                        &mut bufs.ref0[k..k + n],
-                        if is_inter { LAST_FRAME } else { INTRA_FRAME } as u8,
-                    );
+                if f.inter || f.intrabc {
+                    let rf = match (is_inter, f.intrabc) {
+                        (false, _) => INTRA_FRAME as u8,
+                        (true, false) => LAST_FRAME as u8,
+                        (true, true) => REF_INTRABC,
+                    };
+                    fill_small(&mut bufs.ref0[k..k + n], rf);
                     if is_inter {
                         bufs.mvs[k..k + n].fill([bi.mv_row, bi.mv_col]);
                     }
@@ -2114,11 +2369,20 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         }
         if let Some(p) = self.plan.as_deref_mut() {
             let st = &*self.st;
-            p.block(st.b_idx, r, c, bsize, is_inter, has_chroma_, st.block_q);
+            let dv = (is_inter && f.intrabc).then_some([bi.mv_row as i32, bi.mv_col as i32]);
+            p.block(st.b_idx, r, c, bsize, is_inter, has_chroma_, st.block_q, dv);
         }
         // ---- compute_prediction (inter blocks: the whole block, before its residual) ----
         if is_inter && f.do_recon {
-            self.predict_inter_block(bsize, has_chroma_);
+            if f.intrabc {
+                let bufs = &mut *self.bufs;
+                let [a, b, c_] = &mut bufs.plane;
+                let mut planes: [&mut [u8]; 3] = [a, b, c_];
+                let dv = [bi.mv_row as i32, bi.mv_col as i32];
+                predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma_, dv);
+            } else {
+                self.predict_inter_block(bsize, has_chroma_);
+            }
         }
 
         // ---- residual: tx blocks in bitstream order (an inter block's luma in transform_tree
@@ -2237,7 +2501,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 if fp.allow_screen_content_tools != 0 {
                     p.palette.push(self.st.pal);
                 }
-                if f.inter {
+                if f.inter || f.intrabc {
                     p.inter.push(bi);
                 }
             }

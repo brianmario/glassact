@@ -39,6 +39,8 @@ let av1SeqCommand = Command(
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
+        .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
+        .string("crop", "<w>x<h>+<x>+<y>", "code this rectangle of the trace's frames at their own size (not with --width or --score-rgb)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
         .int("aom-speed", "<n>", 0...12, "also code the pictures as libaom realtime key frames at this speed"),
@@ -65,7 +67,15 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 
     // the pictures, converted before the clock starts
     let srcW = reader.header.width, srcH = reader.header.height
-    let width = opts.int("width", 1280) & ~1, height = (srcH * width / srcW) & ~1
+    var crop: (w: Int, h: Int, x: Int, y: Int)?
+    if let c = opts.string("crop") {
+        let n = c.split(whereSeparator: { "x+".contains($0) }).compactMap { Int($0) }
+        guard n.count == 4, n[0] >= 64, n[1] >= 64, n[0] + n[2] <= srcW, n[1] + n[3] <= srcH,
+              !opts.has("width"), !opts.has("score-rgb")
+        else { throw BenchError("--crop: <w>x<h>+<x>+<y> inside the frame, without --width or --score-rgb") }
+        crop = (n[0] & ~1, n[1] & ~1, n[2], n[3])
+    }
+    let width = crop?.w ?? opts.int("width", 1280) & ~1, height = crop?.h ?? (srcH * width / srcW) & ~1
     let full = UnsafeMutableRawBufferPointer.allocate(byteCount: srcW * srcH * 4, alignment: 64)
     let bgra = UnsafeMutableRawBufferPointer.allocate(byteCount: width * height * 4, alignment: 64)
     defer { full.deallocate(); bgra.deallocate() }
@@ -77,7 +87,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         defer { index += 1 }
         guard index >= skip else { continue }
         stamps.append(meta.timestampUS)
-        resample(full, srcW, srcH, into: bgra, width, height)
+        if let crop {
+            for row in 0..<height {
+                (bgra.baseAddress! + row * width * 4).copyMemory(
+                    from: full.baseAddress! + ((crop.y + row) * srcW + crop.x) * 4, byteCount: width * 4)
+            }
+        } else {
+            resample(full, srcW, srcH, into: bgra, width, height)
+        }
         pictures.append(try YUV420(bgra: bgra, width: width, height: height))
     }
     guard !pictures.isEmpty else { throw BenchError("no frames after --skip \(skip)") }
@@ -95,6 +112,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.gpuDecides = !opts.has("cpu-decides")
     encoder.reusesAnalysis = !opts.has("no-reuse")
     encoder.postfilters = !opts.has("no-filters")
+    encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     encoder.interFrames = inter
     encoder.searchesMotion = !opts.has("no-motion-search")
@@ -165,6 +183,13 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
         print(String(format: "             the trace's timing: %d frames over %.2f s · %.1f Mbit/s",
                      stamps.count, span, Double(bytes) * 8 / span / 1e6))
+    }
+    if !opts.has("no-intrabc") {
+        // the key frames: the first of a stream, or every picture
+        let keys = inter ? Array(frames.prefix(1)) : frames
+        let copied = keys.map { $0.timing.intraCopied }
+        print(String(format: "             intra block copy: %d of %d key frames copy, %.1f %% of their pictures on average",
+                     copied.filter { $0 > 0 }.count, keys.count, copied.reduce(0, +) / Double(max(1, keys.count)) * 100))
     }
     print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %% · filtered %.0f %%",
                  mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },

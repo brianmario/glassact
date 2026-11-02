@@ -12,7 +12,9 @@
 //! coefficients up to the Golomb range. From a stream of their own (so that a seed's sequence is
 //! otherwise what it was without them): 128x128 superblocks for some sequences (fp.sb128, every
 //! type of the 128x128 node, 128-sample inter and intra blocks), and frames after the first that
-//! leave the sequence header out ([`InterSeq::flags`]: [`ENC_NO_SEQ_HEADER`]).
+//! leave the sequence header out ([`InterSeq::flags`]: [`ENC_NO_SEQ_HEADER`]); and key frames with
+//! intra block copy (fp.allow_intrabc: no post-filters; blocks of 8x8 and up copying the frame at
+//! valid displacements, odd and even, some repeated so that the candidate stack finds them).
 //!
 //! The records are laid out and ready for [`crate::writer::Writer::encode_ex`]: frame k's
 //! reference pictures are the reconstructions of the frames that last refreshed each slot (a key
@@ -308,6 +310,10 @@ impl InterSeq {
         srng.next();
         let sb128 = srng.chance(35);
         let seq_mode = srng.range(0, 2);
+        // intra block copy, from a stream of its own
+        let mut irng = Rng(seed.wrapping_mul(0xD6E8FEB86659FD93) ^ 0x1B_C0DE);
+        irng.next();
+        let abc_pct = [0, 40, 80][irng.range(0, 2) as usize];
         const SPECIAL: [(i32, i32); 8] = [(1, 1), (7, 13), (65, 65), (64, 64), (8, 8), (13, 7), (72, 40), (129, 3)];
         let (w, h) = if rng.chance(15) {
             SPECIAL[rng.range(0, 7) as usize]
@@ -487,10 +493,24 @@ impl InterSeq {
                     b.cdef_idx = sbc[(b.mi_row as usize >> 4) * sb_cols + (b.mi_col as usize >> 4)];
                 }
             }
+            let mut inter = inter;
+            let abc = key && irng.chance(abc_pct);
+            if abc {
+                // no post-filters: their syntax isn't coded (the sequence's enable_cdef stays)
+                fp.allow_screen_content_tools = 1;
+                fp.allow_intrabc = 1;
+                (fp.loop_filter_level, fp.loop_filter_sharpness) = ([0; 4], 0);
+                (fp.cdef_damping_minus_3, fp.cdef_bits) = (0, 0);
+                (fp.cdef_y_pri, fp.cdef_y_sec, fp.cdef_uv_pri, fp.cdef_uv_sec) = ([0; 8], [0; 8], [0; 8], [0; 8]);
+                for b in &mut blocks {
+                    b.cdef_idx = 0;
+                }
+                add_intrabc(&mut irng, &fp, &tiles, &mut blocks, &mut inter);
+            }
             let mut rec = Record {
                 fp,
                 blocks,
-                inter: if key { Vec::new() } else { inter },
+                inter: if key && !abc { Vec::new() } else { inter },
                 palette: Vec::new(),
                 palette_map: Vec::new(),
                 ..Default::default()
@@ -531,6 +551,104 @@ impl InterSeq {
             flags.push(if omit { ENC_NO_SEQ_HEADER } else { 0 });
         }
         Some(InterSeq { frames, flags })
+    }
+}
+
+/// spec is_mv_valid for an intra block copy block of `bsize` at mi (r, c) of tile `t`: a whole
+/// displacement `dv` (1/8 sample) to an area inside the tile, decoded and INTRABC_DELAY behind; with
+/// chroma and an odd component, also with the area 2 samples larger that way (the writer's rule:
+/// the bilinear chroma reads them).
+fn dv_valid(t: (i32, i32, i32, i32), sb128: bool, mono: bool, r: i32, c: i32, bsize: i32, dv: [i32; 2]) -> bool {
+    if dv[0] & 7 != 0 || dv[1] & 7 != 0 || dv[0].abs() >= 1 << 13 || dv[1].abs() >= 1 << 13 {
+        return false;
+    }
+    let (bw, bh) = (4 * bw4(bsize), 4 * bh4(bsize));
+    let (ey, ex) = if mono {
+        (0, 0)
+    } else {
+        (2 * ((dv[0] / 8) & 1), 2 * ((dv[1] / 8) & 1))
+    };
+    area_valid(t, sb128, r, c, bw, bh, dv) && area_valid(t, sb128, r, c, bw + ex, bh + ey, dv)
+}
+
+/// is_mv_valid's checks of the source area of a `bw` x `bh` block at mi (r, c), displacement `dv`.
+fn area_valid(t: (i32, i32, i32, i32), sb128: bool, r: i32, c: i32, bw: i32, bh: i32, dv: [i32; 2]) -> bool {
+    let (row0, row1, col0, col1) = t;
+    let (top, left) = (r * 4 + dv[0] / 8, c * 4 + dv[1] / 8);
+    let (bottom, right) = (top + bh, left + bw);
+    if top < row0 * 4 || left < col0 * 4 || bottom > row1 * 4 || right > col1 * 4 {
+        return false;
+    }
+    let sb_h = if sb128 { 128 } else { 64 };
+    let (active_row, active_col) = (r * 4 / sb_h, c * 4 / 64);
+    let (src_row, src_col) = ((bottom - 1) / sb_h, (right - 1) / 64);
+    let per_row = (col1 - col0 - 1) / 16 + 1;
+    if src_row * per_row + src_col >= active_row * per_row + active_col - INTRABC_DELAY_SB64 {
+        return false;
+    }
+    let wf = (1 + INTRABC_DELAY_SB64 + sb128 as i32) * (active_row - src_row);
+    src_row <= active_row && src_col < active_col - INTRABC_DELAY_SB64 + wf
+}
+
+/// Turns some blocks of 8x8 and up of a key frame with intra block copy into intra block copy
+/// blocks (mode fields 0) at valid displacements: the tile's last one again now and then (the
+/// candidate stack's), else random ones, near and far.
+fn add_intrabc(
+    rng: &mut Rng,
+    fp: &FrameParams,
+    tiles: &crate::types::Tiles,
+    blocks: &mut [Block],
+    inter: &mut [BlockInter],
+) {
+    let pct = [20, 50, 90][rng.range(0, 2) as usize];
+    let mut last: Option<(usize, [i32; 2])> = None;
+    for (b, bi) in blocks.iter_mut().zip(inter.iter_mut()) {
+        let bs = b.bsize as i32;
+        if bw4(bs) < 2 || bh4(bs) < 2 || !rng.chance(pct) {
+            continue;
+        }
+        let (r, c) = (b.mi_row as i32, b.mi_col as i32);
+        let tr = (0..tiles.rows as usize)
+            .rfind(|&i| tiles.mi_row_starts[i] as i32 <= r)
+            .unwrap();
+        let tc = (0..tiles.cols as usize)
+            .rfind(|&i| tiles.mi_col_starts[i] as i32 <= c)
+            .unwrap();
+        let t = (
+            tiles.mi_row_starts[tr] as i32,
+            (tiles.mi_row_starts[tr + 1] as i32).min(mi_rows(fp.height as i32)),
+            tiles.mi_col_starts[tc] as i32,
+            (tiles.mi_col_starts[tc + 1] as i32).min(mi_cols(fp.width as i32)),
+        );
+        let ti = tr * tiles.cols as usize + tc;
+        let mut found = None;
+        if let Some((lt, dv)) = last
+            && lt == ti
+            && rng.chance(50)
+            && dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, r, c, bs, dv)
+        {
+            found = Some(dv);
+        }
+        for _ in 0..if found.is_some() { 0 } else { 24 } {
+            // a source position in the tile above or left of the block, even or odd
+            let y = rng.range(t.0 * 4, (r * 4).max(t.0 * 4));
+            let x = rng.range(t.2 * 4, (t.3 * 4 - 8).max(t.2 * 4));
+            let dv = [(y - r * 4) * 8, (x - c * 4) * 8];
+            if dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, r, c, bs, dv) {
+                found = Some(dv);
+                break;
+            }
+        }
+        let Some(dv) = found else { continue };
+        last = Some((ti, dv));
+        bi.is_inter = 1;
+        (bi.mv_row, bi.mv_col) = (dv[0] as i16, dv[1] as i16);
+        (b.y_mode, b.angle_delta_y, b.uv_mode, b.angle_delta_uv) = (0, 0, 0, 0);
+        (b.cfl_alpha_u, b.cfl_alpha_v, b.filter_intra) = (0, 0, 0);
+        if b.skip != 0 {
+            b.tx_depth = 0;
+        }
+        b.tx_depth = b.tx_depth.min(2);
     }
 }
 
