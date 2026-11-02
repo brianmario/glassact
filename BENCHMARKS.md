@@ -265,6 +265,29 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Hardware HEVC's per-picture latency at 5K, against AV1 when every superblock changes (2026-11-02)
+
+`vquality` (VideoToolbox HEVC as the Host configures it: max frame QP 34, realtime), 5120×2880,
+24 Mbit/s target, first 100 frames, each picture waited for before the next is handed in, session
+disconnected:
+
+| | encode latency p50 / p95 | first frame (key) | achieved | PSNR-Y |
+|---|---|---|---|---|
+| photos | 35.2 / 54.0 ms | 1.06 MB | 24.4 Mbit/s | 37.3 dB |
+| typing-cc | 47.0 / 61.8 ms | 595 KB | 2.3 Mbit/s | 46.8 dB |
+
+- **One 5K picture is 35–47 ms, not ~17.** The 58–59 fps of "Quality vs speed vs bandwidth at 5K"
+  (2026-08-07) is throughput, with several pictures in the encoder at once. The latency includes
+  handing VideoToolbox the BGRA picture. Typing's is the longer, probably the encoder clocking down
+  between mostly-empty pictures (not checked).
+- **Against AV1 when nothing can be reused** (the 2026-11-01 `av1seq` runs: key frames, and inter
+  frames with every superblock forced changed): the hybrid takes ~148 ms a key frame (6.7–6.8 fps,
+  ~425 KB with intra block copies, 47.3 dB on typing-cc) and ~171 ms a fully-changed inter frame;
+  libaom speed 9 takes 151–163 ms a key frame on 8 threads (~1.03 MB, 47.6 dB). So a full-screen
+  change costs either AV1 encoder 3–4× HEVC's latency, and sustained full-screen motion runs ~6–7
+  fps against HEVC's ~58, for 68–84 % fewer bytes than HEVC at equal quality (the 2026-11-01
+  re-baseline).
+
 ### Metal AV1: the next picture's analysis committed while the last one runs (2026-11-01)
 
 Following up the entry below with a Metal System Trace of 720p typing-cc: between two pictures'
