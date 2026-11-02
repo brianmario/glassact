@@ -137,8 +137,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Padded source planes of partitions already waited on, for the next picture of the same
     /// geometry: making and clearing 22 MB of shared memory per 5K picture cost milliseconds.
     var sourcePool: [[any MTLBuffer]] = []
+    /// Guards the source pool and `readEvent`: a picture's analysis is set up on one thread while
+    /// the last one's is read on another.
+    private let poolLock = NSLock()
 
     func takeSource(_ lengths: [Int]) throws -> [any MTLBuffer] {
+        poolLock.lock()
+        defer { poolLock.unlock() }
         if let i = sourcePool.firstIndex(where: { $0.map(\.length) == lengths.map { max(16, $0) } }) {
             return sourcePool.remove(at: i)
         }
@@ -152,16 +157,31 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
     }
 
-    func recycleSource(_ planes: [any MTLBuffer]) {
-        if sourcePool.count < 2 { sourcePool.append(planes) }
-    }
-
-    /// The padded source of the last partition waited on: the next inter frame's motion search
-    /// predicts from it. The one before goes back to the pool (its partitions are done).
+    /// The padded source of the last partition waited on. The one before goes back to the pool:
+    /// the analyses that read it (its own, and the next picture's motion search) are done.
     var lastSource: [any MTLBuffer]?
     func keepSource(_ planes: [any MTLBuffer]) {
-        if let old = lastSource { recycleSource(old) }
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        if let old = lastSource, sourcePool.count < 2 { sourcePool.append(old) }
         lastSource = planes
+    }
+
+    /// The padded source of the last analysis set up: the next inter frame's motion search
+    /// predicts from it.
+    var referenceSource: [any MTLBuffer]?
+
+    /// Orders pictures' analyses on the GPU behind the CPU's reading of the one before, which
+    /// they overwrite (the cache's results): a picture's analysis is committed while the last one
+    /// still runs, and its command buffer waits until the event reaches the last one's `seq`.
+    let readEvent: any MTLSharedEvent
+    /// Analyses set up so far (each Run's `seq`).
+    var runCount: UInt64 = 0
+    /// Run `seq`'s results are read (or never will be).
+    func markRead(_ seq: UInt64) {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        if readEvent.signaledValue < seq { readEvent.signaledValue = seq }
     }
 
     /// Analyze every superblock of the next picture (keeping nothing from the ones before), as a
@@ -174,11 +194,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     final class AnalysisCache {
         let key: [UInt8]
         let blockResults: any MTLBuffer, leaves: any MTLBuffer, leafCount: any MTLBuffer
-        let leafDecisions: any MTLBuffer, sbJ: any MTLBuffer, keep: any MTLBuffer
+        let leafDecisions: any MTLBuffer, sbJ: any MTLBuffer
         /// An inter frame's analysis (GpInterRes, parallel to blockResults).
         let interResults: any MTLBuffer
-        /// The SBs to analyze (raster), staleCount of them.
-        let stale: any MTLBuffer
+        /// Per SB, whether its analysis is kept (`keep`), and the SBs to analyze (raster,
+        /// staleCount of them: `stale`): two of each, alternating, as the last picture's analysis
+        /// may still be reading its own while the next picture's are set.
+        private let keeps: [any MTLBuffer], stales: [any MTLBuffer]
+        private var flip = 0
+        var keep: any MTLBuffer { keeps[flip] }
+        var stale: any MTLBuffer { stales[flip] }
         var staleCount = 0
         var previous: [[UInt8]]? = nil
         var keptCount = 0
@@ -199,8 +224,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             leafCount = try make(nSb * 2)
             leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
             sbJ = try make(nSb * 4)
-            keep = try make(nSb)
-            stale = try make(nSb * 4)
+            keeps = [try make(nSb), try make(nSb)]
+            stales = [try make(nSb * 4), try make(nSb * 4)]
         }
 
         /// Sets `keep` from the new source against the previous one, and remembers the new one.
@@ -209,6 +234,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// is of, so that a later picture analyzes it.
         func markUnchanged(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                            width: Int, height: Int, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil) {
+            flip ^= 1
             let cw = (width + 1) / 2, ch = (height + 1) / 2
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
             let k = keep.contents().assumingMemoryBound(to: UInt8.self)
@@ -356,6 +382,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no command queue") }
         self.queue = queue
+        guard let readEvent = device.makeSharedEvent() else { throw Failure.metal("no shared event") }
+        self.readEvent = readEvent
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
         var analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int)] = [:]
@@ -531,6 +559,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 stages.analysis = commands.gpuEndTime - commands.gpuStartTime
                 run.encoder.lastStages = stages
                 run.encoder.lastGPUSeconds = stages.analysis
+            } else if !run.encoder.profilesStages {
+                run.encoder.lastGPUSeconds = 0  // every SB kept: no GPU work
             }
             let (blocks, types, inter) = run.leafBlocks()
             let source = run.source
@@ -600,6 +630,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
+        /// This analysis's place in the encoder's order (`readEvent`).
+        let seq: UInt64
+        /// The cache it keeps results in, and its SBs' kept flags (the cache's `keep` then).
+        let cacheRef: AnalysisCache?
+        let keptFlags: (any MTLBuffer)?
 
         /// With `closedLoop` false the closed loop's buffers (reconstruction,
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
@@ -607,6 +642,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
              motion: [Int32]? = nil) throws {
             self.encoder = encoder
+            encoder.runCount += 1
+            seq = encoder.runCount
             self.width = width
             self.height = height
             self.qindex = qindex
@@ -685,7 +722,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             image.cDc = (at(ctx, ctxTotal), at(ctx, ctxTotal + mi), at(ctx, ctxTotal + mi + mi1))
 
             // an inter frame: motion from the last picture's source (padded the same way)
-            let last = motion == nil ? nil : encoder.lastSource.flatMap { last in
+            let last = motion == nil ? nil : encoder.referenceSource.flatMap { last in
                 last.map(\.length) == src.map(\.length) && last[0] !== src[0] ? last : nil
             }
             // analysis grids: every enabled shape over the coded area (inter frames': interPreset's)
@@ -761,6 +798,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             staleSuperblocks = cache?.staleCount
             keptSuperblocks = cache?.keptCount ?? 0
+            cacheRef = cache
+            keptFlags = sbKeep
+            encoder.referenceSource = src
             encoder.lastKeptSuperblocks = keptSuperblocks
             let out = closedLoop ? nSb : 0
             sbOut = try make(out * MemoryLayout<GpSbOut>.stride)
@@ -812,6 +852,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             buffers = made
         }
 
+        // (a run whose results are never read mustn't hold up the next picture's)
+        deinit { encoder.markRead(seq) }
+
         /// Encodes the stages. With `wait` false (and no profiling), returns the
         /// committed command buffer instead of waiting for it.
         @discardableResult
@@ -831,8 +874,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.interSkipsIntra = encoder.interSkipsIntra ? 1 : 0
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
-                guard let c = encoder.queue.makeCommandBuffer(), let e = c.makeComputeCommandEncoder(dispatchType: .concurrent)
-                else { throw Failure.metal("no command encoder") }
+                guard let c = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
+                // the last picture's results, which this one's overwrite, are read
+                if seq > 1 { c.encodeWaitForEvent(encoder.readEvent, value: seq - 1) }
+                guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
                 e.setBytes(&batch, length: MemoryLayout<GpBatch>.stride, index: 0)
@@ -854,7 +899,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             // every SB keeps the previous picture's analysis, and its results are in the cache
             if !closedLoop, !profiling, staleSuperblocks == 0 {
-                encoder.lastGPUSeconds = 0
+                if wait { encoder.lastGPUSeconds = 0 }
                 return nil
             }
             let t0 = CACurrentMediaTime()
@@ -1017,8 +1062,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let decisions = leafDecisions.contents().assumingMemoryBound(to: GpLeafDecision.self)
             let counts = leafCount.contents().assumingMemoryBound(to: UInt16.self)
             // SBs whose analysis was kept have last picture's blocks
-            let cache = encoder.cache.flatMap { $0.blockResults === blockResults ? $0 : nil }
-            let kept = cache?.keep.contents().assumingMemoryBound(to: UInt8.self)
+            let cache = cacheRef
+            let kept = keptFlags?.contents().assumingMemoryBound(to: UInt8.self)
+            defer { encoder.markRead(seq) }
             if let cache, cache.sbBlocks.count != sbCols * sbRows {
                 cache.sbBlocks = Array(repeating: [], count: sbCols * sbRows)
                 cache.sbTypes = Array(repeating: [], count: sbCols * sbRows)
@@ -1088,6 +1134,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
         /// k_pack's work on the CPU: the per-superblock slots into one record, in decode order.
         func encoded() throws -> Encoded {
+            defer { encoder.markRead(seq) }
             let out = sbOut.contents().assumingMemoryBound(to: GpSbOut.self)
             let gBlocks = oBlocks.contents().assumingMemoryBound(to: av1g_block.self)
             let gBlockTxb = oBlockTxb.contents().assumingMemoryBound(to: UInt16.self)

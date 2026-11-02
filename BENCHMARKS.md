@@ -265,6 +265,43 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the next picture's analysis committed while the last one runs (2026-11-01)
+
+Following up the entry below with a Metal System Trace of 720p typing-cc: between two pictures'
+analyses the GPU sat idle ~270–320 µs (under the trace), because picture i + 1's analysis was only
+set up once picture i's had finished: padding and comparing its source, making its buffers (~120
+µs at 720p, ~1.2 ms at 5K), encoding and committing, plus two thread hand-offs.
+
+Now (`AV1HybridEncoder.encode(count:)`, `AV1MetalEncoder.readEvent`) picture i + 1's analysis is
+set up and committed on its thread before the main thread waits for picture i's. Its command buffer
+waits on the GPU (an `MTLSharedEvent`) until the CPU has read picture i's results, which it would
+overwrite in the cache's buffers. The cache's keep and stale lists are two of each, alternating; the
+motion search's reference is the last source set up, not the last waited on; the source pool takes
+a lock. The streams are byte-identical (`--digest`, all 8 below).
+
+Inter frames a second at q20 (`--no-planes`), median of 4 runs interleaved with the commit before:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 720p | 1141 → **1279 (+12 %)** | 501 → 505 (+1 %) | 173 → 184 (+7 %) | 893 → **988 (+11 %)** |
+| 5K | 340 → 336 (−1 %) | 208 → 216 (+3 %) | 83.6 → 87.0 (+4 %) | 312 → 323 (+4 %) |
+
+Run to run the spread narrowed too (720p typing 953–1176 before, 1246–1330 after).
+
+What's left, from the main loop's own clock at 720p typing: each picture the main thread waits
+~0.48 ms for the analysis, then finishes the picture before (closed loop and filters) in ~0.77 ms,
+while the next analysis runs on the GPU beside the filters. The analysis is still the longer: its
+chain of dependent stages, each a block's serial work. At 5K the finish is the limit (2.7 ms typing,
+4.1 ms scroll), so this change can't help there.
+
+Measured and dropped:
+- **Copying each picture's leaves out on the GPU** (a `k_leaf_out` kernel after `k_leaf`, into
+  buffers of the picture's own, so the next analysis needn't wait for the CPU to read the cache):
+  same bytes, no gain at 720p, and 5K scroll −12 % (it copied every superblock's leaves).
+- **A superblock analyzed end to end in one threadgroup** (the entry below's idea): looked at again,
+  it would be slower. Each stage already runs every block of every changed superblock at once across
+  the GPU; one threadgroup per superblock would run its ~680 blocks about 32 at a time.
+
 ### Metal AV1 at 720p: why libaom is faster on inter frames (2026-11-01)
 
 At 720p libaom realtime speed 9 codes typing-cc's inter frames at ~2000 a second and ours at
@@ -293,9 +330,10 @@ Considered and not built:
   superblocks on 4 threads), with no motion search and weaker decisions. With ~5 superblocks on as
   many threads, that's ~0.6 ms against the GPU's ~1.0: at best ~1.4× on typing, short of libaom,
   and costing bytes; on scroll (~24 superblocks) no faster.
-- What would close the gap is the GPU analysis's latency on few superblocks: fewer dependent stages
-  (a superblock analyzed end to end in one threadgroup, shapes to leaf decisions), not more search.
+- What would close the gap is the GPU analysis's latency on few superblocks, not more search.
   At 720p we're already 15–20× past 60 fps, so this matters for latency and power, not frame rate.
+  (Followed up in the entry above: the CPU's setup of each analysis moved off the GPU's critical path,
+  +7–12 % at 720p; one threadgroup per superblock would be slower.)
 
 ### Metal AV1 re-baselined after intra block copy (2026-11-01, evening)
 

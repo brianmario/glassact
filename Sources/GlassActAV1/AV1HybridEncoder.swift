@@ -273,9 +273,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// Pictures 0..<count: picture i + 1's analysis runs on the GPU while
     /// picture i is finished on the CPU. `output` gets them in order. With
     /// `interFrames`, they're one stream: the first a key frame and the rest
-    /// inter frames. Picture i's bitstream is written, and picture i + 2's
-    /// analysis started, on other threads; `output` gets picture i before
-    /// picture i + 1's closed loop.
+    /// inter frames. Picture i's bitstream is written, and picture i + 1's
+    /// analysis set up and committed (while picture i's still runs), on other
+    /// threads; `output` gets picture i before picture i + 1's closed loop.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
@@ -303,6 +303,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 starting = nil
                 pending = try s.wait()
             }
+            // picture i + 1's analysis is set up and committed while picture i's runs: its command
+            // buffer waits on the GPU until picture i's results are read (AV1MetalEncoder.readEvent)
+            let next = upcoming
+            if let next {
+                let copies = interFrames ? copyFinder.wait() : Copies()
+                starting = Later { try self.begin(next, copies, qindex: qindex) }
+                upcoming = i + 2 < count ? try picture(i + 2) : nil
+                if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
+            }
             let partition = try pending.partition.wait()
             let t0 = CACurrentMediaTime()
             var timing = Timing()
@@ -311,13 +320,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
             timing.motion = pending.motionSeconds
             let motion = pending.motion
-            let next = upcoming
-            if let next {
-                let copies = interFrames ? copyFinder.wait() : Copies()
-                starting = Later { try self.begin(next, copies, qindex: qindex) }
-                upcoming = i + 2 < count ? try picture(i + 2) : nil
-                if interFrames, let upcoming { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
-            }
             if let w = writing {
                 writing = nil
                 try output(i - 1, try w.wait())
