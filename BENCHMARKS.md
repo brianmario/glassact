@@ -180,6 +180,7 @@ the numbers and the reasoning.
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | Intra block copy in key frames (`metal-av1`, on by default) | kept | 5K BD-rate typing −18 %, cursor-drag −14 %, scroll −7 %; photos and 720p unchanged (a frame copies only when copies cover ≥ 6 % of its non-flat 8×8s: no filters then); ~10 ms of search per 5K key frame | [entry](#metal-av1-intra-block-copy-in-key-frames-2026-11-01) |
+| Lossy intra block copies; inter blocks' tx types searched (`metal-av1`) | kept | key frames also copy where a near copy's residual is ≤ 0.005 × 1.5 × step² per sample: 5K BD-rate typing −2.3 %, scroll −1.7 %, drag −3.2 % (1080p terminal crop's key frame −11 %); inter tx types: −0.1 to −2.4 % more (720p photos), 2–5 % slower on most points (one 5K point 25 %); split transforms in copies and 4×4 copies measured, not worth it | [entry](#metal-av1-lossy-intra-block-copies-and-inter-blocks-tx-types-2026-11-01) |
 | AV2's 3.7× on text, attributed (AVM, each tool off in turn) | measured; intra block copy is next for `metal-av1` | intra block copy alone is 3.4× on typing; libaom at speed 2 with it gets within ~15 % of AV2 (typing 60 dB: 43 vs 37 KB, 131 KB without); key frames 2.9× smaller at ~45 dB | [entry](#av2s-gain-on-text-attributed-intra-block-copy-which-av1-has-too-2026-11-01) |
 | Prefer smooth motion: frame-QP ceiling 38 while the link has no room (Viewer opt-in) | kept, opt-in | 2M photos 20 → 48 frames, 3M scroll-win queue p95 423 → 344 ms; text p5 SSIMULACRA2 −5 to −18 at caps ≤ 1 Mbit/s, about even above | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | Frame-QP ceiling 42 on thin links | rejected | photos frames 4–8× but SSIMULACRA2 near zero | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
@@ -264,6 +265,67 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: lossy intra block copies, and inter blocks' tx types (2026-11-01)
+
+Where the bytes went after exact intra block copies (an experiment, not kept: every block's bits
+from `ENC_BLOCK_BITS`, and for each block that didn't copy, the least residual of any copy the
+search could find), on the 1080p crop of typing-cc's terminal at q20 (42.8 KB):
+
+- **12.4 % of the bits were in 4×4-ish blocks whose 8×8 had a near-exact copy** (residual SSE under
+  0.05 × 1.5 × step² per sample: glyphs whose antialiasing or colour differs a little, chroma at an
+  odd displacement), and 2.6 % in larger blocks like that.
+- **Small blocks with an exact 4×4 luma copy** held 5.8 % of the crop's bits but only 1.2 % at
+  5K, of which a copy would save only part (its displacement costs bits too, and chroma of an 8×8
+  then comes from its bottom-right 4×4's copy). Not built: the writer's sub-8×8 chroma rules for
+  ~0.5 % at 5K.
+
+So the search now copies lossily too (`hybrid::intrabc`): a block, or a node the analysis split,
+with no exact copy copies where a near copy's residual SSE (luma and chroma, against the source's
+own copy) is at most `NEAR_SHARE` = 0.005 × 1.5 × step² per luma sample, and the closed loop codes
+the residual. Candidates are the tile's 16 most recent displacements and those of exact matches of
+the block's first four non-flat 8×8s (at each parity); the cheapest by SSE + λ × displacement bits
+wins. Only exact copies count toward a frame's decision to copy (≥ 6 % of its non-flat 8×8s):
+counting lossy ones made 720p frames at q26–32 copy (and lose their filters) for −0.2 dB and no
+bytes.
+
+Key frames alone (q 8–32, RGB-scored at 5K and 720p; the crop PSNR-Y), BD-rate against exact
+copies only:
+
+| threshold | crop | 5K typing | 5K scroll | 5K drag | 5K photos, 720p |
+|---|---|---|---|---|---|
+| 0.005, blocks and split nodes | **−11.3 %** | **−2.9 %** | **−3.9 %** | **−4.2 %** | 0.0 % |
+| 0.01, blocks and split 8×8s only | −9.8 % | −2.4 % | −3.2 % | −3.2 % | 0.0 % |
+| 0.01, blocks and split nodes | −11.5 % | −2.8 % | −3.9 % | −4.2 % | 0.0 % |
+| 0.02, blocks and split nodes | −11.3 % | −2.2 % | −3.6 % | −3.7 % | 0.0 % |
+| 0.25, split 8×8s only (lossy counted toward the 6 %) | −6.6 % | +2.7 % | +5.0 % | +3.2 % | +1.4 to +6.8 % |
+
+Whole streams (100 frames, RGB-scored, q 8–32), against exact copies only: 5K typing **−2.3 %**,
+scroll **−1.7 %**, cursor-drag **−3.2 %**; photos and 720p byte-identical. At q20 the 5K key frames
+copy 29–32 % of their pictures (19–24 % exactly): typing 428.0 → 413.7 KB, scroll 388.4 → 372.6 KB,
+drag 410.7 → 394.8 KB, at −0.01 to −0.03 dB. The search costs ~5–10 ms more per 5K key frame.
+
+**Inter blocks' luma tx types are searched now** (`Hybrid::search_inter_tx`, in the quantization
+hook: every type of the block's inter set, as intra's), not DCT_DCT only. A copy's residual and an
+inter frame's motion-searched blocks both use it. Whole streams, against the above:
+
+| | typing | scroll | photos | drag |
+|---|---|---|---|---|
+| 5K | −0.4 % | −0.7 % | −0.1 % | −0.2 % |
+| 720p | −0.2 % | −1.2 % | **−2.4 %** | −0.2 % |
+
+It costs 2–5 % of throughput on most points (one point, 5K typing at q32, 25 %).
+
+Measured and dropped:
+- **Split transforms in copies** (tx_depth 1–2; key frames then need tx_mode_select, which costs
+  every intra block a symbol): +2 % bytes on the crop and 5K typing for at most +0.09 dB.
+- **Larger thresholds:** the closed loop codes a copy's residual with one transform the block's size
+  and skips it where that's cheaper, so a poor copy loses quality the bytes don't buy back.
+
+Tested: the hybrid's key frames with lossy copies (a test picture with repeats nudged by 3 in a
+sample per 16×16) decode exactly in dav1d and in Apple's hardware decoder (VideoToolbox through
+ffmpeg); the Rust tests, the oracle tests against the C++ (which keeps DCT_DCT for inter blocks:
+`Hybrid::as_cpp`), and the Swift AV1 suites pass.
+
 ### Metal AV1: intra block copy in key frames (2026-11-01)
 
 The AV2 attribution (entry below) found intra block copy carrying AV2's gain on text, and AV1 has it
@@ -314,7 +376,7 @@ Measured and dropped: splitting an analysis block that doesn't copy into quadran
 intra ones with its modes): no gain at any threshold (5K typing key frame 422.6 KB not splitting,
 423.0 at half its non-flat area copying, 425.9 splitting nearly always).
 
-Next for text: copies with a residual (glyphs at another sub-sample phase), 4×4 copies, and copies
+Next for text (lossy copies since, entry above): copies with a residual (glyphs at another sub-sample phase), 4×4 copies, and copies
 inside inter frames (which AV1 doesn't have: the custom codec's glyph cache).
 
 ### AV2's gain on text attributed: intra block copy, which AV1 has too (2026-11-01)

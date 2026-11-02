@@ -16,6 +16,13 @@
 //! nearest. The superblock row's own positions are added as the search moves right, once they are
 //! 256 samples behind (is_mv_valid's delay).
 //!
+//! Where a block, or a node the analysis split, has no exact copy, it copies anyway if a near copy's
+//! residual is small (SSE within [`NEAR_SHARE`] of the quantizer step squared per sample: glyphs
+//! whose antialiasing or colour differs a little): the closed loop codes the residual. Its
+//! candidates are the tile's recent displacements and those of exact matches of its first 8x8s.
+//! Only exact copies count toward the frame's decision to copy ([`MIN_BUSY_SHARE`]): lossy ones
+//! alone never pay for the filters the frame gives up.
+//!
 //! Displacements stay under 1024 samples each way, so that a difference to any prediction (another
 //! displacement, or the spec's default) fits read_mv's range.
 use crate::blockinfo::{bh4, bw4};
@@ -28,6 +35,17 @@ use super::decide::SrcView;
 const MAX_DV: i32 = 1023;
 /// Hash chain entries looked at per block.
 const MAX_CHAIN: usize = 512;
+/// A lossy copy's largest residual: its SSE (luma and chroma) per luma sample, in units of the
+/// quantizer step squared times 1.5 (the chroma samples). On the reference traces' key frames
+/// (BD-rate against exact copies only): 0.005 and 0.01 within 0.3 % of each other, 0.02 0.5 %
+/// worse at 5K; at 0.25 and above, 5K loses.
+const NEAR_SHARE: f64 = 0.005;
+/// Lossy copies: a block's 8x8s looked up, the chain entries per lookup, the displacements tried
+/// per block, and the tile's recent displacements kept.
+const NEAR_KEYS: usize = 4;
+const NEAR_CHAIN: usize = 32;
+const NEAR_CANDS: usize = 48;
+const RECENT: usize = 16;
 /// [`IntraBc::h8`] of a flat 8x8 (and of positions without one).
 const FLAT: u32 = 0;
 const NONE: u32 = u32::MAX;
@@ -53,14 +71,15 @@ pub(crate) struct IntraBc {
     pub blocks: Vec<Block>,
     pub inter: Vec<BlockInter>,
     pub tx: Vec<u8>,
-    /// how many blocks copy, and their luma area
+    /// how many blocks copy (exactly or not), and their luma area
     pub copies: usize,
     pub area: usize,
-    /// the picture's non-flat 8x8s (8-aligned), and those in copies
+    /// the picture's non-flat 8x8s (8-aligned), and those in copies, and in exact ones
     pub busy: usize,
     pub busy_copied: usize,
+    pub busy_exact: usize,
     /// what the last search was given (its geometry, blocks and luma tx types) and what it found
-    given_key: [u32; 5],
+    given_key: [u32; 6],
     given: Vec<Block>,
     given_tx: Vec<u8>,
     copied: bool,
@@ -81,14 +100,16 @@ struct TileSearch {
     /// superblock row from it, the columns before `band_x`
     added: i32,
     band_x: i32,
-    /// the tile's last copy's displacement
+    /// the tile's last copy's displacement, and its last [`RECENT`] different ones (oldest first)
     last: Option<[i32; 2]>,
+    recent: Vec<[i32; 2]>,
     blocks: Vec<Block>,
     inter: Vec<BlockInter>,
     tx: Vec<u8>,
     copies: usize,
     area: usize,
     busy_copied: usize,
+    busy_exact: usize,
 }
 
 /// A displacement's cost, for choosing among exact copies: its components' magnitude classes.
@@ -109,6 +130,10 @@ struct Frame<'a> {
     /// [`IntraBc::h8`], and its width
     h8: &'a [u32],
     hw: usize,
+    /// a lossy copy's residual SSE allowed per luma sample, and the cost of a displacement bit
+    /// (one magnitude class of a component: two) as SSE
+    near: f64,
+    lambda: f64,
 }
 
 impl Frame<'_> {
@@ -162,6 +187,43 @@ impl Frame<'_> {
         }
         let wf = (1 + INTRABC_DELAY_SB64 + self.sb128 as i32) * (active_row - src_row);
         src_row <= active_row && src_col < active_col - INTRABC_DELAY_SB64 + wf
+    }
+
+    /// The SSE (luma and chroma) of the block (x, y, bw, bh) against its prediction at `dv`, if
+    /// it is at most `cap` (rows stop being added past it).
+    fn sse(&self, x: i32, y: i32, bw: i32, bh: i32, dv: [i32; 2], cap: u64) -> Option<u64> {
+        let mut e = 0u64;
+        for p in 0..if self.mono { 1 } else { 3 } {
+            let sub = (p > 0) as i32;
+            let (x, y, w, h) = (x >> sub, y >> sub, (bw >> sub) as usize, bh >> sub);
+            let (sx, sy) = (x + (dv[1] >> sub), y + (dv[0] >> sub));
+            let (hx, hy) = (sub != 0 && dv[1] & 1 != 0, sub != 0 && dv[0] & 1 != 0);
+            for i in 0..h {
+                let a = &self.src.at(p, x as usize, (y + i) as usize)[..w];
+                let b = self.src.at(p, sx as usize, (sy + i) as usize);
+                let c = self.src.at(p, sx as usize, (sy + i + hy as i32) as usize);
+                let (ox, row) = (hx as usize, a.iter().enumerate());
+                e += match (hx, hy) {
+                    (false, false) => row.map(|(j, &v)| (v as i32 - b[j] as i32).pow(2) as u64).sum::<u64>(),
+                    (_, false) => row
+                        .map(|(j, &v)| (v as i32 - ((b[j] as i32 + b[j + ox] as i32 + 1) >> 1)).pow(2) as u64)
+                        .sum(),
+                    (false, true) => row
+                        .map(|(j, &v)| (v as i32 - ((b[j] as i32 + c[j] as i32 + 1) >> 1)).pow(2) as u64)
+                        .sum(),
+                    (true, true) => row
+                        .map(|(j, &v)| {
+                            let s = b[j] as i32 + b[j + 1] as i32 + c[j] as i32 + c[j + 1] as i32;
+                            (v as i32 - ((s + 2) >> 2)).pow(2) as u64
+                        })
+                        .sum(),
+                };
+                if e > cap {
+                    return None;
+                }
+            }
+        }
+        Some(e)
     }
 
     /// Whether the block (x, y, bw, bh) equals its prediction at `dv` from the source, luma and
@@ -328,12 +390,88 @@ impl TileSearch {
         best.map(|(dv, _)| dv)
     }
 
+    /// The block's lossy copy, if any: of the tile's recent displacements and those of exact
+    /// matches of the block's first [`NEAR_KEYS`] 8x8s that aren't flat (at each parity), the one
+    /// of least cost (residual SSE, and [`Frame::lambda`] per displacement bit) whose residual is
+    /// within [`Frame::near`].
+    fn lossy(&self, f: &Frame, x: i32, y: i32, bw: i32, bh: i32) -> Option<[i32; 2]> {
+        let t = self.t;
+        if f.near <= 0.0 || bw < 8 || bh < 8 || x + bw > f.w || y + bh > f.h {
+            return None;
+        }
+        let mut cands = [[0i32; 2]; NEAR_CANDS];
+        let mut n = 0;
+        let mut push = |dv: [i32; 2], n: &mut usize| {
+            if *n < NEAR_CANDS && dv != [0, 0] && !cands[..*n].contains(&dv) {
+                cands[*n] = dv;
+                *n += 1;
+            }
+        };
+        for &dv in self.recent.iter().rev() {
+            push(dv, &mut n);
+        }
+        let mut keys = 0;
+        'keys: for cy in (0..bh).step_by(8) {
+            for cx in (0..bw).step_by(8) {
+                if f.hash_at(x + cx, y + cy) == FLAT {
+                    continue;
+                }
+                for (py, px) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let (kx, ky) = (x + cx + px, y + cy + py);
+                    if kx + 8 > f.w || ky + 8 > f.h {
+                        continue;
+                    }
+                    let hb = if px | py == 0 {
+                        f.hash_at(kx, ky)
+                    } else {
+                        hash8(&f.src, kx as usize, ky as usize)
+                    };
+                    if hb == FLAT {
+                        continue;
+                    }
+                    let mut e = self.heads[hb as usize & (self.heads.len() - 1)];
+                    let mut looked = 0;
+                    while e != NONE && looked < NEAR_CHAIN {
+                        looked += 1;
+                        let p = self.pos[e as usize];
+                        e = self.next[e as usize];
+                        let (qx, qy) = ((p & 0xFFFF) as i32, (p >> 16) as i32);
+                        if f.hash_at(qx, qy) == hb {
+                            push([qy - ky, qx - kx], &mut n);
+                        }
+                    }
+                }
+                keys += 1;
+                if keys == NEAR_KEYS {
+                    break 'keys;
+                }
+            }
+        }
+        let limit = (f.near * (bw * bh) as f64) as u64;
+        let mut best: Option<([i32; 2], f64)> = None;
+        for &dv in &cands[..n] {
+            let bits = f.lambda * 2.0 * dv_cost(dv) as f64;
+            let cap = best.map_or(limit, |(_, j)| ((j - bits).max(0.0) as u64).min(limit));
+            if !f.valid(t, x, y, bw, bh, dv) {
+                continue;
+            }
+            if let Some(e) = f.sse(x, y, bw, bh, dv, cap) {
+                let j = e as f64 + bits;
+                if best.is_none_or(|(_, b)| j < b) {
+                    best = Some((dv, j));
+                }
+            }
+        }
+        best.map(|(dv, _)| dv)
+    }
+
     /// The tile's search over the analysis's blocks (its blocks[b0..b1]), superblock by superblock.
     fn run(&mut self, f: &Frame, blocks: &[Block], luma_tx: Option<&[u8]>) {
         self.blocks.clear();
         self.inter.clear();
         self.tx.clear();
-        (self.copies, self.area, self.busy_copied, self.last) = (0, 0, 0, None);
+        (self.copies, self.area, self.busy_copied, self.busy_exact, self.last) = (0, 0, 0, 0, None);
+        self.recent.clear();
         let (row0, row1, col0, col1) = self.t;
         let positions = (((col1 - col0) * 2) * ((row1 - row0) * 2)).max(1) as usize;
         let nb = positions.next_power_of_two().clamp(1 << 10, 1 << 20);
@@ -366,7 +504,8 @@ impl TileSearch {
 
     /// The node (x, y, size) holding blocks[i..j]: one copy for the whole node where it has one
     /// (and the analysis split it: a copy of a 64x64 in place of its blocks, of an 8x8 in place of
-    /// its 4x4s), else its quadrants (a split), else each block (a copy, or the analysis's).
+    /// its 4x4s), exact, else lossy; else its quadrants (a split), else each block (a copy, exact
+    /// or lossy, or the analysis's).
     #[allow(clippy::too_many_arguments)]
     fn node(
         &mut self,
@@ -380,21 +519,22 @@ impl TileSearch {
         size: i32,
     ) {
         let one = j == i + 1 && 4 * bw4(blocks[i].bsize as i32) == size && 4 * bh4(blocks[i].bsize as i32) == size;
-        if !one
-            && size >= 8
-            && x + size <= f.w
-            && y + size <= f.h
-            && let Some(dv) = self.find(f, x, y, size, size)
-        {
-            let bsize = match size {
-                8 => BLOCK_8X8,
-                16 => BLOCK_16X16,
-                32 => BLOCK_32X32,
-                64 => BLOCK_64X64,
-                _ => BLOCK_128X128,
+        if !one && size >= 8 && x + size <= f.w && y + size <= f.h {
+            let found = match self.find(f, x, y, size, size) {
+                Some(dv) => Some((dv, true)),
+                None => self.lossy(f, x, y, size, size).map(|dv| (dv, false)),
             };
-            self.copy(f, &blocks[i], x, y, bsize, dv);
-            return;
+            if let Some((dv, exact)) = found {
+                let bsize = match size {
+                    8 => BLOCK_8X8,
+                    16 => BLOCK_16X16,
+                    32 => BLOCK_32X32,
+                    64 => BLOCK_64X64,
+                    _ => BLOCK_128X128,
+                };
+                self.copy(f, &blocks[i], x, y, bsize, dv, exact);
+                return;
+            }
         }
         if size > 8 {
             // a split: every block inside one quadrant, the quadrants in order
@@ -429,8 +569,12 @@ impl TileSearch {
             let b = &blocks[k];
             let (bx, by) = (b.mi_col as i32 * 4, b.mi_row as i32 * 4);
             let (bw, bh) = (4 * bw4(b.bsize as i32), 4 * bh4(b.bsize as i32));
-            match self.find(f, bx, by, bw, bh) {
-                Some(dv) => self.copy(f, b, bx, by, b.bsize as i32, dv),
+            let found = match self.find(f, bx, by, bw, bh) {
+                Some(dv) => Some((dv, true)),
+                None => self.lossy(f, bx, by, bw, bh).map(|dv| (dv, false)),
+            };
+            match found {
+                Some((dv, exact)) => self.copy(f, b, bx, by, b.bsize as i32, dv, exact),
                 None => {
                     self.blocks.push(*b);
                     self.inter.push(BlockInter::default());
@@ -440,9 +584,10 @@ impl TileSearch {
         }
     }
 
-    /// A copy block of `bsize` at (x, y), at displacement `dv` (samples), with `like`'s quantizer.
+    /// A copy block of `bsize` at (x, y), at displacement `dv` (samples, `exact` or not), with
+    /// `like`'s quantizer.
     #[allow(clippy::too_many_arguments)]
-    fn copy(&mut self, f: &Frame, like: &Block, x: i32, y: i32, bsize: i32, dv: [i32; 2]) {
+    fn copy(&mut self, f: &Frame, like: &Block, x: i32, y: i32, bsize: i32, dv: [i32; 2], exact: bool) {
         self.blocks.push(Block {
             mi_row: (y >> 2) as u16,
             mi_col: (x >> 2) as u16,
@@ -457,17 +602,28 @@ impl TileSearch {
             reserved: [0; 3],
         });
         self.tx.push(DCT_DCT as u8);
-        self.busy_copied += f.busy_in(x, y, 4 * bw4(bsize), 4 * bh4(bsize));
+        let busy = f.busy_in(x, y, 4 * bw4(bsize), 4 * bh4(bsize));
+        self.busy_copied += busy;
+        if exact {
+            self.busy_exact += busy;
+        }
         self.copies += 1;
         self.area += (16 * bw4(bsize) * bh4(bsize)) as usize;
         self.last = Some(dv);
+        if !self.recent.contains(&dv) {
+            if self.recent.len() == RECENT {
+                self.recent.remove(0);
+            }
+            self.recent.push(dv);
+        }
     }
 }
 
 impl IntraBc {
     /// The last search's answer, if it was given these blocks and luma tx types for a picture of
-    /// this geometry (the caller knows the source is the same): its blocks, inter entries and luma
-    /// tx types are still those.
+    /// this geometry and quantizer (the caller knows the source is the same): its blocks, inter
+    /// entries and luma tx types are still those.
+    #[allow(clippy::too_many_arguments)]
     pub fn again(
         &self,
         width: u32,
@@ -476,22 +632,23 @@ impl IntraBc {
         tiles: &Tiles,
         blocks: &[Block],
         luma_tx: Option<&[u8]>,
+        qindex: i32,
     ) -> Option<bool> {
-        let key = [width, height, sb128 as u32, tiles.cols, tiles.rows];
+        let key = [width, height, sb128 as u32, tiles.cols, tiles.rows, qindex as u32];
         (key == self.given_key && blocks == self.given && luma_tx.unwrap_or(&[]) == self.given_tx)
             .then_some(self.copied)
     }
 
     /// No last search to answer from (a picture coded without one came between).
     pub fn forget(&mut self) {
-        self.given_key = [0; 5];
+        self.given_key = [0; 6];
     }
 
     /// The search over a key frame's blocks (tile order, the analysis's: intra, given chroma or
-    /// not) on the padded source `src`, `width` x `height`, tiled `tiles`, on `threads` threads.
-    /// Sets [`IntraBc::blocks`], [`IntraBc::inter`] and [`IntraBc::tx`] (from `luma_tx`, a copy's
-    /// DCT_DCT), and returns whether the frame should copy: its copies cover at least
-    /// [`MIN_BUSY_SHARE`] of its non-flat 8x8s.
+    /// not) on the padded source `src`, `width` x `height`, tiled `tiles`, coded at `qindex`, on
+    /// `threads` threads. Sets [`IntraBc::blocks`], [`IntraBc::inter`] and [`IntraBc::tx`] (from
+    /// `luma_tx`, a copy's DCT_DCT), and returns whether the frame should copy: its exact copies
+    /// cover at least [`MIN_BUSY_SHARE`] of its non-flat 8x8s.
     #[allow(clippy::too_many_arguments)]
     pub fn search(
         &mut self,
@@ -503,6 +660,7 @@ impl IntraBc {
         tiles: &Tiles,
         blocks: &[Block],
         luma_tx: Option<&[u8]>,
+        qindex: i32,
         threads: usize,
     ) -> bool {
         let (w, h) = (
@@ -512,8 +670,8 @@ impl IntraBc {
         self.blocks.clear();
         self.inter.clear();
         self.tx.clear();
-        (self.copies, self.area, self.busy, self.busy_copied) = (0, 0, 0, 0);
-        self.given_key = [0; 5];
+        (self.copies, self.area, self.busy, self.busy_copied, self.busy_exact) = (0, 0, 0, 0, 0);
+        self.given_key = [0; 6];
         if w < 8 || h < 8 {
             return false;
         }
@@ -535,6 +693,8 @@ impl IntraBc {
                 },
             );
         }
+        // the quantizer step, and lambda as the closed loop's (quant.rs)
+        let step = crate::dsp::ac_q(qindex) as f64 / 8.0;
         let f = Frame {
             src,
             w,
@@ -543,6 +703,8 @@ impl IntraBc {
             mono,
             h8: &self.h8,
             hw,
+            near: NEAR_SHARE * 1.5 * step * step,
+            lambda: 0.12 * step * step,
         };
         self.busy = f.busy_in(0, 0, w & !7, h & !7);
         // the tiles' blocks (contiguous, in tile order), and their searches on every thread
@@ -577,6 +739,7 @@ impl IntraBc {
             self.copies += ts.copies;
             self.area += ts.area;
             self.busy_copied += ts.busy_copied;
+            self.busy_exact += ts.busy_exact;
         }
         // blocks past the last tile's (none, in a valid record) as they are
         for b in &blocks[k..] {
@@ -584,8 +747,8 @@ impl IntraBc {
             self.inter.push(BlockInter::default());
         }
         self.tx.extend((k..blocks.len()).map(|o| luma_tx.map_or(0, |l| l[o])));
-        self.copied = self.copies > 0 && self.busy_copied * 100 >= self.busy * MIN_BUSY_SHARE;
-        self.given_key = [width, height, sb128 as u32, tiles.cols, tiles.rows];
+        self.copied = self.copies > 0 && self.busy_exact * 100 >= self.busy * MIN_BUSY_SHARE;
+        self.given_key = [width, height, sb128 as u32, tiles.cols, tiles.rows, qindex as u32];
         self.given.clear();
         self.given.extend_from_slice(blocks);
         self.given_tx.clear();

@@ -217,11 +217,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
 
     /// Key frames copy what repeats inside them (AV1 intra block copy; on): a block whose source
-    /// appears exactly where the decoder has it already (spec is_mv_valid: at least 256 samples
-    /// back, in the tile) copies it. A frame with copies has no deblocking or CDEF, which the
-    /// format turns off for it, so a key frame copies only where its copies cover enough of it
-    /// (text at full size: at 5K, typing -18 %, cursor-drag -14 %, scroll -7 % BD-rate; photos and
-    /// downscaled text don't copy).
+    /// appears where the decoder has it already (spec is_mv_valid: at least 256 samples back, in
+    /// the tile) copies it, exactly or nearly (the residual coded). A frame with copies has no
+    /// deblocking or CDEF, which the format turns off for it, so a key frame copies only where
+    /// its exact copies cover enough of it (text at full size: at 5K, typing -20 %, cursor-drag
+    /// -17 %, scroll -8 % BD-rate; photos and downscaled text don't copy).
     public var intraBlockCopy = true {
         didSet { av1enc_hybrid_set_intrabc(cpu, intraBlockCopy ? 1 : 0) }
     }

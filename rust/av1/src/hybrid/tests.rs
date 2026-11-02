@@ -554,11 +554,13 @@ fn rust_only_sequence_is_deterministic() {
 #[test]
 fn intrabc_key_frames() {
     use crate::writer::parse_with;
-    for (seed, (w, h), (cl, rl), style, repeats) in [
-        (1u64, (600usize, 400usize), (0, 0), Style::Variance, 6),
-        (2, (600, 400), (1, 0), Style::Random, 12),
-        (3, (333, 517), (0, 1), Style::Variance, 6),
-        (4, (600, 400), (0, 0), Style::Variance, 0),
+    // (the last `nudged` repeats have a sample in every 16x16 off by 3: lossy copies)
+    for (seed, (w, h), (cl, rl), style, repeats, nudged) in [
+        (1u64, (600usize, 400usize), (0, 0), Style::Variance, 6, 0),
+        (2, (600, 400), (1, 0), Style::Random, 12, 0),
+        (3, (333, 517), (0, 1), Style::Variance, 6, 0),
+        (4, (600, 400), (0, 0), Style::Variance, 0, 0),
+        (5, (600, 400), (0, 0), Style::Variance, 12, 8),
     ] {
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let mut pic = screen_pic(w, h, seed, seed == 3);
@@ -569,12 +571,14 @@ fn intrabc_key_frames() {
         }
         // repeats: a source rectangle copied (luma and chroma) to even positions below and right
         let (sx, sy, rw, rh) = (w * 2 / 5 + 8, 8usize, 96usize, 80usize);
-        for _ in 0..repeats {
+        for k in 0..repeats {
             let dx = (rng.below((w - rw) as u32) as usize) & !1;
             let dy = ((80 + rng.below((h - rh - 80) as u32)) as usize) & !1;
             for y in 0..rh {
                 for x in 0..rw {
-                    pic.y[(dy + y) * w + dx + x] = pic.y[(sy + y) * w + sx + x];
+                    let v = pic.y[(sy + y) * w + sx + x];
+                    let nudge = k >= repeats - nudged && x % 16 == 5 && y % 16 == 9;
+                    pic.y[(dy + y) * w + dx + x] = if nudge { v.wrapping_add(3).max(3) } else { v };
                 }
             }
             for y in 0..rh / 2 {
@@ -611,6 +615,13 @@ fn intrabc_key_frames() {
             continue;
         }
         assert!(copies > 0 && rec.fp.allow_intrabc == 1, "seed {seed}: no copies");
+        assert!(
+            nudged == 0 || hy.ibc.busy_copied > hy.ibc.busy_exact,
+            "seed {seed}: no lossy copies ({} of {} non-flat 8x8s copied, {} exactly)",
+            hy.ibc.busy_copied,
+            hy.ibc.busy,
+            hy.ibc.busy_exact
+        );
         let one = run(1);
         assert!(
             one.record() == &rec && one.output().recon == hy.output().recon,

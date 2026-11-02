@@ -9,8 +9,8 @@ use super::decide::SrcView;
 use super::fmac;
 use super::fwd::{FWD_F_TMP, FWD_TMP, FwdTx, forward, forward_f, fwd};
 use crate::dsp::{
-    clip1, dequant, dq_denom, flip_lr, flip_ud, get_scan, get_tx_set_intra, inv_txfm2d, qm, qm_step, tx_coeffs, tx_h,
-    tx_type_in_set_intra, tx_w,
+    clip1, dequant, dq_denom, flip_lr, flip_ud, get_scan, get_tx_set_inter, get_tx_set_intra, inv_txfm2d, qm, qm_step,
+    tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
 };
 use crate::tables::{DCT_DCT, TX_SET_DCTONLY, TX_TYPES};
 use crate::types::Txb;
@@ -32,6 +32,8 @@ pub(crate) struct HookOpts {
     /// an inter block's tx block codes no coefficients where that costs less (D + lambda R) than
     /// its quantized residual: libaom realtime's skip when coding costs more than the distortion
     pub inter_rd_skip: bool,
+    /// search an inter block's luma tx types in its inter set (else DCT_DCT)
+    pub inter_tx_types: bool,
 }
 
 /// One tx block's working buffers.
@@ -359,8 +361,33 @@ impl TxbHook for QuantHook<'_> {
             }
             return;
         }
+        if ctx.is_inter && self.o.inter_tx_types {
+            // the inter set's types, as intra's below (a type other than DCT_DCT costs a few bits
+            // more to signal); then coding nothing where that's cheaper
+            let set = get_tx_set_inter(tx_sz, self.o.reduced_tx_set);
+            let mut best_j = 1e301;
+            let mut best_type = DCT_DCT;
+            for ty in 0..TX_TYPES {
+                if !tx_type_in_set_inter(set, ty) {
+                    continue;
+                }
+                let mut j = self.trial(w, tx_sz, ty, dc_q, ac_q, cur, pred, ps, s, ss, 0, qm_level, true);
+                j = fmac(lam, if ty == DCT_DCT { 1.0 } else { 3.0 }, j);
+                if j < best_j {
+                    best_j = j;
+                    best_type = ty;
+                    core::mem::swap(cur, best);
+                }
+            }
+            t.tx_type = best_type as u8;
+            coeffs.copy_from_slice(&best[..n]);
+            if rd_skip {
+                self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+            }
+            return;
+        }
         if ctx.is_inter {
-            // inter blocks: DCT_DCT (in every inter set), for now
+            // DCT_DCT (in every inter set)
             t.tx_type = DCT_DCT as u8;
             let j = self.trial(
                 w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, rd_skip,

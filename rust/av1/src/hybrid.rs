@@ -143,6 +143,10 @@ pub struct Hybrid {
     /// the closed loop searches the luma tx types even where the analysis gave one (the C++
     /// hybrid keeps them: off in its tests): 1.1-1.5 % smaller (BENCHMARKS, 2026-11-01)
     search_luma_tx: bool,
+    /// an inter block's (a motion-searched one's, an intra block copy's) luma tx types are
+    /// searched in its inter set, not DCT_DCT only (the C++ hybrid's: off in its tests): 0.1-2.4 %
+    /// smaller, most on 720p's inter frames (BENCHMARKS, 2026-11-01)
+    search_inter_tx: bool,
     /// key frames search for intra block copies ([`intrabc`]; off by default)
     intrabc: bool,
     ibc: intrabc::IntraBc,
@@ -212,6 +216,7 @@ impl Hybrid {
         Hybrid {
             quant_rnd: QUANT_RND,
             search_luma_tx: true,
+            search_inter_tx: true,
             intrabc: false,
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
@@ -396,6 +401,7 @@ impl Hybrid {
             recon_given,
             quant_rnd,
             search_luma_tx,
+            search_inter_tx,
             intrabc,
             ibc,
             ..
@@ -487,9 +493,11 @@ impl Hybrid {
             ibc.forget();
         }
         let abc = searches
-            && match ibc.again(width, height, sb128, &tiles, given, luma_tx) {
+            && match ibc.again(width, height, sb128, &tiles, given, luma_tx, qindex) {
                 Some(copied) if compare && !src_changed.iter().any(|&c| c) => copied,
-                _ => ibc.search(src, width, height, sb128, false, &tiles, given, luma_tx, *threads),
+                _ => ibc.search(
+                    src, width, height, sb128, false, &tiles, given, luma_tx, qindex, *threads,
+                ),
             };
         let (given, inter, luma_tx) = if abc {
             (&ibc.blocks[..], &ibc.inter[..], luma_tx.map(|_| &ibc.tx[..]))
@@ -724,6 +732,7 @@ impl Hybrid {
                 zbin: QUANT_ZBIN,
                 double_fwd: false,
                 inter_rd_skip: true,
+                inter_tx_types: *search_inter_tx,
             },
         );
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
@@ -965,6 +974,7 @@ impl Hybrid {
     pub(crate) fn as_cpp(&mut self) {
         self.quant_rnd = 0.375;
         self.search_luma_tx = false;
+        self.search_inter_tx = false;
     }
 
     /// av1enc_hybrid_set_intrabc: key frames search for intra block copies (off by default): a
