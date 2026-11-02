@@ -204,6 +204,7 @@ the numbers and the reasoning.
 | Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 2,000 superblocks and up | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
+| RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
 
 **Rate control and transport**
 
@@ -267,6 +268,66 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: RDOQ in the closed loop, where the source has contrast (2026-11-02)
+
+**RDOQ** (`rust/av1/src/hybrid/rdoq.rs`; libaom's greedy `av1_optimize_txb` in outline): after the
+dead-zone quantizer, each nonzero level is tried one lower in reverse scan order, with the writer's
+own base and BR contexts and costs from the frame's coefficient CDFs. The closed loop reconstructs
+apart from coding, so the tile's adapted CDFs aren't at hand, and it uses the defaults for the
+frame's quantizer. Then a trailing level of 1 is dropped while that pays. Distortion is the
+transform domain's, scaled to samples by a per-size gain; λ is the closed loop's (0.12 step²).
+Unlike the light RDOQ rejected on 2026-11-01, the rates are the coder's, not a proxy. libaom's
+own trellis on its realtime path, as a reference: typing +0.1 %, photos −2.9 %.
+
+**Judged by SSIMULACRA2** (`av1seq --score-rgb --ssimulacra2-every`), as delta-q was: by PSNR,
+RDOQ everywhere looked like a gain (5K key frames −0.7 to −1.5 %), but SSIMULACRA2 showed that
+photos lost (+1.5 %) and 720p SSIM was 0.7–1.4 % worse. The loss is in flat areas (sky, shading),
+whose small coefficients RDOQ drops, banding the gradients. A gate on the tx block's source pixels
+fixes it: RDOQ only where they span at least 40 values (max − min), which is text and UI edges,
+and not flat gradients. Gating on the count of distinct values instead was worse than no gate
+(photos +0.9 to +2.4 %), because the blocks with few values are the flat ones.
+
+BD-rate by SSIMULACRA2 against no RDOQ, q 8–32 (PSNR's in parentheses; negative: smaller). 5K key
+frames are 10 frames after the first 100; streams are the first 100 frames, inter, `--tiles 3x0`
+at 5K and `2x0` at 720p:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| **range ≥ 40 (taken): 5K key frames** | **−1.4 % (+0.1)** | **−0.7 % (+0.2)** | **−2.1 % (0.0)** | **−1.2 % (+0.1)** |
+| **range ≥ 40: 5K streams** | **−1.8 % (−0.3)** | **−0.9 % (+0.1)** | **−1.9 % (+0.1)** | **−0.6 % (+0.6)** |
+| **range ≥ 40: 720p streams** | **−1.4 % (−0.3)** | **−1.0 % (−0.5)** | **−2.6 % (−0.8)** | **+0.2 % (+0.9)** |
+| every block: 5K key frames | −1.4 % (−1.5) | | +1.5 % (−0.9) | |
+| every block: 720p streams | −0.9 % (−0.9) | | +0.4 % (−0.7) | |
+| in the tx type trials: 5K key frames | −1.5 % (−1.6) | 0.0 % (−0.9) | −0.4 % (−1.2) | −1.5 % (−1.4) |
+| in the tx type trials: 5K streams | −1.0 % (−1.2) | +0.5 % (−0.1) | −0.3 % (−1.1) | −1.0 % (−1.1) |
+| in the tx type trials: 720p streams | −0.6 % (−1.1) | +0.5 % (−0.6) | −0.6 % (−1.0) | −1.4 % (−1.1) |
+| in the trials, with the tx model (eps 0.05): 5K key frames | −1.6 % (−1.3) | | +1.4 % (−1.1) | |
+
+Thresholds on 5K key frames (typing-cc / photos): range ≥ 24 −1.4 / −1.4 %, **40 −1.4 / −2.1 %**,
+64 −1.0 / −2.2 %, 96 −0.5 / −1.7 %, 128 −0.3 / −1.1 %, 192 0.0 / −0.1 %.
+
+**Its cost.** At first RDOQ redid the forward transform of the type it optimized, and computed each
+level's contexts twice, once for the level and once for one lower: +5–7 ms of closed loop on a 5K
+key frame. Now the type search keeps the best trial's coefficients beside its levels, and the
+contexts are computed once; it codes the same bytes. Median of 2 runs, q20, disconnected:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frame, closed loop (ms) | 29.1 → 29.4 | 27.9 → 29.5 | 39.3 → 43.1 | 28.2 → 29.8 |
+| 5K key frame, picture (ms) | 65.1 → 65.2 | 61.3 → 63.0 | 98.8 → 100.1 | 64.0 → 65.2 |
+| 5K stream, inter frames a second | 340 → 317 | 231 → 230 | 87 → 88 | 334 → 329 |
+| 720p key frame, picture (ms) | 12.9 → 13.1 | 11.8 → 12.1 | 15.5 → 16.0 | 12.9 → 12.2 |
+| 720p stream, inter frames a second | 1183 → 1062 | 482 → 463 | 204 → 204 | 777 → 843 |
+
+RDOQ in the trials costs much more (5K key frames: typing-cc closed loop 38.4 ms, photos 64.7 ms)
+and saves less.
+
+- **Taken, on by default:** `AV1HybridEncoder.usesRDOQ` and `rdoqMinRange` (40), C API
+  `av1enc_hybrid_set_rdoq(h, on, trials, min_range)`, `av1seq --no-rdoq` / `--rdoq-range` /
+  `--rdoq-trials`. The Rust `Hybrid` keeps it off, as the C++ reference hybrid it's tested
+  against has none. `HybridEncoderTests.rdoqKeepsStreamsExact` decodes each form with libaom.
+- **Kept, off:** RDOQ in the tx type trials (`rdoqInTrials`).
 
 ### Metal AV1: learned pruning of the analysis, offline feasibility (2026-11-02)
 

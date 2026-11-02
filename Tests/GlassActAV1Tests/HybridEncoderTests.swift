@@ -356,4 +356,32 @@ extension HybridEncoderTests {
             #expect(rows.isEmpty, "picture \(i): luma differs from libaom on \(rows.count) rows")
         })
     }
+
+    /// RDOQ in each form (contrast-gated, the default; every block; in the tx type trials) changes
+    /// the levels, and libaom decodes what the encoder reconstructed.
+    @available(macOS 27, *)
+    @Test func rdoqKeepsStreamsExact() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (1280, 720)
+        let base = PartitionTests.Picture(width: width, height: height)
+        let picture = AV1HybridEncoder.Picture(y: base.y, u: base.u, v: base.v, width: width, height: height)
+        let none = try AV1HybridEncoder(device: device)
+        none.usesRDOQ = false
+        let plain = try none.encode(picture, qindex: 80).obu
+        for (range, trials) in [(40, false), (0, false), (0, true)] {
+            let e = try AV1HybridEncoder(device: device)
+            e.rdoqMinRange = range
+            e.rdoqInTrials = trials
+            let frame = try e.encode(picture, qindex: 80)
+            #expect(frame.obu != plain, "range \(range), trials \(trials): RDOQ changed nothing")
+            let decoder = try #require(glassact_aom_dec_create(1))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var decoded = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "range \(range), trials \(trials): libaom")
+            let theirs = try #require(decoded.planesTuple(0))
+            let stride = Int(decoded.stridesTuple(0))
+            let rows = (0..<height).filter { r in (0..<width).contains { frame.planes[0][r * width + $0] != theirs[r * stride + $0] } }
+            #expect(rows.isEmpty, "range \(range), trials \(trials): luma differs from libaom on \(rows.count) rows")
+        }
+    }
 }

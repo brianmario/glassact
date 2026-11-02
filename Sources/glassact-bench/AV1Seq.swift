@@ -54,6 +54,9 @@ let av1SeqCommand = Command(
         .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export: the level model, then the mode model's if present)"),
         .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
         .string("dq", "<kind>:<n>", "per-64x64 qindex (delta-q): random:<n> offsets of up to ±n (a correctness check), or text:<n>, n finer where a 64x64 looks like text or UI (few distinct values, strong edges) and n coarser where it looks like a photo"),
+        .bool("no-rdoq", "the closed loop keeps the dead-zone quantizer's levels (no RDOQ)"),
+        .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
+        .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
@@ -174,6 +177,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     encoder.interFrames = inter
     if opts.has("no-tx-search") { encoder.searchesTxTypes = false }
+    if opts.has("no-rdoq") { encoder.usesRDOQ = false }
+    if opts.has("rdoq-trials") { encoder.rdoqInTrials = true }
+    encoder.rdoqMinRange = opts.int("rdoq-range", encoder.rdoqMinRange)
     if let v = opts.string("tx-model-eps").flatMap(Float.init) { encoder.txModelEps = v }
     if let spec = opts.string("dq") {
         let parts = spec.split(separator: ":")

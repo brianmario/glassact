@@ -141,6 +141,27 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         didSet { av1enc_hybrid_set_tx_search(cpu, searchesTxTypes ? 1 : 0, searchesTxTypes ? 1 : 0) }
     }
 
+    /// The closed loop's levels optimized by rate and distortion after the
+    /// dead-zone quantizer (rust/av1 hybrid::rdoq; on), in tx blocks whose
+    /// source spans at least `rdoqMinRange` values (BENCHMARKS "RDOQ").
+    public var usesRDOQ = true {
+        didSet { applyRDOQ() }
+    }
+    /// With `usesRDOQ`: the luma tx type search compares each type after RDOQ.
+    public var rdoqInTrials = false {
+        didSet { applyRDOQ() }
+    }
+    /// With `usesRDOQ`: the smallest span of source values (max - min) a tx
+    /// block's RDOQ needs (0: every block). Flat gradients below it keep the
+    /// quantizer's levels, which RDOQ would drop into bands.
+    public var rdoqMinRange = 40 {
+        didSet { applyRDOQ() }
+    }
+
+    private func applyRDOQ() {
+        av1enc_hybrid_set_rdoq(cpu, usesRDOQ ? 1 : 0, rdoqInTrials ? 1 : 0, Int32(rdoqMinRange))
+    }
+
     /// The learned tx type pruning's eps (rust/av1 hybrid::tx_model): the closed
     /// loop's luma tx search tries only the types it keeps. Nil: every type.
     public var txModelEps: Float? {
@@ -301,6 +322,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         self.motion = motion
         av1enc_hybrid_set_intrabc(cpu, 1)
         copyFinder = try CopyFinder()
+        applyRDOQ()
     }
 
     deinit {

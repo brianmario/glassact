@@ -13,7 +13,7 @@ use crate::dsp::{
     tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
 };
 use crate::tables::{DCT_DCT, TX_SET_DCTONLY, TX_TYPES};
-use super::tx_model;
+use super::{rdoq, tx_model};
 use crate::types::Txb;
 use crate::writer::{TxbCtx, TxbHook};
 
@@ -47,6 +47,8 @@ pub(crate) struct Work {
     dtmp: Vec<f64>,
     dq: Vec<i32>,
     rr: Vec<i32>,
+    /// RDOQ applies to this tx block (its source spans [`QuantHook::rdoq_range`])
+    rdoq_here: bool,
 }
 
 /// A tile thread's scratch (what the C++ keeps in thread_locals).
@@ -54,6 +56,8 @@ pub struct Scratch {
     w: Work,
     cur: Vec<i16>,
     best: Vec<i16>,
+    /// `best`'s forward coefficients (for RDOQ, which would otherwise redo the transform)
+    best_df: Vec<f32>,
     dct: Vec<i16>,
 }
 
@@ -69,9 +73,11 @@ impl Scratch {
                 dtmp: vec![0.0; FWD_TMP],
                 dq: vec![0; 1024],
                 rr: vec![0; 64 * 64],
+                rdoq_here: true,
             },
             cur: vec![0; 1024],
             best: vec![0; 1024],
+            best_df: vec![0.0; 1024],
             dct: vec![0; 1024],
         }
     }
@@ -85,11 +91,45 @@ pub(crate) struct QuantHook<'a> {
     pub tx_model: Option<(&'a [f32], f32)>,
     /// research: every searched luma tx block's features and chosen type ([`tx_model::record`])
     pub collect: Option<&'a std::sync::Mutex<Vec<u8>>>,
+    /// RDOQ's coefficient costs (super::rdoq), or None: the dead-zone quantizer's levels as they are
+    pub rdoq: Option<&'a rdoq::CoeffCosts>,
+    /// with `rdoq`, luma trials optimize their levels before they're compared, so the tx type
+    /// search weighs each type after RDOQ (else only the chosen type's levels are)
+    pub rdoq_trials: bool,
+    /// with `rdoq`, only tx blocks whose source spans at least this many values: text and UI edges,
+    /// not the flat gradients (sky, shading) whose small coefficients RDOQ would drop into bands
+    pub rdoq_range: u8,
+}
+
+/// The sample-domain SSE of a unit transform-domain error, per tx size (the forward transform's
+/// gain, measured on a fixed noise residual with DCT_DCT).
+fn coeff_gain(f: &FwdTx, tx_sz: i32) -> f32 {
+    static G: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        (0..crate::tables::TX_SIZES_ALL)
+            .map(|t| {
+                let (tw, th) = (tx_w(t) as usize, tx_h(t) as usize);
+                let mut r = 1u32;
+                let res: Vec<f32> = (0..tw * th)
+                    .map(|_| {
+                        r = r.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        ((r >> 16) % 61) as f32 - 30.0
+                    })
+                    .collect();
+                let mut out = vec![0f32; 1024];
+                let mut tmp = vec![0f32; FWD_F_TMP];
+                forward_f(f, &res, t, DCT_DCT, &mut out, &mut tmp);
+                let er: f32 = res.iter().map(|v| v * v).sum();
+                let ec: f32 = out[..tx_coeffs(t)].iter().map(|v| v * v).sum();
+                if ec > 0.0 { er / ec } else { 1.0 }
+            })
+            .collect()
+    })[tx_sz as usize]
 }
 
 impl<'a> QuantHook<'a> {
     pub fn new(src: SrcView<'a>, o: HookOpts) -> QuantHook<'a> {
-        QuantHook { src, o, f: fwd(), tx_model: None, collect: None }
+        QuantHook { src, o, f: fwd(), tx_model: None, collect: None, rdoq: None, rdoq_trials: false, rdoq_range: 0 }
     }
 
     /// The types of the set (`in_set`) to try: the model's choice, or all of them.
@@ -103,6 +143,34 @@ impl<'a> QuantHook<'a> {
         }
     }
 
+    /// RDOQ (super::rdoq) of the levels `q` of type `ty`, from that type's forward coefficients in
+    /// `w.df` (the trial's); quantizer matrices and the double forward leave them be.
+    /// `trialed`: the levels are a compared trial's, which `rdoq_trials` optimized already.
+    #[allow(clippy::too_many_arguments)]
+    fn optimize(&self, w: &mut Work, q: &mut [i16], tx_sz: i32, ty: i32, plane: usize, dc_q: i32, ac_q: i32, qm_level: i32, lam: f64, trialed: bool) {
+        let Some(cc) = self.rdoq else { return };
+        if !w.rdoq_here || self.rdoq_trials && plane == 0 && trialed {
+            return;
+        }
+        if self.o.double_fwd || qm(true, qm_level, plane as i32, tx_sz, ty).is_some() {
+            return;
+        }
+        let n = tx_coeffs(tx_sz);
+        rdoq::optimize(
+            cc,
+            &mut q[..n],
+            &w.df[..n],
+            tx_sz,
+            ty,
+            plane,
+            dc_q as f32,
+            ac_q as f32,
+            dq_denom(tx_sz) as f32,
+            coeff_gain(self.f, tx_sz),
+            lam as f32,
+        );
+    }
+
     /// Research: records the block's features and the type the search chose.
     fn collect_sample(&self, w: &Work, tw: usize, th: usize, ac_q: i32, inter: bool, chosen: i32, tx_sz: i32) {
         if let Some(c) = self.collect {
@@ -114,6 +182,18 @@ impl<'a> QuantHook<'a> {
 
 /// One coefficient: q = |v| < zbin ? 0 : floor(|v| + rnd), at most 32767, with v's sign.
 #[inline(always)]
+/// Whether a tw x th source block's values span at least `min_range`.
+fn spans(s: &[u8], ss: usize, tw: usize, th: usize, min_range: u8) -> bool {
+    let (mut lo, mut hi) = (255u8, 0u8);
+    for i in 0..th {
+        for &v in &s[i * ss..][..tw] {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    hi.saturating_sub(lo) >= min_range
+}
+
 fn qcoef(v: f64, rnd: f64, zbin: f64) -> i16 {
     let a = v.abs();
     let qi = if a < zbin {
@@ -236,7 +316,13 @@ impl QuantHook<'_> {
             quantize_d(&w.dd[..n], q, den, dc_q, ac_q, m, rnd, zbin)
         } else {
             forward_f(self.f, &w.resf, tx_sz, ty, &mut w.df, &mut w.ftmp);
-            quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin)
+            let mut nz = quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin);
+            if let Some(cc) = self.rdoq.filter(|_| self.rdoq_trials && w.rdoq_here && need_j && plane == 0 && m.is_none() && nz) {
+                let lam = 0.12 * (ac_q as f32 / 8.0) * (ac_q as f32 / 8.0);
+                rdoq::optimize(cc, &mut q[..n], &w.df[..n], tx_sz, ty, 0, dc_q as f32, ac_q as f32, den as f32, coeff_gain(self.f, tx_sz), lam);
+                nz = q[..n].iter().any(|&v| v != 0);
+            }
+            nz
         };
         if !need_j {
             return 0.0;
@@ -336,7 +422,7 @@ impl TxbHook for QuantHook<'_> {
 
     fn on_txb(&self, scratch: &mut Option<Box<Scratch>>, ctx: &TxbCtx<'_>, t: &mut Txb, coeffs: &mut [i16]) {
         let sc = &mut **scratch.get_or_insert_with(|| Box::new(Scratch::new()));
-        let Scratch { w, cur, best, dct } = sc;
+        let Scratch { w, cur, best, best_df, dct } = sc;
         let (dc_q, ac_q, qm_level) = (ctx.dc_q, ctx.ac_q, ctx.qm_level);
         let lam = 0.12 * (ac_q as f64 / 8.0) * (ac_q as f64 / 8.0);
         let plane = t.plane as usize;
@@ -360,6 +446,7 @@ impl TxbHook for QuantHook<'_> {
                 }
             }
         }
+        w.rdoq_here = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
         let n = tx_coeffs(tx_sz);
         let coeffs = &mut coeffs[..n];
         let rd_skip = ctx.is_inter && self.o.inter_rd_skip;
@@ -380,6 +467,7 @@ impl TxbHook for QuantHook<'_> {
                 qm_level,
                 rd_skip,
             );
+            self.optimize(w, coeffs, tx_sz, ty, plane, dc_q, ac_q, qm_level, lam, false);
             if rd_skip {
                 self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -402,11 +490,14 @@ impl TxbHook for QuantHook<'_> {
                     best_j = j;
                     best_type = ty;
                     core::mem::swap(cur, best);
+                    core::mem::swap(&mut w.df, best_df);
                 }
             }
+            core::mem::swap(&mut w.df, best_df);
             t.tx_type = best_type as u8;
             coeffs.copy_from_slice(&best[..n]);
             self.collect_sample(w, tw, th, ac_q, true, best_type, tx_sz);
+            self.optimize(w, coeffs, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
             if rd_skip {
                 self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -418,6 +509,7 @@ impl TxbHook for QuantHook<'_> {
             let j = self.trial(
                 w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, rd_skip,
             );
+            self.optimize(w, coeffs, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, rd_skip);
             if rd_skip {
                 self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -446,6 +538,7 @@ impl TxbHook for QuantHook<'_> {
             self.trial(
                 w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, false,
             );
+            self.optimize(w, coeffs, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, false);
             return;
         }
         let mask = self.tx_mask(w, tw, th, ac_q, false, in_set);
@@ -461,10 +554,13 @@ impl TxbHook for QuantHook<'_> {
                 best_j = j;
                 best_type = ty;
                 core::mem::swap(cur, best);
+                core::mem::swap(&mut w.df, best_df);
             }
         }
+        core::mem::swap(&mut w.df, best_df);
         t.tx_type = best_type as u8;
         coeffs.copy_from_slice(&best[..n]);
         self.collect_sample(w, tw, th, ac_q, false, best_type, tx_sz);
+        self.optimize(w, coeffs, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
     }
 }

@@ -29,6 +29,7 @@ mod fwd;
 mod fwd_neon;
 mod intrabc;
 mod quant;
+mod rdoq;
 mod tx_model;
 mod tx_weights;
 #[cfg(test)]
@@ -156,6 +157,11 @@ pub struct Hybrid {
     sb_qindex: Vec<u8>,
     /// the learned tx type pruning's eps ([`tx_model`], [`Hybrid::set_tx_model`]), or None: off
     tx_model_eps: Option<f32>,
+    /// RDOQ ([`rdoq`], [`Hybrid::set_rdoq`]): its coefficient costs, for the qindex they're of
+    rdoq: bool,
+    rdoq_trials: bool,
+    rdoq_range: u8,
+    rdoq_costs: Option<(i32, rdoq::CoeffCosts)>,
     /// research: with GA_TX_SAMPLES naming a file, every searched luma tx block's features and
     /// chosen type, appended to it after each picture (examples/prune_train.rs, MODEL=tx)
     tx_samples: Option<(std::sync::Mutex<Vec<u8>>, String)>,
@@ -230,6 +236,10 @@ impl Hybrid {
             intrabc: false,
             sb_qindex: Vec::new(),
             tx_model_eps: None,
+            rdoq: false,
+            rdoq_trials: false,
+            rdoq_range: 0,
+            rdoq_costs: None,
             tx_samples: std::env::var("GA_TX_SAMPLES").ok().map(|p| (std::sync::Mutex::new(Vec::new()), p)),
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
@@ -420,6 +430,10 @@ impl Hybrid {
             sb_qindex,
             tx_model_eps,
             tx_samples,
+            rdoq,
+            rdoq_trials,
+            rdoq_range,
+            rdoq_costs,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -768,6 +782,14 @@ impl Hybrid {
             .filter(|_| tx_weights::TX_WEIGHTS.len() == tx_model::TX_FLOATS && tx_samples.is_none())
             .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
         hook.collect = tx_samples.as_ref().map(|(m, _)| m);
+        if *rdoq {
+            if rdoq_costs.as_ref().is_none_or(|(q, _)| *q != qindex) {
+                *rdoq_costs = Some((qindex, rdoq::CoeffCosts::new(qindex)));
+            }
+            hook.rdoq = rdoq_costs.as_ref().map(|(_, c)| c);
+            hook.rdoq_trials = *rdoq_trials;
+            hook.rdoq_range = *rdoq_range;
+        }
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
         let opts = EncodeOpts {
             flags: ENC_FIX_RANGE | ENC_PREFILTER_RECON,
@@ -1030,6 +1052,14 @@ impl Hybrid {
     /// the analysis's, DCT_DCT without them) and inter blocks' (else DCT_DCT); both on by default.
     pub fn set_tx_search(&mut self, luma: bool, inter: bool) {
         (self.search_luma_tx, self.search_inter_tx) = (luma, inter);
+    }
+
+    /// av1enc_hybrid_set_rdoq: the closed loop's levels optimized by rate and distortion ([`rdoq`])
+    /// after the dead-zone quantizer (off by default).
+    /// With `trials`, luma tx type trials optimize their levels before they're compared; only tx
+    /// blocks whose source spans at least `min_range` values are optimized (0: all).
+    pub fn set_rdoq(&mut self, on: bool, trials: bool, min_range: u8) {
+        (self.rdoq, self.rdoq_trials, self.rdoq_range) = (on, trials, min_range);
     }
 
     /// av1enc_hybrid_set_tx_model: the luma tx type search tries only the types the learned model

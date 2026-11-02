@@ -894,6 +894,12 @@ pub unsafe extern "C" fn av1enc_hybrid_set_tx_search(h: *mut HybridHandle, luma:
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(h: *mut HybridHandle, on: c_int, trials: c_int, min_range: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_rdoq(on != 0, trials != 0, min_range.clamp(0, 255) as u8) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_tx_model(h: *mut HybridHandle, eps: f32) {
     // SAFETY: the handle
     unsafe { (*h).h.set_tx_model(eps) }

@@ -132,6 +132,11 @@ void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
 // The closed loop searches intra blocks' luma tx types (else keeps the analysis's) and inter
 // blocks' (else DCT_DCT): both on by default.
 void av1enc_hybrid_set_tx_search(av1enc_hybrid *h, int luma, int inter);
+// The closed loop's levels optimized by rate and distortion after the dead-zone quantizer, with
+// costs from the frame's coefficient CDFs (off by default), in tx blocks whose source spans at
+// least min_range values (0: all); with trials, the luma tx type search compares each type's
+// levels after RDOQ.
+void av1enc_hybrid_set_rdoq(av1enc_hybrid *h, int on, int trials, int min_range);
 // The luma tx type search tries only what the learned tx model keeps, until all but eps of the
 // probability (and DCT_DCT); eps < 0: off (the default). Off too without shipped weights.
 void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
