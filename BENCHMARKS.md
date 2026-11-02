@@ -179,6 +179,7 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| AV2's 3.7× on text, attributed (AVM, each tool off in turn) | measured; intra block copy is next for `metal-av1` | intra block copy alone is 3.4× on typing; libaom at speed 2 with it gets within ~15 % of AV2 (typing 60 dB: 43 vs 37 KB, 131 KB without); key frames 2.9× smaller at ~45 dB | [entry](#av2s-gain-on-text-attributed-intra-block-copy-which-av1-has-too-2026-11-01) |
 | Prefer smooth motion: frame-QP ceiling 38 while the link has no room (Viewer opt-in) | kept, opt-in | 2M photos 20 → 48 frames, 3M scroll-win queue p95 423 → 344 ms; text p5 SSIMULACRA2 −5 to −18 at caps ≤ 1 Mbit/s, about even above | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | Frame-QP ceiling 42 on thin links | rejected | photos frames 4–8× but SSIMULACRA2 near zero | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | A minimum encoder cap (2–3 Mbit/s) for sharper text on thin links | rejected | 1M scroll-win 98 → 51 frames; 2M cursor-drag 326 → 286 | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
@@ -261,6 +262,53 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### AV2's gain on text attributed: intra block copy, which AV1 has too (2026-11-01)
+
+The AV2 entry (2026-10-25) found AVM 3.7× smaller than libaom on typing-cc at 60 dB. To find which
+tools carry that, AVM research-v15.0.0 (same build and settings: `--good --cpu-used=9
+--tune-content=screen --lag-in-frames=0`) encoded the first 10 frames of typing-cc, scroll-win and
+photos, cropped to the top-left 1920×1080, with each of 22 tools switched off in turn
+(`--enable-<tool>=0`), at qp 100–160 (60–66 dB on text) and 210–255 (44–54 dB on text, nearer
+our operating point). BD-rate on AVM's own PSNR-Y against everything on (+: bytes the tool saves):
+
+| tool off | typing, qp 100–160 | scroll | photos | typing, qp 210–255 | scroll | photos |
+|---|---|---|---|---|---|---|
+| intrabc | +236 % | +56 % | +2.3 % | +245 % | +56 % | +3.3 % |
+| intrabc-ext (local search area) | +14.5 % | +11.7 % | +0.7 % | +11.0 % | +9.9 % | +2.9 % |
+| palette | +8.3 % | +8.6 % | +0.3 % | +10.2 % | +16.1 % | +1.0 % |
+| flip-idtx (identity and 1-D transforms) | +7.6 % | +7.3 % | +1.2 % | +5.2 % | +3.2 % | +2.1 % |
+| fsc (forward skip coding) | +5.9 % | +5.6 % | +1.1 % | +4.3 % | +1.6 % | +3.1 % |
+| sdp, mhccp, tcq, ext-partitions, cfl, ccso | 0–5 % each | | | | | |
+| cdef, mrls, cctx, gdf, pc-wiener, idtx-intra, tx-partition, intra-dip, ist, ibp, parity-hiding | within ±1 % on text | | | up to 3.4 % on photos | | |
+
+**Intra block copy is the gain.** With it off, typing is 3.4× bigger, which is nearly all of the
+3.7×. AV1 has intra block copy too, in key and intra-only frames (with the loop filters off in
+those frames). The 2026-10-25 comparison ran libaom at `--cpu-used=6`, and libaom only searches it at
+speed 2 and below (at speed 3 and up, `--enable-intrabc` 0 and 1 differ by under 0.2 %).
+libaom at speed 2, same 10 frames, intra block copy on against off:
+
+| | typing 60 dB | scroll 60 dB | photos 45 dB |
+|---|---|---|---|
+| AVM (all tools) | 37 KB | 65 KB | 468 KB |
+| libaom speed 2, intra block copy on | 43 KB | 74 KB | 376 KB |
+| libaom speed 2, intra block copy off | 131 KB | 104 KB | 382 KB |
+
+- **On text, AV1 with intra block copy is within ~15 % of AV2,** not 3.7×. The rest is AV2's
+  extended search area, palette, the 1-D transforms and skip coding, a few percent each.
+- **It's the key frame.** In these clips libaom's inter frames are 35 bytes each (nothing moves),
+  so the 10 frames measure key-frame coding. A typing key frame on its own at ~41–45 dB: 55 → 19 KB
+  (cq 40) and 67 → 23 KB (cq 30, speed 0), 2.9× smaller. The gain holds at our quality.
+- **Palette is worth 8–16 % on text here,** against at most 0.7 % in our own encoder at q20 (entry
+  below). The gap isn't explained yet: AVM's palette may be catching what intra block copy misses.
+- **Not measured here:** new text inside inter frames, where AV1 can't use intra block copy and
+  AV2 can. These clips have no such frames.
+- **Nothing for photos:** at most 3 % from any tool, the filters included. AVM is 25 % bigger than
+  libaom speed 2 on photos at 45 dB; not looked into.
+
+For `metal-av1`, intra block copy in key frames comes first: 2.9× smaller key frames on text, inside
+AV1's syntax. Our encoder doesn't have it yet. Apple's AV1 decoder should accept it (it's in Main
+profile), but that is unverified.
 
 ### Metal AV1: the filters' preset search on the GPU, one command buffer a picture (2026-11-01)
 
