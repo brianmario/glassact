@@ -3,6 +3,7 @@ import Foundation
 import GlassActAV1
 import GlassActTestSupport
 import Metal
+import Synchronization
 import Testing
 import libaom
 
@@ -307,6 +308,45 @@ extension HybridEncoderTests {
                 #expect(try unpruned.encode(pictures[i], qindex: 80).obu != alone.obu, "learned pruning didn't change the analysis")
             }
             let decoder = try #require(glassact_aom_dec_create(4))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var decoded = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "picture \(i): libaom")
+            let theirs = try #require(decoded.planesTuple(0))
+            let stride = Int(decoded.stridesTuple(0))
+            let rows = (0..<height).filter { r in (0..<width).contains { frame.planes[0][r * width + $0] != theirs[r * stride + $0] } }
+            #expect(rows.isEmpty, "picture \(i): luma differs from libaom on \(rows.count) rows")
+        })
+    }
+}
+
+extension HybridEncoderTests {
+    /// A qindex per 64×64 (delta-q) keeps the streams the decoder's pictures,
+    /// and kept analysis and kept tiles stay right when a superblock's qindex
+    /// changes and its source doesn't: a reusing encoder codes what a fresh
+    /// one does.
+    @available(macOS 27, *)
+    @Test func deltaQKeepsStreamsExact() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (1280, 720)
+        let base = PartitionTests.Picture(width: width, height: height)
+        let picture = AV1HybridEncoder.Picture(y: base.y, u: base.u, v: base.v, width: width, height: height)
+        let sbs = ((width + 63) / 64) * ((height + 63) / 64)
+        // the same picture three times: the first two with one map, the third with another
+        let maps: [[UInt8]] = [0, 0, 1].map { seed in
+            var rng = SplitMix64(seed: 0xd1_7a00 + UInt64(seed))
+            return (0..<sbs).map { _ in UInt8(60 + Int(rng.next() % 41)) }
+        }
+        let reusing = try AV1HybridEncoder(device: device), fresh = try AV1HybridEncoder(device: device)
+        fresh.reusesAnalysis = false
+        for e in [reusing, fresh] { e.tiling = (2, 1) }
+        // (the encoder asks for each picture's map once, in order, as it sets its analysis up)
+        let calls = Mutex(0)
+        reusing.sbQindex = { _, _ in calls.withLock { n in defer { n += 1 }; return maps[min(n, maps.count - 1)] } }
+        try reusing.encode(count: maps.count, qindex: 80, picture: { _ in picture }, output: { i, frame in
+            fresh.sbQindex = { _, _ in maps[i] }
+            let alone = try fresh.encode(picture, qindex: 80)
+            #expect(frame.obu == alone.obu, "picture \(i) codes differently with kept analysis and tiles")
+            let decoder = try #require(glassact_aom_dec_create(1))
             defer { glassact_aom_dec_destroy(decoder) }
             var decoded = glassact_aom_frame()
             try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "picture \(i): libaom")

@@ -149,6 +149,9 @@ pub struct Hybrid {
     search_inter_tx: bool,
     /// key frames search for intra block copies ([`intrabc`]; off by default)
     intrabc: bool,
+    /// the next pictures' qindex per 64x64 superblock (raster; empty: `qindex` everywhere), coded
+    /// with delta_q_present; not with 128x128 superblocks ([`Hybrid::set_sb_qindex`])
+    sb_qindex: Vec<u8>,
     ibc: intrabc::IntraBc,
     src: Src,
     /// per-tile reuse, for one geometry and quantizer
@@ -218,6 +221,7 @@ impl Hybrid {
             search_luma_tx: true,
             search_inter_tx: true,
             intrabc: false,
+            sb_qindex: Vec::new(),
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
             mem: Vec::new(),
@@ -404,6 +408,7 @@ impl Hybrid {
             search_inter_tx,
             intrabc,
             ibc,
+            sb_qindex,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -562,11 +567,22 @@ impl Hybrid {
         let range = |i: usize| (tile_first[i] as usize, tile_first[i + 1] as usize);
 
         // ---- chroma ----
+        // each block's qindex: its 64x64's from the map, if there is one (delta-q), else the frame's
         let qi = qindex as u8;
+        let sb_cols64 = (mi_cols(width as i32) as usize).div_ceil(16);
+        let qmap: &[u8] = if rec.fp.sb128 == 0 && sb_qindex.len() == sb_cols64 * (mi_rows(height as i32) as usize).div_ceil(16) {
+            (rec.fp.delta_q_present, rec.fp.delta_q_res) = (1, 0);
+            &sb_qindex[..]
+        } else {
+            &[]
+        };
+        let q_of = |b: &Block| -> u8 {
+            if qmap.is_empty() { qi } else { qmap[(b.mi_row as usize >> 4) * sb_cols64 + (b.mi_col as usize >> 4)].max(1) }
+        };
         if given_chroma {
             // the GPU decided chroma: only the fields the closed loop sets
             for b in rec.blocks.iter_mut() {
-                (b.tx_depth, b.sb_qindex) = (0, qi);
+                (b.tx_depth, b.sb_qindex) = (0, q_of(b));
             }
         } else {
             // A tile whose source and block positions are unchanged keeps its chroma decisions:
@@ -587,7 +603,7 @@ impl Hybrid {
                             .all(|(a, b)| (a.mi_row, a.mi_col, a.bsize) == (b.mi_row, b.mi_col, b.bsize));
                     if keep_chroma[i] {
                         for (b, p) in rec.blocks[b0..b1].iter_mut().zip(&prev.blocks[p0..p1]) {
-                            (b.skip, b.tx_depth, b.sb_qindex) = (0, 0, qi);
+                            (b.skip, b.tx_depth, b.sb_qindex) = (0, 0, q_of(b));
                             (b.uv_mode, b.angle_delta_uv) = (p.uv_mode, p.angle_delta_uv);
                             (b.cfl_alpha_u, b.cfl_alpha_v) = (p.cfl_alpha_u, p.cfl_alpha_v);
                         }
@@ -626,7 +642,7 @@ impl Hybrid {
                         d.tx0 = tiles.mi_col_starts[tc] as i32 * 4;
                         d.ty0 = tiles.mi_row_starts[tr] as i32 * 4;
                         let inter_block = is_inter((b as *const Block as usize - base) / size);
-                        (b.tx_depth, b.sb_qindex) = (0, qi);
+                        (b.tx_depth, b.sb_qindex) = (0, q_of(b));
                         (b.uv_mode, b.angle_delta_uv, b.cfl_alpha_u, b.cfl_alpha_v) = (DC_PRED as u8, 0, 0, 0);
                         let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
                         if !inter_block && has_chroma(bs, r, c, false) {
@@ -982,6 +998,16 @@ impl Hybrid {
     /// frame where blocks copy has no post-filters (the record's fp.allow_intrabc says so).
     pub fn set_intrabc(&mut self, on: bool) {
         self.intrabc = on;
+    }
+
+    /// av1enc_hybrid_set_sb_qindex: the next pictures' qindex per 64x64 superblock (raster, 1..255;
+    /// its blocks are quantized and λ'd by it, coded with delta_q_present), or empty for the frame's
+    /// qindex everywhere. A map of another size than the picture's 64x64s, or a picture with 128x128
+    /// superblocks, uses the frame's. Kept tiles stay right: a block's qindex is in the decisions
+    /// they're kept by.
+    pub fn set_sb_qindex(&mut self, map: &[u8]) {
+        self.sb_qindex.clear();
+        self.sb_qindex.extend_from_slice(map);
     }
 
     pub fn set_reuse(&mut self, on: bool) {

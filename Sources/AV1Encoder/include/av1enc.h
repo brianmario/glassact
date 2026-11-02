@@ -129,6 +129,10 @@ int av1enc_hybrid_write_ex(av1enc_hybrid *h, const av1g_frame_params *fp, const 
                            uint32_t flags, uint8_t **obu, size_t *size, char *err, size_t errlen);
 // Keep unchanged tiles' closed loop and bitstream from picture to picture (on by default).
 void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
+// The next pictures' qindex per 64x64 superblock (raster, sb_cols x sb_rows, 1..255), coded with
+// delta_q_present: their blocks are quantized and their RD weighed by it. NULL / 0: the frame's
+// qindex everywhere. Not with 128x128 superblocks (the frame's then).
+void av1enc_hybrid_set_sb_qindex(av1enc_hybrid *h, const uint8_t *map, size_t n);
 // Key frames search for intra block copies (off by default). A frame where blocks copy has no
 // post-filters: the record's fp.allow_intrabc is 1, and av1enc_hybrid_write_ex keeps it so (no
 // deblocking, every cdef_idx 0) whatever fp it's given.

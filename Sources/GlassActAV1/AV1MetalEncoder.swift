@@ -219,6 +219,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var stale: any MTLBuffer { stales[flip] }
         var staleCount = 0
         var previous: [[UInt8]]? = nil
+        /// The last picture's qindex per 64x64 (delta-q), or nil.
+        var previousQ: [UInt8]? = nil
         var keptCount = 0
         /// Each SB's blocks, luma tx types and motion as the last partition read them, for SBs kept since.
         var sbBlocks: [[av1g_block]] = [], sbTypes: [[UInt8]] = [], sbInter: [[av1g_block_inter]] = []
@@ -246,7 +248,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// copies), kept without analysis; one whose source changed keeps the source its analysis
         /// is of, so that a later picture analyzes it.
         func markUnchanged(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-                           width: Int, height: Int, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil) {
+                           width: Int, height: Int, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil, sbQindex: [UInt8]? = nil) {
+            // a 64x64 whose qindex changed is analyzed again, as one whose source did
+            let qmap = sbQindex?.count == sbCols * sbRows ? sbQindex : nil
+            defer { previousQ = qmap }
+            let qChanged: (Int) -> Bool = { [previousQ] i in (qmap?[i] ?? 0) != (previousQ?[i] ?? 0) }
             flip ^= 1
             let cw = (width + 1) / 2, ch = (height + 1) / 2
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
@@ -282,6 +288,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                 }
             }
+            for i in changed.indices where qChanged(i) { changed[i] = true }
             func changedAt(_ r: Int, _ c: Int) -> Bool { r >= 0 && c >= 0 && r < sbRows && c < sbCols && changed[r * sbCols + c] }
             keptCount = 0
             staleCount = 0
@@ -670,9 +677,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// then mixes inter blocks with intra ones (`Partition.inter`).
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
-                               motion: [Int32]? = nil) throws -> PendingPartition {
+                               motion: [Int32]? = nil, sbQindex: [UInt8]? = nil) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
-                          skip: skip, motion: motion)
+                          skip: skip, motion: motion, sbQindex: sbQindex)
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
 
@@ -739,7 +746,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
-             motion: [Int32]? = nil) throws {
+             motion: [Int32]? = nil, sbQindex: [UInt8]? = nil) throws {
             self.encoder = encoder
             encoder.runCount += 1
             seq = encoder.runCount
@@ -791,6 +798,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             image.MiCols = Int32(miCols); image.MiRows = Int32(miRows)
             image.sbCols = Int32(sbCols); image.sbRows = Int32(sbRows)
             image.baseQ = Int32(qindex)
+            // delta-q: the analysis's λ per 64x64 from the picture's map (`sbQindex`)
+            if let map = sbQindex, map.count == sbCols * sbRows {
+                let q = try make(map.count)
+                map.withUnsafeBytes { q.contents().copyMemory(from: $0.baseAddress!, byteCount: map.count) }
+                image.sbQ = AV1MetalEncoder.address(q)
+            }
             image.qctx = qindex <= 20 ? 0 : qindex <= 60 ? 1 : qindex <= 120 ? 2 : 3
             image.qm = (15, 15, 15)
             image.aw = Int32(aw); image.ah = Int32(ah)
@@ -922,7 +935,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             if let cache {
                 cache.markUnchanged(y: y, u: u, v: v, width: width, height: height,
                                     sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4,
-                                    skip: skip?.count == ((miCols + 15) >> 4) * ((miRows + 15) >> 4) ? skip : nil)
+                                    skip: skip?.count == ((miCols + 15) >> 4) * ((miRows + 15) >> 4) ? skip : nil,
+                                    sbQindex: sbQindex)
                 sbKeep = keep(cache.keep)
                 sbList = keep(cache.stale)
             }

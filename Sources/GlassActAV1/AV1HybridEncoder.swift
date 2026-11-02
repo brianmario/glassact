@@ -175,6 +175,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// before, as intra blocks. Each inter frame references the one before it.
     public var interFrames = false
 
+    /// Each picture's qindex per 64×64 superblock (raster, 1…255; given the
+    /// picture and the frame's qindex), coded with delta-q: the GPU analysis
+    /// weighs and the closed loop quantizes each superblock by its own. Nil, or
+    /// a map of another size: the frame's qindex everywhere. Called once a
+    /// picture, on the thread that sets its analysis up. Not with 128×128
+    /// superblocks.
+    public var sbQindex: (@Sendable (Picture, Int) -> [UInt8]?)?
+
     /// With `interFrames`: the stream's size, when its pictures are coded
     /// smaller (decisions.h "Reduced frames"). A decoder shows each frame scaled
     /// up to this size. Every picture of the stream must then be the same size:
@@ -349,7 +357,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 writing = nil
                 try output(i - 1, try w.wait())
             }
-            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, timing: timing, started: t0)
+            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, qmap: pending.qmap, timing: timing, started: t0)
             if let next { current = next }
         }
         if let w = writing {
@@ -451,6 +459,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// Per 64×64: copy, dx, dy (nil: a key frame or a still picture).
         var motion: [Int32]?
         var motionSeconds = 0.0
+        /// The picture's qindex per 64×64 (`sbQindex`'s), or nil.
+        var qmap: [UInt8]? = nil
     }
 
     /// Decides inter frames' copies on a thread of its own, with a motion handle of its own (the
@@ -524,21 +534,24 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
     /// Starts picture `p`'s analysis, without its copies.
     private func begin(_ p: Picture, _ copies: Copies, qindex: Int) throws -> Pending {
+        let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
+        let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         let partition = try p.y.withUnsafeBufferPointer { y in
             try p.u.withUnsafeBufferPointer { u in
                 try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
-                                             motion: copies.candidates)
+                                             motion: copies.candidates, sbQindex: qmap)
                 }
             }
         }
-        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds)
+        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap)
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,
-                        timing: Timing, started t0: Double) throws -> Writing {
+                        qmap: [UInt8]?, timing: Timing, started t0: Double) throws -> Writing {
         var timing = timing
+        (qmap ?? []).withUnsafeBufferPointer { av1enc_hybrid_set_sb_qindex(cpu, $0.baseAddress, $0.count) }
         var message = [CChar](repeating: 0, count: 256)
         let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4
         // an inter frame: the copies, and the blocks with them

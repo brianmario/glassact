@@ -48,10 +48,12 @@ let av1SeqCommand = Command(
         .int("aom-threads", "<n>", 1...64, "libaom worker threads (default 8)"),
         .bool("score-rgb", "also score every frame as vquality scores HEVC: BT.601 luma of the decoded picture in BGRA against the trace frame (SSIM on 8x8 blocks, PSNR)"),
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
+        .int("ssimulacra2-every", "<n>", 1...1000, "with --score-rgb: also SSIMULACRA2 (the ssimulacra2 binary on PATH) on every nth frame"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
         .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export: the level model, then the mode model's if present)"),
         .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
+        .string("dq", "<kind>:<n>", "per-64x64 qindex (delta-q): random:<n> offsets of up to ±n (a correctness check), or text:<n>, n finer where a 64x64 looks like text or UI (few distinct values, strong edges) and n coarser where it looks like a photo"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
         .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
         .bool("ml-chroma", "learned chroma pruning too, with the shipped chroma model (AV1PrunerWeights.chromaV1; off by default)"),
@@ -169,6 +171,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.angleDeltasUpToShare = f
     }
     encoder.interFrames = inter
+    if let spec = opts.string("dq") {
+        let parts = spec.split(separator: ":")
+        guard parts.count == 2, let amount = Int(parts[1]), (0...64).contains(amount), ["random", "text"].contains(parts[0])
+        else { throw BenchError("--dq: random:<n> or text:<n>, n 0-64") }
+        encoder.sbQindex = deltaQMap(kind: String(parts[0]), amount: amount)
+    }
     encoder.streamSize = stream
     encoder.searchesMotion = !opts.has("no-motion-search")
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
@@ -210,7 +218,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var psnr = 0.0
     let scoreRGB = opts.has("score-rgb")
     let rgb = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
-                                       coded: stream == nil ? nil : (width, height)) : nil
+                                       coded: stream == nil ? nil : (width, height),
+                                       ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
     defer { glassact_aom_dec_destroy(decoder) }
     for (i, f) in frames.enumerated() {
@@ -377,6 +386,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 /// resamples them before converting to 4:2:0. Reads the trace a second time, in step.
 final class RGBScorer {
     let reader: ScapReader
+    /// `--ssimulacra2-every`: its scorer and period, and the pairs added
+    let ssimu2: SSIMULACRA2Scorer?, ssimu2Every: Int
+    var ssimu2Count = 0
     let width: Int, height: Int
     /// Reduced frames: the size they're coded at, scaled up to width × height to be scored.
     let coded: (width: Int, height: Int)?
@@ -385,8 +397,11 @@ final class RGBScorer {
     var rects: [DirtyRect] = []
     var ssim = 0.0, psnr = 0.0, frames = 0
 
-    init(trace: String, skip: Int, width: Int, height: Int, coded: (width: Int, height: Int)? = nil) throws {
+    init(trace: String, skip: Int, width: Int, height: Int, coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil) throws {
         reader = try openTrace(trace)
+        ssimu2 = try ssimulacra2Every.flatMap { _ in try SSIMULACRA2Scorer.make(setting: nil) }
+        ssimu2Every = ssimulacra2Every ?? 0
+        if ssimulacra2Every != nil, ssimu2 == nil { throw BenchError("--ssimulacra2-every: no ssimulacra2 on PATH") }
         self.width = width
         self.height = height
         self.coded = coded
@@ -414,14 +429,23 @@ final class RGBScorer {
             try decoded.bgra(into: shown)
         }
         let (s, p) = lumaQuality(UnsafeRawBufferPointer(reference), UnsafeRawBufferPointer(shown), width, height)
+        if let ssimu2, frames % ssimu2Every == 0 {
+            _ = try ssimu2.add(reference: reference, distorted: shown, width: width, height: height)
+            ssimu2Count += 1
+        }
         ssim += s
         if p.isFinite { psnr += p }
         frames += 1
     }
 
     func summary(_ name: String) -> String {
-        String(format: "             %@, scored as vquality: SSIM mean %.4f · PSNR mean %.2f dB", name,
-               ssim / Double(max(1, frames)), psnr / Double(max(1, frames)))
+        var line = String(format: "             %@, scored as vquality: SSIM mean %.4f · PSNR mean %.2f dB", name,
+                          ssim / Double(max(1, frames)), psnr / Double(max(1, frames)))
+        if let ssimu2, let scores = try? ssimu2.scoreAll(), !scores.isEmpty {
+            line += String(format: " · SSIMULACRA2 mean %.2f, min %.2f (%d frames)", scores.reduce(0, +) / Double(scores.count),
+                           scores.min() ?? 0, scores.count)
+        }
+        return line
     }
 }
 
@@ -487,4 +511,38 @@ func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, 
         try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(String(format: "p%03d.bin", i)))
     }
     print("av1seq: \(pictures.count) partitions written to \(dir)")
+}
+
+/// `--dq`: a per-64x64 qindex map from the picture's luma (AV1HybridEncoder.sbQindex).
+@available(macOS 27, *)
+func deltaQMap(kind: String, amount: Int) -> @Sendable (AV1HybridEncoder.Picture, Int) -> [UInt8]? {
+    { p, qindex in
+        let (cols, rows) = ((p.width + 63) / 64, (p.height + 63) / 64)
+        var map = [UInt8](repeating: UInt8(qindex), count: cols * rows)
+        var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &* UInt64(qindex + 1)
+        for sb in 0..<map.count {
+            var offset = 0
+            if kind == "random" {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+                offset = Int(rng % UInt64(2 * amount + 1)) - amount
+            } else {
+                // few distinct values and strong edges: text or UI; many distinct values: a photo
+                let (x0, y0) = ((sb % cols) * 64, (sb / cols) * 64)
+                var seen = [Bool](repeating: false, count: 256)
+                var distinct = 0, edges = 0, n = 0
+                for y in y0..<min(y0 + 64, p.height) {
+                    for x in x0..<min(x0 + 64, p.width) {
+                        let v = Int(p.y[y * p.width + x])
+                        if !seen[v] { seen[v] = true; distinct += 1 }
+                        if x + 1 < p.width, abs(v - Int(p.y[y * p.width + x + 1])) > 48 { edges += 1 }
+                        n += 1
+                    }
+                }
+                if distinct > 1, distinct <= 64, edges * 50 >= n { offset = -amount }
+                else if distinct > 160 { offset = amount }
+            }
+            map[sb] = UInt8(clamping: max(1, min(255, qindex + offset)))
+        }
+        return map
+    }
 }

@@ -888,6 +888,15 @@ pub unsafe extern "C" fn av1enc_hybrid_set_reuse(h: *mut HybridHandle, on: c_int
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: *const u8, n: usize) {
+    // SAFETY: the handle; `map` has `n` bytes (or is null with n 0)
+    unsafe {
+        let m = if map.is_null() || n == 0 { &[][..] } else { std::slice::from_raw_parts(map, n) };
+        (*h).h.set_sb_qindex(m)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_intrabc(h: *mut HybridHandle, on: c_int) {
     // SAFETY: the handle
     unsafe { (*h).h.set_intrabc(on != 0) }
