@@ -201,7 +201,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
-| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes | kept, on at 2,000 superblocks and up | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
+| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 2,000 superblocks and up | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 
@@ -416,6 +416,12 @@ trace scored by a model trained on the others, eps 0.02: 4.0–5.1 modes screene
 98.7 → 98.6 ms (noise), bytes +0.05 %. Its features cost about what it saves, as the leaf stage's
 split predicted (entry above). The dumps carry chroma (CHRO) and the trainer exports chromaV1, so
 it can be re-measured on more data.
+
+**Then turned on** (the owner: keep work removed even when the other side is the limit). BD-rate
+against off, 5K, q 8–32: key frames 0.0 / 0.0 / +0.1 / 0.0 %, streams 0.0 / 0.0 / 0.0 / 0.0 %
+(typing-cc / scroll-win / photos / cursor-drag). Median of 2 interleaved runs: the leaf stage 7.6 →
+6.6, 8.2 → 7.2, 8.0 → 7.9, 6.7 → 5.9 ms; key frames 64.5 → 63.8, 60.8 → 60.8, 97.5 → 97.2, 62.8 →
+62.2 ms. `av1seq --no-ml-chroma` for off.
 
 **Retraining.** `scripts/pruner-traces.txt` lists the traces with their training and test frames;
 `scripts/train-pruner` dumps the training pictures (to ~/Library/Caches/Glass Act/pruner: screen

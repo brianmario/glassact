@@ -56,7 +56,7 @@ let av1SeqCommand = Command(
         .string("dq", "<kind>:<n>", "per-64x64 qindex (delta-q): random:<n> offsets of up to ±n (a correctness check), or text:<n>, n finer where a 64x64 looks like text or UI (few distinct values, strong edges) and n coarser where it looks like a photo"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
         .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
-        .bool("ml-chroma", "learned chroma pruning too, with the shipped chroma model (AV1PrunerWeights.chromaV1; off by default)"),
+        .bool("no-ml-chroma", "no learned chroma pruning (every leaf screens all its chroma modes, and CfL)"),
         .string("ml-chroma-eps", "<p>", "learned chroma pruning: a leaf keeps its likeliest chroma modes until all but this much probability is kept (default: the encoder's)"),
         .string("ml-eps", "<p>", "learned pruning: a cell keeps its likeliest levels until all but this much probability is kept (default 0.02)"),
         .bool("no-ml-prune", "no learned pruning (the variance rule instead)"),
@@ -163,7 +163,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         if let v = opts.string("ml-over").flatMap(Double.init) { lp.overShare = v }
         if opts.has("no-ml-modes") { lp.modeWeights = nil }
         if let v = opts.string("ml-chroma-eps").flatMap(Float.init) { lp.chromaEps = v }
-        if opts.has("ml-chroma"), lp.chromaWeights == nil { lp.chromaWeights = AV1PrunerWeights.chromaV1 }
+        if opts.has("no-ml-chroma") { lp.chromaWeights = nil }
         encoder.learnedPrune = lp
     }
     if let v = opts.string("deltas-up-to") {
