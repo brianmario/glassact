@@ -315,6 +315,17 @@ then ~0.7 ms of event latency.
   work starts the moment picture i's results are read. The same bytes and no faster (typing-cc
   58.1 → 58.4 ms, scroll-win 51.1 → 51.0, photos 90.6 → 90.0, over 30 frames). With the CPU's
   finish (~49 ms) shorter than the GPU's analysis, the setup already fits inside the wait.
+- **The GPU's 55 ms** (`--profile`, typing-cc / photos): the shapes' analysis 44.3 / 60.9 ms
+  (64x64 9.4 / 10.2, 32x32 8.5 / 11.2), leaves 6.6 / 7.0, learned pruning ~3.9, partition 0.3.
+  Learned pruning pass by pass: the node statistics 3.1 ms, the mode network 0.4–0.5, the cells'
+  network 0.2, the tree 0.06, the lists ~0.2. **Fusing the passes into fewer dispatches would
+  save at most their barriers** (a few tenths of a millisecond); the statistics are the cost.
+- **Rejected: each sample's gradient orientation once** (a pass before the statistics, which then
+  sum the bins of their interior samples: the same bytes, as the magnitudes are whole numbers),
+  instead of an `atan2` per sample per level. The statistics stayed at 3.15 ms: the cost is the
+  per-node loops, one thread walking all of a node's samples (4,096 twice for a 64x64) with
+  neighbouring threads far apart in memory, not the trigonometry. Threads sharing a node, with
+  integer sums, would change the features' low bits (not the same bytes; a BD check).
 
 ### Metal AV1: RDOQ in the closed loop, where the source has contrast (2026-11-02)
 
