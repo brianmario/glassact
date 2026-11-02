@@ -170,6 +170,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
     }
 
+    /// Learned pruning's buffers (`Run.kept`), from picture to picture: the ML kernels write every
+    /// entry they read, so they're neither made nor cleared again (29 MB a 5K picture, ~2 ms).
+    private var mlScratch: [Int: any MTLBuffer] = [:]
+    func mlBuffer(_ slot: Int, length: Int) throws -> any MTLBuffer {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        if let b = mlScratch[slot], b.length >= length { return b }
+        guard let b = device.makeBuffer(length: max(16, length), options: .storageModeShared)
+        else { throw Failure.metal("no buffer of \(length) bytes") }
+        mlScratch[slot] = b
+        return b
+    }
+
     /// The padded source of the last partition waited on. The one before goes back to the pool:
     /// the analyses that read it (its own, and the next picture's motion search) are done.
     var lastSource: [any MTLBuffer]?
@@ -769,6 +782,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 made.append(b)
                 return b
             }
+            // one of learned pruning's buffers, kept by the encoder (its next picture's analysis waits
+            // on the GPU until this one's is read: readEvent)
+            func kept(_ slot: Int, _ length: Int) throws -> any MTLBuffer {
+                let b = try encoder.mlBuffer(slot, length: length)
+                made.append(b)
+                return b
+            }
             // source planes, padded to whole superblocks by edge replication
             let planes = [(y, width, height), (u, (width + 1) / 2, (height + 1) / 2), (v, (width + 1) / 2, (height + 1) / 2)]
             let src = try encoder.takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)])
@@ -815,7 +835,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let coded = skip.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
             if let lp = encoder.learnedPrune, encoder.mlWeights != nil, coded > lp.overShare,
                sbCols * sbRows >= encoder.learnedPruneMinSuperblocks {
-                let mask = try make(aw / 8 * (ah / 8) * 4)
+                let mask = try kept(0, aw / 8 * (ah / 8) * 4)
                 mlMask = mask
                 image.mlSkip = AV1MetalEncoder.address(mask)
                 image.cols8 = Int32(aw / 8)
@@ -827,19 +847,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     base += UInt32((width / n) * (height / n) * 16)  // ML_STRIDE floats a node
                     nodes += UInt32((width / n) * (height / n))
                 }
-                mlStatsBuffer = try make(Int(max(base, 1)) * 4)
+                mlStatsBuffer = try kept(1, Int(max(base, 1)) * 4)
                 if let chroma = encoder.mlChromaWeights {
                     made.append(chroma)
                     image.mlChroma = AV1MetalEncoder.address(chroma)
                     image.mlChromaEps = lp.chromaEps
                 }
                 if encoder.mlModeWeights != nil {
-                    let modes = try make(Int(max(nodes, 1)) * 2)
+                    let modes = try kept(2, Int(max(nodes, 1)) * 2)
                     mlModes = modes
                     image.mlModes = AV1MetalEncoder.address(modes)
                     image.mlModeBase = (mlModeBases[0], mlModeBases[1], mlModeBases[2], mlModeBases[3])
                 }
-                mlKeep = try make(aw / 8 * (ah / 8))
+                mlKeep = try kept(3, aw / 8 * (ah / 8))
                 mlCounts = try make(Int(GP_NSHAPES) * 4)
             }
             image.tileCols = Int32(tl.cols); image.tileRows = Int32(tl.rows)
@@ -993,7 +1013,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.nSbList = UInt32(staleSuperblocks ?? 0)
             batch.inter = meBest != nil ? AV1MetalEncoder.address(interResults) : nil
             if let counts = mlCounts {
-                let list = try make(Int(max(blkTotal, 1)) * 4)
+                let list = try kept(4, Int(max(blkTotal, 1)) * 4)
                 mlListBuffer = list
                 batch.mlList = AV1MetalEncoder.address(list)
                 batch.mlCount = AV1MetalEncoder.address(counts)

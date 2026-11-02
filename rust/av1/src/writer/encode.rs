@@ -24,6 +24,10 @@ pub const ENC_ONE_PASS: u32 = 0x40000;
 /// Internal: count each block's bits ([`Writer::block_bits`]; the partition symbols before it
 /// aren't its).
 pub const ENC_BLOCK_BITS: u32 = 0x80000;
+/// Internal: with the blocks reconstructed on several threads, the tiles aren't coded after them
+/// (no payloads, saved CDFs or symbols): the hybrid's closed loop, which codes the frame again
+/// once its filters are chosen. A tile reconstructed in its coding walk is coded as ever.
+pub const ENC_NO_CODE: u32 = 0x100000;
 
 /// One tile thread's state. Reused.
 #[derive(Default)]
@@ -406,6 +410,8 @@ struct Split<'a, H: TxbHook> {
     /// coded tiles not finished
     left: AtomicUsize,
     n_fixed: AtomicU64,
+    /// [`ENC_NO_CODE`]
+    no_code: bool,
 }
 
 // SAFETY: the raw pointers are the record's and the writer's buffers, which the tasks' order keeps
@@ -474,9 +480,12 @@ impl<H: TxbHook> Split<'_, H> {
             let mut rec = unsafe { self.rec(j) };
             let one_pass = kind == TASK_ONE_PASS;
             let f = if one_pass { &self.f } else { &self.code_f };
-            let r = code_tile(
-                w, f, &mut rec, bufs, payload, syms, self.hook, &mut hs, i, j.first, j.end, None, one_pass,
-            );
+            let r = if self.no_code && !one_pass {
+                payload.clear();
+                Ok((0, 0))
+            } else {
+                code_tile(w, f, &mut rec, bufs, payload, syms, self.hook, &mut hs, i, j.first, j.end, None, one_pass)
+            };
             let mut out = j.out.lock().unwrap_or_else(|e| e.into_inner());
             match r {
                 Ok((s, x)) => (out.0, out.1) = (s, x),
@@ -1243,6 +1252,7 @@ impl Writer {
                 ready: &self.ready,
                 left: AtomicUsize::new(ncoded),
                 n_fixed: AtomicU64::new(0),
+                no_code: opts.flags & ENC_NO_CODE != 0,
             };
             for i in 0..ntiles {
                 if !skipped(i) {

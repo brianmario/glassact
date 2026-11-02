@@ -205,6 +205,7 @@ the numbers and the reasoning.
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
+| The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. Setting the next analysis up a picture earlier: no faster (the GPU bounds a 5K key frame of text now) | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
 
 **Rate control and transport**
 
@@ -268,6 +269,52 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop stops coding its tiles; learned pruning's buffers kept (2026-11-02)
+
+**Where a 5K key frame's time went** after RDOQ (typing-cc, `sample` and a per-picture timeline):
+the pipeline's period is about 59 ms, the CPU's `finish` (copy search 18, closed loop 29, writer 9
+inline: a key frame with copies has no filters) against the next picture's setup (4 ms) and GPU
+analysis (54 ms). The workers are only 40–47 % busy, so the CPU stages are bound by their chains
+and not by cores. Per tile, the closed loop's three phases (the plan's walk, the blocks on every
+thread, then the tile's coding walk) showed what bound it: **each tile's coding came last on its
+critical path, 4–8 ms on typing-cc and 4–13 ms on photos, and its symbols are discarded.** The
+hybrid codes the frame again in `write_ex` once the filters are chosen. (An earlier measurement
+on inter frames called that coding negligible; on key frames it isn't.)
+
+**What changed:**
+- **The closed loop doesn't code** (`ENC_NO_CODE`, internal to the writer). With the blocks
+  reconstructed on several threads, a tile's coding task finishes without coding: no payload,
+  saved CDFs or symbols, none of which the hybrid reads from the closed loop. A tile that the plan
+  rejects is still reconstructed in its coding walk, as before.
+- **Learned pruning's buffers are kept** by the encoder from picture to picture, uncleared. The
+  ML kernels write every entry they read: node statistics, modes, cells' keeps, the skip mask and
+  the block lists, whose counts the GPU clears. Before, each picture made and zeroed 29 MB
+  (statistics 19.6 MB, lists 9.7 MB), about 1 ms of a 5K picture's setup.
+
+Every stream is the same (`--digest`, four traces: key frames with and without kept analysis, 5K
+and 720p streams). Median of 2 runs, alternated with the commit before, q20, disconnected:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frame, closed loop (ms) | 29.5 → **21.4** | 29.5 → **20.6** | 42.8 → **29.2** | 28.6 → **19.6** |
+| 5K key frame, picture (ms, 10 frames) | 65.3 → **61.4** | 63.1 → **54.5** | 99.5 → **96.1** | 63.8 → **60.2** |
+| 5K stream, inter frames a second | 347 → 346 | 219 → 241 | 84.7 → 89.0 | 318 → 357 |
+| 720p key frame, picture (ms) | 13.0 → **10.9** | 12.1 → **11.1** | 15.7 → **12.9** | 13.2 → **11.2** |
+| 720p stream, inter frames a second | 1038 → 1157 | 469 → 521 | 201 → 214 | 788 → 895 |
+
+(One run of 5K typing-cc's stream read 214; its repeat read 346, as the commit before.) Over 30
+key frames, which spreads the first picture's unpipelined latency thinner, the period is typing-cc
+57.9, scroll-win 50.7 and photos 90.5 ms. What RDOQ added to key frames (0–2.7 %) is more than made up.
+
+**Now the GPU bounds a 5K key frame of text:** its analysis (~55.5 ms), then the CPU's reading of
+its results (`leafBlocks`, ~1.2 ms) before the next picture's analysis may start (`readEvent`),
+then ~0.7 ms of event latency.
+
+- **Rejected: setting picture i + 1's analysis up while picture i − 1 is finished**, so its GPU
+  work starts the moment picture i's results are read. The same bytes and no faster (typing-cc
+  58.1 → 58.4 ms, scroll-win 51.1 → 51.0, photos 90.6 → 90.0, over 30 frames). With the CPU's
+  finish (~49 ms) shorter than the GPU's analysis, the setup already fits inside the wait.
 
 ### Metal AV1: RDOQ in the closed loop, where the source has contrast (2026-11-02)
 

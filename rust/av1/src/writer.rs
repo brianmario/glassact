@@ -52,7 +52,7 @@ mod palette_tests;
 #[cfg(test)]
 mod tests;
 
-pub use encode::{ENC_BLOCK_BITS, ENC_CHECK_EDGES, ENC_ONE_PASS, ENC_SKIP_RECON, Extras, Writer, encode, validate};
+pub use encode::{ENC_BLOCK_BITS, ENC_CHECK_EDGES, ENC_NO_CODE, ENC_ONE_PASS, ENC_SKIP_RECON, Extras, Writer, encode, validate};
 pub(crate) use headers::{BitWriter, frame_obus};
 pub use layout::{
     LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex, sb_grid,

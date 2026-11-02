@@ -791,8 +791,9 @@ impl Hybrid {
             hook.rdoq_range = *rdoq_range;
         }
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
+        // (its coding would be discarded: write_ex codes the frame once the filters are chosen)
         let opts = EncodeOpts {
-            flags: ENC_FIX_RANGE | ENC_PREFILTER_RECON,
+            flags: ENC_FIX_RANGE | ENC_PREFILTER_RECON | crate::writer::ENC_NO_CODE,
             seq_level_idx: -1,
         };
         let mut slots: RefSlots = [None; 8];
