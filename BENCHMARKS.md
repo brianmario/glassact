@@ -432,9 +432,15 @@ and drag streams). Interleaved, 3 runs each:
 | 720p typing-cc stream (inter frames a second) | 972–1277 | **1303–1358** |
 | 720p photos stream | 190–200 | **198–204** |
 
-The chroma half (7 modes screened per leaf, then CfL): DC only and no CfL took the stage from 13.0
-to 6.5 ms on typing and 15.4 to 8.4 on photos, for +3.7 % and +2 % of bytes: a candidate for a
-learned model, at most ~4 ms of a 5K picture.
+What's left of the stage is chroma (7 modes screened per leaf, then CfL): 7.4 ms on typing, of
+which the modes are ~3.3 (DC only: 4.1 ms, +1.2 % bytes) and CfL ~2 (none: 5.4 ms, +2.2 %). A
+learned chroma model could save at most ~3 ms of GPU and under 2 of the picture: **not built.**
+
+**Where a 5K full-change picture goes now** (typing-cc key frames, overlapped 66.7 ms): the GPU
+analysis 54.9 ms; on the CPU, 18.4 ms before the closed loop (almost all the intra block copy
+search: 1.5 ms without it, though without copies the picture is 547 KB, not 412, and needs 33 ms of
+filters), the closed loop 27.3, the writer 9.4. The two sides are even, ~55 ms each, so further
+gains need both: the GPU's analysis and the CPU's copy search and closed loop.
 
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 
