@@ -888,6 +888,18 @@ pub unsafe extern "C" fn av1enc_hybrid_set_reuse(h: *mut HybridHandle, on: c_int
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_tx_search(h: *mut HybridHandle, luma: c_int, inter: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_tx_search(luma != 0, inter != 0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_tx_model(h: *mut HybridHandle, eps: f32) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_tx_model(eps) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: *const u8, n: usize) {
     // SAFETY: the handle; `map` has `n` bytes (or is null with n 0)
     unsafe {

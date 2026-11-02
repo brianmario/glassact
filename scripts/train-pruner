@@ -1,14 +1,19 @@
 #!/usr/bin/env python3 -I
-"""Retrains the Metal AV1 encoder's learned pruning (Sources/GlassActAV1/Shaders/k_ml.h) from the
-traces in scripts/pruner-traces.txt, and measures new weights against the shipped ones.
+"""Retrains the Metal AV1 encoder's learned pruning from the traces in scripts/pruner-traces.txt
+(the GPU's level, mode and chroma models, Sources/GlassActAV1/Shaders/k_ml.h; the CPU closed
+loop's tx type model, rust/av1/src/hybrid/tx_model.rs), and measures new weights against the
+shipped ones.
 
-  scripts/train-pruner dump       dump each trace's training pictures (skips ones already dumped)
+  scripts/train-pruner dump       dump each trace's training pictures, and record the closed loop's
+                                  tx samples on them (skips ones already done)
   scripts/train-pruner eval       each trace scored by models trained on the others
-  scripts/train-pruner export     train on everything: <work>/weights.bin and AV1PrunerWeights.swift
+  scripts/train-pruner export     train on everything: <work>/weights.bin, AV1PrunerWeights.swift
+                                  and tx_weights.rs
   scripts/train-pruner compare    BD-rate and speed of <work>/weights.bin against the shipped
                                   weights, on each trace's test frames (waits while anyone is
                                   connected: timing a shared screen is meaningless)
-  scripts/train-pruner install    copy <work>/AV1PrunerWeights.swift into Sources/GlassActAV1
+  scripts/train-pruner install    copy <work>/AV1PrunerWeights.swift into Sources/GlassActAV1 and
+                                  <work>/tx_weights.rs into rust/av1/src/hybrid
   scripts/train-pruner all        dump, eval, export, compare
 
 Options: --manifest <file> (default scripts/pruner-traces.txt), --work <dir> (default
@@ -16,8 +21,10 @@ Options: --manifest <file> (default scripts/pruner-traces.txt), --work <dir> (de
 (default ~/Library/Application Support/Glass Act/traces), --redump. Training settings are the
 shipped weights' (SUB=3, STEPS=3000000): with the same dumps, export reproduces them exactly.
 
-After `install`, record what `compare` printed in BENCHMARKS ("learned pruning of the analysis")
-and run the AV1 tests (just test-fast).
+`compare` measures the GPU models only: the tx model is compiled in, so measure it after
+`install` (av1seq --tx-model-eps against without). After `install`, record what `compare` printed
+in BENCHMARKS ("learned pruning of the analysis") and run the AV1 tests (just test-fast). The tx
+samples come from the encoder as it is, so retrain the tx model after the GPU models change.
 """
 import argparse
 import math
@@ -34,6 +41,7 @@ SMALL_WIDTH = 1280                # dump: and at this width besides the trace's 
 SPREAD = 5                        # dump: pictures from a train range
 COMPARE_Q = (8, 14, 20, 26, 32)   # compare: BD-rate over these q
 TRAIN_ENV = {"SUB": "3", "STEPS": "3000000"}
+TX_FRAMES = 10                    # dump: an inter stream from each trace's first training frame
 
 
 def sh(cmd, env=None, capture=False):
@@ -99,18 +107,37 @@ def dump(args, traces, b):
                     sh([b, "av1seq", "--trace", t["file"], "--width", str(w), "--frames", "1", "--skip", str(frame),
                         "--q", str(q), "--dump-partition", d], capture=True)
                     n += 1
+        # the closed loop's tx samples: the same pictures as key frames, and an inter stream
+        os.makedirs(args.txdir, exist_ok=True)
+        for q in QUANTIZERS:
+            for w in widths:
+                tiles = "3x0" if w >= 2560 else "2x0"
+                runs = [(f'{t["key"]}-key-{frame}-q{q}-w{w}.txs', ["--frames", "1", "--skip", str(frame), "--no-reuse"])
+                        for frame in t["frames"]]
+                runs.append((f'{t["key"]}-inter-q{q}-w{w}.txs',
+                             ["--frames", str(TX_FRAMES), "--skip", str(t["frames"][0]), "--inter"]))
+                for name, extra in runs:
+                    out = os.path.join(args.txdir, name)
+                    if os.path.exists(out) and not args.redump:
+                        continue
+                    if os.path.exists(out):
+                        os.remove(out)
+                    sh([b, "av1seq", "--trace", t["file"], "--width", str(w), "--tiles", tiles, "--q", str(q)] + extra,
+                       env={"GA_TX_SAMPLES": out}, capture=True)
         print(f'train-pruner: {t["name"]}: dumped')
-    print(f"train-pruner: {n} pictures dumped to {args.dumps}")
+    print(f"train-pruner: {n} pictures dumped to {args.dumps}, tx samples to {args.txdir}")
 
 
 def evaluate(args):
     sh([trainer(), args.dumps], env={"SUB": "8", "STEPS": "3000000"})
+    sh([trainer(), args.dumps], env={"SUB": "4", "STEPS": "3000000", "TXDIR": args.txdir})
 
 
 def export(args):
     p = trainer()
     sh([p, args.dumps], env=dict(TRAIN_ENV, EXPORT=os.path.join(args.work, "weights.bin")))
     sh([p, args.dumps], env=dict(TRAIN_ENV, EXPORT=os.path.join(args.work, "AV1PrunerWeights.swift")))
+    sh([p, args.dumps], env=dict(TRAIN_ENV, TXDIR=args.txdir, EXPORT_TX=os.path.join(args.work, "tx_weights.rs")))
     print(f"train-pruner: {args.work}/weights.bin and AV1PrunerWeights.swift; `install` puts the latter in Sources")
 
 
@@ -120,6 +147,11 @@ def install(args):
     with open(src) as f, open(dst, "w") as g:
         g.write(f.read())
     print(f"train-pruner: installed {dst}")
+    src, dst = os.path.join(args.work, "tx_weights.rs"), os.path.join(ROOT, "rust/av1/src/hybrid/tx_weights.rs")
+    if os.path.exists(src):
+        with open(src) as f, open(dst, "w") as g:
+            g.write(f.read())
+        print(f"train-pruner: installed {dst}")
 
 
 def connected():
@@ -194,6 +226,7 @@ def main():
     ap.add_argument("--redump", action="store_true", help="dump again pictures already dumped")
     args = ap.parse_args()
     args.dumps = os.path.join(args.work, "dumps")
+    args.txdir = os.path.join(args.work, "tx")
     os.makedirs(args.work, exist_ok=True)
     if args.command == "install":
         return install(args)

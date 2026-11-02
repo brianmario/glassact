@@ -5,7 +5,11 @@
 //! - mode: per tree node, which luma modes its own blocks choose, from the node's statistics and
 //!   its gradients' orientations;
 //! - chroma: per leaf, which of the 7 chroma modes k_leaf screens, and CfL, it chooses, from its
-//!   chroma's statistics, how much each plane follows luma, its size and its luma mode.
+//!   chroma's statistics, how much each plane follows luma, its size and its luma mode;
+//! - tx: per luma tx block of the CPU closed loop, which tx type its search chooses, from its
+//!   residual's statistics (rust/av1/src/hybrid/tx_model.rs), on samples the closed loop records
+//!   with GA_TX_SAMPLES naming a file: TXDIR=<dir of .txs files> MODEL=tx (EXPORT_TX=<.rs>
+//!   writes src/hybrid/tx_weights.rs).
 //!
 //! Data: pictures dumped by `glassact-bench av1seq --dump-partition <dir>/<trace>-<anything>`, one
 //! directory each (the trace id before the first '-'; `scripts/train-pruner` makes them from
@@ -731,8 +735,128 @@ fn report_chroma(m: &Mlp, pics: &[&Pic]) -> String {
     out
 }
 
+/// The tx model's features' count, hidden units and types (src/hybrid/tx_model.rs).
+const TX_NF: usize = 15;
+const TX_H: usize = 16;
+const TX_C: usize = 16;
+
+/// The tx samples of a directory of .txs files (the trace before the first '-'): per trace,
+/// (features, chosen type, allowed types).
+fn load_tx(dir: &str) -> (Vec<String>, Vec<(usize, Vec<f32>, u8, u32)>) {
+    use glassact_av1::dsp::{get_tx_set_inter, get_tx_set_intra, tx_type_in_set_inter, tx_type_in_set_intra};
+    let mut traces: Vec<String> = vec![];
+    let mut out = vec![];
+    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    entries.sort();
+    let sub = std::env::var("SUB").map_or(1, |v| v.parse::<usize>().unwrap()).max(1);
+    for e in entries.iter().filter(|e| e.extension().is_some_and(|x| x == "txs")) {
+        let name = e.file_name().unwrap().to_string_lossy().to_string();
+        let tr = name.split('-').next().unwrap().to_string();
+        if !traces.contains(&tr) {
+            traces.push(tr.clone());
+        }
+        let ti = traces.iter().position(|t| *t == tr).unwrap();
+        let d = fs::read(e).unwrap();
+        for (k, r) in d.chunks(64).enumerate() {
+            if r.len() < 64 || k % sub != 0 {
+                continue;
+            }
+            let f: Vec<f32> = (0..TX_NF).map(|i| f32::from_le_bytes(r[4 * i..4 * i + 4].try_into().unwrap())).collect();
+            let (chosen, tx_sz, inter) = (r[60], r[61] as i32, r[62] != 0);
+            let mut allowed = 0u32;
+            for t in 0..16 {
+                let ok = if inter {
+                    tx_type_in_set_inter(get_tx_set_inter(tx_sz, false), t)
+                } else {
+                    tx_type_in_set_intra(get_tx_set_intra(tx_sz, false), t)
+                };
+                if ok {
+                    allowed |= 1 << t;
+                }
+            }
+            out.push((ti, f, chosen, allowed));
+        }
+    }
+    (traces, out)
+}
+
+/// The tx model's types kept, as src/hybrid/tx_model.rs keep(): the allowed types' renormalized
+/// probabilities, the likeliest until all but eps, and DCT_DCT.
+fn keep_tx(m: &Mlp, f: &[f32], allowed: u32, eps: f32, h: &mut [f32], p: &mut [f32]) -> u32 {
+    m.fwd(f, h, p);
+    let sum: f32 = (0..TX_C).filter(|&c| allowed >> c & 1 != 0).map(|c| p[c]).sum();
+    // DCT_DCT always, and its probability with it
+    let mut bits = 1u32;
+    let mut kept = if allowed & 1 != 0 { p[0] } else { 0.0 };
+    while kept < (1.0 - eps) * sum {
+        let best = (0..TX_C).filter(|&c| allowed >> c & 1 != 0 && bits >> c & 1 == 0).max_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap());
+        match best {
+            Some(b) => {
+                bits |= 1 << b;
+                kept += p[b];
+            }
+            None => break,
+        }
+    }
+    bits & allowed | 1
+}
+
+fn report_tx(m: &Mlp, data: &[&(usize, Vec<f32>, u8, u32)]) -> String {
+    let (mut h, mut p) = (vec![0f32; TX_H], vec![0f32; TX_C]);
+    let mut out = String::new();
+    let allowed: f64 = data.iter().map(|d| d.3.count_ones() as f64).sum::<f64>() / data.len().max(1) as f64;
+    out += &format!(" {:.1} types allowed |", allowed);
+    for &eps in &EPSS {
+        let (mut kept, mut miss) = (0f64, 0f64);
+        for d in data {
+            let k = keep_tx(m, &d.1, d.3, eps, &mut h, &mut p);
+            kept += k.count_ones() as f64;
+            if k >> d.2 & 1 == 0 {
+                miss += 1.0;
+            }
+        }
+        let n = data.len().max(1) as f64;
+        out += &format!(" eps {eps}: {:.1} tried, missed {:.1} % |", kept / n, miss / n * 100.);
+    }
+    out
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: prune_train <dumps> (see the file comment)");
+    if let Ok(txdir) = std::env::var("TXDIR") {
+        let steps = std::env::var("STEPS").map_or(3_000_000usize, |v| v.parse().unwrap());
+        let (traces, data) = load_tx(&txdir);
+        if let Ok(out) = std::env::var("EXPORT_TX") {
+            let all: Vec<(&[f32], u8)> = data.iter().map(|d| (d.1.as_slice(), d.2)).collect();
+            let m = train(&all, TX_NF, TX_H, TX_C, steps, 13);
+            let v = m.floats();
+            let body: String = v
+                .chunks(6)
+                .map(|row| format!("    {},\n", row.iter().map(|x| format!("{x:e}")).collect::<Vec<_>>().join(", ")))
+                .collect();
+            fs::write(
+                &out,
+                format!(
+                    "//! Generated by examples/prune_train.rs (MODEL=tx, EXPORT_TX): the closed loop's tx type model's\n\
+                     //! weights ([`super::tx_model`]), from {} tx blocks.\n\
+                     #[rustfmt::skip]\npub(crate) static TX_WEIGHTS: [f32; {}] = [\n{}];\n",
+                    all.len(),
+                    v.len(),
+                    body
+                ),
+            )
+            .unwrap();
+            println!("{} floats written to {out} ({} tx blocks)", v.len(), all.len());
+            return;
+        }
+        for t in 0..traces.len() {
+            let train_set: Vec<(&[f32], u8)> = data.iter().filter(|d| d.0 != t).map(|d| (d.1.as_slice(), d.2)).collect();
+            let test: Vec<&(usize, Vec<f32>, u8, u32)> = data.iter().filter(|d| d.0 == t).collect();
+            let m = train(&train_set, TX_NF, TX_H, TX_C, steps, 13 + t as u64);
+            println!("{} tx: {} blocks trained on |{}", traces[t], train_set.len(), report_tx(&m, &test));
+        }
+        return;
+    }
     let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
     let sub = env("SUB", 1);
     let steps = env("STEPS", 1_500_000);

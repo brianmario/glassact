@@ -432,6 +432,42 @@ anyone is connected); `install` puts the new weights in Sources. From the manife
 tagged sections (PICT, LEAF, NODE, MODE), so a new model's data is a new section that older
 readers skip.
 
+### Metal AV1: the closed loop's tx type search, and a learned model to prune it (2026-11-02)
+
+**Where the CPU goes on a 5K key frame** (`sample` of typing-cc, after learned pruning): the closed
+loop's tx type trials (`QuantHook::trial`: forward transform, quantizer, and for a compared type
+the exact inverse, SSE and rate proxy) lead, then the writer's coefficient coding, then the intra
+block copy search (its lossy search, the 8x8 hashes, its exact lookups). `av1seq --no-tx-search`
+(new; DCT_DCT, or the analysis's types) shows what the search is worth: typing-cc's closed loop
+31.0 → 21.5 ms, photos 43.7 → 27.7 ms, for +3 % bytes and −0.6 dB on typing-cc. 527 k compared
+trials a 5K typing key frame, against 48 k without the search.
+
+**A model of the tx type** (`rust/av1/src/hybrid/tx_model.rs`, CPU, in the closed loop): from the
+residual, its energy share in 4 column and 4 row bands, horizontal and vertical neighbour
+correlation, log energy against the step, the tx block's size and whether inter (15-16-16);
+the search tries the likeliest types of the block's set until all but eps, and DCT_DCT. Samples
+from the closed loop itself (GA_TX_SAMPLES; the model is off while recording), 3.5 M tx blocks of
+the training frames at q8 / q20 / q32, 5K and 720p, key frames and inter streams; `prune_train`
+MODEL=tx, EXPORT_TX writes `tx_weights.rs`. Each trace scored by a model trained on the others,
+eps 0.05: 2.9–4.2 of 6.9–8.3 allowed types tried, 2.0–2.3 % of chosen types dropped.
+- A first keep rule left DCT_DCT's probability out of the total kept, so it kept nearly everything.
+- With libm's tanh and exp the model cost what it saved (527 k → 301 k trials, closed loop ~flat);
+  approximated (a rational tanh, exp from the float's bits), it pays, 4x4s included.
+
+BD-rate against the full search, q 8–32, and the closed loop (5K key frames, median of 2 runs):
+
+| eps | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 0.05: 5K key frames / streams | +0.3 / +0.3 % | +0.2 / +0.3 % | 0.0 / +0.1 % | +0.1 / +0.2 % |
+| 0.05: 720p key frames / streams | +0.1 / +0.1 % | +0.2 / −0.7 % | +0.1 / +1.3 % | 0.0 / +0.1 % |
+| 0.1: 5K key frames / streams | +0.5 / +0.6 % | +0.3 / +0.5 % | 0.0 / +0.2 % | +0.3 / +0.4 % |
+| closed loop, ms: full / 0.05 / 0.1 | 27.2 / 25.1 / 24.6 | 27.4 / 25.9 / 25.4 | 37.6 / 35.6 / 33.2 | 26.4 / 24.6 / 24.1 |
+
+**Kept, off** (`AV1HybridEncoder.txModelEps`, `av1seq --tx-model-eps`): ~2 ms of CPU a 5K key
+frame, nothing on streams (their closed loop is 1.6–4 ms), for 0.1–0.3 % of bytes (1.3 % on 720p
+photos streams): a bytes trade, not a free gain. `scripts/train-pruner` records and exports it with
+the other models.
+
 ### Metal AV1: a qindex per 64x64 (delta-q) by a hand rule, judged by SSIMULACRA2 (2026-11-02)
 
 Before training a model to spend bits where they show, a hand rule to see if there's a gain:

@@ -134,6 +134,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public static let defaultLearnedPrune = AV1MetalEncoder.LearnedPrune(
         levelWeights: AV1PrunerWeights.cellV1, eps: 0.02, modeWeights: AV1PrunerWeights.modeV1, modeEps: 0.02,
         chromaWeights: AV1PrunerWeights.chromaV1, chromaEps: 0.02, overShare: 0.5)
+    /// The closed loop searches luma tx types: intra blocks' and inter blocks'
+    /// (on). Off: DCT_DCT, or the analysis's types where it searches them
+    /// (`leafTxSearchPixels`).
+    public var searchesTxTypes = true {
+        didSet { av1enc_hybrid_set_tx_search(cpu, searchesTxTypes ? 1 : 0, searchesTxTypes ? 1 : 0) }
+    }
+
+    /// The learned tx type pruning's eps (rust/av1 hybrid::tx_model): the closed
+    /// loop's luma tx search tries only the types it keeps. Nil: every type.
+    public var txModelEps: Float? {
+        didSet { av1enc_hybrid_set_tx_model(cpu, txModelEps ?? -1) }
+    }
+
     /// See `AV1MetalEncoder.learnedPrune` (on: `defaultLearnedPrune`).
     public var learnedPrune: AV1MetalEncoder.LearnedPrune? {
         get { metal.learnedPrune }

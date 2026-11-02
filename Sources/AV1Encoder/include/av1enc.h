@@ -129,6 +129,12 @@ int av1enc_hybrid_write_ex(av1enc_hybrid *h, const av1g_frame_params *fp, const 
                            uint32_t flags, uint8_t **obu, size_t *size, char *err, size_t errlen);
 // Keep unchanged tiles' closed loop and bitstream from picture to picture (on by default).
 void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
+// The closed loop searches intra blocks' luma tx types (else keeps the analysis's) and inter
+// blocks' (else DCT_DCT): both on by default.
+void av1enc_hybrid_set_tx_search(av1enc_hybrid *h, int luma, int inter);
+// The luma tx type search tries only what the learned tx model keeps, until all but eps of the
+// probability (and DCT_DCT); eps < 0: off (the default). Off too without shipped weights.
+void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
 // The next pictures' qindex per 64x64 superblock (raster, sb_cols x sb_rows, 1..255), coded with
 // delta_q_present: their blocks are quantized and their RD weighed by it. NULL / 0: the frame's
 // qindex everywhere. Not with 128x128 superblocks (the frame's then).

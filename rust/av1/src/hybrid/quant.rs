@@ -13,6 +13,7 @@ use crate::dsp::{
     tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
 };
 use crate::tables::{DCT_DCT, TX_SET_DCTONLY, TX_TYPES};
+use super::tx_model;
 use crate::types::Txb;
 use crate::writer::{TxbCtx, TxbHook};
 
@@ -80,11 +81,34 @@ pub(crate) struct QuantHook<'a> {
     pub src: SrcView<'a>,
     pub o: HookOpts,
     pub f: &'static FwdTx,
+    /// the learned tx type pruning's weights and eps (super::tx_model), or None: every type of the set
+    pub tx_model: Option<(&'a [f32], f32)>,
+    /// research: every searched luma tx block's features and chosen type ([`tx_model::record`])
+    pub collect: Option<&'a std::sync::Mutex<Vec<u8>>>,
 }
 
 impl<'a> QuantHook<'a> {
     pub fn new(src: SrcView<'a>, o: HookOpts) -> QuantHook<'a> {
-        QuantHook { src, o, f: fwd() }
+        QuantHook { src, o, f: fwd(), tx_model: None, collect: None }
+    }
+
+    /// The types of the set (`in_set`) to try: the model's choice, or all of them.
+    fn tx_mask(&self, w: &Work, tw: usize, th: usize, ac_q: i32, inter: bool, in_set: impl Fn(i32) -> bool) -> u32 {
+        match self.tx_model {
+            // (below 8x8 a trial costs about what the model does: every type)
+            Some((weights, eps)) if tw * th >= tx_model::MIN_SAMPLES => {
+                tx_model::keep(weights, &tx_model::features(&w.resf, tw, th, ac_q, inter), in_set, eps)
+            }
+            _ => u32::MAX,
+        }
+    }
+
+    /// Research: records the block's features and the type the search chose.
+    fn collect_sample(&self, w: &Work, tw: usize, th: usize, ac_q: i32, inter: bool, chosen: i32, tx_sz: i32) {
+        if let Some(c) = self.collect {
+            let f = tx_model::features(&w.resf, tw, th, ac_q, inter);
+            tx_model::record(&mut c.lock().unwrap(), &f, chosen, tx_sz, inter);
+        }
     }
 }
 
@@ -365,10 +389,11 @@ impl TxbHook for QuantHook<'_> {
             // the inter set's types, as intra's below (a type other than DCT_DCT costs a few bits
             // more to signal); then coding nothing where that's cheaper
             let set = get_tx_set_inter(tx_sz, self.o.reduced_tx_set);
+            let mask = self.tx_mask(w, tw, th, ac_q, true, |ty| tx_type_in_set_inter(set, ty));
             let mut best_j = 1e301;
             let mut best_type = DCT_DCT;
             for ty in 0..TX_TYPES {
-                if !tx_type_in_set_inter(set, ty) {
+                if !tx_type_in_set_inter(set, ty) || mask >> ty & 1 == 0 {
                     continue;
                 }
                 let mut j = self.trial(w, tx_sz, ty, dc_q, ac_q, cur, pred, ps, s, ss, 0, qm_level, true);
@@ -381,6 +406,7 @@ impl TxbHook for QuantHook<'_> {
             }
             t.tx_type = best_type as u8;
             coeffs.copy_from_slice(&best[..n]);
+            self.collect_sample(w, tw, th, ac_q, true, best_type, tx_sz);
             if rd_skip {
                 self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -422,10 +448,11 @@ impl TxbHook for QuantHook<'_> {
             );
             return;
         }
+        let mask = self.tx_mask(w, tw, th, ac_q, false, in_set);
         let mut best_j = 1e301;
         let mut best_type = DCT_DCT;
         for ty in 0..TX_TYPES {
-            if !tx_type_in_set_intra(set, ty) {
+            if !tx_type_in_set_intra(set, ty) || mask >> ty & 1 == 0 {
                 continue;
             }
             let mut j = self.trial(w, tx_sz, ty, dc_q, ac_q, cur, pred, ps, s, ss, 0, qm_level, true);
@@ -438,5 +465,6 @@ impl TxbHook for QuantHook<'_> {
         }
         t.tx_type = best_type as u8;
         coeffs.copy_from_slice(&best[..n]);
+        self.collect_sample(w, tw, th, ac_q, false, best_type, tx_sz);
     }
 }

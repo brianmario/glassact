@@ -29,6 +29,8 @@ mod fwd;
 mod fwd_neon;
 mod intrabc;
 mod quant;
+mod tx_model;
+mod tx_weights;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -152,6 +154,11 @@ pub struct Hybrid {
     /// the next pictures' qindex per 64x64 superblock (raster; empty: `qindex` everywhere), coded
     /// with delta_q_present; not with 128x128 superblocks ([`Hybrid::set_sb_qindex`])
     sb_qindex: Vec<u8>,
+    /// the learned tx type pruning's eps ([`tx_model`], [`Hybrid::set_tx_model`]), or None: off
+    tx_model_eps: Option<f32>,
+    /// research: with GA_TX_SAMPLES naming a file, every searched luma tx block's features and
+    /// chosen type, appended to it after each picture (examples/prune_train.rs, MODEL=tx)
+    tx_samples: Option<(std::sync::Mutex<Vec<u8>>, String)>,
     ibc: intrabc::IntraBc,
     src: Src,
     /// per-tile reuse, for one geometry and quantizer
@@ -222,6 +229,8 @@ impl Hybrid {
             search_inter_tx: true,
             intrabc: false,
             sb_qindex: Vec::new(),
+            tx_model_eps: None,
+            tx_samples: std::env::var("GA_TX_SAMPLES").ok().map(|p| (std::sync::Mutex::new(Vec::new()), p)),
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
             mem: Vec::new(),
@@ -409,6 +418,8 @@ impl Hybrid {
             intrabc,
             ibc,
             sb_qindex,
+            tx_model_eps,
+            tx_samples,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -739,7 +750,7 @@ impl Hybrid {
                 *reused_count += t.kept as u32;
             }
         }
-        let hook = QuantHook::new(
+        let mut hook = QuantHook::new(
             src,
             HookOpts {
                 tx_types: true,
@@ -752,6 +763,11 @@ impl Hybrid {
                 inter_tx_types: *search_inter_tx,
             },
         );
+        // (recording samples, the search tries every type: they're what it chooses unpruned)
+        hook.tx_model = tx_model_eps
+            .filter(|_| tx_weights::TX_WEIGHTS.len() == tx_model::TX_FLOATS && tx_samples.is_none())
+            .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
+        hook.collect = tx_samples.as_ref().map(|(m, _)| m);
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
         let opts = EncodeOpts {
             flags: ENC_FIX_RANGE | ENC_PREFILTER_RECON,
@@ -853,6 +869,16 @@ impl Hybrid {
         prev_tile_first.extend_from_slice(tile_first);
         let t2 = Instant::now();
         *seconds = [(t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64()];
+        if let Some((m, path)) = tx_samples.as_ref() {
+            let mut v = m.lock().unwrap();
+            if !v.is_empty() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(&v);
+                }
+                v.clear();
+            }
+        }
         Ok(())
     }
 
@@ -998,6 +1024,19 @@ impl Hybrid {
     /// frame where blocks copy has no post-filters (the record's fp.allow_intrabc says so).
     pub fn set_intrabc(&mut self, on: bool) {
         self.intrabc = on;
+    }
+
+    /// av1enc_hybrid_set_tx_search: the closed loop searches intra blocks' luma tx types (else keeps
+    /// the analysis's, DCT_DCT without them) and inter blocks' (else DCT_DCT); both on by default.
+    pub fn set_tx_search(&mut self, luma: bool, inter: bool) {
+        (self.search_luma_tx, self.search_inter_tx) = (luma, inter);
+    }
+
+    /// av1enc_hybrid_set_tx_model: the luma tx type search tries only the types the learned model
+    /// ([`tx_model`]) keeps, until all but `eps` of their probability (and DCT_DCT); eps < 0: off.
+    /// Without shipped weights it stays off.
+    pub fn set_tx_model(&mut self, eps: f32) {
+        self.tx_model_eps = (eps >= 0.0).then_some(eps);
     }
 
     /// av1enc_hybrid_set_sb_qindex: the next pictures' qindex per 64x64 superblock (raster, 1..255;
