@@ -426,6 +426,29 @@ anyone is connected); `install` puts the new weights in Sources. From the manife
 tagged sections (PICT, LEAF, NODE, MODE), so a new model's data is a new section that older
 readers skip.
 
+### Metal AV1: a qindex per 64x64 (delta-q) by a hand rule, judged by SSIMULACRA2 (2026-11-02)
+
+Before training a model to spend bits where they show, a hand rule to see if there's a gain:
+`AV1HybridEncoder.sbQindex` (each 64x64's qindex; the GPU's λ and the closed loop's quantizer
+follow it, coded with delta_q_present) with `av1seq --dq text:n`: n finer where a 64x64 has few
+distinct values (2–64) and strong edges (a 2 % share of steps over 48), text or UI; n coarser where
+it has over 160 (a photo); the frame's elsewhere. Scored by SSIMULACRA2 (`--ssimulacra2-every`,
+the `ssimulacra2` binary; key frames: 5 of 10 frames, streams: 10 of 100) and PSNR. 5K, q 8–32,
+BD-rate against the frame's qindex everywhere:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| key frames, text:12, by SSIMULACRA2 (PSNR) | −0.5 % (+0.1) | 0.0 % (0.0) | −2.1 % (+0.7) | −0.5 % (+0.1) |
+| key frames, text:24 | −0.6 % (+0.5) | +0.1 % (+0.6) | −2.2 % (+2.7) | −0.6 % (+0.4) |
+| streams, text:12 / text:24 | 0.0 / 0.0 % | 0.0 / +0.1 % | 0.0 / +0.1 % | 0.0 / 0.0 % |
+
+- The gain is the photo areas made coarser (photos' key frames −11 % bytes for 1–4 points of
+  SSIMULACRA2), not text made finer: text is already sharp at these quantizers, its repeats copied.
+- Streams don't move: their inter frames are mostly copies, which a quantizer doesn't touch.
+- **Not taken, and no model trained:** 0.5–2 % on key frames and nothing on streams is too little
+  to learn a map for (and SSIMULACRA2 scores a picture, which makes per-64x64 labels hard). The
+  path stays, off (a test holds delta-q streams to libaom and kept analysis to fresh).
+
 ### Metal AV1: the leaves' luma tx search dropped, unused (2026-11-02)
 
 Timing the leaf stage (`k_leaf`, 13–15 ms of a 5K key frame after learned pruning): half of it was

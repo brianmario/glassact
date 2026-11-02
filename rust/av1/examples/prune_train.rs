@@ -36,6 +36,18 @@ const LEVEL_NF: usize = 4 * PF + 1;
 const LEVEL_H: usize = 24;
 /// The mode model: the node's statistics, its orientations, its level (one-hot) and a bias; 13 modes.
 const MODE_NF: usize = PF + OB + 4 + 1;
+/// CONTEXT=1 (an experiment the GPU doesn't run): the level model also gets the mean statistics of
+/// its 8 and 16 nodes' 8 neighbours (2 PF more), the mode model its node's neighbours' mean
+/// orientations (OB more).
+fn context() -> bool {
+    std::env::var("CONTEXT").is_ok_and(|v| v == "1")
+}
+fn level_nf() -> usize {
+    LEVEL_NF + if context() { 2 * PF } else { 0 }
+}
+fn mode_nf() -> usize {
+    MODE_NF + if context() { OB } else { 0 }
+}
 const MODE_H: usize = 24;
 const MODES: usize = 13;
 /// The chroma model: per plane (U, V) its log variance, gradients and squared correlation with luma;
@@ -330,11 +342,33 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
                 )
             })
             .collect();
+        // the mean of a grid's 8 neighbours of (nx, ny) (those inside it)
+        let neighbours = |v: &dyn Fn(usize) -> Vec<f32>, cols: usize, rows: usize, nx: usize, ny: usize, k: usize| -> Vec<f32> {
+            let mut m = vec![0f32; k];
+            let mut c = 0f32;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (x, y) = (nx as i32 + dx, ny as i32 + dy);
+                    if (dx, dy) == (0, 0) || x < 0 || y < 0 || x >= cols as i32 || y >= rows as i32 {
+                        continue;
+                    }
+                    for (a, b) in m.iter_mut().zip(v(y as usize * cols + x as usize)) {
+                        *a += b;
+                    }
+                    c += 1.0;
+                }
+            }
+            m.iter().map(|a| a / c.max(1.0)).collect()
+        };
         let node_features = |li: usize, nx: usize, ny: usize| -> Vec<f32> {
             let (cols, g, o) = &grids[li];
-            let mut f = Vec::with_capacity(MODE_NF);
+            let mut f = Vec::with_capacity(mode_nf());
             f.extend_from_slice(&g[ny * cols + nx]);
             f.extend_from_slice(&o[ny * cols + nx]);
+            if context() {
+                let rows = h / (8 << li);
+                f.extend(neighbours(&|i| o[i].to_vec(), *cols, rows, nx, ny, OB));
+            }
             for k in 0..4 {
                 f.push((k == li) as u8 as f32);
             }
@@ -348,12 +382,21 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
                 if sub > 1 && (cx * 7 + cy * 13) % sub != 0 {
                     continue;
                 }
-                let mut f = vec![0f32; LEVEL_NF];
+                let mut f = vec![0f32; level_nf()];
                 for (li, n) in [8usize, 16, 32, 64].iter().enumerate() {
                     let (cols, g, _) = &grids[li];
                     f[li * PF..li * PF + PF].copy_from_slice(&g[(cy * 8 / n) * cols + cx * 8 / n]);
                 }
-                f[LEVEL_NF - 1] = 1.0;
+                if context() {
+                    for li in 0..2 {
+                        let (cols, g, _) = &grids[li];
+                        let n = 8 << li;
+                        let m = neighbours(&|i| g[i].to_vec(), *cols, h / n, cx * 8 / n, cy * 8 / n, PF);
+                        f[4 * PF + li * PF..4 * PF + li * PF + PF].copy_from_slice(&m);
+                    }
+                }
+                let nf = level_nf();
+                f[nf - 1] = 1.0;
                 cells.push((cy * (w / 8) + cx, f, lvl[(cy * 2) * mc + cx * 2]));
             }
         }
@@ -708,12 +751,12 @@ fn main() {
     };
     if let Ok(wf) = std::env::var("EVAL") {
         let v: Vec<f32> = fs::read(&wf).unwrap().chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        let level = Mlp::from_floats(&v, LEVEL_NF, LEVEL_H, 4);
+        let level = Mlp::from_floats(&v, level_nf(), LEVEL_H, 4);
         let all: Vec<&Pic> = pics.iter().collect();
         println!("level:{}", report_level(&level, &all));
         let nl = level.floats().len();
         if v.len() > nl {
-            let mode = Mlp::from_floats(&v[nl..], MODE_NF, MODE_H, MODES);
+            let mode = Mlp::from_floats(&v[nl..], mode_nf(), MODE_H, MODES);
             println!("mode:{}", report_mode(&mode, &all));
             let nm = mode.floats().len();
             if v.len() > nl + nm {
@@ -724,11 +767,12 @@ fn main() {
         return;
     }
     if let Ok(out) = std::env::var("EXPORT") {
+        assert!(!context(), "CONTEXT=1 is an offline experiment: the GPU's models have no context features");
         // the data is subsampled at load (SUB) here, so every sample counts
         let level_all: Vec<(&[f32], u8)> = pics.iter().flat_map(|p| p.cells.iter().map(|c| (c.1.as_slice(), c.2))).collect();
-        let level = train(&level_all, LEVEL_NF, LEVEL_H, 4, steps, 5);
+        let level = train(&level_all, level_nf(), LEVEL_H, 4, steps, 5);
         let mode_all = mode_data(&|_| true);
-        let mode = train(&mode_all, MODE_NF, MODE_H, MODES, steps, 7);
+        let mode = train(&mode_all, mode_nf(), MODE_H, MODES, steps, 7);
         let chroma_all: Vec<(&[f32], u8)> = pics.iter().flat_map(|p| p.chroma.iter().map(|c| (c.0.as_slice(), c.1))).collect();
         let chroma = train(&chroma_all, CHROMA_NF, CHROMA_H, CHROMA_C, steps, 11);
         let (lv, mv, cv) = (level.floats(), mode.floats(), chroma.floats());
@@ -772,7 +816,7 @@ fn main() {
     for t in 0..traces.len() {
         let test: Vec<&Pic> = pics.iter().filter(|p| p.trace == t).collect();
         if model.is_empty() || model == "level" {
-            let m = train(&level_data(&|p| p.trace != t), LEVEL_NF, LEVEL_H, 4, steps, 5 + t as u64);
+            let m = train(&level_data(&|p| p.trace != t), level_nf(), LEVEL_H, 4, steps, 5 + t as u64);
             println!("{} level:{}", traces[t], report_level(&m, &test));
         }
         if model.is_empty() || model == "chroma" {
@@ -784,7 +828,7 @@ fn main() {
         if model.is_empty() || model == "mode" {
             let data = mode_data(&|p| p.trace != t);
             let sampled: Vec<(&[f32], u8)> = data.iter().enumerate().filter(|(i, _)| i % sub.max(1) == 0).map(|(_, d)| *d).collect();
-            let m = train(&sampled, MODE_NF, MODE_H, MODES, steps, 7 + t as u64);
+            let m = train(&sampled, mode_nf(), MODE_H, MODES, steps, 7 + t as u64);
             println!("{} mode: {} blocks trained on |{}", traces[t], sampled.len(), report_mode(&m, &test));
         }
     }
