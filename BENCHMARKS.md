@@ -265,6 +265,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 at 720p: why libaom is faster on inter frames (2026-11-01)
+
+At 720p libaom realtime speed 9 codes typing-cc's inter frames at ~2000 a second and ours at
+~900–1200 (runs on this machine vary by ±20 % here). Measured with `av1seq --inter --no-planes`,
+q20:
+
+- **It's the GPU analysis, nothing else.** Our inter frames run at 1 / (GPU analysis time): 1.0,
+  1.6 and 4.8 ms a frame for typing, scroll and photos (906, 524, 176 frames a second). Without
+  filters it's the same (920, 489, 180): they overlap it.
+- **The rest of the pipeline is as fast as libaom.** With every 64×64 forced to a copy (an
+  experiment: no analysis at all), the same pipeline runs typing and scroll at ~1930 frames a
+  second with filters and 1830–2590 without, against libaom's 2030 and 969.
+- **For a few superblocks the analysis is latency, not work.** Typing analyzes ~2 % of its
+  superblocks (about 5) a frame and still takes ~1 ms of GPU: a chain of dependent stages
+  (projection and motion search 0.10 ms, inter candidates 0.12, the intra shapes 0.02–0.16 each,
+  partition, leaf decisions 0.1, each timed alone), each a block's serial work on one SIMD-group.
+  Photos analyzes 68 % of its superblocks: that 4.8 ms is throughput.
+- **Not the GPU's clock:** with a 5K photos encode running beside it, typing's analysis took the
+  same 1.0 ms.
+- **Not the preset:** inter frames at turbo, turbo2, turbo3 or faster were within the run-to-run
+  noise on typing and scroll (photos: turbo3 and faster slower).
+
+Considered and not built:
+- **Deciding a few changed superblocks on the CPU instead** (`hybrid::Decider`, the reference
+  engine's open-loop search): about 0.6 ms of CPU per 64×64 (720p screen picture, 37 ms for 240
+  superblocks on 4 threads), with no motion search and weaker decisions. With ~5 superblocks on as
+  many threads, that's ~0.6 ms against the GPU's ~1.0: at best ~1.4× on typing, short of libaom,
+  and costing bytes; on scroll (~24 superblocks) no faster.
+- What would close the gap is the GPU analysis's latency on few superblocks: fewer dependent stages
+  (a superblock analyzed end to end in one threadgroup, shapes to leaf decisions), not more search.
+  At 720p we're already 15–20× past 60 fps, so this matters for latency and power, not frame rate.
+
 ### Metal AV1 re-baselined after intra block copy (2026-11-01, evening)
 
 The morning's re-baseline (entry below, same script) on the encoder with exact and lossy intra block
