@@ -50,8 +50,9 @@ let av1SeqCommand = Command(
         .bool("aom-inter", "with --aom-speed: libaom codes one stream of inter frames after a key frame, not key frames"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
-        .string("ml-prune", "<weights.bin>", "research: learned pruning of the analysis with these weights (k_ml.h; the offline trainer's export)"),
-        .string("ml-threshold", "<p>", "with --ml-prune: skip a node's shapes below this likelihood (default 0.05)"),
+        .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export)"),
+        .string("ml-eps", "<p>", "learned pruning: a cell keeps its likeliest levels until all but this much probability is kept (default 0.02)"),
+        .bool("no-ml-prune", "no learned pruning (the variance rule instead)"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
@@ -132,11 +133,16 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.postfilters = !opts.has("no-filters")
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
-    if let path = opts.string("ml-prune") {
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        guard weights.count == 4 * (2 * 13 + 16 * 13 + 2 * 16 + 1) else { throw BenchError("--ml-prune: \(weights.count) floats, not 4 levels' 267") }
-        encoder.learnedPrune = (weights, Float(opts.string("ml-threshold").flatMap(Float.init) ?? 0.05),
+    if opts.has("no-ml-prune") {
+        encoder.learnedPrune = nil
+    } else if opts.has("ml-prune") || opts.has("ml-eps") || opts.has("ml-over") {
+        var weights = AV1PrunerWeights.cellV1
+        if let path = opts.string("ml-prune") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            weights = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            guard weights.count == 982 else { throw BenchError("--ml-prune: \(weights.count) floats, not 982 (k_ml.h ML_FLOATS)") }
+        }
+        encoder.learnedPrune = (weights, Float(opts.string("ml-eps").flatMap(Float.init) ?? 0.02),
                                 Double(opts.string("ml-over").flatMap(Double.init) ?? 0.5))
     }
     if let v = opts.string("deltas-up-to") {
@@ -414,7 +420,8 @@ func writeIVF(_ frames: [[UInt8]], width: Int, height: Int, to path: String) thr
 }
 
 /// `--dump-partition`: for each picture, `<dir>/pNNN.bin`: width, height, qindex (UInt32 each), the
-/// luma plane, the leaf count (UInt32) and the leaves as av1g_block records.
+/// luma plane, the leaf count (UInt32) and the leaves as av1g_block records, then the DP's node
+/// costs (count, floats: GP_DP_DEBUG per 64x64, raster).
 @available(macOS 27, *)
 func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, preset: AV1MetalEncoder.Preset,
                     device: any MTLDevice, to dir: String) throws {
@@ -425,6 +432,7 @@ func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, 
     metal.busyBlockPrune = 0
     metal.searchesAngleDeltas = false
     metal.tiling = (2, 0)
+    metal.dumpsNodeCosts = true
     for (i, p) in pictures.enumerated() {
         let part = try metal.partition(y: p.planes[0], u: p.planes[1], v: p.planes[2], width: width, height: height, qindex: qindex)
         var data = Data()
@@ -432,6 +440,9 @@ func dumpPartitions(_ pictures: [YUV420], width: Int, height: Int, qindex: Int, 
         data.append(contentsOf: p.planes[0].prefix(width * height))
         withUnsafeBytes(of: UInt32(part.blocks.count)) { data.append(contentsOf: $0) }
         part.blocks.withUnsafeBytes { data.append(contentsOf: $0) }
+        // then the DP's node costs: their count (UInt32) and the floats
+        withUnsafeBytes(of: UInt32(part.nodeCosts.count)) { data.append(contentsOf: $0) }
+        part.nodeCosts.withUnsafeBytes { data.append(contentsOf: $0) }
         try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent(String(format: "p%03d.bin", i)))
     }
     print("av1seq: \(pictures.count) partitions written to \(dir)")

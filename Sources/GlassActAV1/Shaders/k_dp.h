@@ -62,12 +62,13 @@ kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                     const int cb = lvBase[L + 1], cper = per * 2;
                     for (int k = 0; k < 4; k++) splitJ += node[cb + (ny * 2 + (k >> 1)) * cper + nx * 2 + (k & 1)].J;
                 }
-                float best = GP_INF;
+                float best = GP_INF, own = GP_INF, split = GP_INF;
                 int bp = AV1G_PARTITION_SPLIT;
                 const float lamN = lambda * ssim_scale(I, x, y, n, n);
                 auto consider = [&](int p, float J, float bits) {
                     const float t = J + lamN * bits;
                     if (t < best) { best = t; bp = p; }
+                    if (p == AV1G_PARTITION_SPLIT) split = min(split, t); else own = min(own, t);
                 };
                 const bool big = n > P.maxPart;  // only SPLIT above the largest allowed partition
                 if (hasRows && hasCols) {
@@ -117,10 +118,16 @@ kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 }
                 nd.J = best;
                 nd.p = (int8_t)bp;
+                if (B.dpDebug) {  // Glass Act, research (GP_DP_DEBUG)
+                    device float *d = B.dpDebug + (size_t)sb * GP_DP_DEBUG + 2 * (lvBase[L] + ny * per + nx);
+                    d[0] = own;
+                    d[1] = split;
+                }
             }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane != 0) return;
+    if (B.dpDebug) B.dpDebug[(size_t)sb * GP_DP_DEBUG + 2 * 85] = lambda;
     B.sbJ[sb] = node[0].J;
     // ---- leaves in decode order ----
     device GpLeaf *out = B.leaves + (size_t)sb * GP_MAX_LEAVES;

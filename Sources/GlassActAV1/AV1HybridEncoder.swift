@@ -128,8 +128,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.searchesAngleDeltas }
         set { metal.searchesAngleDeltas = newValue }
     }
-    /// See `AV1MetalEncoder.learnedPrune` (research).
-    public var learnedPrune: (weights: [Float], threshold: Float, overShare: Double)? {
+    /// See `AV1MetalEncoder.learnedPrune` (on: the shipped weights, eps 0.02,
+    /// in pictures coding more than half their superblocks).
+    public var learnedPrune: (weights: [Float], eps: Float, overShare: Double)? {
         get { metal.learnedPrune }
         set { metal.learnedPrune = newValue }
     }
@@ -262,6 +263,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
         metal.busyBlockPrune = 4
+        metal.learnedPrune = (AV1PrunerWeights.cellV1, 0.02, 0.5)
         metal.leafTxSearchPixels = 128
         metal.leafChromaAngledModes = false
         metal.searchesSubpelMotion = true

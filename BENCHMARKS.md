@@ -201,7 +201,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
-| Learned pruning of the analysis (a small network per tree level, `metal-av1`) | measured, kept off | offline it skipped 53–63 % at ~2 % misses on screen content; on the GPU ×1.13–1.21 for +2–6 % on 5K key frames; needs cost-weighted labels and compacted small-shape dispatch | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
+| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels | kept, on at 2,000 superblocks and up | 5K key frames 25–32 % faster on screen content (photos 9 %), BD −0.6 to 0.0 % against the variance rule; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 
@@ -327,6 +327,53 @@ numbers:
   skip too. The 16×16 stage, a SIMD group per block, fell 51 % at threshold 0.05; 4×4 only 35 %.
 A second version would need both: labels weighted by the cost a skip adds (the analysis's J per
 shape, dumped), and the surviving blocks compacted into a list before the small shapes' dispatch.
+
+**Second version: kept, on in the hybrid at 2,000 superblocks and up** (`AV1MetalEncoder.learnedPrune`,
+`AV1PrunerWeights.cellV1`, eps 0.02; `av1seq --no-ml-prune` for the variance rule).
+- **Costs, not choices.** `k_dp` can write each node's best own partition and its SPLIT (with
+  partition bits) and each SB's λ (`GpBatch.dpDebug`, `--dump-partition`), so what a skip adds is
+  the DP again without it. Per node, the first version's skips cost little one at a time (0.2–0.4 %
+  of the pictures' J at 42–49 % skipped) but much more together (scroll 5 %, photos 14 %): a node
+  whose runner-up is its children looks cheap, and so do the children.
+- **A level per cell instead.** A network per 8×8 cell (8 statistics of each of its four nested
+  nodes, 33-24-4) says which level the search will choose there; the cell keeps its likeliest
+  levels until all but eps of the probability is kept, and a node's own shapes are searched where
+  any of its cells keeps that level. A repair per SB (`k_ml_tree`) keeps each cell's levels
+  reachable: where a cell below needs a node to split, every child without a complete partition of
+  its own keeps its shapes (without it, text next to a cell that wanted 64×64 became one 64×64
+  block: typing −2.8 dB at eps 0.05).
+- **Compacted small shapes.** `k_ml_list` front-packs the blocks of the thread-per-block shapes
+  that are still analyzed (writing the pruned result for the rest), so their SIMD-groups stay full.
+- Trained on 120 pictures not among the test frames (the four traces from frame 120 on, at q8, q20
+  and q32, 5K and 720p): `rust/av1/examples/prune_train.rs`, whose export reproduces the shipped
+  weights exactly. Offline, each trace scored by models trained on the other three, at eps 0.02:
+  31–45 % of the shape stages skipped for 0.01–0.02 % of the J.
+
+On the GPU (q 8–32; key frames: 10 from frame 100 analyzed whole; streams: first 100, `--inter`):
+
+| BD-rate against the variance rule | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frames, eps 0.01 / 0.02 / 0.03 | −0.5 / −0.5 / −0.5 % | −0.3 / −0.3 / −0.3 % | 0.0 % | −0.6 / −0.6 / −0.6 % |
+| 5K streams, eps 0.02 | 0.0 % | −0.1 % | 0.0 % | −0.7 % |
+| 720p key frames, eps 0.02 | 0.0 % | +0.4 % | 0.0 % | 0.0 % |
+
+| Speed, median of 3 interleaved runs, variance rule → eps 0.02 | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frame (ms) | 107.9 → **81.2** | 105.2 → **71.5** | 126.3 → 114.7 | 105.5 → **78.9** |
+| 5K stream (inter frames a second) | 334 → 336 | 212 → 224 | 89.9 → 90.1 | 341 → 343 |
+| 720p key frame (ms) | 13.8 → 13.9 | 11.8 → 12.5 | 15.5 → 16.4 | 14.1 → 13.1 |
+| 720p stream (inter frames a second) | 1097 → 1175 | 483 → 465 | **207 → 159** | 812 → 809 |
+
+- At 5K a full-screen change codes **25–32 % faster on screen content** (photos 9 %), for slightly
+  fewer bytes than the variance rule it replaces. Together with the angle-delta gate, a 5K key
+  frame of typing went from ~154 ms this morning to ~81.
+- Small pictures only lose: the passes (2 ms at 5K) lengthen a GPU chain that's already the limit,
+  and 720p photos codes 23 % slower. Hence the floor of 2,000 superblocks (4K and up). At 1080p,
+  1440p and 4K (the 5K traces resampled, which the model wasn't trained on) it made ±2 %; native
+  captures at those sizes are untested.
+- eps 0.05 still costs typing 1.3 dB though the offline DP calls it nearly free: the open-loop J
+  understates what a forced big block costs on text. Stay at 0.02 or below without new data.
+- More varied training traces (video, maps, image-heavy pages, IDEs) are the next lever.
 
 ### Metal AV1: reduced frames for full-screen change at 5K, measured (2026-11-02)
 

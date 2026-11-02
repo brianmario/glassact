@@ -247,6 +247,16 @@ struct GpBatch {
     uint32_t nSbList;
     // Glass Act: inter frames: per (shape, position), parallel to blk (NULL: an intra picture)
     GP_DEV GpInterRes *inter;
+    // Glass Act, research: if set, k_dp writes per SB GP_DP_DEBUG floats: for each of its 85 nodes
+    // (64, then 32s, 16s, 8s, raster) the best of its own partitions and its SPLIT, with their
+    // partition bits (8 nodes: SPLIT is the 4x4s), then the SB's lambda
+    GP_DEV float *dpDebug;
+    // Glass Act, research: learned pruning's lists (k_ml_list): per shape the blocks the
+    // thread-per-block analysis still runs (block indices, at the shape's blk offset), and their
+    // counts [GP_NSHAPES]. NULL: every block.
+    GP_DEV uint32_t *mlList;
+    GP_DEV const uint32_t *mlCount;
 };
+#define GP_DP_DEBUG 171  // 2 * 85 + 1
 
 #endif

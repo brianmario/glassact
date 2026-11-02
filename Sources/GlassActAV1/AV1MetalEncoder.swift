@@ -42,6 +42,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// An inter frame's (`beginPartition(motion:)`): every block's motion, parallel to
         /// `blocks` (an inter block's intra fields are 0); empty otherwise.
         public var inter: [av1g_block_inter] = []
+        /// With `dumpsNodeCosts`: per SB (raster) GP_DP_DEBUG floats, as k_dp writes them.
+        public var nodeCosts: [Float] = []
         /// The source the analysis read (`beginPartition`'s): Y, U and V padded to whole 64×64s
         /// by edge replication, rows `sourceStrides` apart. It's the encoder's until the next
         /// picture's partition is read, and then goes back to its pool (the picture after next
@@ -359,15 +361,22 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// most of the picture is copied or predicted from the previous one.
     public var interPreset: Preset?
     let recon: any MTLComputePipelineState
-    let mlPrune: any MTLComputePipelineState, mlFix: any MTLComputePipelineState
+    let mlStats: any MTLComputePipelineState, mlCell: any MTLComputePipelineState
+    let mlTree: any MTLComputePipelineState, mlList: any MTLComputePipelineState
     var params: GpParams
 
-    /// Research: learned pruning of the analysis (k_ml.h). A small network per
-    /// tree level, trained offline on the full search's choices, skips a node's
-    /// own shapes where it rates them less likely than `threshold`; today's
-    /// variance rule then stands aside. Only in pictures that code more than
-    /// `overShare` of their superblocks (key frames count as all). nil: off.
-    public var learnedPrune: (weights: [Float], threshold: Float, overShare: Double)? {
+    /// Learned pruning of the analysis (k_ml.h). A small network per 8×8
+    /// cell, trained offline on the full search's choices
+    /// (rust/av1/examples/prune_train.rs), says which tree level the search
+    /// will choose; the cell keeps its likeliest levels until all but `eps` of
+    /// the probability is kept, and the analysis skips the shapes of levels no
+    /// cell of a node keeps (repaired so each cell's levels stay reachable).
+    /// The variance rule then stands aside. Only in pictures of at least
+    /// `learnedPruneMinSuperblocks` that code more than `overShare` of their
+    /// superblocks (key frames count as all). A 5K key frame then analyzes
+    /// ~25–32 % faster on screen content for no bytes (BENCHMARKS.md). nil: off
+    /// (the hybrid encoder turns it on).
+    public var learnedPrune: (weights: [Float], eps: Float, overShare: Double)? {
         didSet {
             mlWeights = learnedPrune.flatMap { lp in
                 lp.weights.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: .storageModeShared) }
@@ -375,6 +384,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
     }
     var mlWeights: (any MTLBuffer)?
+    /// Learned pruning's least picture: below it the passes cost more than they
+    /// save (at 720p a moving picture codes up to ~20 % slower).
+    public var learnedPruneMinSuperblocks = 2000
+    /// Research: `partition` also returns the DP's per-node costs (`Partition.nodeCosts`).
+    public var dumpsNodeCosts = false
     /// GPU time of the last picture's command buffer (analysis, DP, closed loop).
     public private(set) var lastGPUSeconds: Double = 0
 
@@ -449,10 +463,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         else { throw Failure.metal("no k_leaf") }
         leafScan = try Self.pipeline(leafScanFunction, threads: 1024, device: device)
         leaf = try Self.pipeline(leafFunction, threads: Self.leafThreads, device: device)
-        guard let mlPruneFunction = library.makeFunction(name: "k_ml_prune"), let mlFixFunction = library.makeFunction(name: "k_ml_fix")
-        else { throw Failure.metal("no k_ml_prune / k_ml_fix") }
-        mlPrune = try Self.pipeline(mlPruneFunction, threads: 64, device: device)
-        mlFix = try Self.pipeline(mlFixFunction, threads: 256, device: device)
+        let ml = try ["k_ml_stats", "k_ml_cell", "k_ml_tree", "k_ml_list"].map { name in
+            guard let f = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }
+            return try Self.pipeline(f, threads: 64, device: device)
+        }
+        (mlStats, mlCell, mlTree, mlList) = (ml[0], ml[1], ml[2], ml[3])
         guard let dpFunction = library.makeFunction(name: "k_dp"),
               let reconFunction = library.makeFunction(name: "k_recon")
         else { throw Failure.metal("no k_dp / k_recon") }
@@ -563,7 +578,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false)
         try run.execute(closedLoop: false)
         let (blocks, types, inter) = run.leafBlocks()
-        return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
+        var part = Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter)
+        if let b = run.nodeCostBuffer {
+            part.nodeCosts = Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: Float.self), count: b.length / 4))
+        }
+        return part
     }
 
     /// A picture's analysis and partition DP, running on the GPU: the caller
@@ -656,8 +675,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let decidesLeaves: Bool
         /// SBs the caller replaces (`beginPartition(skip:)`): the partition gives each one block.
         let skipped: [UInt8]?
-        /// Learned pruning's per-8x8 skip flags, when this picture uses it.
+        /// Learned pruning's buffers, when this picture uses it: per-8x8 skip flags (4 levels),
+        /// node statistics (per level from `mlBases`), the cells' kept levels, the small shapes'
+        /// lists and their counts.
         var mlMask: (any MTLBuffer)?
+        var mlStatsBuffer: (any MTLBuffer)?, mlKeep: (any MTLBuffer)?, mlListBuffer: (any MTLBuffer)?, mlCounts: (any MTLBuffer)?
+        var mlBases: [UInt32] = []
+        /// `dumpsNodeCosts`: the DP's per-node costs (GP_DP_DEBUG floats per SB).
+        var nodeCostBuffer: (any MTLBuffer)?
         var shapeOffset = [UInt32](repeating: 0, count: Int(GP_NSHAPES)), shapeColumns = [Int32](repeating: 0, count: Int(GP_NSHAPES))
         /// Wavefront steps: superblocks whose left and above-right neighbours are done.
         var steps: [[UInt32]] = []
@@ -732,11 +757,21 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             image.rpitch = image.spitch
             // learned pruning: in a picture that codes enough of itself (key frames: all)
             let coded = skip.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
-            if let lp = encoder.learnedPrune, encoder.mlWeights != nil, coded > lp.overShare {
+            if let lp = encoder.learnedPrune, encoder.mlWeights != nil, coded > lp.overShare,
+               sbCols * sbRows >= encoder.learnedPruneMinSuperblocks {
                 let mask = try make(aw / 8 * (ah / 8) * 4)
                 mlMask = mask
                 image.mlSkip = AV1MetalEncoder.address(mask)
                 image.cols8 = Int32(aw / 8)
+                var base: UInt32 = 0
+                for level in 0..<4 {
+                    let n = 8 << level
+                    mlBases.append(base)
+                    base += UInt32((width / n) * (height / n) * 8)
+                }
+                mlStatsBuffer = try make(Int(max(base, 1)) * 4)
+                mlKeep = try make(aw / 8 * (ah / 8))
+                mlCounts = try make(Int(GP_NSHAPES) * 4)
             }
             image.tileCols = Int32(tl.cols); image.tileRows = Int32(tl.rows)
             let colStarts = withUnsafeBytes(of: tl.mi_col_starts) { Array($0.bindMemory(to: UInt32.self)) }
@@ -887,6 +922,17 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             batch.sbList = sbList.flatMap { AV1MetalEncoder.address($0) }
             batch.nSbList = UInt32(staleSuperblocks ?? 0)
             batch.inter = meBest != nil ? AV1MetalEncoder.address(interResults) : nil
+            if let counts = mlCounts {
+                let list = try make(Int(max(blkTotal, 1)) * 4)
+                mlListBuffer = list
+                batch.mlList = AV1MetalEncoder.address(list)
+                batch.mlCount = AV1MetalEncoder.address(counts)
+            }
+            if encoder.dumpsNodeCosts {
+                let debug = try make(sbCols * sbRows * Int(GP_DP_DEBUG) * 4)
+                nodeCostBuffer = debug
+                batch.dpDebug = AV1MetalEncoder.address(debug)
+            }
             tiles = tl
             buffers = made
         }
@@ -945,23 +991,51 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             let t0 = CACurrentMediaTime()
             var e = try open()
-            if let mask = mlMask, let weights = encoder.mlWeights, let lp = encoder.learnedPrune {
-                // learned pruning: each level's nodes (their own bytes of the mask), then the fix-up
-                var threshold = lp.threshold
+            // the shapes the thread-per-block kernel takes (the analysis loop below decides the same)
+            func smallKernel(_ s: Int) -> Bool {
+                guard shTotal[s] > 0, params.smallKernel != 0, encoder.analysisSmall[s] != nil else { return false }
+                let size = AV1MetalEncoder.blockSizes[s]
+                let n = staleSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
+                return n > 0 && !(isInter && (n < 4096 || size.w * size.h >= 64))
+            }
+            if let mask = mlMask, let weights = encoder.mlWeights, let lp = encoder.learnedPrune,
+               let stats = mlStatsBuffer, let keepBuffer = mlKeep, let counts = mlCounts {
+                // learned pruning: node statistics, the cells' network, each SB's skip flags (repaired),
+                // then the small shapes' lists (k_ml.h)
+                func threads(_ n: Int) -> (MTLSize, MTLSize) { (MTLSize(width: max(n, 1), height: 1, depth: 1), MTLSize(width: 64, height: 1, depth: 1)) }
+                e.setComputePipelineState(encoder.mlStats)
+                e.setBuffer(stats, offset: 0, index: 3)
                 for level in 0..<4 {
-                    var lv = UInt32(level)
-                    let n = 8 << level, nodes = ((aw + n - 1) / n) * ((ah + n - 1) / n)
-                    e.setComputePipelineState(encoder.mlPrune)
+                    var lv = UInt32(level), base = mlBases[level]
+                    let n = 8 << level
                     e.setBytes(&lv, length: 4, index: 2)
-                    e.setBuffer(weights, offset: 0, index: 3)
-                    e.setBuffer(mask, offset: 0, index: 4)
-                    e.setBytes(&threshold, length: 4, index: 5)
-                    e.dispatchThreads(MTLSize(width: nodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+                    e.setBytes(&base, length: 4, index: 4)
+                    let (g, t) = threads((width / n) * (height / n))
+                    e.dispatchThreads(g, threadsPerThreadgroup: t)
                 }
                 e.memoryBarrier(scope: .buffers)
-                e.setComputePipelineState(encoder.mlFix)
-                e.setBuffer(mask, offset: 0, index: 4)
-                e.dispatchThreads(MTLSize(width: aw / 8 * (ah / 8), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                var eps = lp.eps
+                e.setComputePipelineState(encoder.mlCell)
+                e.setBytes(mlBases, length: 16, index: 4)
+                e.setBuffer(weights, offset: 0, index: 5)
+                e.setBuffer(keepBuffer, offset: 0, index: 6)
+                e.setBytes(&eps, length: 4, index: 7)
+                e.setBuffer(counts, offset: 0, index: 8)
+                let (gc, tc) = threads(max(aw / 8 * (ah / 8), Int(GP_NSHAPES)))
+                e.dispatchThreads(gc, threadsPerThreadgroup: tc)
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.mlTree)
+                e.setBuffer(mask, offset: 0, index: 9)
+                let (gt, tt) = threads(sbCols * sbRows)
+                e.dispatchThreads(gt, threadsPerThreadgroup: tt)
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.mlList)
+                for s in 0..<Int(GP_NSHAPES) where mlListBuffer != nil && smallKernel(s) {
+                    var bs = UInt32(s)
+                    e.setBytes(&bs, length: 4, index: 2)
+                    let (g, t) = threads(Int(shTotal[s]))
+                    e.dispatchThreads(g, threadsPerThreadgroup: t)
+                }
                 e.memoryBarrier(scope: .buffers)
                 if profiling { stages.mlPrune = try close(); e = try open() }
             }
@@ -1021,6 +1095,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 let size = AV1MetalEncoder.blockSizes[s]
                 let fewBlocks = isInter && (n < 4096 || size.w * size.h >= 64)
                 if params.smallKernel != 0, !fewBlocks, let pipeline = encoder.analysisSmall[s] {
+                    if mlListBuffer != nil { n = shTotal[s] }  // the list's count bounds it
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
                     e.dispatchThreads(MTLSize(width: Int(n), height: 1, depth: 1),

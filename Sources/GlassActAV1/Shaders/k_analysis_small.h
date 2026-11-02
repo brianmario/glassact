@@ -103,7 +103,10 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     device const GpImage &I = B.img[lo];
     const int nbx = I.shNbx[BS];
     uint32_t li = gb - starts[lo];
-    if (B.sbList) {  // Glass Act: only the listed SBs (one image)
+    if (B.mlList) {  // Glass Act: learned pruning's list of the blocks still analyzed (k_ml_list)
+        if (gb >= B.mlCount[BS]) return;
+        li = B.mlList[I.shOff[BS] + gb];
+    } else if (B.sbList) {  // Glass Act: only the listed SBs (one image)
         const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
         const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
         const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));

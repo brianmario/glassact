@@ -275,3 +275,45 @@ extension HybridEncoderTests {
         #expect(copying >= (stream ? 1 : 3), "\(label): \(copying) frames copied")
     }
 }
+
+extension HybridEncoderTests {
+    /// Learned pruning (on in pictures of 2,000 superblocks and up) changes the
+    /// analysis, and the streams stay the decoder's pictures; kept analysis is
+    /// still the analysis (each cell's skips depend only on its own superblock).
+    @available(macOS 27, *)
+    @Test func learnedPruningKeepsStreamsExact() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (4096, 2048)  // 2,048 superblocks
+        // lines of glyph-like text over most of the picture, a flat band, a noisy gradient
+        var base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x6d6c_7072)
+        for row in 0..<1600 where row % 24 >= 6 && row % 24 < 20 {
+            for col in 0..<width where (col / 7 + row / 24) % 9 != 0 && rng.next() % 3 == 0 { base.y[row * width + col] = 40 }
+        }
+        for row in 1800..<height { for col in 0..<width { base.y[row * width + col] = UInt8(truncatingIfNeeded: col / 16 + Int(rng.next() % 12)) } }
+        var edited = base.y
+        for row in 300..<420 { for col in 1000..<1500 { edited[row * width + col] = 236 } }  // a paragraph deleted
+        let pictures = [base.y, edited].map { AV1HybridEncoder.Picture(y: $0, u: base.u, v: base.v, width: width, height: height) }
+
+        let reusing = try AV1HybridEncoder(device: device), fresh = try AV1HybridEncoder(device: device)
+        let unpruned = try AV1HybridEncoder(device: device)
+        fresh.reusesAnalysis = false
+        unpruned.learnedPrune = nil
+        for e in [reusing, fresh, unpruned] { e.tiling = (2, 1) }
+        try reusing.encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { i, frame in
+            let alone = try fresh.encode(pictures[i], qindex: 80)
+            #expect(frame.obu == alone.obu, "picture \(i) codes differently with kept analysis")
+            if i == 0 {
+                #expect(try unpruned.encode(pictures[i], qindex: 80).obu != alone.obu, "learned pruning didn't change the analysis")
+            }
+            let decoder = try #require(glassact_aom_dec_create(4))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var decoded = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "picture \(i): libaom")
+            let theirs = try #require(decoded.planesTuple(0))
+            let stride = Int(decoded.stridesTuple(0))
+            let rows = (0..<height).filter { r in (0..<width).contains { frame.planes[0][r * width + $0] != theirs[r * stride + $0] } }
+            #expect(rows.isEmpty, "picture \(i): luma differs from libaom on \(rows.count) rows")
+        })
+    }
+}
