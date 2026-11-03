@@ -306,6 +306,16 @@ Every stream is the same (`--digest`). Median of 2 runs alternated with the comm
 A 5K key frame of scroll-win is now bound by the CPU (its GPU dropped 6 ms, its picture didn't).
 (The 5K typing-cc stream's 262 is a slow first run of the commit before; the other read 363.)
 
+**The other kernels, swept the same way** (5K photos key frames, each stage of the filters' search
+committed alone; ms). The filters' search is ~10.9 ms of GPU alone (~16 ms beside the next
+picture's analysis), and photos' key frames are bound by the GPU (analysis ~64 + filters):
+l_cdef_sse 3.85, p_cdef 3.09, p_deblock 2.92, p_cdef_dir 0.73, l_select 0.28, the rest < 0.1.
+- **Taken: p_deblock's threadgroups 8 x 8** (32 x 4 before): 2.92 → **2.59 ms** (4 x 16, 8 x 16,
+  8 x 4 about as good; 16 x 8 and 2 x 16 no better). The same streams.
+- No better: p_cdef and p_cdef_dir at any of 64x1 … 16x16 (their 32 x 8 and 16 x 8 are best);
+  l_cdef_sse at 64 or 128 threads (256: 3.89, 128: 3.91, 64: 3.96); the thread-per-block analysis
+  kernel at 32 … 256 threads (128 stays); the motion search (k_me) at one warp.
+
 ### Metal AV1: learned pruning's statistics in one pass per SB, from whole-number sums (2026-11-02)
 
 The node statistics were 3.1 of learned pruning's ~3.9 ms on a 5K picture: a thread per node per

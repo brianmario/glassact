@@ -788,7 +788,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 var pass = pass
                 begin(compute, "p_deblock")
                 compute.setBytes(&pass, length: 4, index: 2)
-                grid(compute, miCols, miRows, nPlanes, tw: 32, th: 4)
+                grid(compute, miCols, miRows, nPlanes, tw: 8, th: 8)  // (8 x 8: −11 % against 32 x 4, BENCHMARKS)
             }
         }
 
