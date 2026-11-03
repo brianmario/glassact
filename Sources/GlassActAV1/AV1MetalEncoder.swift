@@ -388,6 +388,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Inter frames' analysis effort (nil: `preset`'s): their intra blocks matter less, as
     /// most of the picture is copied or predicted from the previous one.
     public var interPreset: Preset?
+    /// Inter frames coding more than `interGateOverShare` of their superblocks analyze only these
+    /// shapes (GpParams.shapeMask bits; nil: their preset's). Fewer shapes cost a little more of
+    /// such a picture's bytes for less analysis (BENCHMARKS "fewer shapes in mostly new pictures").
+    public var newPictureShapeMask: Int32?
     let recon: any MTLComputePipelineState
     let mlStats: any MTLComputePipelineState, mlCell: any MTLComputePipelineState
     let mlTree: any MTLComputePipelineState, mlList: any MTLComputePipelineState, mlMode: any MTLComputePipelineState
@@ -902,8 +906,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 last.map(\.length) == src.map(\.length) && last[0] !== src[0] ? last : nil
             }
             // analysis grids: every enabled shape over the coded area (inter frames': interPreset's)
-            let shapeMask = last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
-                                        : encoder.params.shapeMask
+            let newPicture = last != nil && encoder.newPictureShapeMask != nil
+                && Double(skipped?.count(where: { $0 == 0 }) ?? 1) > encoder.interGateOverShare * Double(max(1, skipped?.count ?? 1))
+            let shapeMask = newPicture ? encoder.newPictureShapeMask!
+                : last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
+                : encoder.params.shapeMask
             var nbx = [Int32](repeating: 0, count: Int(GP_NSHAPES)), nby = nbx
             var shOff = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
             var blkTotal: UInt32 = 0
@@ -1058,6 +1065,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             // the share of the picture coded (not copied): the same with kept analysis as without
             let codedShare = skipped.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
             if !encoder.searchesAngleDeltas || codedShare > encoder.angleDeltasUpToShare { params.deltas = 0; params.uvDeltas = 0 }
+            if isInter, codedShare > encoder.interGateOverShare, let m = encoder.newPictureShapeMask { params.shapeMask = m }
             // the inter gate where most of the picture is new (a switch of Spaces, apps or windows)
             params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)

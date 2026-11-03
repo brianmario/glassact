@@ -35,6 +35,7 @@ let av1SeqCommand = Command(
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
+        .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
@@ -225,6 +226,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
     encoder.returnsPlanes = !opts.has("no-planes")
     encoder.interSkipsIntra = !opts.has("intra-everywhere")
+    if let m = opts.string("new-shapes") {
+        guard let v = Int32(m.replacingOccurrences(of: "0x", with: ""), radix: 16) else { throw BenchError("--new-shapes: hex") }
+        encoder.newPictureShapeMask = v
+    }
     if let name = opts.string("inter-preset") {
         guard let p = AV1MetalEncoder.Preset(rawValue: name) else { throw BenchError("--inter-preset: unknown") }
         encoder.interPreset = p

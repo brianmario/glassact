@@ -273,6 +273,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.interPreset }
         set { metal.interPreset = newValue }
     }
+    /// See `AV1MetalEncoder.newPictureShapeMask` (nil: off).
+    public var newPictureShapeMask: Int32? {
+        get { metal.newPictureShapeMask }
+        set { metal.newPictureShapeMask = newValue }
+    }
 
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false

@@ -214,6 +214,7 @@ the numbers and the reasoning.
 | An inter frame's 8x8, 8x16 and 16x8 on the thread-per-block kernel where most of the picture is new (`metal-av1`) | kept | the same streams; the full-change mixes' GPU analysis −1.5 to −10 ms at 5K (photos+drag 81.6 → 71.6) | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
+| Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | built, off: the owner's choice | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -278,6 +279,44 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: what buys speed on a picture of new content, at what bytes (2026-11-03)
+
+A 5K picture new against both references (the four-trace rotation, q20) takes ~55 ms: the GPU
+bounds it, ~42 ms of analysis beside ~15 ms of filters (the filters' wall time on a GPU the next
+picture's analysis shares: `av1seq` now prints it). Stage by stage (`--profile`): analysis 32.4 ms
+spread over every shape (4x4 1.5 · 4x8 1.7 · 8x4 1.7 · 8x8 2.0 · 8x16 3.7 · 16x8 3.6 · 16x16 2.8 ·
+16x32 3.4 · 32x16 3.2 · 32x32 3.9 · 64x64 4.4), inter candidates 6.9, leaves 4.4, motion search
+3.0, learned pruning 2.2. The closed loop takes ~19 ms of CPU, the write ~8 (on its thread).
+
+Three levers, each only in pictures coding more than half their 64x64s, measured on the rotation
+(24 pictures, q 14–32; BD-rate by RGB PSNR / SSIMULACRA2 against today's; inter frames a second;
+the GPU's analysis a picture):
+
+| | BD-rate | inter frames a second | GPU analysis (ms) |
+|---|---|---|---|
+| today | — | 17.7–19.1 | 40.7–43.5 |
+| **shapes: no 8x16 / 16x8** (`--new-shapes 13CF`) | +0.45 % / +0.42 % | 19.3–22.4 | 33.7–36.1 |
+| shapes: no 16x32 / 32x16 (`127F`) | +0.37 % / +0.64 % | 18.8–21.5 | 35.5–38.1 |
+| **shapes: squares, 4x8, 8x4** (`124F`) | +0.95 % / +1.08 % | 20.8–24.2 | 28.0–30.8 |
+| **shapes: squares** (`1249`) | +1.58 % / +1.66 % | 22.1–25.5 | 24.8–26.7 |
+| shapes: squares from 8x8 (`1248`) | +10.1 % / +7.8 % | 23.0–25.5 | 23.3–24.0 |
+| learned pruning, eps 0.05 (levels, modes, chroma) | +2.2 % / +1.9 % | 17.8–20.8 | 36.7–38.7 |
+| learned pruning, eps 0.2 | +8.4 % / +9.2 % | 20.1–23.0 | 29.6–32.0 |
+| learned pruning, eps 0.35 | +16.4 % / +27.1 % | 20.9–24.5 | 26.2–28.5 |
+| preset turbo2 (= turbo3 here: angle deltas are off in such pictures) | +8.8 % / +6.1 % | 20.0–21.6 | 35.8–37.7 |
+| turbo2 and eps 0.2 | +17.7 % / +16.4 % | 22.0–25.3 | 25.8–27.6 |
+| tiles 3x1 instead of 3x0 | +0.6 % / +0.2 % | 18.0–19.3 | 40.8–44.3 |
+
+The shapes win: rectangles cost 43 % of the analysis and buy ~1.5 % of a new picture's bytes.
+`AV1HybridEncoder.newPictureShapeMask` (`av1seq --new-shapes`), off: a bytes trade, the owner's
+choice. With it set, the single traces are byte-identical (no picture of theirs is mostly new)
+and the two-screen mixes +0.1 % (their first inter frame, before GOLDEN_FRAME has a picture).
+
+None of these reaches 60 a second: at best ~25, where the closed loop (~19 ms of CPU) and the
+filters come next. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
+ProRes and JPEG). Not kept: copying GOLDEN_FRAME's planes beside the closed loop instead of after
+it (~0.7 ms of CPU; no difference in pictures a second, which the GPU bounds).
 
 ### Metal AV1: GOLDEN_FRAME, and where libaom beat us on a full-screen change (2026-11-02)
 
