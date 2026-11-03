@@ -906,7 +906,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 last.map(\.length) == src.map(\.length) && last[0] !== src[0] ? last : nil
             }
             // analysis grids: every enabled shape over the coded area (inter frames': interPreset's)
-            let newPicture = last != nil && encoder.newPictureShapeMask != nil
+            let newPicture = skipped != nil && encoder.newPictureShapeMask != nil
                 && Double(skipped?.count(where: { $0 == 0 }) ?? 1) > encoder.interGateOverShare * Double(max(1, skipped?.count ?? 1))
             let shapeMask = newPicture ? encoder.newPictureShapeMask!
                 : last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
@@ -1065,7 +1065,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             // the share of the picture coded (not copied): the same with kept analysis as without
             let codedShare = skipped.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
             if !encoder.searchesAngleDeltas || codedShare > encoder.angleDeltasUpToShare { params.deltas = 0; params.uvDeltas = 0 }
-            if isInter, codedShare > encoder.interGateOverShare, let m = encoder.newPictureShapeMask { params.shapeMask = m }
+            // (an inter frame has copies decided, with or without a motion search)
+            if skipped != nil, codedShare > encoder.interGateOverShare, let m = encoder.newPictureShapeMask { params.shapeMask = m }
             // the inter gate where most of the picture is new (a switch of Spaces, apps or windows)
             params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)

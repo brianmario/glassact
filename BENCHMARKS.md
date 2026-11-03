@@ -313,8 +313,15 @@ The shapes win: rectangles cost 43 % of the analysis and buy ~1.5 % of a new pic
 choice. With it set, the single traces are byte-identical (no picture of theirs is mostly new)
 and the two-screen mixes +0.1 % (their first inter frame, before GOLDEN_FRAME has a picture).
 
-None of these reaches 60 a second: at best ~25, where the closed loop (~19 ms of CPU) and the
-filters come next. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
+The motion search in such pictures saves 3.9 % of their bytes (q20: 497 → 478 KB) for ~10 ms of
+GPU (`--no-motion-search`: 41.5 → 31.1 ms). Squares and no motion search together: the GPU's
+analysis 17.8 ms, +3.8 % bytes, but only 25.5 inter frames a second, because the period is no
+longer the GPU's. Each picture's closed loop (~17 ms) predicts from the previous picture's filtered
+output, so it waits for those filters (~9–11 ms of GPU): closed loop, filters, closed loop is a
+serial chain of ~28 ms a picture, plus ~12 ms of reading the analysis, applying copies and
+waiting on the last write.
+
+None of these reaches 60 a second: at best ~25, where that chain bounds it. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
 ProRes and JPEG). Not kept: copying GOLDEN_FRAME's planes beside the closed loop instead of after
 it (~0.7 ms of CPU; no difference in pictures a second, which the GPU bounds).
 
