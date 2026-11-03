@@ -73,7 +73,7 @@ import GlassActWire
             guard let engine = box.engine else { return }
             let now = MonotonicClock.nowUS
             if engine.state == .running {
-                frameCopy.withUnsafeBytes { raw in
+                (box.frame ?? frameCopy).withUnsafeBytes { raw in
                     engine.encodeTick(frame: raw, bytesPerRow: width * 4, dirtyRects: nil, captureTimestampUS: now, nowUS: now)
                 }
             }
@@ -97,6 +97,7 @@ import GlassActWire
 
     final class HostBox: @unchecked Sendable {
         var engine: HostEngine? // serverQueue
+        var frame: [UInt8]? // serverQueue: what the host shows instead of the rig's frame
         let log = HostLog()
     }
 
@@ -124,6 +125,63 @@ import GlassActWire
             return true
         }
         return ok ? (w, h, out) : nil
+    }
+
+    /// A change that lands before `wait_for_change` is called: missed without `since`, found with
+    /// it, at once, in the regions it touched and not in the others.
+    @Test func waitForChangeSinceCatchesAChangeThatCameFirst() throws {
+        guard let rig = try Self.makeRig() else {
+            Issue.record("QUIC loopback didn't come up")
+            return
+        }
+        defer { rig.stop() }
+        #expect(Self.waitUntil(15) { ((try? rig.driver.perform("status", [:]))?["connected"] as? Bool) == true })
+        let shot = try rig.driver.perform("screenshot", ["timeout": 5.0])
+        let before = try #require(shot["version"] as? Int)
+
+        func wait(_ args: [String: Any]) throws -> (changed: Bool, seconds: Double, version: Int?) {
+            let t0 = MonotonicClock.nowUS
+            let r = try rig.driver.perform("wait_for_change", args)
+            return (r["changed"] as? Bool ?? false, Double(MonotonicClock.nowUS - t0) / 1e6, r["version"] as? Int)
+        }
+        func setPixels(x: Int, y: Int, to value: UInt8, _ frame: [UInt8]) -> [UInt8] {
+            var f = frame
+            for row in y..<(y + 8) { for col in x..<(x + 8) { for c in 0..<3 { f[(row * Self.width + col) * 4 + c] = value } } }
+            return f
+        }
+        // nothing yet
+        #expect(try wait(["since": before, "timeout": 0.3]).changed == false)
+
+        // a small change in one tile, which arrives and settles before anyone waits
+        let changed = setPixels(x: 100, y: 100, to: 0x55, rig.frame)
+        rig.serverQueue.sync { rig.hostBox.frame = changed }
+        #expect(Self.waitUntil(5) { rig.session.queue.sync { rig.session.engine.contentVersion } != UInt64(before) })
+        _ = try rig.driver.perform("wait_for_settle", ["timeout": 5.0])
+
+        #expect(try wait(["timeout": 0.3]).changed == false) // the race this exists for
+        let found = try wait(["since": before, "timeout": 5.0])
+        #expect(found.changed && found.seconds < 1)
+        #expect(try wait(["since": before, "region": [96, 96, 16, 16], "timeout": 5.0]).changed)
+        #expect(try wait(["since": before, "region": [400, 300, 16, 16], "timeout": 0.2]).changed == false)
+        let later = try #require(found.version)
+        #expect(try wait(["since": later, "timeout": 0.2]).changed == false)
+        // a version from another session is no proof that nothing changed
+        #expect(try wait(["since": later + 1_000_000, "timeout": 0.2]).changed)
+
+        // a change during a region wait without `since`: its pixels, and only there
+        rig.serverQueue.asyncAfter(deadline: .now() + 0.2) {
+            rig.hostBox.frame = setPixels(x: 300, y: 200, to: 0xAA, changed)
+        }
+        #expect(try wait(["region": [292, 196, 16, 16], "timeout": 5.0]).changed)
+        #expect(try wait(["region": [96, 96, 16, 16], "timeout": 0.2]).changed == false)
+
+        // an action hands back the version from before its input
+        let click = try rig.driver.perform("click", ["x": 10, "y": 10])
+        #expect(click["version"] is Int)
+        for bad: Any in [-1, 1.5, "soon"] {
+            #expect(throws: AgentDriver.Failure.self) { _ = try rig.driver.perform("wait_for_change", ["since": bad]) }
+        }
+        #expect(throws: AgentDriver.Failure.self) { _ = try rig.driver.perform("wait_for_change", ["region": [9000, 9000, 4, 4]]) }
     }
 
     @Test func agentSeesExactPixelsAndDrivesTheHost() throws {

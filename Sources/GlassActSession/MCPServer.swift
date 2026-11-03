@@ -136,6 +136,7 @@ public final class MCPServer {
         var info = "Screenshot \(r["width"] ?? "?")×\(r["height"] ?? "?")"
         if let region = r["region"] { info += " of region \(region)" }
         if (r["settled"] as? Bool) == false { info += " (still changing — may be mid-update)" }
+        if let version = r["version"] { info += "; version \(version)" }
         return ["content": [["type": "image", "data": data, "mimeType": "image/png"], ["type": "text", "text": info]]]
     }
 
@@ -167,7 +168,8 @@ public final class MCPServer {
         Drives a remote Mac through Glass Act. Start with `connect` (a headless session of your own — the \
         host's user approves it once) or `attach_viewer` (the session the person already has open in \
         Glass Act Viewer). Then: `screenshot` to look, act with `click`/`type`/`key`/`scroll`/`drag`, and \
-        `wait_for_settle` before judging the result. Coordinates are in the screenshot's pixel space \
+        `wait_for_settle` before judging the result. To wait for what an action caused, pass the `version` \
+        it returned to `wait_for_change` as `since`, which can't miss a change that came first. Coordinates are in the screenshot's pixel space \
         (status reports it). Screenshots are exact once settled. `ui_tree` lists the focused window's \
         controls with frames — often easier than reading pixels. If an input call says the person is \
         using it, wait: people at either end always win.
@@ -229,8 +231,9 @@ public final class MCPServer {
          "inputSchema": schema(["text": str, "screenshot": shot], required: ["text"])],
         ["name": "wait", "description": "Wait some seconds.", "inputSchema": schema(["seconds": num])],
         ["name": "wait_for_settle", "description": "Wait until the screen stops changing.", "inputSchema": schema(["timeout": num])],
-        ["name": "wait_for_change", "description": "Wait until the screen (or a region) changes.",
-         "inputSchema": schema(["region": rect, "timeout": num])],
+        ["name": "wait_for_change", "description": "Wait until the screen (or a region) changes. Without `since`, only changes after this call count, so one an action already caused is missed.",
+         "inputSchema": schema(["region": rect, "timeout": num,
+                                "since": ["type": "integer", "description": "a `version` an earlier call returned: waits for a change after it, returning at once if there already was one (screenshot, click and other actions return one)"]])],
         ["name": "cursor_position", "description": "Where the agent last put the pointer.", "inputSchema": schema([:])],
         ["name": "list_windows", "description": "The host's on-screen windows (id, app, title).", "inputSchema": schema([:])],
         ["name": "share_window", "description": "Share only one window (its id), or 0 for the whole display.",

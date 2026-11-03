@@ -1205,6 +1205,19 @@ public final class ViewerEngine: @unchecked Sendable {
         (dirty.changed(since: since), dirty.tileCount)
     }
 
+    /// Whether the picture changed after `contentVersion` was `since`: anywhere,
+    /// or in the tiles touching a rect of canvas pixels.
+    public func contentChanged(since: UInt64, x: Int = 0, y: Int = 0, width: Int? = nil, height: Int? = nil) -> Bool {
+        guard let grid, width != nil || height != nil else { return since != dirty.version }
+        let tile = TileGrid.tileSize
+        let x0 = max(0, x), y0 = max(0, y)
+        let x1 = min(grid.width, x + (width ?? grid.width)), y1 = min(grid.height, y + (height ?? grid.height))
+        guard x1 > x0, y1 > y0 else { return false }
+        return dirty.anyChanged(since: since, rows: (y0 / tile)..<((y1 + tile - 1) / tile),
+                                columns: (x0 / tile)..<((x1 + tile - 1) / tile),
+                                stride: (grid.width + tile - 1) / tile)
+    }
+
     /// Drains the dirty-tile set (present-side consumption).
     public func drainDirtyTiles(into out: inout [Int]) {
         dirty.drain(into: &out)

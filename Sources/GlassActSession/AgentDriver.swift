@@ -151,9 +151,10 @@ public final class AgentDriver: @unchecked Sendable {
             return ["waited": seconds]
         case "wait_for_settle":
             let result = try waitSettled(timeout: try args.optionalDouble("timeout") ?? 5)
-            return ["settled": result.settled, "moving_tiles": result.moving]
+            return ["settled": result.settled, "moving_tiles": result.moving, "version": version()]
         case "wait_for_change":
-            return try waitForChange(region: try args.rect("region"), timeout: try args.optionalDouble("timeout") ?? 10)
+            return try waitForChange(region: try args.rect("region"), since: try args.optionalVersion("since"),
+                                     timeout: try args.optionalDouble("timeout") ?? 10)
         case "cursor_position":
             let (cw, ch) = try canvasSize()
             let s = scale(cw, ch)
@@ -180,7 +181,11 @@ public final class AgentDriver: @unchecked Sendable {
             return try uiTree(windowID: args.optionalInt("window_id") ?? 0,
                               maxNodes: args.optionalInt("max_nodes") ?? 400)
         default:
-            return try input(op, args)
+            // read before the input goes out, so what it causes is after this version
+            let before = version()
+            var result = try input(op, args)
+            result["version"] = before
+            return result
         }
     }
 
@@ -431,6 +436,7 @@ public final class AgentDriver: @unchecked Sendable {
             "control": control,
             "agent_active": active,
             "max_edge": maxEdge,
+            "version": version(),
         ]
         if !reason.isEmpty { out["control_reason"] = reason }
         if let grid = snapshot.1 {
@@ -485,16 +491,25 @@ public final class AgentDriver: @unchecked Sendable {
     }
 
     private func frame() throws -> ScreenFrame {
-        guard let f = session.queue.sync(execute: { ScreenFrame.capture(session.engine) }) else {
-            throw Failure("no picture yet")
-        }
-        return f
+        try versionedFrame().frame
+    }
+
+    /// The picture, and the version that covers exactly its pixels.
+    private func versionedFrame() throws -> (frame: ScreenFrame, version: UInt64) {
+        let read = session.queue.sync { (ScreenFrame.capture(session.engine), session.engine.contentVersion) }
+        guard let f = read.0 else { throw Failure("no picture yet") }
+        return (f, read.1)
+    }
+
+    /// The picture's version: pass it to `wait_for_change` as `since`.
+    private func version() -> Int {
+        Int(clamping: session.queue.sync { session.engine.contentVersion })
     }
 
     private func screenshot(settled wantSettled: Bool, timeout: Double, region: CGRect?) throws -> [String: Any] {
         let settle = wantSettled ? try waitSettled(timeout: timeout) : (settled: false, moving: -1)
         let settled = settle.settled
-        let f = try frame()
+        let (f, shown) = try versionedFrame()
         let s = scale(f.width, f.height)
         guard let image = f.image() else { throw Failure("couldn't build the image") }
         var crop: CGRect?
@@ -517,33 +532,57 @@ public final class AgentDriver: @unchecked Sendable {
             "width": outW, "height": outH,
             "screen": ["width": Int((Double(f.width) / s).rounded()), "height": Int((Double(f.height) / s).rounded())],
             "settled": settled,
+            "version": Int(clamping: shown),
         ]
         if settle.moving > 0 { out["moving_tiles"] = settle.moving }
         if let region { out["region"] = [region.minX, region.minY, region.width, region.height] }
         return out
     }
 
-    private func waitForChange(region: CGRect?, timeout: Double) throws -> [String: Any] {
+    /// Waits for a change after `since` (a `version` an earlier operation returned), which returns
+    /// at once if it has already happened: a change that lands between an action and this call
+    /// isn't missed. By a tile being written, so a tile sent again unchanged counts too. Without
+    /// `since`, only changes after this call count, and in a region only ones to its pixels.
+    private func waitForChange(region: CGRect?, since: UInt64?, timeout: Double) throws -> [String: Any] {
         try requireRunning()
         let deadline = MonotonicClock.nowUS + UInt64(min(120, max(0, timeout)) * 1_000_000)
+        var area: (x: Int, y: Int, width: Int, height: Int)?
         if let region {
-            let first = try frame()
-            let s = scale(first.width, first.height)
-            let (x, y) = (Int(region.minX * s), Int(region.minY * s))
-            let (w, h) = (Int((region.width * s).rounded(.up)), Int((region.height * s).rounded(.up)))
-            let baseline = first.digest(x: x, y: y, width: w, height: h)
-            while MonotonicClock.nowUS < deadline {
-                Thread.sleep(forTimeInterval: 0.1)
-                if try frame().digest(x: x, y: y, width: w, height: h) != baseline { return ["changed": true] }
+            let (cw, ch) = try canvasSize()
+            let s = scale(cw, ch)
+            let a = (x: Int(region.minX * s), y: Int(region.minY * s),
+                     width: Int((region.width * s).rounded(.up)), height: Int((region.height * s).rounded(.up)))
+            guard a.x < cw, a.y < ch, a.x + a.width > 0, a.y + a.height > 0 else { throw Failure("region is off screen") }
+            area = a
+        }
+        var mark: UInt64
+        var baseline: Int?
+        if let since {
+            mark = since
+        } else if let area {
+            let (f, shown) = try versionedFrame()
+            baseline = f.digest(x: area.x, y: area.y, width: area.width, height: area.height)
+            mark = shown
+        } else {
+            mark = session.queue.sync { session.engine.contentVersion }
+        }
+        while true {
+            let (changed, now) = session.queue.sync { () -> (Bool, UInt64) in
+                let e = session.engine
+                let c = area.map { e.contentChanged(since: mark, x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+                return (c ?? e.contentChanged(since: mark), e.contentVersion)
             }
-            return ["changed": false]
-        }
-        let baseline = session.queue.sync { session.engine.contentVersion }
-        while MonotonicClock.nowUS < deadline {
+            if changed {
+                guard let baseline, let area else { return ["changed": true, "version": Int(clamping: now)] }
+                let (f, shown) = try versionedFrame()
+                if f.digest(x: area.x, y: area.y, width: area.width, height: area.height) != baseline {
+                    return ["changed": true, "version": Int(clamping: shown)]
+                }
+                mark = shown // written, but the same pixels
+            }
+            if MonotonicClock.nowUS >= deadline { return ["changed": false, "version": Int(clamping: now)] }
             Thread.sleep(forTimeInterval: 0.05)
-            if session.queue.sync(execute: { session.engine.contentVersion }) != baseline { return ["changed": true] }
         }
-        return ["changed": false]
     }
 
     private func listWindows() throws -> [String: Any] {
@@ -650,6 +689,16 @@ struct Args {
         return n.intValue
     }
     func optionalInt(_ key: String) -> Int? { (raw[key] as? NSNumber)?.intValue }
+
+    /// A picture version: far past `maxMagnitude` within seconds of a busy 5K screen, and whole.
+    func optionalVersion(_ key: String) throws -> UInt64? {
+        guard has(key) else { return nil }
+        guard let n = raw[key] as? NSNumber, n.doubleValue >= 0, n.doubleValue <= 9_007_199_254_740_992,
+              n.doubleValue.rounded() == n.doubleValue else {
+            throw AgentDriver.Failure("“\(key)” must be a version an earlier operation returned")
+        }
+        return n.uint64Value
+    }
 
     func bool(_ key: String) -> Bool? { (raw[key] as? NSNumber)?.boolValue }
 

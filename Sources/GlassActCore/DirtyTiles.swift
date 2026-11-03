@@ -15,6 +15,9 @@ struct DirtyTiles {
     /// moved since then" (an agent tolerating a spinner while it waits for
     /// everything else to settle).
     private var stamps = ContiguousArray<UInt64>()
+    /// `version` at the last geometry reset: everything changed then, though
+    /// the stamps restart at 0.
+    private var resetVersion: UInt64 = 0
 
     /// New canvas geometry: nothing dirty.
     mutating func reset(tileCount: Int) {
@@ -22,6 +25,7 @@ struct DirtyTiles {
         stamps = ContiguousArray(repeating: 0, count: tileCount)
         count = 0
         version &+= 1
+        resetVersion = version
     }
 
     @inline(__always)
@@ -39,6 +43,17 @@ struct DirtyTiles {
         var n = 0
         for s in stamps where s > since { n += 1 }
         return n
+    }
+
+    /// Whether any of the tiles in `rows` × `columns` (of a grid `stride` tiles
+    /// wide) changed after `since`. A `since` this set never handed out (a
+    /// version from another session) counts as changed: nothing says otherwise.
+    func anyChanged(since: UInt64, rows: Range<Int>, columns: Range<Int>, stride: Int) -> Bool {
+        if since < resetVersion || since > version { return true }
+        for row in rows {
+            for column in columns where stamps[row * stride + column] > since { return true }
+        }
+        return false
     }
 
     var tileCount: Int { stamps.count }
