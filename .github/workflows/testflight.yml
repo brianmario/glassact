@@ -1,0 +1,82 @@
+name: TestFlight
+
+# Builds the iPad Viewer, signs it for the App Store, and uploads it to App
+# Store Connect for TestFlight. Run it by hand (Actions › TestFlight › Run
+# workflow) from any branch. RELEASING.md has the one-time setup.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    name: TestFlight
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      TEAM: ${{ vars.APPLE_TEAM_ID }}
+      IPAD_PROFILE: ${{ vars.IPAD_PROFILE_NAME }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      OUT: build/ci-testflight
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Secrets present
+        env:
+          CERT: ${{ secrets.DISTRIBUTION_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DISTRIBUTION_P12_PASSWORD }}
+          IPAD_PROFILE_DATA: ${{ secrets.IPAD_PROFILE_BASE64 }}
+          ASC_KEY: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=()
+          # ASC_ISSUER_ID is only for a team API key; an individual key has none.
+          for name in TEAM IPAD_PROFILE ASC_KEY_ID CERT CERT_PASSWORD IPAD_PROFILE_DATA ASC_KEY; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::TestFlight setup incomplete (RELEASING.md): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Signing keychain and profile
+        env:
+          KEYCHAIN: ${{ runner.temp }}/testflight.keychain-db
+          CERT: ${{ secrets.DISTRIBUTION_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DISTRIBUTION_P12_PASSWORD }}
+          IPAD_PROFILE_DATA: ${{ secrets.IPAD_PROFILE_BASE64 }}
+          ASC_KEY: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          PROFILES="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          mkdir -p "$PROFILES"
+          echo "$IPAD_PROFILE_DATA" | base64 --decode > "$RUNNER_TEMP/p.mobileprovision"
+          uuid=$(security cms -D -i "$RUNNER_TEMP/p.mobileprovision" | plutil -extract UUID raw -o - -)
+          mv "$RUNNER_TEMP/p.mobileprovision" "$PROFILES/$uuid.mobileprovision"
+          echo "$ASC_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Build, sign, upload
+        run: Apps/ci-testflight.sh
+
+      - name: Clean up
+        if: always()
+        env:
+          KEYCHAIN: ${{ runner.temp }}/testflight.keychain-db
+        run: |
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/cert.p12"
