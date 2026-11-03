@@ -101,7 +101,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "glassact-bench",
-            dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport"],
+            dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActShare"],
             swiftSettings: strict
         ),
         // A Host with a synthetic screen, for developing a viewer (the iPad
