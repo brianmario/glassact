@@ -337,7 +337,24 @@ pictures, q 8–40): **30–35 inter frames a second** on pictures that are all 
 −13.8 % (BD-rate by PSNR / SSIMULACRA2). At q20: GPU analysis 18.8 ms, closed loop 10.2, filters
 14.3 (their GPU 11.3), writer 6.3. The all-GPU encoder (av1gpu's closed loop on the GPU, 98
 dependent wavefront steps) takes 749 ms for one such picture, against the hybrid's ~100
-(`av1still --hybrid`, scroll-win, q20). No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
+(`av1still --hybrid`, scroll-win, q20).
+
+**Decisions without RD:** the CPU's open-loop proxy (`Decider::node`, the reference engine's:
+squares, NONE vs SPLIT and the mode by the Hadamard-domain proxy, blocks up to 32x32) in place of
+the GPU's partition for the coded 64x64s of mostly new pictures (a temporary switch, not kept):
+**+76.0 % / +64.5 %** against today's (no motion search in both), +66.1 % / +46.2 % against
+libaom, −0.9 % / +27.2 % against HEVC; 5 pictures a second (the proxy on the CPU). With 64x64
+blocks allowed it lost 10 dB at q8: a 64x64 transform codes only its 32x32 lowest frequencies,
+which the proxy doesn't see. The RD search is what earns the bytes (squares through it: +1.6 %).
+
+**The Rust post-filters at 5K:** deblocking and CDEF of a dense picture (8x8 and 16x16 coded
+blocks, random samples, 8 CDEF presets) take ~70 ms on one thread (`postfilter`, a scratch
+example). Rows in parallel on 14 cores would be ~5–7 ms.
+
+**The CPU's work a picture** of the rotation, from user + system time over 40 more pictures:
+~480 core-ms (~380 with everything cheap), the bench's own reading and libaom decode check
+included. 60 a second allows at most ~233 core-ms on 14 cores. `docs/AV1-ENCODER-ARCHITECTURE.md`
+proposes what to do about all this. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
 ProRes and JPEG). Not kept: copying GOLDEN_FRAME's planes beside the closed loop instead of after
 it (~0.7 ms of CPU; no difference in pictures a second, which the GPU bounds).
 
