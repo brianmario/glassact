@@ -11,7 +11,7 @@
 #pragma once
 #include "k_analysis_small.h"
 
-#define LEAF_NW 4  // SIMD-groups per threadgroup
+#define LEAF_NW 1  // SIMD-groups per threadgroup (1: faster than 4, BENCHMARKS "one warp a threadgroup")
 #ifndef LEAF_WARP_TX
 #define LEAF_WARP_TX 1
 #endif

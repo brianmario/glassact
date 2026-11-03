@@ -357,8 +357,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         return cache
     }
 
-    /// k_leaf's threadgroup: LEAF_NW SIMD-groups, one leaf each at a time.
-    static let leafThreads = 128
+    /// k_leaf's threadgroup: LEAF_NW (1) SIMD-groups, one leaf each at a time.
+    static let leafThreads = 32
     /// After the partition, also decide every leaf's chroma mode and CfL and
     /// its luma tx type on the GPU, from the source (k_leaf): the partition's
     /// blocks then carry them, for a closed loop that only quantizes.

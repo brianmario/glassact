@@ -208,6 +208,7 @@ the numbers and the reasoning.
 | The closed loop without its tile coding, which the writer redid (`metal-av1`); learned pruning's buffers kept | kept | 5K key frames' closed loop −27 to −32 %, their pictures −3.4 to −8.6 ms, 720p key frames −1 to −2.8 ms; the same bytes. The next analysis set up a picture earlier, kept: no faster today (the GPU bounds a 5K key frame of text), up to 3–4 ms once the GPU catches up | [entry](#metal-av1-the-closed-loop-stops-coding-its-tiles-learned-prunings-buffers-kept-2026-11-02) |
 | Flat blocks with flat edges skip their analysis search (`metal-av1`) | kept | the same results; 720p scroll-win's analysis 7.4 → 6.9 ms, 5K ±noise (learned pruning already leaves few flat blocks to the search) | [entry](#metal-av1-flat-blocks-with-flat-edges-skip-their-search-results-unchanged-2026-11-02) |
 | Learned pruning's statistics in one pass per SB from whole-number sums (`metal-av1`) | kept | 3.85 → 2.02 ms of GPU a 5K picture; key frames −0.4 to −1.9 ms; BD 0.0 % (8x8 and 16x16 features bit-identical) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
+| One warp a threadgroup for the analysis's 16x32, 32x16, 32x32, their inter search, and the leaves (`metal-av1`) | kept | the same results; 5K key frames' GPU −5.7 to −7.4 ms (typing-cc picture 58.8 → 52.7, photos 89.9 → 82.0); 16x16 and smaller keep 4 warps (1 is slower there) | [entry](#metal-av1-one-warp-a-threadgroup-for-the-analysiss-16x32-32x16-and-32x32-their-inter-search-and-the-leaves-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -272,6 +273,38 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: one warp a threadgroup for the analysis's 16x32, 32x16 and 32x32, their inter search, and the leaves (2026-11-02)
+
+The analysis kernels put NW warps in a threadgroup, each on its own block: av1gpu's 4, or fewer
+where their scratch passes 32 KB (32x32: 3, 64x64: 1). Run with one warp a threadgroup (the same
+results: each block is still one warp's), the big shapes got much faster, not slower. `--profile`,
+5K key frames, ms (typing-cc / scroll-win / photos), NW as before → 1:
+
+| | 16x16 | 16x32 | 32x16 | 32x32 | leaves (k_leaf, LEAF_NW 4 → 1) |
+|---|---|---|---|---|---|
+| before | 2.89 / 2.53 / 4.03 | 4.78 / 3.39 / 6.12 | 3.63 / 2.76 / 5.19 | 8.65 / 6.23 / 11.38 | 6.6 / 7.0 / 6.9 |
+| one warp | 3.05 / 2.60 / 4.53 | **3.68 / 2.46 / 4.63** | **3.35 / 2.28 / 4.34** | **5.80 / 3.85 / 7.44** | **4.7 / – / 5.8** |
+
+Two warps sat between. Taken: 1 for 16x32, 32x16 and 32x32 (and their inter candidate search,
+k_inter: photos' inter frames 2.43 → 1.96 ms), and for the leaves; 16x16 and the smaller shapes
+keep 4, 64x64 had 1. Unchanged at one warp: the motion search (k_me). Why it pays isn't measured: a
+threadgroup holds its warps' scratch (to ~27 KB) until its slowest block is done, and smaller
+groups pack the cores more freely.
+
+Every stream is the same (`--digest`). Median of 2 runs alternated with the commit before, q20:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frame, GPU (ms, 30 frames) | 53.1 → **47.0** | 44.3 → **38.3** | 71.3 → **63.9** | 51.9 → **46.2** |
+| 5K key frame, picture (ms) | 58.8 → **52.7** | 51.3 → 51.5 | 89.9 → **82.0** | 56.1 → **53.1** |
+| 5K stream, inter frames a second | 262 → 363 | 239 → 270 | 97.0 → 107 | 361 → 356 |
+| 1440p key frame, GPU (ms) | 19.0 → 17.2 | 16.8 → 16.1 | 22.1 → 19.8 | 18.4 → 16.5 |
+| 720p key frame, GPU (ms) | 8.4 → 7.5 | 7.9 → 7.3 | 8.1 → 7.9 | 8.4 → 7.2 |
+| 720p stream, inter frames a second | 985 → 1133 | 506 → 538 | 217 → 228 | 773 → 737 |
+
+A 5K key frame of scroll-win is now bound by the CPU (its GPU dropped 6 ms, its picture didn't).
+(The 5K typing-cc stream's 262 is a slow first run of the commit before; the other read 363.)
 
 ### Metal AV1: learned pruning's statistics in one pass per SB, from whole-number sums (2026-11-02)
 
