@@ -29,6 +29,17 @@ __device__ __forceinline__ float ga_sum(float v, int tid, float *red) {
     return t;
 }
 template <int NT>
+__device__ __forceinline__ uint ga_sumu(uint v, int tid, int *redi) {
+    v = simd_sum(v);
+    if (NT == 32) return v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tid & 31) == 0) redi[tid >> 5] = (int)v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint t = 0;
+    for (int w = 0; w < NT / 32; w++) t += (uint)redi[w];
+    return t;
+}
+template <int NT>
 __device__ __forceinline__ int ga_max(int v, int tid, int *redi) {
     v = warp_max(v);
     if (NT == 32) return v;

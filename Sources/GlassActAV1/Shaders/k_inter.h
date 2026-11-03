@@ -337,12 +337,12 @@ constexpr int ga_tx_of() {
          : AV1G_TX_64X16;
 }
 
-template <int W, int H, int BS, int NW>
+template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                     constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
                     uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     threadgroup ASmem<W, H> smem[NW];
-    const int warp = (int)threadIdx_x >> 5, lane = (int)threadIdx_x & 31;
+    const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;  // the block's slot, its thread (k_analysis's NT)
     threadgroup ASmem<W, H> &S = smem[warp];
     constexpr int txSz = ga_tx_of<W, H>();
     for (uint32_t gb = blockIdx_x * NW + warp; gb < nTotal; gb += gridDim_x * NW) {
@@ -392,9 +392,9 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             const int2 v = int2(U.v[2 * j], U.v[2 * j + 1]);
             if (!ga_ref_inside(I, x, y, v, W, H)) continue;
             uint sad = 0;
-            for (int p = lane; p < (W / 8) * (H / 8); p += 32)
+            for (int p = lane; p < (W / 8) * (H / 8); p += NT)
                 sad += S8[j * 64 + (by8 + p / (W / 8)) * 8 + bx8 + p % (W / 8)];
-            sad = simd_sum(sad);
+            sad = ga_sumu<NT>(sad, lane, S.redi);
             const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
             if (s < bestS) { bestS = s; bestSad = sad; best = v; }
         }
@@ -402,14 +402,14 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         // content), no RD for it: intra will code the block
         if (P.interGate > 0.f && bestSad > 0) {
             uint s1 = 0;
-            for (int p = lane; p < W * H; p += 32) s1 += src[(p / W) * sp + p % W];
-            const int mean = (int)((simd_sum(s1) + W * H / 2) / (W * H));
+            for (int p = lane; p < W * H; p += NT) s1 += src[(p / W) * sp + p % W];
+            const int mean = (int)((ga_sumu<NT>(s1, lane, S.redi) + W * H / 2) / (W * H));
             uint dc = 0;
-            for (int p = lane; p < W * H; p += 32) dc += (uint)abs((int)src[(p / W) * sp + p % W] - mean);
-            dc = simd_sum(dc);
+            for (int p = lane; p < W * H; p += NT) dc += (uint)abs((int)src[(p / W) * sp + p % W] - mean);
+            dc = ga_sumu<NT>(dc, lane, S.redi);
             if ((float)bestSad > P.interGate * (float)dc) {
                 if (lane == 0) { ir.dx = (int16_t)best.x; ir.dy = (int16_t)best.y; ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
-                __syncwarp();
+                ga_sync<NT>();
                 continue;
             }
         }
@@ -428,15 +428,15 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             o.D = 0.f; o.R = base_bits(e, 0); o.eob = 0;
         } else {
             float en = 0.f;
-            for (int p = lane; p < W * H; p += 32) {
+            for (int p = lane; p < W * H; p += NT) {
                 const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, best);
                 S.res[p] = (int16_t)d;
                 en += (float)(d * d);
             }
-            __syncwarp();
-            e.resEnergy = warp_sum(en);
+            ga_sync<NT>();
+            e.resEnergy = ga_sum<NT>(en, lane, S.red);
             e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
-            warp_eval<W, H>(S.res, S.tmp, S.q, e, o, lane);
+            warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
         }
         const int hasC = av1g_has_chroma(BS, y >> 2, x >> 2, I.mono);
         const float J = o.D + lambda * (o.R + ga_mv_bits(best, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
@@ -447,6 +447,6 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             ir.zero = o.eob == 0 ? 1 : 0;
             ir.J = J;
         }
-        __syncwarp();
+        ga_sync<NT>();
     }
 }

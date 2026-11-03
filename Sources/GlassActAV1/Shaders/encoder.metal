@@ -45,7 +45,8 @@ GA_ANALYSIS(16, 64, AV1G_BLOCK_16X64, 3)
 GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
 
 // Inter frames' motion search (k_me, then k_inter per shape of 8x8 and up, after the analysis):
-// k_inter_<W>x<H>_w<NW>, NW as the analysis's (1 for 16x32, 32x16 and 32x32 likewise).
+// k_inter_<W>x<H>_w<NW>, NW as the analysis's (1 for 16x32, 32x16 and 32x32 likewise), or
+// k_inter_<W>x<H>_w1t<NT>: a block on NT threads, as k_analysis's.
 #include "k_inter.h"
 #define GA_INTER(W, H, BS, NWS)                                                                            \
     template [[host_name("k_inter_" #W "x" #H "_w" #NWS)]] kernel void k_inter<W, H, BS, NWS>(            \
@@ -53,18 +54,24 @@ GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
         constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
     static_assert(NWS <= GA_AN_NW(W, H), "k_inter_" #W "x" #H ": its NW warps' scratch must fit");
+#define GA_INTER_T(W, H, BS, NT)                                                                           \
+    template [[host_name("k_inter_" #W "x" #H "_w1t" #NT)]] kernel void k_inter<W, H, BS, 1, NT>(           \
+        constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
+        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);
+
 GA_INTER(8, 8, AV1G_BLOCK_8X8, 4)
 GA_INTER(8, 16, AV1G_BLOCK_8X16, 4)
 GA_INTER(16, 8, AV1G_BLOCK_16X8, 4)
 GA_INTER(16, 16, AV1G_BLOCK_16X16, 4)
 GA_INTER(8, 32, AV1G_BLOCK_8X32, 4)
 GA_INTER(32, 8, AV1G_BLOCK_32X8, 4)
-GA_INTER(16, 32, AV1G_BLOCK_16X32, 1)
-GA_INTER(32, 16, AV1G_BLOCK_32X16, 1)
-GA_INTER(32, 32, AV1G_BLOCK_32X32, 1)
+GA_INTER_T(16, 32, AV1G_BLOCK_16X32, 64)
+GA_INTER_T(32, 16, AV1G_BLOCK_32X16, 64)
+GA_INTER_T(32, 32, AV1G_BLOCK_32X32, 128)
 GA_INTER(32, 64, AV1G_BLOCK_32X64, 2)
 GA_INTER(64, 32, AV1G_BLOCK_64X32, 2)
-GA_INTER(64, 64, AV1G_BLOCK_64X64, 1)
+GA_INTER_T(64, 64, AV1G_BLOCK_64X64, 128)
 GA_INTER(16, 64, AV1G_BLOCK_16X64, 3)
 GA_INTER(64, 16, AV1G_BLOCK_64X16, 3)
 

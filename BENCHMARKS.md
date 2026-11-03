@@ -316,6 +316,13 @@ photos+drag 11.9 → **13.3** (71.5 → 62.1); 1440p 55.6 → 60.9 and 38.0 → 
 runs each: typing-cc 363 → 364, scroll-win 256 → 264, cursor-drag 330 → 340. A 5K key frame of text
 is bound by the CPU again (its finish ~49 ms against the GPU's ~39).
 
+**The inter candidates likewise** (k_inter, NT 64 for 16x32 and 32x16, 128 for 32x32 and 64x64;
+its SAD sums `ga_sumu`). `--profile`, 5K full-change mixes: inter candidates 7.8 → **6.05 ms**
+(typing+scroll), 9.05 → **6.87** (photos+drag). The same streams on every trace and on the mixes
+but photos+drag at q8 (a decision the sums' order moved: BD 0.00 % by PSNR-Y, q 8–32). Median of
+2, against the commit before: 5K mixes 20.7 → **21.4** and 13.3 → **13.8** inter frames a second
+(GPU 38.9 → 37.0, 62.5 → 59.3 ms); 1440p and ordinary streams within noise.
+
 ### Metal AV1: full-screen change inside a stream, and the inter gate (2026-11-02)
 
 **A benchmark for it.** A key frame isn't what a stream codes when the whole screen changes (a
