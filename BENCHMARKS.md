@@ -287,6 +287,26 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 against libaom and hardware HEVC, after the day's speed work (2026-11-03)
+
+The hybrid at 077d14e (squares on new pictures, four tx types, quick trials, the writer
+overlapped; `--tiles 3x0`) against the same pictures' stored libaom speed 9 (inter frames) and
+VideoToolbox HEVC (`vquality --qp`, 18–42) runs of 2026-11-02: 5120×2880, 40 pictures, q 8–40.
+BD-rate by RGB PSNR / SSIMULACRA2. The hybrid's run wasn't gated on a locked screen, so its speeds
+may read a little low; bytes and quality don't depend on that.
+
+| content | against libaom | against HEVC | hybrid, inter frames a second | libaom | HEVC, by one picture's latency |
+|---|---|---|---|---|---|
+| every picture new (four traces in turn) | −4.5 % / −9.6 % | −42.8 % / −21.2 % | 26–29 | 20–25 | 26–30 |
+| typing and scrolling in turn | −90.2 % / −90.5 % | −95.7 % / −93.8 % | 140–172 | 27–36 | 27–30 |
+| photos and dragging in turn | −87.1 % / −86.8 % | −90.8 % / −87.9 % | 52–60 | 13–18 | 26–29 |
+
+The day's byte trades show on the first row (−7 % / −11 % and −44 % / −23 % before them). HEVC's
+column is one picture at a time; with several in the encoder at once it reached 58–59 a second
+on 2026-08-07's traces (not on these), so it's still ahead on throughput on new pictures. At q20
+on new pictures the stages are GPU analysis 24.5, closed loop 16.4, filters 15.7 (GPU 8.7), writer
+10.8 ms. Single traces weren't re-measured here.
+
 ### Metal AV1: the closed loop's forward DCTs by their butterflies, measured, not kept (2026-11-03)
 
 The forward matrices (the exact inverse of AV1's integer inverse transforms) keep the DCT's

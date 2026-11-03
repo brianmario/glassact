@@ -20,8 +20,8 @@ and of GOLDEN_FRAME's are decided on the CPU from the sources, ahead, and skip t
 | content | inter frames a second | against libaom / HEVC (BD-rate) |
 |---|---|---|
 | scrolling, dragging, typing (copies at a shift) | 160–230 | −33 to −58 % / −68 to −84 % (2026-11-01) |
-| two screens in turn (app, Space or tab switching) | 48–128 | −87 to −91 % / −88 to −96 % |
-| every picture new (four traces in turn) | 18–20 | −7 to −11 % / −23 to −44 % |
+| two screens in turn (app, Space or tab switching) | 52–172 (2026-11-03) | −87 to −91 % / −88 to −96 % |
+| every picture new (four traces in turn) | 26–29 (2026-11-03; 18–20 when this note was written) | −5 to −10 % / −21 to −43 % |
 | every picture new, everything cheap (squares, no motion search, no tx search, tiles 4x1) | 30–35 | +8 / −1 % / −36 / −14 % |
 
 Only the last two rows miss 60. A picture of new content costs, at q20:
