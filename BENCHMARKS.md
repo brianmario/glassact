@@ -321,7 +321,23 @@ output, so it waits for those filters (~9–11 ms of GPU): closed loop, filters,
 serial chain of ~28 ms a picture, plus ~12 ms of reading the analysis, applying copies and
 waiting on the last write.
 
-None of these reaches 60 a second: at best ~25, where that chain bounds it. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
+None of these reaches 60 a second: at best ~25, where that chain bounds it.
+
+**The rest of the levers** (the rotation, 24 pictures, q 14–32, against today's; q20's stages):
+
+| | BD-rate | inter frames a second | at q20: closed loop / filters' GPU / writer (ms) |
+|---|---|---|---|
+| tiles 4x0 / 4x1 / 5x1 | +0.8/+0.2, +1.4/+0.4, +1.8/+0.6 % | unchanged (18–20) | the closed loop unchanged (~18.5; it is block-parallel already); writer 8.4 → 6.9 / 5.5 / 5.1 |
+| no tx type search (`--no-tx-search`) | +8.9 % / +6.8 % | unchanged | closed loop 18.5 → 10.9 |
+| only 8x8 and 16x16 (`--new-shapes 0048`, no motion search) | +30 % / +33 % | 13.8–14.5 (slower) | closed loop 43: the CPU's cost follows the number of blocks |
+
+**Everything cheap at once** (squares, no motion search, no tx type search, tiles 4x1; 40
+pictures, q 8–40): **30–35 inter frames a second** on pictures that are all new, for +15.3 % /
++11.9 % bytes against today's; against libaom +7.7 % / −0.7 %, against hardware HEVC −35.8 % /
+−13.8 % (BD-rate by PSNR / SSIMULACRA2). At q20: GPU analysis 18.8 ms, closed loop 10.2, filters
+14.3 (their GPU 11.3), writer 6.3. The all-GPU encoder (av1gpu's closed loop on the GPU, 98
+dependent wavefront steps) takes 749 ms for one such picture, against the hybrid's ~100
+(`av1still --hybrid`, scroll-win, q20). No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
 ProRes and JPEG). Not kept: copying GOLDEN_FRAME's planes beside the closed loop instead of after
 it (~0.7 ms of CPU; no difference in pictures a second, which the GPU bounds).
 
