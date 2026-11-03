@@ -284,6 +284,18 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the filters ahead of the next analysis on the GPU, measured, not kept (2026-11-03)
+
+The owner asked for it after the timeline showed one picture in four's filters starting only
+when the next picture's analysis ends. The analysis committed in three command buffers (after
+the inter candidates, after the shapes; a temporary `GA_SPLIT`) so the filters' (another queue)
+can run between them: those pictures' filters 24–26 → 20–22 ms, but the period unchanged (mean
+39.5 → 40.1 ms; 26.2 / 25.6 against 27.1 / 26.0 inter frames a second, noise). The next closed
+loop needs the next picture's analysis as well as these filters, and the GPU is busy through
+both: letting the filters in first reorders the same work. Not kept. What would help there is
+less GPU work a new picture (the analysis's ~25 ms, the filters' ~9), or a cheaper closed loop
+now that the writer shares its cores.
+
 ### Metal AV1: a picture's write beside the next closed loop, handed on from the writer's thread (2026-11-03)
 
 The owner's choice, in the latency-neutral form. The write's state (its own `Writer`, its
