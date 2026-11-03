@@ -381,7 +381,7 @@ mod tests {
         check!(FrameParams, "FrameParams", width: "width", monochrome: "monochrome", loop_filter_level: "loop_filter_level",
                cdef_y_pri: "cdef_y_pri", cdef_uv_sec: "cdef_uv_sec", allow_screen_content_tools: "allow_screen_content_tools");
         check!(FrameParams, "FrameParams", video: "video", frame_type: "frame_type", ref_slot: "ref_slot",
-               refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", reserved: "reserved");
+               refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", golden_slot: "golden_slot");
         check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref",
                mv_precision: "mv_precision", sb128: "sb128", allow_intrabc: "allow_intrabc");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");

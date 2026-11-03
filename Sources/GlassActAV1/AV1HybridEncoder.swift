@@ -172,6 +172,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         didSet { av1enc_hybrid_set_tx_model(cpu, txModelEps ?? -1) }
     }
 
+    /// The closed loop's luma tx type search measures each type's distortion in the transform
+    /// domain and stops at DCT_DCT when that codes nothing (rust/av1 hybrid::quant). Off: exact.
+    public var quickTxTrials = false {
+        didSet { av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0) }
+    }
+
     /// See `AV1MetalEncoder.learnedPrune` (on: `defaultLearnedPrune`).
     public var learnedPrune: AV1MetalEncoder.LearnedPrune? {
         get { metal.learnedPrune }

@@ -215,6 +215,8 @@ the numbers and the reasoning.
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | built, off: the owner's choice | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
+| The closed loop's quantizer (NEON f64), rate proxy (raster order) and shared first forward products (`metal-av1`) | kept | the same streams; a 5K picture of new content's closed loop 18.5 → 15.9 ms, its work −15 % | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
+| Quick tx trials: transform-domain distortion, and stopping where DCT_DCT codes nothing (`metal-av1`, `quickTxTrials`) | built, off: the owner's choice | BD-neutral (+0.24 % / −0.08 %); closed loop −1 to −2 ms, −9 % of its work | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -279,6 +281,43 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop's work, not its dependencies; cheaper tx trials (2026-11-03)
+
+**The closed loop is bound by its work.** `GA_CRIT=1` (new: each split picture's task times on
+stderr) on the four-trace rotation at 5K, q20: its wall time ~15 ms, its work ~185 core-ms (12–13
+of 14 cores busy), its critical path (a tile's plan, then its longest chain of blocks by the
+samples they read) 5–14 ms. Scheduling the critical path first can't buy anything; only cheaper
+blocks can. (The architecture note's "~4–5 cores busy" was an estimate from `sample`'s average
+over the whole period, waits included.)
+
+**Where its work goes** (`sample`, the quantizer and the rate proxy out of line): the forward
+transform 28 %, the quantizer 21 %, the inverse transforms and dequantization of the compared
+trials ~12 %, RDOQ ~9 %, the residual's setup 9 %, the trials' SSE 7 %, the rate proxy 6 %.
+
+**Byte-identical** (`--digest` the same; the oracle's differential tests pass):
+- the quantizer's exact path two lanes at a time (NEON f64: the same multiply, divide, add and
+  floor as the scalar code): ~2x on dense blocks;
+- the rate proxy in raster order (each coefficient's scan position gives the last nonzero), a
+  loop LLVM vectorizes: ~2.5x;
+- the forward transform's first product shared by the types of a search with the same column
+  kind and row flip (`Stage1Cache`): a column flip only reverses the order its rows are read in.
+  An intra search's 7 types need 3 first products, an inter search's 16 need 4.
+
+Rotation, q20, 24 pictures, interleaved: closed loop 18.5 → 15.9 ms (work 232 → 199 core-ms,
+−15 %). Pictures a second unchanged (18.4–18.5): the GPU bounds them (42 ms of analysis, ~10 of
+filters).
+
+**Two decision changes, measured** (BD-rate against exact trials, rotation, q 14–32, RGB PSNR /
+SSIMULACRA2):
+
+| | BD-rate | closed loop |
+|---|---|---|
+| distortion in the transform domain (libaom's `tx_domain_dist`: the residual's energy less what the coded coefficients take of it, at the transform's gain per size and type) | 0.00 % / +0.02 % | −0.5 to −1 ms |
+| the search stops at DCT_DCT when it codes nothing | +0.17 % / −0.15 % | −1 ms, −9 % of its work |
+| both (`AV1HybridEncoder.quickTxTrials`, `av1seq --quick-tx-trials`; q 14–26) | +0.24 % / −0.08 % | −1 to −2 ms (noisy: runs paused and resumed) |
+
+Built, off: BD-neutral, but they change the streams, so the owner's call.
 
 ### Metal AV1: what buys speed on a picture of new content, at what bytes (2026-11-03)
 

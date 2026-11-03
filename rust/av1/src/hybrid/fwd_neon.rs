@@ -4,8 +4,8 @@
 //!
 //! The C++ skips zero factors; adding a zero product (±0) to an accumulator that is never -0
 //! leaves it unchanged, so these loops don't. Identity kinds (diagonal matrices) are one multiply.
-use super::fwd::{FwdTx, flipped};
-use crate::dsp::{K_IDT, col_kind, row_kind};
+use super::fwd::FwdTx;
+use crate::dsp::{K_IDT, col_kind, flip_lr, flip_ud, row_kind};
 use crate::tables::{Transform_Row_Shift, Tx_Height_Log2, Tx_Width_Log2};
 use core::arch::aarch64::*;
 
@@ -63,9 +63,10 @@ fn stage1<const NV: usize>(
     }
 }
 
-/// out[(i0 + l) * tw + j0 + j] = scale * sum_k t[i0 + l][k] * FrT[k][j0 + j] for l < 4, j < 4 NV.
+/// out[(i0 + l) * tw + j0 + j] = scale * sum_k t[i0 + l][k'] * FrT[k][j0 + j] for l < 4, j < 4 NV,
+/// k' = k, or w - 1 - k with FLR (the residual's columns flipped: the first product's are too).
 #[inline(always)]
-fn stage2<const NV: usize>(
+fn stage2<const NV: usize, const FLR: bool>(
     frt: &[f32],
     w: usize,
     tt: &[f32],
@@ -79,7 +80,7 @@ fn stage2<const NV: usize>(
     // SAFETY: NEON is part of the aarch64 baseline.
     let mut acc = [[unsafe { vdupq_n_f32(0.0) }; NV]; 4];
     for k in 0..w {
-        let b = ld(&tt[k * th + i0..]);
+        let b = ld(&tt[if FLR { w - 1 - k } else { k } * th + i0..]);
         let f = &frt[k * w + j0..];
         let a: [float32x4_t; NV] = core::array::from_fn(|v| ld(&f[4 * v..]));
         fma4(&mut acc, &a, b);
@@ -92,18 +93,17 @@ fn stage2<const NV: usize>(
     }
 }
 
-pub(super) fn forward_f(f: &FwdTx, res: &[f32], tx_sz: i32, tx_type: i32, out: &mut [f32], tmp: &mut [f32]) {
+/// The first product, transposed (`tt`, w x th): of the residual with its rows flipped when the
+/// type flips them (`fud`), by the column kind `ck`. A flip of its columns permutes this
+/// product's rows, so [`stage2_from`] applies it; types sharing (ck, fud) share this.
+pub(super) fn stage1_into(f: &FwdTx, res: &[f32], tx_sz: i32, ck: i32, fud: bool, tt: &mut [f32], rbuf: &mut [f32]) {
     let (lw, lh) = (
         Tx_Width_Log2[tx_sz as usize] as usize,
         Tx_Height_Log2[tx_sz as usize] as usize,
     );
     let (w, h) = (1usize << lw, 1usize << lh);
-    let (tw, th) = (w.min(32), h.min(32));
-    let (rk, ck) = (row_kind(tx_type), col_kind(tx_type));
-    let rect = if lw.abs_diff(lh) == 1 { 2896.0f32 / 4096.0 } else { 1.0 };
-    let scale = (1 << (Transform_Row_Shift[tx_sz as usize] + 4)) as f32 / rect;
-    let (rbuf, tt) = tmp.split_at_mut(64 * 64);
-    let r = flipped(res, w, h, tx_type, rbuf);
+    let th = h.min(32);
+    let r = flipped_ud(res, w, h, fud, rbuf);
     let tt = &mut tt[..w * th];
     if ck == K_IDT {
         let fc = &f.ff[ck as usize][lh];
@@ -127,13 +127,27 @@ pub(super) fn forward_f(f: &FwdTx, res: &[f32], tx_sz: i32, tx_type: i32, out: &
             }
         }
     }
+}
+
+/// The second product from [`stage1_into`]'s `tt`, by the row kind `rk`, reading its rows in
+/// reverse with `flr`: th x tw coefficients into `out`.
+pub(super) fn stage2_from(f: &FwdTx, tt: &[f32], tx_sz: i32, rk: i32, flr: bool, out: &mut [f32]) {
+    let (lw, lh) = (
+        Tx_Width_Log2[tx_sz as usize] as usize,
+        Tx_Height_Log2[tx_sz as usize] as usize,
+    );
+    let (w, h) = (1usize << lw, 1usize << lh);
+    let (tw, th) = (w.min(32), h.min(32));
+    let rect = if lw.abs_diff(lh) == 1 { 2896.0f32 / 4096.0 } else { 1.0 };
+    let scale = (1 << (Transform_Row_Shift[tx_sz as usize] + 4)) as f32 / rect;
     let out = &mut out[..th * tw];
     if rk == K_IDT {
         let fr = &f.ff[rk as usize][lw];
         for j in 0..tw {
             let c = fr[j * w + j];
+            let jj = if flr { w - 1 - j } else { j };
             for i in 0..th {
-                out[i * tw + j] = tt[j * th + i].mul_add(c, 0.0) * scale;
+                out[i * tw + j] = tt[jj * th + i].mul_add(c, 0.0) * scale;
             }
         }
     } else {
@@ -141,13 +155,33 @@ pub(super) fn forward_f(f: &FwdTx, res: &[f32], tx_sz: i32, tx_type: i32, out: &
         for i0 in (0..th).step_by(4) {
             let mut j0 = 0;
             while j0 < tw {
-                match tw - j0 {
-                    4 => stage2::<1>(frt, w, tt, th, i0, j0, out, tw, scale),
-                    8 => stage2::<2>(frt, w, tt, th, i0, j0, out, tw, scale),
-                    _ => stage2::<4>(frt, w, tt, th, i0, j0, out, tw, scale),
+                match (tw - j0, flr) {
+                    (4, false) => stage2::<1, false>(frt, w, tt, th, i0, j0, out, tw, scale),
+                    (8, false) => stage2::<2, false>(frt, w, tt, th, i0, j0, out, tw, scale),
+                    (_, false) => stage2::<4, false>(frt, w, tt, th, i0, j0, out, tw, scale),
+                    (4, true) => stage2::<1, true>(frt, w, tt, th, i0, j0, out, tw, scale),
+                    (8, true) => stage2::<2, true>(frt, w, tt, th, i0, j0, out, tw, scale),
+                    (_, true) => stage2::<4, true>(frt, w, tt, th, i0, j0, out, tw, scale),
                 }
                 j0 += 16;
             }
         }
     }
+}
+
+/// `res` with its rows flipped (`fud`), into `r` (or `res` itself).
+fn flipped_ud<'a>(res: &'a [f32], w: usize, h: usize, fud: bool, r: &'a mut [f32]) -> &'a [f32] {
+    if !fud {
+        return &res[..w * h];
+    }
+    for i in 0..h {
+        r[i * w..][..w].copy_from_slice(&res[(h - 1 - i) * w..][..w]);
+    }
+    &r[..w * h]
+}
+
+pub(super) fn forward_f(f: &FwdTx, res: &[f32], tx_sz: i32, tx_type: i32, out: &mut [f32], tmp: &mut [f32]) {
+    let (rbuf, tt) = tmp.split_at_mut(64 * 64);
+    stage1_into(f, res, tx_sz, col_kind(tx_type), flip_ud(tx_type), tt, rbuf);
+    stage2_from(f, tt, tx_sz, row_kind(tx_type), flip_lr(tx_type), out);
 }

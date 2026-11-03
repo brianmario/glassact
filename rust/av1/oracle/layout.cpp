@@ -16,7 +16,7 @@ extern "C" long long oracle_layout(const char *what) {
     O("FrameParams", av1g_frame_params, cdef_uv_sec) O("FrameParams", av1g_frame_params, allow_screen_content_tools)
     O("FrameParams", av1g_frame_params, video) O("FrameParams", av1g_frame_params, frame_type)
     O("FrameParams", av1g_frame_params, ref_slot) O("FrameParams", av1g_frame_params, refresh_frame_flags)
-    O("FrameParams", av1g_frame_params, error_resilient_mode) O("FrameParams", av1g_frame_params, reserved)
+    O("FrameParams", av1g_frame_params, error_resilient_mode) O("FrameParams", av1g_frame_params, golden_slot)
     O("FrameParams", av1g_frame_params, lf_inter_off) O("FrameParams", av1g_frame_params, cdf_from_ref)
     O("FrameParams", av1g_frame_params, mv_precision) O("FrameParams", av1g_frame_params, sb128)
     O("FrameParams", av1g_frame_params, allow_intrabc)

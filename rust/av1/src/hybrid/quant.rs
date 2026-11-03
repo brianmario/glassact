@@ -7,7 +7,7 @@
 //! DCT-only luma type); here those trials stop after the quantizer, with the same coefficients.
 use super::decide::SrcView;
 use super::fmac;
-use super::fwd::{FWD_F_TMP, FWD_TMP, FwdTx, forward, forward_f, fwd};
+use super::fwd::{FWD_F_TMP, FWD_TMP, FwdTx, Stage1Cache, forward, forward_f, forward_f_cached, fwd};
 use crate::dsp::{
     clip1, dequant, dq_denom, flip_lr, flip_ud, get_scan, get_tx_set_inter, get_tx_set_intra, inv_txfm2d, qm, qm_step,
     tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
@@ -49,6 +49,10 @@ pub(crate) struct Work {
     rr: Vec<i32>,
     /// RDOQ applies to this tx block (its source spans [`QuantHook::rdoq_range`])
     rdoq_here: bool,
+    /// the residual's energy (sum of squares), with [`QuantHook::td_dist`]
+    energy: u64,
+    /// the residual's first forward products, shared by the types a search tries
+    s1: Stage1Cache,
 }
 
 /// A tile thread's scratch (what the C++ keeps in thread_locals).
@@ -74,6 +78,8 @@ impl Scratch {
                 dq: vec![0; 1024],
                 rr: vec![0; 64 * 64],
                 rdoq_here: true,
+                energy: 0,
+                s1: Stage1Cache::default(),
             },
             cur: vec![0; 1024],
             best: vec![0; 1024],
@@ -99,6 +105,66 @@ pub(crate) struct QuantHook<'a> {
     /// with `rdoq`, only tx blocks whose source spans at least this many values: text and UI edges,
     /// not the flat gradients (sky, shading) whose small coefficients RDOQ would drop into bands
     pub rdoq_range: u8,
+    /// compared trials' distortion in the transform domain (libaom's tx_domain_dist): the
+    /// residual's energy less what the coded coefficients take of it, at the transform's gain,
+    /// with no inverse transform (else the exact reconstruction's SSE)
+    pub td_dist: bool,
+    /// a luma search stops at DCT_DCT (the first type tried) when it codes nothing
+    pub dct_zero_stops: bool,
+}
+
+/// Each coefficient's position in [`get_scan`]'s order for the tx size and type.
+fn inverse_scan(tx_sz: i32, ty: i32) -> &'static [u16] {
+    static T: std::sync::OnceLock<(Vec<Vec<u16>>, Vec<u8>)> = std::sync::OnceLock::new();
+    let (tabs, at) = T.get_or_init(|| {
+        let (mut tabs, mut ptrs, mut at) = (Vec::new(), Vec::<*const u16>::new(), Vec::new());
+        for t in 0..crate::tables::TX_SIZES_ALL {
+            for y in 0..16 {
+                let scan = get_scan(t, y);
+                let k = ptrs.iter().position(|&p| p == scan.as_ptr()).unwrap_or_else(|| {
+                    let mut inv = vec![0u16; scan.len()];
+                    for (i, &p) in scan.iter().enumerate() {
+                        inv[p as usize] = i as u16;
+                    }
+                    ptrs.push(scan.as_ptr());
+                    tabs.push(inv);
+                    tabs.len() - 1
+                });
+                at.push(k as u8);
+            }
+        }
+        (tabs, at)
+    });
+    &tabs[at[tx_sz as usize * 16 + ty as usize] as usize]
+}
+
+/// [`coeff_gain`] per tx size and type, measured on first use.
+fn coeff_gain_t(f: &FwdTx, tx_sz: i32, ty: i32) -> f32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const UNSET: u32 = u32::MAX;
+    static G: [AtomicU32; crate::tables::TX_SIZES_ALL as usize * 16] =
+        [const { AtomicU32::new(UNSET) }; crate::tables::TX_SIZES_ALL as usize * 16];
+    let slot = &G[tx_sz as usize * 16 + ty as usize];
+    let v = slot.load(Ordering::Relaxed);
+    if v != UNSET {
+        return f32::from_bits(v);
+    }
+    let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
+    let mut r = 1u32;
+    let res: Vec<f32> = (0..tw * th)
+        .map(|_| {
+            r = r.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((r >> 16) % 61) as f32 - 30.0
+        })
+        .collect();
+    let mut out = vec![0f32; 1024];
+    let mut tmp = vec![0f32; FWD_F_TMP];
+    forward_f(f, &res, tx_sz, ty, &mut out, &mut tmp);
+    let er: f32 = res.iter().map(|v| v * v).sum();
+    let ec: f32 = out[..tx_coeffs(tx_sz)].iter().map(|v| v * v).sum();
+    let g = if ec > 0.0 { er / ec } else { 1.0 };
+    slot.store(g.to_bits(), Ordering::Relaxed);
+    g
 }
 
 /// The sample-domain SSE of a unit transform-domain error, per tx size (the forward transform's
@@ -129,7 +195,18 @@ fn coeff_gain(f: &FwdTx, tx_sz: i32) -> f32 {
 
 impl<'a> QuantHook<'a> {
     pub fn new(src: SrcView<'a>, o: HookOpts) -> QuantHook<'a> {
-        QuantHook { src, o, f: fwd(), tx_model: None, collect: None, rdoq: None, rdoq_trials: false, rdoq_range: 0 }
+        QuantHook {
+            src,
+            o,
+            f: fwd(),
+            tx_model: None,
+            collect: None,
+            rdoq: None,
+            rdoq_trials: false,
+            rdoq_range: 0,
+            td_dist: false,
+            dct_zero_stops: false,
+        }
     }
 
     /// The types of the set (`in_set`) to try: the model's choice, or all of them.
@@ -213,6 +290,7 @@ fn zero_below(ac_q: i32, den: i32, rnd: f64, zbin: f64) -> f64 {
 }
 
 /// The quantizer over float coefficients; returns whether any level is nonzero.
+#[inline(never)]
 pub(crate) fn quantize_f(
     d: &[f32],
     q: &mut [i16],
@@ -244,18 +322,44 @@ pub(crate) fn quantize_f(
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::*;
+        // the exact path two lanes at a time: the same IEEE operations as `exact` (d * den, then
+        // / step, |v| + rnd, floor), so the same levels
+        // SAFETY: NEON is part of the aarch64 baseline.
+        let (vden, vstep, vrnd, vzbin, vmax) = unsafe {
+            (
+                vdupq_n_f64(den as f64),
+                vdupq_n_f64(ac_q as f64),
+                vdupq_n_f64(rnd),
+                vdupq_n_f64(zbin),
+                vdupq_n_f64(32767.0),
+            )
+        };
+        let mut any = unsafe { vdupq_n_s64(0) };
         for c in (4..n).step_by(4) {
             let x: &[f32; 4] = d[c..c + 4].try_into().unwrap();
-            // SAFETY: NEON is part of the aarch64 baseline; x is 4 floats.
-            let all_zero = unsafe { vminvq_u32(vcltq_f32(vabsq_f32(vld1q_f32(x.as_ptr())), vdupq_n_f32(thr))) != 0 };
-            if all_zero {
-                q[c..c + 4].fill(0);
-            } else {
-                for i in c..c + 4 {
-                    nz |= exact(i, q);
+            // SAFETY: NEON is part of the aarch64 baseline; x is 4 floats, q[c..c + 4] 4 levels.
+            unsafe {
+                let xf = vld1q_f32(x.as_ptr());
+                if vminvq_u32(vcltq_f32(vabsq_f32(xf), vdupq_n_f32(thr))) != 0 {
+                    q[c..c + 4].fill(0);
+                    continue;
                 }
+                let level = |v: float64x2_t| {
+                    let v = vdivq_f64(vmulq_f64(v, vden), vstep);
+                    let a = vabsq_f64(v);
+                    let t = vminq_f64(vrndmq_f64(vaddq_f64(a, vrnd)), vmax);
+                    let t = vbslq_f64(vcltq_f64(a, vzbin), vdupq_n_f64(0.0), t);
+                    let l = vcvtq_s64_f64(t);
+                    vbslq_s64(vcltzq_f64(v), vnegq_s64(l), l)
+                };
+                let (lo, hi) = (level(vcvt_f64_f32(vget_low_f32(xf))), level(vcvt_high_f64_f32(xf)));
+                any = vorrq_s64(any, vorrq_s64(lo, hi));
+                let l = vcombine_s32(vmovn_s64(lo), vmovn_s64(hi));
+                vst1_s16(q[c..c + 4].as_mut_ptr(), vmovn_s32(l));
             }
         }
+        // SAFETY: NEON is part of the aarch64 baseline.
+        nz |= unsafe { vmaxvq_u32(vreinterpretq_u32_s64(any)) } != 0;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for i in 4..n {
@@ -315,7 +419,7 @@ impl QuantHook<'_> {
             forward(self.f, &w.resi, tx_sz, ty, &mut w.dd, &mut w.dtmp);
             quantize_d(&w.dd[..n], q, den, dc_q, ac_q, m, rnd, zbin)
         } else {
-            forward_f(self.f, &w.resf, tx_sz, ty, &mut w.df, &mut w.ftmp);
+            forward_f_cached(self.f, &w.resf, tx_sz, ty, &mut w.df, &mut w.ftmp, &mut w.s1);
             let mut nz = quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin);
             if let Some(cc) = self.rdoq.filter(|_| self.rdoq_trials && w.rdoq_here && need_j && plane == 0 && m.is_none() && nz) {
                 let lam = 0.12 * (ac_q as f32 / 8.0) * (ac_q as f32 / 8.0);
@@ -331,6 +435,21 @@ impl QuantHook<'_> {
         let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
         let mut sse = 0u64;
         let mut r = 1.0f64;
+        if nz && self.td_dist && m.is_none() && !self.o.double_fwd {
+            // E - g sum(c^2 - (c - c')^2), c' = q step / den: what the coded coefficients take of
+            // the residual's energy E
+            let (dcs, acs) = (dc_q as f32 / den as f32, ac_q as f32 / den as f32);
+            let mut acc = 0f32;
+            for (i, (&c, &l)) in w.df[..n].iter().zip(&q[..n]).enumerate() {
+                if l != 0 {
+                    let e = c - l as f32 * if i == 0 { dcs } else { acs };
+                    acc += c * c - e * e;
+                }
+            }
+            let d = w.energy as f64 - coeff_gain_t(self.f, tx_sz, ty) as f64 * acc as f64;
+            r = self.rate(q, tx_sz, ty, n);
+            return fmac(lambda, r, d.max(0.0));
+        }
         if nz {
             dequant(q, &mut w.dq, tx_sz, dc_q, ac_q, m);
             if inv_txfm2d(&w.dq, tx_sz, ty, &mut w.rr) != 0 {
@@ -350,18 +469,9 @@ impl QuantHook<'_> {
                     rr.iter().zip(p.iter().zip(sr)).map(d).sum::<u32>()
                 } as u64;
             }
-            let scan = get_scan(tx_sz, ty);
-            let last = (0..n).rev().find(|&c| q[scan[c] as usize] != 0).unwrap_or(0);
-            let (mut bits, mut zeros) = (0i64, 0i32);
-            for &p in &scan[..=last] {
-                let a = (q[p as usize] as i32).unsigned_abs();
-                if a != 0 {
-                    bits += 2 + 2 * a.ilog2() as i64; // 2 + 2 floor(log2 a), exact
-                } else {
-                    zeros += 1;
-                }
-            }
-            r = fmac(0.3, zeros as f64, r + bits as f64);
+            r = self.rate(q, tx_sz, ty, n);
+        } else if self.td_dist && !self.o.double_fwd {
+            sse = w.energy;
         } else {
             for i in 0..th {
                 let (p, sr) = (&pred[i * ps..][..tw], &s[i * ss..][..tw]);
@@ -376,6 +486,27 @@ impl QuantHook<'_> {
             }
         }
         fmac(lambda, r, sse as f64)
+    }
+}
+
+impl QuantHook<'_> {
+    /// The trials' rate proxy: 1 + 2 + 2 floor(log2 |level|) a nonzero level, 0.3 a zero one
+    /// before the last in scan order. In raster order (the scan's position of each coefficient
+    /// gives the last), so a loop LLVM vectorizes; the same sums as walking the scan.
+    #[inline(never)]
+    fn rate(&self, q: &[i16], tx_sz: i32, ty: i32, n: usize) -> f64 {
+        let iscan = inverse_scan(tx_sz, ty);
+        let (mut bits, mut nnz, mut last) = (0u32, 0u32, 0u32);
+        for (&l, &p) in q[..n].iter().zip(&iscan[..n]) {
+            let a = l.unsigned_abs() as u32;
+            let nzb = (a != 0) as u32;
+            bits += nzb * (2 + 2 * (31 - (a | 1).leading_zeros()));
+            nnz += nzb;
+            last = last.max(nzb * p as u32);
+        }
+        // the scan's zeros up to its last nonzero (one, the first, when there is none)
+        let zeros = last + 1 - nnz;
+        fmac(0.3, zeros as f64, 1.0 + bits as f64)
     }
 }
 
@@ -439,12 +570,17 @@ impl TxbHook for QuantHook<'_> {
                 }
             }
         } else {
+            let mut e = 0u64;
             for i in 0..th {
                 let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resf[i * tw..][..tw]);
                 for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
-                    *d = (s as i32 - p as i32) as f32;
+                    let v = s as i32 - p as i32;
+                    e += (v * v) as u64;
+                    *d = v as f32;
                 }
             }
+            w.energy = e;
+            w.s1.reset();
         }
         w.rdoq_here = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
         let n = tx_coeffs(tx_sz);
@@ -491,6 +627,9 @@ impl TxbHook for QuantHook<'_> {
                     best_type = ty;
                     core::mem::swap(cur, best);
                     core::mem::swap(&mut w.df, best_df);
+                }
+                if ty == DCT_DCT && self.dct_zero_stops && best[..n].iter().all(|&v| v == 0) {
+                    break;
                 }
             }
             core::mem::swap(&mut w.df, best_df);
@@ -556,11 +695,150 @@ impl TxbHook for QuantHook<'_> {
                 core::mem::swap(cur, best);
                 core::mem::swap(&mut w.df, best_df);
             }
+            if ty == DCT_DCT && self.dct_zero_stops && best[..n].iter().all(|&v| v == 0) {
+                break;
+            }
         }
         core::mem::swap(&mut w.df, best_df);
         t.tx_type = best_type as u8;
         coeffs.copy_from_slice(&best[..n]);
         self.collect_sample(w, tw, th, ac_q, false, best_type, tx_sz);
         self.optimize(w, coeffs, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::*;
+
+    fn hook() -> QuantHook<'static> {
+        let o = HookOpts {
+            tx_types: true,
+            reduced_tx_set: false,
+            given_luma_tx: 0,
+            rnd: 0.45,
+            zbin: 0.0,
+            double_fwd: false,
+            inter_rd_skip: true,
+            inter_tx_types: true,
+        };
+        QuantHook::new(
+            super::super::decide::SrcView {
+                stride: [0; 3],
+                p: [&[], &[], &[]],
+            },
+            o,
+        )
+    }
+
+    /// The rate proxy in raster order sums what walking the scan to its last nonzero does.
+    #[test]
+    fn rate_matches_the_scan_walk() {
+        let h = hook();
+        let mut r = 0x9e37_79b9u32;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        let mut q = vec![0i16; 1024];
+        for case in 0..20_000 {
+            let tx = (next() % TX_SIZES_ALL as u32) as i32;
+            let ty = (next() % 16) as i32;
+            // (the types the search tries: every inter set holds the intra one's)
+            if !tx_type_in_set_inter(get_tx_set_inter(tx, false), ty) {
+                continue;
+            }
+            let n = tx_coeffs(tx);
+            let density = next() % 5;
+            for v in &mut q[..n] {
+                let x = next();
+                *v = if x % 8 < density {
+                    ((x >> 8) % 300) as i16 - 150
+                } else {
+                    0
+                };
+                if x % 997 == 0 {
+                    *v = if x & 1 == 0 { 32767 } else { -32767 };
+                }
+            }
+            let scan = get_scan(tx, ty);
+            let last = (0..n).rev().find(|&c| q[scan[c] as usize] != 0).unwrap_or(0);
+            let (mut bits, mut zeros) = (0i64, 0i32);
+            for &p in &scan[..=last] {
+                let a = (q[p as usize] as i32).unsigned_abs();
+                if a != 0 {
+                    bits += 2 + 2 * a.ilog2() as i64;
+                } else {
+                    zeros += 1;
+                }
+            }
+            let want = fmac(0.3, zeros as f64, 1.0 + bits as f64);
+            assert_eq!(
+                h.rate(&q, tx, ty, n).to_bits(),
+                want.to_bits(),
+                "case {case} tx {tx} type {ty}"
+            );
+        }
+    }
+
+    /// The trial's parts per tx size: forward, quantizer, rate (q20's steps, ±30 residuals).
+    #[test]
+    #[ignore]
+    fn bench_trial_parts() {
+        let f = fwd();
+        let (dcq, acq) = (crate::dsp::dc_q(20), crate::dsp::ac_q(20));
+        for (name, tx) in [
+            ("4x4", TX_4X4),
+            ("8x8", TX_8X8),
+            ("16x16", TX_16X16),
+            ("32x32", TX_32X32),
+            ("8x16", TX_8X16),
+        ] {
+            let (tw, th) = (tx_w(tx) as usize, tx_h(tx) as usize);
+            let n = tx_coeffs(tx);
+            let mut r = 7u32;
+            let res: Vec<f32> = (0..tw * th)
+                .map(|_| {
+                    r = r.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    ((r >> 16) % 61) as f32 - 30.0
+                })
+                .collect();
+            let mut out = vec![0f32; 1024];
+            let mut tmp = vec![0f32; FWD_F_TMP];
+            let mut q = vec![0i16; 1024];
+            let iters = 2_000_000 / (tw * th);
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                forward_f(f, &res, tx, DCT_DCT, &mut out, &mut tmp);
+                std::hint::black_box(&out);
+            }
+            let tf = t.elapsed().as_nanos() as f64 / iters as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(quantize_f(&out[..n], &mut q, dq_denom(tx), dcq, acq, None, 0.45, 0.0));
+            }
+            let tq = t.elapsed().as_nanos() as f64 / iters as f64;
+            let hook = hook();
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(hook.rate(&q, tx, DCT_DCT, n));
+            }
+            let tr = t.elapsed().as_nanos() as f64 / iters as f64;
+            let nz = q[..n].iter().filter(|&&v| v != 0).count();
+            let mut dq = vec![0i32; 1024];
+            let mut rr = vec![0i32; 64 * 64];
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                dequant(&q, &mut dq, tx, dcq, acq, None);
+                std::hint::black_box(inv_txfm2d(&dq, tx, DCT_DCT, &mut rr));
+            }
+            let ti = t.elapsed().as_nanos() as f64 / iters as f64;
+            println!(
+                "{name}: forward {tf:.0} ns, quantize {tq:.0}, rate {tr:.0}, dequant+inverse {ti:.0} ({nz}/{n} nonzero)"
+            );
+        }
     }
 }

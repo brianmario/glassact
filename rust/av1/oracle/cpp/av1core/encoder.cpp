@@ -1235,8 +1235,8 @@ void Encoder::run(av1g_output *out) {
         if (fp->delta_q_present > 1 || fp->delta_q_res > 3 || fp->using_qmatrix > 1 || fp->qm_y > 15 || fp->qm_u > 15 ||
             fp->qm_v > 15)
             throw Error(AV1G_ERR_INVALID, "bad delta_q / quantizer matrix parameters");
-        for (int i = 0; i < (int)sizeof fp->reserved; i++)
-            if (fp->reserved[i]) throw Error(AV1G_ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
+        // Glass Act: the reserved byte became golden_slot (decisions.h), 0 in interface v1
+        if (fp->golden_slot) throw Error(AV1G_ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
         if (fp->allow_screen_content_tools > 1) throw Error(AV1G_ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
     doRecon = !(opts.flags & AV1G_ENC_SKIP_RECON);

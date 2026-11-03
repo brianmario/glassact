@@ -1,7 +1,7 @@
 //! The hybrid encoder's tests: the SIMD forward transform and quantizer against the scalar code;
 //! with the `oracle` feature, the closed loop, the write and the tile reuse against the C++
 //! (av1enc_hybrid_*) on random pictures, partitions and sequences; and `#[ignore]` benchmarks.
-use super::fwd::{FWD_F_TMP, forward_f, forward_f_scalar, fwd};
+use super::fwd::{FWD_F_TMP, Stage1Cache, forward_f, forward_f_cached, forward_f_scalar, fwd};
 use super::quant::quantize_f;
 use super::*;
 use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma, mi_cols, mi_rows};
@@ -32,6 +32,47 @@ fn fwd_cases() -> Vec<(i32, i32)> {
         }
     }
     v
+}
+
+/// A tx type search's forward transforms through the first-pass cache, the types in shuffled
+/// orders: bit for bit forward_f's.
+#[test]
+fn forward_f_cached_matches_uncached() {
+    let f = fwd();
+    let mut r = Rng(0x0c0f_fee5_eed5_1234);
+    let (mut a, mut b) = (vec![0f32; 1024], vec![0f32; 1024]);
+    let mut tmp = vec![0f32; FWD_F_TMP];
+    let mut cache = Stage1Cache::default();
+    let cases = fwd_cases();
+    for tx_sz in 0..TX_SIZES_ALL {
+        let mut tys: Vec<i32> = cases.iter().filter(|c| c.0 == tx_sz).map(|c| c.1).collect();
+        let n = (tx_w(tx_sz) * tx_h(tx_sz)) as usize;
+        for k in 0..12 {
+            for i in (1..tys.len()).rev() {
+                tys.swap(i, r.below(i as u32 + 1) as usize);
+            }
+            let res: Vec<f32> = (0..n)
+                .map(|_| match k % 3 {
+                    0 => r.range(-255, 255) as f32,
+                    1 => (r.range(-3, 3) * (r.below(8) == 0) as i32) as f32,
+                    _ => 0.0,
+                })
+                .collect();
+            cache.reset();
+            for &ty in &tys {
+                forward_f_cached(f, &res, tx_sz, ty, &mut a, &mut tmp, &mut cache);
+                forward_f(f, &res, tx_sz, ty, &mut b, &mut tmp);
+                let m = tx_coeffs(tx_sz);
+                for i in 0..m {
+                    assert_eq!(
+                        a[i].to_bits(),
+                        b[i].to_bits(),
+                        "tx {tx_sz} type {ty} case {k} coeff {i}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

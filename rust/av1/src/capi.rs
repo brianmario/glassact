@@ -913,6 +913,12 @@ pub unsafe extern "C" fn av1enc_hybrid_set_tx_model(h: *mut HybridHandle, eps: f
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_quick_tx_trials(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_quick_tx_trials(on != 0) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: *const u8, n: usize) {
     // SAFETY: the handle; `map` has `n` bytes (or is null with n 0)
     unsafe {

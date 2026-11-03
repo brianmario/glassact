@@ -84,6 +84,13 @@ mode once motion stops) restores full quality.
    waiting in the chain. The GPU's work doesn't fit yet (squares alone: 19–26 ms of analysis,
    before the filters).
 
+   **Corrected the next day:** timing the closed loop's tasks (`GA_CRIT`, BENCHMARKS "the closed
+   loop's work, not its dependencies") finds 12–13 of the 14 cores busy while it runs, ~200
+   core-ms in ~16 ms, its critical path 5–14 ms. `sample`'s average hid that behind the waits
+   between closed loops. So the closed loop alone would fill the CPU at 60 a second: its work,
+   not the chain, is the CPU's limit, and frames in flight can't overlap two closed loops that
+   each take every core.
+
 So the sketch below is replaced by the revised one after it.
 
 ## The first sketch (replaced): a motion mode beside the RD mode
@@ -144,8 +151,8 @@ learned models (RD mode), the Metal analysis (RD mode), the filters' Metal code 
    thread** (no added latency), with 4x1 tiles in motion (writer 8.4 → 5.5 ms, +0.4 %
    SSIMULACRA2).
 5. **Frames in flight** once 1–4 hold: the next picture's closed loop starts on a superblock row
-   when the rows its references reach are filtered. With the cores ~80 % idle this is the
-   biggest lever on the CPU side.
+   when the rows its references reach are filtered. (Written when the cores looked ~80 % idle;
+   they aren't while a closed loop runs, so this overlaps only the other stages with it.)
 
 What it would cost in bytes: about "everything cheap" (+12–15 % against today, level with
 libaom, 14–36 % under HEVC), or less with the learned tx pruning in place of no search. What it
@@ -170,10 +177,12 @@ base: squares in mostly-new pictures (+1.6 %), the motion search and the tx type
 
 - **Latency** of a new picture: analysis ~12 + closed loop ~18 + last rows ~3 + writer ~5.5 ≈ 38
   ms, against ~55 today.
-- **The CPU's budget gets tight.** ~135 core-ms a picture today, plus up to ~70 for the filters on
-  dense content: ~205 of the 233 that 60 a second allows, and 4 of the 14 cores are efficiency
-  cores. No tx type search frees much of the trials' share (42 % of the busy time).
-- **Risks, biggest first:** the CPU's budget; the square kernels' 2x (a guess: at 19–26 ms the
+- **The CPU's budget doesn't fit** (corrected: the closed loop's work was undercounted). The
+  closed loop takes every core for ~16 ms a new picture after the byte-identical trial speedups
+  (~18.5 before), plus up to ~70 core-ms for the filters on dense content, against 16.7 ms of the
+  whole CPU at 60 a second. 60 needs the closed loop's work about halved: no tx type search
+  (18.5 → 10.9 ms), or more like the trials' speedups.
+- **Risks, biggest first:** the CPU's budget (above: a certainty without a cheaper closed loop); the square kernels' 2x (a guess: at 19–26 ms the
   GPU caps everything at ~38–50 a second); the row-parallel filters' 5–7 ms (the single-thread
   ~70 ms is measured, the spread isn't).
 
@@ -190,11 +199,12 @@ what they'd buy:
    critical path. Distortion in the transform domain (libaom's `tx_domain_dist`, a per-size scale
    for AV1's not-quite-orthonormal transforms) skips each compared type's inverse and SSE; only the
    winner is reconstructed, exactly. Near byte-neutral expected (decisions change slightly).
-   Guess: closed loop 18.5 → ~14 ms.
-2. **The closed loop's critical path.** ~4–5 of 14 cores are busy during it. Measure its longest
-   chain of dependent blocks against its wall time: if the chain is much shorter, schedule the
-   blocks on it first (byte-identical); if not, only cheaper blocks (1) or a big block's trials on
-   several threads help.
+   Guess: closed loop 18.5 → ~14 ms. **Done:** byte-identical speedups of the quantizer, the
+   rate proxy and the forward transform (shared first products), 18.5 → 15.9 ms; transform-domain
+   distortion and a stop where DCT_DCT codes nothing, BD-neutral, built off (`quickTxTrials`).
+2. **The closed loop's critical path.** Measured (BENCHMARKS, "the closed loop's work, not its
+   dependencies"): 12–13 of 14 cores busy, critical path 5–14 ms of its ~15. Nothing to gain from
+   scheduling; only cheaper blocks.
 3. **The filters ahead of the next analysis on the GPU.** They take 9–11 ms alone, 14–21 beside
    the next picture's analysis, which isn't on the chain. Commit the next analysis after them, or
    in smaller command buffers. Byte-identical; up to 4–10 ms off the chain, but the GPU's total is
@@ -219,8 +229,8 @@ Done: decisions without RD (killed: +64–76 %), a first timing of the CPU filte
 Next:
 
 1. **A per-picture timeline with frames in flight simulated** (two pictures' closed loops on
-   disjoint cores): how much of the chain overlaps once the filters are off the GPU. The core-ms
-   already fit (~135 of ~233).
+   disjoint cores): how much of the chain overlaps once the filters are off the GPU. (The core-ms
+   don't fit, corrected above: the closed loop takes every core while it runs.)
 2. **Row-parallel CPU filters in the closed loop**, timed on real pictures and checked against
    the GPU's output (they must be byte-identical: both are the spec's). Kill the move if they
    take more than ~6 ms at 5K.

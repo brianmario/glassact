@@ -62,6 +62,7 @@ let av1SeqCommand = Command(
         .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
         .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
+        .bool("quick-tx-trials", "the tx type search's distortion in the transform domain, stopping where DCT_DCT codes nothing"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
         .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
@@ -215,6 +216,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     if opts.has("rdoq-trials") { encoder.rdoqInTrials = true }
     encoder.rdoqMinRange = opts.int("rdoq-range", encoder.rdoqMinRange)
     if let v = opts.string("tx-model-eps").flatMap(Float.init) { encoder.txModelEps = v }
+    if opts.has("quick-tx-trials") { encoder.quickTxTrials = true }
     if let spec = opts.string("dq") {
         let parts = spec.split(separator: ":")
         guard parts.count == 2, let amount = Int(parts[1]), (0...64).contains(amount), ["random", "text"].contains(parts[0])

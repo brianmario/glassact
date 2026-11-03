@@ -161,6 +161,8 @@ pub struct Hybrid {
     sb_qindex: Vec<u8>,
     /// the learned tx type pruning's eps ([`tx_model`], [`Hybrid::set_tx_model`]), or None: off
     tx_model_eps: Option<f32>,
+    /// [`Hybrid::set_quick_tx_trials`]
+    quick_tx_trials: bool,
     /// RDOQ ([`rdoq`], [`Hybrid::set_rdoq`]): its coefficient costs, for the qindex they're of
     rdoq: bool,
     rdoq_trials: bool,
@@ -240,6 +242,7 @@ impl Hybrid {
             intrabc: false,
             sb_qindex: Vec::new(),
             tx_model_eps: None,
+            quick_tx_trials: false,
             rdoq: false,
             rdoq_trials: false,
             rdoq_range: 0,
@@ -433,6 +436,7 @@ impl Hybrid {
             ibc,
             sb_qindex,
             tx_model_eps,
+            quick_tx_trials,
             tx_samples,
             rdoq,
             rdoq_trials,
@@ -788,6 +792,7 @@ impl Hybrid {
             .filter(|_| tx_weights::TX_WEIGHTS.len() == tx_model::TX_FLOATS && tx_samples.is_none())
             .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
         hook.collect = tx_samples.as_ref().map(|(m, _)| m);
+        (hook.td_dist, hook.dct_zero_stops) = (*quick_tx_trials, *quick_tx_trials);
         if *rdoq {
             if rdoq_costs.as_ref().is_none_or(|(q, _)| *q != qindex) {
                 *rdoq_costs = Some((qindex, rdoq::CoeffCosts::new(qindex)));
@@ -1085,6 +1090,13 @@ impl Hybrid {
     /// Without shipped weights it stays off.
     pub fn set_tx_model(&mut self, eps: f32) {
         self.tx_model_eps = (eps >= 0.0).then_some(eps);
+    }
+
+    /// av1enc_hybrid_set_quick_tx_trials: the luma tx type search measures each compared type's
+    /// distortion in the transform domain (no inverse transform), and stops at DCT_DCT, the first
+    /// type it tries, when that codes nothing. Off: the exact reconstruction's SSE, every type.
+    pub fn set_quick_tx_trials(&mut self, on: bool) {
+        self.quick_tx_trials = on;
     }
 
     /// av1enc_hybrid_set_sb_qindex: the next pictures' qindex per 64x64 superblock (raster, 1..255;

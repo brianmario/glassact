@@ -412,6 +412,9 @@ struct Split<'a, H: TxbHook> {
     n_fixed: AtomicU64,
     /// [`ENC_NO_CODE`]
     no_code: bool,
+    /// GA_CRIT: per task its start and end (ns from t0), or empty
+    prof: &'a [AtomicU64],
+    t0: std::time::Instant,
 }
 
 // SAFETY: the raw pointers are the record's and the writer's buffers, which the tasks' order keeps
@@ -464,39 +467,52 @@ impl<H: TxbHook> Split<'_, H> {
             };
             idle = 0;
             let k = task as usize;
-            if k < self.n_blocks {
-                self.block(w, k, &mut hs, &mut n_fixed, &mut next);
-                continue;
+            if !self.prof.is_empty() {
+                self.prof[2 * k].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            let (i, kind) = ((k - self.n_blocks) / 3, (k - self.n_blocks) % 3);
-            let j = self.jobs[i].as_ref().unwrap();
-            if kind == TASK_PLAN {
-                self.plan(w, i, j, &mut hs);
-                continue;
-            }
-            // SAFETY: the tile's coding or one-pass walk: its other tasks are done
-            let (bufs, payload) = unsafe { (&mut *j.bufs, &mut *j.payload) };
-            let syms = (!j.syms.is_null()).then(|| unsafe { &mut *j.syms });
-            let mut rec = unsafe { self.rec(j) };
-            let one_pass = kind == TASK_ONE_PASS;
-            let f = if one_pass { &self.f } else { &self.code_f };
-            let r = if self.no_code && !one_pass {
-                payload.clear();
-                Ok((0, 0))
-            } else {
-                code_tile(w, f, &mut rec, bufs, payload, syms, self.hook, &mut hs, i, j.first, j.end, None, one_pass)
-            };
-            let mut out = j.out.lock().unwrap_or_else(|e| e.into_inner());
-            match r {
-                Ok((s, x)) => (out.0, out.1) = (s, x),
-                Err(e) => out.2 = out.2.take().or(Some(e)),
-            }
-            drop(out);
-            if self.left.fetch_sub(1, Ordering::SeqCst) == 1 {
-                self.ready.wake_all();
+            self.task_run(w, k, &mut hs, &mut n_fixed, &mut next);
+            if !self.prof.is_empty() {
+                self.prof[2 * k + 1].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
         self.n_fixed.fetch_add(n_fixed, Ordering::Relaxed);
+    }
+
+    /// One task: a block's reconstruction, a tile's plan, or its coding or one-pass walk.
+    fn task_run(&self, w: &mut Worker, k: usize, hs: &mut H::Scratch, n_fixed: &mut u64, next: &mut Option<u32>) {
+        if k < self.n_blocks {
+            self.block(w, k, hs, n_fixed, next);
+            return;
+        }
+        let (i, kind) = ((k - self.n_blocks) / 3, (k - self.n_blocks) % 3);
+        let j = self.jobs[i].as_ref().unwrap();
+        if kind == TASK_PLAN {
+            self.plan(w, i, j, hs);
+            return;
+        }
+        // SAFETY: the tile's coding or one-pass walk: its other tasks are done
+        let (bufs, payload) = unsafe { (&mut *j.bufs, &mut *j.payload) };
+        let syms = (!j.syms.is_null()).then(|| unsafe { &mut *j.syms });
+        let mut rec = unsafe { self.rec(j) };
+        let one_pass = kind == TASK_ONE_PASS;
+        let f = if one_pass { &self.f } else { &self.code_f };
+        let r = if self.no_code && !one_pass {
+            payload.clear();
+            Ok((0, 0))
+        } else {
+            code_tile(
+                w, f, &mut rec, bufs, payload, syms, self.hook, hs, i, j.first, j.end, None, one_pass,
+            )
+        };
+        let mut out = j.out.lock().unwrap_or_else(|e| e.into_inner());
+        match r {
+            Ok((s, x)) => (out.0, out.1) = (s, x),
+            Err(e) => out.2 = out.2.take().or(Some(e)),
+        }
+        drop(out);
+        if self.left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.ready.wake_all();
+        }
     }
 
     /// Tile i's plan: its first blocks queued, or (rejected) its one-pass walk.
@@ -585,6 +601,86 @@ impl<H: TxbHook> Split<'_, H> {
             self.ready.push(self.task(i, TASK_CODE));
         }
     }
+}
+
+/// GA_CRIT: the split picture's wall time, work and critical path (plan, then its blocks by their
+/// reads, then its coding), on stderr.
+fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize) {
+    let t = |k: usize| {
+        (
+            prof[2 * k].load(Ordering::Relaxed),
+            prof[2 * k + 1].load(Ordering::Relaxed),
+        )
+    };
+    let d = |k: usize| {
+        let (a, b) = t(k);
+        b.saturating_sub(a)
+    };
+    let (mut lo, mut hi, mut work) = (u64::MAX, 0u64, 0u64);
+    let (mut wplan, mut wblk, mut wcode) = (0u64, 0u64, 0u64);
+    let mut cp = 0u64;
+    let (mut cp_plan, mut cp_rec, mut cp_code) = (0u64, 0u64, 0u64);
+    let mut longest_block = 0u64;
+    for i in 0..ntiles {
+        let Some(j) = sp.jobs[i].as_ref() else { continue };
+        // SAFETY: every task is done (the pool returned), so nothing writes the plan
+        let plan = unsafe { &*j.plan };
+        let tp = sp.task(i, TASK_PLAN) as usize;
+        let tc = sp.task(i, TASK_CODE) as usize;
+        for k in [tp, tc] {
+            let (a, b) = t(k);
+            if b > 0 {
+                lo = lo.min(a);
+                hi = hi.max(b);
+            }
+        }
+        let (pd, cd) = (d(tp), d(tc));
+        wplan += pd;
+        wcode += cd;
+        let (first, n) = (j.first as usize, (j.end - j.first) as usize);
+        let mut es = vec![pd; n];
+        let mut rmax = pd;
+        for b in 0..n {
+            let k = first + b;
+            let (a, e) = t(k);
+            lo = lo.min(a);
+            hi = hi.max(e);
+            let bd = e.saturating_sub(a);
+            wblk += bd;
+            longest_block = longest_block.max(bd);
+            let ef = es[b] + bd;
+            rmax = rmax.max(ef);
+            for &m in plan.readers(b) {
+                let m = m as usize;
+                es[m] = es[m].max(ef);
+            }
+        }
+        let tcp = rmax + cd;
+        if tcp > cp {
+            cp = tcp;
+            cp_plan = pd;
+            cp_rec = rmax - pd;
+            cp_code = cd;
+        }
+    }
+    work += wplan + wblk + wcode;
+    let wall = hi.saturating_sub(lo);
+    let ms = |x: u64| x as f64 / 1e6;
+    eprintln!(
+        "crit: wall {:.2} ms, work {:.2} (plan {:.2} blocks {:.2} code {:.2}), {:.1} busy, critical path {:.2} (plan {:.2} + blocks {:.2} + code {:.2}), longest block {:.3}, tiles {}",
+        ms(wall),
+        ms(work),
+        ms(wplan),
+        ms(wblk),
+        ms(wcode),
+        work as f64 / wall.max(1) as f64,
+        ms(cp),
+        ms(cp_plan),
+        ms(cp_rec),
+        ms(cp_code),
+        ms(longest_block),
+        ntiles
+    );
 }
 
 fn check_frame(fp: &FrameParams) -> Res<()> {
@@ -1236,6 +1332,14 @@ impl Writer {
                     })
                 })
                 .collect();
+            // GA_CRIT: each split picture's critical path on stderr (diagnostics)
+            static CRIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let crit = *CRIT.get_or_init(|| std::env::var_os("GA_CRIT").is_some());
+            let prof: Vec<AtomicU64> = if crit {
+                (0..2 * (n_blocks + 3 * ntiles)).map(|_| AtomicU64::new(0)).collect()
+            } else {
+                Vec::new()
+            };
             let sp = Split {
                 f,
                 plan_f: Frame {
@@ -1259,6 +1363,8 @@ impl Writer {
                 left: AtomicUsize::new(ncoded),
                 n_fixed: AtomicU64::new(0),
                 no_code: opts.flags & ENC_NO_CODE != 0,
+                prof: &prof,
+                t0: std::time::Instant::now(),
             };
             for i in 0..ntiles {
                 if !skipped(i) {
@@ -1266,6 +1372,9 @@ impl Writer {
                 }
             }
             crate::pool::each(&mut self.workers[..nthreads], |w| sp.work(w));
+            if crit {
+                crit_report(&sp, &prof, ntiles);
+            }
             // the first error in tile order, as sequential coding reports
             let (mut nsym, mut nfixed) = (0, sp.n_fixed.into_inner());
             for j in jobs.into_iter().flatten() {

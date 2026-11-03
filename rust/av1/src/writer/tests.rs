@@ -268,7 +268,6 @@ fn r_encode(
         tile_skip: sk.as_deref(),
         record_syms: syms,
         refs: None,
-        refs_golden: None,
     };
     let mut out = Output::default();
     let r = if hook != 0 {

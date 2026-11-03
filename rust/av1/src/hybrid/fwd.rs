@@ -164,6 +164,63 @@ pub(crate) fn forward_f(f: &FwdTx, res: &[f32], tx_sz: i32, tx_type: i32, out: &
     forward_f_scalar(f, res, tx_sz, tx_type, out, tmp);
 }
 
+/// The first products of one residual's forward transforms, by (column kind, rows flipped), for
+/// a tx type search: the types sharing them compute them once ([`forward_f_cached`]). Reused.
+pub(crate) struct Stage1Cache {
+    tt: [Vec<f32>; 4],
+    /// which of `tt` hold the current residual's
+    valid: u8,
+}
+
+impl Default for Stage1Cache {
+    fn default() -> Self {
+        Stage1Cache {
+            tt: core::array::from_fn(|_| vec![0.0; 64 * 64]),
+            valid: 0,
+        }
+    }
+}
+
+impl Stage1Cache {
+    /// A new residual: nothing held.
+    pub fn reset(&mut self) {
+        self.valid = 0;
+    }
+}
+
+/// [`forward_f`] of the residual `cache` holds the first products of (since its last reset),
+/// the same coefficients.
+pub(crate) fn forward_f_cached(
+    f: &FwdTx,
+    res: &[f32],
+    tx_sz: i32,
+    tx_type: i32,
+    out: &mut [f32],
+    tmp: &mut [f32],
+    cache: &mut Stage1Cache,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (ck, fud) = (col_kind(tx_type), flip_ud(tx_type));
+        let k = match (ck, fud) {
+            (K_IDT, _) => 3,
+            (K_ADST, true) => 2,
+            (K_ADST, false) => 1,
+            _ => 0,
+        };
+        if cache.valid >> k & 1 == 0 {
+            super::fwd_neon::stage1_into(f, res, tx_sz, ck, fud, &mut cache.tt[k], tmp);
+            cache.valid |= 1 << k;
+        }
+        super::fwd_neon::stage2_from(f, &cache.tt[k], tx_sz, row_kind(tx_type), flip_lr(tx_type), out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = cache;
+        forward_f(f, res, tx_sz, tx_type, out, tmp);
+    }
+}
+
 /// `res` with the tx type's flips applied, into `r` (or `res` itself when there are none).
 pub(crate) fn flipped<'a>(res: &'a [f32], w: usize, h: usize, tx_type: i32, r: &'a mut [f32]) -> &'a [f32] {
     let (fud, flr) = (flip_ud(tx_type), flip_lr(tx_type));
