@@ -283,6 +283,28 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: the analysis's forward transform, a lane's outputs split (2026-11-03)
+
+The SIMD-group analysis's forward transform gives each lane a whole column, then a whole row, of
+outputs: 32x32 and 64x64 on 128 threads run their row pass on 32 lanes, 2048 multiply-adds each.
+`warp_fwd_ct` spreads a column's (row's) outputs over the idle lanes; each output still
+accumulates over k in the same order, so the same streams (`--digest`, as below).
+
+5K, the rotation, q20, per shape (ms, three interleaved runs each): 16x32 2.88 → 2.70, 32x16 2.78
+→ 2.61, 64x64 2.68 → 2.55, but 16x16 2.26 → 2.55 and 32x32 3.30 → 5.8 (the compiler's registers,
+presumably). Kept for the rectangles and 64x64 only (`warp_eval`), which `k_inter` shares.
+End to end within noise (GPU 41.5 → 41.0 ms).
+
+**Measured, not kept:** the thread-per-block kernel's threadgroup at 64, 256, 512 and 1024
+threads instead of 128 (level or slower: 8x16 3.7 → 4.2 at 512).
+
+**What's left, for the record** (a 5K picture of new content, ms of GPU): the thread-per-block
+kernel 14.3 (screening ~9.6, its RD ~5.8; its private arrays' computed indices, apparently: edges
+in threadgroup memory and unrolled loops were slower), the SIMD-group shapes ~13.5, inter
+candidates ~7 (0.75–1.2 a shape: the new-content gate's two passes), leaves 4.4 (a SIMD-group a
+leaf, most of its lanes idle on 4x4 chroma; float sums whose order a restructure would change),
+motion search 3.1, learned pruning 2.2.
+
 ### Metal AV1: the analysis's screening without atomic contention or divergence (2026-11-03)
 
 Where a 5K picture of new content's GPU analysis goes (`--profile`, the rotation, q20; by

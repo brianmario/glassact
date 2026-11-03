@@ -356,11 +356,93 @@ __device__ __forceinline__ void warp_eval_rt(const int16_t *res, float *tmp, int
     warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi);
 }
 
+// Glass Act: warp_fwd_rt at a compile-time size, its outputs spread over the lanes: where a pass
+// has fewer columns (rows) than lanes, a lane takes part of one's outputs instead of all of them.
+// Each output accumulates over k in the same order, so the same coefficients; the row pass reads
+// a whole row of tmp before any lane writes into it. Only the rectangles and 64x64 (warp_eval):
+// 16x16 and 32x32 measured slower so (BENCHMARKS, "the analysis's forward transform").
+template <int W, int H, int NT>
+__device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int txSz, int txType, int lane) {
+    constexpr int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1;
+    constexpr int SC = NT >= 2 * W ? (NT / W < th / 4 ? NT / W : th / 4) : 1, CC = th / SC;  // column pass: parts a column
+    constexpr int SR = NT / th < tw / 4 ? NT / th : tw / 4, CR = tw / SR;                    // row pass: parts a row
+    const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
+    const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
+    AV1G_CONST const float *Fc = g_fwd + g_fwdOff[ck][log2i(H)];
+    AV1G_CONST const float *Fr = g_fwd + g_fwdOff[rk][log2i(W)];
+    AV1G_CONST const float *FcT = g_fwdT + g_fwdOff[ck][log2i(H)];
+    AV1G_CONST const float *FrT = g_fwdT + g_fwdOff[rk][log2i(W)];
+    for (int t = lane; t < W * SC; t += NT) {
+        const int j = t % W, i0 = (t / W) * CC;
+        const int jj = flr ? W - 1 - j : j;
+        if (ck == AV1G_K_IDT) {
+#pragma unroll
+            for (int i = i0; i < i0 + CC; i++) tmp[i * TS + j] = __ldg(&Fc[i * H + i]) * (float)res[(fud ? H - 1 - i : i) * W + jj];
+            continue;
+        }
+        float acc[CC];
+#pragma unroll
+        for (int i = 0; i < CC; i++) acc[i] = 0.f;
+        for (int k = 0; k < H; k++) {
+            const float x = (float)res[(fud ? H - 1 - k : k) * W + jj];
+            AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FcT + k * H + i0);
+#pragma unroll
+            for (int i4 = 0; i4 < CC / 4; i4++) {
+                const float4 f = __ldg(&f4[i4]);
+                acc[4 * i4 + 0] = fmaf(f.x, x, acc[4 * i4 + 0]);
+                acc[4 * i4 + 1] = fmaf(f.y, x, acc[4 * i4 + 1]);
+                acc[4 * i4 + 2] = fmaf(f.z, x, acc[4 * i4 + 2]);
+                acc[4 * i4 + 3] = fmaf(f.w, x, acc[4 * i4 + 3]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < CC; i++) tmp[(i0 + i) * TS + j] = acc[i];
+    }
+    ga_sync<NT>();
+    const float scale = g_txScale[txSz];
+    // (th * SR <= NT: one item a lane at most, so every lane reaches the barrier once)
+    const bool on = lane < th * SR;
+    const int i = lane % th, j0 = (lane / th) * CR;
+    float acc[CR];
+#pragma unroll
+    for (int jj = 0; jj < CR; jj++) acc[jj] = 0.f;
+    if (on) {
+        if (rk == AV1G_K_IDT) {
+#pragma unroll
+            for (int jj = 0; jj < CR; jj++) acc[jj] = __ldg(&Fr[(j0 + jj) * W + j0 + jj]) * tmp[i * TS + j0 + jj];
+        } else {
+            for (int k = 0; k < W; k++) {
+                const float x = tmp[i * TS + k];
+                AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FrT + k * W + j0);
+#pragma unroll
+                for (int j4 = 0; j4 < CR / 4; j4++) {
+                    const float4 f = __ldg(&f4[j4]);
+                    acc[4 * j4 + 0] = fmaf(f.x, x, acc[4 * j4 + 0]);
+                    acc[4 * j4 + 1] = fmaf(f.y, x, acc[4 * j4 + 1]);
+                    acc[4 * j4 + 2] = fmaf(f.z, x, acc[4 * j4 + 2]);
+                    acc[4 * j4 + 3] = fmaf(f.w, x, acc[4 * j4 + 3]);
+                }
+            }
+        }
+    }
+    ga_sync<NT>();
+    if (on) {
+#pragma unroll
+        for (int jj = 0; jj < CR; jj++) tmp[i * TS + j0 + jj] = acc[jj] * scale;
+    }
+    ga_sync<NT>();
+}
+
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
 template <int W, int H, int NT = 32>
 __device__ __forceinline__ void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
                                           int lane, float *red = nullptr, int *redi = nullptr) {
-    warp_eval_rt<NT>(res, tmp, q, e, o, W, H, lane, red, redi);
+    if (W != H || W == 64) {
+        warp_fwd_ct<W, H, NT>(res, tmp, e.txSz, e.txType, lane);
+        warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi);
+    } else {
+        warp_eval_rt<NT>(res, tmp, q, e, o, W, H, lane, red, redi);
+    }
 }
 
 // Runtime dispatch over the 19 transform sizes (closed loop).
