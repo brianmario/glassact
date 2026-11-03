@@ -1491,6 +1491,10 @@ automatic checks.
   type, waits, UI tree, windows, clipboard.
 - Agent coordinates use a space whose longest edge is ≤ 1568 px. With
   `--size`, a virtual display makes agent coordinates equal host points.
+- Reads and actions return the picture's `version` (an action's from before its
+  input). `wait_for_change` with that as `since` returns at once if a tile changed
+  after it, so a change that lands before the wait isn't missed. Viewer-side only:
+  no wire change.
 - A screenshot waits for the screen to settle, tolerating 0.5 % of tiles still
   changing.
 - Every operation but `status` marks the agent active, watching included

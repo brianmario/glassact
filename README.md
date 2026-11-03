@@ -118,8 +118,12 @@ glassact --session viewer status       # drive your open Viewer session instead
 To use it from an MCP client such as Claude Code, run
 `claude mcp add glassact -- ~/.local/bin/glassact mcp`. The tools mirror
 computer use: `screenshot`, `zoom`, `click`, `drag`, `scroll`, `key`, `type`,
-`wait_for_settle`, `ui_tree`, `list_windows`, `clipboard_get` and
-`clipboard_set`.
+`wait_for_settle`, `wait_for_change`, `ui_tree`, `list_windows`,
+`clipboard_get` and `clipboard_set`.
+
+To wait for what an action caused, pass the `version` it returned as `since`:
+`glassact click 200 100` prints a version, and `glassact wait-change --since
+<version>` returns at once if the change has already happened.
 
 Agents work two ways:
 - **Headless:** the agent connects with its own key. The Host asks you once,

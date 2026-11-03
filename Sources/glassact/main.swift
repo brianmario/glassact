@@ -79,7 +79,7 @@ let usage = """
     Look
       glassact screenshot [-o FILE] [--region x,y,w,h] [--no-settle]
       glassact zoom x,y,w,h [-o FILE]
-      glassact wait-settle [--timeout S]  glassact wait-change [--region x,y,w,h] [--timeout S]
+      glassact wait-settle [--timeout S]  glassact wait-change [--region x,y,w,h] [--since VERSION] [--timeout S]
       glassact ui-tree [--window ID] [--max-nodes N]
       glassact windows                    glassact cursor
 
@@ -286,7 +286,7 @@ func run() throws {
         let out = p.options["o"] ?? "screenshot-\(Int(Date().timeIntervalSince1970)).png"
         try png.write(to: URL(fileURLWithPath: out))
         emit(r.merging(["file": out]) { $1 }, json: json) {
-            "\(out) (\(r["width"] ?? "?")×\(r["height"] ?? "?")\((r["settled"] as? Bool) == false ? ", still changing" : ""))"
+            "\(out) (\(r["width"] ?? "?")×\(r["height"] ?? "?")\((r["settled"] as? Bool) == false ? ", still changing" : ""); version \(r["version"] ?? "?"))"
         }
     case "click", "double-click", "right-click":
         var a: [String: Any] = ["x": try p.number(0, "X"), "y": try p.number(1, "Y")]
@@ -320,6 +320,10 @@ func run() throws {
     case "wait-change":
         var a: [String: Any] = ["timeout": Double(p.options["timeout"] ?? "10") ?? 10]
         if let r = p.options["region"] { a["region"] = try p.rect(r) }
+        if let since = p.options["since"] {
+            guard let v = Int(since), v >= 0 else { throw Usage("--since needs a version from an earlier command") }
+            a["since"] = v
+        }
         try act("wait_for_change", a)
     case "cursor":
         try act("cursor_position", [:])
