@@ -280,7 +280,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.interPreset }
         set { metal.interPreset = newValue }
     }
-    /// See `AV1MetalEncoder.newPictureShapeMask` (nil: off).
+    /// Squares only (GpParams.shapeMask bits 4x4, 8x8, 16x16, 32x32, 64x64) where most of an inter
+    /// frame is new: +1.6 % of such a picture's bytes for ~17 ms less GPU at 5K (BENCHMARKS "what
+    /// buys speed on a picture of new content"; the owner's choice, 2026-11-03).
+    public static let defaultNewPictureShapeMask: Int32 = 0x1249
+    /// See `AV1MetalEncoder.newPictureShapeMask` (nil: off; default `defaultNewPictureShapeMask`).
     public var newPictureShapeMask: Int32? {
         get { metal.newPictureShapeMask }
         set { metal.newPictureShapeMask = newValue }
@@ -351,6 +355,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.leafChromaAngledModes = false
         metal.searchesSubpelMotion = true
         metal.interGate = 2
+        metal.newPictureShapeMask = Self.defaultNewPictureShapeMask
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
