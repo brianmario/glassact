@@ -136,7 +136,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "glassact-bench",
-            dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport",
+            dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActShare",
                            "GlassActAV1", "AV1Core", "libaom"],
             swiftSettings: strict
         ),

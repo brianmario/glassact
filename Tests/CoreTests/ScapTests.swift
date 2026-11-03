@@ -10,6 +10,63 @@ import GlassActTestSupport
             .appendingPathComponent("glassact-scap-\(name)-\(UInt64.random(in: 0...UInt64.max)).scap")
     }
 
+    /// A raw capture compresses into the `.scap` the ordinary writer would have made, byte for
+    /// byte, from tight and padded rows alike, on any number of threads.
+    @Test(arguments: [(0, 1), (0, 3), (32, 3), (0, 64)])
+    func rawCaptureCompressesToTheSameTrace(padding: Int, threads: Int) throws {
+        var rng = SplitMix64(seed: 78)
+        let width = 96, height = 64
+        let (raw, viaRaw, direct) = (tempURL("raw"), tempURL("viaraw"), tempURL("direct"))
+        defer { [raw, viaRaw, direct].forEach { try? FileManager.default.removeItem(at: $0) } }
+        let rawWriter = try ScapRawWriter(url: raw, width: width, height: height)
+        let writer = try ScapWriter(url: direct, width: width, height: height)
+        let stride = width * 4 + padding
+        for i in 0..<9 {
+            let tight = rng.bytes(width * height * 4)
+            let rects = i % 3 == 0 ? [] : [DirtyRect(x: rng.int(0..<32), y: rng.int(0..<32), width: rng.int(1..<64), height: 7),
+                                           DirtyRect(x: 1, y: 2, width: 3, height: 4)]
+            var padded = [UInt8](repeating: 0xEE, count: stride * height)
+            for row in 0..<height {
+                padded.replaceSubrange((row * stride)..<(row * stride + width * 4), with: tight[(row * width * 4)..<((row + 1) * width * 4)])
+            }
+            let ts = UInt64(i) * 16_667 + 5_000_000_000
+            try padded.withUnsafeBytes { try rawWriter.appendFrame(timestampUS: ts, dirtyRects: rects, frame: $0, bytesPerRow: stride) }
+            try tight.withUnsafeBytes { try writer.appendFrame(timestampUS: ts, dirtyRects: rects, frame: $0) }
+        }
+        try writer.finish()
+        #expect(rawWriter.frameCount == 9)
+        var seen: [Int] = []
+        let frames = try ScapRaw.compress(raw: raw, to: viaRaw, threads: threads) { seen.append($0) }
+        #expect(frames == 9 && seen.last == 9)
+        #expect(try Data(contentsOf: viaRaw) == Data(contentsOf: direct))
+    }
+
+    /// A capture that was killed mid-frame still gives the frames it finished; a raw file is never
+    /// taken for a trace, or a trace for a raw file.
+    @Test func rawCaptureCutShortKeepsItsWholeFrames() throws {
+        var rng = SplitMix64(seed: 79)
+        let width = 32, height = 16
+        let (raw, out) = (tempURL("cut"), tempURL("cutout"))
+        defer { [raw, out].forEach { try? FileManager.default.removeItem(at: $0) } }
+        let rawWriter = try ScapRawWriter(url: raw, width: width, height: height)
+        for i in 0..<3 {
+            try rng.bytes(width * height * 4).withUnsafeBytes {
+                try rawWriter.appendFrame(timestampUS: UInt64(i), dirtyRects: [], frame: $0, bytesPerRow: width * 4)
+            }
+        }
+        let whole = try Data(contentsOf: raw)
+        #expect(throws: ScapError.badMagic) { _ = try ScapReader(url: raw) }
+        try whole.dropLast(100).write(to: raw)
+        #expect(try ScapRaw.compress(raw: raw, to: out) == 2)
+        #expect(throws: ScapError.badMagic) { _ = try ScapRaw.compress(raw: out, to: raw) }
+        let reader = try ScapReader(url: out)
+        let buf = UnsafeMutableRawBufferPointer.allocate(byteCount: width * height * 4, alignment: 64)
+        defer { buf.deallocate() }
+        var rects: [DirtyRect] = [], count = 0
+        while try reader.readFrame(rects: &rects, into: buf) != nil { count += 1 }
+        #expect(count == 2)
+    }
+
     @Test func roundTripPreservesFramesExactly() throws {
         var rng = SplitMix64(seed: 77)
         let width = 96, height = 64
