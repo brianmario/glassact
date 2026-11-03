@@ -879,7 +879,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            planes: recon, source: source, sourceStrides: strides,
                                            sourceBuffers: analysisSource.isEmpty ? nil : partition.source,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
-                                           lfZero: inter.isEmpty ? nil : inter.map { $0.is_inter != 0 ? 3 : 0 },
+                                           lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
                                            cropsOutput: returnsPlanes)
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
