@@ -159,6 +159,9 @@ void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
 // inverse transform), and stops at DCT_DCT, the first type tried, when that codes nothing. Off
 // (the default here; AV1HybridEncoder turns it on): the exact reconstruction's SSE, every type.
 void av1enc_hybrid_set_quick_tx_trials(av1enc_hybrid *h, int on);
+// The luma tx type search tries only these types (bit t: AV1 tx type t; DCT_DCT always), within
+// each block's set. All (0xFFFFFFFF) by default.
+void av1enc_hybrid_set_tx_types(av1enc_hybrid *h, uint32_t mask);
 // The next pictures' qindex per 64x64 superblock (raster, sb_cols x sb_rows, 1..255), coded with
 // delta_q_present: their blocks are quantized and their RD weighed by it. NULL / 0: the frame's
 // qindex everywhere. Not with 128x128 superblocks (the frame's then).

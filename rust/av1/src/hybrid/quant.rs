@@ -111,6 +111,8 @@ pub(crate) struct QuantHook<'a> {
     pub td_dist: bool,
     /// a luma search stops at DCT_DCT (the first type tried) when it codes nothing
     pub dct_zero_stops: bool,
+    /// the tx types a luma search may try (bit t: type t; DCT_DCT always)
+    pub tx_types: u32,
 }
 
 /// Each coefficient's position in [`get_scan`]'s order for the tx size and type.
@@ -206,11 +208,17 @@ impl<'a> QuantHook<'a> {
             rdoq_range: 0,
             td_dist: false,
             dct_zero_stops: false,
+            tx_types: u32::MAX,
         }
     }
 
     /// The types of the set (`in_set`) to try: the model's choice, or all of them.
     fn tx_mask(&self, w: &Work, tw: usize, th: usize, ac_q: i32, inter: bool, in_set: impl Fn(i32) -> bool) -> u32 {
+        (self.tx_types | 1 << DCT_DCT) & self.tx_mask_model(w, tw, th, ac_q, inter, in_set)
+    }
+
+    /// The types the learned model keeps, or every type.
+    fn tx_mask_model(&self, w: &Work, tw: usize, th: usize, ac_q: i32, inter: bool, in_set: impl Fn(i32) -> bool) -> u32 {
         match self.tx_model {
             // (below 8x8 a trial costs about what the model does: every type)
             Some((weights, eps)) if tw * th >= tx_model::MIN_SAMPLES => {

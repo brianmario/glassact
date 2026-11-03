@@ -62,6 +62,7 @@ let av1SeqCommand = Command(
         .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
         .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
+        .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; E01: DCT, IDTX, V_DCT, H_DCT)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
@@ -217,6 +218,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.rdoqMinRange = opts.int("rdoq-range", encoder.rdoqMinRange)
     if let v = opts.string("tx-model-eps").flatMap(Float.init) { encoder.txModelEps = v }
     if opts.has("exact-tx-trials") { encoder.quickTxTrials = false }
+    if let m = opts.string("tx-types") {
+        guard let v = UInt32(m.replacingOccurrences(of: "0x", with: ""), radix: 16) else { throw BenchError("--tx-types: hex") }
+        encoder.txTypes = v
+    }
     if let spec = opts.string("dq") {
         let parts = spec.split(separator: ":")
         guard parts.count == 2, let amount = Int(parts[1]), (0...64).contains(amount), ["random", "text"].contains(parts[0])

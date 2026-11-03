@@ -163,6 +163,8 @@ pub struct Hybrid {
     tx_model_eps: Option<f32>,
     /// [`Hybrid::set_quick_tx_trials`]
     quick_tx_trials: bool,
+    /// [`Hybrid::set_tx_types`]
+    tx_types: u32,
     /// RDOQ ([`rdoq`], [`Hybrid::set_rdoq`]): its coefficient costs, for the qindex they're of
     rdoq: bool,
     rdoq_trials: bool,
@@ -326,6 +328,7 @@ impl Hybrid {
             sb_qindex: Vec::new(),
             tx_model_eps: None,
             quick_tx_trials: false,
+            tx_types: u32::MAX,
             rdoq: false,
             rdoq_trials: false,
             rdoq_range: 0,
@@ -526,6 +529,7 @@ impl Hybrid {
             sb_qindex,
             tx_model_eps,
             quick_tx_trials,
+            tx_types,
             tx_samples,
             rdoq,
             rdoq_trials,
@@ -882,6 +886,7 @@ impl Hybrid {
             .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
         hook.collect = tx_samples.as_ref().map(|(m, _)| m);
         (hook.td_dist, hook.dct_zero_stops) = (*quick_tx_trials, *quick_tx_trials);
+        hook.tx_types = *tx_types;
         if *rdoq {
             if rdoq_costs.as_ref().is_none_or(|(q, _)| *q != qindex) {
                 *rdoq_costs = Some((qindex, rdoq::CoeffCosts::new(qindex)));
@@ -1233,6 +1238,12 @@ impl Hybrid {
     /// type it tries, when that codes nothing. Off: the exact reconstruction's SSE, every type.
     pub fn set_quick_tx_trials(&mut self, on: bool) {
         self.quick_tx_trials = on;
+    }
+
+    /// av1enc_hybrid_set_tx_types: the luma tx type search tries only these types (bit t: type t;
+    /// DCT_DCT always), within each block's set. All by default.
+    pub fn set_tx_types(&mut self, mask: u32) {
+        self.tx_types = mask;
     }
 
     /// av1enc_hybrid_set_sb_qindex: the next pictures' qindex per 64x64 superblock (raster, 1..255;
