@@ -1094,10 +1094,50 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 let n = staleSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
                 return n > 0 && !(isInter && (n < 4096 || size.w * size.h >= 64))
             }
+            let analyzed = staleSuperblocks ?? (sbCols * sbRows)
+            if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
+                var sbs = UInt32(analyzed)
+                e.setComputePipelineState(encoder.projectionSearch)
+                e.setBytes(&sbs, length: 4, index: 2)
+                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+                var cells = UInt32(analyzed * 16)
+                e.setComputePipelineState(encoder.motionSearch)
+                e.setBytes(&cells, length: 4, index: 2)
+                e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.candidateSAD)  // the SB's candidates, its 8x8s' SADs
+                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
+                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                if profiling {
+                    stages.motionSearch = try close()
+                    e = try open()
+                }
+            }
+            if isInter, analyzed > 0 {  // the inter candidates, which the intra analysis then weighs
+                e.memoryBarrier(scope: .buffers)
+                for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
+                    guard let (pipeline, warps) = encoder.inter[s] else { continue }
+                    let size = AV1MetalEncoder.blockSizes[s]
+                    var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
+                    e.setComputePipelineState(pipeline)
+                    e.setBytes(&n, length: 4, index: 2)
+                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                }
+                if profiling {
+                    stages.interSearch = try close()
+                    e = try open()
+                }
+            }
+            if isInter, analyzed > 0 { e.memoryBarrier(scope: .buffers) }
             if let mask = mlMask, let weights = encoder.mlWeights, let lp = encoder.learnedPrune,
                let stats = mlStatsBuffer, let keepBuffer = mlKeep, let counts = mlCounts {
                 // learned pruning: node statistics, the cells' network, each SB's skip flags (repaired),
-                // then the small shapes' lists (k_ml.h)
+                // then the small shapes' lists (k_ml.h); after an inter frame's motion search and inter
+                // candidates, whose results the lists read
                 func threads(_ n: Int) -> (MTLSize, MTLSize) { (MTLSize(width: max(n, 1), height: 1, depth: 1), MTLSize(width: 64, height: 1, depth: 1)) }
                 // with kept analysis, the passes cover the stale list's SBs only (B.sbList): `per`
                 // items an SB, or the whole picture's `all`
@@ -1152,45 +1192,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.memoryBarrier(scope: .buffers)
                 if profiling { stages.mlPrune = try close(); e = try open() }
             }
-            let analyzed = staleSuperblocks ?? (sbCols * sbRows)
-            if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
-                var sbs = UInt32(analyzed)
-                e.setComputePipelineState(encoder.projectionSearch)
-                e.setBytes(&sbs, length: 4, index: 2)
-                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
-                                       threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-                e.memoryBarrier(scope: .buffers)
-                var cells = UInt32(analyzed * 16)
-                e.setComputePipelineState(encoder.motionSearch)
-                e.setBytes(&cells, length: 4, index: 2)
-                e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
-                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-                e.memoryBarrier(scope: .buffers)
-                e.setComputePipelineState(encoder.candidateSAD)  // the SB's candidates, its 8x8s' SADs
-                e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
-                                       threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
-                if profiling {
-                    stages.motionSearch = try close()
-                    e = try open()
-                }
-            }
-            if isInter, analyzed > 0 {  // the inter candidates, which the intra analysis then weighs
-                e.memoryBarrier(scope: .buffers)
-                for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
-                    guard let (pipeline, warps) = encoder.inter[s] else { continue }
-                    let size = AV1MetalEncoder.blockSizes[s]
-                    var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
-                    e.setComputePipelineState(pipeline)
-                    e.setBytes(&n, length: 4, index: 2)
-                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
-                                           threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
-                }
-                if profiling {
-                    stages.interSearch = try close()
-                    e = try open()
-                }
-            }
-            if isInter, analyzed > 0 { e.memoryBarrier(scope: .buffers) }
             for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
                 var n = shTotal[s]
                 if let stale = staleSuperblocks {  // only the listed SBs' blocks
