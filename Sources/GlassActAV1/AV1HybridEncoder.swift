@@ -406,7 +406,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 writing = nil
                 try output(i - 1, try w.wait())
             }
-            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, qmap: pending.qmap, timing: timing, started: t0)
+            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, qmap: pending.qmap,
+                                 hashes: pending.hashes, timing: timing, started: t0)
             if let s = starting {
                 starting = following
                 following = nil
@@ -511,6 +512,29 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// A picture's analysis under way, and its copies (an inter frame's).
+    /// A picture's intra block copy hashes, taken while its analysis runs (`begin`), for its
+    /// closed loop (av1enc_ibc_hashes): from `hashPool`, and back to it once given.
+    private final class IbcHashes: @unchecked Sendable {
+        let handle: OpaquePointer
+        init() throws {
+            guard let h = av1enc_ibc_hashes_create() else { throw Failure.encode("no hashes") }
+            handle = h
+        }
+        deinit { av1enc_ibc_hashes_destroy(handle) }
+    }
+    private var hashPool: [IbcHashes] = []
+    private let hashPoolLock = NSLock()
+    private func takeHashes() throws -> IbcHashes {
+        hashPoolLock.lock()
+        defer { hashPoolLock.unlock() }
+        return try hashPool.popLast() ?? IbcHashes()
+    }
+    private func give(_ hashes: IbcHashes) {
+        hashPoolLock.lock()
+        defer { hashPoolLock.unlock() }
+        hashPool.append(hashes)
+    }
+
     private struct Pending {
         var partition: AV1MetalEncoder.PendingPartition
         /// Per 64×64: copy, dx, dy (nil: a key frame or a still picture).
@@ -518,6 +542,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var motionSeconds = 0.0
         /// The picture's qindex per 64×64 (`sbQindex`'s), or nil.
         var qmap: [UInt8]? = nil
+        /// A key frame's intra block copy hashes, or nil.
+        var hashes: IbcHashes? = nil
     }
 
     /// Decides inter frames' copies on a thread of its own, with a motion handle of its own (the
@@ -602,12 +628,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 }
             }
         }
-        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap)
+        // a key frame's intra block copy hashes, while its analysis runs on the GPU
+        var hashes: IbcHashes?
+        if intraBlockCopy && copies.motion == nil {
+            let h = try takeHashes()
+            p.y.withUnsafeBufferPointer { av1enc_ibc_hashes_compute(h.handle, $0.baseAddress, UInt32(p.width), UInt32(p.height)) }
+            hashes = h
+        }
+        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap, hashes: hashes)
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,
-                        qmap: [UInt8]?, timing: Timing, started t0: Double) throws -> Writing {
+                        qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double) throws -> Writing {
         var timing = timing
+        if let hashes {  // (its closed loop's search takes them)
+            av1enc_hybrid_use_ibc_hashes(cpu, hashes.handle)
+            give(hashes)
+        }
         (qmap ?? []).withUnsafeBufferPointer { av1enc_hybrid_set_sb_qindex(cpu, $0.baseAddress, $0.count) }
         var message = [CChar](repeating: 0, count: 256)
         let sbCols0 = (2 * ((p.width + 7) >> 3) + 15) >> 4, sbRows0 = (2 * ((p.height + 7) >> 3) + 15) >> 4

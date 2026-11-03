@@ -64,7 +64,7 @@ type TileArea = (i32, i32, i32, i32);
 pub(crate) struct IntraBc {
     /// per even position (x / 2, y / 2) of the coded area, the hash of the luma 8x8 there, or
     /// [`FLAT`]
-    h8: Vec<u32>,
+    pub(super) h8: Vec<u32>,
     /// per tile (raster order)
     tiles: Vec<TileSearch>,
     /// the blocks, their inter entries and luma tx types the search gives
@@ -83,6 +83,8 @@ pub(crate) struct IntraBc {
     given: Vec<Block>,
     given_tx: Vec<u8>,
     copied: bool,
+    /// `h8` holds the next search's hashes already, for a picture of this size ([`IntraBc::use_hashes`])
+    pre: Option<(u32, u32)>,
 }
 
 /// One tile's search: its chains, and the blocks it gives.
@@ -274,15 +276,55 @@ fn row8(src: &SrcView, x: usize, y: usize) -> u64 {
 /// The hash of the luma 8x8 at (x, y), or [`FLAT`].
 #[inline]
 fn hash8(src: &SrcView, x: usize, y: usize) -> u32 {
-    let r0 = row8(src, x, y);
+    hash_rows(|k| row8(src, x, y + k))
+}
+
+/// The hash of an 8x8 from its rows (`row(k)`: row k's 8 samples, little-endian), or [`FLAT`].
+#[inline(always)]
+fn hash_rows(row: impl Fn(usize) -> u64) -> u32 {
+    let r0 = row(0);
     let mut flat = r0 == (r0 & 0xFF).wrapping_mul(0x0101_0101_0101_0101);
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
     for k in 0..8 {
-        let r = if k == 0 { r0 } else { row8(src, x, y + k) };
+        let r = if k == 0 { r0 } else { row(k) };
         flat &= r == r0;
         h = (h ^ r).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29);
     }
     if flat { FLAT } else { ((h >> 32) as u32).max(1) }
+}
+
+/// The hashes [`IntraBc::search`] takes of a `width` x `height` picture's luma (`y`, rows `width`
+/// apart), from it as the hybrid pads it (edge samples repeated) to its coded area: every even
+/// position's 8x8, into `out`, on `threads` threads. A search given them ([`IntraBc::use_hashes`])
+/// needn't take them itself, so they can be taken on another thread beforehand.
+pub(crate) fn hash_picture(y: &[u8], width: u32, height: u32, out: &mut Vec<u32>, threads: usize) {
+    let (pw, ph) = (width as usize, height as usize);
+    let (w, h) = (
+        crate::blockinfo::mi_cols(width as i32) as usize * 4,
+        crate::blockinfo::mi_rows(height as i32) as usize * 4,
+    );
+    out.clear();
+    if w < 8 || h < 8 || y.len() < pw * ph {
+        return;
+    }
+    let (hw, hh) = ((w - 8) / 2 + 1, (h - 8) / 2 + 1);
+    out.resize(hw * hh, FLAT);
+    let mut rows: Vec<(usize, &mut [u32])> = out.chunks_mut(hw).enumerate().collect();
+    super::par_for(threads, &mut rows, || (), |_, (j, o)| {
+        let y0 = *j * 2;
+        for (i, v) in o.iter_mut().enumerate() {
+            let x0 = i * 2;
+            *v = if x0 + 8 <= pw && y0 + 8 <= ph {
+                hash_rows(|k| u64::from_le_bytes(y[(y0 + k) * pw + x0..][..8].try_into().unwrap()))
+            } else {
+                // past the picture's edge: its last column and row repeated, as the padding does
+                hash_rows(|k| {
+                    let r = &y[(y0 + k).min(ph - 1) * pw..][..pw];
+                    u64::from_le_bytes(core::array::from_fn(|c| r[(x0 + c).min(pw - 1)]))
+                })
+            };
+        }
+    });
 }
 
 impl TileSearch {
@@ -639,6 +681,18 @@ impl IntraBc {
             .then_some(self.copied)
     }
 
+    /// The next search's hashes, taken beforehand ([`hash_picture`]) of the picture it will search,
+    /// `width` x `height`: swapped in, `v` getting the buffer they replace.
+    pub fn use_hashes(&mut self, v: &mut Vec<u32>, width: u32, height: u32) {
+        core::mem::swap(&mut self.h8, v);
+        self.pre = Some((width, height));
+    }
+
+    /// Hashes given for a picture are its alone: the next picture's search takes its own.
+    pub fn clear_hashes(&mut self) {
+        self.pre = None;
+    }
+
     /// No last search to answer from (a picture coded without one came between).
     pub fn forget(&mut self) {
         self.given_key = [0; 6];
@@ -675,11 +729,14 @@ impl IntraBc {
         if w < 8 || h < 8 {
             return false;
         }
-        // every even position's hash
+        // every even position's hash (unless given: use_hashes)
         let (hw, hh) = (((w - 8) / 2 + 1) as usize, ((h - 8) / 2 + 1) as usize);
-        self.h8.clear();
-        self.h8.resize(hw * hh, FLAT);
-        {
+        let given = self.pre.take() == Some((width, height)) && self.h8.len() == hw * hh;
+        if !given {
+            self.h8.clear();
+            self.h8.resize(hw * hh, FLAT);
+        }
+        if !given {
             let src = &src;
             let mut rows: Vec<(usize, &mut [u32])> = self.h8.chunks_mut(hw).enumerate().collect();
             super::par_for(

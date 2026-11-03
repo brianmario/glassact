@@ -209,6 +209,7 @@ the numbers and the reasoning.
 | Flat blocks with flat edges skip their analysis search (`metal-av1`) | kept | the same results; 720p scroll-win's analysis 7.4 → 6.9 ms, 5K ±noise (learned pruning already leaves few flat blocks to the search) | [entry](#metal-av1-flat-blocks-with-flat-edges-skip-their-search-results-unchanged-2026-11-02) |
 | Learned pruning's statistics in one pass per SB from whole-number sums (`metal-av1`) | kept | 3.85 → 2.02 ms of GPU a 5K picture; key frames −0.4 to −1.9 ms; BD 0.0 % (8x8 and 16x16 features bit-identical) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 | One warp a threadgroup for the analysis's 16x32, 32x16, 32x32, their inter search, and the leaves (`metal-av1`) | kept | the same results; 5K key frames' GPU −5.7 to −7.4 ms (typing-cc picture 58.8 → 52.7, photos 89.9 → 82.0); 16x16 and smaller keep 4 warps (1 is slower there) | [entry](#metal-av1-one-warp-a-threadgroup-for-the-analysiss-16x32-32x16-and-32x32-their-inter-search-and-the-leaves-2026-11-02) |
+| A key frame's intra block copy hashes taken while its analysis runs (`metal-av1`) | kept | the copy search's stage −1.5 to −1.6 ms a 5K key frame; the same streams | [entry](#metal-av1-a-key-frames-intra-block-copy-hashes-taken-while-its-analysis-runs-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -273,6 +274,23 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a key frame's intra block copy hashes taken while its analysis runs (2026-11-02)
+
+The copy search hashes the luma 8x8 at every even position before it looks for copies (5K: 3.7 M
+hashes, ~17 ms of CPU threads, ~1.5 ms of the picture's finish). They read only the source, so they
+are now taken in `begin`, on its thread while the GPU analyzes (`av1enc_ibc_hashes_compute`, from
+the picture as the hybrid pads it: its last row and column repeated), and swapped into the hybrid
+right before the closed loop (`av1enc_hybrid_use_ibc_hashes`, no copy), whose search then skips them.
+A Rust test holds them to the search's own on every test picture (333 x 517 among them) and the
+search given them to the search alone. Every stream is the same (`--digest`).
+
+5K key frames, 30 frames, two runs alternated with the commit before (ms):
+
+| | typing-cc | scroll-win | cursor-drag |
+|---|---|---|---|
+| the copy search's stage ("CPU chroma") | 18.6 → **17.0** | 16.9 → **15.4** | 17.5 → **16.0** |
+| picture | 52.8 → 51.8 | 50.0 → 48.7 | 50.6 → 50.5 |
 
 ### Metal AV1: one warp a threadgroup for the analysis's 16x32, 32x16 and 32x32, their inter search, and the leaves (2026-11-02)
 

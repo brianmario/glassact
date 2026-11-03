@@ -148,6 +148,15 @@ void av1enc_hybrid_set_sb_qindex(av1enc_hybrid *h, const uint8_t *map, size_t n)
 // post-filters: the record's fp.allow_intrabc is 1, and av1enc_hybrid_write_ex keeps it so (no
 // deblocking, every cdef_idx 0) whatever fp it's given.
 void av1enc_hybrid_set_intrabc(av1enc_hybrid *h, int on);
+// A picture's intra block copy hashes, taken ahead of its closed loop on any thread (each handle
+// on one at a time): av1enc_ibc_hashes_compute of its luma (rows width apart), then
+// av1enc_hybrid_use_ibc_hashes right before that picture's av1enc_hybrid_closed_loop_ex, which
+// then needn't take them (the handle gets the buffer they replace, to compute into again).
+typedef struct av1enc_ibc_hashes av1enc_ibc_hashes;
+av1enc_ibc_hashes *av1enc_ibc_hashes_create(void);
+void av1enc_ibc_hashes_destroy(av1enc_ibc_hashes *p);
+void av1enc_ibc_hashes_compute(av1enc_ibc_hashes *p, const uint8_t *y, uint32_t width, uint32_t height);
+void av1enc_hybrid_use_ibc_hashes(av1enc_hybrid *h, av1enc_ibc_hashes *p);
 // Tiles the last closed loop kept.
 uint32_t av1enc_hybrid_reused_tiles(const av1enc_hybrid *h);
 // Per 64x64 (raster), nonzero where the last closed loop re-coded the tile: elsewhere the

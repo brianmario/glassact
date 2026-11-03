@@ -30,6 +30,8 @@ mod fwd_neon;
 mod intrabc;
 mod quant;
 mod rdoq;
+
+pub(crate) use intrabc::hash_picture as hash_ibc_picture;
 mod tx_model;
 mod tx_weights;
 #[cfg(test)]
@@ -530,6 +532,7 @@ impl Hybrid {
                     src, width, height, sb128, false, &tiles, given, luma_tx, qindex, *threads,
                 ),
             };
+        ibc.clear_hashes();
         let (given, inter, luma_tx) = if abc {
             (&ibc.blocks[..], &ibc.inter[..], luma_tx.map(|_| &ibc.tx[..]))
         } else {
@@ -1053,6 +1056,13 @@ impl Hybrid {
     /// the analysis's, DCT_DCT without them) and inter blocks' (else DCT_DCT); both on by default.
     pub fn set_tx_search(&mut self, luma: bool, inter: bool) {
         (self.search_luma_tx, self.search_inter_tx) = (luma, inter);
+    }
+
+    /// av1enc_hybrid_use_ibc_hashes: the next call's intra block copy search takes its hashes from
+    /// `v` (intrabc::hash_picture of that call's picture, `width` x `height`), which gets the buffer
+    /// they replace.
+    pub fn use_ibc_hashes(&mut self, v: &mut Vec<u32>, width: u32, height: u32) {
+        self.ibc.use_hashes(v, width, height);
     }
 
     /// av1enc_hybrid_set_rdoq: the closed loop's levels optimized by rate and distortion ([`rdoq`])

@@ -914,6 +914,52 @@ pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: 
     }
 }
 
+/// A picture's intra block copy hashes, taken ahead of its closed loop (av1enc_ibc_hashes_compute)
+/// on any thread, then given to the hybrid (av1enc_hybrid_use_ibc_hashes).
+pub struct IbcHashes {
+    v: Vec<u32>,
+    width: u32,
+    height: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1enc_ibc_hashes_create() -> *mut IbcHashes {
+    Box::into_raw(Box::new(IbcHashes { v: Vec::new(), width: 0, height: 0 }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_ibc_hashes_destroy(p: *mut IbcHashes) {
+    if !p.is_null() {
+        // SAFETY: av1enc_ibc_hashes_create's, destroyed once
+        drop(unsafe { Box::from_raw(p) });
+    }
+}
+
+/// The hashes of a `width` x `height` picture's luma `y` (rows `width` apart), on every core.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_ibc_hashes_compute(p: *mut IbcHashes, y: *const u8, width: u32, height: u32) {
+    if p.is_null() || y.is_null() {
+        return;
+    }
+    // SAFETY: the handle, and the caller's luma of width * height samples
+    let (p, y) = unsafe { (&mut *p, core::slice::from_raw_parts(y, width as usize * height as usize)) };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    crate::hybrid::hash_ibc_picture(y, width, height, &mut p.v, threads);
+    (p.width, p.height) = (width, height);
+}
+
+/// The next av1enc_hybrid_closed_loop_ex takes `p`'s hashes (of its picture); `p` gets the buffer
+/// they replace, to compute into again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_use_ibc_hashes(h: *mut HybridHandle, p: *mut IbcHashes) {
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: the handles
+    let (h, p) = unsafe { (&mut *h, &mut *p) };
+    h.h.use_ibc_hashes(&mut p.v, p.width, p.height);
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_intrabc(h: *mut HybridHandle, on: c_int) {
     // SAFETY: the handle

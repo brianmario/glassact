@@ -601,6 +601,16 @@ fn intrabc_key_frames() {
         let mut hy = run(Hybrid::new().threads);
         let rec = hy.record().clone();
         let copies = rec.inter.iter().filter(|i| i.is_inter != 0).count();
+        // the hashes taken ahead of the closed loop (on another thread) are the search's, and a
+        // search given them finds what it finds alone
+        let mut pre = Vec::new();
+        super::intrabc::hash_picture(&pic.y, w as u32, h as u32, &mut pre, 3);
+        assert!(pre == hy.ibc.h8, "seed {seed}: the hashes taken ahead");
+        let mut given = Hybrid::new();
+        given.set_intrabc(true);
+        given.use_ibc_hashes(&mut pre, w as u32, h as u32);
+        given.closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl).unwrap();
+        assert!(given.record() == &rec, "seed {seed}: a search given its hashes");
         if repeats == 0 {
             let mut plain = Hybrid::new();
             plain
