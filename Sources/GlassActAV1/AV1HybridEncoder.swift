@@ -180,9 +180,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The tx types the closed loop's luma search tries (bit t: AV1 tx type t; DCT_DCT always).
-    /// `screenTxTypes`: DCT_DCT, IDTX, V_DCT and H_DCT, +0.1–0.5 % of new pictures' bytes for a
-    /// cheaper closed loop (BENCHMARKS "the closed loop's tx types").
-    public var txTypes: UInt32 = .max {
+    /// By default `screenTxTypes`: DCT_DCT, IDTX, V_DCT and H_DCT, +0.1–0.5 % of new pictures'
+    /// bytes for a cheaper closed loop (BENCHMARKS "the closed loop's tx types"; the owner's
+    /// choice, 2026-11-03). `.max`: every type.
+    public var txTypes: UInt32 = AV1HybridEncoder.screenTxTypes {
         didSet { av1enc_hybrid_set_tx_types(cpu, txTypes) }
     }
     public static let screenTxTypes: UInt32 = 0xE01
@@ -372,6 +373,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         copyFinder = try CopyFinder()
         applyRDOQ()
         av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0)
+        av1enc_hybrid_set_tx_types(cpu, txTypes)
     }
 
     deinit {

@@ -62,7 +62,7 @@ let av1SeqCommand = Command(
         .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
         .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
-        .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; E01: DCT, IDTX, V_DCT, H_DCT)"),
+        .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),

@@ -215,7 +215,7 @@ the numbers and the reasoning.
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | squares on (the owner's choice, 2026-11-03; `--new-shapes off`) | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
-| The closed loop's tx types: DCT_DCT, IDTX, V_DCT, H_DCT only (`metal-av1`, `txTypes`) | built, off: the owner's choice | +0.49 % / +0.11 % (PSNR / SSIMULACRA2) for ~+6 % pictures a second on new 5K pictures; DCT and IDTX alone +3.5 % / +1.9 % | [entry](#metal-av1-the-closed-loops-tx-types-2026-11-03) |
+| The closed loop's tx types: DCT_DCT, IDTX, V_DCT, H_DCT only (`metal-av1`, `txTypes`) | on (the owner's choice, 2026-11-03; `--tx-types FFFFFFFF` for all) | +0.49 % / +0.11 % (PSNR / SSIMULACRA2) for ~+6 % pictures a second on new 5K pictures; DCT and IDTX alone +3.5 % / +1.9 % | [entry](#metal-av1-the-closed-loops-tx-types-2026-11-03) |
 | A picture's write beside the next closed loop, handed on from the writer's thread (`metal-av1`; the owner's choice) | kept | the same streams; 5K new pictures 23.65 → 26.2 inter frames a second (the writer wait 6.6 → 0.5 ms, the closed loop 15.1 → 20.8 sharing the cores) | [entry](#metal-av1-a-pictures-write-beside-the-next-closed-loop-handed-on-from-the-writers-thread-2026-11-03) |
 | The analysis's screening: lanes summed before one atomic add, and a row a lane (`metal-av1`) | kept | the same streams; a 5K picture of new content's shapes of 16x16 and up 17.5 → 13.9 ms of GPU, 17.0 → 17.75 a second | [entry](#metal-av1-the-analysiss-screening-without-atomic-contention-or-divergence-2026-11-03) |
 | The closed loop's quantizer (NEON f64), rate proxy (raster order) and shared first forward products (`metal-av1`) | kept | the same streams; a 5K picture of new content's closed loop 18.5 → 15.9 ms, its work −15 % | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
@@ -306,7 +306,7 @@ SSIMULACRA2; inter frames a second at q 14 / 20 / 26 / 32, the Mac in use):
 
 On screen content the 1-D transforms earn nearly all of the search; the ADSTs add ~0.4 %.
 `AV1HybridEncoder.txTypes` (`screenTxTypes` = `E01`), built, all types by default: a bytes
-trade, the owner's choice. The streams with every type are unchanged.
+trade, the owner's choice: on since the same day. The streams with every type are unchanged.
 
 ### Metal AV1: the filters ahead of the next analysis on the GPU, measured, not kept (2026-11-03)
 
