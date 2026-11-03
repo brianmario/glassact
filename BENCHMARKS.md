@@ -215,6 +215,7 @@ the numbers and the reasoning.
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | squares on (the owner's choice, 2026-11-03; `--new-shapes off`) | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
+| The closed loop's forward DCTs by their butterflies (`metal-av1`) | rejected | byte-identical streams (BD 0.00 %), but slower than the register-blocked matrices at every size (32x32 1.7 → 2.5 µs); a fast one could save at most ~7 % of the closed loop | [entry](#metal-av1-the-closed-loops-forward-dcts-by-their-butterflies-measured-not-kept-2026-11-03) |
 | RDOQ off, or gated harder, on new pictures (`metal-av1`) | rejected | off +0.54 % / +2.69 % (PSNR / SSIMULACRA2), span ≥ 80 +0.33 / +1.04 %, ≥ 120 +0.47 / +1.48 %; no speed difference outside the noise | [entry](#metal-av1-rdoq-on-pictures-of-new-content-re-measured-2026-11-03) |
 | The closed loop's tx types: DCT_DCT, IDTX, V_DCT, H_DCT only (`metal-av1`, `txTypes`) | on (the owner's choice, 2026-11-03; `--tx-types FFFFFFFF` for all) | +0.49 % / +0.11 % (PSNR / SSIMULACRA2) for ~+6 % pictures a second on new 5K pictures; DCT and IDTX alone +3.5 % / +1.9 % | [entry](#metal-av1-the-closed-loops-tx-types-2026-11-03) |
 | A picture's write beside the next closed loop, handed on from the writer's thread (`metal-av1`; the owner's choice) | kept | the same streams; 5K new pictures 23.65 → 26.2 inter frames a second (the writer wait 6.6 → 0.5 ms, the closed loop 15.1 → 20.8 sharing the cores) | [entry](#metal-av1-a-pictures-write-beside-the-next-closed-loop-handed-on-from-the-writers-thread-2026-11-03) |
@@ -285,6 +286,31 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop's forward DCTs by their butterflies, measured, not kept (2026-11-03)
+
+The forward matrices (the exact inverse of AV1's integer inverse transforms) keep the DCT's
+even/odd symmetry exactly at every level of the folding (F[k][m - 1 - j] = ±F[k][j] over the
+first m = n >> l columns of the rows k = 0 mod 2^l; checked for 4 to 64 points), so a partial
+butterfly with the matrices' own entries is the same transform rounded in another order: the
+input folded into sums and differences, the odd frequencies from the differences (a half-size
+product), the same again on the sums. Built for the DCT passes of 16 points and up (NEON, 4
+signals a vector, the odd outputs 8 at a time; a scalar reference step for step), behind a
+switch.
+
+- **Bytes:** 65 % of the coefficients differ in their last bits (`forward_f`'s test cases), and
+  no level moved: the rotation's streams byte-identical (`--digest`), BD-rate 0.00 % / 0.00 % at
+  q 8–40.
+- **Speed:** slower than the matrices at every size (16x16 230 → 630 ns, 32x32 1665 → 2460,
+  64x64 4750 → 5530; a first version with one accumulator an output, 32x32 2550). The matrix
+  kernel keeps 4 x 16 outputs in registers on float4 loads; the butterfly's intermediates go
+  through memory. Below 16 points the matrices win outright.
+- **What a fast one could save at most:** forward transforms by tx size on new 5K pictures (12
+  pictures): 4x4 2.56 M, 8x8 696 k, 16x16 187 k, 32x32 65 k, 64x64 17 k, the rest under 17 k
+  each; at the matrix's cost ~25 core-ms a picture, 77 % of it at 16x16 and up. A butterfly 2.5x
+  faster there would save ~11 core-ms of the closed loop's ~170 (~7 %, ~1 ms of its wall time):
+  days of hand-scheduled kernels (libaom's NEON fdct style) for that. Not kept; the code is in
+  the session's notes only.
 
 ### Metal AV1: RDOQ on pictures of new content, re-measured (2026-11-03)
 
