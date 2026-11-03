@@ -320,6 +320,23 @@ Taken, on by default (2). Inter frames a second, median of 2 alternated runs (60
 
 (the 5K mixes' GPU analysis 65.4 → 47.2 and 100.5 → 82.5 ms; sizes −0.1 to −0.2 %.)
 
+**Where a full change's period goes now** (5K, typing+scroll mix, a per-picture timeline): ~50 ms,
+bound by the GPU (the next picture's analysis, ~41 ms, beside this one's filters, ~11). The CPU's
+path is ~2 ms reading the analysis, ~4 ms waiting for the last picture's write, ~17 ms of closed
+loop, then waiting on the filters.
+
+- **Not taken: the write overlapped with the next closed loop.** Byte-identical, but it would need a
+  second writer, the tiles' memory split (the write's payloads apart from the closed loop's tile
+  state, with a generation per tile in place of payload_valid), the CDEF indices and
+  cdf_from_ref decided at write time, and the record shared with the write thread. And frames go to
+  `output` on the encoding thread, which would be in the next closed loop when a write finished:
+  each frame's bytes up to a closed loop later (~17–20 ms at 5K). Latency matters more than
+  throughput here; the owner's choice. Done again, it would want frames delivered from the writer's
+  thread.
+- **Not taken: a faster intra block copy search split finer than tiles.** Exact parallelism inside a
+  tile isn't possible (a block's choice depends on the tile's earlier copies), so it would be a
+  bytes trade, for key frames only.
+
 **Then: an inter frame's 8x8s on the thread-per-block kernel where most of the picture is new.**
 Inter frames give the SIMD-group kernel every shape of 64 samples and up, because where inter
 prediction leaves nothing to code a block skips its intra search and a thread-per-block SIMD-group
