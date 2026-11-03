@@ -23,6 +23,8 @@ struct ASmem {
     float satd[32];
     int cand[32];
     int dcv;
+    float red[8];  // ga_sum / ga_max across a block's SIMD-groups (NT > 32)
+    int redi[8];
 };
 
 __device__ __forceinline__ float hadamard4_abs(int *d) {
@@ -112,7 +114,7 @@ __device__ __forceinline__ int pred_fast(thread const PredCand &p, int i, int j,
 }
 
 // SATD of candidates cands[c0..c1) (all 4x4 sub-blocks), accumulated into satd[]
-template <int W, int H>
+template <int W, int H, int NT = 32>
 __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const int *cands, int c0, int c1, threadgroup float *satd,
                                             const uint8_t *A, const uint8_t *L, int dcv, int lane, int sub = 1) {
     typedef TxD<W, H> T;
@@ -120,7 +122,7 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
     // sub == 2: checkerboard of 4x4 sub-blocks (nsx is even for every shape >= 256 pixels)
     const int nsub = sub == 2 ? nsub0 / 2 : nsub0;
     const int items = (c1 - c0) * nsub;
-    for (int it = lane; it < items; it += 32) {
+    for (int it = lane; it < items; it += NT) {
         const int ci = c0 + it / nsub;
         int sb = it % nsub;
         if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
@@ -134,16 +136,16 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
                 d[i * 4 + j] = (int)src[(sy + i) * sp + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv);
         atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], hadamard4_abs(d), memory_order_relaxed);
     }
-    __syncwarp();
+    ga_sync<NT>();
 }
 
 // residual of candidate c into res (W x H), returns sum r^2 (all lanes).  With the intra edge filter,
 // directional candidates use edges prepared by lane 0 into pa/pl (filter type 0: neighbour modes unknown).
-template <int W, int H>
+template <int W, int H, int NT = 32>
 __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c, int16_t *res, const uint8_t *A,
                                                const uint8_t *L, int dcv, int lane, uint8_t *pa = nullptr, uint8_t *pl = nullptr,
                                                int *up = nullptr, int edgeFilter = 0, int haveL = 0, int haveA = 0, int x = 0,
-                                               int y = 0, int maxX = 0, int maxY = 0) {
+                                               int y = 0, int maxX = 0, int maxY = 0, float *red = nullptr) {
     typedef TxD<W, H> T;
     const int m = cand_mode(c);
     const bool ef = edgeFilter && av1g_is_directional(m);
@@ -153,11 +155,11 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
             av1g_edge_prepare(pangle_of(m, cand_delta(c)), T::lw, T::lh, 0, haveL, haveA, x, y, maxX, maxY, pa + AV1G_EDGE_OFF,
                               pl + AV1G_EDGE_OFF, &up[0], &up[1]);
         }
-        __syncwarp();
+        ga_sync<NT>();
     }
     const PredCand pc = pred_cand(c, T::lw, T::lh);
     float e = 0.f;
-    for (int p = lane; p < W * H; p += 32) {
+    for (int p = lane; p < W * H; p += NT) {
         const int i = p / W, j = p % W;
         const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
                                                pl + AV1G_EDGE_OFF, up[0], up[1])
@@ -166,8 +168,8 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
         res[p] = (int16_t)r;
         e += (float)(r * r);
     }
-    __syncwarp();
-    return warp_sum(e);
+    ga_sync<NT>();
+    return ga_sum<NT>(e, lane, red);
 }
 
 // Glass Act: an inter frame's candidate for a block of 8x8 and up (k_inter's, run before this), or
@@ -185,13 +187,14 @@ static inline void ga_merge_inter(device GpBlockRes &out, device GpInterRes *ir,
     ir->isInter = inter ? 1 : 0;
 }
 
-template <int W, int H, int BS, int NW>
+// NT: threads to a block (32, or more for the big shapes, which then take one block a threadgroup)
+template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
                        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     typedef TxD<W, H> T;
     threadgroup ASmem<W, H> smem[NW];
-    const int warp = (int)threadIdx_x >> 5, lane = (int)threadIdx_x & 31;
+    const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;  // the block's slot, its thread
     threadgroup ASmem<W, H> &S = smem[warp];
     threadgroup uint8_t *A = S.ea + AV1G_EDGE_OFF, *L = S.el + AV1G_EDGE_OFF;
     device const uint32_t *starts = B.shImgStart + (size_t)BS * (B.nimg + 1);
@@ -230,7 +233,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         device GpInterRes *ir = ga_inter_of<W, H>(B, I, BS, li);
         if (ir && P.interSkipsIntra && ir->zero && ir->J < GP_INF) {  // Glass Act: an inter block with no residual, no intra search
             if (lane == 0) { out.J = ir->J; out.ncand = 0; ir->isInter = 1; }
-            __syncwarp();
+            ga_sync<NT>();
             continue;
         }
         const TileBox tb = tile_of(I, x, y);
@@ -246,30 +249,30 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         AV1G_CONST const float *C = g_cost[I.qctx];
         if (prune_flat(I, P, x, y, W, H, qidx)) {
             if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
-            __syncwarp();
+            ga_sync<NT>();
             continue;
         }
         if (P.pruneVar > 0.f && W * H >= P.pruneMinArea) {
             float s1 = 0.f, s2 = 0.f;
-            for (int p = lane; p < W * H; p += 32) {
+            for (int p = lane; p < W * H; p += NT) {
                 const float v = (float)src[(p / W) * sp + p % W];
                 s1 += v;
                 s2 += v * v;
             }
-            s1 = warp_sum(s1);
-            s2 = warp_sum(s2);
+            s1 = ga_sum<NT>(s1, lane, S.red);
+            s2 = ga_sum<NT>(s2, lane, S.red);
             const float var = s2 / (W * H) - (s1 / (W * H)) * (s1 / (W * H));
             const float st = av1g_ac_q(qidx) / 8.f;
             if (var > P.pruneVar * st * st) {
                 if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
-                __syncwarp();
+                ga_sync<NT>();
                 continue;
             }
         }
-        build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, lane, 32);
-        __syncwarp();
+        build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, lane, NT);
+        ga_sync<NT>();
         if (lane == 0) S.dcv = av1g_dc_value(A, L, haveLeft, haveAbove, T::lw, T::lh);
-        __syncwarp();
+        ga_sync<NT>();
         const int dcv = S.dcv;
         // Glass Act: a flat block whose prediction edges are flat too (common on screens) is
         // predicted exactly by every mode, so every candidate screens at 0 and its RD is an
@@ -278,10 +281,10 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         {
             const uint8_t v = src[0];
             int bad = 0;
-            for (int p = lane; p < W * H; p += 32) bad |= src[(p / W) * sp + p % W] != v;
-            for (int i = lane - 1; i < W + H; i += 32) bad |= A[i] != v;
-            for (int i = lane; i < W + H; i += 32) bad |= L[i] != v;
-            flat = warp_max(bad) == 0;
+            for (int p = lane; p < W * H; p += NT) bad |= src[(p / W) * sp + p % W] != v;
+            for (int i = lane - 1; i < W + H; i += NT) bad |= A[i] != v;
+            for (int i = lane; i < W + H; i += NT) bad |= L[i] != v;
+            flat = ga_max<NT>(bad, lane, S.redi) == 0;
         }
         device const GpExtCand *ext = (device const GpExtCand *)B.extCand[BS];
         int K = min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
@@ -305,18 +308,18 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 n++;
             }
             K = min(K, n);
-            __syncwarp();
+            ga_sync<NT>();
         } else {
         if (lane < 32) { S.satd[lane] = 0.f; S.cand[lane] = 0; }
-        __syncwarp();
+        ga_sync<NT>();
         // Glass Act: the modes learned mode pruning leaves (all 13 without it), packed in order
         const uint mm = ml_mode_mask(I, x, y, W, H);
         if (lane < 13 && (mm >> lane & 1)) S.cand[popcount(mm & ((1u << lane) - 1u))] = cand_pack(lane, 0);
-        __syncwarp();
+        ga_sync<NT>();
         // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
         int ncand = (int)popcount(mm);
-        if (!flat) warp_screen<W, H>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
+        if (!flat) warp_screen<W, H, NT>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
         // (angle deltas read S.satd by mode: only with every mode screened)
         const bool allowDelta = P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
         if (allowDelta) {
@@ -334,8 +337,8 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 const int d = k < 3 ? -(k + 1) : (k - 2);
                 S.cand[13 + lane] = cand_pack(m, d);
             }
-            __syncwarp();
-            if (!flat) warp_screen<W, H>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, lane, ssub);
+            ga_sync<NT>();
+            if (!flat) warp_screen<W, H, NT>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, lane, ssub);
             ncand = 25;
         }
         // ---- top-K by screening cost (every lane computes the same selection) ----
@@ -371,26 +374,26 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 if (J < bestJ) { bestJ = J; bestK = k; }
                 continue;
             }
-            e.resEnergy = warp_residual<W, H>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             e.txType = AV1G_DCT_DCT;
             e.intraDir = cand_mode(c);
             e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
             EvalOut o;
-            warp_eval<W, H>(S.res, S.tmp, S.q, e, o, lane);
+            warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
             const float J = o.D + lambda * (o.R + mbits(c) + overhead);
             if (J < bestJ) { bestJ = J; bestK = k; }
         }
         // ---- tx-type search for the winner ----
         if (P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
             const int c = S.cand[top[bestK]];
-            e.resEnergy = warp_residual<W, H>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             e.intraDir = cand_mode(c);
             for (int t = 1; t < 16; t++) {
                 if (!av1g_tx_type_in_set_intra(set, t)) continue;
                 e.txType = t;
                 e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, t);
                 EvalOut o;
-                warp_eval<W, H>(S.res, S.tmp, S.q, e, o, lane);
+                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
                 const float J = o.D + lambda * (o.R + mbits(c) + overhead);
                 if (J < bestJ) { bestJ = J; bestTx = t; }
             }
@@ -404,6 +407,6 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 if (k != bestK) out.cand[n++] = (uint8_t)S.cand[top[k]];
             out.ncand = (uint8_t)n;
         }
-        __syncwarp();
+        ga_sync<NT>();
     }
 }

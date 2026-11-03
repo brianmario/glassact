@@ -95,7 +95,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let device: any MTLDevice
     let queue: any MTLCommandQueue
     /// Per AV1 block size: the analysis kernel and its warps per threadgroup.
-    let analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int)]
+    let analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)]
     /// The thread-per-block analysis kernels of the shapes up to 64 pixels.
     let analysisSmall: [Int: any MTLComputePipelineState]
     static let smallThreads = 128
@@ -485,14 +485,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.readEvent = readEvent
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
-        var analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int)] = [:]
+        var analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 {
+            // k_analysis_<W>x<H>_w<NW>: NW blocks a threadgroup, a SIMD-group each; or _w1t<NT>: a
+            // block a threadgroup, on NT threads
             let prefix = "k_analysis_\(size.w)x\(size.h)_w"
-            guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }),
-                  let warps = Int(name.dropFirst(prefix.count)),
-                  let function = library.makeFunction(name: name)
-            else { throw Failure.metal("no \(prefix)…") }
-            analysis[bsize] = (try Self.pipeline(function, threads: warps * 32, device: device), warps)
+            guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }) else { throw Failure.metal("no \(prefix)…") }
+            let parts = name.dropFirst(prefix.count).split(separator: "t").compactMap { Int($0) }
+            guard let warps = parts.first, let function = library.makeFunction(name: name) else { throw Failure.metal("no \(prefix)…") }
+            let perBlock = parts.count > 1 ? parts[1] : 32
+            analysis[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), warps, warps * perBlock)
         }
         self.analysis = analysis
         var inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int)] = [:]
@@ -1236,11 +1238,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                     continue
                 }
-                guard let (pipeline, warps) = encoder.analysis[s] else { continue }
+                guard let (pipeline, warps, threads) = encoder.analysis[s] else { continue }
                 e.setComputePipelineState(pipeline)
                 e.setBytes(&n, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
-                                       threadsPerThreadgroup: MTLSize(width: warps * 32, height: 1, depth: 1))
+                                       threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
                 if profiling {
                     let t = try close()
                     stages.shapes[s] = t

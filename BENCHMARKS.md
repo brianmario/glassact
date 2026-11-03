@@ -212,6 +212,7 @@ the numbers and the reasoning.
 | A key frame's intra block copy hashes taken while its analysis runs (`metal-av1`) | kept | the copy search's stage −1.5 to −1.6 ms a 5K key frame; the same streams | [entry](#metal-av1-a-key-frames-intra-block-copy-hashes-taken-while-its-analysis-runs-2026-11-02) |
 | The inter gate: no motion windows or inter RD where nothing beats 2 x the mean's SAD, in pictures mostly new (`metal-av1`) | kept, on | full-screen change at 5K 14.3 → 19.1 inter frames a second (motion search 13.7 → 4.3 ms, inter candidates 16.7 → 7.8); BD −0.2 to +0.1 %; in every picture it cost 720p scroll-win 0.5 % | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | An inter frame's 8x8, 8x16 and 16x8 on the thread-per-block kernel where most of the picture is new (`metal-av1`) | kept | the same streams; the full-change mixes' GPU analysis −1.5 to −10 ms at 5K (photos+drag 81.6 → 71.6) | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
+| A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -276,6 +277,44 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a block on several SIMD-groups for the analysis's big shapes (2026-11-02)
+
+The analysis kernel (k_analysis.h) gave each block one SIMD-group: a 64x64's 4,096 samples, 13
+modes' screening and its candidates' 64-point transforms on 32 threads, ~20 KB of scratch held
+the whole time. It now takes NT threads to a block (a template parameter, default 32: the
+SIMD-group code as it was): the loops stride by NT, `__syncwarp` becomes a threadgroup barrier,
+and the sums (screening's, the residual's energy, distortion, bits, the eob's maximum) are
+SIMD-group sums then the SIMD-groups' partials in a fixed order (`ga_sum`, `ga_max`, dev_tx.h).
+The transform's columns and rows stay one thread each, so its outputs don't change. NT per shape,
+`--profile` 5K key frames (typing-cc / photos, ms; NT 32 = one SIMD-group a block as before):
+
+| | 16x16 | 16x32 | 32x16 | 32x32 | 64x64 |
+|---|---|---|---|---|---|
+| 32 | 2.84 / 3.89 | 3.70 / 4.65 | 3.55 / 4.58 | 5.80 / 7.44 | 9.5 / 10.2 |
+| 64 | 3.94 / 5.75 | **3.17 / 3.89** | **3.06 / 3.89** | 3.80 / 4.74 | 5.48 / 5.97 |
+| 128 | | 4.60 / 5.46 | 4.40 / 5.38 | **3.67 / 4.43** | **3.97 / 4.26** |
+| 256 | | | | 5.70 / 6.68 | 4.08 / 4.33 |
+
+Taken: 64 for 16x32 and 32x16, 128 for 32x32 and 64x64 (`GA_ANALYSIS_T`, kernels named
+`_w1t<NT>`); 16x16 and smaller keep four one-SIMD-group blocks a threadgroup. **Every stream is
+byte for byte the same** (`--digest`, the four traces' key frames and streams at q8, q20 and q32):
+the sums' new order changed no decision. (The scratch's reduction slots pushed the unused 16x64
+and 64x16 from 4 to 3 blocks a threadgroup.)
+
+Median of 2 runs alternated with the commit before (30 key frames; 60-frame streams):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K key frame, GPU (ms) | 47.2 → **38.5** | 38.5 → **32.8** | 63.6 → **53.2** | 46.2 → **37.5** |
+| 5K key frame, picture (ms) | 52.0 → 50.8 | 49.8 → 50.1 | 81.9 → **77.7** | 50.4 → 49.8 |
+| 1440p key frame, GPU (ms) | 17.4 → 15.1 | 17.1 → 14.8 | 19.4 → 17.2 | 16.6 → 15.9 |
+| 720p stream, inter frames a second | 1137 → 1252 | 392 → 405 | 174 → 193 | 710 → 944 |
+
+Full-change mixes (inter frames a second, GPU ms): 5K typing+scroll 19.3 → **20.6** (44.2 → 38.8),
+photos+drag 11.9 → **13.3** (71.5 → 62.1); 1440p 55.6 → 60.9 and 38.0 → 41.6. 5K streams at three
+runs each: typing-cc 363 → 364, scroll-win 256 → 264, cursor-drag 330 → 340. A 5K key frame of text
+is bound by the CPU again (its finish ~49 ms against the GPU's ~39).
 
 ### Metal AV1: full-screen change inside a stream, and the inter gate (2026-11-02)
 

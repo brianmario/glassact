@@ -8,6 +8,38 @@
 #pragma once
 #include "dev_common.h"
 
+// Glass Act: the warp-level routines below take NT threads to one block (default one SIMD-group;
+// more for the big shapes, k_analysis): NT > 32 syncs with threadgroup barriers and reduces
+// through `red` / `redi` (NT / 32 entries of threadgroup memory), the SIMD-groups' partials summed
+// in a fixed order. NT == 32 is the SIMD-group code as it was.
+template <int NT>
+__device__ __forceinline__ void ga_sync() {
+    if (NT > 32) threadgroup_barrier(mem_flags::mem_threadgroup);
+    else __syncwarp();
+}
+template <int NT>
+__device__ __forceinline__ float ga_sum(float v, int tid, float *red) {
+    v = warp_sum(v);
+    if (NT == 32) return v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // (red free)
+    if ((tid & 31) == 0) red[tid >> 5] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float t = 0.f;
+    for (int w = 0; w < NT / 32; w++) t += red[w];
+    return t;
+}
+template <int NT>
+__device__ __forceinline__ int ga_max(int v, int tid, int *redi) {
+    v = warp_max(v);
+    if (NT == 32) return v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tid & 31) == 0) redi[tid >> 5] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int t = redi[0];
+    for (int w = 1; w < NT / 32; w++) t = max(t, redi[w]);
+    return t;
+}
+
 template <int W, int H>
 struct TxD {
     static constexpr constant int w = W, h = H;
@@ -171,11 +203,11 @@ static __device__ float coeff_bits(int c, int eob, const int16_t *q, AV1G_CONST 
 // Forward transform (dequant-domain coefficients into tmp, th x tw with row stride W + 1).
 // Runtime sizes; the passes are templated on the number of outputs per lane (TH / TW in 4..32) so
 // the accumulators stay in registers.
-template <int TH>
+template <int TH, int NT = 32>
 __device__ __forceinline__ void fwd_col_pass(const int16_t *res, float *tmp, int W, int H, int ck, int fud, int flr,
                                              AV1G_CONST const float *Fc, AV1G_CONST const float *FcT, int lane) {
     const int TS = W + 1;
-    for (int j = lane; j < W; j += 32) {
+    for (int j = lane; j < W; j += NT) {
         const int jj = flr ? W - 1 - j : j;
         if (ck == AV1G_K_IDT) {   // diagonal (identity transforms are never 64 long, so TH == H)
 #pragma unroll
@@ -201,11 +233,11 @@ __device__ __forceinline__ void fwd_col_pass(const int16_t *res, float *tmp, int
         for (int i = 0; i < TH; i++) tmp[i * TS + j] = acc[i];
     }
 }
-template <int TW>
+template <int TW, int NT = 32>
 __device__ __forceinline__ void fwd_row_pass(float *tmp, int W, int th, int rk, AV1G_CONST const float *Fr, AV1G_CONST const float *FrT,
                                              float scale, int lane) {
     const int TS = W + 1;
-    for (int i = lane; i < th; i += 32) {
+    for (int i = lane; i < th; i += NT) {
         float acc[TW];
 #pragma unroll
         for (int jj = 0; jj < TW; jj++) acc[jj] = 0.f;
@@ -233,6 +265,7 @@ __device__ __forceinline__ void fwd_row_pass(float *tmp, int W, int th, int rk, 
 
 __device__ __forceinline__ int log2i(int v) { return 31 - __clz(v); }
 
+template <int NT = 32>
 __device__ __forceinline__ void warp_fwd_rt(const int16_t *res, float *tmp, int W, int H, int txSz, int txType, int lane) {
     const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W;
     const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
@@ -242,30 +275,31 @@ __device__ __forceinline__ void warp_fwd_rt(const int16_t *res, float *tmp, int 
     AV1G_CONST const float *FcT = g_fwdT + g_fwdOff[ck][log2i(H)];
     AV1G_CONST const float *FrT = g_fwdT + g_fwdOff[rk][log2i(W)];
     switch (th) {
-    case 4: fwd_col_pass<4>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
-    case 8: fwd_col_pass<8>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
-    case 16: fwd_col_pass<16>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
-    default: fwd_col_pass<32>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
+    case 4: fwd_col_pass<4, NT>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
+    case 8: fwd_col_pass<8, NT>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
+    case 16: fwd_col_pass<16, NT>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
+    default: fwd_col_pass<32, NT>(res, tmp, W, H, ck, fud, flr, Fc, FcT, lane); break;
     }
-    __syncwarp();
+    ga_sync<NT>();
     const float scale = g_txScale[txSz];
     switch (tw) {
-    case 4: fwd_row_pass<4>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
-    case 8: fwd_row_pass<8>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
-    case 16: fwd_row_pass<16>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
-    default: fwd_row_pass<32>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
+    case 4: fwd_row_pass<4, NT>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
+    case 8: fwd_row_pass<8, NT>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
+    case 16: fwd_row_pass<16, NT>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
+    default: fwd_row_pass<32, NT>(tmp, W, th, rk, Fr, FrT, scale, lane); break;
     }
-    __syncwarp();
+    ga_sync<NT>();
 }
 
 // Quantize tmp -> q, return distortion / rate.  All lanes get the results.
+template <int NT = 32>
 __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o, int W, int H,
-                                                   int lane) {
+                                                   int lane, float *red = nullptr, int *redi = nullptr) {
     const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1, n = tw * th;
     const int lt = log2i(tw);
     const int den = av1g_dq_denom(e.txSz);
     float dist = 0.f, kept = 0.f;
-    for (int idx = lane; idx < n; idx += 32) {
+    for (int idx = lane; idx < n; idx += NT) {
         const int i = idx >> lt, j = idx & (tw - 1);
         const float v = tmp[i * TS + j];
         const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
@@ -280,23 +314,23 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
         dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
         kept = fmaf(v, v, kept);
     }
-    dist = warp_sum(dist);
-    __syncwarp();
+    dist = ga_sum<NT>(dist, lane, red);
+    ga_sync<NT>();
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
     int last = 0;
-    for (int c = lane; c < n; c += 32)
+    for (int c = lane; c < n; c += NT)
         if (q[scan[c]]) last = c + 1;
-    const int eob = warp_max(last);
+    const int eob = ga_max<NT>(last, lane, redi);
     float bits = lane == 0 ? base_bits(e, eob) : 0.f;
     if (eob > 0) {
         const int txClass = av1g_tx_class(e.txType);
-        for (int c = lane; c < eob; c += 32) bits += coeff_bits(c, eob, q, scan, e.txSz, txClass, e.plane > 0, e.dcCtx, e.C);
+        for (int c = lane; c < eob; c += NT) bits += coeff_bits(c, eob, q, scan, e.txSz, txClass, e.plane > 0, e.dcCtx, e.C);
     }
-    bits = warp_sum(bits);
+    bits = ga_sum<NT>(bits, lane, red);
     const float g = g_txg[e.txSz][e.txType];
     float D = g * dist;
     if (W == 64 || H == 64) {
-        kept = warp_sum(kept);
+        kept = ga_sum<NT>(kept, lane, red);
         D += fmaxf(0.f, e.resEnergy - g * kept);
     }
     o.D = D;
@@ -304,17 +338,18 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
     o.eob = eob;
 }
 
+template <int NT = 32>
 __device__ __forceinline__ void warp_eval_rt(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
-                                             int W, int H, int lane) {
-    warp_fwd_rt(res, tmp, W, H, e.txSz, e.txType, lane);
-    warp_quant_rate_rt(tmp, q, e, o, W, H, lane);
+                                             int W, int H, int lane, float *red = nullptr, int *redi = nullptr) {
+    warp_fwd_rt<NT>(res, tmp, W, H, e.txSz, e.txType, lane);
+    warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi);
 }
 
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
-template <int W, int H>
+template <int W, int H, int NT = 32>
 __device__ __forceinline__ void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
-                                          int lane) {
-    warp_eval_rt(res, tmp, q, e, o, W, H, lane);
+                                          int lane, float *red = nullptr, int *redi = nullptr) {
+    warp_eval_rt<NT>(res, tmp, q, e, o, W, H, lane, red, redi);
 }
 
 // Runtime dispatch over the 19 transform sizes (closed loop).

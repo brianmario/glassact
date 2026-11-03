@@ -2,10 +2,10 @@
 //
 // Analysis: one kernel per block shape, k_analysis_<W>x<H>_w<NW>. NW warps share a
 // threadgroup: av1gpu's 4 (2 for 64-point shapes), fewer where their scratch would pass
-// Metal's 32 KB of threadgroup memory (CUDA allows 48), and 1 for 16x32, 32x16 and 32x32,
-// whose blocks a single warp's threadgroups analyze much faster (BENCHMARKS "one warp a
-// threadgroup"; each block is one warp's, so the results are the same). The host reads NW
-// from the name.
+// Metal's 32 KB of threadgroup memory (CUDA allows 48). The big shapes take a block a threadgroup
+// on more threads (GA_ANALYSIS_T: k_analysis_<W>x<H>_w1t<NT>, 64 for 16x32 and 32x16, 128 for
+// 32x32 and 64x64; BENCHMARKS "a block on several SIMD-groups"). The host reads NW (and NT) from
+// the name.
 #include "k_analysis.h"
 
 #define GA_AN_NW(W, H) (32768 / sizeof(ASmem<W, H>) >= 4 ? 4 : 32768 / sizeof(ASmem<W, H>))
@@ -15,6 +15,14 @@
         constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
     static_assert(NWS <= GA_AN_NW(W, H), "k_analysis_" #W "x" #H ": its NW warps' scratch must fit");
+
+// A block on NT threads (one block a threadgroup): k_analysis_<W>x<H>_w1t<NT>
+#define GA_ANALYSIS_T(W, H, BS, NT)                                                                         \
+    template [[host_name("k_analysis_" #W "x" #H "_w1t" #NT)]] kernel void k_analysis<W, H, BS, 1, NT>(     \
+        constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
+        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
+    static_assert(sizeof(ASmem<W, H>) <= 32768, "k_analysis_" #W "x" #H ": its scratch must fit");
 
 GA_ANALYSIS(4, 4, AV1G_BLOCK_4X4, 4)
 GA_ANALYSIS(4, 8, AV1G_BLOCK_4X8, 4)
@@ -27,14 +35,14 @@ GA_ANALYSIS(16, 8, AV1G_BLOCK_16X8, 4)
 GA_ANALYSIS(16, 16, AV1G_BLOCK_16X16, 4)
 GA_ANALYSIS(8, 32, AV1G_BLOCK_8X32, 4)
 GA_ANALYSIS(32, 8, AV1G_BLOCK_32X8, 4)
-GA_ANALYSIS(16, 32, AV1G_BLOCK_16X32, 1)
-GA_ANALYSIS(32, 16, AV1G_BLOCK_32X16, 1)
-GA_ANALYSIS(32, 32, AV1G_BLOCK_32X32, 1)
+GA_ANALYSIS_T(16, 32, AV1G_BLOCK_16X32, 64)
+GA_ANALYSIS_T(32, 16, AV1G_BLOCK_32X16, 64)
+GA_ANALYSIS_T(32, 32, AV1G_BLOCK_32X32, 128)
 GA_ANALYSIS(32, 64, AV1G_BLOCK_32X64, 2)
 GA_ANALYSIS(64, 32, AV1G_BLOCK_64X32, 2)
-GA_ANALYSIS(64, 64, AV1G_BLOCK_64X64, 1)
-GA_ANALYSIS(16, 64, AV1G_BLOCK_16X64, 4)
-GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 4)
+GA_ANALYSIS_T(64, 64, AV1G_BLOCK_64X64, 128)
+GA_ANALYSIS(16, 64, AV1G_BLOCK_16X64, 3)
+GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
 
 // Inter frames' motion search (k_me, then k_inter per shape of 8x8 and up, after the analysis):
 // k_inter_<W>x<H>_w<NW>, NW as the analysis's (1 for 16x32, 32x16 and 32x32 likewise).
@@ -57,8 +65,8 @@ GA_INTER(32, 32, AV1G_BLOCK_32X32, 1)
 GA_INTER(32, 64, AV1G_BLOCK_32X64, 2)
 GA_INTER(64, 32, AV1G_BLOCK_64X32, 2)
 GA_INTER(64, 64, AV1G_BLOCK_64X64, 1)
-GA_INTER(16, 64, AV1G_BLOCK_16X64, 4)
-GA_INTER(64, 16, AV1G_BLOCK_64X16, 4)
+GA_INTER(16, 64, AV1G_BLOCK_16X64, 3)
+GA_INTER(64, 16, AV1G_BLOCK_64X16, 3)
 
 // Partition DP: one thread per 64x64.
 #include "k_dp.h"
