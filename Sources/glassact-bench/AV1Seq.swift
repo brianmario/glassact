@@ -65,6 +65,7 @@ let av1SeqCommand = Command(
         .string("ml-chroma-eps", "<p>", "learned chroma pruning: a leaf keeps its likeliest chroma modes until all but this much probability is kept (default: the encoder's)"),
         .string("ml-eps", "<p>", "learned pruning: a cell keeps its likeliest levels until all but this much probability is kept (default 0.02)"),
         .bool("no-ml-prune", "no learned pruning (the variance rule instead)"),
+        .int("ml-min-sbs", "<n>", 0...1_000_000, "learned pruning only in pictures of at least this many 64x64s (default the encoder's, 900: 1440p and up)"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
@@ -166,6 +167,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         if let v = opts.string("ml-eps").flatMap(Float.init) { lp.eps = v }
         if let v = opts.string("ml-mode-eps").flatMap(Float.init) { lp.modeEps = v }
         if let v = opts.string("ml-over").flatMap(Double.init) { lp.overShare = v }
+        encoder.learnedPruneMinSuperblocks = opts.int("ml-min-sbs", encoder.learnedPruneMinSuperblocks)
         if opts.has("no-ml-modes") { lp.modeWeights = nil }
         if let v = opts.string("ml-chroma-eps").flatMap(Float.init) { lp.chromaEps = v }
         if opts.has("no-ml-chroma") { lp.chromaWeights = nil }

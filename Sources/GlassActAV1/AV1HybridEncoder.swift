@@ -173,6 +173,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.learnedPrune }
         set { metal.learnedPrune = newValue }
     }
+    /// See `AV1MetalEncoder.learnedPruneMinSuperblocks`.
+    public var learnedPruneMinSuperblocks: Int {
+        get { metal.learnedPruneMinSuperblocks }
+        set { metal.learnedPruneMinSuperblocks = newValue }
+    }
     /// See `AV1MetalEncoder.angleDeltasUpToShare`.
     public var angleDeltasUpToShare: Double {
         get { metal.angleDeltasUpToShare }

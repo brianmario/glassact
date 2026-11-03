@@ -201,7 +201,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
-| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 2,000 superblocks and up | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 720p only loses (photos streams −23 %); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
+| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 900 superblocks (1440p) and up since its one-pass statistics (2,000 before) | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 1440p's GPU analysis −8 to −22 % at ±0.3 %; 720p only loses (photos streams −23 %, before the one-pass statistics); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
@@ -298,6 +298,24 @@ matter); a node above the cells is its children's sums with its seams'.
 - A first version, a threadgroup per SB with one thread per node climbing the levels (16, 4, then
   1 thread doing a 64x64's seams), was slower (6.6 ms): too few threads up top, and its
   threadgroup memory capped occupancy.
+
+**The floor, measured again** (`av1seq --ml-min-sbs`, new): with the statistics this cheap, below
+2,000 superblocks. The GPU's analysis per key frame, models off → on (20 frames, q20), and BD-rate
+by SSIMULACRA2 over q 8–32 (key frames / streams):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 1440p (920 SBs), GPU (ms) | 23.5 → **19.0** | 21.0 → **16.7** | 23.9 → 22.1 | 23.4 → **18.4** |
+| 1440p, BD | −0.2 / −0.1 % | +0.2 / 0.0 % | +0.3 / 0.0 % | 0.0 / 0.0 % |
+| 1080p (510 SBs), GPU (ms) | 14.3 → 14.3 | 13.2 → 13.4 | 15.6 → 13.9 | 16.1 → 13.8 |
+| 1080p, BD | +0.4 / +0.3 % | +0.5 / +0.7 % | +0.1 / 0.0 % | +0.1 / +0.1 % |
+| 720p (240 SBs), GPU (ms) | 9.1 → 8.2 | 8.3 → 8.1 | 8.6 → 9.2 | 8.9 → 8.2 |
+| 720p, BD | +0.1 / −0.2 % | 0.0 / 0.0 % | +0.3 / −0.2 % | +0.2 / −0.2 % |
+
+**The owner's choice: the floor down to 900 superblocks**, 1440p and up (`learnedPruneMinSuperblocks`).
+At 1080p the models cost up to 0.7 % of bytes for a GPU saving on two traces of four, and 720p's
+moves are within noise; both stay off. Pictures at these sizes are bound by the CPU, so the
+pictures' times don't move yet: what's saved is the GPU's.
 
 **Measured and rejected, a time context for the models** (the transformer question's cheap
 version): in a stream, what the search chose at the same place in the previous picture. On pairs of

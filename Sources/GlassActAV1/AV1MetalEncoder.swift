@@ -434,9 +434,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
     }
     var mlWeights: (any MTLBuffer)?, mlModeWeights: (any MTLBuffer)?, mlChromaWeights: (any MTLBuffer)?
-    /// Learned pruning's least picture: below it the passes cost more than they
-    /// save (at 720p a moving picture codes up to ~20 % slower).
-    public var learnedPruneMinSuperblocks = 2000
+    /// Learned pruning's least picture: 1440p (920 superblocks) and up, where
+    /// it takes 8–22 % off the GPU's analysis at the same bytes (±0.3 %). At
+    /// 1080p it costs up to 0.7 % of bytes for less (BENCHMARKS "learned
+    /// pruning's statistics in one pass").
+    public var learnedPruneMinSuperblocks = 900
     /// Training data for the learned pruning (`glassact-bench av1seq --dump-partition`):
     /// `partition` also returns the DP's per-node costs and every analyzed block's best mode.
     public var dumpsTrainingData = false
