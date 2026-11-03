@@ -215,6 +215,7 @@ the numbers and the reasoning.
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | built, off: the owner's choice | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
+| The analysis's screening: lanes summed before one atomic add, and a row a lane (`metal-av1`) | kept | the same streams; a 5K picture of new content's shapes of 16x16 and up 17.5 → 13.9 ms of GPU, 17.0 → 17.75 a second | [entry](#metal-av1-the-analysiss-screening-without-atomic-contention-or-divergence-2026-11-03) |
 | The closed loop's quantizer (NEON f64), rate proxy (raster order) and shared first forward products (`metal-av1`) | kept | the same streams; a 5K picture of new content's closed loop 18.5 → 15.9 ms, its work −15 % | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | Quick tx trials: transform-domain distortion, and stopping where DCT_DCT codes nothing (`metal-av1`, `quickTxTrials`) | kept, on (the owner's choice, 2026-11-03) | BD-neutral (+0.24 % / −0.08 %); closed loop −1 to −2 ms, −9 % of its work | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
@@ -281,6 +282,33 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the analysis's screening without atomic contention or divergence (2026-11-03)
+
+Where a 5K picture of new content's GPU analysis goes (`--profile`, the rotation, q20; by
+switching stages off in the shader, which the source tree compiles at runtime): the shapes of
+16x16 and up 17.5 ms, of which the SATD screening of the 13 modes 9.2, the RD of the best 5.9,
+the rest (edges, flat check, residual) 2.4; the thread-per-block kernel's shapes (4x4 to 16x8 in
+such pictures) 14.3 ms, of which screening ~9.6, RD ~5.8. Inter candidates 6.9 ms (0.75–1.2 a
+shape, mostly the new-content gate's passes), leaves 4.4, motion search 3.1, learned pruning 2.2.
+
+**Kept, the same streams** (`--digest`: the rotation, typing-cc's stream and key frames at 5K,
+720p):
+- each 4x4's SATD summed in registers by the lanes sharing a candidate before one atomic add a
+  group (every lane added to the same threadgroup address before: up to 128-way). Each SATD is a
+  multiple of 0.25 and a candidate's total stays below 2^22, so any order sums exactly;
+- shapes with 8 or more 4x4s screened: four lanes a 4x4, a row each (its prediction and the
+  Hadamard's row pass; the column pass by shuffles across the four), so a SIMD-group takes one
+  candidate at a time instead of four with different prediction branches.
+
+Per shape (ms): 16x16 2.75 → 2.26, 16x32 3.35 → 2.87, 32x16 3.22 → 2.78, 32x32 3.89 → 3.29, 64x64
+4.31 → 2.71. End to end (interleaved, the Mac in use): GPU analysis 45.7 → 43.0 ms, 17.0 → 17.75
+inter frames a second.
+
+**Measured, not kept:** 8x8, 8x16 and 16x8 back on the SIMD-group kernel in such pictures (8x8
+2.0 → 5.0 ms, the rectangles level); the thread-per-block kernel's screening loops unrolled
+(8x16 3.7 → 4.3, 16x8 3.6 → 5.4: registers), its edges in threadgroup memory (8x16 → 4.5), and a
+row's prediction work hoisted (no change: the compiler does it).
 
 ### Metal AV1: the closed loop's work, not its dependencies; cheaper tx trials (2026-11-03)
 

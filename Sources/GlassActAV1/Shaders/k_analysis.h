@@ -121,20 +121,74 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
     constexpr int nsx = W / 4, nsub0 = (W / 4) * (H / 4);
     // sub == 2: checkerboard of 4x4 sub-blocks (nsx is even for every shape >= 256 pixels)
     const int nsub = sub == 2 ? nsub0 / 2 : nsub0;
+    if (nsub >= 8) {
+        // Glass Act: four lanes a 4x4, a row each (its prediction, then the Hadamard's row pass;
+        // the column pass across the four by shuffles), so a SIMD-group takes one candidate at a
+        // time: no divergence between candidates' predictions. Integer transforms, then quarters
+        // summed exactly: the same SATDs as below.
+        const int per = nsub * 4, items4 = (c1 - c0) * per;
+        for (int base = 0; base < items4; base += NT) {
+            const int it = base + lane;
+            const bool on = it < items4;
+            const int ci = c0 + it / per, k = it % per, i = k & 3;
+            int sb = k >> 2;
+            if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
+            const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
+            int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+            if (on) {
+                const PredCand pc = pred_cand(cands[ci], T::lw, T::lh);
+                const uint8_t *s = src + (sy + i) * sp + sx;
+                const int d0 = (int)s[0] - pred_fast(pc, sy + i, sx, A, L, dcv);
+                const int d1 = (int)s[1] - pred_fast(pc, sy + i, sx + 1, A, L, dcv);
+                const int d2 = (int)s[2] - pred_fast(pc, sy + i, sx + 2, A, L, dcv);
+                const int d3 = (int)s[3] - pred_fast(pc, sy + i, sx + 3, A, L, dcv);
+                const int s0 = d0 + d1, s1 = d0 - d1, s2 = d2 + d3, s3 = d2 - d3;
+                r0 = s0 + s2; r1 = s1 + s3; r2 = s0 - s2; r3 = s1 - s3;
+            }
+            // columns: rows (0, 1) and (2, 3) into sums and differences, then those across pairs;
+            // row i keeps output i of each column
+            int a = 0;
+            const int rr[4] = {r0, r1, r2, r3};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int v = rr[j], b = simd_shuffle_xor(v, (ushort)1);
+                const int plus = v + b, minus = (i & 1) ? b - v : v - b;
+                const int pp = simd_shuffle_xor(plus, (ushort)2), pm = simd_shuffle_xor(minus, (ushort)2);
+                a += abs(i == 0 ? plus + pp : i == 1 ? minus + pm : i == 2 ? pp - plus : pm - minus);
+            }
+            const float v = simd_sum(on ? (float)a * 0.25f : 0.f);
+            if (on && (lane & 31) == 0)
+                atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], v, memory_order_relaxed);
+        }
+        ga_sync<NT>();
+        return;
+    }
     const int items = (c1 - c0) * nsub;
-    for (int it = lane; it < items; it += NT) {
+    // Glass Act: a candidate's items are nsub (a power of two) consecutive ones, so aligned groups
+    // of g lanes of a SIMD-group share one: they sum in registers, and one lane a group adds to
+    // satd (instead of every lane, which serialized on one address). Each SATD is a multiple of
+    // 0.25 and a candidate's total stays below 2^22, so every order sums exactly: the same totals.
+    const int g = min(nsub, 32), sl = lane & 31;
+    for (int base = 0; base < items; base += NT) {
+        const int it = base + lane;
         const int ci = c0 + it / nsub;
-        int sb = it % nsub;
-        if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
-        const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
-        const PredCand pc = pred_cand(cands[ci], T::lw, T::lh);
-        int d[16];
+        float v = 0.f;
+        if (it < items) {
+            int sb = it % nsub;
+            if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
+            const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
+            const PredCand pc = pred_cand(cands[ci], T::lw, T::lh);
+            int d[16];
 #pragma unroll
-        for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 4; i++)
 #pragma unroll
-            for (int j = 0; j < 4; j++)
-                d[i * 4 + j] = (int)src[(sy + i) * sp + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv);
-        atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], hadamard4_abs(d), memory_order_relaxed);
+                for (int j = 0; j < 4; j++)
+                    d[i * 4 + j] = (int)src[(sy + i) * sp + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv);
+            v = hadamard4_abs(d);
+        }
+        for (int off = g >> 1; off > 0; off >>= 1) v += simd_shuffle_down(v, (ushort)off);
+        if (it < items && (sl & (g - 1)) == 0)
+            atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], v, memory_order_relaxed);
     }
     ga_sync<NT>();
 }
