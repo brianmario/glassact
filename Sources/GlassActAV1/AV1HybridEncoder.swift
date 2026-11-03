@@ -60,6 +60,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var keptTiles = 0.0
         /// The share of 64×64s filtered anew.
         public var filtered = 1.0
+        /// The filters' GPU time (their command buffers').
+        public var filtersGPU = 0.0
         /// Inter frames: the share of 64×64s copied from the GOLDEN_FRAME picture (`goldenFrames`).
         public var copiedGolden = 0.0
         /// Inter frames: the share of 64×64s copied from the previous picture (unchanged or
@@ -878,6 +880,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let t2 = CACurrentMediaTime()
         timing.filters = t2 - t1
         timing.filtered = postfilter.lastFilteredShare
+        timing.filtersGPU = postfilter.lastGPUSeconds
 
         remember(p, search.planes, sbMotion)
         return Writing(cpu: cpu, search: search, sbCols: sbCols, flags: headerFlags(search.params), timing: timing, t0: t0, t2: t2)

@@ -303,8 +303,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         print(String(format: "             intra block copy: %d of %d key frames copy, %.1f %% of their pictures on average",
                      copied.filter { $0 > 0 }.count, keys.count, copied.reduce(0, +) / Double(max(1, keys.count)) * 100))
     }
-    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %% · filtered %.0f %%",
-                 mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.writer },
+    print(String(format: "             per frame: GPU analysis %.1f · CPU chroma %.1f · closed loop %.1f · filters %.1f (GPU %.1f) · writer %.1f (ms) · kept: analysis %.0f %%, tiles %.0f %% · filtered %.0f %%",
+                 mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.filtersGPU },
+                 mean { $0.writer },
                  mean { $0.kept } / 10, mean { $0.keptTiles } / 10, mean { $0.filtered } / 10))
 
     if inter, frames.count > 1 {
