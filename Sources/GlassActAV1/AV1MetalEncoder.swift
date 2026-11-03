@@ -1094,12 +1094,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             let t0 = CACurrentMediaTime()
             var e = try open()
-            // the shapes the thread-per-block kernel takes (the analysis loop below decides the same)
+            // the shapes the thread-per-block kernel takes (the analysis loop below decides the same):
+            // in an inter frame, not those of 64 samples and up (below), but 8x8 where most of the
+            // picture is new, which few blocks skip the intra search of (3.2 -> 2.0 ms at 5K)
+            let newPicture = isInter && codedShare > encoder.interGateOverShare
+            func takesSIMDGroup(_ size: (w: Int, h: Int), _ n: Int) -> Bool {
+                isInter && (n < 4096 || (size.w * size.h >= 64 && !(newPicture && size.w == 8 && size.h == 8)))
+            }
             func smallKernel(_ s: Int) -> Bool {
                 guard shTotal[s] > 0, params.smallKernel != 0, encoder.analysisSmall[s] != nil else { return false }
                 let size = AV1MetalEncoder.blockSizes[s]
                 let n = staleSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
-                return n > 0 && !(isInter && (n < 4096 || size.w * size.h >= 64))
+                return n > 0 && !takesSIMDGroup(size, n)
             }
             let analyzed = staleSuperblocks ?? (sbCols * sbRows)
             if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
@@ -1214,7 +1220,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // skips the intra search, and a thread-per-block SIMD-group then waits on its
                 // slowest block (8x8 to 16x8 3-6x slower there; BENCHMARKS)
                 let size = AV1MetalEncoder.blockSizes[s]
-                let fewBlocks = isInter && (n < 4096 || size.w * size.h >= 64)
+                let fewBlocks = takesSIMDGroup(size, Int(n))
                 if params.smallKernel != 0, !fewBlocks, let pipeline = encoder.analysisSmall[s] {
                     if mlListBuffer != nil { n = shTotal[s] }  // the list's count bounds it
                     e.setComputePipelineState(pipeline)

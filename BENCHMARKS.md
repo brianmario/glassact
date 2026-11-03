@@ -319,6 +319,18 @@ Taken, on by default (2). Inter frames a second, median of 2 alternated runs (60
 
 (the 5K mixes' GPU analysis 65.4 → 47.2 and 100.5 → 82.5 ms; sizes −0.1 to −0.2 %.)
 
+**Then: an inter frame's 8x8s on the thread-per-block kernel where most of the picture is new.**
+Inter frames give the SIMD-group kernel every shape of 64 samples and up, because where inter
+prediction leaves nothing to code a block skips its intra search and a thread-per-block SIMD-group
+waits on its slowest block. In a picture mostly new few blocks skip: there the 8x8s' analysis
+takes 3.16 → **1.96 ms** at 5K on the thread kernel (8x16 and 16x8: no better, so they stay). The
+same streams (`--digest`; BD 0.0 % on every trace and both mixes). The mixes, median of 2:
+
+| | typing+scroll mix, GPU (ms) / inter frames a second | photos+drag mix |
+|---|---|---|
+| 5K | 46.4 → 45.2 / 18.6 → 19.1 | 81.6 → **76.1** / 10.9 → 11.3 |
+| 1440p | 16.5 → 15.9 / 53.1 → 55.6 | 25.6 → 24.3 / 34.6 → 36.1 |
+
 ### Metal AV1: a key frame's intra block copy hashes taken while its analysis runs (2026-11-02)
 
 The copy search hashes the luma 8x8 at every even position before it looks for copies (5K: 3.7 M
