@@ -41,6 +41,29 @@ import GlassActTestSupport
         #expect(try Data(contentsOf: viaRaw) == Data(contentsOf: direct))
     }
 
+    /// `finish` leaves only the whole trace; a capture without a whole frame leaves nothing; both
+    /// are found as leftovers until then.
+    @Test func finishingLeavesOnlyAWholeTrace() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glassact-finish-\(UInt64.random(in: 0...UInt64.max))")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var rng = SplitMix64(seed: 80)
+        let raw = dir.appendingPathComponent("a.\(ScapRawWriter.fileExtension)"), out = dir.appendingPathComponent("a.scap")
+        let writer = try ScapRawWriter(url: raw, width: 32, height: 16)
+        try rng.bytes(32 * 16 * 4).withUnsafeBytes {
+            try writer.appendFrame(timestampUS: 1, dirtyRects: [], frame: $0, bytesPerRow: 32 * 4)
+        }
+        #expect(writer.hasRoomToFinish)
+        #expect(ScapRaw.leftovers(in: dir) .map(\.lastPathComponent) == ["a.\(ScapRawWriter.fileExtension)"])
+        #expect(try ScapRaw.finish(raw: raw, to: out) == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path) == ["a.scap"])
+
+        let empty = dir.appendingPathComponent("b.\(ScapRawWriter.fileExtension)")
+        _ = try ScapRawWriter(url: empty, width: 32, height: 16)
+        #expect(try ScapRaw.finish(raw: empty, to: dir.appendingPathComponent("b.scap")) == 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path) == ["a.scap"])
+    }
+
     /// A capture that was killed mid-frame still gives the frames it finished; a raw file is never
     /// taken for a trace, or a trace for a raw file.
     @Test func rawCaptureCutShortKeepsItsWholeFrames() throws {

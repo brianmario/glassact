@@ -124,14 +124,18 @@ public final class ScapWriter {
 /// write; BENCHMARKS "the trace recorder"). Not read by anything else.
 public final class ScapRawWriter {
     public static let magic: [UInt8] = Array("SCPR".utf8)
+    /// Raw captures' file extension.
+    public static let fileExtension = "scapraw"
 
     public let header: ScapHeader
     public private(set) var frameCount = 0
 
+    private let url: URL
     private let fd: Int32
     private var tight: UnsafeMutableRawBufferPointer?
 
     public init(url: URL, width: Int, height: Int) throws {
+        self.url = url
         header = ScapHeader(width: width, height: height)
         fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         guard fd >= 0 else { throw ScapError.ioError }
@@ -183,6 +187,16 @@ public final class ScapRawWriter {
         frameCount += 1
     }
 
+    /// Whether the disk still has room to compress what's written, whose `.scap` can be as large
+    /// and sits beside it until it's whole, and a margin: past that a capture should stop. Raw
+    /// frames fill a disk fast (3.5 GB/s at 5K, 60 fps).
+    public var hasRoomToFinish: Bool {
+        let free = (try? url.deletingLastPathComponent()
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage ?? .max
+        return free > Int64(frameCount) * Int64(header.frameByteCount) + 10_000_000_000
+    }
+
     private func writeAll(_ bytes: UnsafeRawBufferPointer) throws {
         var done = 0
         while done < bytes.count {
@@ -196,6 +210,28 @@ public final class ScapRawWriter {
 
 /// Turns a `ScapRawWriter` file into a `.scap`, with every core compressing.
 public enum ScapRaw {
+    /// `compress`, by way of a temporary name so that a `.scap` is always whole, then the raw file
+    /// deleted. A capture without a whole frame leaves no trace. Returns the frame count.
+    @discardableResult
+    public static func finish(raw: URL, to output: URL, threads: Int = ProcessInfo.processInfo.activeProcessorCount,
+                              progress: (Int) -> Void = { _ in }) throws -> Int {
+        let partial = output.appendingPathExtension("partial")
+        defer { try? FileManager.default.removeItem(at: partial) }
+        let frames = try compress(raw: raw, to: partial, threads: threads, progress: progress)
+        if frames > 0 {
+            try? FileManager.default.removeItem(at: output)
+            try FileManager.default.moveItem(at: partial, to: output)
+        }
+        try FileManager.default.removeItem(at: raw)
+        return frames
+    }
+
+    /// The raw captures in `directory`: ones a capture that was cut short never finished.
+    public static func leftovers(in directory: URL) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == ScapRawWriter.fileExtension }
+    }
+
     /// Writes `.scap` to `output`, frame for frame, and returns its frame count. A record cut short
     /// at the end (a capture that was killed) is left out. `progress` gets the frames done so far.
     public static func compress(raw: URL, to output: URL, threads: Int = ProcessInfo.processInfo.activeProcessorCount,

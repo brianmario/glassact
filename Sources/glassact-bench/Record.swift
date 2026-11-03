@@ -20,10 +20,9 @@ let recordCommand = Command(
         .string("from-raw", "<file.scapraw>", "don't record: compress a raw capture left behind by a killed run (with --out)"),
     ],
     notes: """
-      The same capture as the Host's (BGRA, sRGB, the main display's own pixels), but nothing compresses a
-      frame while the screen is recording, so full-screen video keeps its frame rate: the Host's recorder
-      compresses on its capture queue, ~55 ms for a 5K frame of video, and drops what arrives meanwhile.
-      A 30 s trace takes up to ~106 GB of disk at 60 fps while it's raw (~42 GB at 24).
+      Host › Developer › Record Trace from a terminal (BGRA, sRGB, the main display's own pixels): nothing
+      compresses a frame while the screen is recording, so full-screen video keeps its frame rate, and
+      this reports the frames it dropped. A 30 s trace takes up to ~106 GB of disk at 60 fps while it's raw (~42 GB at 24).
       Needs Screen Recording for the app this runs in (your terminal).
     """,
     run: cmdRecord
@@ -90,7 +89,7 @@ private final class RawRecorder: @unchecked Sendable {
 
 private func compressRaw(_ raw: URL, to out: URL) throws -> Int {
     let t0 = Date()
-    let frames = try ScapRaw.compress(raw: raw, to: out) { done in
+    let frames = try ScapRaw.finish(raw: raw, to: out) { done in
         print("\rcompressing: \(done) frames", terminator: "")
         fflush(stdout)
     }
@@ -118,7 +117,7 @@ func cmdRecord(_ opts: Options) throws {
         AppPaths.dataDirectory.appendingPathComponent("traces").appendingPathComponent("glassact-\(Int(Date().timeIntervalSince1970)).scap")
     }()
     try FileManager.default.createDirectory(at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let raw = out.deletingPathExtension().appendingPathExtension("scapraw")
+    let raw = out.deletingPathExtension().appendingPathExtension(ScapRawWriter.fileExtension)
     let need = Int64(seconds) * Int64(fps) * Int64(size.w * size.h * 4)
     let free = (try? out.deletingLastPathComponent().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
         .volumeAvailableCapacityForImportantUsage ?? .max
@@ -176,7 +175,6 @@ func cmdRecord(_ opts: Options) throws {
     print(String(format: "recorded %d frames in %.1f s (%.1f a second), %d dropped; a frame's write: median %.1f ms, slowest %.1f",
                  frames, span, Double(max(frames - 1, 0)) / max(span, 0.001), dropped, ms[ms.count / 2], ms[ms.count - 1]))
     _ = try compressRaw(raw, to: out)
-    try FileManager.default.removeItem(at: raw)
 }
 
 /// When the capture task is done.

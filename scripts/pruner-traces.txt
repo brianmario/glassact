@@ -8,8 +8,7 @@
 # frames (key frames: 10 of them; streams: up to 100). The two mustn't overlap. A trace without
 # its file is skipped with a warning, so this list can name traces only some Macs have.
 #
-# Record new ones with the Host's trace recorder (~30 s each), or for video `glassact-bench record`,
-# which keeps its frame rate (BENCHMARKS "the trace recorder"). Traces are screen captures: they
+# Record new ones with the Host's trace recorder (~30 s each). Traces are screen captures: they
 # stay out of the repo (*.scap is ignored), and so do the dumps made from them.
 #
 # Wanted (none of these are recorded yet; content the models haven't seen helps them most):

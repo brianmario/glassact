@@ -94,9 +94,6 @@ To measure a change yourself:
 1. Record traces of your own: Host › Developer › **Record Trace** (or
    **Record 30 Seconds**, which starts after 5 s so the menu stays out of
    the capture). Files land in `~/Library/Application Support/Glass Act/traces/`.
-   Video, or anything else that changes the whole screen every frame, needs
-   `glassact-bench record` instead (raw to disk, compressed afterwards): the
-   Host's recorder drops frames there ("the trace recorder" in the log).
 2. Run `just bench replay --trace <file> --mode encode` before and after the
    change, and the standard golden run above. `just bench help` lists the
    other commands; `glassact-bench synth` makes synthetic traces anyone can
@@ -292,20 +289,19 @@ which.
 
 ### The trace recorder: raw to disk, compressed afterwards (2026-11-03)
 
-A full-screen movie recorded with the Host's recorder (`glassact-1793733277.scap`, VLC, window
-then full screen, 53.7 s) kept 793 frames, ~15 a second, of a ~24 fps picture: the Host's status
-line counts 537 frames superseded. Replaying its frames through the recorder's steps, per 5K frame:
-the copy 1–3 ms, **LZ4 53–58 ms**, the write 4–6 ms (59–67 ms in all, 15–17 fps), all on the
-queue that takes captured frames, so the latest-frame slot drops what arrives meanwhile. The
-frames it keeps are exact; it's only the rate.
+A full-screen movie recorded by the Host (`glassact-1793733277.scap`, VLC, window then full screen,
+53.7 s) kept 793 frames, ~15 a second, of a ~24 fps picture (a later 30 s run: 120 frames kept for
+~80 superseded in each 8.3 s). Replaying its frames through the recorder's steps, per 5K frame: the
+copy 1–3 ms, **LZ4 53–58 ms**, the write 4–6 ms (59–67 ms in all, 15–17 fps), all on the queue
+that takes captured frames, so the latest-frame slot dropped what arrived meanwhile. The frames it
+kept are exact; it was only the rate.
 
-`glassact-bench record` is the same capture (`GlassActShare`'s backend and settings, the main
-display's own pixels) with nothing between a frame and the disk: `ScapRawWriter` (past the page
-cache), then `ScapRaw.compress` on every core once the capture stops. Its `.scap` is byte for byte
-what `ScapWriter` makes (`ScapTests`). 41 GB of 5K frames to this Mac's disk, uncached: 6.6 GB/s,
-112 frames a second; a frame's write median 8.7 ms, slowest 21. A 5 s test: 274 frames in 5.00 s
-(4.0 GB after 4.3 s of compressing; 14 MB a frame, an easier screen than the movie's 33). A 5K trace
-takes ~56 MB a frame while raw.
+Now the recorder writes raw (`ScapRawWriter`, past the page cache) and compresses when it stops
+(`ScapRaw.finish`, every core), in the Host and in the new `glassact-bench record`. Its `.scap` is byte
+for byte what `ScapWriter` makes (`ScapTests`). 41 GB of 5K frames to this Mac's disk, uncached:
+6.6 GB/s, 112 frames a second; a frame's write median 8.7 ms, slowest 21. A 5 s test: 274 frames in
+5.00 s (4.0 GB after 4.3 s of compressing). A 5K trace takes ~59 MB a frame while raw (3.5 GB/s at 60 fps).
+A capture stops itself when the disk couldn't hold its compressed copy beside it, with 10 GB to spare.
 
 ### Metal AV1 against libaom and hardware HEVC, after the day's speed work (2026-11-03)
 

@@ -189,9 +189,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// Where the screen changes (SCK dirty rects), per status interval —
     /// names what keeps an "idle" session sending. encodeQueue only.
     private var changeHotspots = ChangeHotspots()
-    private var recorder: ScapWriter?
+    private var recorder: ScapRawWriter?
     private var recordName = ""
-    private var recordTight: UnsafeMutableRawBufferPointer?
+    /// encodeQueue only: the raw file `recorder` writes.
+    private var recordRaw: URL?
+    /// Compresses finished captures, off the capture's way.
+    private let traceQueue = DispatchQueue(label: "glassact.host.traces", qos: .utility)
     private var frameCount = 0 // encodeQueue-confined
     // Static-screen drain (encodeQueue-confined): SCK stops delivering frames
     // the moment the host screen goes quiet, but governor-deferred tiles,
@@ -1891,23 +1894,39 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
     }
 
-    /// encodeQueue only.
+    /// encodeQueue only. `status` once the capture is compressed into its trace.
     private func closeRecorder(status: String) {
-        var finishError: Error?
-        if let recorder {
-            do {
-                try recorder.finish()
-            } catch {
-                finishError = error
+        guard let recorder, let raw = recordRaw else {
+            onStatus(status)
+            return
+        }
+        onStatus("compressing \(recordName) (\(recorder.frameCount) frames)")
+        self.recorder = nil
+        recordRaw = nil
+        compressTrace(raw, status: status)
+    }
+
+    /// A raw capture into its trace, on `traceQueue`.
+    private func compressTrace(_ raw: URL, status: String) {
+        let encodeQueue = encodeQueue
+        traceQueue.async { [self] in
+            let trace = raw.deletingPathExtension().appendingPathExtension("scap")
+            let result = Result { try ScapRaw.finish(raw: raw, to: trace) }
+            encodeQueue.async { [self] in
+                switch result {
+                case .success: onStatus(status)
+                case let .failure(error): onStatus("trace compression failed, raw capture kept (\(raw.lastPathComponent)): \(error)")
+                }
             }
         }
-        recorder = nil
-        recordTight?.deallocate()
-        recordTight = nil
-        if let finishError {
-            onStatus("trace finish failed: \(finishError)")
-        } else {
-            onStatus(status)
+    }
+
+    /// Finishes the captures an earlier run was stopped in the middle of (a quit while compressing,
+    /// a crash): they're in the traces folder as raw files.
+    func recoverInterruptedTraces() {
+        for raw in ScapRaw.leftovers(in: AppPaths.dataDirectory.appendingPathComponent("traces")) {
+            onStatus("compressing \(raw.lastPathComponent), left from an earlier run")
+            compressTrace(raw, status: "trace saved: \(raw.deletingPathExtension().lastPathComponent).scap")
         }
     }
 
@@ -2889,10 +2908,9 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private func record(frame: UnsafeRawBufferPointer, bytesPerRow: Int,
                         width: Int, height: Int, rects: [DirtyRect], nowUS: UInt64) {
         guard recordingArmed else { return }
-        // The trace format has one geometry per file, and recordTight is
-        // sized from the first frame: a geometry change mid-recording (RESIZE,
-        // window pick, auto-scale, native restore) would write larger frames
-        // past the buffer. Close this file and continue in a new one.
+        // The trace format has one geometry per file: on a geometry change
+        // mid-recording (RESIZE, window pick, auto-scale, native restore),
+        // close this file and continue in a new one.
         if let current = recorder, current.header.width != width || current.header.height != height {
             closeRecorder(status: "geometry changed — trace saved: \(recordName); continuing in a new file")
         }
@@ -2903,8 +2921,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             let name = "glassact-\(Int(Date().timeIntervalSince1970)).scap"
             do {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                recorder = try ScapWriter(url: dir.appendingPathComponent(name), width: width, height: height)
-                recordTight = .allocate(byteCount: width * height * 4, alignment: 64)
+                // raw to disk, compressed once the capture stops: a 5K frame of video takes ~55 ms of
+                // LZ4, and this queue dropping frames meanwhile would thin the trace to ~15 a second
+                let raw = dir.appendingPathComponent(name).deletingPathExtension()
+                    .appendingPathExtension(ScapRawWriter.fileExtension)
+                recorder = try ScapRawWriter(url: raw, width: width, height: height)
+                recordRaw = raw
                 recordName = name
                 onStatus("recording \(name)")
             } catch {
@@ -2912,16 +2934,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 return
             }
         }
-        guard let recorder, let tight = recordTight else { return }
-        let srcBase = frame.baseAddress!
-        let dstBase = tight.baseAddress!
-        for row in 0..<height {
-            dstBase.advanced(by: row * width * 4)
-                .copyMemory(from: srcBase.advanced(by: row * bytesPerRow), byteCount: width * 4)
+        guard let recorder else { return }
+        if recorder.frameCount % 60 == 59, !recorder.hasRoomToFinish {
+            disarmRecording(reason: "recording stopped, the disk is nearly full — trace saved: \(recordName)")
+            return
         }
         do {
-            try recorder.appendFrame(timestampUS: nowUS, dirtyRects: rects,
-                                     frame: UnsafeRawBufferPointer(tight))
+            try recorder.appendFrame(timestampUS: nowUS, dirtyRects: rects, frame: frame, bytesPerRow: bytesPerRow)
         } catch {
             disarmRecording(reason: "recording failed mid-trace (frame \(recorder.frameCount)): \(error)")
         }
@@ -2930,11 +2949,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// encodeQueue only.
     private func disarmRecording(reason: String) {
         recordingArmed = false
-        recorder = nil
-        recordTight?.deallocate()
-        recordTight = nil
         DispatchQueue.main.async { self.isRecording = false }
-        onStatus(reason)
+        closeRecorder(status: reason)
     }
 }
 
