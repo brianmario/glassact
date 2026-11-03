@@ -1095,11 +1095,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let t0 = CACurrentMediaTime()
             var e = try open()
             // the shapes the thread-per-block kernel takes (the analysis loop below decides the same):
-            // in an inter frame, not those of 64 samples and up (below), but 8x8 where most of the
-            // picture is new, which few blocks skip the intra search of (3.2 -> 2.0 ms at 5K)
+            // in an inter frame, not those of 64 samples and up (below), but those up to 128 (8x8, 8x16,
+            // 16x8) where most of the picture is new, which few blocks skip the intra search of (5K:
+            // 8x8 3.2 -> 2.0 ms; photos' 8x16 and 16x8 5.3 -> 3.6)
             let newPicture = isInter && codedShare > encoder.interGateOverShare
             func takesSIMDGroup(_ size: (w: Int, h: Int), _ n: Int) -> Bool {
-                isInter && (n < 4096 || (size.w * size.h >= 64 && !(newPicture && size.w == 8 && size.h == 8)))
+                isInter && (n < 4096 || (size.w * size.h >= 64 && !(newPicture && size.w * size.h <= 128)))
             }
             func smallKernel(_ s: Int) -> Bool {
                 guard shTotal[s] > 0, params.smallKernel != 0, encoder.analysisSmall[s] != nil else { return false }

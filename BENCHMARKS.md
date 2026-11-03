@@ -211,6 +211,7 @@ the numbers and the reasoning.
 | One warp a threadgroup for the analysis's 16x32, 32x16, 32x32, their inter search, and the leaves (`metal-av1`) | kept | the same results; 5K key frames' GPU −5.7 to −7.4 ms (typing-cc picture 58.8 → 52.7, photos 89.9 → 82.0); 16x16 and smaller keep 4 warps (1 is slower there) | [entry](#metal-av1-one-warp-a-threadgroup-for-the-analysiss-16x32-32x16-and-32x32-their-inter-search-and-the-leaves-2026-11-02) |
 | A key frame's intra block copy hashes taken while its analysis runs (`metal-av1`) | kept | the copy search's stage −1.5 to −1.6 ms a 5K key frame; the same streams | [entry](#metal-av1-a-key-frames-intra-block-copy-hashes-taken-while-its-analysis-runs-2026-11-02) |
 | The inter gate: no motion windows or inter RD where nothing beats 2 x the mean's SAD, in pictures mostly new (`metal-av1`) | kept, on | full-screen change at 5K 14.3 → 19.1 inter frames a second (motion search 13.7 → 4.3 ms, inter candidates 16.7 → 7.8); BD −0.2 to +0.1 %; in every picture it cost 720p scroll-win 0.5 % | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
+| An inter frame's 8x8, 8x16 and 16x8 on the thread-per-block kernel where most of the picture is new (`metal-av1`) | kept | the same streams; the full-change mixes' GPU analysis −1.5 to −10 ms at 5K (photos+drag 81.6 → 71.6) | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -330,6 +331,14 @@ same streams (`--digest`; BD 0.0 % on every trace and both mixes). The mixes, me
 |---|---|---|
 | 5K | 46.4 → 45.2 / 18.6 → 19.1 | 81.6 → **76.1** / 10.9 → 11.3 |
 | 1440p | 16.5 → 15.9 / 53.1 → 55.6 | 25.6 → 24.3 / 34.6 → 36.1 |
+
+And 8x16 and 16x8 likewise (no better on the typing+scroll mix, but photos+drag's 5.30 → 3.68 and
+5.35 → 3.55 ms): the same streams again. Median of 2, against the 8x8s alone:
+
+| | typing+scroll mix, GPU (ms) / inter frames a second | photos+drag mix |
+|---|---|---|
+| 5K | 45.5 → 44.6 / 19.4 → 19.7 | 76.9 → **71.6** / 11.4 → 12.0 |
+| 1440p | 15.8 → 15.4 / 55.4 → 55.9 | 24.4 → **22.9** / 36.1 → 38.0 |
 
 ### Metal AV1: a key frame's intra block copy hashes taken while its analysis runs (2026-11-02)
 
