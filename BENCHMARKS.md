@@ -210,6 +210,7 @@ the numbers and the reasoning.
 | Learned pruning's statistics in one pass per SB from whole-number sums (`metal-av1`) | kept | 3.85 → 2.02 ms of GPU a 5K picture; key frames −0.4 to −1.9 ms; BD 0.0 % (8x8 and 16x16 features bit-identical) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 | One warp a threadgroup for the analysis's 16x32, 32x16, 32x32, their inter search, and the leaves (`metal-av1`) | kept | the same results; 5K key frames' GPU −5.7 to −7.4 ms (typing-cc picture 58.8 → 52.7, photos 89.9 → 82.0); 16x16 and smaller keep 4 warps (1 is slower there) | [entry](#metal-av1-one-warp-a-threadgroup-for-the-analysiss-16x32-32x16-and-32x32-their-inter-search-and-the-leaves-2026-11-02) |
 | A key frame's intra block copy hashes taken while its analysis runs (`metal-av1`) | kept | the copy search's stage −1.5 to −1.6 ms a 5K key frame; the same streams | [entry](#metal-av1-a-key-frames-intra-block-copy-hashes-taken-while-its-analysis-runs-2026-11-02) |
+| The inter gate: no motion windows or inter RD where nothing beats 2 x the mean's SAD, in pictures mostly new (`metal-av1`) | kept, on | full-screen change at 5K 14.3 → 19.1 inter frames a second (motion search 13.7 → 4.3 ms, inter candidates 16.7 → 7.8); BD −0.2 to +0.1 %; in every picture it cost 720p scroll-win 0.5 % | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -274,6 +275,49 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: full-screen change inside a stream, and the inter gate (2026-11-02)
+
+**A benchmark for it.** A key frame isn't what a stream codes when the whole screen changes (a
+switch of Spaces, apps or windows): that's an inter frame, with no intra block copy, filtered and
+written on the writer's thread. `av1seq --mix <trace>` (new) alternates the pictures with another
+trace's, so every superblock changes from picture to picture (scoring with `--score-rgb` compares
+against the first trace only, so for a mix the hybrid's own PSNR-Y counts). 5K, typing-cc mixed with
+scroll-win, q20: 14.3 inter frames a second; the GPU's analysis 64 ms and the filters (waiting on
+the GPU beside the next analysis) 43 ms. Stage by stage (`--profile`): **the motion search 13.7 ms**
+(k_proj 1.0, k_me 10.9, k_inter_sad 2.0) and **the inter candidates 16.7 ms**, beside the intra
+analysis's 22.7: half the GPU spent looking for motion in new content.
+
+- No better: k_me and k_inter at other threadgroup sizes; k_me's windows loaded into threadgroup
+  memory (13.7 → 17.4 ms: its lanes' reads were already neighbours).
+
+**The inter gate** (`AV1HybridEncoder.interGate`, `av1seq --inter-gate`, GpParams.interGate): in a
+picture that codes more than half its superblocks, a 16x16 whose search windows' centres (no
+motion, each candidate) all predict worse than 2 x its SAD to its own mean doesn't search the
+windows (k_me), and a block whose best candidate does worse than that costs no inter RD (k_inter:
+no inter result). Motion search 13.7 → **4.3 ms**, inter candidates 16.7 → **7.8 ms**.
+
+BD-rate by SSIMULACRA2 (PSNR) against off, 60 frames from 100, q 8–32:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K streams, gate 2 | 0.0 % | −0.1 % | −0.1 % | 0.0 % |
+| 720p streams, gate 2 (in any picture) | 0.0 % | +0.5 % | 0.0 % | 0.0 % |
+| 720p streams, gate 2, pictures coding > 0.5 (taken) | 0.0 % | −0.2 % | +0.1 % | 0.0 % |
+| 720p streams, gate 1 (in any picture) | 0.0 % | +1.1 % | +2.4 % | 0.0 % |
+
+The mixes by the hybrid's PSNR-Y: typing+scroll −0.1 % (5K) / −0.2 % (720p), photos+drag −0.2 % /
+0.0 %. Gate 3 and 4 kept 720p scroll-win at +0.5 % in any picture: the cost was inter RD skipped
+on a resampled scroll (inter still wins there at a high SAD), hence only where most is new.
+
+Taken, on by default (2). Inter frames a second, median of 2 alternated runs (60 frames, q20):
+
+| | typing+scroll mix | photos+drag mix | scroll-win | photos |
+|---|---|---|---|---|
+| 5K | 14.3 → **19.1** | 9.3 → **11.1** | 248 → 251 | 101 → 101 |
+| 1440p | 46.0 → **55.5** | 30.9 → **35.4** | 347 → 322 | 153 → 151 |
+
+(the 5K mixes' GPU analysis 65.4 → 47.2 and 100.5 → 82.5 ms; sizes −0.1 to −0.2 %.)
 
 ### Metal AV1: a key frame's intra block copy hashes taken while its analysis runs (2026-11-02)
 

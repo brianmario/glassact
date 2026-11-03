@@ -17,6 +17,7 @@ let av1SeqCommand = Command(
     flags: [
         .trace,
         .int("frames", "<n>", 1...10_000, "frames to encode (default 60)"),
+        .string("mix", "<trace.scap>", "alternate the pictures with this trace's (from the same --skip, resampled the same): every superblock changes from picture to picture"),
         .int("skip", "<n>", 0...100_000, "trace frames to skip first (default 0)"),
         .int("width", "<px>", 64...8192, "resample frames to this width (default 1280)"),
         .int("q", "<0-63>", 0...63, "quantizer, libaom's scale; qindex 4q, 63 → 255 (default 20)"),
@@ -54,6 +55,7 @@ let av1SeqCommand = Command(
         .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export: the level model, then the mode model's if present)"),
         .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
         .string("dq", "<kind>:<n>", "per-64x64 qindex (delta-q): random:<n> offsets of up to ±n (a correctness check), or text:<n>, n finer where a 64x64 looks like text or UI (few distinct values, strong edges) and n coarser where it looks like a photo"),
+        .string("inter-gate", "<f>", "with --inter, in pictures most of which is new: no motion windows or inter RD where nothing predicts better than f times a block's SAD to its mean (default 2; 0: off)"),
         .bool("no-rdoq", "the closed loop keeps the dead-zone quantizer's levels (no RDOQ)"),
         .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
         .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
@@ -109,9 +111,29 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var pictures: [YUV420] = []
     var index = 0
     var stamps: [UInt64] = []
+    // --mix: every other picture from a second trace (its own frames from --skip), the same size
+    let mix = try opts.string("mix").map { try ScapReader(url: URL(fileURLWithPath: $0)) }
+    let mixFull = mix.map { UnsafeMutableRawBufferPointer.allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
+    defer { mixFull?.deallocate() }
+    var mixIndex = 0, mixRects: [DirtyRect] = []
+    func mixPicture() throws -> YUV420? {
+        guard let mix, let mixFull, crop == nil else { return nil }
+        while let _ = try mix.readFrame(rects: &mixRects, into: mixFull) {
+            defer { mixIndex += 1 }
+            guard mixIndex >= skip else { continue }
+            resample(mixFull, mix.header.width, mix.header.height, into: bgra, width, height)
+            return try YUV420(bgra: bgra, width: width, height: height)
+        }
+        return nil
+    }
     while pictures.count < count, let meta = try reader.readFrame(rects: &rects, into: full) {
         defer { index += 1 }
         guard index >= skip else { continue }
+        if mix != nil, pictures.count % 2 == 1, let m = try mixPicture() {
+            pictures.append(m)
+            stamps.append(meta.timestampUS)
+            if pictures.count == count { break }
+        }
         stamps.append(meta.timestampUS)
         if let crop {
             for row in 0..<height {
@@ -182,6 +204,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.interFrames = inter
     if opts.has("no-tx-search") { encoder.searchesTxTypes = false }
     if opts.has("no-rdoq") { encoder.usesRDOQ = false }
+    if let v = opts.string("inter-gate").flatMap(Float.init) { encoder.interGate = v }
     if opts.has("rdoq-trials") { encoder.rdoqInTrials = true }
     encoder.rdoqMinRange = opts.int("rdoq-range", encoder.rdoqMinRange)
     if let v = opts.string("tx-model-eps").flatMap(Float.init) { encoder.txModelEps = v }

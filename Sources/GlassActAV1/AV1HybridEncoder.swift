@@ -173,6 +173,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.learnedPrune }
         set { metal.learnedPrune = newValue }
     }
+    /// See `AV1MetalEncoder.interGate` (2: BENCHMARKS "the inter gate").
+    public var interGate: Float {
+        get { metal.interGate }
+        set { metal.interGate = newValue }
+    }
     /// See `AV1MetalEncoder.learnedPruneMinSuperblocks`.
     public var learnedPruneMinSuperblocks: Int {
         get { metal.learnedPruneMinSuperblocks }
@@ -321,6 +326,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.leafTxSearchPixels = 0
         metal.leafChromaAngledModes = false
         metal.searchesSubpelMotion = true
+        metal.interGate = 2
         postfilter = try AV1MetalPostfilter(device: device)
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
         self.cpu = cpu

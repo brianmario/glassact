@@ -97,6 +97,9 @@ struct GpParams {
     int meSubpel;
     // Glass Act: inter frames search no intra for a block whose inter residual quantizes to nothing
     int interSkipsIntra;
+    // Glass Act: > 0: no inter RD for a block whose best candidate's SAD passes interGate times its
+    // SAD to its own mean (no inter result: J = GP_INF), where motion found nothing it could use
+    float interGate;
 };
 
 // Per-image descriptor (device copy in an array; host fills it).

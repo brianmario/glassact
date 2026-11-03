@@ -380,6 +380,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// Inter frames search no intra modes for a block whose motion-compensated residual
     /// quantizes to nothing (libaom realtime's rule; on).
     public var interSkipsIntra = true
+    /// > 0: inter frames cost no inter RD for a block whose best candidate's SAD passes this many
+    /// times its SAD to its own mean (GpParams.interGate); 0: off.
+    public var interGate: Float = 0
+    /// The inter gate only in pictures coding more than this share of their superblocks.
+    public var interGateOverShare = 0.5
     /// Inter frames' analysis effort (nil: `preset`'s): their intra blocks matter less, as
     /// most of the picture is copied or predicted from the previous one.
     public var interPreset: Preset?
@@ -1051,6 +1056,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             // the share of the picture coded (not copied): the same with kept analysis as without
             let codedShare = skipped.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
             if !encoder.searchesAngleDeltas || codedShare > encoder.angleDeltasUpToShare { params.deltas = 0; params.uvDeltas = 0 }
+            // the inter gate where most of the picture is new (a switch of Spaces, apps or windows)
+            params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
             params.meSubpel = encoder.searchesSubpelMotion ? 1 : 0

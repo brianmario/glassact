@@ -188,7 +188,32 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     const int2 sbv = I.meSb ? int2(I.meSb[2 * sb], I.meSb[2 * sb + 1]) : int2(0, 0);
     const int n = GA_ME_ZERO + 81 * (min(I.nMeCand, GP_ME_CANDS) + (I.meSb && (sbv.x | sbv.y) ? 1 : 0));
     uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 11 | i): the lane's best two
-    for (int i = (int)lane; i < n; i += 32) {
+    // Glass Act: where no window's centre (no motion, each candidate) predicts better than the
+    // cell's own mean (P.interGate times its SAD to it), new content: the centres only
+    int nSearch = n;
+    if (P.interGate > 0.f) {
+        uint s1 = 0;
+        for (int p = (int)lane; p < 128; p += 32) s1 += cur[warp][(p >> 4) * 32 + (p & 15)];  // the even rows'
+        const int mean = (int)((simd_sum(s1) + 64) / 128);
+        uint dc = 0;
+        for (int p = (int)lane; p < 128; p += 32) dc += (uint)abs((int)cur[warp][(p >> 4) * 32 + (p & 15)] - mean);
+        dc = simd_sum(dc);
+        const int nw = 1 + (n - GA_ME_ZERO) / 81;
+        uint best = 0xFFFFFFFFu;
+        for (int w = (int)lane; w < nw; w += 32) {
+            const int i = w == 0 ? GA_ME_ZERO / 2 : GA_ME_ZERO + 81 * (w - 1) + 40;  // the window's centre
+            const int2 v = ga_me_vector(I, i, sbv);
+            const int rx = x + v.x, ry = y + v.y;
+            if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
+            device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
+            uint sad = 0;
+            for (int row = 0; row < 16; row += 2)
+                for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
+            best = min(best, sad);
+        }
+        if ((float)simd_min(best) > P.interGate * (float)dc) nSearch = 0;
+    }
+    for (int i = (int)lane; i < nSearch; i += 32) {
         const int2 v = ga_me_vector(I, i, sbv);
         if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
             bool seen = abs(v.x) <= 8 && abs(v.y) <= 8;
@@ -372,6 +397,21 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             sad = simd_sum(sad);
             const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
             if (s < bestS) { bestS = s; bestSad = sad; best = v; }
+        }
+        // Glass Act: where the best candidate predicts worse than the block's own mean would (new
+        // content), no RD for it: intra will code the block
+        if (P.interGate > 0.f && bestSad > 0) {
+            uint s1 = 0;
+            for (int p = lane; p < W * H; p += 32) s1 += src[(p / W) * sp + p % W];
+            const int mean = (int)((simd_sum(s1) + W * H / 2) / (W * H));
+            uint dc = 0;
+            for (int p = lane; p < W * H; p += 32) dc += (uint)abs((int)src[(p / W) * sp + p % W] - mean);
+            dc = simd_sum(dc);
+            if ((float)bestSad > P.interGate * (float)dc) {
+                if (lane == 0) { ir.dx = (int16_t)best.x; ir.dy = (int16_t)best.y; ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
+                __syncwarp();
+                continue;
+            }
         }
         // the best one's exact-rate RD, as the analysis costs an intra candidate
         EvalIn e;
