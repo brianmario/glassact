@@ -1095,10 +1095,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // learned pruning: node statistics, the cells' network, each SB's skip flags (repaired),
                 // then the small shapes' lists (k_ml.h)
                 func threads(_ n: Int) -> (MTLSize, MTLSize) { (MTLSize(width: max(n, 1), height: 1, depth: 1), MTLSize(width: 64, height: 1, depth: 1)) }
+                // with kept analysis, the passes cover the stale list's SBs only (B.sbList): `per`
+                // items an SB, or the whole picture's `all`
+                let stale = staleSuperblocks
+                func items(_ per: Int, all: Int) -> Int { stale.map { $0 * per } ?? all }
                 e.setComputePipelineState(encoder.mlStats)
                 e.setBuffer(stats, offset: 0, index: 3)
                 e.setBytes(mlBases, length: 16, index: 4)
-                e.dispatchThreadgroups(MTLSize(width: sbCols * sbRows, height: 1, depth: 1),
+                e.dispatchThreadgroups(MTLSize(width: max(1, items(1, all: sbCols * sbRows)), height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)
                 if let modes = mlModes, let modeWeights = encoder.mlModeWeights {
@@ -1114,7 +1118,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                         let n = 8 << level
                         e.setBytes(&lv, length: 4, index: 2)
                         e.setBytes(&base, length: 4, index: 4)
-                        let (g, t) = threads((width / n) * (height / n))
+                        let (g, t) = threads(items((8 >> level) * (8 >> level), all: (width / n) * (height / n)))
                         e.dispatchThreads(g, threadsPerThreadgroup: t)
                     }
                 }
@@ -1125,19 +1129,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.setBuffer(keepBuffer, offset: 0, index: 6)
                 e.setBytes(&eps, length: 4, index: 7)
                 e.setBuffer(counts, offset: 0, index: 8)
-                let (gc, tc) = threads(max(aw / 8 * (ah / 8), Int(GP_NSHAPES)))
+                let (gc, tc) = threads(max(items(64, all: aw / 8 * (ah / 8)), Int(GP_NSHAPES)))
                 e.dispatchThreads(gc, threadsPerThreadgroup: tc)
                 e.memoryBarrier(scope: .buffers)
                 e.setComputePipelineState(encoder.mlTree)
                 e.setBuffer(mask, offset: 0, index: 9)
-                let (gt, tt) = threads(sbCols * sbRows)
+                let (gt, tt) = threads(items(1, all: sbCols * sbRows))
                 e.dispatchThreads(gt, threadsPerThreadgroup: tt)
                 e.memoryBarrier(scope: .buffers)
                 e.setComputePipelineState(encoder.mlList)
                 for s in 0..<Int(GP_NSHAPES) where mlListBuffer != nil && smallKernel(s) {
                     var bs = UInt32(s)
                     e.setBytes(&bs, length: 4, index: 2)
-                    let (g, t) = threads(Int(shTotal[s]))
+                    let size = AV1MetalEncoder.blockSizes[s]
+                    let (g, t) = threads(items((64 / size.w) * (64 / size.h), all: Int(shTotal[s])))
                     e.dispatchThreads(g, threadsPerThreadgroup: t)
                 }
                 e.memoryBarrier(scope: .buffers)

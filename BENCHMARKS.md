@@ -317,6 +317,25 @@ At 1080p the models cost up to 0.7 % of bytes for a GPU saving on two traces of 
 moves are within noise; both stay off. Pictures at these sizes are bound by the CPU, so the
 pictures' times don't move yet: what's saved is the GPU's.
 
+**The passes over the stale SBs only.** With kept analysis, each pass now skips kept SBs and is
+dispatched over the stale list (`B.sbList`), so its cost follows what changed: the statistics a
+threadgroup per stale SB, the cells' network 64 threads a stale SB, the tree one, the modes their
+level's nodes in a stale SB, the lists its blocks. The same streams (`--digest`). It changes
+nothing on these traces' measurements (their pictures that run the models analyze every SB).
+
+**Measured, not taken: the models on every picture of a stream** (`--ml-over 0`, against the share
+of 0.5), with the passes over the stale SBs only. The GPU's analysis per inter frame, 100 frames,
+q20, two runs:
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K (ms) | 1.3 → 1.5–1.6 | 2.6 → **2.1** | 9.0 → **8.0** (25.7 → 25.9 KB a frame) | 1.5 → 1.4 |
+| 1440p (ms) | 0.8 → 0.9–1.0 | 1.6 → **1.4** | 5.2 → 5.6–5.7 | 1.0 → 0.8–0.9 |
+
+A small change can't carry the passes' chain of five dependent stages (typing-cc), and photos pay
+0.8 % of bytes at 5K and lose time at 1440p. A rule by the stale SBs' count, or fewer stages
+(fusing the cells' network with the tree, the lists with them), would be the next try.
+
 **Measured and rejected, a time context for the models** (the transformer question's cheap
 version): in a stream, what the search chose at the same place in the previous picture. On pairs of
 consecutive frames (5K q20, four pairs a trace, every picture analyzed whole), a changed 8x8 cell

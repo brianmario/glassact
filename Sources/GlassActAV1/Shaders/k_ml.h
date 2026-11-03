@@ -117,10 +117,13 @@ static inline int ga_ml_inner_level(int a) {
 // its children's sums with its own seams'. Each whole node inside the visible picture
 // (n = 8 << level) gets its features at its level's base, raster within the level's grid.
 kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[buffer(3)]],
-                       constant uint32_t *bases [[buffer(4)]], uint sb [[threadgroup_position_in_grid]],
+                       constant uint32_t *bases [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
                        uint t [[thread_position_in_threadgroup]]) {
     device const GpImage &I = B.img[0];
+    // with kept analysis, a threadgroup per SB of the stale list (B.sbList)
+    const uint sb = B.sbList ? (tg < B.nSbList ? B.sbList[tg] : 0xFFFFFFFFu) : tg;
     if ((int)sb >= I.sbCols * I.sbRows) return;  // (the whole threadgroup)
+    if (B.sbKeep && B.sbKeep[I.sbBase + (int)sb]) return;  // kept: its analysis is the last picture's
     // the 85 nodes' sums (cells, then 16, 4, 1), and the seams of the 21 above the cells
     threadgroup MlSums sums[85];
     threadgroup atomic_uint seam[21][2 + ML_OB + 1];  // dx, dy, the bins, their total
@@ -229,9 +232,16 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
     device const GpImage &I = B.img[0];
     if (gid < GP_NSHAPES) atomic_store_explicit(&counts[gid], 0u, memory_order_relaxed);
     const int cols8 = I.aw / 8, rows8 = I.ah / 8;
-    if ((int)gid >= cols8 * rows8) return;
-    const int cx = (int)gid % cols8, cy = (int)gid / cols8;
-    if (cx >= (I.W / 64) * 8 || cy >= (I.H / 64) * 8) { keep[gid] = 0xF; return; }
+    uint g = gid;
+    if (B.sbList) {  // with kept analysis, 64 threads per SB of the stale list
+        if (gid / 64 >= B.nSbList) return;
+        const int sb = (int)B.sbList[gid / 64], k = (int)gid % 64;
+        g = (uint)(((sb / I.sbCols) * 8 + k / 8) * cols8 + (sb % I.sbCols) * 8 + k % 8);
+    }
+    if ((int)g >= cols8 * rows8) return;
+    const int cx = (int)g % cols8, cy = (int)g / cols8;
+    if (B.sbKeep && B.sbKeep[I.sbBase + (cy / 8) * I.sbCols + cx / 8]) return;  // kept
+    if (cx >= (I.W / 64) * 8 || cy >= (I.H / 64) * 8) { keep[g] = 0xF; return; }
     float f[ML_NF];
     for (int lv = 0; lv < 4; lv++) {
         const int n = 8 << lv, cols = I.W / n;
@@ -266,7 +276,7 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
         bits |= (uint8_t)(1 << best);
         kept += p[best];
     }
-    keep[gid] = bits ? bits : 0xF;  // (never empty)
+    keep[g] = bits ? bits : 0xF;  // (never empty)
 }
 
 // One thread per 64x64 SB: each node's own shapes are searched where a cell in it keeps the node's
@@ -274,9 +284,12 @@ kernel void k_ml_cell(constant GpBatch &B [[buffer(0)]], device const float *sta
 // complete partition of its own keeps its own shapes, so each cell's levels stay reachable (a
 // SPLIT needs all four children). Writes each 8x8 cell's skip byte per level.
 kernel void k_ml_tree(constant GpBatch &B [[buffer(0)]], device const uint8_t *keep [[buffer(6)]],
-                      device uint8_t *mask [[buffer(9)]], uint gid [[thread_position_in_grid]]) {
+                      device uint8_t *mask [[buffer(9)]], uint tid [[thread_position_in_grid]]) {
     device const GpImage &I = B.img[0];
+    // with kept analysis, a thread per SB of the stale list
+    const uint gid = B.sbList ? (tid < B.nSbList ? B.sbList[tid] : 0xFFFFFFFFu) : tid;
     if ((int)gid >= I.sbCols * I.sbRows) return;
+    if (B.sbKeep && B.sbKeep[I.sbBase + (int)gid]) return;  // kept
     const int sbx = (int)gid % I.sbCols, sby = (int)gid / I.sbCols, cols8 = I.aw / 8, rows8 = I.ah / 8;
     uint8_t cell[64];
     for (int k = 0; k < 64; k++) {
@@ -340,10 +353,20 @@ kernel void k_ml_tree(constant GpBatch &B [[buffer(0)]], device const uint8_t *k
 kernel void k_ml_mode(constant GpBatch &B [[buffer(0)]], constant uint32_t &level [[buffer(2)]],
                       device const float *stats [[buffer(3)]], constant uint32_t &base [[buffer(4)]],
                       device const float *wts [[buffer(5)]], constant float &eps [[buffer(7)]],
-                      device uint16_t *modes [[buffer(10)]], uint gid [[thread_position_in_grid]]) {
+                      device uint16_t *modes [[buffer(10)]], uint tid [[thread_position_in_grid]]) {
     device const GpImage &I = B.img[0];
     const int n = 8 << level, cols = I.W / n, rows = I.H / n;
+    uint gid = tid;
+    if (B.sbList) {  // with kept analysis, the level's nodes of the stale list's SBs
+        const int per = 8 >> level;
+        if (tid / (per * per) >= B.nSbList) return;
+        const int sb = (int)B.sbList[tid / (per * per)], k = (int)tid % (per * per);
+        const int nx = (sb % I.sbCols) * per + k % per, ny = (sb / I.sbCols) * per + k / per;
+        if (nx >= cols || ny >= rows) return;
+        gid = (uint)(ny * cols + nx);
+    }
     if ((int)gid >= cols * rows) return;
+    if (B.sbKeep && B.sbKeep[I.sbBase + ((int)gid / cols * n >> 6) * I.sbCols + ((int)gid % cols * n >> 6)]) return;  // kept
     float f[ML_MODE_NF];
     device const float *s = stats + base + gid * ML_STRIDE;
     for (int k = 0; k < ML_STRIDE; k++) f[k] = s[k];
@@ -384,11 +407,21 @@ kernel void k_ml_mode(constant GpBatch &B [[buffer(0)]], constant uint32_t &leve
 // checks before the prune, so the results are the same as without the list.
 kernel void k_ml_list(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                       constant uint32_t &bs [[buffer(2)]], device atomic_uint *counts [[buffer(8)]],
-                      uint gid [[thread_position_in_grid]]) {
+                      uint tid [[thread_position_in_grid]]) {
     device const GpImage &I = B.img[0];
     const int nbx = I.shNbx[bs], nby = I.shNby[bs];
-    if ((int)gid >= nbx * nby) return;
     const int W = bw_px((int)bs), H = bh_px((int)bs);
+    uint gid = tid;
+    if (B.sbList) {  // with kept analysis, the stale list's SBs' blocks (as k_analysis_small reads it)
+        const uint per = (uint)((64 / W) * (64 / H));
+        if (tid / per >= B.nSbList) return;
+        const uint sb = B.sbList[tid / per], k = tid % per;
+        const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
+        const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+        if (bx >= nbx || by >= nby) return;
+        gid = (uint)(by * nbx + bx);
+    }
+    if ((int)gid >= nbx * nby) return;
     const int x = (int)(gid % nbx) * W, y = (int)(gid / nbx) * H;
     bool analyze = true;
     if (x < I.MiCols * 4 && y < I.MiRows * 4) {
