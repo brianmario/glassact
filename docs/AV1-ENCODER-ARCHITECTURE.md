@@ -201,7 +201,7 @@ what they'd buy:
    winner is reconstructed, exactly. Near byte-neutral expected (decisions change slightly).
    Guess: closed loop 18.5 → ~14 ms. **Done:** byte-identical speedups of the quantizer, the
    rate proxy and the forward transform (shared first products), 18.5 → 15.9 ms; transform-domain
-   distortion and a stop where DCT_DCT codes nothing, BD-neutral, built off (`quickTxTrials`).
+   distortion and a stop where DCT_DCT codes nothing, BD-neutral, on (`quickTxTrials`).
 2. **The closed loop's critical path.** Measured (BENCHMARKS, "the closed loop's work, not its
    dependencies"): 12–13 of 14 cores busy, critical path 5–14 ms of its ~15. Nothing to gain from
    scheduling; only cheaper blocks.

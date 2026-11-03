@@ -143,7 +143,7 @@ void av1enc_hybrid_set_rdoq(av1enc_hybrid *h, int on, int trials, int min_range)
 void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
 // The luma tx type search measures each compared type's distortion in the transform domain (no
 // inverse transform), and stops at DCT_DCT, the first type tried, when that codes nothing. Off
-// (the default): the exact reconstruction's SSE, every type.
+// (the default here; AV1HybridEncoder turns it on): the exact reconstruction's SSE, every type.
 void av1enc_hybrid_set_quick_tx_trials(av1enc_hybrid *h, int on);
 // The next pictures' qindex per 64x64 superblock (raster, sb_cols x sb_rows, 1..255), coded with
 // delta_q_present: their blocks are quantized and their RD weighed by it. NULL / 0: the frame's

@@ -173,8 +173,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The closed loop's luma tx type search measures each type's distortion in the transform
-    /// domain and stops at DCT_DCT when that codes nothing (rust/av1 hybrid::quant). Off: exact.
-    public var quickTxTrials = false {
+    /// domain and stops at DCT_DCT when that codes nothing (rust/av1 hybrid::quant; on: BD-neutral,
+    /// BENCHMARKS). Off: the exact reconstruction's SSE, every type.
+    public var quickTxTrials = true {
         didSet { av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0) }
     }
 
@@ -357,6 +358,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         av1enc_hybrid_set_intrabc(cpu, 1)
         copyFinder = try CopyFinder()
         applyRDOQ()
+        av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0)
     }
 
     deinit {
