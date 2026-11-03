@@ -332,9 +332,30 @@ q20, two runs:
 | 5K (ms) | 1.3 → 1.5–1.6 | 2.6 → **2.1** | 9.0 → **8.0** (25.7 → 25.9 KB a frame) | 1.5 → 1.4 |
 | 1440p (ms) | 0.8 → 0.9–1.0 | 1.6 → **1.4** | 5.2 → 5.6–5.7 | 1.0 → 0.8–0.9 |
 
-A small change can't carry the passes' chain of five dependent stages (typing-cc), and photos pay
-0.8 % of bytes at 5K and lose time at 1440p. A rule by the stale SBs' count, or fewer stages
-(fusing the cells' network with the tree, the lists with them), would be the next try.
+A small change can't carry the passes' cost (typing-cc), and photos pay 0.8 % of bytes at 5K and
+lose time at 1440p.
+
+**Rejected: the passes fused into one kernel** (`k_ml_sb`, a threadgroup of 64 per SB doing the
+statistics, both networks, the tree and the lists in turn between threadgroup barriers; the same
+models and the same streams). Learned pruning at 5K 2.02 → **3.95 ms**, and no better on streams
+with the models on every picture (typing-cc 5K 1.4 → 1.6 ms, as unfused). Apart, each pass fills
+the GPU (230 k cells, ~300 k nodes, up to ~2 M blocks for the lists); together they run in 64-thread
+groups holding ~11.5 KB of threadgroup memory each (fewer resident at once), and every SB pays its
+own chain of serial points (the tree on one thread, two rounds of mode nodes). The barriers it
+saved were tenths of a millisecond, and a few SBs' cost is each SB's own chain of work, which
+fusing lengthens.
+
+**Measured, not taken: the models in pictures coding at least N superblocks** (`--ml-min-coded`,
+new; besides the share rule). The GPU's analysis per inter frame (100 frames, q20):
+
+| | typing-cc | scroll-win | photos | cursor-drag |
+|---|---|---|---|---|
+| 5K, share rule → ≥ 50 SBs (ms) | 1.3 → 1.3 | 2.6 → **2.0** | 8.9 → 7.9 (25.7 → 25.9 KB) | 1.5 → 1.5 |
+| 1440p, share rule → ≥ 50 SBs (ms) | 0.7 → 0.7 | 1.5 → **1.3** | 5.1 → 5.7 | 1.0 → 1.0 |
+
+Typing-cc's and cursor-drag's pictures code fewer; scroll-win gains; photos (mostly video, which the
+models weren't trained on) pays bytes at 5K and time at 1440p. **The owner's choice: the share rule
+stays** until video traces (on the wanted list) can teach the models video.
 
 **Measured and rejected, a time context for the models** (the transformer question's cheap
 version): in a stream, what the search chose at the same place in the previous picture. On pairs of

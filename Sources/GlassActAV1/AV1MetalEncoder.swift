@@ -425,12 +425,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var chromaWeights: [Float]?
         /// A leaf keeps its likeliest chroma modes (and CfL) until all but this much is kept.
         public var chromaEps: Float
-        /// Only in pictures coding more than this share of their superblocks.
+        /// Only in pictures coding more than this share of their superblocks, or (with
+        /// `minCoded`) at least that many of them.
         public var overShare: Double
+        public var minCoded: Int?
         public init(levelWeights: [Float], eps: Float, modeWeights: [Float]?, modeEps: Float,
-                    chromaWeights: [Float]? = nil, chromaEps: Float = 0.02, overShare: Double) {
+                    chromaWeights: [Float]? = nil, chromaEps: Float = 0.02, overShare: Double, minCoded: Int? = nil) {
             (self.levelWeights, self.eps, self.modeWeights, self.modeEps) = (levelWeights, eps, modeWeights, modeEps)
-            (self.chromaWeights, self.chromaEps, self.overShare) = (chromaWeights, chromaEps, overShare)
+            (self.chromaWeights, self.chromaEps, self.overShare, self.minCoded) = (chromaWeights, chromaEps, overShare, minCoded)
         }
     }
     var mlWeights: (any MTLBuffer)?, mlModeWeights: (any MTLBuffer)?, mlChromaWeights: (any MTLBuffer)?
@@ -834,8 +836,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             image.rec = (AV1MetalEncoder.address(rec[0]), AV1MetalEncoder.address(rec[1]), AV1MetalEncoder.address(rec[2]))
             image.rpitch = image.spitch
             // learned pruning: in a picture that codes enough of itself (key frames: all)
-            let coded = skip.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
-            if let lp = encoder.learnedPrune, encoder.mlWeights != nil, coded > lp.overShare,
+            let codedSBs = skip.map { m in m.count(where: { $0 == 0 }) } ?? sbCols * sbRows
+            let coded = Double(codedSBs) / Double(max(1, skip?.count ?? sbCols * sbRows))
+            if let lp = encoder.learnedPrune, encoder.mlWeights != nil,
+               coded > lp.overShare || lp.minCoded.map({ codedSBs >= $0 }) == true,
                sbCols * sbRows >= encoder.learnedPruneMinSuperblocks {
                 let mask = try kept(0, aw / 8 * (ah / 8) * 4)
                 mlMask = mask
