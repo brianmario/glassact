@@ -215,6 +215,7 @@ the numbers and the reasoning.
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
 | GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | Fewer analysis shapes in mostly new inter pictures (`metal-av1`, `newPictureShapeMask`) | squares on (the owner's choice, 2026-11-03; `--new-shapes off`) | a 5K picture of new content: no 8x16/16x8 +0.4 % bytes for −8 ms of GPU analysis; squares, 4x8 and 8x4 +1.0 % for −13 ms; squares +1.6 % for −17 ms (43 → 26 ms, 18 → 24 a second). Learned pruning's eps and the turbo2 preset cost 5–10× more bytes for the same time | [entry](#metal-av1-what-buys-speed-on-a-picture-of-new-content-at-what-bytes-2026-11-03) |
+| A picture's write beside the next closed loop, handed on from the writer's thread (`metal-av1`; the owner's choice) | kept | the same streams; 5K new pictures 23.65 → 26.2 inter frames a second (the writer wait 6.6 → 0.5 ms, the closed loop 15.1 → 20.8 sharing the cores) | [entry](#metal-av1-a-pictures-write-beside-the-next-closed-loop-handed-on-from-the-writers-thread-2026-11-03) |
 | The analysis's screening: lanes summed before one atomic add, and a row a lane (`metal-av1`) | kept | the same streams; a 5K picture of new content's shapes of 16x16 and up 17.5 → 13.9 ms of GPU, 17.0 → 17.75 a second | [entry](#metal-av1-the-analysiss-screening-without-atomic-contention-or-divergence-2026-11-03) |
 | The closed loop's quantizer (NEON f64), rate proxy (raster order) and shared first forward products (`metal-av1`) | kept | the same streams; a 5K picture of new content's closed loop 18.5 → 15.9 ms, its work −15 % | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | Quick tx trials: transform-domain distortion, and stopping where DCT_DCT codes nothing (`metal-av1`, `quickTxTrials`) | kept, on (the owner's choice, 2026-11-03) | BD-neutral (+0.24 % / −0.08 %); closed loop −1 to −2 ms, −9 % of its work | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
@@ -282,6 +283,26 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a picture's write beside the next closed loop, handed on from the writer's thread (2026-11-03)
+
+The owner's choice, in the latency-neutral form. The write's state (its own `Writer`, its
+output, the reference slots' saved CDFs) is a `WriteSide` that a `WriteJob` takes with the
+picture's record (`av1enc_hybrid_write_begin`), codes on the writer's thread
+(`av1enc_write_job_run`) while the next picture's closed loop runs, and gives back
+(`av1enc_hybrid_write_end`) once that picture's filters are chosen, before its own write begins.
+The closed loop decides cdf_from_ref from the slots the writes begun so far will have CDFs for
+(it codes nothing, so it needn't read them). Inter frames always overlap: they keep no tile, and
+what a write notes for the next picture's tiles the next closed loop drops. A frame with kept
+tiles (a still screen's key frames) is written in begin, as before. `encode(count:written:)` hands
+each frame on from the writer's thread as soon as it's coded; `output` still gets it on the
+encoder's thread. The same streams (`--digest` as before).
+
+The rotation at 5K, q20, squares, `--no-planes`, interleaved twice: **23.4 / 23.9 → 26.0 / 26.4
+inter frames a second**; typing-cc's stream 336.5 → 339.2. The timeline: the wait for the last
+write 6.6 → 0.5 ms (median), but the closed loop 15.1 → 20.8, the writer now on its cores at the
+same time. A first version wrote every frame synchronously in begin (every closed loop marks its
+tiles valid): 22.5, slower than before.
 
 ### Metal AV1: where a new picture's period goes, and why the filters stay on the GPU (2026-11-03)
 

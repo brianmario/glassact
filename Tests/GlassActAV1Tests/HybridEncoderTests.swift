@@ -247,7 +247,14 @@ extension HybridEncoderTests {
         let decoder = try #require(glassact_aom_dec_create(1))
         defer { glassact_aom_dec_destroy(decoder) }
         var golden = 0.0
-        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+        // the writer's thread hands each frame on as soon as it's written (each write runs beside
+        // the next closed loop): every one, in order, the bytes `output` gets later
+        let written = Mutex<[(Int, [UInt8])]>([])
+        var outputs: [[UInt8]] = []
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, written: { i, f in
+            written.withLock { $0.append((i, f.obu)) }
+        }, output: { i, f in
+            outputs.append(f.obu)
             if i >= 2 { golden += f.timing.copiedGolden }
             var frame = glassact_aom_frame()
             try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
@@ -261,6 +268,9 @@ extension HybridEncoderTests {
             }
         })
         #expect(golden / 8 > 0.5, "\(label): \(golden / 8) of the 64×64s copied GOLDEN_FRAME on average")
+        let handed = written.withLock { $0 }
+        #expect(handed.map(\.0) == Array(pictures.indices), "\(label): frames handed on \(handed.map(\.0))")
+        #expect(handed.map(\.1) == outputs, "\(label): a handed-on frame differs from its output")
     }
 }
 

@@ -188,9 +188,9 @@ pub struct Hybrid {
     recs: [Record; 2],
     outs: [Output; 2],
     cur: usize,
-    /// the last write's
-    obu: Output,
     writer: Writer,
+    /// the writes' own state, out while a write job has it ([`Hybrid::write_begin`])
+    side: Option<Box<WriteSide>>,
     seconds: [f64; 2],
     threads: usize,
     src_changed: Vec<bool>,
@@ -202,8 +202,91 @@ pub struct Hybrid {
     src_given: bool,
     /// the last closed loop wrote its reconstruction into its caller's planes, not `outs`
     recon_given: bool,
+    /// video mode: the slots whose saved CDFs the writes begun so far leave them (the closed loop's
+    /// cdf_from_ref; the CDFs are the write side's)
+    slot_known: u8,
+    /// what the closed loop's inter frames take for a reference's saved CDFs: it codes nothing, so
+    /// their values don't enter its reconstruction
+    cl_cdfs: Box<FrameCdfs>,
+}
+
+/// What a picture's write needs besides its record: the writer, its output, and each reference
+/// slot's saved CDFs (video mode). A [`WriteJob`] takes it, so a write runs beside the next closed
+/// loop.
+struct WriteSide {
+    writer: Writer,
+    obu: Output,
     /// video mode: each reference slot's saved CDFs, from the writes that refreshed it
     slot_cdfs: [Option<Box<FrameCdfs>>; 8],
+}
+
+/// A picture's write, begun by [`Hybrid::write_begin`] and given back to [`Hybrid::write_end`];
+/// [`WriteJob::run`] codes it on any thread, beside the next closed loop.
+pub struct WriteJob {
+    side: Box<WriteSide>,
+    /// the record (taken from its slot in `Hybrid::recs`), or None: written already, in place
+    rec: Option<Record>,
+    at: usize,
+    flags: u32,
+    /// coded (or failed) already
+    done: Option<Result<(), Error>>,
+}
+
+impl WriteJob {
+    /// Codes the frame (once; later calls return the first result).
+    pub fn run(&mut self) -> Result<(), Error> {
+        if let Some(r) = &self.done {
+            return r.clone();
+        }
+        let rec = self.rec.as_mut().expect("a job not yet coded has its record");
+        let r = write_record(&mut self.side, rec, None, self.flags).map(|_| ());
+        self.done = Some(r.clone());
+        r
+    }
+}
+
+/// Codes `rec` (its fp and cdef_idx set) with `side`'s writer into `side.obu`, its tiles skipped as
+/// `skips` says (None: none), and keeps the CDFs of the slots it refreshes. Returns the slots it
+/// left with saved CDFs (video mode; all refreshed ones but where none were known).
+fn write_record(side: &mut WriteSide, rec: &mut Record, skips: Option<&[TileSkip]>, flags: u32) -> Result<u8, Error> {
+    let fp = rec.fp;
+    let opts = EncodeOpts {
+        flags: ENC_TD | ENC_BITSTREAM_ONLY | flags,
+        seq_level_idx: -1,
+    };
+    // an inter frame reads its reference's saved CDFs (no planes: the bitstream only)
+    let inter = fp.frame_type == FRAME_INTER;
+    let WriteSide { writer, obu, slot_cdfs } = side;
+    let mut slots: RefSlots = [None; 8];
+    if inter {
+        let s = (fp.ref_slot & 7) as usize;
+        slots[s] = Some(RefPicture {
+            cdfs: slot_cdfs[s].as_deref(),
+            ..Default::default()
+        });
+    }
+    let extras = Extras {
+        tile_skip: skips,
+        record_syms: false,
+        refs: inter.then_some(&slots),
+    };
+    writer.encode_with_hook::<NoHook>(rec.as_mut(), &opts, None, &extras, obu)?;
+    // the slots it refreshes keep its saved CDFs (none known: a later frame starts afresh)
+    let mut known = 0u8;
+    if fp.video != 0 {
+        let refresh = if inter { fp.refresh_frame_flags } else { 0xFF };
+        for (i, s) in slot_cdfs.iter_mut().enumerate() {
+            if refresh >> i & 1 != 0 {
+                match (&obu.saved_cdfs, s.as_mut()) {
+                    (Some(c), Some(b)) => b.clone_from(c),
+                    (Some(c), None) => *s = Some(c.clone()),
+                    (None, _) => *s = None,
+                }
+            }
+            known |= (s.is_some() as u8) << i;
+        }
+    }
+    Ok(known)
 }
 
 impl Default for Hybrid {
@@ -261,16 +344,21 @@ impl Hybrid {
             recs: Default::default(),
             outs: Default::default(),
             cur: 0,
-            obu: Output::default(),
             writer: Writer::new(),
+            side: Some(Box::new(WriteSide {
+                writer: Writer::new(),
+                obu: Output::default(),
+                slot_cdfs: Default::default(),
+            })),
             seconds: [0.0; 2],
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
             src_changed: Vec::new(),
             keep_chroma: Vec::new(),
             last_inter: false,
-            slot_cdfs: Default::default(),
             src_given: false,
             recon_given: false,
+            slot_known: 0,
+            cl_cdfs: Box::new(FrameCdfs::new(0)),
         }
     }
 
@@ -426,7 +514,8 @@ impl Hybrid {
             threads,
             src_changed,
             keep_chroma,
-            slot_cdfs,
+            slot_known,
+            cl_cdfs,
             src_given,
             recon_given,
             quant_rnd,
@@ -470,7 +559,7 @@ impl Hybrid {
             (f.stream_width, f.stream_height) = (v.fp.stream_width, v.fp.stream_height);
             f.golden_slot = if v.fp.frame_type == FRAME_INTER { v.fp.golden_slot } else { 0 };
             // from the reference's saved CDFs, where the slot has them
-            f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
+            f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && *slot_known >> (v.fp.ref_slot & 7) & 1 != 0) as u8;
         }
         rec.inter.clear();
         rec.inter.extend_from_slice(inter);
@@ -813,7 +902,7 @@ impl Hybrid {
         {
             let s = (v.fp.ref_slot & 7) as usize;
             slots[s] = v.reference.map(|r| RefPicture {
-                cdfs: slot_cdfs[s].as_deref(),
+                cdfs: (*slot_known >> s & 1 != 0).then_some(&**cl_cdfs),
                 ..r
             });
             let g = (v.fp.golden_slot as usize).wrapping_sub(1) & 7;
@@ -938,8 +1027,30 @@ impl Hybrid {
         sb_cols: usize,
         flags: u32,
     ) -> Result<&[u8], Error> {
+        let mut job = self.write_begin(fp, sb_cdef, sb_cols, flags)?;
+        let r = job.run();
+        self.write_end(job)?;
+        r?;
+        Ok(&self.side.as_ref().expect("given back").obu.obu)
+    }
+
+    /// av1enc_hybrid_write_begin: [`Hybrid::write_ex`]'s frame as a job: [`WriteJob::run`] codes it
+    /// on any thread while the next closed loop runs, and [`Hybrid::write_end`] takes it back
+    /// (before the closed loop after that one, which reuses its record, and before the next write).
+    /// Where the closed loop kept tiles, which the write reads and updates, it's written here and
+    /// the job is done already.
+    pub fn write_begin(
+        &mut self,
+        fp: &FrameParams,
+        sb_cdef: Option<&[i8]>,
+        sb_cols: usize,
+        flags: u32,
+    ) -> Result<Box<WriteJob>, Error> {
         if flags & !ENC_NO_SEQ_HEADER != 0 {
             return Err(error(ERR_INVALID, "write flags: ENC_NO_SEQ_HEADER or 0"));
+        }
+        if self.side.is_none() {
+            return Err(error(ERR_INVALID, "a write is running: write_end it first"));
         }
         let Hybrid {
             mem,
@@ -948,9 +1059,8 @@ impl Hybrid {
             reuse,
             recs,
             cur,
-            obu,
-            writer,
-            slot_cdfs,
+            side,
+            slot_known,
             ..
         } = self;
         let rec = &mut recs[*cur];
@@ -972,6 +1082,24 @@ impl Hybrid {
                 None => 0,
             };
             k.cdef_idx = c.max(0);
+        }
+        let mut side = side.take().expect("checked");
+        // An inter frame keeps no tile from the last picture (its closed loop dropped them), and
+        // what the write would note for the next picture's tiles the next closed loop drops too
+        // (`last_inter`): so it touches nothing the next closed loop does, and runs beside it.
+        // Likewise where no tile is kept at all. The slots it refreshes will have its CDFs: every
+        // tile is coded, the context tile too.
+        if fp.frame_type == FRAME_INTER || !mem.iter().any(|m| m.valid) {
+            if fp.video != 0 {
+                *slot_known |= if fp.frame_type == FRAME_INTER { fp.refresh_frame_flags } else { 0xFF };
+            }
+            return Ok(Box::new(WriteJob {
+                side,
+                rec: Some(std::mem::take(rec)),
+                at: *cur,
+                flags,
+                done: None,
+            }));
         }
         // a reused tile keeps its bytes while its cdef_idx values and cdef_bits are as they were coded
         let ntiles = mem.len();
@@ -995,56 +1123,64 @@ impl Hybrid {
                 }
             })
             .collect();
-        let opts = EncodeOpts {
-            flags: ENC_TD | ENC_BITSTREAM_ONLY | flags,
-            seq_level_idx: -1,
-        };
-        // an inter frame reads its reference's saved CDFs (no planes: the bitstream only)
-        let inter = fp.frame_type == FRAME_INTER;
-        let mut slots: RefSlots = [None; 8];
-        if inter {
-            let s = (fp.ref_slot & 7) as usize;
-            slots[s] = Some(RefPicture {
-                cdfs: slot_cdfs[s].as_deref(),
-                ..Default::default()
-            });
-        }
-        let extras = Extras {
-            tile_skip: Some(&skips),
-            record_syms: false,
-            refs: inter.then_some(&slots),
-        };
-        writer.encode_with_hook::<NoHook>(rec.as_mut(), &opts, None, &extras, obu)?;
-        // the slots it refreshes keep its saved CDFs (none known: a later frame starts afresh)
-        if fp.video != 0 {
-            let refresh = if inter { fp.refresh_frame_flags } else { 0xFF };
-            for (i, s) in slot_cdfs.iter_mut().enumerate() {
-                if refresh >> i & 1 != 0 {
-                    match (&obu.saved_cdfs, s.as_mut()) {
-                        (Some(c), Some(b)) => b.clone_from(c),
-                        (Some(c), None) => *s = Some(c.clone()),
-                        (None, _) => *s = None,
-                    }
+        let r = write_record(&mut side, rec, Some(&skips), flags);
+        if let Ok(known) = r {
+            if fp.video != 0 {
+                *slot_known = known;
+            }
+            let skipped: Vec<bool> = skips.iter().map(|s| s.skip).collect();
+            let payloads = side.writer.tile_payloads();
+            for i in 0..ntiles.min(payloads.len()) {
+                let m = &mut mem[i];
+                if skipped[i] || !m.valid {
+                    continue;
                 }
+                let (b0, b1) = (tile_first[i] as usize, tile_first[i + 1] as usize);
+                m.payload.clear();
+                m.payload.extend_from_slice(&payloads[i]);
+                m.cdef.clear();
+                m.cdef.extend(rec.blocks[b0..b1].iter().map(|b| b.cdef_idx));
+                m.cdef_bits = cdef_bits;
+                m.abc = abc;
+                m.payload_valid = true;
             }
         }
-        let skipped: Vec<bool> = skips.iter().map(|s| s.skip).collect();
-        let payloads = writer.tile_payloads();
-        for i in 0..ntiles.min(payloads.len()) {
-            let m = &mut mem[i];
-            if skipped[i] || !m.valid {
-                continue;
-            }
-            let (b0, b1) = (tile_first[i] as usize, tile_first[i + 1] as usize);
-            m.payload.clear();
-            m.payload.extend_from_slice(&payloads[i]);
-            m.cdef.clear();
-            m.cdef.extend(rec.blocks[b0..b1].iter().map(|b| b.cdef_idx));
-            m.cdef_bits = cdef_bits;
-            m.abc = abc;
-            m.payload_valid = true;
+        Ok(Box::new(WriteJob {
+            side,
+            rec: None,
+            at: *cur,
+            flags,
+            done: Some(r.map(|_| ())),
+        }))
+    }
+
+    /// av1enc_hybrid_write_end: takes back a job [`Hybrid::write_begin`] gave (run or not: an unrun
+    /// one is run here) and its record; its result, the bitstream in [`Hybrid::written`].
+    pub fn write_end(&mut self, mut job: Box<WriteJob>) -> Result<(), Error> {
+        let r = job.run();
+        let WriteJob { side, rec, at, .. } = *job;
+        if let Some(rec) = rec {
+            self.recs[at] = rec;
         }
-        Ok(&obu.obu)
+        self.side = Some(side);
+        if r.is_err() {
+            // the slots' CDFs are unknown after a failed write
+            self.slot_known = 0;
+            if let Some(s) = &mut self.side {
+                s.slot_cdfs = Default::default();
+            }
+        }
+        r
+    }
+
+    /// The last write's bitstream (empty while a write job runs).
+    pub fn written(&self) -> &[u8] {
+        self.side.as_ref().map_or(&[], |s| &s.obu.obu)
+    }
+
+    /// The bitstream a job coded.
+    pub fn job_bitstream(job: &WriteJob) -> &[u8] {
+        &job.side.obu.obu
     }
 
     /// av1enc_hybrid_set_reuse: keep unchanged tiles' closed loop and bitstream from picture to

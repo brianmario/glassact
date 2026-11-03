@@ -900,6 +900,94 @@ pub unsafe extern "C" fn av1enc_hybrid_set_tx_search(h: *mut HybridHandle, luma:
     unsafe { (*h).h.set_tx_search(luma != 0, inter != 0) }
 }
 
+/// av1enc_write_job: a picture's write, run beside the next closed loop.
+pub struct WriteJobHandle {
+    job: Box<crate::hybrid::WriteJob>,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_write_begin(
+    h: *mut HybridHandle,
+    fp: *const FrameParams,
+    sb_cdef: *const i8,
+    sb_cols: c_int,
+    flags: u32,
+    job: *mut *mut WriteJobHandle,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || fp.is_null() || job.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: the handle, fp, and a per-SB cdef map covering the picture (sb_cols wide) when given.
+    let hh = unsafe { &mut *h };
+    let fp = unsafe { &*fp };
+    let sb_cdef = (!sb_cdef.is_null()).then(|| {
+        let rows = (crate::blockinfo::mi_rows(fp.height as i32) as usize + 15) >> 4;
+        unsafe { slice::from_raw_parts(sb_cdef, rows * sb_cols.max(0) as usize) }
+    });
+    match hh.h.write_begin(fp, sb_cdef, sb_cols.max(0) as usize, flags) {
+        Ok(j) => {
+            // SAFETY: the caller's out pointer
+            unsafe { *job = Box::into_raw(Box::new(WriteJobHandle { job: j })) };
+            OK
+        }
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_write_job_run(job: *mut WriteJobHandle, err: *mut c_char, errlen: usize) -> c_int {
+    if job.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: a job av1enc_hybrid_write_begin gave, not yet ended, used by one thread at a time
+    match unsafe { (*job).job.run() } {
+        Ok(()) => OK,
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_write_job_bitstream(job: *const WriteJobHandle, obu: *mut *const u8, size: *mut usize) {
+    // SAFETY: a job av1enc_hybrid_write_begin gave, not yet ended; out pointers
+    unsafe {
+        let b = crate::hybrid::Hybrid::job_bitstream(&(*job).job);
+        *obu = b.as_ptr();
+        *size = b.len();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_write_end(
+    h: *mut HybridHandle,
+    job: *mut WriteJobHandle,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || job.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: the handle, and a job its write_begin gave (taken back here: freed)
+    let hh = unsafe { &mut *h };
+    let j = unsafe { Box::from_raw(job) };
+    let r = hh.h.write_end(j.job);
+    hh.rec = hh.h.record_c();
+    match r {
+        Ok(()) => OK,
+        Err(e) => {
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(h: *mut HybridHandle, on: c_int, trials: c_int, min_range: c_int) {
     // SAFETY: the handle

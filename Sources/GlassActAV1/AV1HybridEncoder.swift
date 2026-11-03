@@ -386,7 +386,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// analysis set up and committed (while picture i - 1 is finished), on other
     /// threads; `output` gets picture i before picture i + 1's closed loop.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
-                       output: (Int, Frame) throws -> Void) throws {
+                       written: (@Sendable (Int, Frame) -> Void)? = nil, output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
         goldenPlanes = []
@@ -401,7 +401,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var starting: Later<Pending>?, following: Later<Pending>?
         defer {
             copyFinder.drain()
-            _ = try? writing?.wait()
+            _ = try? writing?.end()
             _ = try? starting?.wait()
             _ = try? following?.wait()
         }
@@ -442,13 +442,21 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
             timing.motion = pending.motionSeconds
             let motion = pending.motion
-            if let w = writing {
-                writing = nil
-                try output(i - 1, try w.wait())
+            // picture i - 1's write runs beside this closed loop; finish takes it back before
+            // picture i's write begins (until then `writing` holds it, for the defer)
+            var onWritten: (@Sendable (Frame) -> Void)?
+            if let written {
+                let index = i
+                onWritten = { frame in written(index, frame) }
+            }
+            let (w, ended) = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex,
+                                        qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
+                                        written: onWritten)
+            writing = w
+            if let ended {
+                try output(i - 1, ended)
                 Self.trace("written \(i - 1)")
             }
-            writing = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex, qmap: pending.qmap,
-                                 hashes: pending.hashes, timing: timing, started: t0)
             if let s = starting {
                 starting = following
                 following = nil
@@ -461,7 +469,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         if let w = writing {
             writing = nil
-            try output(count - 1, try w.wait())
+            try output(count - 1, try w.end())
         }
     }
 
@@ -492,15 +500,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
     }
 
-    /// A picture's bitstream, written on a thread of its own (`av1enc_hybrid_write_ex`) while
-    /// the main thread starts the next picture's analysis. It's waited for before the next
-    /// closed loop, which uses the same CPU state.
+    /// A picture's bitstream, written on a thread of its own while the next picture's closed loop
+    /// runs (av1enc_hybrid_write_begin, av1enc_write_job_run): begun once its filters are chosen,
+    /// taken back (`end`) on the encoder's thread before the next picture's write begins, which
+    /// needs the writer's state again. `written` gets the frame on the writer's thread as soon as
+    /// its bitstream exists.
     private final class Writing: @unchecked Sendable {
         private let cpu: OpaquePointer?
-        private var params: av1g_frame_params
+        private var job: OpaquePointer?
         private let frameParams: av1g_frame_params
-        private let cdef: [Int8]
-        private let sbCols: Int, flags: UInt32
         private let planes: [[UInt8]]
         private var timing: Timing
         private let t0: Double, t2: Double
@@ -509,56 +517,71 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
         /// Starts writing the last closed loop's picture with the filters' choices.
         init(cpu: OpaquePointer, search: AV1MetalPostfilter.Search, sbCols: Int, flags: UInt32, timing: Timing,
-             t0: Double, t2: Double) {
+             t0: Double, t2: Double, written: (@Sendable (Frame) -> Void)?) throws {
             self.cpu = cpu
-            params = search.params
             frameParams = search.params
-            cdef = search.superblockCDEF
-            self.sbCols = sbCols
-            self.flags = flags
             planes = search.planes
             self.timing = timing
             self.t0 = t0
             self.t2 = t2
+            var params = search.params
+            var message = [CChar](repeating: 0, count: 256)
+            var job: OpaquePointer?
+            let rc = search.superblockCDEF.withUnsafeBufferPointer { cdef in
+                av1enc_hybrid_write_begin(cpu, &params, cdef.baseAddress, Int32(sbCols), flags, &job, &message, 256)
+            }
+            guard rc == AV1G_OK, let job else { throw Failure.encode("writer (\(rc)): \(Self.text(message))") }
+            self.job = job
             DispatchQueue.global(qos: .userInitiated).async {
                 self.result = Result { try self.write() }
+                if let written, case let .success(frame) = self.result { written(frame) }
                 self.done.signal()
             }
         }
 
         /// A picture already written.
         init(_ frame: Frame) {
-            (cpu, params, frameParams, cdef, sbCols, flags) = (nil, frame.params, frame.params, [], 0, 0)
-            (planes, timing, t0, t2) = (frame.planes, frame.timing, 0, 0)
+            (cpu, job, frameParams, planes, timing, t0, t2) = (nil, nil, frame.params, frame.planes, frame.timing, 0, 0)
             result = .success(frame)
             done.signal()
         }
 
-        /// The picture's frame, once written.
-        func wait() throws -> Frame {
+        /// The picture's frame, once written; the job taken back. On the encoder's thread; again
+        /// after the first, the same result.
+        func end() throws -> Frame {
             done.wait()
-            done.signal()  // for a later wait (an encode that threw)
+            done.signal()  // for a later end (an encode that threw)
+            if let job, let cpu {
+                self.job = nil
+                var message = [CChar](repeating: 0, count: 256)
+                let rc = av1enc_hybrid_write_end(cpu, job, &message, 256)
+                if rc != AV1G_OK, case .success = result {
+                    result = .failure(Failure.encode("writer (\(rc)): \(Self.text(message))"))
+                }
+            }
             return try result!.get()
         }
 
         private func write() throws -> Frame {
+            guard let job else { throw Failure.encode("writer: no job") }
             var message = [CChar](repeating: 0, count: 256)
-            var bytes: UnsafeMutablePointer<UInt8>?
-            var size = 0
             AV1HybridEncoder.trace("writer start")
-            let wrc = cdef.withUnsafeBufferPointer { cdef in
-                av1enc_hybrid_write_ex(cpu, &params, cdef.baseAddress, Int32(sbCols), flags, &bytes, &size, &message, 256)
-            }
-            guard wrc == AV1G_OK, let bytes else {
-                throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
-            }
-            defer { free(bytes) }
+            let wrc = av1enc_write_job_run(job, &message, 256)
+            guard wrc == AV1G_OK else { throw Failure.encode("writer (\(wrc)): \(Self.text(message))") }
+            var bytes: UnsafePointer<UInt8>?
+            var size = 0
+            av1enc_write_job_bitstream(job, &bytes, &size)
+            guard let bytes else { throw Failure.encode("writer: no bitstream") }
             let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
             let t3 = CACurrentMediaTime()
             AV1HybridEncoder.trace("writer end")
             timing.writer = t3 - t2
             timing.wall = t3 - t0
             return Frame(obu: obu, planes: planes, params: frameParams, timing: timing)
+        }
+
+        static func text(_ message: [CChar]) -> String {
+            String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         }
     }
 
@@ -731,7 +754,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, refs: Refs?, qindex: Int,
-                        qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double) throws -> Writing {
+                        qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double, writingBefore: Writing?,
+                        written: (@Sendable (Frame) -> Void)?) throws -> (Writing, Frame?) {
         var timing = timing
         if let hashes {  // (its closed loop's search takes them)
             av1enc_hybrid_use_ibc_hashes(cpu, hashes.handle)
@@ -882,11 +906,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let n = Int(record.pointee.n_blocks)
         guard postfilters, !copies else {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
+            let ended = try writingBefore?.end()  // (the writer's state, back for this write)
             let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames, timing: timing,
                                   t0: t0, t1: t1)
             filteredLast = false
             remember(p, frame.planes, sbMotion)
-            return Writing(frame)
+            written?(frame)
+            return (Writing(frame), ended)
         }
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)
         var direct: [UInt8]?
@@ -917,7 +943,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.filtersGPU = postfilter.lastGPUSeconds
 
         remember(p, search.planes, sbMotion)
-        return Writing(cpu: cpu, search: search, sbCols: sbCols, flags: headerFlags(search.params), timing: timing, t0: t0, t2: t2)
+        // the previous picture's write ran beside this closed loop and these filters: taken back
+        // now, before this one's begins
+        let ended = try writingBefore?.end()
+        let writing = try Writing(cpu: cpu, search: search, sbCols: sbCols, flags: headerFlags(search.params), timing: timing,
+                                  t0: t0, t2: t2, written: written)
+        return (writing, ended)
     }
 
     /// The writer's flags for a frame: an inter frame of a stream without its sequence header.

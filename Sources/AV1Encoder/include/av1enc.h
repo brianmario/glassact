@@ -138,6 +138,20 @@ void av1enc_hybrid_set_tx_search(av1enc_hybrid *h, int luma, int inter);
 // least min_range values (0: all); with trials, the luma tx type search compares each type's
 // levels after RDOQ.
 void av1enc_hybrid_set_rdoq(av1enc_hybrid *h, int on, int trials, int min_range);
+// A picture's write as a job, so that it codes beside the next closed loop:
+// av1enc_hybrid_write_begin takes what av1enc_hybrid_write_ex does and gives *job (the last closed
+// loop's record goes with it: av1enc_hybrid_record is empty until the job is ended);
+// av1enc_write_job_run codes it, on any thread, while the next av1enc_hybrid_closed_loop_ex runs on
+// the handle's; av1enc_write_job_bitstream then points at its [TD,] [sequence header,] frame (valid
+// until the job is ended); av1enc_hybrid_write_end takes the job back and frees it (run or not: it
+// runs it), and must come before the closed loop after the next and before the next write.
+// Where the closed loop kept tiles (key frames of a still screen), the write happens in begin.
+typedef struct av1enc_write_job av1enc_write_job;
+int av1enc_hybrid_write_begin(av1enc_hybrid *h, const av1g_frame_params *fp, const int8_t *sb_cdef, int sb_cols,
+                              uint32_t flags, av1enc_write_job **job, char *err, size_t errlen);
+int av1enc_write_job_run(av1enc_write_job *job, char *err, size_t errlen);
+void av1enc_write_job_bitstream(const av1enc_write_job *job, const uint8_t **obu, size_t *size);
+int av1enc_hybrid_write_end(av1enc_hybrid *h, av1enc_write_job *job, char *err, size_t errlen);
 // The luma tx type search tries only what the learned tx model keeps, until all but eps of the
 // probability (and DCT_DCT); eps < 0: off (the default). Off too without shipped weights.
 void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
