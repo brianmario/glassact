@@ -136,8 +136,10 @@ learned models (RD mode), the Metal analysis (RD mode), the filters' Metal code 
    quantizer in motion (no search). The next picture's closed loop no longer waits on the GPU,
    and the GPU's time is the analysis alone.
 3. **Shorten the closed loop's wall time in motion,** which is on the chain even though its
-   core-ms fit: the tx type search's learned pruning (+0.2–0.6 %) or none (18.5 → 10.9 ms,
-   +7–9 %), and more of the cores, which sit idle, through finer parallelism inside tiles.
+   core-ms fit: cheaper tx trials (below, "What the current design can still do"), the tx type
+   search's learned pruning (+0.2–0.6 %, but only ~2 ms of a 5K key frame's ~27) or no search
+   (18.5 → 10.9 ms, +7–9 %), and more of the cores, which sit idle, through finer parallelism
+   inside tiles.
 4. **The writer overlapped with the next closed loop, delivering each frame from its own
    thread** (no added latency), with 4x1 tiles in motion (writer 8.4 → 5.5 ms, +0.4 %
    SSIMULACRA2).
@@ -150,6 +152,66 @@ libaom, 14–36 % under HEVC), or less with the learned tx pruning in place of n
 needs that's new: the row-parallel CPU filters, the overlapped writer, and the kernel work. What
 60 a second needs is all of it; each step is worth having alone (the chain shortens as each
 lands).
+
+## Estimated performance (arithmetic from the stage times above, not measured)
+
+A 5K picture of all-new content; pictures that mostly copy don't change (48–230 a second). The
+base: squares in mostly-new pictures (+1.6 %), the motion search and the tx type search kept,
+4x1 tiles (+0.4 % / +1.4 %). Cumulative:
+
+| after | GPU a picture | the chain a picture | pictures a second | bytes against today's |
+|---|---|---|---|---|
+| today | 42 + filters 10 | ~45–55 | 18–19 (measured) | — |
+| 1. square kernels 2x | ~12 + 10 | write wait ~8 + closed loop ~18 + filters ~10 ≈ 36 | ~28 | +2–3 % |
+| 2. filters on the CPU by row | ~12 | ~8 + 18 + last rows ~3 ≈ 29 | ~35 | 0 (the same output); CDEF strengths from the quantizer unmeasured |
+| 4. the writer overlapped | ~12 | ~18 + 3 ≈ 21 | ~45–50 | 0 |
+| 5. frames in flight | ~12 | no longer the period | ~50–60, if the CPU keeps up | ~0; references limited to filtered rows unmeasured |
+| or 3. no tx type search there | ~12 | ~11 + 3 ≈ 14 | ~60 | +9–12 % |
+
+- **Latency** of a new picture: analysis ~12 + closed loop ~18 + last rows ~3 + writer ~5.5 ≈ 38
+  ms, against ~55 today.
+- **The CPU's budget gets tight.** ~135 core-ms a picture today, plus up to ~70 for the filters on
+  dense content: ~205 of the 233 that 60 a second allows, and 4 of the 14 cores are efficiency
+  cores. No tx type search frees much of the trials' share (42 % of the busy time).
+- **Risks, biggest first:** the CPU's budget; the square kernels' 2x (a guess: at 19–26 ms the
+  GPU caps everything at ~38–50 a second); the row-parallel filters' 5–7 ms (the single-thread
+  ~70 ms is measured, the spread isn't).
+
+Realistic: ~40–50 a second after 1–4, 60 if all three risks come out well. The first experiment
+below turns this into a measurement.
+
+## What the current design can still do
+
+Steps 1 and 3 above need no new architecture; 2, 4 and 5 do. Without them, in rough order of
+what they'd buy:
+
+1. **Cheaper tx trials.** The trials (forward transform, quantizer, and for each compared type the
+   exact inverse, SSE and rate proxy) are 42 % of the CPU's busy time and on the closed loop's
+   critical path. Distortion in the transform domain (libaom's `tx_domain_dist`, a per-size scale
+   for AV1's not-quite-orthonormal transforms) skips each compared type's inverse and SSE; only the
+   winner is reconstructed, exactly. Near byte-neutral expected (decisions change slightly).
+   Guess: closed loop 18.5 → ~14 ms.
+2. **The closed loop's critical path.** ~4–5 of 14 cores are busy during it. Measure its longest
+   chain of dependent blocks against its wall time: if the chain is much shorter, schedule the
+   blocks on it first (byte-identical); if not, only cheaper blocks (1) or a big block's trials on
+   several threads help.
+3. **The filters ahead of the next analysis on the GPU.** They take 9–11 ms alone, 14–21 beside
+   the next picture's analysis, which isn't on the chain. Commit the next analysis after them, or
+   in smaller command buffers. Byte-identical; up to 4–10 ms off the chain, but the GPU's total is
+   unchanged, so it pays only where the chain, not the GPU, is the period.
+4. **A cheaper motion search in mostly-new pictures:** 10 ms of GPU for 3.9 % of their bytes.
+   Only the candidates already at hand (zero, GOLDEN_FRAME, the copy finder's shifts, the
+   neighbours') might keep most of that for a fraction of the time. Unmeasured.
+5. **CDEF's preset search in mostly-new pictures:** part of the filters' 9–11 ms. Fewer presets,
+   or strengths from the quantizer: a bytes trade, unmeasured.
+6. **The bytes trades already measured** (the owner's choice): squares (`newPictureShapeMask`,
+   +1.6 %), 4x1 tiles there (writer 8.4 → 5.5 ms, which the next closed loop waits for;
+   +1.4 % / +0.4 %), no tx type search there (+8.9 % / +6.8 %).
+
+Estimate with all of them and today's architecture: GPU ~23 ms a picture (analysis ~13, filters
+~10), the chain ~30 (write wait ~6, closed loop ~14, filters ~10): **~30–35 a second at ~+3 %**,
+everything cheap's speed for a fifth of its bytes; ~40 with no tx type search. The chain caps
+this design there, which is why 2, 4 and 5 of the proposal are the way to 60.
 
 ## The experiments, in order (each can kill the plan)
 
