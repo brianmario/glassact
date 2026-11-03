@@ -200,7 +200,7 @@ the numbers and the reasoning.
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
-| Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
+| Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken; **reopened for inter frames at 5K** (libaom's palette + residual halves its intra coding of new text there; a first proxy-chosen prototype saved nothing) | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
 | Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 900 superblocks (1440p) and up since its one-pass statistics (2,000 before) | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 1440p's GPU analysis −8 to −22 % at ±0.3 %; 720p only loses (photos streams −23 %, before the one-pass statistics); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
@@ -213,6 +213,7 @@ the numbers and the reasoning.
 | The inter gate: no motion windows or inter RD where nothing beats 2 x the mean's SAD, in pictures mostly new (`metal-av1`) | kept, on | full-screen change at 5K 14.3 → 19.1 inter frames a second (motion search 13.7 → 4.3 ms, inter candidates 16.7 → 7.8); BD −0.2 to +0.1 %; in every picture it cost 720p scroll-win 0.5 % | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | An inter frame's 8x8, 8x16 and 16x8 on the thread-per-block kernel where most of the picture is new (`metal-av1`) | kept | the same streams; the full-change mixes' GPU analysis −1.5 to −10 ms at 5K (photos+drag 81.6 → 71.6) | [entry](#metal-av1-full-screen-change-inside-a-stream-and-the-inter-gate-2026-11-02) |
 | A block on several SIMD-groups for the analysis's 16x32, 32x16 (64 threads), 32x32 and 64x64 (128) (`metal-av1`) | kept | the same streams; 5K key frames' GPU −5.7 to −10.4 ms (64x64 9.5 → 4.0), full-change mixes +7–12 % inter frames a second | [entry](#metal-av1-a-block-on-several-simd-groups-for-the-analysiss-big-shapes-2026-11-02) |
+| GOLDEN_FRAME: inter frames also copy the picture before the latest mostly new one (`metal-av1`) | kept, on | two screens in turn at 5K: inter frames 317 → 14 KB (typing+scroll) and 735 → 76 KB (photos+drag), 21 → 128 and 14 → 48 a second; BD-rate against libaom −87 to −91 % (+24 to +30 % before); single traces byte-identical | [entry](#metal-av1-golden_frame-and-where-libaom-beat-us-on-a-full-screen-change-2026-11-02) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 
 **Rate control and transport**
@@ -277,6 +278,84 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: GOLDEN_FRAME, and where libaom beat us on a full-screen change (2026-11-02)
+
+**The comparison** (5K, 40 pictures from 100; the hybrid and libaom realtime speed 9 at q 8–40,
+hardware HEVC at fixed QP 18–42 (`vquality --qp` and `--mix`, new), all scored the same way
+(`--score-rgb` now follows `--mix`: RGB luma PSNR, and SSIMULACRA2 on every 4th picture); bytes are
+the average picture's, the key frame included). Before this change, BD-rate of the hybrid:
+
+| mix | vs libaom, by PSNR / SSIMULACRA2 | vs HEVC | inter frames a second: hybrid / libaom |
+|---|---|---|---|
+| typing+scroll | +29.7 % / +24.3 % | −43.3 % / −20.7 % | 20–22 / 27–36 |
+| photos+drag | −6.9 % / −4.3 % | −34.9 % / −13.7 % | 13–15 / 13–18 |
+
+(HEVC's encode latency is 34–37 ms a picture.) On the single traces the hybrid was already 33–58 %
+under libaom (the 2026-11-01 re-baseline); the mixes were the gap.
+
+**Where libaom's lead came from**, counted in its bitstream writer (bits per block by kind and by
+reference; a temporary patch, not kept), q20, KB a picture:
+
+| picture | ours | libaom | libaom, palette off |
+|---|---|---|---|
+| typing (after a scroll picture) | 275 | 170: 51 % of its area from GOLDEN_FRAME, its key frame | 130 |
+| scroll (after a typing picture) | 319 | 290: 227 of it in 16x16 palette blocks | 570–600 |
+
+- **Its second reference, three quarters of the gap.** libaom's realtime mode keeps the key frame
+  as GOLDEN_FRAME, and each typing picture copies the typing picture before from it. (libaom limited
+  to LAST_FRAME by `AOM_EFLAG_NO_REF_*` gave identical bytes, because its realtime reference
+  structure ignores those flags: the count by reference showed it.)
+- **Palette, the rest.** On new content libaom's palette (the colours as the prediction, a DCT
+  residual on top) halves its intra coding, which without it is far worse than ours (570–600 vs
+  319 KB); with it libaom is 10 % under us there. This reopens the 2026-11-01 palette decision for
+  inter frames at 5K: that measurement scored lossy palettes without a residual, and libaom's at
+  720p. A first prototype of ours (k-means of 8x8 to 32x32 intra nodes, chosen by the Hadamard
+  proxy) chose palettes everywhere and saved nothing (1.4–1.5 bits a pixel in them): not kept.
+- Identity transforms (libaom's `use_idtx_nonrd`) moved it ±2 %.
+
+**GOLDEN_FRAME.** Inter frames copy an older picture too: GOLDEN_FRAME's, the last one before the
+latest picture that was mostly new.
+- Writer (Rust): `fp.golden_slot` (GOLDEN_FRAME's slot + 1, in the reserved byte; 0 as before),
+  `is_inter` 4 for a GOLDEN_FRAME block. read_ref_frames with count_refs' contexts (single_ref
+  p1/p3/p5), the MV stack for either reference (its extra search takes either), each block's
+  prediction from its own, and the loop filter's GOLDEN_FRAME delta at −63 like LAST_FRAME's. The
+  parser reads them; random sequences with GOLDEN_FRAME blocks (a stream of their own in
+  `inter_gen`) round-trip and decode exactly in dav1d, aomdec and the vendored libaom.
+- Copies (`Motion::classify_ex`): the 64x64s that don't copy the previous picture are tested
+  against GOLDEN_FRAME's source, unchanged or at a shift (the neighbours' shifts and its own row
+  and column candidates); they skip the analysis as copies do.
+- Slots: a picture most of whose 64x64s don't copy the previous one swaps them: it goes into
+  GOLDEN_FRAME's slot, and the previous picture becomes GOLDEN_FRAME (its decoded planes copied out
+  of the filters' buffers before this picture's filters overwrite them). Switching back to what
+  was on screen copies it. On by default (`AV1HybridEncoder.goldenFrames`, `av1seq --no-golden`).
+
+The single traces never swap: byte-identical streams, speed within noise. The mixes, q20:
+
+| | inter frames | inter frames a second | 64x64s copied from GOLDEN_FRAME |
+|---|---|---|---|
+| typing+scroll | 317 → **14.1 KB** | 21 → **128** | 79 % |
+| photos+drag | 735 → **76.4 KB** | 14 → **48** | 89 % |
+
+BD-rate with it (libaom and HEVC as above):
+
+| mix | vs libaom, by PSNR / SSIMULACRA2 | vs HEVC | inter frames a second: hybrid / libaom |
+|---|---|---|---|
+| typing+scroll | **−90.3 % / −90.5 %** | −95.8 % / −93.9 % | 124–150 / 27–36 |
+| photos+drag | **−87.3 % / −86.8 %** | −90.9 % / −88.0 % | 47–52 / 13–18 |
+
+These mixes are two screens in turn, the best case for a second reference (libaom keeps only its
+key frame there; we keep whichever screen came before). A picture new against both references is
+the worst case: `--mix` now takes several traces in turn for it. **Four traces in turn** (typing,
+scroll, photos, drag; 21 % of 64x64s still copy, the shared wallpaper and menu bar, 4 % of them
+GOLDEN_FRAME's):
+
+| | vs libaom, by PSNR / SSIMULACRA2 | vs HEVC | inter frames a second: hybrid / libaom / HEVC |
+|---|---|---|---|
+| typing, scroll, photos, drag | **−6.7 % / −11.3 %** | **−44.2 % / −22.8 %** | 18–20 / 20–25 / ~28 (34–37 ms latency) |
+
+The bytes beat both everywhere now; the speed doesn't. A 5K picture of new content, q20: GPU
+analysis ~42 ms, closed loop ~19, filters ~24, write ~8 (the GPU bounds the period).
 
 ### Metal AV1: a block on several SIMD-groups for the analysis's big shapes (2026-11-02)
 
