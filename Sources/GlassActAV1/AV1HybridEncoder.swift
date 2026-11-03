@@ -421,6 +421,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
         for i in 0..<count {
             let partition = try pending.partition.wait()
+            Self.trace("partition \(i)")
             // picture i + 2's analysis, set up after picture i + 1's (two at most are set up and not
             // yet read: their kept-analysis buffers alternate)
             let afterNext = upcoming
@@ -444,6 +445,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             if let w = writing {
                 writing = nil
                 try output(i - 1, try w.wait())
+                Self.trace("written \(i - 1)")
             }
             writing = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex, qmap: pending.qmap,
                                  hashes: pending.hashes, timing: timing, started: t0)
@@ -461,6 +463,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             writing = nil
             try output(count - 1, try w.wait())
         }
+    }
+
+    /// GA_TIMELINE (diagnostics): each picture's stages as they start and end, and the GPU's
+    /// command buffers, on stderr as `tl <ms> <what>` (BENCHMARKS "where a new picture's period goes").
+    static let traces = ProcessInfo.processInfo.environment["GA_TIMELINE"] != nil
+    static func trace(_ what: @autoclosure () -> String) {
+        guard traces else { return }
+        FileHandle.standardError.write("tl \(String(format: "%.3f", CACurrentMediaTime() * 1000)) \(what())\n".data(using: .utf8)!)
     }
 
     /// Work on a thread of its own, and its result.
@@ -535,6 +545,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             var message = [CChar](repeating: 0, count: 256)
             var bytes: UnsafeMutablePointer<UInt8>?
             var size = 0
+            AV1HybridEncoder.trace("writer start")
             let wrc = cdef.withUnsafeBufferPointer { cdef in
                 av1enc_hybrid_write_ex(cpu, &params, cdef.baseAddress, Int32(sbCols), flags, &bytes, &size, &message, 256)
             }
@@ -544,6 +555,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             defer { free(bytes) }
             let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
             let t3 = CACurrentMediaTime()
+            AV1HybridEncoder.trace("writer end")
             timing.writer = t3 - t2
             timing.wall = t3 - t0
             return Frame(obu: obu, planes: planes, params: frameParams, timing: timing)
@@ -805,6 +817,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
         let store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
         let into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
+        Self.trace("closed loop start")
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
@@ -833,6 +846,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         guard rc == AV1G_OK, let record = av1enc_hybrid_record(cpu) else {
             throw Failure.encode("closed loop (\(rc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
         }
+        Self.trace("closed loop end")
         timing.chroma = av1enc_hybrid_seconds(cpu, 0)
         timing.closedLoop = av1enc_hybrid_seconds(cpu, 1)
         // a frame that swaps the slots makes the previous picture GOLDEN_FRAME's: its decoded
@@ -887,6 +901,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
         }
         filteredLast = true
+        Self.trace("filters start")
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
@@ -896,6 +911,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            cropsOutput: returnsPlanes)
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
+        Self.trace("filters end")
         timing.filters = t2 - t1
         timing.filtered = postfilter.lastFilteredShare
         timing.filtersGPU = postfilter.lastGPUSeconds

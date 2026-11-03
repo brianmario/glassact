@@ -680,6 +680,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if let error = commands.error { throw Failure.metal("\(error)") }
                 var stages = StageTimes()
                 stages.analysis = commands.gpuEndTime - commands.gpuStartTime
+                AV1HybridEncoder.trace("analysis gpu \(String(format: "%.3f %.3f", commands.gpuStartTime * 1000, commands.gpuEndTime * 1000))")
                 run.encoder.lastStages = stages
                 run.encoder.lastGPUSeconds = stages.analysis
             } else if !run.encoder.profilesStages {

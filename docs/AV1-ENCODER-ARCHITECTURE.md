@@ -138,7 +138,9 @@ learned models (RD mode), the Metal analysis (RD mode), the filters' Metal code 
    (`newPictureShapeMask`, +1.6 %): 19–26 ms. Make its square kernels about twice as fast
    (they were tuned for the full shape set: per-shape work, threadgroup shapes, the leaves).
    Target ≤ 12 ms at 5K.
-2. **Take the filters off the GPU and into the closed loop**, per superblock row on the CPU
+2. **(Measured not to pay, 2026-11-03: BENCHMARKS "where a new picture's period goes"; ~150–175
+   core-ms a picture on a CPU the closed loop already fills, against ~10.8 ms of GPU.)**
+   **Take the filters off the GPU and into the closed loop**, per superblock row on the CPU
    (Rust, NEON, rows in parallel behind the reconstruction), with CDEF's strengths from the
    quantizer in motion (no search). The next picture's closed loop no longer waits on the GPU,
    and the GPU's time is the analysis alone.

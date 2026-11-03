@@ -534,6 +534,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         commands.waitUntilCompleted()
         if let error = commands.error { throw Failure.metal("\(error)") }
         lastGPUSeconds += commands.gpuEndTime - commands.gpuStartTime
+        AV1HybridEncoder.trace("filters gpu \(String(format: "%.3f %.3f", commands.gpuStartTime * 1000, commands.gpuEndTime * 1000))")
     }
 
     /// One picture's planes, maps and frame.

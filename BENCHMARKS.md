@@ -283,6 +283,38 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: where a new picture's period goes, and why the filters stay on the GPU (2026-11-03)
+
+`GA_TIMELINE=1` (new: each picture's stages and the GPU's command buffers, stamped, on stderr),
+the rotation at 5K, q20, squares on new pictures, `--no-planes`, 20 pictures: 23.9 inter frames
+a second; per picture (from its analysis being read to the next's), median and range:
+
+| | ms |
+|---|---|
+| waiting for the previous picture's writer (the closed loop shares its CPU state) | 6.6 (3.7–14.8) |
+| the closed loop | 15.1 (12.9–28.2) |
+| the filters (GPU 8.6–10.4 of them) | 10.8 (5.6–22.7) |
+| reading the next analysis | 2.3 |
+| the period | 43.9 (28.2–47.7) |
+
+The four traces repeat: once in four pictures the filters wait ~10 ms behind the next picture's
+analysis on the GPU (their command buffer starts when the analysis's ends), once the closed loop
+takes ~27 ms (sharing the cores with the copy finder's and the next set-up's work), once the
+writer wait is ~14 ms.
+
+**The filters on the CPU don't pay** (the owner asked for them; measured before building):
+deblocking takes 1.9 ms and a CDEF pass 5.6 ms of one core on a dense 1080p picture
+(`bench_postfilter`), so ~13.5 and ~40 core-ms at 5K; the search filters every 64x64 with three
+more candidate strengths a plane type, then CDEF is applied: ~150–175 core-ms a picture, 11–13
+ms on all 14 cores at best, against the GPU's ~10.8 ms on the chain, and taken from the closed
+loop and the copy finder, which already share the CPU. The architecture note's plan assumed idle
+cores (corrected in "the closed loop's work, not its dependencies").
+
+What the timeline says would shorten the period instead: the writer overlapped with the next
+closed loop (~8 ms a picture on average: the latency-neutral form, delivering from the writer's
+thread, is the owner's call), and the filters ahead of the next analysis on the GPU (~2.5 ms
+on average, the one picture in four).
+
 ### Metal AV1: the analysis's forward transform, a lane's outputs split (2026-11-03)
 
 The SIMD-group analysis's forward transform gives each lane a whole column, then a whole row, of
