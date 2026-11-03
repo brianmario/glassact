@@ -811,6 +811,7 @@ fn sb128_frames_from_motion() {
         fp,
         inter: &[],
         reference: None,
+        golden: None,
         padded: None,
     };
     let key_video = video;
@@ -892,6 +893,7 @@ fn sb128_frames_from_motion() {
         fp,
         inter: &inter,
         reference: Some(reference),
+        golden: None,
         padded: None,
     };
     hy.closed_loop_ex(

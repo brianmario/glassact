@@ -1,7 +1,7 @@
 //! The sequence header and frame header (a reduced still picture, or a frame of a video stream:
 //! decisions.h "Video mode"), and the OBUs around the tile payloads.
 use super::TileInfo;
-use crate::tables::{ALTREF_FRAME, EIGHTTAP, LAST_FRAME, PRIMARY_REF_NONE, REFS_PER_FRAME};
+use crate::tables::{ALTREF_FRAME, EIGHTTAP, GOLDEN_FRAME, LAST_FRAME, PRIMARY_REF_NONE, REFS_PER_FRAME};
 use crate::types::FrameParams;
 
 /// MSB-first bit writer (av1g::BitWriter).
@@ -193,8 +193,10 @@ pub(crate) fn write_headers(
                 );
             }
             fh.put(fp.refresh_frame_flags as u32, 8);
-            for _ in 0..REFS_PER_FRAME {
-                fh.put(fp.ref_slot as u32, 3); // ref_frame_idx[i]
+            for i in 0..REFS_PER_FRAME {
+                // ref_frame_idx[i]: GOLDEN_FRAME's own slot, if it has one; else LAST_FRAME's
+                let golden = i == GOLDEN_FRAME - LAST_FRAME && fp.golden_slot != 0;
+                fh.put(if golden { fp.golden_slot - 1 } else { fp.ref_slot } as u32, 3);
             }
             if reduced && fp.error_resilient_mode == 0 {
                 // frame_size_with_refs: no found_ref (the size is coded, whatever the reference's)
@@ -300,8 +302,9 @@ pub(crate) fn write_headers(
         fh.put(fp.loop_filter_sharpness as u32, 3);
         if fp.lf_inter_off != 0 {
             // loop_filter_delta_enabled, _update; from setup_past_independence's ref deltas
-            // (INTRA_FRAME 1, LAST_FRAME 0): INTRA_FRAME 0 (the levels as given), LAST_FRAME -63
-            // (inter blocks at level 0); the mode deltas stay 0
+            // (INTRA_FRAME 1, LAST_FRAME 0, GOLDEN_FRAME -1): INTRA_FRAME 0 (the levels as given),
+            // LAST_FRAME -63 (inter blocks at level 0), and GOLDEN_FRAME -63 with its own slot;
+            // the mode deltas stay 0
             fh.put(1, 1);
             fh.put(1, 1);
             for i in 0..8 {
@@ -311,6 +314,10 @@ pub(crate) fn write_headers(
                         fh.su(0, 7);
                     }
                     1 => {
+                        fh.put(1, 1);
+                        fh.su(-63, 7);
+                    }
+                    4 if fp.golden_slot != 0 => {
                         fh.put(1, 1);
                         fh.su(-63, 7);
                     }

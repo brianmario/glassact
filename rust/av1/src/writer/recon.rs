@@ -324,7 +324,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let dv = bufs.mvs[((r - bufs.r0) * bufs.mw + c - bufs.c0) as usize];
         let dv = [dv[0] as i32, dv[1] as i32];
         predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma, dv);
-    } else if is_inter && let Some(refs) = f.refs.as_ref() {
+    } else if is_inter && f.refs.is_some() {
         let maps = InterMaps {
             ref0: &bufs.ref0,
             mvs: &bufs.mvs,
@@ -333,7 +333,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
             mw: bufs.mw,
             stride: bufs.stride,
         };
-        predict_inter_block(f, refs, &maps, &mut planes, r, c, bsize, has_chroma, &mut ws.mc);
+        predict_inter_block(f, &maps, &mut planes, r, c, bsize, has_chroma, &mut ws.mc);
     }
     let mut max_luma = (0, 0);
     for ti in rec.block_txb[k] as usize..rec.block_txb[k + 1] as usize {

@@ -11,8 +11,9 @@
 //! - [`sb_matches`] checks that a superblock is an exact copy at an offset.
 //! - [`inter_sb_cover`] covers a superblock with the largest legal blocks ([`inter_sb_cover128`] a
 //!   128x128 one).
+//! - [`Motion::classify_ex`] also finds copies of an older picture (GOLDEN_FRAME's).
 //! - [`Motion::apply`] / [`Motion::apply_ex`] make a picture's partition with its copies covered.
-use crate::types::{Block, BlockInter, ERR_INVALID, Tiles};
+use crate::types::{Block, BlockInter, ERR_INVALID, GOLDEN, Tiles};
 
 /// A whole-pixel offset into the previous picture: the superblock at (x, y) copies (x + dx, y + dy).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -264,12 +265,13 @@ impl BandScratch {
 /// difference from any candidate the writer codes it against, stays in AV1's range.
 pub const MAX_SHIFT: i32 = 1000;
 
-/// A superblock's decision: copied from the previous picture at `shift` (no motion: unchanged), or
-/// coded.
+/// A superblock's decision: copied from the previous picture (with `golden`, from the GOLDEN_FRAME
+/// picture) at `shift` (no motion: unchanged), or coded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SbMotion {
     pub copy: bool,
     pub shift: Shift,
+    pub golden: bool,
 }
 
 /// Exact copies for a picture (av1enc_motion): which superblocks equal the previous source,
@@ -317,6 +319,77 @@ impl Motion {
     /// candidate shift: its left or upper neighbour's, or one of up to `max_candidates` from
     /// [`ShiftFinder`]. Returns how many are copies.
     pub fn classify(&mut self, cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
+        self.classify_ex(cur, prev, None, planes, max_candidates)
+    }
+
+    /// [`Motion::classify`], then the 64x64s that don't copy `prev` against `golden` (a picture
+    /// before it, GOLDEN_FRAME's) the same way: unchanged, or at its left or upper neighbour's
+    /// shift into it or one of `golden`'s own candidates. Its copies have [`SbMotion::golden`];
+    /// [`Motion::candidates`] stay `prev`'s (the motion search's).
+    pub fn classify_ex(
+        &mut self,
+        cur: &[Plane; 3],
+        prev: &[Plane; 3],
+        golden: Option<&[Plane; 3]>,
+        planes: usize,
+        max_candidates: usize,
+    ) -> usize {
+        let n = self.classify_last(cur, prev, planes, max_candidates);
+        match golden {
+            Some(g) if n < self.sbs.len() && g[0].width == cur[0].width && g[0].height == cur[0].height => {
+                n + self.classify_golden(cur, g, planes, max_candidates)
+            }
+            _ => n,
+        }
+    }
+
+    /// The copies of `golden` among the 64x64s that aren't copies yet; returns how many.
+    fn classify_golden(&mut self, cur: &[Plane; 3], g: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
+        let sb_cols = self.sb_cols;
+        let rows_per = self.sb_rows.div_ceil(self.threads.max(1)).max(1);
+        let mut parts: Vec<_> = self.sbs.chunks_mut(rows_per * sb_cols).enumerate().collect();
+        crate::pool::each(&mut parts, |(k, part)| {
+            for (i, m) in part.iter_mut().enumerate() {
+                let s = *k * rows_per * sb_cols + i;
+                if !m.copy && sb_matches(cur, g, planes, s % sb_cols, s / sb_cols, Shift::default()) {
+                    *m = SbMotion { copy: true, shift: Shift::default(), golden: true };
+                }
+            }
+        });
+        let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
+        let usable = |s: &Shift| {
+            s.dx.abs() <= MAX_SHIFT && s.dy.abs() <= MAX_SHIFT && (planes == 1 || (s.dx & 1 == 0 && s.dy & 1 == 0))
+        };
+        let cands: Vec<Shift> = if changed.contains(&1) && max_candidates > 0 {
+            self.finder
+                .candidates(&cur[0], &g[0], &changed, sb_cols, max_candidates)
+                .into_iter()
+                .filter(usable)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for s in 0..self.sbs.len() {
+            if self.sbs[s].copy {
+                continue;
+            }
+            let (x, y) = (s % sb_cols, s / sb_cols);
+            let moved = |m: SbMotion| (m.copy && m.golden && m.shift != Shift::default()).then_some(m.shift);
+            let left = if x > 0 { moved(self.sbs[s - 1]) } else { None };
+            let up = if y > 0 { moved(self.sbs[s - sb_cols]) } else { None };
+            let found = up
+                .into_iter()
+                .chain(left)
+                .chain(cands.iter().copied())
+                .find(|&d| sb_matches(cur, g, planes, x, y, d));
+            if let Some(d) = found {
+                self.sbs[s] = SbMotion { copy: true, shift: d, golden: true };
+            }
+        }
+        self.sbs.iter().filter(|m| m.copy && m.golden).count()
+    }
+
+    fn classify_last(&mut self, cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
         let (sb_cols, sb_rows) = (cur[0].width.div_ceil(64), cur[0].height.div_ceil(64));
         (self.sb_cols, self.sb_rows) = (sb_cols, sb_rows);
         self.sbs.clear();
@@ -363,7 +436,7 @@ impl Motion {
                 .chain(cands.iter().copied())
                 .find(|&d| sb_matches(cur, prev, planes, x, y, d));
             if let Some(d) = found {
-                self.sbs[s] = SbMotion { copy: true, shift: d };
+                self.sbs[s] = SbMotion { copy: true, shift: d, golden: false };
             }
         }
         self.sbs.iter().filter(|m| m.copy).count()
@@ -404,7 +477,7 @@ impl Motion {
                         let mv = BlockInter {
                             mv_row: (m.shift.dy * 8) as i16,
                             mv_col: (m.shift.dx * 8) as i16,
-                            is_inter: 1,
+                            is_inter: if m.golden { GOLDEN } else { 1 },
                             ..Default::default()
                         };
                         self.inter.resize(self.blocks.len(), mv);
@@ -530,7 +603,7 @@ impl Motion {
         let mv_of = |m: SbMotion| BlockInter {
             mv_row: (m.shift.dy * 8) as i16,
             mv_col: (m.shift.dx * 8) as i16,
-            is_inter: 1,
+            is_inter: if m.golden { GOLDEN } else { 1 },
             ..Default::default()
         };
         for tr in 0..tiles.rows as usize {
@@ -722,6 +795,7 @@ mod tests {
                             dx: 0,
                             dy: [0, 2][rng(&mut s).is_multiple_of(4) as usize],
                         },
+                        golden: rng(&mut s).is_multiple_of(5),
                     })
                     .collect();
                 let mut m = Motion::new();
@@ -731,6 +805,7 @@ mod tests {
                 rec.fp.video = 1;
                 rec.fp.frame_type = crate::types::FRAME_INTER;
                 rec.fp.allow_screen_content_tools = 1;
+                rec.fp.golden_slot = 2; // (GOLDEN_FRAME copies)
                 rec.inter = m.inter.clone();
                 rec.layout().unwrap();
                 crate::writer::validate(rec.as_mut()).unwrap_or_else(|e| panic!("{w}x{h} apply_ex: {e}"));

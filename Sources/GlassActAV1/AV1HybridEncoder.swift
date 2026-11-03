@@ -60,6 +60,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var keptTiles = 0.0
         /// The share of 64×64s filtered anew.
         public var filtered = 1.0
+        /// Inter frames: the share of 64×64s copied from the GOLDEN_FRAME picture (`goldenFrames`).
+        public var copiedGolden = 0.0
         /// Inter frames: the share of 64×64s copied from the previous picture (unchanged or
         /// shifted), and of those at a shift; the time deciding them.
         public var copied = 0.0, shifted = 0.0, motion = 0.0
@@ -273,6 +275,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false
 
+    /// Inter frames also copy from an older picture, GOLDEN_FRAME's: the last one before the
+    /// latest picture that was mostly new (most of whose 64×64s didn't copy the picture before
+    /// it). Switching back to what was on the screen before (another app, a Space, a tab) copies
+    /// it (on).
+    public var goldenFrames = true
+    /// GOLDEN_FRAME's decoded planes (tight), for the inter frame whose copies chose it.
+    private var goldenPlanes: [[UInt8]] = []
+
     /// The current stream's superblock size (set when it starts).
     private var streamSB128 = false
 
@@ -359,6 +369,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
+        goldenPlanes = []
+        copyFinder.golden = interFrames && goldenFrames
+        copyFinder.reset()
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
         if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
@@ -412,7 +425,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 writing = nil
                 try output(i - 1, try w.wait())
             }
-            writing = try finish(current, partition: partition, motion: motion, qindex: qindex, qmap: pending.qmap,
+            writing = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex, qmap: pending.qmap,
                                  hashes: pending.hashes, timing: timing, started: t0)
             if let s = starting {
                 starting = following
@@ -550,6 +563,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var qmap: [UInt8]? = nil
         /// A key frame's intra block copy hashes, or nil.
         var hashes: IbcHashes? = nil
+        /// An inter frame's reference slots (nil: a key frame or a still picture).
+        var refs: Refs? = nil
+    }
+
+    /// An inter frame's reference slots: LAST_FRAME's, GOLDEN_FRAME's + 1 (0: none), the slots it
+    /// refreshes, and whether it swaps them (it was mostly new: the previous picture becomes
+    /// GOLDEN_FRAME's and this one LAST_FRAME's, in the slot GOLDEN_FRAME's had).
+    struct Refs {
+        var last = 0, golden = 0, refresh = 1
+        var swaps = false
     }
 
     /// Decides inter frames' copies on a thread of its own, with a motion handle of its own (the
@@ -559,6 +582,17 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         private var result: Copies?
         private var running = false
         private let done = DispatchSemaphore(value: 0)
+        /// `goldenFrames`: GOLDEN_FRAME's source and the two slots, as of the next picture (the
+        /// pictures are classified in order)
+        var golden = false
+        private var goldenSource: Picture?
+        private var lastSlot = 0, goldenSlot = 1
+
+        /// A stream starts (after its key frame every slot holds it; no GOLDEN_FRAME yet).
+        func reset() {
+            goldenSource = nil
+            (lastSlot, goldenSlot) = (0, 1)
+        }
 
         init() throws {
             guard let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
@@ -593,11 +627,28 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let tm = CACurrentMediaTime()
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
             var m = [Int32](repeating: 0, count: 3 * nsb)
+            let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
+            let g = goldenSource.flatMap { $0.width == p.width && $0.height == p.height ? $0 : nil }
             AV1HybridEncoder.planes(p) { cur in
                 AV1HybridEncoder.planes(prev) { before in
-                    let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
-                    _ = av1enc_motion_classify(motion, cur, strides, before, strides, Int32(p.width), Int32(p.height), 3, 8, &m)
+                    if let g {
+                        AV1HybridEncoder.planes(g) { old in
+                            _ = av1enc_motion_classify_ex(motion, cur, strides, before, strides, old, strides,
+                                                          Int32(p.width), Int32(p.height), 3, 8, &m)
+                        }
+                    } else {
+                        _ = av1enc_motion_classify(motion, cur, strides, before, strides, Int32(p.width), Int32(p.height), 3, 8, &m)
+                    }
                 }
+            }
+            // the reference slots, and GOLDEN_FRAME's for the next picture
+            let fromLast = (0..<nsb).filter { m[3 * $0] == 1 }.count
+            let swaps = golden && 2 * fromLast < nsb
+            let refs = Refs(last: lastSlot, golden: g != nil ? goldenSlot + 1 : 0,
+                            refresh: 1 << (swaps ? goldenSlot : lastSlot), swaps: swaps)
+            if swaps {
+                goldenSource = prev
+                (lastSlot, goldenSlot) = (goldenSlot, lastSlot)
             }
             var candidates: [Int32]?
             if searchesMotion {
@@ -606,7 +657,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 candidates = c
             }
             return Copies(motion: m, skip: (0..<nsb).map { UInt8(m[3 * $0]) }, candidates: candidates,
-                          seconds: CACurrentMediaTime() - tm)
+                          seconds: CACurrentMediaTime() - tm, refs: refs)
         }
     }
 
@@ -619,6 +670,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// The frame's shift candidates for the motion search.
         var candidates: [Int32]?
         var seconds = 0.0
+        /// The frame's reference slots.
+        var refs: Refs?
     }
 
     /// Starts picture `p`'s analysis, without its copies.
@@ -641,10 +694,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             p.y.withUnsafeBufferPointer { av1enc_ibc_hashes_compute(h.handle, $0.baseAddress, UInt32(p.width), UInt32(p.height)) }
             hashes = h
         }
-        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap, hashes: hashes)
+        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap, hashes: hashes,
+                       refs: copies.refs)
     }
 
-    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, qindex: Int,
+    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, refs: Refs?, qindex: Int,
                         qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double) throws -> Writing {
         var timing = timing
         if let hashes {  // (its closed loop's search takes them)
@@ -681,7 +735,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
             if reference != nil, let sbMotionIn {
                 video.frame_type = UInt8(AV1G_FRAME_INTER)
-                video.refresh_frame_flags = 1  // slot 0: always the previous picture
+                let refs = refs ?? Refs()
+                video.ref_slot = UInt8(refs.last)
+                video.golden_slot = goldenPlanes.count == 3 ? UInt8(refs.golden) : 0
+                video.refresh_frame_flags = UInt8(refs.refresh)
                 video.lf_inter_off = 1
                 video.allow_screen_content_tools = 1
                 video.cdf_from_ref = carriesCDFs ? 1 : 0
@@ -711,6 +768,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 lumaTx = Array(UnsafeBufferPointer(start: outTx, count: Int(n)))
                 let nsb = sbCols0 * sbRows0
                 timing.copied = Double(copies) / Double(nsb)
+                timing.copiedGolden = Double((0..<nsb).filter { sbMotion[3 * $0] == 2 }.count) / Double(nsb)
                 timing.shifted = Double((0..<nsb).filter { sbMotion[3 * $0] != 0 && (sbMotion[3 * $0 + 1] != 0 || sbMotion[3 * $0 + 2] != 0) }.count) / Double(nsb)
             }
         }
@@ -733,7 +791,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     blocks.withUnsafeBufferPointer { blocks in
                         lumaTx.withUnsafeBufferPointer { types in
                             inter.withUnsafeBufferPointer { inter in
-                                Self.reference(refPlanes, gpu: gpuRef, width: p.width) { ref in
+                                Self.reference(refPlanes, gpu: gpuRef, golden: video.golden_slot != 0 ? goldenPlanes : [],
+                                               width: p.width) { ref in
                                     withUnsafePointer(to: video) { vp in
                                     av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
                                                                  UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
@@ -756,6 +815,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         timing.chroma = av1enc_hybrid_seconds(cpu, 0)
         timing.closedLoop = av1enc_hybrid_seconds(cpu, 1)
+        // a frame that swaps the slots makes the previous picture GOLDEN_FRAME's: its decoded
+        // planes, before this one's filters overwrite them
+        if refs?.swaps == true, reference != nil {
+            goldenPlanes = previousDecoded(width: p.width, height: p.height)
+        }
         let tileCount = (1 << max(0, tiling.columnsLog2)) * (1 << max(0, tiling.rowsLog2))
         timing.keptTiles = Double(av1enc_hybrid_reused_tiles(cpu)) / Double(tileCount)
 
@@ -849,7 +913,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     (changed[s], direct[s]) = (1, 0)
                     continue
                 }
-                var same = now[3 * s + 1] == 0 && now[3 * s + 2] == 0
+                var same = now[3 * s] == 1 && now[3 * s + 1] == 0 && now[3 * s + 2] == 0
                 for dr in -1...1 where same {
                     for dc in -1...1 where r + dr >= 0 && r + dr < sbRows && c + dc >= 0 && c + dc < sbCols {
                         if before[3 * ((r + dr) * sbCols + c + dc)] == 0 { same = false }
@@ -871,24 +935,49 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The reference picture (cropped planes, tight) as av1g_ref_planes; nil when there's none.
-    static func reference<R>(_ planes: [[UInt8]], gpu: ([UnsafePointer<UInt8>], [Int])?, width: Int,
-                             _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+    /// With `golden` (tight planes), two: the reference's, then GOLDEN_FRAME's.
+    static func reference<R>(_ planes: [[UInt8]], gpu: ([UnsafePointer<UInt8>], [Int])?, golden: [[UInt8]] = [],
+                             width: Int, _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+        let cw = Int32((width + 1) / 2)
+        func tight(_ q: [[UInt8]], _ body: (av1g_ref_planes) -> R) -> R {
+            q[0].withUnsafeBufferPointer { y in
+                q[1].withUnsafeBufferPointer { u in
+                    q[2].withUnsafeBufferPointer { v in
+                        var r = av1g_ref_planes()
+                        r.plane = (y.baseAddress, u.baseAddress, v.baseAddress)
+                        r.stride = (Int32(width), cw, cw)
+                        return body(r)
+                    }
+                }
+            }
+        }
+        func with(_ last: av1g_ref_planes) -> R {
+            guard golden.count == 3 else { return withUnsafePointer(to: last) { body($0) } }
+            return tight(golden) { g in [last, g].withUnsafeBufferPointer { body($0.baseAddress) } }
+        }
         if let (p, s) = gpu, p.count == 3, s.count == 3 {
             var r = av1g_ref_planes()
             r.plane = (p[0], p[1], p[2])
             r.stride = (Int32(s[0]), Int32(s[1]), Int32(s[2]))
-            return body(&r)
+            return with(r)
         }
         guard planes.count == 3 else { return body(nil) }
-        return planes[0].withUnsafeBufferPointer { y in
-            planes[1].withUnsafeBufferPointer { u in
-                planes[2].withUnsafeBufferPointer { v in
-                    var r = av1g_ref_planes()
-                    r.plane = (y.baseAddress, u.baseAddress, v.baseAddress)
-                    r.stride = (Int32(width), Int32((width + 1) / 2), Int32((width + 1) / 2))
-                    return body(&r)
-                }
+        return tight(planes) { with($0) }
+    }
+
+    /// The previous picture's decoded planes, tight (a copy of the filters' buffers when they
+    /// hold them).
+    private func previousDecoded(width: Int, height: Int) -> [[UInt8]] {
+        guard previousOnGPU else { return previous?.planes ?? [] }
+        let p = postfilter.outputPlanes, s = postfilter.outputStrides
+        guard p.count == 3, s.count == 3 else { return [] }
+        return (0..<3).map { k in
+            let (w, h) = k == 0 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+            var out = [UInt8](repeating: 0, count: w * h)
+            out.withUnsafeMutableBufferPointer { o in
+                for row in 0..<h { (o.baseAddress! + row * w).update(from: p[k] + row * s[k], count: w) }
             }
+            return out
         }
     }
 

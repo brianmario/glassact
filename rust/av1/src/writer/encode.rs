@@ -647,9 +647,6 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     {
         fail!(ERR_INVALID, "bad delta_q / quantizer matrix parameters");
     }
-    if fp.reserved.iter().any(|&r| r != 0) {
-        fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
-    }
     if fp.allow_screen_content_tools > 1 {
         fail!(ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
@@ -674,6 +671,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fp.mv_precision,
         fp.sb128,
         (fp.stream_width | fp.stream_height != 0) as u8,
+        fp.golden_slot,
     ];
     if fp.version == 1 && v2.iter().any(|&r| r != 0) {
         fail!(ERR_INVALID, "reserved frame_params fields must be 0 in interface v1");
@@ -704,14 +702,16 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
             || fp.lf_inter_off != 0
             || fp.cdf_from_ref != 0
             || fp.mv_precision != 0
+            || fp.golden_slot != 0
         {
             fail!(
                 ERR_INVALID,
-                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode, lf_inter_off, cdf_from_ref and mv_precision must be 0"
+                "key frames refresh every slot: ref_slot, refresh_frame_flags, error_resilient_mode, lf_inter_off, cdf_from_ref, mv_precision and golden_slot must be 0"
             );
         }
     } else {
         if fp.ref_slot > 7
+            || fp.golden_slot > 8
             || fp.error_resilient_mode > 1
             || fp.lf_inter_off > 1
             || fp.cdf_from_ref > 1
@@ -719,7 +719,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         {
             fail!(
                 ERR_INVALID,
-                "ref_slot must be 0..7, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1, mv_precision 0..2"
+                "ref_slot must be 0..7, golden_slot 0..8, error_resilient_mode, lf_inter_off and cdf_from_ref 0/1, mv_precision 0..2"
             );
         }
         if fp.cdf_from_ref != 0 && fp.error_resilient_mode != 0 {
@@ -738,10 +738,10 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     Ok(())
 }
 
-/// LAST_FRAME's planes of an inter frame: the slot's planes, checked against the picture size.
-fn ref_planes<'a>(fp: &FrameParams, refs: Option<&RefSlots<'a>>) -> Res<[RefPlane<'a>; 3]> {
-    let Some(r) = refs.and_then(|r| r[fp.ref_slot as usize]) else {
-        fail!(ERR_INVALID, "inter frame: reference slot {} is empty", fp.ref_slot);
+/// A reference's planes for an inter frame: slot `slot`'s, checked against the picture size.
+fn ref_planes<'a>(fp: &FrameParams, refs: Option<&RefSlots<'a>>, slot: u8) -> Res<[RefPlane<'a>; 3]> {
+    let Some(r) = refs.and_then(|r| r[slot as usize]) else {
+        fail!(ERR_INVALID, "inter frame: reference slot {slot} is empty");
     };
     let mut out = [RefPlane {
         data: &[],
@@ -756,8 +756,7 @@ fn ref_planes<'a>(fp: &FrameParams, refs: Option<&RefSlots<'a>>) -> Res<[RefPlan
         if stride < w as usize || data.len() < (h as usize - 1) * stride + w as usize {
             fail!(
                 ERR_INVALID,
-                "reference slot {} plane {p}: {} samples at stride {stride} don't hold {w}x{h}",
-                fp.ref_slot,
+                "reference slot {slot} plane {p}: {} samples at stride {stride} don't hold {w}x{h}",
                 data.len()
             );
         }
@@ -981,9 +980,15 @@ impl Writer {
             );
         }
         let refs = if inter && do_recon {
-            Some(ref_planes(&fp, extras.refs)?)
+            Some(ref_planes(&fp, extras.refs, fp.ref_slot)?)
         } else {
             None
+        };
+        // GOLDEN_FRAME's: its own slot's, or LAST_FRAME's
+        let refs_golden = if inter && do_recon && fp.golden_slot != 0 {
+            Some(ref_planes(&fp, extras.refs, fp.golden_slot - 1)?)
+        } else {
+            refs
         };
         let (w, h) = (fp.width, fp.height);
         let mono = fp.monochrome != 0;
@@ -1126,6 +1131,7 @@ impl Writer {
             inter,
             intrabc,
             refs,
+            refs_golden,
             cdfs_in,
             cdfs_out: (fp.video != 0).then_some(&self.saved),
             context_tile,
@@ -1426,7 +1432,7 @@ fn recon(
             for y in 0..mh {
                 for (x, d) in pf_skip[(r0 + y) * mc + c0..][..mw].iter_mut().enumerate() {
                     let k = y * mw + x;
-                    *d = if t.ref0[k] as i32 == LAST_FRAME {
+                    *d = if t.ref0[k] as i32 == LAST_FRAME || t.ref0[k] == crate::types::GOLDEN {
                         pf_skip_value(t.skip[k] != 0, flags, t.mi_size[k] as i32)
                     } else {
                         t.skip[k]

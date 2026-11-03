@@ -122,6 +122,9 @@ fn inter_sequences_round_trip() {
     );
     assert_phase_coverage(20);
     assert_intrabc_coverage(20);
+    let golden = GOLDEN_BLOCKS.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("{golden} GOLDEN_FRAME blocks");
+    assert!(golden > 1000);
 }
 
 /// Random sequences whose frames are all coded smaller than their stream (decisions.h "Reduced
@@ -180,6 +183,9 @@ fn sb128_sequences_round_trip() {
 /// The round trips of [`inter_sequences_round_trip`] for the sequences of `n` seeds that `pick`
 /// takes, sides up to `maxdim`; with `reduced`, every frame coded smaller than its stream
 /// ([`reduce`]). Returns the frame count.
+/// GOLDEN_FRAME blocks [`round_trip_seqs`] coded.
+static GOLDEN_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
     let frames = std::sync::atomic::AtomicU64::new(0);
     seeds(n, |w, seed| {
@@ -192,6 +198,8 @@ fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) 
         if reduced {
             reduce(&mut seq, seed);
         }
+        let golden = seq.frames.iter().flat_map(|r| &r.inter).filter(|i| i.is_inter == crate::types::GOLDEN).count();
+        GOLDEN_BLOCKS.fetch_add(golden as u64, std::sync::atomic::Ordering::Relaxed);
         let outs = match encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD) {
             Ok(o) => o,
             Err((k, e)) => panic!("seed {seed} frame {k}: {e}"),
@@ -356,7 +364,9 @@ fn video_key_frames_are_still_pictures() {
 /// the coefficients alone.
 struct McCheck<'a> {
     inter: &'a [BlockInter],
+    /// LAST_FRAME's picture, and GOLDEN_FRAME's
     reference: RefPicture<'a>,
+    golden: RefPicture<'a>,
     w: u32,
     h: u32,
     checked: std::sync::atomic::AtomicU64,
@@ -375,9 +385,10 @@ impl TxbHook for McCheck<'_> {
         }
         let bi = self.inter[ctx.block_idx as usize];
         let sub = (p != 0) as u32;
+        let pic = if bi.is_inter == crate::types::GOLDEN { &self.golden } else { &self.reference };
         let r = RefPlane {
-            data: self.reference.plane[p],
-            stride: self.reference.stride[p],
+            data: pic.plane[p],
+            stride: pic.stride[p],
             w: ((self.w + sub) >> sub) as i32,
             h: ((self.h + sub) >> sub) as i32,
         };
@@ -418,12 +429,14 @@ fn hook_sees_the_inter_prediction() {
             let fp = seq.frames[k].fp;
             if fp.frame_type == FRAME_INTER {
                 let rec = &mut seq.frames[k];
-                let reference = RefPicture::from_output(&plain[slot_of[fp.ref_slot as usize]]);
-                let refs: RefSlots = [Some(reference); 8];
+                let refs: RefSlots = core::array::from_fn(|s| Some(RefPicture::from_output(&plain[slot_of[s]])));
+                let reference = refs[fp.ref_slot as usize].unwrap();
+                let golden = if fp.golden_slot != 0 { refs[fp.golden_slot as usize - 1].unwrap() } else { reference };
                 let inter = rec.inter.clone();
                 let hook = McCheck {
                     inter: &inter,
                     reference,
+                    golden,
                     w: fp.width,
                     h: fp.height,
                     checked: Default::default(),

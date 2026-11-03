@@ -17,7 +17,7 @@ let av1SeqCommand = Command(
     flags: [
         .trace,
         .int("frames", "<n>", 1...10_000, "frames to encode (default 60)"),
-        .string("mix", "<trace.scap>", "alternate the pictures with this trace's (from the same --skip, resampled the same): every superblock changes from picture to picture"),
+        .string("mix", "<trace.scap>[,<trace.scap>...]", "interleave the pictures with these traces' (each from the same --skip, resampled the same), in turn: every superblock changes from picture to picture"),
         .int("skip", "<n>", 0...100_000, "trace frames to skip first (default 0)"),
         .int("width", "<px>", 64...8192, "resample frames to this width (default 1280)"),
         .int("q", "<0-63>", 0...63, "quantizer, libaom's scale; qindex 4q, 63 → 255 (default 20)"),
@@ -42,6 +42,7 @@ let av1SeqCommand = Command(
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
+        .bool("no-golden", "with --inter: inter frames copy only the picture before them, not GOLDEN_FRAME (the picture before the latest mostly new one)"),
         .string("crop", "<w>x<h>+<x>+<y>", "code this rectangle of the trace's frames at their own size (not with --width or --score-rgb)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
         .bool("cpu-decides", "decide chroma and search luma tx types on the CPU in the closed loop, not up front on the GPU"),
@@ -111,17 +112,18 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var pictures: [YUV420] = []
     var index = 0
     var stamps: [UInt64] = []
-    // --mix: every other picture from a second trace (its own frames from --skip), the same size
-    let mix = try opts.string("mix").map { try ScapReader(url: URL(fileURLWithPath: $0)) }
-    let mixFull = mix.map { UnsafeMutableRawBufferPointer.allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
-    defer { mixFull?.deallocate() }
-    var mixIndex = 0, mixRects: [DirtyRect] = []
-    func mixPicture() throws -> YUV420? {
-        guard let mix, let mixFull, crop == nil else { return nil }
-        while let _ = try mix.readFrame(rects: &mixRects, into: mixFull) {
-            defer { mixIndex += 1 }
-            guard mixIndex >= skip else { continue }
-            resample(mixFull, mix.header.width, mix.header.height, into: bgra, width, height)
+    // --mix: after each of the trace's pictures, one from each of these traces in turn (their own
+    // frames from --skip), the same size
+    let mixes = try mixTraces(opts).map { try ScapReader(url: URL(fileURLWithPath: $0)) }
+    let mixFull = mixes.map { UnsafeMutableRawBufferPointer.allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
+    defer { mixFull.forEach { $0.deallocate() } }
+    var mixIndex = [Int](repeating: 0, count: mixes.count), mixRects: [DirtyRect] = []
+    func mixPicture(_ k: Int) throws -> YUV420? {
+        guard crop == nil else { return nil }
+        while let _ = try mixes[k].readFrame(rects: &mixRects, into: mixFull[k]) {
+            defer { mixIndex[k] += 1 }
+            guard mixIndex[k] >= skip else { continue }
+            resample(mixFull[k], mixes[k].header.width, mixes[k].header.height, into: bgra, width, height)
             return try YUV420(bgra: bgra, width: width, height: height)
         }
         return nil
@@ -129,9 +131,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     while pictures.count < count, let meta = try reader.readFrame(rects: &rects, into: full) {
         defer { index += 1 }
         guard index >= skip else { continue }
-        if mix != nil, pictures.count % 2 == 1, let m = try mixPicture() {
-            pictures.append(m)
-            stamps.append(meta.timestampUS)
+        if pictures.count > 0 {
+            for k in mixes.indices where pictures.count < count {
+                guard let m = try mixPicture(k) else { break }
+                pictures.append(m)
+                stamps.append(meta.timestampUS)
+            }
             if pictures.count == count { break }
         }
         stamps.append(meta.timestampUS)
@@ -172,6 +177,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.reusesAnalysis = !opts.has("no-reuse")
     encoder.postfilters = !opts.has("no-filters")
     encoder.intraBlockCopy = !opts.has("no-intrabc")
+    encoder.goldenFrames = !opts.has("no-golden")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("no-ml-prune") {
         encoder.learnedPrune = nil
@@ -254,7 +260,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 
     var psnr = 0.0
     let scoreRGB = opts.has("score-rgb")
-    let rgb = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
+    let rgb = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
                                        coded: stream == nil ? nil : (width, height),
                                        ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
@@ -307,9 +313,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         func avg(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { rest.map { f($0.timing) }.reduce(0, +) / m }
         let steady = outputAt.count == frames.count && frames.count > 1
             ? String(format: " · %.1f inter frames a second", Double(frames.count - 1) / (outputAt[frames.count - 1] - outputAt[0])) : ""
-        print(String(format: "             key frame %@ · inter frames %@ on average%@ · copied %.1f %% of 64x64s (%.1f %% at a shift) · deciding them %.2f ms · motion-searched blocks %.1f %% of the picture",
+        print(String(format: "             key frame %@ · inter frames %@ on average%@ · copied %.1f %% of 64x64s (%.1f %% at a shift, %.1f %% from GOLDEN_FRAME) · deciding them %.2f ms · motion-searched blocks %.1f %% of the picture",
                      formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count), steady,
-                     avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.motion } * 1000, avg { $0.searched } * 100))
+                     avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.copiedGolden } * 100, avg { $0.motion } * 1000,
+                     avg { $0.searched } * 100))
     }
 
     if opts.has("profile") {
@@ -397,7 +404,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let headerSize = Int(glassact_aom_enc_sequence_header(enc, &header, header.count))
         guard let aomDecoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
         defer { glassact_aom_dec_destroy(aomDecoder) }
-        let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, skip: skip, width: width, height: height) : nil
+        let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, width: width, height: height,
+                                              ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
         for (i, s) in streams.enumerated() {
             let full = headerSize > 0 && (!aomInter || i == 0) ? Array(header.prefix(headerSize)) + s : s
             let decoded = aomInter ? try YUV420.decode(full, width: width, height: height, with: aomDecoder)
@@ -418,11 +426,18 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
 }
 
+/// `--mix`'s traces (comma-separated).
+func mixTraces(_ opts: Options) -> [String] {
+    opts.string("mix").map { $0.split(separator: ",").map(String.init) } ?? []
+}
+
 /// `--score-rgb`: decoded pictures scored as vquality scores HEVC (lumaQuality: BT.601 luma of BGRA,
 /// SSIM on 8x8 blocks and PSNR), against the trace's frames resampled to the canvas as av1seq
 /// resamples them before converting to 4:2:0. Reads the trace a second time, in step.
 final class RGBScorer {
     let reader: ScapReader
+    /// `--mix`: the traces whose pictures come in turn after each of the trace's, and their frames
+    let mix: [ScapReader], mixFull: [UnsafeMutableRawBufferPointer]
     /// `--ssimulacra2-every`: its scorer and period, and the pairs added
     let ssimu2: SSIMULACRA2Scorer?, ssimu2Every: Int
     var ssimu2Count = 0
@@ -434,8 +449,11 @@ final class RGBScorer {
     var rects: [DirtyRect] = []
     var ssim = 0.0, psnr = 0.0, frames = 0
 
-    init(trace: String, skip: Int, width: Int, height: Int, coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil) throws {
+    init(trace: String, mix mixTraces: [String] = [], skip: Int, width: Int, height: Int,
+         coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil) throws {
         reader = try openTrace(trace)
+        mix = try mixTraces.map { try ScapReader(url: URL(fileURLWithPath: $0)) }
+        mixFull = mix.map { .allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
         ssimu2 = try ssimulacra2Every.flatMap { _ in try SSIMULACRA2Scorer.make(setting: nil) }
         ssimu2Every = ssimulacra2Every ?? 0
         if ssimulacra2Every != nil, ssimu2 == nil { throw BenchError("--ssimulacra2-every: no ssimulacra2 on PATH") }
@@ -447,18 +465,22 @@ final class RGBScorer {
         shown = .allocate(byteCount: width * height * 4, alignment: 64)
         small = .allocate(byteCount: coded.map { $0.width * $0.height * 4 } ?? 0, alignment: 64)
         for _ in 0..<skip { _ = try reader.readFrame(rects: &rects, into: full) }
+        for (m, f) in zip(mix, mixFull) { for _ in 0..<skip { _ = try m.readFrame(rects: &rects, into: f) } }
     }
 
     deinit {
         full.deallocate()
+        mixFull.forEach { $0.deallocate() }
         reference.deallocate()
         shown.deallocate()
         small.deallocate()
     }
 
     func add(_ decoded: YUV420) throws {
-        guard try reader.readFrame(rects: &rects, into: full) != nil else { throw BenchError("--score-rgb: the trace ended early") }
-        resample(full, reader.header.width, reader.header.height, into: reference, width, height)
+        let k = frames % (mix.count + 1)
+        let (r, f) = k == 0 ? (reader, full) : (mix[k - 1], mixFull[k - 1])
+        guard try r.readFrame(rects: &rects, into: f) != nil else { throw BenchError("--score-rgb: the trace ended early") }
+        resample(f, r.header.width, r.header.height, into: reference, width, height)
         if let coded {
             try decoded.bgra(into: small)
             resample(small, coded.width, coded.height, into: shown, width, height)

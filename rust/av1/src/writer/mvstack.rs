@@ -1,5 +1,6 @@
 //! The motion vector candidate stack (spec 7.10.2, find_mv_stack) for the writer's inter
-//! toolset: single prediction from LAST_FRAME, identity global motion (GlobalMvs are 0), the
+//! toolset: single prediction from LAST_FRAME or GOLDEN_FRAME (no order hints, so every
+//! RefFrameSignBias is 0), identity global motion (GlobalMvs are 0), the
 //! frame's MV precision (force_integer_mv, allow_high_precision_mv: fp.mv_precision), no
 //! reference-frame MVs (use_ref_frame_mvs = 0: no temporal scan, so ZeroMvContext is 0). It reads
 //! only the tile's mode info of blocks already coded, so the writer and the parser build the same
@@ -14,14 +15,15 @@
 //! [`derive_mode`] is the writer's rule from a block's motion vector to its mode (decisions.h
 //! "Inter blocks").
 use crate::tables::*;
+use crate::types::GOLDEN;
 
 /// One tile's mode info at 4x4 granularity (tile-local, `mw` wide, origin (`r0`, `c0`)), as the
 /// stack reads it.
 pub(crate) struct MvMaps<'a> {
-    /// RefFrames[.][.][0]: 0 intra, 1 LAST_FRAME, [`REF_INTRABC`] intra block copy, [`REF_UNSET`]
-    /// not coded yet in this frame
+    /// RefFrames[.][.][0]: 0 intra, 1 LAST_FRAME, [`GOLDEN`] GOLDEN_FRAME, [`REF_INTRABC`] intra
+    /// block copy, [`REF_UNSET`] not coded yet in this frame
     pub ref0: &'a [u8],
-    /// Mvs[.][.][0] as [row, col] (1/8 sample), valid where ref0 is LAST_FRAME or REF_INTRABC
+    /// Mvs[.][.][0] as [row, col] (1/8 sample), valid where ref0 is a reference or REF_INTRABC
     pub mvs: &'a [[i16; 2]],
     /// YModes (inter modes for inter blocks)
     pub y_mode: &'a [u8],
@@ -87,7 +89,7 @@ pub(crate) fn lower_mv_precision(v: i32, prec: u8) -> i32 {
 
 struct Search<'a, 'b> {
     m: &'b MvMaps<'a>,
-    /// the candidates' ref0: LAST_FRAME, or REF_INTRABC
+    /// the candidates' ref0: LAST_FRAME, GOLDEN_FRAME, or REF_INTRABC
     target: u8,
     mi_row: i32,
     mi_col: i32,
@@ -216,10 +218,11 @@ impl Search<'_, '_> {
                 if !self.m.is_inside(r, c) {
                     break;
                 }
-                // add_extra_mv_candidate (candRef > INTRA_FRAME: LAST_FRAME, never an intra block
-                // copy block): RefFrameSignBias is 0 for every reference
+                // add_extra_mv_candidate (candRef > INTRA_FRAME: a reference, any of them; never
+                // an intra block copy block): RefFrameSignBias is 0 for every reference
                 let k = self.m.at(r, c);
-                if self.m.ref0[k] == LAST_FRAME as u8 {
+                let cand_ref = self.m.ref0[k];
+                if self.target != REF_INTRABC && (cand_ref == LAST_FRAME as u8 || cand_ref == GOLDEN) {
                     let mv = self.m.mvs[k];
                     let cand = [mv[0] as i32, mv[1] as i32];
                     let s = &mut self.s;
@@ -244,12 +247,13 @@ impl Search<'_, '_> {
 }
 
 /// find_mv_stack(0) for the block (mi_row, mi_col, bsize) of the tile `m`, RefFrame LAST_FRAME.
+#[cfg(test)]
 pub(crate) fn find_mv_stack(m: &MvMaps, mi_row: i32, mi_col: i32, bsize: i32) -> MvStack {
     find_mv_stack_ref(m, mi_row, mi_col, bsize, LAST_FRAME as u8)
 }
 
-/// find_mv_stack(0) for RefFrame `target`: LAST_FRAME, or [`REF_INTRABC`] (INTRA_FRAME, an intra
-/// block copy block's).
+/// find_mv_stack(0) for RefFrame `target`: LAST_FRAME, [`GOLDEN`] (GOLDEN_FRAME), or
+/// [`REF_INTRABC`] (INTRA_FRAME, an intra block copy block's).
 pub(crate) fn find_mv_stack_ref(m: &MvMaps, mi_row: i32, mi_col: i32, bsize: i32, target: u8) -> MvStack {
     let (bw4, bh4) = (
         Num_4x4_Blocks_Wide[bsize as usize] as i32,

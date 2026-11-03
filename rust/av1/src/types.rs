@@ -103,7 +103,9 @@ pub struct FrameParams {
     /// frames"). 0, or the frame's own size: the frame is the stream's size.
     pub stream_width: u16,
     pub stream_height: u16,
-    pub reserved: [u8; 1],
+    /// inter: GOLDEN_FRAME's reference slot + 1 (blocks with is_inter [`GOLDEN`] predict from
+    /// it); 0: GOLDEN_FRAME uses `ref_slot`, as every other reference does
+    pub golden_slot: u8,
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
@@ -112,6 +114,8 @@ pub const DECISIONS_VERSION: u32 = 2;
 /// av1g_frame_params.frame_type
 pub const FRAME_KEY: u8 = 0;
 pub const FRAME_INTER: u8 = 1;
+/// av1g_block_inter.is_inter of a block that predicts from GOLDEN_FRAME (its RefFrame)
+pub const GOLDEN: u8 = 4;
 
 /// A block's palettes (spec palette_mode_info, with allow_screen_content_tools): intra blocks of
 /// 8x8 to 64x64 with y_mode (luma) or uv_mode (chroma) DC_PRED. All zero: no palette.
@@ -138,7 +142,8 @@ pub struct BlockInter {
     /// luma motion, 1/8 sample, multiples of 8
     pub mv_row: i16,
     pub mv_col: i16,
-    /// 1: inter (LAST_FRAME), 0: intra
+    /// the reference a block predicts from: 1 (LAST_FRAME) or [`GOLDEN`] (GOLDEN_FRAME, inter
+    /// frames with fp.golden_slot); 0: intra
     pub is_inter: u8,
     pub reserved: [u8; 3],
 }

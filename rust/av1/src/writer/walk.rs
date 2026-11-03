@@ -9,7 +9,7 @@
 mod palette;
 
 use super::mvstack::{
-    MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack, find_mv_stack_ref, mv_class,
+    MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack_ref, mv_class,
 };
 use super::recon::TilePlan;
 use super::sink::Sink;
@@ -49,6 +49,8 @@ pub(crate) struct Frame<'a> {
     pub intrabc: bool,
     /// an inter frame with a reconstruction: LAST_FRAME's planes
     pub refs: Option<[RefPlane<'a>; 3]>,
+    /// and GOLDEN_FRAME's (LAST_FRAME's where fp.golden_slot is 0)
+    pub refs_golden: Option<[RefPlane<'a>; 3]>,
     /// the CDFs every tile starts from (primary_ref_frame's saved ones); `None`: the defaults
     pub cdfs_in: Option<&'a FrameCdfs>,
     /// video mode: where tile `context_tile` (context_update_tile_id) leaves its CDFs, counters
@@ -411,10 +413,11 @@ impl TileState {
     }
 }
 
-/// IsInters of a RefFrames[.][.][0] map entry: LAST_FRAME, or an intra block copy block.
+/// IsInters of a RefFrames[.][.][0] map entry: LAST_FRAME or GOLDEN_FRAME, or an intra block copy
+/// block.
 #[inline(always)]
 pub(super) fn is_inter_ref(v: u8) -> bool {
-    v == LAST_FRAME as u8 || v == REF_INTRABC
+    v == LAST_FRAME as u8 || v == GOLDEN || v == REF_INTRABC
 }
 
 /// One tile's walk.
@@ -442,11 +445,11 @@ pub(super) struct InterMaps<'a> {
 }
 
 /// An inter block's motion-compensated prediction of every plane, into the tile's planes (at
-/// tile-local positions).
+/// tile-local positions), from each (sub-8x8 chroma: each of its 8x8's blocks') reference: `f`'s
+/// LAST_FRAME or GOLDEN_FRAME planes, which an inter frame with a reconstruction has.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predict_inter_block(
     f: &Frame,
-    refs: &[RefPlane; 3],
     maps: &InterMaps,
     planes: &mut [&mut [u8]; 3],
     r: i32,
@@ -489,7 +492,10 @@ pub(super) fn predict_inter_block(
         for (ri, y) in (0..n4h * 4).step_by(h).enumerate() {
             for (ci, x) in (0..n4w * 4).step_by(w).enumerate() {
                 let (px, py) = (base_x + x, base_y + y);
-                let m = maps.mvs[mi(cand_r + ri as i32, cand_c + ci as i32)];
+                let k = mi(cand_r + ri as i32, cand_c + ci as i32);
+                let m = maps.mvs[k];
+                let refs = if maps.ref0[k] == GOLDEN { &f.refs_golden } else { &f.refs };
+                let Some(refs) = refs.as_ref() else { return };
                 #[cfg(test)]
                 {
                     let (qx, qy) = crate::dsp::mc_position(px, py, [m[0] as i32, m[1] as i32], sub);
@@ -1366,24 +1372,42 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     #[inline(never)]
     fn inter_block_mode_info(&mut self, r: i32, c: i32, bsize: i32, bi: &mut BlockInter) -> Res<i32> {
         let b_idx = self.st.b_idx;
-        // read_ref_frames: single_ref_p1 = p3 = p4 = 0. With only LAST_FRAME and intra neighbours
-        // every count but LAST_FRAME's is 0, so the three contexts are ref_count_ctx(last, 0).
-        let last_count = {
+        // read_ref_frames (single prediction): LAST_FRAME is single_ref_p1 = p3 = p4 = 0,
+        // GOLDEN_FRAME p1 = 0, p3 = p5 = 1. The neighbours are intra, LAST_FRAME or GOLDEN_FRAME
+        // blocks, so of count_refs only those two counts can be nonzero.
+        let (last, golden) = {
             let (bufs, st) = (&*self.bufs, &*self.st);
-            let last = |k: usize| (bufs.ref0[k] as i32 == LAST_FRAME) as i32;
-            (if st.avail_u { last(bufs.mi(r - 1, c)) } else { 0 })
-                + if st.avail_l { last(bufs.mi(r, c - 1)) } else { 0 }
+            let count = |rf: u8| {
+                let at = |k: usize| (bufs.ref0[k] == rf) as i32;
+                (if st.avail_u { at(bufs.mi(r - 1, c)) } else { 0 }) + if st.avail_l { at(bufs.mi(r, c - 1)) } else { 0 }
+            };
+            (count(LAST_FRAME as u8), count(GOLDEN))
         };
-        let rctx = if last_count == 0 { 1 } else { 2 };
-        for p in [0, 2, 3] {
-            if self.sk.sym(&mut self.st.icdf.single_ref[rctx][p], 0) != 0 {
-                fail!(
-                    ERR_INVALID,
-                    "block {b_idx}: reference frames other than LAST_FRAME are not supported"
-                );
-            }
+        let ref_count_ctx = |c0: i32, c1: i32| (c0 >= c1) as usize + (c0 > c1) as usize;
+        let golden_w = S::WRITE && bi.is_inter == GOLDEN;
+        if self.sk.sym(&mut self.st.icdf.single_ref[ref_count_ctx(last + golden, 0)][0], 0) != 0 {
+            fail!(ERR_INVALID, "block {b_idx}: backward references are not supported");
         }
-        let s: MvStack = find_mv_stack(&self.mv_maps(), r, c, bsize);
+        // p3: LAST_FRAME / LAST2_FRAME against LAST3_FRAME / GOLDEN_FRAME
+        let golden_r = self.sk.sym(
+            &mut self.st.icdf.single_ref[ref_count_ctx(last, golden)][2],
+            golden_w as i32,
+        ) != 0;
+        // p4 (LAST_FRAME / LAST2_FRAME) or p5 (LAST3_FRAME / GOLDEN_FRAME)
+        let (ctx, p) = if golden_r {
+            (ref_count_ctx(0, golden), 4)
+        } else {
+            (ref_count_ctx(last, 0), 3)
+        };
+        if self.sk.sym(&mut self.st.icdf.single_ref[ctx][p], golden_r as i32) != golden_r as i32 {
+            fail!(
+                ERR_INVALID,
+                "block {b_idx}: reference frames other than LAST_FRAME and GOLDEN_FRAME are not supported"
+            );
+        }
+        let rf = if golden_r { GOLDEN } else { LAST_FRAME as u8 };
+        bi.is_inter = rf;
+        let s: MvStack = find_mv_stack_ref(&self.mv_maps(), r, c, bsize, rf);
         let mv_w = [bi.mv_row as i32, bi.mv_col as i32];
         let (mode_w, idx_w) = if S::WRITE {
             match derive_mode(&s, mv_w) {
@@ -1747,7 +1771,9 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     /// block of its 8x8 unit, unless one of them is intra.
     #[inline(never)]
     fn predict_inter_block(&mut self, bsize: i32, has_chroma: bool) {
-        let Some(refs) = self.f.refs.as_ref() else { return };
+        if self.f.refs.is_none() {
+            return;
+        }
         let (st, bufs) = (&mut *self.st, &mut *self.bufs);
         let maps = InterMaps {
             ref0: &bufs.ref0,
@@ -1761,7 +1787,6 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let mut planes: [&mut [u8]; 3] = [a, b, c];
         predict_inter_block(
             self.f,
-            refs,
             &maps,
             &mut planes,
             st.mi_row,
@@ -1776,10 +1801,12 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     #[inline(never)]
     fn check_inter_fields(&self, b: &Block, bi: &BlockInter) -> Res<()> {
         let b_idx = self.st.b_idx;
-        if bi.is_inter > 1 || bi.reserved != [0; 3] {
+        if !(bi.is_inter <= 1 || (bi.is_inter == GOLDEN && self.f.inter && self.f.fp.golden_slot != 0))
+            || bi.reserved != [0; 3]
+        {
             fail!(
                 ERR_INVALID,
-                "block {b_idx}: inter entry: is_inter must be 0/1, reserved 0"
+                "block {b_idx}: inter entry: is_inter must be 0/1 (or GOLDEN in an inter frame with fp.golden_slot), reserved 0"
             );
         }
         if bi.is_inter != 0 {
@@ -2180,14 +2207,21 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             } else {
                 0
             };
-            self.sk.sym(&mut self.st.icdf.is_inter[ctx], bi.is_inter as i32) != 0
+            self.sk.sym(&mut self.st.icdf.is_inter[ctx], (bi.is_inter != 0) as i32) != 0
         } else if f.intrabc {
             // use_intrabc
-            self.sk.sym(&mut self.st.icdf.intrabc, bi.is_inter as i32) != 0
+            self.sk.sym(&mut self.st.icdf.intrabc, (bi.is_inter != 0) as i32) != 0
         } else {
             false
         };
-        bi.is_inter = is_inter as u8;
+        // (written: the block's reference; parsed: read_ref_frames reads it)
+        bi.is_inter = if !is_inter {
+            0
+        } else if S::WRITE {
+            bi.is_inter
+        } else {
+            1
+        };
         self.st.is_inter = is_inter;
         // the YModes value of the block: its intra mode, its inter mode, or an intra block copy
         // block's DC_PRED
@@ -2357,7 +2391,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 if f.inter || f.intrabc {
                     let rf = match (is_inter, f.intrabc) {
                         (false, _) => INTRA_FRAME as u8,
-                        (true, false) => LAST_FRAME as u8,
+                        (true, false) => bi.is_inter, // LAST_FRAME or GOLDEN_FRAME
                         (true, true) => REF_INTRABC,
                     };
                     fill_small(&mut bufs.ref0[k..k + n], rf);

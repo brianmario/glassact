@@ -92,10 +92,11 @@ int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t 
                               int qindex, int tile_cols_log2, int tile_rows_log2, char *err, size_t errlen);
 // av1enc_hybrid_closed_loop for a frame of a stream: video (null: a still picture) supplies the
 // frame's video fields (video, frame_type, ref_slot, refresh_frame_flags, error_resilient_mode,
-// lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision, sb128; the rest is ignored). An inter frame takes inter (one
+// lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision, sb128, golden_slot; the rest is ignored). An inter frame takes inter (one
 // per block, or null: all intra) and ref, LAST_FRAME's picture (the decoder's output of the frame
-// in ref_slot: planes of the picture's size at their strides). Inter blocks are skip blocks
-// (tx_depth 0, intra fields 0) and copy the reference at their motion vector. An inter frame's
+// in ref_slot: planes of the picture's size at their strides); with golden_slot, ref points to two:
+// LAST_FRAME's, then GOLDEN_FRAME's (the output of the frame in golden_slot - 1). Inter blocks are
+// skip blocks (tx_depth 0, intra fields 0) and copy their reference at their motion vector. An inter frame's
 // tiles are coded afresh, and the next picture's aren't kept from it. With sb128 the blocks are in
 // 128x128-superblock decode order (av1enc_motion_apply_ex makes it from a 64x64 one), tiled as
 // av1g_tile_layout_ex(..., 1) gives it, and inter blocks may be 128x128, 128x64 or 64x128.
@@ -182,6 +183,13 @@ void av1enc_motion_destroy(av1enc_motion *m);
 int av1enc_motion_classify(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
                            const uint8_t *const prev[3], const int prev_stride[3], int width, int height, int planes,
                            int max_candidates, int32_t *out);
+// av1enc_motion_classify, then the 64x64s that don't copy prev against golden (null: none), an
+// older picture (GOLDEN_FRAME's), the same way. out's copy is 2 for a copy of golden; apply makes
+// it GOLDEN_FRAME inter blocks. av1enc_motion_candidates stay prev's.
+int av1enc_motion_classify_ex(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
+                              const uint8_t *const prev[3], const int prev_stride[3],
+                              const uint8_t *const golden[3], const int golden_stride[3], int width, int height,
+                              int planes, int max_candidates, int32_t *out);
 // The last classify's shift candidates (dx, dy pairs, best first), up to max; returns the count.
 int av1enc_motion_candidates(const av1enc_motion *m, int32_t *out, int max);
 // A classify's decisions (sb_motion, as its out) applied to a partition in coding order (and its

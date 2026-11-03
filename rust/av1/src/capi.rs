@@ -743,9 +743,14 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
     } else {
         unsafe { slice::from_raw_parts(inter, n as usize) }
     };
-    let mut pic = None;
-    if !reference.is_null() {
-        let r = unsafe { &*reference };
+    // LAST_FRAME's picture, and with fp.golden_slot GOLDEN_FRAME's after it
+    let golden = !video.is_null() && unsafe { (*video).golden_slot } != 0;
+    let mut pics = [None, None];
+    for (i, pic) in pics.iter_mut().enumerate().take(if golden { 2 } else { 1 }) {
+        if reference.is_null() {
+            break;
+        }
+        let r = unsafe { &*reference.add(i) };
         let mut p = writer::RefPicture::default();
         for k in 0..3 {
             let sub = (k != 0) as u32;
@@ -758,8 +763,9 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
             p.plane[k] = unsafe { slice::from_raw_parts(r.plane[k], (ph as usize - 1) * stride + pw as usize) };
             p.stride[k] = stride;
         }
-        pic = Some(p);
+        *pic = Some(p);
     }
+    let [pic, golden_pic] = pics;
     let mut given = None;
     if !padded.is_null() {
         // SAFETY: three planes of the padded geometry (av1enc.h)
@@ -792,6 +798,7 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         fp: unsafe { *video },
         inter,
         reference: pic,
+        golden: golden_pic,
         padded: given,
     });
     let r = hh.h.closed_loop_ex(
@@ -1252,22 +1259,59 @@ pub unsafe extern "C" fn av1enc_motion_classify(
     max_candidates: c_int,
     out: *mut i32,
 ) -> c_int {
+    // SAFETY: as av1enc_motion_classify_ex's
+    unsafe {
+        av1enc_motion_classify_ex(
+            m,
+            cur,
+            cur_stride,
+            prev,
+            prev_stride,
+            core::ptr::null(),
+            core::ptr::null(),
+            width,
+            height,
+            planes,
+            max_candidates,
+            out,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_classify_ex(
+    m: *mut crate::motion::Motion,
+    cur: *const *const u8,
+    cur_stride: *const c_int,
+    prev: *const *const u8,
+    prev_stride: *const c_int,
+    golden: *const *const u8,
+    golden_stride: *const c_int,
+    width: c_int,
+    height: c_int,
+    planes: c_int,
+    max_candidates: c_int,
+    out: *mut i32,
+) -> c_int {
     if m.is_null() || width < 1 || height < 1 || (planes != 1 && planes != 3) {
         return -1;
     }
-    // SAFETY: the handle; both pictures' planes; out holds 3 ints per 64x64 (av1enc.h)
+    // SAFETY: the handle; the pictures' planes (golden's when given); out holds 3 ints per 64x64
+    // (av1enc.h)
     let (c, q) = unsafe {
         (
             motion_planes(cur, cur_stride, width, height, planes),
             motion_planes(prev, prev_stride, width, height, planes),
         )
     };
+    let g = (!golden.is_null()).then(|| unsafe { motion_planes(golden, golden_stride, width, height, planes) });
     let m = unsafe { &mut *m };
-    let n = m.classify(&c, &q, planes as usize, max_candidates.max(0) as usize);
+    let n = m.classify_ex(&c, &q, g.as_ref(), planes as usize, max_candidates.max(0) as usize);
     if !out.is_null() {
         let o = unsafe { slice::from_raw_parts_mut(out, 3 * m.sbs.len()) };
         for (k, s) in m.sbs.iter().enumerate() {
-            o[3 * k..3 * k + 3].copy_from_slice(&[s.copy as i32, s.shift.dx, s.shift.dy]);
+            let copy = if s.golden { 2 } else { s.copy as i32 };
+            o[3 * k..3 * k + 3].copy_from_slice(&[copy, s.shift.dx, s.shift.dy]);
         }
     }
     n as c_int
@@ -1369,6 +1413,7 @@ pub unsafe extern "C" fn av1enc_motion_apply_ex(
             .map(|c| crate::motion::SbMotion {
                 copy: c[0] != 0,
                 shift: crate::motion::Shift { dx: c[1], dy: c[2] },
+                golden: c[0] == 2,
             })
             .collect()
     };

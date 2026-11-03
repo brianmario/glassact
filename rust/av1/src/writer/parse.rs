@@ -9,7 +9,8 @@ use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::clip3;
 use crate::entropy::FrameCdfs;
 use crate::tables::{
-    ALTREF_FRAME, EIGHTTAP, INTER_FRAME, KEY_FRAME, LAST_FRAME, NUM_REF_FRAMES, PRIMARY_REF_NONE, REFS_PER_FRAME,
+    ALTREF_FRAME, EIGHTTAP, GOLDEN_FRAME, INTER_FRAME, KEY_FRAME, LAST_FRAME, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    REFS_PER_FRAME,
 };
 
 /// av1g_parsed: the record with all decisions and quantized coefficients, and where the tiles were.
@@ -348,7 +349,9 @@ fn parse_frame(
         for i in 0..REFS_PER_FRAME {
             let idx = br.f(3)? as u8;
             if i == 0 {
-                fp.ref_slot = idx; // LAST_FRAME's; the only reference blocks may use
+                fp.ref_slot = idx; // LAST_FRAME's
+            } else if i == GOLDEN_FRAME - LAST_FRAME && idx != fp.ref_slot {
+                fp.golden_slot = idx + 1; // GOLDEN_FRAME's own (the other references blocks don't use)
             }
         }
         if override_ && !err_res {
@@ -490,7 +493,10 @@ fn parse_frame(
         if inter && delta_enabled {
             // only lf_inter_off's deltas: the levels as given for intra blocks, 0 for inter ones
             need!(
-                ref_deltas[0] == 0 && ref_deltas[1] == -63 && mode_deltas == [0, 0],
+                ref_deltas[0] == 0
+                    && ref_deltas[1] == -63
+                    && (ref_deltas[4] == -1 || ref_deltas[4] == -63)
+                    && mode_deltas == [0, 0],
                 "loop filter deltas in inter frames other than lf_inter_off's not supported"
             );
             fp.lf_inter_off = 1;
@@ -608,6 +614,7 @@ fn parse_frame(
         inter,
         intrabc: fp.allow_intrabc != 0,
         refs: None,
+        refs_golden: None,
         cdfs_in: cdfs_in.as_deref(),
         cdfs_out: (state.is_some() && end_update).then_some(&saved),
         context_tile,

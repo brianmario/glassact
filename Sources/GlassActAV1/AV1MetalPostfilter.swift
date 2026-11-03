@@ -73,8 +73,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public private(set) var lastFilteredShare = 1.0
 
     /// av1g_frame_params up to its last field (the rest is padding).
-    private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.reserved)!
-        + MemoryLayout.size(ofValue: av1g_frame_params().reserved)
+    private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.golden_slot)!
+        + MemoryLayout.size(ofValue: av1g_frame_params().golden_slot)
     /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, chroma half;
     /// the picture's samples at the top left), valid until the next call: what a caller that
     /// doesn't take `Search.planes` reads instead.

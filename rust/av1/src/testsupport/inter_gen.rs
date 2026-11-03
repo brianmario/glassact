@@ -24,7 +24,7 @@ use crate::dsp::{
     get_scan, get_tx_set_inter, get_tx_set_intra, is_directional, tx_type_in_set_inter, tx_type_in_set_intra,
 };
 use crate::tables::*;
-use crate::types::{Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams};
+use crate::types::{Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams, GOLDEN};
 use crate::writer::{Record, apply_sb_qindex, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
 /// splitmix64 (as fuzz_gen's, its own stream)
@@ -64,6 +64,10 @@ struct Gen<'a> {
     tx_select: bool,
     inter_frame: bool,
     inter_pct: i32,
+    /// of the inter blocks, those that predict from GOLDEN_FRAME (drawn from `grng`, a stream of
+    /// its own)
+    golden_pct: i32,
+    grng: Rng,
     skip_pct: i32,
     fi: bool,
     /// motion vectors this frame reuses (so that neighbours share them: NEAREST / NEAR modes)
@@ -123,7 +127,7 @@ impl Gen<'_> {
         let mut bi = BlockInter::default();
         b.skip = self.rng.chance(self.skip_pct) as u8;
         if inter {
-            bi.is_inter = 1;
+            bi.is_inter = if self.grng.chance(self.golden_pct) { GOLDEN } else { 1 };
             [bi.mv_row, bi.mv_col] = self.mv();
             if self.tx_select && bs > BLOCK_4X4 && b.skip == 0 {
                 b.tx_depth = self.rng.range(0, max_tx_depth(bs)) as u8;
@@ -314,6 +318,9 @@ impl InterSeq {
         let mut irng = Rng(seed.wrapping_mul(0xD6E8FEB86659FD93) ^ 0x1B_C0DE);
         irng.next();
         let abc_pct = [0, 40, 80][irng.range(0, 2) as usize];
+        // GOLDEN_FRAME, from a stream of its own
+        let mut grng = Rng(seed.wrapping_mul(0xA24BAED4963EE407) ^ 0x60_1DE7);
+        grng.next();
         const SPECIAL: [(i32, i32); 8] = [(1, 1), (7, 13), (65, 65), (64, 64), (8, 8), (13, 7), (72, 40), (129, 3)];
         let (w, h) = if rng.chance(15) {
             SPECIAL[rng.range(0, 7) as usize]
@@ -446,7 +453,12 @@ impl InterSeq {
                 fp.error_resilient_mode = rng.chance(30) as u8;
                 fp.lf_inter_off = rng.chance(50) as u8;
                 fp.cdf_from_ref = (fp.error_resilient_mode == 0 && rng.chance(60)) as u8;
+                // GOLDEN_FRAME in a slot of its own (half the frames), which its blocks need
+                if grng.chance(50) {
+                    fp.golden_slot = ((fp.ref_slot as i32 + grng.range(1, 7)) % 8 + 1) as u8;
+                }
             }
+            let golden_pct = if fp.golden_slot == 0 { 0 } else { [10, 30, 60][grng.range(0, 2) as usize] };
             let inter_pct = [0, 30, 60, 85, 100][rng.range(0, 4) as usize];
             let skip_pct = [5, 20, 50, 80][rng.range(0, 3) as usize];
             let mv_far = [24, 96, (w.max(h) + 80).min(1000)][rng.range(0, 2) as usize];
@@ -458,6 +470,8 @@ impl InterSeq {
                 tx_select: fp.tx_mode_select != 0,
                 inter_frame: !key,
                 inter_pct,
+                golden_pct,
+                grng: Rng(grng.next()),
                 skip_pct,
                 fi: fp.enable_filter_intra != 0,
                 mv_pool: Vec::new(),

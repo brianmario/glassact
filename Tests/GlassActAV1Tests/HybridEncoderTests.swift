@@ -213,6 +213,58 @@ extension HybridEncoderTests {
 }
 
 extension HybridEncoderTests {
+    /// GOLDEN_FRAME: two screens in turn (one with a word typed into it each time, the other
+    /// scrolled), each picture mostly new against the one before. Every picture after the first
+    /// two copies the one before that from GOLDEN_FRAME, and the stream decodes in libaom to
+    /// exactly the pictures the encoder reports.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(1280, 720, 80, 2), (333, 201, 120, -1)])
+    func goldenFramesDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interFrames = true
+        var rng = SplitMix64(seed: 0x601d)
+        let base = PartitionTests.Picture(width: width, height: height)
+        // screen A: glyph-like noise; screen B: a taller page, scrolled 2 rows a picture
+        var a = base.y
+        for k in a.indices where rng.int(0..<4) == 0 { a[k] = UInt8(rng.int(20..<90)) }
+        var page = [UInt8](repeating: 200, count: width * (height + 64))
+        for k in page.indices where rng.int(0..<3) == 0 { page[k] = UInt8(rng.int(100..<180)) }
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<10 {
+            if i % 2 == 0 {
+                let x0 = rng.int(0..<max(1, width - 24)), y0 = rng.int(0..<max(1, height - 12))
+                for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { a[r * width + c] = 40 } }
+                pictures.append(AV1HybridEncoder.Picture(y: a, u: base.u, v: base.v, width: width, height: height))
+            } else {
+                let top = 2 * i
+                let b = Array(page[(top * width)..<((top + height) * width)])
+                pictures.append(AV1HybridEncoder.Picture(y: b, u: base.u, v: base.v, width: width, height: height))
+            }
+        }
+        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2)"
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var golden = 0.0
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            if i >= 2 { golden += f.timing.copiedGolden }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        #expect(golden / 8 > 0.5, "\(label): \(golden / 8) of the 64×64s copied GOLDEN_FRAME on average")
+    }
+}
+
+extension HybridEncoderTests {
     /// Intra block copy: pictures whose text repeats (at even and odd offsets) copy it, with no
     /// post-filters, and decode in libaom to exactly the pictures the encoder reports: as still
     /// pictures (the same one again, keeping its tiles; a photo after it, which doesn't copy and

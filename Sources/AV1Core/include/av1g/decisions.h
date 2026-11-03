@@ -166,9 +166,11 @@
  *     video frame saves its CDFs (disable_frame_end_update_cdf = 0; context_update_tile_id: the
  *     median tile by block count; none are saved when that tile is reused).  0: primary_ref_frame
  *     NONE, as before.
- *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from ONE reference picture
- *     (LAST_FRAME; ref_frame_idx[] of all 7 references = fp.ref_slot); it refreshes the
- *     slots in fp.refresh_frame_flags.  Blocks are intra or inter
+ *   fp.frame_type AV1G_FRAME_INTER: an inter frame predicting from LAST_FRAME (slot
+ *     fp.ref_slot) and GOLDEN_FRAME (slot fp.golden_slot - 1; with fp.golden_slot 0, the same
+ *     slot: ref_frame_idx[] of every other reference = fp.ref_slot); it refreshes the slots in
+ *     fp.refresh_frame_flags.  With fp.golden_slot and lf_inter_off, the loop filter's
+ *     GOLDEN_FRAME delta is coded too (-63, as LAST_FRAME's).  Blocks are intra or inter
  *     (av1g_decision_record.inter); intra blocks use the inter-frame syntax (y_mode CDFs by
  *     size group, is_inter, palette flags coded as 0) with the same fields.
  *   fp.mv_precision (inter frames; key frames: 0): the precision of every motion vector of
@@ -184,6 +186,7 @@
  *
  * Inter blocks (av1g_block_inter, one per block when rec.inter != NULL).
  *   is_inter       1: the block predicts from LAST_FRAME with motion vector (mv_row, mv_col);
+ *                  4 (AV1G_GOLDEN): from GOLDEN_FRAME (inter frames with fp.golden_slot);
  *                  0: an intra block (av1g_block's mode fields apply).  NULL rec.inter, and
  *                  every block of a key frame: intra.
  *   mv_row/mv_col  luma motion in 1/8 sample, |mv| < 2^14 (spec is_mv_valid), of the frame's
@@ -334,13 +337,13 @@ typedef struct av1g_frame_params {
     uint8_t  allow_intrabc;        /* key frames: 1 = intra block copy (see "Intra block copy") */
     uint16_t stream_width;         /* video: the stream's size when this frame is coded smaller */
     uint16_t stream_height;        /*   (see "Reduced frames"); 0 or width/height: full size */
-    uint8_t  reserved[1];
+    uint8_t  golden_slot;          /* inter: GOLDEN_FRAME's slot + 1; 0 = fp.ref_slot's (see "Video mode") */
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {
     int16_t  mv_row;         /* luma, 1/8 sample, of fp.mv_precision (multiple of 8 / even / any) */
     int16_t  mv_col;
-    uint8_t  is_inter;       /* 1: inter (LAST_FRAME), 0: intra */
+    uint8_t  is_inter;       /* 1: inter (LAST_FRAME), 4: inter (GOLDEN_FRAME), 0: intra */
     uint8_t  reserved[3];    /* 0 */
 } av1g_block_inter;
 

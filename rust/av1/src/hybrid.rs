@@ -77,7 +77,7 @@ pub const GIVEN_CHROMA: i32 = 1;
 pub struct Video<'a> {
     /// the frame's video fields: video, frame_type, ref_slot, refresh_frame_flags,
     /// error_resilient_mode, lf_inter_off, allow_screen_content_tools, cdf_from_ref, mv_precision,
-    /// sb128 (the rest is ignored). With sb128 the blocks are in 128x128-superblock decode order
+    /// sb128, golden_slot (the rest is ignored). With sb128 the blocks are in 128x128-superblock decode order
     /// ([`crate::motion::Motion::apply_ex`] makes it from a 64x64 one) and the tiles are
     /// [`tile_layout_ex`]'s.
     pub fp: FrameParams,
@@ -86,6 +86,8 @@ pub struct Video<'a> {
     pub inter: &'a [BlockInter],
     /// inter frames: LAST_FRAME's picture (the decoder's output of the frame in fp.ref_slot)
     pub reference: Option<RefPicture<'a>>,
+    /// inter frames with fp.golden_slot: GOLDEN_FRAME's (the output of the frame in its slot)
+    pub golden: Option<RefPicture<'a>>,
     /// The source already padded as the closed loop pads it (to whole 64x64s by edge
     /// replication: luma sb_cols * 64 wide and sb_rows * 64 high, chroma half that each way),
     /// for an inter frame's closed loop to read in place of its own copy (the Metal analysis's
@@ -462,6 +464,7 @@ impl Hybrid {
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
             (f.mv_precision, f.sb128) = (v.fp.mv_precision, v.fp.sb128);
             (f.stream_width, f.stream_height) = (v.fp.stream_width, v.fp.stream_height);
+            f.golden_slot = if v.fp.frame_type == FRAME_INTER { v.fp.golden_slot } else { 0 };
             // from the reference's saved CDFs, where the slot has them
             f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && slot_cdfs[(v.fp.ref_slot & 7) as usize].is_some()) as u8;
         }
@@ -808,6 +811,10 @@ impl Hybrid {
                 cdfs: slot_cdfs[s].as_deref(),
                 ..r
             });
+            let g = (v.fp.golden_slot as usize).wrapping_sub(1) & 7;
+            if v.fp.golden_slot != 0 && g != s {
+                slots[g] = v.golden;
+            }
         }
         let extras = Extras {
             tile_skip: Some(&skips),
