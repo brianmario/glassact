@@ -351,9 +351,13 @@ which the proxy doesn't see. The RD search is what earns the bytes (squares thro
 blocks, random samples, 8 CDEF presets) take ~70 ms on one thread (`postfilter`, a scratch
 example). Rows in parallel on 14 cores would be ~5–7 ms.
 
-**The CPU's work a picture** of the rotation, from user + system time over 40 more pictures:
-~480 core-ms (~380 with everything cheap), the bench's own reading and libaom decode check
-included. 60 a second allows at most ~233 core-ms on 14 cores. `docs/AV1-ENCODER-ARCHITECTURE.md`
+**The CPU's work a picture** of the rotation: a `sample` of 6 s while encoding finds ~3 of the 14
+cores busy on average, ~165 core-ms a picture at 18 a second; of the busy time the closed loop's
+tx trials, quantizer and RDOQ 42 %, libaom's decode check (the bench's) 15 %, the closed loop's
+reconstruction 11 %, the writer 9 %, the copy decisions 7 %, memmove 5 %, the bench's trace
+handling 4 %. **The encoder's ~135 core-ms fits the ~233 that 60 a second allows on 14 cores: the
+CPU is idle ~80 % of the time, waiting in the chain.** (A first estimate from user + system time,
+~480, counted the bench reading and converting the traces up front.) `docs/AV1-ENCODER-ARCHITECTURE.md`
 proposes what to do about all this. No hardware AV1 encoder here (VideoToolbox on the M4 Pro lists HEVC, H.264,
 ProRes and JPEG). Not kept: copying GOLDEN_FRAME's planes beside the closed loop instead of after
 it (~0.7 ms of CPU; no difference in pictures a second, which the GPU bounds).

@@ -77,11 +77,12 @@ mode once motion stops) restores full quality.
 2. **The Rust post-filters on the CPU:** deblocking and CDEF of a dense 5K picture take ~70 ms on
    one thread (random content, the worst case): ~5–7 ms if spread over superblock rows on 14
    cores. Comparable to the GPU's, and with no round trip.
-3. **The CPU's work a picture**, from user + system time over 40 more pictures of the rotation:
-   ~480 core-ms (~380 with everything cheap), the bench's own reading, conversion and libaom
-   decode check included. At 60 a second 14 cores give at most ~233 core-ms a picture (fewer: 4
-   are efficiency cores). So beyond the chain, the CPU's work has to roughly halve, and so does
-   the GPU's (squares alone: 19–26 ms of analysis, before the filters).
+3. **The CPU's work a picture fits; its waiting doesn't.** A `sample` while encoding the
+   rotation finds ~3 of 14 cores busy on average: ~135 core-ms of encoder a picture (the closed
+   loop's tx trials and quantizer 42 % of it, its reconstruction 11 %, the writer 9 %, the copy
+   decisions 7 %), against ~233 that 60 a second allows. The cores are idle ~80 % of the time,
+   waiting in the chain. The GPU's work doesn't fit yet (squares alone: 19–26 ms of analysis,
+   before the filters).
 
 So the sketch below is replaced by the revised one after it.
 
@@ -124,7 +125,7 @@ stays 14–36 % under HEVC; motion mode will cost more. How much is the first ex
 What it keeps: the writer and parser, copies, GOLDEN_FRAME, intra block copy key frames, the
 learned models (RD mode), the Metal analysis (RD mode), the filters' Metal code (RD mode).
 
-## The revised proposal: the same decisions, pipelined, with half the work
+## The revised proposal: the same decisions, pipelined
 
 1. **Keep the RD analysis on the GPU**, with squares in pictures that are mostly new
    (`newPictureShapeMask`, +1.6 %): 19–26 ms. Make its square kernels about twice as fast
@@ -134,14 +135,15 @@ learned models (RD mode), the Metal analysis (RD mode), the filters' Metal code 
    (Rust, NEON, rows in parallel behind the reconstruction), with CDEF's strengths from the
    quantizer in motion (no search). The next picture's closed loop no longer waits on the GPU,
    and the GPU's time is the analysis alone.
-3. **Halve the closed loop's CPU work in motion:** no tx type search (the closed loop 18.5 → 10.9
-   ms, +7–9 %; or its learned pruning, +0.2–0.6 %), and count what RDOQ, chroma and the copy
-   decisions cost before choosing more.
+3. **Shorten the closed loop's wall time in motion,** which is on the chain even though its
+   core-ms fit: the tx type search's learned pruning (+0.2–0.6 %) or none (18.5 → 10.9 ms,
+   +7–9 %), and more of the cores, which sit idle, through finer parallelism inside tiles.
 4. **The writer overlapped with the next closed loop, delivering each frame from its own
    thread** (no added latency), with 4x1 tiles in motion (writer 8.4 → 5.5 ms, +0.4 %
    SSIMULACRA2).
 5. **Frames in flight** once 1–4 hold: the next picture's closed loop starts on a superblock row
-   when the rows its references reach are filtered.
+   when the rows its references reach are filtered. With the cores ~80 % idle this is the
+   biggest lever on the CPU side.
 
 What it would cost in bytes: about "everything cheap" (+12–15 % against today, level with
 libaom, 14–36 % under HEVC), or less with the learned tx pruning in place of no search. What it
@@ -154,9 +156,9 @@ lands).
 Done: decisions without RD (killed: +64–76 %), a first timing of the CPU filters (plausible).
 Next:
 
-1. **Core-ms per stage**, measured cleanly (the closed loop, the copy decisions, the writer,
-   reading the analysis), to know which CPU work to halve. Kill the CPU side of the plan if the
-   closed loop alone needs more than ~150 core-ms a 5K picture without its tx search.
+1. **A per-picture timeline with frames in flight simulated** (two pictures' closed loops on
+   disjoint cores): how much of the chain overlaps once the filters are off the GPU. The core-ms
+   already fit (~135 of ~233).
 2. **Row-parallel CPU filters in the closed loop**, timed on real pictures and checked against
    the GPU's output (they must be byte-identical: both are the spec's). Kill the move if they
    take more than ~6 ms at 5K.
