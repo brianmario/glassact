@@ -1058,6 +1058,10 @@ fixed seed.
 
 **Recorder** (Host › Developer › Record Trace, or Record 30 Seconds):
 - Writes `.scap` files to `~/Library/Application Support/Glass Act/traces/`.
+- Writes frames raw while it records (`ScapRawWriter`, a `.scapraw` file) and compresses them when it
+  stops (`ScapRaw.finish`): a 5K frame of video takes ~55 ms of LZ4, which on the capture queue would
+  drop frames. A raw file left by a quit or crash is compressed at the next launch.
+  `glassact-bench record` is the same from a terminal.
 - Header (11 B): `{magic "SCAP", ver u8, w u16, h u16, pixfmt u8, tile u8}`.
 - Then, per frame: `{ts_us u64, rect_cnt u16, rects[(x,y,w,h) u16×4], lz4_len u32,
   lz4(full tightly-packed frame)}`. `rect_cnt = 0` means no dirty info, so the

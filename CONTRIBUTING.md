@@ -14,10 +14,13 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
   are for the Mac you build on.
 - The iPad Viewer: iPadOS 27 or later.
 - [`just`](https://github.com/casey/just).
+- Rust, from [rustup](https://rustup.rs) (stable). The AV1 encoder's CPU code
+  is in `rust/av1`. For the Intel build, also run
+  `rustup target add x86_64-apple-darwin`.
 
 The package uses system frameworks only, plus the vendored libwebp and
 libaom in `ThirdParty/`; the apps also use Sparkle for updates. Don't add
-dependencies.
+dependencies: the Rust crate uses std only.
 
 ## Building
 
@@ -29,6 +32,10 @@ xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build
 xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Viewer build
 xcodebuild -project Apps/GlassActApps.xcodeproj -scheme iPad -destination 'generic/platform=iOS Simulator' build
 ```
+
+`just` builds the Rust library (`scripts/build-rust`) before every Swift build
+and test. Run it yourself before a bare `swift build` or `swift test`; add
+`--universal` for an x86_64 build. The apps don't link it yet.
 
 You can also open `Apps/GlassActApps.xcodeproj` in Xcode. The "(Release)"
 schemes are for anything performance-related. `just bench <args>` runs the

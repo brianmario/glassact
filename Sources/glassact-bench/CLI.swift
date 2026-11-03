@@ -7,10 +7,14 @@ import Foundation
 
 /// Every subcommand, in usage order.
 let allCommands: [Command] = [
+    recordCommand,
     synthCommand,
     replayCommand,
     codecsCommand,
     keyframeCommand,
+    av1StillCommand,
+    av1SeqCommand,
+    av1TilesCommand,
     dragScanCommand,
     dumpPNGCommand,
     dumpTilesCommand,

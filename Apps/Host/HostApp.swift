@@ -78,6 +78,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             Self.log.notice("\(text, privacy: .public)")
             DispatchQueue.main.async { self?.statusLine = text }
         }
+        controller.recoverInterruptedTraces()
         controller.onPhase = { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.phaseChanged()
