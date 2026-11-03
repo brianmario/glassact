@@ -333,6 +333,10 @@ loop, then waiting on the filters.
   each frame's bytes up to a closed loop later (~17–20 ms at 5K). Latency matters more than
   throughput here; the owner's choice. Done again, it would want frames delivered from the writer's
   thread.
+- **Not possible: CDEF applying its strength search's outputs** instead of filtering again (p_cdef,
+  ~3 ms of a 5K picture's ~11 ms of filters). The search's arithmetic is the spec's, but from
+  qindex 33 to 220 (tuneiq's CDEF_ADAPTIVE, libaom's) the presets signal half the searched
+  strengths, so the filter applied is never one the search measured.
 - **Not taken: a faster intra block copy search split finer than tiles.** Exact parallelism inside a
   tile isn't possible (a block's choice depends on the tile's earlier copies), so it would be a
   bytes trade, for key frames only.
