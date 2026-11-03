@@ -309,8 +309,8 @@ switch.
   pictures): 4x4 2.56 M, 8x8 696 k, 16x16 187 k, 32x32 65 k, 64x64 17 k, the rest under 17 k
   each; at the matrix's cost ~25 core-ms a picture, 77 % of it at 16x16 and up. A butterfly 2.5x
   faster there would save ~11 core-ms of the closed loop's ~170 (~7 %, ~1 ms of its wall time):
-  days of hand-scheduled kernels (libaom's NEON fdct style) for that. Not kept; the code is in
-  the session's notes only.
+  days of hand-scheduled kernels (libaom's NEON fdct style) for that. Not kept (reverted; this
+  entry describes it).
 
 ### Metal AV1: RDOQ on pictures of new content, re-measured (2026-11-03)
 
