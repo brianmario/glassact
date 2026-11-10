@@ -103,6 +103,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     static let smallMaxPixels = 128
     let dp: any MTLComputePipelineState
     let leaf: any MTLComputePipelineState, leafScan: any MTLComputePipelineState
+    let leafSmall: any MTLComputePipelineState
     /// Inter frames' motion search: k_me, and per block size of 8×8 and up k_inter and its warps.
     let motionSearch: any MTLComputePipelineState, projectionSearch: any MTLComputePipelineState
     /// k_inter_sad: an SB's distinct inter candidates and its 8x8s' SAD at each, which k_inter sums.
@@ -359,6 +360,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     /// k_leaf's threadgroup: LEAF_NW (1) SIMD-groups, one leaf each at a time.
     static let leafThreads = 32
+    /// k_leaf_small's threadgroup: a leaf a thread (k_leaf.h LEAF_SMALL_TG).
+    static let leafSmallThreads = 32
     /// After the partition, also decide every leaf's chroma mode and CfL and
     /// its luma tx type on the GPU, from the source (k_leaf): the partition's
     /// blocks then carry them, for a closed loop that only quantizes.
@@ -525,9 +528,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
         analysisSmall = small
         guard let leafFunction = library.makeFunction(name: "k_leaf"),
+              let leafSmallFunction = library.makeFunction(name: "k_leaf_small"),
               let leafScanFunction = library.makeFunction(name: "k_leaf_scan")
         else { throw Failure.metal("no k_leaf") }
         leafScan = try Self.pipeline(leafScanFunction, threads: 1024, device: device)
+        leafSmall = try Self.pipeline(leafSmallFunction, threads: Self.leafSmallThreads, device: device)
         leaf = try Self.pipeline(leafFunction, threads: Self.leafThreads, device: device)
         let ml = try ["k_ml_stats", "k_ml_cell", "k_ml_tree", "k_ml_list", "k_ml_mode"].map { name in
             guard let f = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }
@@ -746,8 +751,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let keptSuperblocks: Int
         /// With `reusesAnalysis`, the superblocks to analyze (the rest are kept).
         let staleSuperblocks: Int?
-        /// k_leaf's list of every SB's leaves, and its indirect dispatch.
-        let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer
+        /// The list of every SB's leaves and the leaf kernels' indirect dispatches (k_leaf_small's,
+        /// then k_leaf's), and the leaves k_leaf_small leaves to k_leaf.
+        let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer, leafRest: any MTLBuffer
         let decidesLeaves: Bool
         /// SBs the caller replaces (`beginPartition(skip:)`): the partition gives each one block.
         let skipped: [UInt8]?
@@ -970,7 +976,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             interResults = try cache.map { keep($0.interResults) } ?? make(meBest != nil ? Int(blkTotal) * MemoryLayout<GpInterRes>.stride : 16)
             decidesLeaves = encoder.decidesLeaves
             leafOffsets = try make(4 * (nSb + 1))
-            leafDispatch = try make(MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
+            leafDispatch = try make(2 * MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride)
+            leafRest = try make(4 * nSb * Int(GP_MAX_LEAVES))
             let sbJ = try cache.map { keep($0.sbJ) } ?? make(nSb * 4)
             var sbKeep: (any MTLBuffer)?, sbList: (any MTLBuffer)?
             if let cache {
@@ -1279,8 +1286,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)
-                e.setComputePipelineState(encoder.leaf)
+                e.setComputePipelineState(encoder.leafSmall)  // a leaf a thread; it lists the rest
+                e.setBuffer(leafRest, offset: 0, index: 4)
                 e.dispatchThreadgroups(indirectBuffer: leafDispatch, indirectBufferOffset: 0,
+                                       threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.leafSmallThreads, height: 1, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+                e.setComputePipelineState(encoder.leaf)  // a SIMD-group per leaf of the rest
+                e.dispatchThreadgroups(indirectBuffer: leafDispatch,
+                                       indirectBufferOffset: MemoryLayout<MTLDispatchThreadgroupsIndirectArguments>.stride,
                                        threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.leafThreads, height: 1, depth: 1))
             }
             if profiling {

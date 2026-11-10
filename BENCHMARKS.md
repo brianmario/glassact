@@ -230,6 +230,7 @@ the numbers and the reasoning.
 | The closed loop's quantizer (NEON f64), rate proxy (raster order) and shared first forward products (`metal-av1`) | kept | the same streams; a 5K picture of new content's closed loop 18.5 → 15.9 ms, its work −15 % | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | Quick tx trials: transform-domain distortion, and stopping where DCT_DCT codes nothing (`metal-av1`, `quickTxTrials`) | kept, on (the owner's choice, 2026-11-03) | BD-neutral (+0.24 % / −0.08 %); closed loop −1 to −2 ms, −9 % of its work | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
+| A leaf a thread where its chroma is 4x4 or none; a SIMD-group a leaf for the rest (`metal-av1`, `k_leaf_small`) | kept | the same streams; the leaf stage of a 5K picture of new content 4.5 → 2.9 ms of GPU, GPU analysis 26.3 → 23.5 ms (provisional: the Mac in use) | [entry](#metal-av1-a-leaf-a-thread-where-its-chroma-is-4x4-or-none-2026-11-09) |
 
 **Rate control and transport**
 
@@ -293,6 +294,69 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a leaf a thread, where its chroma is 4x4 or none (2026-11-09)
+
+The leaf stage (`k_leaf`: each leaf's chroma mode and CfL) gave every leaf a SIMD-group of 32
+lanes. Most leaves give those lanes nothing to do. A 5K key frame of the rotation (typing-cc,
+then scroll-win, photos and cursor-drag mixed in; q20) has about 96,000 leaves:
+
+| leaves | | what the stage does for one |
+|---|---|---|
+| 46,080 | no chroma (three of an 8x8's four 4x4s, and the like) | writes defaults |
+| 36,290 | chroma 4x4 | the model, 7 modes screened, CfL: 16 samples a plane |
+| 2,053 | chroma of 32 samples (4x8, 8x4) | |
+| 5,657 | 64 samples (8x8, 4x16, 16x4) | |
+| 1,830 | 128 samples | |
+| 2,370 | 256 samples (16x16) | |
+| 1,794 | 1024 samples (32x32) | |
+
+(The rotation's other pictures leave 8,857 to 24,124 leaves in the last five rows.)
+
+**Kept, the same streams:** `k_leaf_small` takes a leaf a thread (threadgroups of 32). It decides
+the first two rows alone, and lists the others for `k_leaf`, a SIMD-group each as before (an
+indirect dispatch sized by the list). A thread's decision has to match the SIMD-group's bit for
+bit, and its float sums are where it could differ. Two probes on this GPU (M4 Pro, SIMD width
+32, MSL 4.1, `mathMode = .safe`) say what the SIMD-group computes:
+- `simd_sum` of floats adds the lanes as a tree of adjacent pairs: 2,048 of 2,048 random inputs
+  matched `((l0 + l1) + (l2 + l3)) + …` bit for bit, with 16 lanes nonzero and with 32;
+- products aren't contracted into fused multiply-adds: the model's output layer on 524,288
+  inputs was the same from the SIMD kernel, from a thread's `b + tree16(w * h)`, and from the CPU
+  without fma.
+
+For a 4x4 chroma block that leaves little to emulate. Each of the 16 samples, and each (mode,
+plane), has a lane of its own, so a mode's cost is its U lane's plus its V lane's; the model's
+feature sums and CfL's are of whole numbers of 64ths below 2^24, exact in any order; the output
+layer's sum over 16 hidden units is the tree, written out (`leaf_tree16`). The model's pieces
+(features, hidden unit, keep rule) are shared by both kernels.
+
+`--profile`, the rotation at 5K, 8 frames, ms a frame. **Provisional:** the Mac was in use and
+the pruner's dumps were running on the GPU throughout, so read the differences, not the levels.
+
+| | before | after |
+|---|---|---|
+| leaves (GPU stage) | 4.5 | **2.9** |
+| GPU analysis | 26.3 | **23.5** |
+| closed loop · filters · writer | 18.0 · 12.6 · 12.9 | 16.5 · 10.8 · 9.7 (the CPU's share of a busy Mac, not this change) |
+| inter frames a second | 28.6 | 31.4 |
+
+Every stream is the same (`--digest`): the rotation (`93c5d5eeb49fd481` for 8 frames), 5K key
+frames, and against the commit before with `--chroma-angles`, `--no-ml-chroma`, `--leaf-tx 256`,
+`--leaf-tx 64 --no-tx-search`, `--q 45 --ml-chroma-eps 0.2`, 2560 wide at q30, and 1728 wide at
+q12 with `--tiles 1x1`.
+
+**What's left of the stage** (2.9 ms; by having one class write defaults instead of deciding):
+the scan, the thread kernel and the dispatches 1.1; the SIMD-group kernel 1.8, of which the
+64-sample class 0.6, 16x16 0.4, 32x32 0.9, and the 32- and 128-sample classes nothing
+measurable.
+
+**Not built: bigger chroma blocks on a thread.** It would need the lanes emulated: 32
+accumulators a sum (item p into accumulator p mod 32, in p's order), then the 32-leaf tree; and
+from 8x8 up the model's sum of squared luma means passes 2^24 (64 × 255² in 16ths), so its
+order matters too. A thread does no more work than a SIMD-group does in total, but a SIMD-group
+of threads waits for its slowest, so the leaves would also want listing by class. On 32x32 the
+SIMD-group kernel already fills its lanes (896 items, 28 full passes). At most the 64-sample
+class's 0.6 ms is there to take.
 
 ### Reference traces v3 (2026-11-09)
 
