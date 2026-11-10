@@ -318,10 +318,12 @@ where the content rested (app-switch's longest rest is 2.3 s). Two of the eight 
 had one slow raw write each (640 and 359 ms, both on busy content, against a median
 of 5.5 ms): a jump of that length in window-open-close and in maps. Unexplained so far.
 
-Also on disk: an earlier take of app-switch (`glassact-1793737105.scap`, 1470 frames, 30.1 s, 17 dropped),
-and two recordings of the film from before the raw recorder, at ~15 frames a second
-(`glassact-1793733277.scap`, the entry below, and `glassact-1793734530.scap`, 473 frames in
-32.2 s), which movie replaces.
+Deleted on 2026-11-09 as superseded (64 GB): an earlier take of app-switch
+(`glassact-1793737105.scap`, 1470 frames, 30.1 s, 17 dropped), and two recordings of the film
+from before the raw recorder, at ~15 frames a second (`glassact-1793733277.scap`, which the
+entry below measured, and `glassact-1793734530.scap`, 473 frames in 32.2 s), which movie
+replaces. Frames sampled across `glassact-1793733277.scap` were all full screen, so it held no
+video in a window.
 
 Still wanted: switching Spaces and back, video in a window, and captures at other display sizes
 (a MacBook's, a 4K display).
