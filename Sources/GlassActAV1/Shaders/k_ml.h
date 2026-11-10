@@ -140,12 +140,18 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
     const int vw = I.W - sbx, vh = I.H - sby;
     {
         const int cx = (int)t % 8 * 8, cy = (int)t / 8 * 8;
+        // the levels of the cell's last column and row's pairs, and of its border's orientations
+        // (the samples inside are level 0's)
+        const int px7 = ga_ml_pair_level(cx + 7), py7 = ga_ml_pair_level(cy + 7);
+        const int ix0 = ga_ml_inner_level(cx), ix7 = ga_ml_inner_level(cx + 7);
+        const int iy0 = ga_ml_inner_level(cy), iy7 = ga_ml_inner_level(cy + 7);
         MlSums m;
         ga_ml_sums_clear(m);
         device const uint8_t *src = I.src[0] + (size_t)(sby + cy) * sp + sbx + cx;
         for (int r = 0; r < 8; r++) {
             device const uint8_t *row = src + (size_t)r * sp;
             const int y = cy + r;
+            const int ly = r == 0 ? iy0 : r == 7 ? iy7 : 0;
             for (int c = 0; c < 8; c++) {
                 const int x = cx + c;
                 const uint v = row[c], v2 = v * v;
@@ -159,18 +165,18 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
                 m.hi = max(m.hi, v);
                 if (x < 63 && x + 1 < vw) {
                     const uint d = (uint)abs((int)row[c + 1] - (int)v);
-                    const int l = ga_ml_pair_level(x);
+                    const int l = c == 7 ? px7 : 0;
                     if (l == 0) m.dx += d;
                     else if (d) atomic_fetch_add_explicit(&seam[upper(l, x, y)][0], d, memory_order_relaxed);
                 }
                 if (y < 63 && y + 1 < vh) {
                     const uint d = (uint)abs((int)row[c + sp] - (int)v);
-                    const int l = ga_ml_pair_level(y);
+                    const int l = r == 7 ? py7 : 0;
                     if (l == 0) m.dy += d;
                     else if (d) atomic_fetch_add_explicit(&seam[upper(l, x, y)][1], d, memory_order_relaxed);
                 }
                 if (orientations && x + 1 < vw && y + 1 < vh) {
-                    const int l = max(ga_ml_inner_level(x), ga_ml_inner_level(y));
+                    const int l = max(c == 0 ? ix0 : c == 7 ? ix7 : 0, ly);
                     int k = 0;
                     const uint mag = l < 4 ? ga_ml_orient(row + c, sp, k) : 0;
                     if (mag && l == 0) {

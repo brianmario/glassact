@@ -89,6 +89,29 @@ __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const 
     return o;
 }
 
+// pred_cand of mode m at delta 0, from literals (Mode_To_Angle, Dr_Intra_Derivative), so that a
+// constant m leaves a constant
+__device__ __forceinline__ PredCand pred_cand0(int m, int lw, int lh) {
+    PredCand p;
+    p.mode = m;
+    p.w = 1 << lw; p.h = 1 << lh;
+    p.dx = 0; p.dy = 0;
+    p.wx = av1g_sm_weights(lw); p.wy = av1g_sm_weights(lh);
+    switch (m) {
+    case AV1G_DC_PRED: p.zone = 0; break;
+    case AV1G_V_PRED: p.zone = 4; break;
+    case AV1G_H_PRED: p.zone = 5; break;
+    case AV1G_D45_PRED: p.zone = 1; p.dx = 64; break;
+    case AV1G_D67_PRED: p.zone = 1; p.dx = 27; break;
+    case AV1G_D113_PRED: p.zone = 2; p.dx = 27; p.dy = 151; break;
+    case AV1G_D135_PRED: p.zone = 2; p.dx = 64; p.dy = 64; break;
+    case AV1G_D157_PRED: p.zone = 2; p.dx = 151; p.dy = 27; break;
+    case AV1G_D203_PRED: p.zone = 3; p.dy = 27; break;
+    default: p.zone = 6; break;
+    }
+    return p;
+}
+
 template <int W, int H, int BS>
 kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                              constant uint32_t &nTotal [[buffer(2)]], uint gb [[thread_position_in_grid]]) {
@@ -163,9 +186,8 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         if (BS >= AV1G_BLOCK_8X8 && av1g_is_directional(m)) b += C[CID(angle_delta[m - AV1G_V_PRED]) + cand_delta(c) + 3];
         return b;
     };
-    auto satd_of = [&](int c) -> float {
+    auto satd_pc = [&](const PredCand pc) -> float {
         if (flat) return 0.f;
-        const PredCand pc = pred_cand(c, T::lw, T::lh);
         float t = 0.f;
         for (int sy = 0; sy < H; sy += 4)
             for (int sx = 0; sx < W; sx += 4) {
@@ -179,6 +201,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
             }
         return t;
     };
+    auto satd_of = [&](int c) -> float { return satd_pc(pred_cand(c, T::lw, T::lh)); };
     device const GpExtCand *ext = (device const GpExtCand *)B.extCand[BS];
     int K = min(P.K, GP_MAXK);
     int cands[GP_MAXK];
@@ -203,10 +226,11 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
             }
         };
         const uint mm = ml_mode_mask(I, x, y, W, H);  // Glass Act: learned mode pruning's modes
+#pragma unroll
         for (int m = 0; m < 13; m++) {
             if (!(mm >> m & 1)) continue;
             const int c = cand_pack(m, 0);
-            const float j = satd_of(c) + lamS * mbits(c);
+            const float j = satd_pc(pred_cand0(m, T::lw, T::lh)) + lamS * mbits(c);
             if (m >= AV1G_V_PRED && m <= AV1G_D67_PRED) dirJ[m - AV1G_V_PRED] = j;
             insert(c, j);
         }

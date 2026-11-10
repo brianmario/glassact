@@ -235,6 +235,10 @@ the numbers and the reasoning.
 | The exact-prediction shortcut in the analysis's thread kernel; skipping the screening where one mode is left; `k_ml_stats`'s `atan2` by comparisons (`metal-av1`) | measured, not kept | no difference (threads run as SIMD-groups); the `atan2` has at most 0.1 ms to give | [entry](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09) |
 | The filters' GPU kernels: a thread a 4x4 (4x2 of chroma) in CDEF and its strength search, zero-strength taps unread, deblocking's wide filter by a sliding sum called with constant sizes, `AV1G_UNROLL` on the direction search (`metal-av1`) | kept | the same streams; the filters' search alone on a 5K key frame 10.6 → 4.9 ms of GPU (`p_deblock` 2.6 → 0.58, `p_cdef_dir` 0.71 → 0.06, `p_cdef` 3.0 → 1.5, `l_cdef_sse` 3.7 → 2.5); in the rotation the filters' GPU beside the analysis 8.0 → 3.7 ms (provisional: the Mac was in use) | [entry](#metal-av1-the-filters-gpu-kernels-the-same-streams-in-under-half-the-time-2026-11-09) |
 | The strength search reusing direction 0's sums; `p_cdef` storing words; word loads in the direction search; `p_cdef` at other threadgroup shapes (`metal-av1`) | measured, not kept | no faster | [entry](#metal-av1-the-filters-gpu-kernels-the-same-streams-in-under-half-the-time-2026-11-09) |
+| The analysis's thread kernel screening each mode as a constant (`pred_cand0`); `k_ml_stats` taking a sample's levels from its thread's (`metal-av1`) | kept | the same streams; a 5K picture of new content's 8x8s 2.03 → 1.93 ms of GPU, its learned pruning 2.00 → 1.95 (provisional: the Mac in use) | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
+| Unrolled loops in the thread kernel's flat check, SATD and mode loop (without constants) and in `k_ml_stats`; `k_ml_stats`'s seams summed a thread before one atomic add (`metal-av1`) | measured, not kept | no faster (the SATD's sub-blocks unrolled: slower at 8x8) | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
+| The thread kernel's blocks listed by learned mode mask, so a SIMD-group screens the same modes (`metal-av1`) | not built | at most 0.5 ms of a 5K picture of new content's 23 ms (every lane given its group's first mask: 4x4 1.50 → 1.33, 8x8 1.95 → 1.63), before the cost of sorting the list | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
+| Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 
 **Rate control and transport**
 
@@ -298,6 +302,92 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the analysis's thread kernel and the learned pruning's statistics, by parts (2026-11-09)
+
+The rest of [where the GPU analysis goes](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09),
+with the filters' lesson in hand (a loop the compiler doesn't unroll, around a local array). The
+rotation at 5K (typing-cc, then scroll-win, photos and cursor-drag mixed in; q20, squares,
+`--profile` at 8 frames: one inter frame, each stage's best of 10). **Provisional levels:** the
+Mac was in use; the same build repeats to 0.02 ms.
+
+**By parts** (a part compiled out or the kernel left early, the stream no longer valid; ms):
+
+| kernel | 4x4 | 8x8 | 16x16 | 32x32 | 64x64 |
+|---|---|---|---|---|---|
+| | thread | thread | SIMD-group | threadgroup | threadgroup |
+| to the learned pruning's exit, and set-up | 0.08 | 0.04 | 0.13 | 0.13 | 0.03 |
+| edges, DC, the flat check | | | 0.16 | 0.21 | 0.27 |
+| screening the modes | 0.78 | 1.07 | 0.92 | 1.19 | 1.31 |
+| the one candidate's RD | 0.66 | 0.91 | 0.9 | 1.57 | 0.82 |
+| whole | 1.51 | 2.03 | 2.18 | 3.13 | 2.43 |
+
+Screening is 5.3 ms and the one candidate's RD 4.9 across the levels; the tx search in the
+kernels is off in this preset. The learned pruning's 2.0 ms, by leaving each pass at its top:
+`k_ml_stats` 1.22 · `k_ml_mode` 0.36 · `k_ml_cell` 0.16 · `k_ml_tree` 0.15 · `k_ml_list` 0.14.
+Inside `k_ml_stats`: the samples' orientations 0.53 (the `atan2` 0.12 of it), the neighbour
+differences 0.25, the cells' features 0.19, the levels above the cells 0.07; everything a
+sample does is 0.65, and the rest is 3,600 threadgroups of 64 and their barriers.
+
+**The learned mode mask saves the thread kernel nothing because a SIMD-group's 32 lanes hold
+32 blocks with different masks**, so every lane waits through every mode some lane kept. With
+every lane given its group's first block's mask (the wrong streams, for the time only): 4x4
+1.50 → 1.33, 8x8 1.95 → 1.63. Listing the blocks by mask therefore has at most 0.5 ms to give
+before the sort's own cost. Not built.
+
+**Kept, the same streams:**
+- the thread kernel screens its 13 modes with the mode a constant (`pred_cand0`, the loop
+  unrolled), so each mode's predictor is compiled for itself instead of chosen a sample at a
+  time: 8x8 2.03 → **1.93**, 4x4 1.51 → 1.50;
+- `k_ml_stats` takes the level of a sample's pairs and of its orientation from its thread's
+  cell (only a cell's border samples are above level 0) instead of working it out a sample at
+  a time: learned pruning 2.00 → **1.95**.
+
+The rotation's digest (`93c5d5eeb49fd481`), the 18 settings of the entry below against a build
+of `6b6fa1c`, and the Swift AV1 tests.
+
+**Measured, not kept** (the same streams, no faster):
+- `#pragma unroll` on the thread kernel's flat check, and on its mode loop without the
+  constants; its SATD's sub-blocks unrolled (slower at 8x8);
+- `k_ml_stats`'s seams summed in the thread and added to the threadgroup's atomics once a cell
+  instead of once a sample (1.98 against 1.95: the atomics aren't the cost); its column loop
+  unrolled (1.96).
+
+**What this says:** the analysis has no kernel out of line and no loop like the filters' had.
+What is left to take without changing a byte is a few percent of a kernel at a time. Bringing
+a new picture's 23 ms of GPU analysis under the 13 ms that 60 a second leaves beside the
+filters means analysing fewer blocks or fewer candidates, which moves bytes.
+
+**The levers that move bytes, measured for the owner's choice.** The same rotation, 12 frames
+at q 8, 14, 20, 26 and 32 (`--score-rgb --ssimulacra2-every 3`): BD-rate against the defaults
+by PSNR and by SSIMULACRA2, and the GPU stages' sum at q20 (motion search, inter candidates,
+analysis, partition, leaves, learned pruning; 8 frames, provisional as above).
+
+| lever | BD-rate (PSNR / SSIMULACRA2) | GPU stages (ms) | what moved |
+|---|---|---|---|
+| the defaults | | 23.0 | |
+| `--no-motion-search` (copies only) | +3.07 % / +3.02 % | **16.1** | motion search 2.89 and inter candidates 3.85 → 0 |
+| `--ml-mode-eps 0.05` (default 0.02) | +0.13 % / +0.22 % | 22.3 | analysis 11.2 → 10.5 (16x16 and up) |
+| `--ml-mode-eps 0.10` | +0.36 % / +0.37 % | 21.7 | analysis 11.2 → 9.9 |
+| `--ml-eps 0.05` (default 0.02) | +1.85 % / +1.31 % | 21.8 | analysis 11.2 → 10.0 |
+| `--ml-eps 0.10` | +9.54 % / +10.12 % | 21.5 | analysis 11.2 → 9.5 |
+| `--new-shapes 1248` (no 4x4s) | +7.67 % / +5.85 % | 20.9 | analysis 11.2 → 9.8, leaves 2.9 → 2.4 |
+| the retrained weights (`--ml-prune`, eleven traces; not installed) | +0.01 % / +0.04 % | 23.8 | analysis 11.2 → 11.8: they keep more 16x16s and up here |
+| the retrained weights at `--ml-eps 0.05` | +0.24 % / +0.26 % | 22.6 | analysis 10.6 |
+| the retrained weights at `--ml-eps 0.10` | +4.72 % / +4.31 % | 21.5 | analysis 9.6 |
+
+- **The motion search is the only large one:** 6.7 of 23 ms for 3 % of bytes, on a rotation
+  where every picture is mostly new (12 % of each is motion-searched).
+- The mode model's threshold is cheap in bytes and only pays in the kernels of 16x16 and up,
+  where a SIMD-group screens one candidate; the thread kernel's lanes wait for each other
+  (above).
+- The shipped level model's +1.85 % at 0.05 is one point: at q20 the stream loses 0.6 dB at
+  the same bytes (PSNR 44.55 → 43.93, SSIMULACRA2 76.47 → 75.45) and at the other four q
+  0.03 dB or less. Not looked into; a frame-by-frame look comes before anyone raises it. The
+  retrained model at 0.05 has no such point (its worst is −0.07 dB at q32).
+- No motion search, the mode threshold at 0.10 and the retrained level model at 0.05 would
+  come to about 14 ms together if their savings add, for about 3.7 %: not measured together.
+- Subsampled screening is already on in this preset (`screenSub` 2 at 16x16 and up).
 
 ### Metal AV1: the filters' GPU kernels, the same streams in under half the time (2026-11-09)
 
