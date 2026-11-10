@@ -113,9 +113,16 @@ Recordings are named `glassact-<unix time>.scap`. The traces most entries use:
 | typing (2026-08-05) | `glassact-1785961372.scap` | Terminal.app at ~5 cps; includes the recorder's own menu |
 | idle | `glassact-1785961857.scap` | static screen, hands off (67.5 s) |
 | live 5K session | `glassact-1785995222.scap` | browser video, 87.5 s |
+| movie | `glassact-1793736335.scap` | a film full screen in VLC, 24 frames a second (30.0 s) |
+| app-switch | `glassact-1793737268.scap` | Cmd-Tab between apps and back, resting on each (27.5 s) |
+| tabs | `glassact-1794265876.scap` | a Safari window's tabs switched in turn, twice round (30.0 s) |
+| window-open-close | `glassact-1794271260.scap` | Finder windows opened, moved and closed over other windows (29.9 s) |
+| ide | `glassact-1794283848.scap` | Zed full screen on Rust source: typing, scrolling, switching files (29.3 s) |
+| maps | `glassact-1794284096.scap` | Maps.app full screen, panned and zoomed (30.1 s) |
+| images-scroll | `glassact-1794284419.scap` | image search results in Chrome full screen, scrolled down and back (30.0 s) |
 
-Details: "Reference traces v2" (2026-08-07) and "Reference traces"
-(2026-08-05) in the log.
+Details: "Reference traces v3" (2026-11-09), "Reference traces v2" (2026-08-07) and
+"Reference traces" (2026-08-05) in the log.
 
 ## Decisions and rejected experiments
 
@@ -286,6 +293,38 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Reference traces v3 (2026-11-09)
+
+Seven more traces of the owner's 5K display (5120×2880), recorded raw (the entry below) with
+`glassact-bench record --seconds 30 --delay 5`, for what the earlier sets lack: video, where the
+motion search decides, and content that comes back after something covered it (GOLDEN_FRAME,
+long-term references). Recorded on 2026-11-03 (the first two) and
+2026-11-09. **Not measured yet:** no encoder has run on them. The content is each recording's
+script, with one frame of each looked at.
+
+| name | file | content | frames | seconds | the recorder's drops |
+|---|---|---|---|---|---|
+| movie | `glassact-1793736335.scap` | a film full screen in VLC | 720 | 30.0 | 0 (slowest write 10.5 ms); 24.0 a second, the film's rate |
+| app-switch | `glassact-1793737268.scap` | Cmd-Tab between apps (Safari on a results page, Photos among them) and back, ~2 s on each | 1367 | 27.5 | 2 (slowest write 49 ms) |
+| tabs | `glassact-1794265876.scap` | a Safari window over other windows, its tabs switched in turn, twice round, then two of them back and forth | 1731 | 30.0 | not noted; no gap over 33 ms between frames |
+| window-open-close | `glassact-1794271260.scap` | Finder windows opened, moved and closed over other apps' windows | 1378 | 29.9 | 35 (one write of 640 ms) |
+| ide | `glassact-1794283848.scap` | Zed full screen on Rust source: typing, scrolling, switching files, an overlay opened and dismissed | 947 | 29.3 | 0 (slowest write 10.5 ms) |
+| maps | `glassact-1794284096.scap` | Maps.app full screen: panning, zooming, another map style | 1509 | 30.1 | 48 (one write of 359 ms) |
+| images-scroll | `glassact-1794284419.scap` | image search results in Chrome full screen: scrolled down, flicked, back up | 1478 | 30.0 | 22 (slowest write 65 ms) |
+
+A trace holds a frame only when the screen changed, so the counts fall short of 60 a second
+where the content rested (app-switch's longest rest is 2.3 s). Two of the eight runs
+had one slow raw write each (640 and 359 ms, both on busy content, against a median
+of 5.5 ms): a jump of that length in window-open-close and in maps. Unexplained so far.
+
+Also on disk: an earlier take of app-switch (`glassact-1793737105.scap`, 1470 frames, 30.1 s, 17 dropped),
+and two recordings of the film from before the raw recorder, at ~15 frames a second
+(`glassact-1793733277.scap`, the entry below, and `glassact-1793734530.scap`, 473 frames in
+32.2 s), which movie replaces.
+
+Still wanted: switching Spaces and back, video in a window, and captures at other display sizes
+(a MacBook's, a 4K display).
 
 ### The trace recorder: raw to disk, compressed afterwards (2026-11-03)
 

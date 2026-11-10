@@ -12,18 +12,25 @@
 # stay out of the repo (*.scap is ignored), and so do the dumps made from them.
 #
 # Wanted (none of these are recorded yet; content the models haven't seen helps them most):
-# - video playing, full screen and in a window
-# - maps, panning and zooming
-# - image-heavy web pages, scrolled
-# - an IDE (Xcode, VS Code), editing and scrolling code
+# - video playing in a window
 # - native captures at other display sizes: a MacBook's (2940 x 1912, 3024 x 1964) and a 4K
 #   external display (the learned pruning's 2,000-superblock floor was set on resampled 5K)
 # - revisited content, for long-term references (BENCHMARKS "learned pruning of the analysis",
-#   what else): switching apps (Cmd-Tab) and back, switching Spaces and back, switching browser
-#   tabs, a window opened and closed over what's under it
+#   what else): switching Spaces and back
 
 # (the frames the shipped weights were trained on)
 glassact-1786116323.scap  120,150,185,220,255  0-109  typing-cc
 glassact-1786116475.scap  150,240,330,420,510  0-109  scroll-win
 glassact-1786116654.scap  150,240,330,420,510  0-109  photos
 glassact-1786116861.scap  150,240,330,420,510  0-109  cursor-drag
+
+# (BENCHMARKS "Reference traces v3", recorded 2026-11-03 and 2026-11-09. The shipped weights
+# haven't seen these, and train-pruner hasn't been run on them yet: the train ranges are every
+# frame after the test frames, not hand-picked. Retrain and `compare` before `install`.)
+glassact-1793736335.scap  150-719   0-109  movie
+glassact-1793737268.scap  150-1366  0-109  app-switch
+glassact-1794265876.scap  150-1730  0-109  tabs
+glassact-1794271260.scap  150-1377  0-109  window-open-close
+glassact-1794283848.scap  150-946   0-109  ide
+glassact-1794284096.scap  150-1508  0-109  maps
+glassact-1794284419.scap  150-1477  0-109  images-scroll
