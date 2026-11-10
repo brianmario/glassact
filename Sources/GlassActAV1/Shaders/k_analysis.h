@@ -290,6 +290,13 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             ga_sync<NT>();
             continue;
         }
+        // (pruned blocks are most of a level on a new picture: before the rest of the set-up)
+        const int qidx = sb_qindex(I, x, y);
+        if (prune_flat(I, P, x, y, W, H, qidx)) {
+            if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
+            ga_sync<NT>();
+            continue;
+        }
         const TileBox tb = tile_of(I, x, y);
         const int haveLeft = x > tb.x0, haveAbove = y > tb.y0;
         const int haveAR = ol_decoded(x + W, y - 1, x, y, 0, tb);
@@ -297,15 +304,9 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         const int maxX = I.MiCols * 4 - 1, maxY = I.MiRows * 4 - 1;
         device const uint8_t *src = I.src[0] + (size_t)y * I.spitch[0] + x;
         const int sp = I.spitch[0];
-        const int qidx = sb_qindex(I, x, y);
         const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
         const float lamS = P.satdLambda * sqrtf(lambda);
         AV1G_CONST const float *C = g_cost[I.qctx];
-        if (prune_flat(I, P, x, y, W, H, qidx)) {
-            if (lane == 0) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; }
-            ga_sync<NT>();
-            continue;
-        }
         if (P.pruneVar > 0.f && W * H >= P.pruneMinArea) {
             float s1 = 0.f, s2 = 0.f;
             for (int p = lane; p < W * H; p += NT) {
@@ -429,6 +430,14 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 continue;
             }
             e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            // Glass Act: a prediction that is exact (common on screens: stripes, a repeated row or
+            // column) leaves nothing to transform: no distortion and an all-zero block's bits,
+            // which is what the transform and the quantizer would arrive at
+            if (e.resEnergy == 0.f) {
+                const float J = 0.f + lambda * (base_bits(e, 0) + mbits(c) + overhead);
+                if (J < bestJ) { bestJ = J; bestK = k; }
+                continue;
+            }
             e.txType = AV1G_DCT_DCT;
             e.intraDir = cand_mode(c);
             e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);

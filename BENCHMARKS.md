@@ -231,6 +231,8 @@ the numbers and the reasoning.
 | Quick tx trials: transform-domain distortion, and stopping where DCT_DCT codes nothing (`metal-av1`, `quickTxTrials`) | kept, on (the owner's choice, 2026-11-03) | BD-neutral (+0.24 % / −0.08 %); closed loop −1 to −2 ms, −9 % of its work | [entry](#metal-av1-the-closed-loops-work-not-its-dependencies-cheaper-tx-trials-2026-11-03) |
 | A time context for the learned models (the previous picture's choice at the same place) | rejected | a changed cell keeps its level no more often than the most common level predicts (photos 30–35 % vs 32–34 %) | [entry](#metal-av1-learned-prunings-statistics-in-one-pass-per-sb-from-whole-number-sums-2026-11-02) |
 | A leaf a thread where its chroma is 4x4 or none; a SIMD-group a leaf for the rest (`metal-av1`, `k_leaf_small`) | kept | the same streams; the leaf stage of a 5K picture of new content 4.5 → 2.9 ms of GPU, GPU analysis 26.3 → 23.5 ms (provisional: the Mac in use) | [entry](#metal-av1-a-leaf-a-thread-where-its-chroma-is-4x4-or-none-2026-11-09) |
+| The analysis's SIMD-group kernel: an exact prediction's RD without the transform, and the learned pruning's check ahead of a block's set-up (`metal-av1`) | kept | the same streams; a 5K picture of new content's analysis 11.7 → 11.3 ms of GPU (provisional: the Mac in use) | [entry](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09) |
+| The exact-prediction shortcut in the analysis's thread kernel; skipping the screening where one mode is left; `k_ml_stats`'s `atan2` by comparisons (`metal-av1`) | measured, not kept | no difference (threads run as SIMD-groups); the `atan2` has at most 0.1 ms to give | [entry](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09) |
 
 **Rate control and transport**
 
@@ -294,6 +296,85 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: where the GPU analysis goes on a picture of new content, kernel by kernel (2026-11-09)
+
+After the leaf stage, the rest of the GPU analysis of the rotation at 5K (typing-cc, then
+scroll-win, photos and cursor-drag mixed in; q20, squares, `--profile`: one inter frame, each
+stage's best of 10). **Provisional throughout:** the Mac was in use and the pruner's dumps were
+on the GPU, so read the shares and the differences, not the levels.
+
+| stage (ms) | | its kernels |
+|---|---|---|
+| motion search | 2.9 | `k_proj` 1.21 · `k_me` 1.21 · `k_inter_sad` 0.47 |
+| inter candidates | 3.9 | `k_inter` 8x8 1.10 · 16x16 0.80 · 32x32 0.93 · 64x64 1.12 |
+| learned pruning | 2.0 | `k_ml_stats` 1.11 · `k_ml_mode` 0.44 · `k_ml_cell` 0.22 · `k_ml_tree` 0.06 · `k_ml_list` 0.19 |
+| analysis | 11.7 | 4x4 1.53 · 8x8 2.03 · 16x16 2.27 · 32x32 3.30 · 64x64 2.55 |
+| partition · leaves | 0.2 · 2.9 | |
+
+**The analysis, block by block.** Counters in the kernels, for the profiled picture (the copied
+superblocks, 14 % of this stream's on average, leave before the first count):
+
+| level | in the picture | past the pruning | of those, not flat | ms | ns a block past the pruning |
+|---|---|---|---|---|---|
+| 4x4 | 921,600 | 220,928 | 176,681 | 1.53 | 6.9 |
+| 8x8 | 230,400 | 55,232 | 49,410 | 2.03 | 37 |
+| 16x16 | 57,600 | 25,879 | 23,391 | 2.27 | 88 |
+| 32x32 | 14,400 | 10,766 | 9,826 | 3.30 | 306 |
+| 64x64 | 3,600 | 2,750 | 2,330 | 2.55 | 924 |
+
+(4x4 and 8x8 share a level of the learned pruning, so the 4x4s are four times the 8x8s. The
+stream's other inter pictures run from 22,000 8x8s and 571 64x64s past the pruning to 101,000
+and 2,000.) A level costs 0.23 to 0.57 ns a sample: the work is spread evenly, with no kernel
+out of line. Past the copies and the learned pruning are 24 % of the picture's 8x8s and 4x4s
+and 45 % of its 16x16s, but three quarters of its 32x32s and 64x64s, which are half the stage
+(5.9 of 11.7 ms). How many of the missing quarter are copies wasn't counted for this picture;
+if most are, the level model drops few of the large blocks it is shown, and that is where a
+better one would pay.
+
+By parts, from ablations (a part compiled out, the stream no longer valid) and from running a
+part twice:
+- visiting the blocks and the set-up before the screening: 0.6 ms;
+- screening the modes, and the edges: 5.9 ms;
+- the one candidate's RD: 5.1 ms (4x4 0.66 · 8x8 0.90 · 16x16 0.95 · 32x32 1.68 · 64x64 0.90);
+  in the SIMD-group kernel its residual 0.13 / 0.25 / 0.19, forward transform 0.18 / 0.87 / –,
+  quantizer and rate 0.12 / 0.38 / 0.16 (16x16 / 32x32 / 64x64; the 64x64 transform's
+  difference wasn't credible).
+
+The chosen candidate's residual is all zero (the prediction exact: stripes, a repeated row or
+column) for 1.5 to 29 % of the 4x4s that aren't flat across the stream's inter pictures, 0.9 to
+19 % of 8x8s, 1.7 to 20 % of 16x16s, 5 to 36 % of 32x32s and 2 to 36 % of 64x64s.
+
+**Kept, the same streams** (`k_analysis`, the SIMD-group kernel: 16x16 and up on new pictures):
+- an exact prediction's RD without the transform and the quantizer: no distortion and an
+  all-zero block's bits (`base_bits(e, 0)`), which is what they arrive at;
+- the learned pruning's check ahead of the rest of a block's set-up (the tile box, the edges'
+  availability, the costs), since most blocks of a level stop there.
+
+| GPU stage (ms) | before | after |
+|---|---|---|
+| analysis | 11.7 | **11.3** |
+| 16x16 · 32x32 · 64x64 | 2.27 · 3.30 · 2.55 | 2.18 · 3.13 · 2.44 |
+| 4x4 · 8x8 (the thread kernel, untouched) | 1.53 · 2.03 | 1.52 · 2.02 |
+
+Every stream is the same (`--digest`) as the commit before's, over 18 settings: the rotation
+(`93c5d5eeb49fd481` for 8 frames); 5K key frames; `--chroma-angles`; `--no-ml-chroma`;
+`--leaf-tx 256`; `--leaf-tx 64 --no-tx-search`; `--q 45 --ml-chroma-eps 0.2`;
+`--new-shapes off`; `--no-ml-prune`; `--intra-everywhere`; `--q 32 --dq text:16`;
+`--inter-gate 0 --no-deltas`; 2560 wide at q30, and at q55 with
+`--no-tx-search --exact-tx-trials`; 1728 wide at q12 with `--tiles 1x1`; and the `fast`,
+`base` and `slow` presets (2560, 2560 and 1728 wide).
+
+**Measured, not kept** (no difference):
+- the exact-prediction shortcut in the thread kernel (4x4 1.53, 8x8 2.02 to 2.06): threads run
+  as SIMD-groups, so a branch saves nothing unless a whole group takes it;
+- skipping the screening where the learned mode mask leaves one mode;
+- `k_ml_stats`'s `atan2` (the gradient's orientation bin, a sample): with the bin faked the pass
+  goes 1.11 → 1.00 ms, so an exact binning by comparisons has at most 0.1 ms to give.
+
+**Not built:** a fold of the analysis's forward DCT into its even and odd halves (not
+bit-identical to the matrix form in floats: it would need the digests, and BD where they
+move); skipping the transform's zero rows.
 
 ### Metal AV1: a leaf a thread, where its chroma is 4x4 or none (2026-11-09)
 
