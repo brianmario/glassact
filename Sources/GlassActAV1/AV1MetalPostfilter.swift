@@ -801,7 +801,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         func cdef(_ compute: any MTLComputeCommandEncoder) {
             begin(compute, "p_cdef")
             for p in 0..<3 { compute.setBuffer(output[p], offset: 0, index: 3 + p) }
-            grid(compute, miCols * 4, miRows * 4, nPlanes, tw: 32, th: 8)
+            // a thread a 4x4 of luma, or a 4x2 of chroma: U beside V in the second layer
+            grid(compute, miCols, miRows, nPlanes > 1 ? 2 : 1, tw: 8, th: 8)
         }
 
         func superblockCDEF() -> [Int8] {

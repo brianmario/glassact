@@ -37,6 +37,16 @@
 #define AV1G_TABLE(T, name, dims, ...) static const T name##_host dims = __VA_ARGS__;
 #endif
 
+/* Before a loop with a constant trip count: the Metal compiler unrolls it whole.  Left to itself
+ * it keeps a loop of many trips (the direction search's 8 x 8 samples), and a local array the loop
+ * indexes stays in memory and is read and written a trip at a time: several times slower on the
+ * GPU.  (The CPU builds are left to their own choice.) */
+#if defined(__METAL_VERSION__)
+#define AV1G_UNROLL _Pragma("clang loop unroll(full)")
+#else
+#define AV1G_UNROLL
+#endif
+
 #if defined(__METAL_VERSION__)
 #define AV1G_CONST constant
 #define AV1G_DEV device  /* pointer members the host fills with GPU addresses */

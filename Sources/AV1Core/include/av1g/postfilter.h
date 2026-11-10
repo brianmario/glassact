@@ -136,6 +136,26 @@ AV1G_HD void av1g_pf_mark_block(AV1G_CONST const av1g_pf_frame *f, const av1g_bl
 /* ---------------- deblocking ---------------- */
 AV1G_HD int av1g_iabs(int x) { return x < 0 ? -x : x; }
 
+/* The wide filter (7.14.6.4) of one line: 2n outputs around the edge, each the rounded sum of its
+ * 2n + 1 taps, clamped to the samples -(n + 1) .. n, with the taps within n2 of it counted twice.
+ * Glass Act: the samples are read once (a[k + n + 1]), and an output's sum slides to the next
+ * one's: one sample leaves and one enters.  (The same whole-number sums as the spec's loop over
+ * every tap of every output.)  Called with constants, so the loops unroll. */
+AV1G_HD void av1g_lf_wide(uint8_t *q0p, ptrdiff_t step, int n, int n2, int log2Size) {
+    int a[14];
+    AV1G_UNROLL
+    for (int k = 0; k < 2 * n + 2; k++) a[k] = q0p[(k - n - 1) * step];
+    int box = n * a[0];
+    AV1G_UNROLL
+    for (int k = 1; k <= n + 1; k++) box += a[k];
+    AV1G_UNROLL
+    for (int i = 0; i < 2 * n; i++) {  /* the output at i - n: a[i + 1] */
+        const int t = box + a[i + 1] + (n2 ? a[i] + a[i + 2] : 0);
+        q0p[(i - n) * step] = (uint8_t)av1g_round2(t, log2Size);
+        box += a[i + n + 2 < 2 * n + 1 ? i + n + 2 : 2 * n + 1] - a[i + 1 > n ? i + 1 - n : 0];
+    }
+}
+
 /* Sample filtering process (7.14.6) for one line across an edge.  q0p points at q0 and
  * step is the distance between successive samples across the edge (1 or the stride). */
 AV1G_HD void av1g_lf_line(uint8_t *q0p, ptrdiff_t step, int plane, int filterSize, int limit, int blimit, int thresh) {
@@ -181,18 +201,10 @@ AV1G_HD void av1g_lf_line(uint8_t *q0p, ptrdiff_t step, int plane, int filterSiz
     /* wide filter (7.14.6.4) */
     const int log2Size = (filterSize == 8 || !flatMask2) ? 3 : 4;
     const int n = log2Size == 4 ? 6 : plane == 0 ? 3 : 2;
-    const int n2 = (log2Size == 3 && plane == 0) ? 0 : 1;
     AV1G_PF_STAT(n == 6 ? AV1G_PF_LF_WIDE16 : n == 3 ? AV1G_PF_LF_WIDE8 : AV1G_PF_LF_WIDE6);
-    int F[12];
-    for (int i = -n; i < n; i++) {
-        int t = 0;
-        for (int j = -n; j <= n; j++) {
-            const int p = av1g_clip3(-(n + 1), n, i + j);
-            t += S_(p) * (av1g_iabs(j) <= n2 ? 2 : 1);
-        }
-        F[i + n] = av1g_round2(t, log2Size);
-    }
-    for (int i = -n; i < n; i++) q0p[i * step] = (uint8_t)F[i + n];
+    if (n == 6) av1g_lf_wide(q0p, step, 6, 1, 4);
+    else if (n == 3) av1g_lf_wide(q0p, step, 3, 0, 3);
+    else av1g_lf_wide(q0p, step, 2, 1, 3);
 #undef S_
 }
 
@@ -274,9 +286,13 @@ AV1G_HD int av1g_floor_log2(uint32_t x) {  /* FloorLog2; -1 for 0 */
 AV1G_HD void av1g_cdef_direction(const uint8_t *src, int stride, int *yDir, int *var) {
     int cost[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int partial[8][15];
+    AV1G_UNROLL
     for (int i = 0; i < 8; i++)
+        AV1G_UNROLL
         for (int j = 0; j < 15; j++) partial[i][j] = 0;
+    AV1G_UNROLL
     for (int i = 0; i < 8; i++)
+        AV1G_UNROLL
         for (int j = 0; j < 8; j++) {
             const int x = src[i * stride + j] - 128;
             partial[0][i + j] += x;
@@ -289,25 +305,31 @@ AV1G_HD void av1g_cdef_direction(const uint8_t *src, int stride, int *yDir, int 
             partial[7][i / 2 + j] += x;
         }
     const int Div[9] = {0, 840, 420, 280, 210, 168, 140, 120, 105};  /* Div_Table (7.15.2) */
+    AV1G_UNROLL
     for (int i = 0; i < 8; i++) {
         cost[2] += partial[2][i] * partial[2][i];
         cost[6] += partial[6][i] * partial[6][i];
     }
     cost[2] *= Div[8];
     cost[6] *= Div[8];
+    AV1G_UNROLL
     for (int i = 0; i < 7; i++) {
         cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i]) * Div[i + 1];
         cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i]) * Div[i + 1];
     }
     cost[0] += partial[0][7] * partial[0][7] * Div[8];
     cost[4] += partial[4][7] * partial[4][7] * Div[8];
+    AV1G_UNROLL
     for (int i = 1; i < 8; i += 2) {
+        AV1G_UNROLL
         for (int j = 0; j < 4 + 1; j++) cost[i] += partial[i][3 + j] * partial[i][3 + j];
         cost[i] *= Div[8];
+        AV1G_UNROLL
         for (int j = 0; j < 4 - 1; j++)
             cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j]) * Div[2 * j + 2];
     }
     int bestCost = 0, d = 0;
+    AV1G_UNROLL
     for (int i = 0; i < 8; i++)
         if (cost[i] > bestCost) { bestCost = cost[i]; d = i; }
     *yDir = d;
@@ -375,27 +397,43 @@ AV1G_HD av1g_cdef_blk av1g_cdef_setup(AV1G_CONST const av1g_pf_frame *f, const u
     return av1g_cdef_params(f, idx, yDir, var);
 }
 
+/* Cdef_Directions (7.15.3): a direction's two taps' (dy, dx).  (A table of the file, not of the
+ * function: a GPU thread doesn't build it for every sample.) */
+AV1G_TABLE(int8_t, Cdef_Directions, [8][2][2], {-1, 1, -2, 2, 0, 1, -1, 2, 0, 1, 0, 2, 0, 1, 1, 2,
+                                               1,  1, 2,  2, 1, 0, 2,  1, 1, 0, 2, 0, 1, 0, 2, -1})
+
 /* CDEF filter process (7.15.3) for the sample at plane coordinates (x, y) of the deblocked
  * plane src.  damping: CdefDamping for luma, CdefDamping - 1 for chroma. */
 AV1G_HD int av1g_cdef_pixel(AV1G_CONST const av1g_pf_frame *f, const uint8_t *src, int sstride, int plane, int x, int y, int priStr,
                             int secStr, int damping, int dir) {
     const int sub = plane ? 1 : 0;
-    const int8_t Dirs[8][2][2] = {{{-1, 1}, {-2, 2}}, {{0, 1}, {-1, 2}}, {{0, 1}, {0, 2}}, {{0, 1}, {1, 2}},  /* Cdef_Directions */
-                                  {{1, 1}, {2, 2}},   {{1, 0}, {2, 1}},  {{1, 0}, {2, 0}}, {{1, 0}, {2, -1}}};
-    const int8_t PriTaps[2][2] = {{4, 2}, {3, 3}}, SecTaps[2] = {2, 1};  /* Cdef_Pri_Taps / Cdef_Sec_Taps */
     const int x0v = src[(size_t)y * sstride + x];
+    /* Glass Act: a strength of 0 leaves its taps unread.  They add nothing to the sum, and the
+     * clamp to every tap's range, theirs included, can't bind without them: a set's weights total
+     * 12 (2 * (4 + 2) or 2 * (3 + 3) primary, 4 * (2 + 1) secondary) and a constrained difference
+     * is no larger than the difference and has its sign, so with one set the sum is within
+     * [-12 D-, 12 D+] of that set's largest differences below and above the sample, and
+     * (8 + sum - (sum < 0)) >> 4 within [-D-, D+].  The same samples, fewer loads. */
+    if (!priStr && !secStr) return x0v;
     const int priAdj = av1g_cdef_damping_adj(priStr, damping), secAdj = av1g_cdef_damping_adj(secStr, damping);
     int sum = 0, mx = x0v, mn = x0v;
+    /* two samples or more from every edge of the frame: every tap is inside it */
+    const int inside = x >= 2 && y >= 2 && (((y + 2) << sub) >> 2) < f->MiRows && (((x + 2) << sub) >> 2) < f->MiCols;
+    AV1G_UNROLL
     for (int k = 0; k < 2; k++)
+        AV1G_UNROLL
         for (int sign = -1; sign <= 1; sign += 2)
+            AV1G_UNROLL
             for (int t = 0; t < 3; t++) {  /* t = 0: primary tap (dir), 1/2: secondary (dir - 2, dir + 2) */
+                if (!(t == 0 ? priStr : secStr)) continue;
                 const int dd = t == 0 ? dir : (dir + (t == 1 ? -2 : 2)) & 7;
-                const int yy = y + sign * Dirs[dd][k][0], xx = x + sign * Dirs[dd][k][1];
+                const int yy = y + sign * AV1G_T(Cdef_Directions)[dd][k][0], xx = x + sign * AV1G_T(Cdef_Directions)[dd][k][1];
                 /* is_inside_filter_region: the frame (MiRows x MiCols in luma 4x4 units) */
-                if (yy < 0 || xx < 0 || ((yy << sub) >> 2) >= f->MiRows || ((xx << sub) >> 2) >= f->MiCols) continue;
+                if (!inside && (yy < 0 || xx < 0 || ((yy << sub) >> 2) >= f->MiRows || ((xx << sub) >> 2) >= f->MiCols)) continue;
                 const int p = src[(size_t)yy * sstride + xx];
-                if (t == 0) sum += PriTaps[priStr & 1][k] * av1g_cdef_constrain_adj(p - x0v, priStr, priAdj);
-                else sum += SecTaps[k] * av1g_cdef_constrain_adj(p - x0v, secStr, secAdj);
+                /* Cdef_Pri_Taps[priStr & 1][k] ({4, 2}, {3, 3}) and Cdef_Sec_Taps[k] ({2, 1}) */
+                if (t == 0) sum += ((priStr & 1) ? 3 : 4 - 2 * k) * av1g_cdef_constrain_adj(p - x0v, priStr, priAdj);
+                else sum += (2 - k) * av1g_cdef_constrain_adj(p - x0v, secStr, secAdj);
                 mx = p > mx ? p : mx;
                 mn = p < mn ? p : mn;
             }

@@ -43,27 +43,45 @@ kernel void p_cdef_dir(constant av1g_pf_frame &f [[buffer(0)]], uint2 g [[thread
     f.cdefDirVar[by * n8c + bx] = (var << 3) | yDir;
 }
 
-// one thread per sample of one plane (z = plane: no luma/chroma divergence); outputs have the
-// sources' strides
+// CDEF over the n samples of the 4-wide block at (bx, by) of a plane, all in one 8x8, whose
+// parameters are read once (a block CDEF leaves alone has strengths of 0: its samples as they are)
+static inline void pf_cdef_block(constant av1g_pf_frame &f, device uint8_t *out, int plane, int bx, int by, int n) {
+    const int sub = plane ? 1 : 0;
+    const int r = ((by << sub) >> 3) * 2, c = ((bx << sub) >> 3) * 2;
+    const int idx = av1g_cdef_active_idx(&f, r, c);
+    device const uint8_t *src = f.plane[plane];
+    const int ss = f.stride[plane];
+    int pri = 0, sec = 0, dir = 0;
+    if (idx >= 0) {
+        const int dv = f.cdefDirVar[(r >> 1) * (f.MiCols >> 1) + (c >> 1)];
+        const av1g_cdef_blk b = av1g_cdef_params(&f, idx, dv & 7, dv >> 3);
+        pri = plane ? b.uvPri : b.yPri;
+        sec = plane ? b.uvSec : b.ySec;
+        dir = plane ? b.uvDir : b.yDir;
+    }
+    const int damping = f.cdefDamping - sub;
+    for (int i = 0; i < n; i++) {
+        const int x = bx + (i & 3), y = by + (i >> 2);
+        out[y * ss + x] = (uint8_t)av1g_cdef_pixel(&f, src, ss, plane, x, y, pri, sec, damping, dir);
+    }
+}
+
+// A thread takes a 4x4 of luma (z = 0) or a 4x2 of one chroma plane (z = 1: U in the left half of
+// the grid, V in the right), so a layer of MiCols x MiRows threads covers its samples exactly;
+// outputs have the sources' strides. (MiCols and MiRows are even.)
 kernel void p_cdef(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *outY [[buffer(3)]],
                    device uint8_t *outU [[buffer(4)]], device uint8_t *outV [[buffer(5)]],
                    uint3 g [[thread_position_in_grid]]) {
-    const int plane = (int)g.z, sub = plane ? 1 : 0;
-    const int x = (int)g.x, y = (int)g.y;
-    if (x >= (f.MiCols * 4) >> sub || y >= (f.MiRows * 4) >> sub) return;
-    const int bx = x >> (3 - sub), by = y >> (3 - sub);  // 8x8 luma block index
-    const int idx = av1g_cdef_active_idx(&f, by * 2, bx * 2);
-    device const uint8_t *src = f.plane[plane];
-    const int ss = f.stride[plane];
-    int v = src[y * ss + x];
-    if (idx >= 0) {
-        const int dv = f.cdefDirVar[by * (f.MiCols >> 1) + bx];
-        const av1g_cdef_blk b = av1g_cdef_params(&f, idx, dv & 7, dv >> 3);
-        v = plane == 0 ? av1g_cdef_pixel(&f, src, ss, 0, x, y, b.yPri, b.ySec, f.cdefDamping, b.yDir)
-                       : av1g_cdef_pixel(&f, src, ss, plane, x, y, b.uvPri, b.uvSec, f.cdefDamping - 1, b.uvDir);
+    const int nu = f.MiCols >> 1;  // U's threads of a chroma row
+    int gx = (int)g.x;
+    if (gx >= f.MiCols || (int)g.y >= f.MiRows) return;
+    if (g.z == 0) {
+        pf_cdef_block(f, outY, 0, gx * 4, (int)g.y * 4, 16);
+    } else {
+        const int plane = gx < nu ? 1 : 2;
+        if (plane == 2) gx -= nu;
+        pf_cdef_block(f, plane == 1 ? outU : outV, plane, gx * 4, (int)g.y * 2, 8);
     }
-    device uint8_t *out = plane == 0 ? outY : plane == 1 ? outU : outV;
-    out[y * ss + x] = (uint8_t)v;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,44 +113,63 @@ struct LfTaps {
     int mn, mx;
 };
 
-static inline int lf_tap(device const uint8_t *src, int stride, int x, int y, int dy, int dx, int sub, int MiRows, int MiCols) {
+// inside: the sample is two or more from every edge of the frame, so every tap is in it
+static inline int lf_tap(device const uint8_t *src, int stride, int x, int y, int dy, int dx, int sub, int MiRows, int MiCols,
+                         bool inside) {
     const int yy = y + dy, xx = x + dx;
+    if (inside) return src[yy * stride + xx];
     if (yy < 0 || xx < 0 || ((yy << sub) >> 2) >= MiRows || ((xx << sub) >> 2) >= MiCols) return -1;
     return src[yy * stride + xx];
 }
 
 static inline void lf_gather(thread LfTaps &t, device const uint8_t *src, int stride, int x, int y, int dir, int sub,
-                             int MiRows, int MiCols, int x0) {
+                             int MiRows, int MiCols, bool inside, int x0) {
     t.mn = t.mx = x0;
     for (int k = 0; k < 2; k++)
         for (int sg = 0; sg < 2; sg++) {
             const int sign = sg ? 1 : -1;
-            int v = lf_tap(src, stride, x, y, sign * lf_dirs[dir * 4 + k * 2], sign * lf_dirs[dir * 4 + k * 2 + 1], sub, MiRows, MiCols);
+            int v = lf_tap(src, stride, x, y, sign * lf_dirs[dir * 4 + k * 2], sign * lf_dirs[dir * 4 + k * 2 + 1], sub, MiRows, MiCols, inside);
             t.p[k * 2 + sg] = v;
             if (v >= 0) { t.mn = min(t.mn, v); t.mx = max(t.mx, v); }
             for (int o = 0; o < 2; o++) {
                 const int dd = (dir + (o ? 2 : -2)) & 7;
-                v = lf_tap(src, stride, x, y, sign * lf_dirs[dd * 4 + k * 2], sign * lf_dirs[dd * 4 + k * 2 + 1], sub, MiRows, MiCols);
+                v = lf_tap(src, stride, x, y, sign * lf_dirs[dd * 4 + k * 2], sign * lf_dirs[dd * 4 + k * 2 + 1], sub, MiRows, MiCols, inside);
                 t.s[(k * 2 + sg) * 2 + o] = v;
                 if (v >= 0) { t.mn = min(t.mn, v); t.mx = max(t.mx, v); }
             }
         }
 }
 
-static inline int lf_sec_sum(thread const LfTaps &t, int x0, int sec, int damping) {
+// A direction set's secondary taps alone: all that a candidate without a primary strength reads. It
+// needs no range either, since the clamp can't bind with one set of taps (av1g_cdef_pixel).
+static inline void lf_gather_sec(thread LfTaps &t, device const uint8_t *src, int stride, int x, int y, int dir, int sub,
+                                 int MiRows, int MiCols, bool inside) {
+    for (int k = 0; k < 2; k++)
+        for (int sg = 0; sg < 2; sg++) {
+            const int sign = sg ? 1 : -1;
+            for (int o = 0; o < 2; o++) {
+                const int dd = (dir + (o ? 2 : -2)) & 7;
+                t.s[(k * 2 + sg) * 2 + o] =
+                    lf_tap(src, stride, x, y, sign * lf_dirs[dd * 4 + k * 2], sign * lf_dirs[dd * 4 + k * 2 + 1], sub, MiRows, MiCols, inside);
+            }
+        }
+}
+
+// (dAdj: av1g_cdef_damping_adj of the strength, which a block's samples share)
+static inline int lf_sec_sum(thread const LfTaps &t, int x0, int sec, int dAdj) {
     if (!sec) return 0;
     int s = 0;
     for (int i = 0; i < 8; i++)
-        if (t.s[i] >= 0) s += (i < 4 ? 2 : 1) * av1g_cdef_constrain(t.s[i] - x0, sec, damping);  // Cdef_Sec_Taps[k]
+        if (t.s[i] >= 0) s += (i < 4 ? 2 : 1) * av1g_cdef_constrain_adj(t.s[i] - x0, sec, dAdj);  // Cdef_Sec_Taps[k]
     return s;
 }
 
-static inline int lf_pri_sum(thread const LfTaps &t, int x0, int adj, int damping) {
+static inline int lf_pri_sum(thread const LfTaps &t, int x0, int adj, int dAdj) {
     if (!adj) return 0;
     const int w0 = (adj & 1) ? 3 : 4, w1 = (adj & 1) ? 3 : 2;  // Cdef_Pri_Taps[adj & 1]
     int s = 0;
     for (int i = 0; i < 4; i++)
-        if (t.p[i] >= 0) s += (i < 2 ? w0 : w1) * av1g_cdef_constrain(t.p[i] - x0, adj, damping);
+        if (t.p[i] >= 0) s += (i < 2 ? w0 : w1) * av1g_cdef_constrain_adj(t.p[i] - x0, adj, dAdj);
     return s;
 }
 
@@ -153,15 +190,19 @@ static void lf_cdef_sse_sb(constant av1g_pf_frame &f, constant LfCand &cd, devic
         uint32_t acc[LF_NC];
         for (int j = 0; j < LF_NC; j++) acc[j] = 0;
         if (active) {
-            const int npx = pass == 0 ? 4096 : 2048;
-            for (int i = (int)tid; i < npx; i += 256) {
-                int plane, x, y;
-                if (pass == 0) { plane = 0; y = sbr * 64 + (i >> 6); x = sbc * 64 + (i & 63); }
-                else { plane = 1 + (i >> 10); const int j = i & 1023; y = sbr * 32 + (j >> 5); x = sbc * 32 + (j & 31); }
-                const int sub = plane ? 1 : 0;
-                if (((x << sub) >> 2) >= f.MiCols || ((y << sub) >> 2) >= f.MiRows) continue;
-                const int ly = y << sub, lx = x << sub;  // luma position of the sample's 8x8
-                if (av1g_cdef_active_idx(&f, (ly >> 3) * 2, (lx >> 3) * 2) < 0) continue;
+            // A thread takes a 4x4 of luma (16 samples), then a 4x2 of one chroma plane (8): samples
+            // of one 8x8, whose parameters it reads once. (The sums are whole numbers: any order.)
+            int plane, bx, by, n;
+            if (pass == 0) {
+                // (a SIMD-group's 32 threads take a 32x16 of the 64x64)
+                const int q = (int)(tid >> 5), i = (int)(tid & 31);
+                plane = 0; bx = sbc * 64 + ((q & 1) * 8 + (i & 7)) * 4; by = sbr * 64 + ((q >> 1) * 4 + (i >> 3)) * 4; n = 16;
+            }
+            else { plane = 1 + (int)(tid >> 7); bx = sbc * 32 + (int)(tid & 7) * 4; by = sbr * 32 + (int)((tid >> 3) & 15) * 2; n = 8; }
+            const int sub = plane ? 1 : 0;
+            const int ly = by << sub, lx = bx << sub;  // luma position of the samples' 8x8
+            // (MiCols and MiRows are even: a block is inside the frame or outside it, whole)
+            if ((lx >> 2) < f.MiCols && (ly >> 2) < f.MiRows && av1g_cdef_active_idx(&f, (ly >> 3) * 2, (lx >> 3) * 2) >= 0) {
                 const int dv = f.cdefDirVar[(ly >> 3) * n8c + (lx >> 3)];
                 const int yDir = dv & 7, var = dv >> 3;
                 int varStr = 0;
@@ -170,27 +211,39 @@ static void lf_cdef_sse_sb(constant av1g_pf_frame &f, constant LfCand &cd, devic
                 const int st = f.stride[plane];
                 device const uint8_t *tg = plane == 0 ? s0 : plane == 1 ? s1 : s2;
                 const int damping = plane ? f.cdefDamping - 1 : f.cdefDamping;
-                const int target = tg[y * st + x];
-                const int x0 = src[y * st + x];
-                LfTaps tA, t0;
-                lf_gather(tA, src, st, x, y, yDir, sub, f.MiRows, f.MiCols, x0);
-                lf_gather(t0, src, st, x, y, 0, sub, f.MiRows, f.MiCols, x0);
-                int SA[LF_NSEC], S0[LF_NSEC];
-                for (int si = 0; si < LF_NSEC; si++) {
-                    SA[si] = lf_sec_sum(tA, x0, cd.sec[si], damping);
-                    S0[si] = lf_sec_sum(t0, x0, cd.sec[si], damping);
-                }
+                const int MiRows = f.MiRows, MiCols = f.MiCols;
+                const bool inside = bx >= 2 && by >= 2 && ((lx >> 2) + 1 + sub) < MiCols && ((ly >> 2) + 1 + sub) < MiRows;
+                // the candidates' strengths, and their damping, are the block's: worked out once
+                int secAdj[LF_NSEC], priStr[LF_NPRI], priAdj[LF_NPRI];
+                for (int si = 0; si < LF_NSEC; si++) secAdj[si] = av1g_cdef_damping_adj(cd.sec[si], damping);
                 for (int pi = 0; pi < LF_NPRI; pi++) {
                     const int pri = cd.pri[pi];
-                    const int adj = sub ? pri : (var ? (pri * (4 + varStr) + 8) >> 4 : 0);
-                    const int P = pri ? lf_pri_sum(tA, x0, adj, damping) : 0;
-                    const int mn = pri ? tA.mn : t0.mn, mx = pri ? tA.mx : t0.mx;
+                    priStr[pi] = sub ? pri : (var ? (pri * (4 + varStr) + 8) >> 4 : 0);
+                    priAdj[pi] = av1g_cdef_damping_adj(priStr[pi], damping);
+                }
+                for (int i = 0; i < n; i++) {
+                    const int x = bx + (i & 3), y = by + (i >> 2);
+                    const int target = tg[y * st + x];
+                    const int x0 = src[y * st + x];
+                    LfTaps tA, t0;
+                    lf_gather(tA, src, st, x, y, yDir, sub, MiRows, MiCols, inside, x0);
+                    lf_gather_sec(t0, src, st, x, y, 0, sub, MiRows, MiCols, inside);
+                    int SA[LF_NSEC], S0[LF_NSEC];
                     for (int si = 0; si < LF_NSEC; si++) {
-                        const int sum = P + (pri ? SA[si] : S0[si]);
-                        int v = x0 + ((8 + sum - (sum < 0)) >> 4);
-                        v = v < mn ? mn : v > mx ? mx : v;
-                        const int e = v - target;
-                        acc[pi * LF_NSEC + si] += (uint32_t)(e * e);
+                        SA[si] = lf_sec_sum(tA, x0, cd.sec[si], secAdj[si]);
+                        S0[si] = lf_sec_sum(t0, x0, cd.sec[si], secAdj[si]);
+                    }
+                    for (int pi = 0; pi < LF_NPRI; pi++) {
+                        const int pri = cd.pri[pi], adj = priStr[pi];
+                        const int P = pri ? lf_pri_sum(tA, x0, adj, priAdj[pi]) : 0;
+                        for (int si = 0; si < LF_NSEC; si++) {
+                            const int sum = P + (pri ? SA[si] : S0[si]);
+                            int v = x0 + ((8 + sum - (sum < 0)) >> 4);
+                            // the clamp binds only where both sets of taps are read (av1g_cdef_pixel)
+                            if (adj && cd.sec[si]) v = v < tA.mn ? tA.mn : v > tA.mx ? tA.mx : v;
+                            const int e = v - target;
+                            acc[pi * LF_NSEC + si] += (uint32_t)(e * e);
+                        }
                     }
                 }
             }
@@ -463,13 +516,13 @@ kernel void l_assign_c(constant av1g_pf_frame &f [[buffer(0)]], device const uin
         redo[atomic_fetch_add_explicit((device atomic_uint *)&sel.n, 1u, memory_order_relaxed)] = sb;
 }
 
-// p_cdef_r's dispatch over the redo list (64-thread threadgroups, 4096 threads a 64x64 and
-// plane), and the presets kept for the next picture
+// p_cdef_r's dispatch over the redo list (64-thread threadgroups, 256 threads a 64x64 and
+// layer: luma, then both chroma planes), and the presets kept for the next picture
 kernel void l_finish(constant av1g_pf_frame &f [[buffer(0)]], constant PfSelArgs &a [[buffer(6)]],
                      device PfSel &sel [[buffer(7)]], device PfCdef &keep [[buffer(10)]]) {
-    sel.tg[0] = sel.n * 64;
+    sel.tg[0] = sel.n * 4;
     sel.tg[1] = 1;
-    sel.tg[2] = (uint32_t)a.nPlanes;
+    sel.tg[2] = a.nPlanes > 1 ? 2 : 1;
     sel.sbCols = (uint32_t)f.sbCols;
     keep.bits = sel.bits;
     for (int j = 0; j < 8; j++) {
@@ -517,31 +570,26 @@ kernel void p_cdef_dir_r(constant av1g_pf_frame &f [[buffer(0)]], constant PfReg
     f.cdefDirVar[by * n8c + bx] = (var << 3) | yDir;
 }
 
+// p_cdef over the listed 64x64s: 256 threads a 64x64 and layer (z = 0: luma, a 4x4 a thread, a
+// threadgroup of 64 a 32x32; z = 1: chroma, a 4x2 a thread, U then V, a threadgroup a 32x16)
 kernel void p_cdef_r(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *outY [[buffer(3)]],
                      device uint8_t *outU [[buffer(4)]], device uint8_t *outV [[buffer(5)]],
                      constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
                      uint3 g [[thread_position_in_grid]]) {
-    const int plane = (int)g.z, sub = plane ? 1 : 0;
-    const uint32_t j = g.x / 4096, k = g.x % 4096;
+    const uint32_t j = g.x >> 8;
+    const int k = (int)(g.x & 255);
     if (j >= R.n) return;
-    const int side = 64 >> sub;
-    if ((int)k >= side * side) return;
     const uint32_t sb = list[j];
-    const int x = (int)(sb % R.sbCols) * side + (int)k % side, y = (int)(sb / R.sbCols) * side + (int)k / side;
-    if (x >= (f.MiCols * 4) >> sub || y >= (f.MiRows * 4) >> sub) return;
-    const int bx = x >> (3 - sub), by = y >> (3 - sub);
-    const int idx = av1g_cdef_active_idx(&f, by * 2, bx * 2);
-    device const uint8_t *src = f.plane[plane];
-    const int ss = f.stride[plane];
-    int v = src[y * ss + x];
-    if (idx >= 0) {
-        const int dv = f.cdefDirVar[by * (f.MiCols >> 1) + bx];
-        const av1g_cdef_blk b = av1g_cdef_params(&f, idx, dv & 7, dv >> 3);
-        v = plane == 0 ? av1g_cdef_pixel(&f, src, ss, 0, x, y, b.yPri, b.ySec, f.cdefDamping, b.yDir)
-                       : av1g_cdef_pixel(&f, src, ss, plane, x, y, b.uvPri, b.uvSec, f.cdefDamping - 1, b.uvDir);
+    const int sbc = (int)(sb % R.sbCols), sbr = (int)(sb / R.sbCols);
+    if (g.z == 0) {
+        const int q = k >> 6, i = k & 63;
+        const int c = sbc * 16 + (q & 1) * 8 + (i & 7), r = sbr * 16 + (q >> 1) * 8 + (i >> 3);
+        if (c < f.MiCols && r < f.MiRows) pf_cdef_block(f, outY, 0, c * 4, r * 4, 16);
+    } else {
+        const int plane = 1 + (k >> 7), i = k & 127;
+        const int c = sbc * 8 + (i & 7), r = sbr * 16 + (i >> 3);
+        if (c < (f.MiCols >> 1) && r < f.MiRows) pf_cdef_block(f, plane == 1 ? outU : outV, plane, c * 4, r * 2, 8);
     }
-    device uint8_t *out = plane == 0 ? outY : plane == 1 ? outU : outV;
-    out[y * ss + x] = (uint8_t)v;
 }
 
 // the listed 64x64s of the planes from rows of the same strides (the ring the region's deblocking

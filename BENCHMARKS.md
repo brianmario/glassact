@@ -233,6 +233,8 @@ the numbers and the reasoning.
 | A leaf a thread where its chroma is 4x4 or none; a SIMD-group a leaf for the rest (`metal-av1`, `k_leaf_small`) | kept | the same streams; the leaf stage of a 5K picture of new content 4.5 → 2.9 ms of GPU, GPU analysis 26.3 → 23.5 ms (provisional: the Mac in use) | [entry](#metal-av1-a-leaf-a-thread-where-its-chroma-is-4x4-or-none-2026-11-09) |
 | The analysis's SIMD-group kernel: an exact prediction's RD without the transform, and the learned pruning's check ahead of a block's set-up (`metal-av1`) | kept | the same streams; a 5K picture of new content's analysis 11.7 → 11.3 ms of GPU (provisional: the Mac in use) | [entry](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09) |
 | The exact-prediction shortcut in the analysis's thread kernel; skipping the screening where one mode is left; `k_ml_stats`'s `atan2` by comparisons (`metal-av1`) | measured, not kept | no difference (threads run as SIMD-groups); the `atan2` has at most 0.1 ms to give | [entry](#metal-av1-where-the-gpu-analysis-goes-on-a-picture-of-new-content-kernel-by-kernel-2026-11-09) |
+| The filters' GPU kernels: a thread a 4x4 (4x2 of chroma) in CDEF and its strength search, zero-strength taps unread, deblocking's wide filter by a sliding sum called with constant sizes, `AV1G_UNROLL` on the direction search (`metal-av1`) | kept | the same streams; the filters' search alone on a 5K key frame 10.6 → 4.9 ms of GPU (`p_deblock` 2.6 → 0.58, `p_cdef_dir` 0.71 → 0.06, `p_cdef` 3.0 → 1.5, `l_cdef_sse` 3.7 → 2.5); in the rotation the filters' GPU beside the analysis 8.0 → 3.7 ms (provisional: the Mac was in use) | [entry](#metal-av1-the-filters-gpu-kernels-the-same-streams-in-under-half-the-time-2026-11-09) |
+| The strength search reusing direction 0's sums; `p_cdef` storing words; word loads in the direction search; `p_cdef` at other threadgroup shapes (`metal-av1`) | measured, not kept | no faster | [entry](#metal-av1-the-filters-gpu-kernels-the-same-streams-in-under-half-the-time-2026-11-09) |
 
 **Rate control and transport**
 
@@ -296,6 +298,79 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the filters' GPU kernels, the same streams in under half the time (2026-11-09)
+
+A picture's period on new content is bound by the GPU: the next picture's analysis beside this
+picture's filters. The filters' search alone on a 5K key frame (q20; photos / typing-cc; each
+stage committed alone, best of 12 to 20; ms), a step at a time. **Provisional levels:** the Mac
+was in use and the pruner's training was on the GPU; the steps were timed minutes apart on the
+same load, and every one leaves the streams' bytes as they were.
+
+| step | whole | `l_cdef_sse` | `p_cdef` | `p_deblock` | `p_cdef_dir` |
+|---|---|---|---|---|---|
+| before (`4bce8e1`) | 10.59 / 10.69 | 3.75 / 3.64 | 3.00 / 3.00 | 2.55 / 2.68 | 0.71 / 0.62 |
+| CDEF: a strength of 0 leaves its taps unread | 9.86 / 9.83 | | 2.37 / 2.31 | | |
+| strength search: direction 0's primary taps unread; the clamp only where both sets are read | 9.46 / 9.34 | 3.46 / 3.39 | | | |
+| strength search: samples two or more from the frame's edges skip the taps' bounds checks | 8.80 / 8.72 | 2.80 / 2.77 | | | |
+| CDEF: the same | 8.86 / 8.64 | | 2.29 / 2.23 | | |
+| strength search: a thread a 4x4 of luma or a 4x2 of chroma, its 8x8's parameters read once | 8.48 / 8.37 | 2.57 / 2.50 | | | |
+| CDEF: the same threads (8 x 8 a threadgroup) | 7.90 / 7.82 | | 1.70 / 1.68 | | |
+| strength search: a SIMD-group takes a 32x16 | 7.81 / 7.82 | 2.51 / 2.50 | | | |
+| deblocking's wide filter: the samples read once, each output's sum slid from the last | 7.10 / 7.05 | | | 1.86 / 1.93 | |
+| deblocking's wide filter: called by size with constants | 5.83 / 5.69 | | | 0.58 / 0.57 | |
+| CDEF: the directions a table of the file, the tap weights by arithmetic | 5.76 / 5.61 | | 1.61 / 1.59 | | |
+| `AV1G_UNROLL` on the direction search's 8 x 8 samples and CDEF's taps | 5.17 / 5.06 | | 1.50 / 1.48 | | 0.22 / 0.20 |
+| strength search: the candidates' damping once a block | 5.12 / 5.02 | 2.46 / 2.46 | | | |
+| `AV1G_UNROLL` on the direction search's other loops | **4.94 / 4.89** | 2.47 / 2.45 | 1.51 / 1.48 | 0.58 / 0.57 | **0.06 / 0.05** |
+
+(`l_select` 0.27 throughout; the rest under 0.1.) In the rotation at 5K (typing-cc, then
+scroll-win, photos and cursor-drag mixed in; q20, squares, `--profile`), a picture's filters went
+10.6 → **8.1 ms**, and their GPU beside the next analysis 8.0 → **3.7 ms**.
+
+**The same streams:** the rotation's digest (`93c5d5eeb49fd481`, 8 frames), the digests of 18 settings (key and inter frames; 1728, 2560 and
+5120 wide; the three presets; with and without the learned pruning, the new shapes, the chroma
+model, the leaf tx search, deltas and the quality map) against a build of `6b6fa1c`, the
+key frames' sizes (1014.3 KB, 525.2 KB) with libaom's decode equal to the GPU's picture, the
+Swift AV1 tests, and the Rust crate's tests against the C++ oracle (which includes the shared
+header, so the CPU's filters took the same changes).
+
+**What was slow, and it is the lesson for the analysis kernels: a loop the Metal compiler
+doesn't unroll, around a local array.** The array stays in memory and the loop reads and writes
+it a trip at a time.
+- Deblocking's wide filter was the spec's loop: for each of 2n outputs, 2n + 1 taps, n one of 6,
+  3 and 2 at run time, the samples loaded inside it and the outputs kept in `F[12]`. That was
+  ~2.2 of `p_deblock`'s 2.6 ms (timed with parts removed: the threads alone ≤ 0.14, the maps
+  0.26, the loads and masks 0.39, everything but the wide filter 0.45). Now `av1g_lf_wide`
+  reads the samples once and slides a sum, and is called with constants so its loops unroll:
+  the same whole-number sums.
+- The direction search's loop over its 8 x 8 samples has a constant count, and the compiler kept
+  it anyway, with `partial[8][15]` in memory. `#pragma clang loop unroll(full)` (hd.h's
+  `AV1G_UNROLL`, empty outside Metal) took it 0.71 → 0.06 ms with no other change. Its loads
+  weren't the cost: word loads of the rows changed nothing.
+- A constant table declared inside a function (CDEF's directions) is built by every call on the
+  GPU; at file scope (`AV1G_TABLE`) it isn't.
+
+**Also kept:** a thread a block instead of a thread a sample. The block's 8x8 decides the
+strengths and the direction, so 16 (or 8) samples share one read of them, and the test for the
+frame's edges. A zero strength's taps add nothing and can't make the clamp bind (the argument is
+in `av1g_cdef_pixel`), so a candidate without a primary strength reads 8 taps, not 12.
+
+**Measured, not kept (no faster):**
+- The strength search reusing the block direction's secondary sums where that direction is 0
+  (3.51 / 3.37 against 3.46 / 3.39: a branch a thread).
+- `p_cdef` storing a row of outputs as a word (1.70 / 1.67).
+- `AV1G_UNROLL` on the strength search's small loops and on its sample loop, and on a deblocking
+  edge's four lines: the compiler already had the small ones, and the others don't index an
+  array across trips.
+- `p_cdef`'s threadgroup at other shapes: 8 x 8 1.70 / 1.68 · 8 x 4, 8 x 16, 4 x 4 the same ·
+  4 x 8 1.74 / 1.80 · 16 x 4 and 16 x 8 1.96 / 1.76 · 32 x 2 2.32 / 1.94. (Empty threads are
+  nearly free: two passes of 2.7 M that return at once are 0.14 ms.)
+
+**What is left** is the strength search (2.5 ms: ~22 loads a sample for four candidates) and
+CDEF itself (1.5). A block's taps overlap, so loading its neighbourhood once would cut the
+loads, but a direction chosen at run time then indexes a local array: the slow pattern above.
+Not tried.
 
 ### Metal AV1: where the GPU analysis goes on a picture of new content, kernel by kernel (2026-11-09)
 
