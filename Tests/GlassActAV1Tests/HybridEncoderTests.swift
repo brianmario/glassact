@@ -447,3 +447,65 @@ extension HybridEncoderTests {
         }
     }
 }
+
+extension HybridEncoderTests {
+    /// Palette blocks (`palette`): pictures of antialiased two-tone glyphs, every one new (so an
+    /// inter frame's blocks are intra), over the whole picture to its right and bottom edges.
+    /// Palettes are chosen in the key frame and in inter frames, some past the picture's edge, and
+    /// the stream decodes in libaom to exactly the pictures the encoder reports.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(333, 201, 160, -1), (1280, 720, 120, 2)])
+    func paletteStreamsDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interFrames = true
+        encoder.palette = true
+        var rng = SplitMix64(seed: 0x9a1e)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for _ in 0..<4 {
+            // glyphs: dark strokes on a light ground, a mid-grey sample beside each stroke
+            var y = [UInt8](repeating: 236, count: width * height)
+            for gy in stride(from: 1, to: height, by: 9) {
+                for gx in stride(from: rng.int(0..<4), to: width, by: 7) where rng.int(0..<5) != 0 {
+                    for _ in 0..<3 {
+                        let vertical = rng.int(0..<2) == 0, len = rng.int(3..<7)
+                        let (x0, y0) = (gx + rng.int(0..<5), gy + rng.int(0..<6))
+                        for t in 0..<len {
+                            let (x, yy) = vertical ? (x0, y0 + t) : (x0 + t, y0)
+                            guard x < width, yy < height else { continue }
+                            y[yy * width + x] = 24
+                            let (ax, ay) = vertical ? (x + 1, yy) : (x, yy + 1)
+                            if ax < width, ay < height, y[ay * width + ax] == 236 { y[ay * width + ax] = 140 }
+                        }
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2)"
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var inKey = 0.0
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            if i == 0 { inKey = encoder.paletteStats[3] }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        let stats = encoder.paletteStats
+        #expect(inKey > 0, "\(label): no palette block in the key frame")
+        #expect(stats[3] > inKey, "\(label): no palette block in an inter frame")
+        if width % 8 != 0 || height % 8 != 0 {
+            #expect(stats.count > 10 && stats[10] > 0, "\(label): no palette block past the picture's edge")
+        }
+    }
+}

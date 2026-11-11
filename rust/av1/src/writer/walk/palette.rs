@@ -85,7 +85,7 @@ pub(crate) fn predict_palette(
 
 /// get_palette_color_context: the colours ranked by the scores of the left, above-left and above
 /// neighbours (2, 1, 2), and the context of that ranking.
-fn color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize) -> ([u8; 8], usize) {
+pub(crate) fn color_context(map: &[u8], stride: usize, r: usize, c: usize, n: usize) -> ([u8; 8], usize) {
     let mut scores = [0u8; 8];
     let mut order = [0u8, 1, 2, 3, 4, 5, 6, 7];
     if c > 0 {

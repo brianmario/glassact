@@ -66,7 +66,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    fn new() -> Scratch {
+    pub(crate) fn new() -> Scratch {
         Scratch {
             w: Work {
                 resf: vec![0.0; 64 * 64],
@@ -551,6 +551,72 @@ impl QuantHook<'_> {
         if fmac(lambda, 1.0, sse as f64) <= j {
             q.fill(0);
         }
+    }
+}
+
+impl QuantHook<'_> {
+    /// An intra luma tx block's cost as the closed loop's search would compare it, open loop: the
+    /// residual `s - pred` (`tx_sz`'s whole block), the types [`TxbHook::on_txb`] tries for an intra
+    /// luma tx block (its set, the mask, the learned pruning, the stop at an all-zero DCT_DCT), and
+    /// the least J, a type's signalling included. Levels aren't kept, and RDOQ applies as it does
+    /// to the search's trials. The palette decision ([`super::palette`]) prices both of its sides
+    /// with it.
+    pub(crate) fn intra_luma_j(
+        &self,
+        sc: &mut Scratch,
+        tx_sz: i32,
+        pred: &[u8],
+        ps: usize,
+        s: &[u8],
+        ss: usize,
+        dc_q: i32,
+        ac_q: i32,
+    ) -> f64 {
+        let Scratch { w, cur, .. } = sc;
+        let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
+        let lam = 0.12 * (ac_q as f64 / 8.0) * (ac_q as f64 / 8.0);
+        if self.o.double_fwd {
+            for i in 0..th {
+                let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resi[i * tw..][..tw]);
+                for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
+                    *d = s as i32 - p as i32;
+                }
+            }
+        } else {
+            let mut e = 0u64;
+            for i in 0..th {
+                let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resf[i * tw..][..tw]);
+                for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
+                    let v = s as i32 - p as i32;
+                    e += (v * v) as u64;
+                    *d = v as f32;
+                }
+            }
+            w.energy = e;
+            w.s1.reset();
+        }
+        w.rdoq_here = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
+        let set = get_tx_set_intra(tx_sz, self.o.reduced_tx_set);
+        if self.o.given_luma_tx != 0 || set == TX_SET_DCTONLY || !self.o.tx_types {
+            let j = self.trial(w, tx_sz, DCT_DCT, dc_q, ac_q, cur, pred, ps, s, ss, 0, 15, true);
+            return fmac(lam, 1.0, j);
+        }
+        let n = tx_coeffs(tx_sz);
+        let in_set = |ty: i32| ty < TX_TYPES && tx_type_in_set_intra(set, ty);
+        let mask = self.tx_mask(w, tw, th, ac_q, false, in_set);
+        let mut best_j = 1e301f64;
+        for ty in 0..TX_TYPES {
+            if !tx_type_in_set_intra(set, ty) || mask >> ty & 1 == 0 {
+                continue;
+            }
+            let mut j = self.trial(w, tx_sz, ty, dc_q, ac_q, cur, pred, ps, s, ss, 0, 15, true);
+            j = fmac(lam, if ty == DCT_DCT { 1.0 } else { 3.0 }, j);
+            best_j = best_j.min(j);
+            if ty == DCT_DCT && self.dct_zero_stops && cur[..n].iter().all(|&v| v == 0) {
+                break;
+            }
+        }
+        best_j
     }
 }
 

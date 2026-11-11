@@ -159,6 +159,15 @@ void av1enc_hybrid_set_tx_model(av1enc_hybrid *h, float eps);
 // inverse transform), and stops at DCT_DCT, the first type tried, when that codes nothing. Off
 // (the default here; AV1HybridEncoder turns it on): the exact reconstruction's SSE, every type.
 void av1enc_hybrid_set_quick_tx_trials(av1enc_hybrid *h, int on);
+// Intra blocks may be luma palette blocks, decided by cost before the closed loop (rust/av1
+// hybrid::palette; off by default, and off the output is as without it).
+void av1enc_hybrid_set_palette(av1enc_hybrid *h, int on);
+// The palette decisions' totals since the encoder was made, up to n into out: pictures decided,
+// intra blocks that may be palettes, of them tried, palette blocks, the eligible blocks' area and
+// the palette blocks' (samples), the decisions' seconds; then, with GA_PALETTE_BITS set in the
+// environment, the writes' bits of all blocks, intra blocks and palette blocks; then the palette
+// blocks past the picture's right or bottom edge. Returns how many values there are.
+int av1enc_hybrid_palette_stats(const av1enc_hybrid *h, double *out, int n);
 // The luma tx type search tries only these types (bit t: AV1 tx type t; DCT_DCT always), within
 // each block's set. All (0xFFFFFFFF) by default.
 void av1enc_hybrid_set_tx_types(av1enc_hybrid *h, uint32_t mask);

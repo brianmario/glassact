@@ -43,6 +43,7 @@ let av1SeqCommand = Command(
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
+        .bool("palette", "intra blocks may be luma palette blocks, decided by cost before the closed loop (AV1HybridEncoder.palette; off by default); prints how many are (with GA_PALETTE_BITS=1 in the environment, their bits too)"),
         .bool("no-golden", "with --inter: inter frames copy only the picture before them, not GOLDEN_FRAME (the picture before the latest mostly new one)"),
         .string("crop", "<w>x<h>+<x>+<y>", "code this rectangle of the trace's frames at their own size (not with --width or --score-rgb)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
@@ -181,6 +182,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.reusesAnalysis = !opts.has("no-reuse")
     encoder.postfilters = !opts.has("no-filters")
     encoder.intraBlockCopy = !opts.has("no-intrabc")
+    encoder.palette = opts.has("palette")
     encoder.goldenFrames = !opts.has("no-golden")
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("no-ml-prune") {
@@ -252,6 +254,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.busyBlockPrune = f
     }
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
+    let paletteBefore = encoder.paletteStats
 
     // --two-steps: frames 2i and 2i + 1 are picture i's two steps
     let coarseQindex: Int? = opts.has("two-steps") ? (opts.int("two-steps", 0) == 63 ? 255 : 4 * opts.int("two-steps", 0)) : nil
@@ -391,6 +394,18 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                  mean { $0.analysis }, mean { $0.chroma }, mean { $0.closedLoop }, mean { $0.filters }, mean { $0.filtersGPU },
                  mean { $0.writer },
                  mean { $0.kept } / 10, mean { $0.keptTiles } / 10, mean { $0.filtered } / 10))
+    if opts.has("palette") {
+        let after = encoder.paletteStats
+        let d = zip(after, paletteBefore + [Double](repeating: 0, count: max(0, after.count - paletteBefore.count))).map { $0 - $1 }
+        if d.count >= 10, d[0] > 0 {
+            var line = String(format: "             palette: %.0f of %.0f eligible intra blocks (%.0f tried) · %.1f %% of their area · %.1f %% of the picture · deciding %.2f ms a picture",
+                              d[3], d[1], d[2], d[5] / max(1, d[4]) * 100, d[5] / d[0] / Double(width * height) * 100, d[6] / d[0] * 1000)
+            if d[7] > 0 {
+                line += String(format: " · palette blocks' bits %.1f %% of all, %.1f %% of intra blocks'", d[9] / d[7] * 100, d[9] / max(1, d[8]) * 100)
+            }
+            print(line)
+        }
+    }
 
     if inter, frames.count > 1 {
         let rest = frames.dropFirst()

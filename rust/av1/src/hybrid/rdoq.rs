@@ -26,7 +26,7 @@ fn bits_table() -> &'static [f32; 4097] {
 
 /// The cost in bits of symbol `s` of a spec-format CDF.
 #[inline(always)]
-fn sym_bits(cdf: &[u16], s: usize) -> f32 {
+pub(crate) fn sym_bits(cdf: &[u16], s: usize) -> f32 {
     let lo = if s == 0 { 0 } else { cdf[s - 1] as u32 };
     bits_table()[((cdf[s] as u32 - lo) >> 3) as usize]
 }

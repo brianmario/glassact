@@ -20,7 +20,7 @@ use crate::entropy::{Cdfs, FrameCdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::*;
 use palette::PaletteMaps;
-pub(crate) use palette::{map_dims, map_origin, predict_palette};
+pub(crate) use palette::{color_context, map_dims, map_origin, predict_palette};
 
 /// [`TileBufs::pal_at`]: a block without a palette.
 pub(crate) const NO_PALETTE: u32 = u32::MAX;

@@ -1013,6 +1013,26 @@ pub unsafe extern "C" fn av1enc_hybrid_set_quick_tx_trials(h: *mut HybridHandle,
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_palette(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_palette(on != 0) }
+}
+
+/// Writes up to `n` of [`crate::hybrid::Hybrid::palette_stats`]'s values into `out`; returns how
+/// many there are.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_palette_stats(h: *const HybridHandle, out: *mut f64, n: c_int) -> c_int {
+    // SAFETY: the handle
+    let v = unsafe { (*h).h.palette_stats() };
+    if !out.is_null() && n > 0 {
+        let k = v.len().min(n as usize);
+        // SAFETY: `out` has room for `n` doubles
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, k) };
+    }
+    v.len() as c_int
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: *const u8, n: usize) {
     // SAFETY: the handle; `map` has `n` bytes (or is null with n 0)
     unsafe {

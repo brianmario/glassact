@@ -179,6 +179,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         didSet { av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0) }
     }
 
+    /// Intra blocks may be luma palette blocks (AV1 screen content tools: a few colours as the
+    /// prediction, the residual coded on top), decided by cost before the closed loop (rust/av1
+    /// hybrid::palette). Off by default; off, the stream is as without it.
+    public var palette = false {
+        didSet { av1enc_hybrid_set_palette(cpu, palette ? 1 : 0) }
+    }
+
+    /// The palette decisions' totals since the encoder was made (`av1enc_hybrid_palette_stats`):
+    /// pictures, eligible intra blocks, tried, palette blocks, eligible area, palette area,
+    /// seconds, with GA_PALETTE_BITS set the written bits of all, intra and palette blocks, and
+    /// palette blocks past the picture's right or bottom edge.
+    public var paletteStats: [Double] {
+        var v = [Double](repeating: 0, count: 16)
+        let n = Int(av1enc_hybrid_palette_stats(cpu, &v, Int32(v.count)))
+        return Array(v.prefix(n))
+    }
+
     /// The tx types the closed loop's luma search tries (bit t: AV1 tx type t; DCT_DCT always).
     /// By default `screenTxTypes`: DCT_DCT, IDTX, V_DCT and H_DCT, +0.1–0.5 % of new pictures'
     /// bytes for a cheaper closed loop (BENCHMARKS "the closed loop's tx types"; the owner's

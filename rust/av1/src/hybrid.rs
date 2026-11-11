@@ -28,6 +28,7 @@ mod fwd;
 #[cfg(target_arch = "aarch64")]
 mod fwd_neon;
 mod intrabc;
+mod palette;
 mod quant;
 mod rdoq;
 
@@ -170,6 +171,19 @@ pub struct Hybrid {
     rdoq_trials: bool,
     rdoq_range: u8,
     rdoq_costs: Option<(i32, rdoq::CoeffCosts)>,
+    /// palette blocks decided by cost before the closed loop ([`palette`], [`Hybrid::set_palette`];
+    /// off by default)
+    palette: bool,
+    /// the decisions' symbol costs, made on first use
+    pal_costs: Option<Box<palette::PalCosts>>,
+    /// the decisions' workers' buffers, kept from picture to picture
+    pal_pool: Mutex<Vec<palette::PalScratch>>,
+    /// this picture's units: (tile, first block, end block, first map byte)
+    pal_units: Vec<(u32, u32, u32, u32)>,
+    /// the decisions' totals since the encoder was made, and their seconds
+    pal_stats: palette::Stats,
+    pal_seconds: f64,
+    pal_frames: u64,
     /// research: with GA_TX_SAMPLES naming a file, every searched luma tx block's features and
     /// chosen type, appended to it after each picture (examples/prune_train.rs, MODEL=tx)
     tx_samples: Option<(std::sync::Mutex<Vec<u8>>, String)>,
@@ -220,6 +234,10 @@ struct WriteSide {
     obu: Output,
     /// video mode: each reference slot's saved CDFs, from the writes that refreshed it
     slot_cdfs: [Option<Box<FrameCdfs>>; 8],
+    /// research (GA_PALETTE_BITS set): every write counts its blocks' bits into `bits`: all
+    /// blocks', intra blocks', palette blocks'
+    count_bits: bool,
+    bits: [f64; 3],
 }
 
 /// A picture's write, begun by [`Hybrid::write_begin`] and given back to [`Hybrid::write_end`];
@@ -258,7 +276,17 @@ fn write_record(side: &mut WriteSide, rec: &mut Record, skips: Option<&[TileSkip
     };
     // an inter frame reads its reference's saved CDFs (no planes: the bitstream only)
     let inter = fp.frame_type == FRAME_INTER;
-    let WriteSide { writer, obu, slot_cdfs } = side;
+    let WriteSide {
+        writer,
+        obu,
+        slot_cdfs,
+        count_bits,
+        bits,
+    } = side;
+    let opts = EncodeOpts {
+        flags: opts.flags | if *count_bits { crate::writer::ENC_BLOCK_BITS } else { 0 },
+        ..opts
+    };
     let mut slots: RefSlots = [None; 8];
     if inter {
         let s = (fp.ref_slot & 7) as usize;
@@ -273,6 +301,18 @@ fn write_record(side: &mut WriteSide, rec: &mut Record, skips: Option<&[TileSkip
         refs: inter.then_some(&slots),
     };
     writer.encode_with_hook::<NoHook>(rec.as_mut(), &opts, None, &extras, obu)?;
+    if *count_bits {
+        for k in 0..rec.blocks.len() {
+            let v = writer.block_bits(k) as f64;
+            bits[0] += v;
+            if rec.inter.get(k).is_none_or(|i| i.is_inter == 0) {
+                bits[1] += v;
+            }
+            if rec.palette.get(k).is_some_and(|p| p.size_y != 0) {
+                bits[2] += v;
+            }
+        }
+    }
     // the slots it refreshes keep its saved CDFs (none known: a later frame starts afresh)
     let mut known = 0u8;
     if fp.video != 0 {
@@ -306,6 +346,48 @@ fn same_decisions(a: &Block, b: &Block) -> bool {
     a == b
 }
 
+/// Whether `n` blocks of `a` from `a0` have the palettes (sizes, colours and maps) of `b`'s from
+/// `b0` (a record without palettes has none).
+fn same_palettes(a: &Record, a0: usize, b: &Record, b0: usize, n: usize) -> bool {
+    if a.palette.is_empty() && b.palette.is_empty() {
+        return true;
+    }
+    let none = BlockPalette::default();
+    (0..n).all(|k| {
+        let (pa, pb) = (
+            a.palette.get(a0 + k).unwrap_or(&none),
+            b.palette.get(b0 + k).unwrap_or(&none),
+        );
+        if (pa.size_y, pa.size_uv, pa.colors) != (pb.size_y, pb.size_uv, pb.colors) {
+            return false;
+        }
+        if pa.size_y == 0 && pa.size_uv == 0 {
+            return true;
+        }
+        let bs = a.blocks[a0 + k].bsize as i32;
+        let len = (bw4(bs) * bh4(bs) * 16) as usize * (1 + (pa.size_uv != 0) as usize);
+        let (ma, mb) = (pa.map_off as usize, pb.map_off as usize);
+        match (a.palette_map.get(ma..ma + len), b.palette_map.get(mb..mb + len)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    })
+}
+
+/// A palette worker's buffers, lent from the pool for one picture's decisions.
+struct Lease<'a> {
+    pool: &'a Mutex<Vec<palette::PalScratch>>,
+    s: Option<palette::PalScratch>,
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.s.take() {
+            self.pool.lock().unwrap().push(s);
+        }
+    }
+}
+
 /// A tile's coded area in luma samples: (x0, y0, x1, y1).
 fn area(t: &Tiles, i: usize, mi_cols: usize, mi_rows: usize) -> (usize, usize, usize, usize) {
     let (tr, tc) = (i / t.cols as usize, i % t.cols as usize);
@@ -333,6 +415,13 @@ impl Hybrid {
             rdoq_trials: false,
             rdoq_range: 0,
             rdoq_costs: None,
+            palette: false,
+            pal_costs: None,
+            pal_pool: Mutex::new(Vec::new()),
+            pal_units: Vec::new(),
+            pal_stats: palette::Stats::default(),
+            pal_seconds: 0.0,
+            pal_frames: 0,
             tx_samples: std::env::var("GA_TX_SAMPLES").ok().map(|p| (std::sync::Mutex::new(Vec::new()), p)),
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
@@ -352,6 +441,8 @@ impl Hybrid {
                 writer: Writer::new(),
                 obu: Output::default(),
                 slot_cdfs: Default::default(),
+                count_bits: std::env::var_os("GA_PALETTE_BITS").is_some(),
+                bits: [0.0; 3],
             })),
             seconds: [0.0; 2],
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
@@ -535,6 +626,13 @@ impl Hybrid {
             rdoq_trials,
             rdoq_range,
             rdoq_costs,
+            palette: pal_on,
+            pal_costs,
+            pal_pool,
+            pal_units,
+            pal_stats,
+            pal_seconds,
+            pal_frames,
             ..
         } = self;
         let inter: &[BlockInter] = video.map_or(&[], |v| v.inter);
@@ -795,6 +893,123 @@ impl Hybrid {
             }
         }
         let t1 = Instant::now();
+        let mut hook = QuantHook::new(
+            src,
+            HookOpts {
+                tx_types: true,
+                reduced_tx_set: false,
+                given_luma_tx: (luma_tx.is_some() && !*search_luma_tx) as i32,
+                rnd: *quant_rnd,
+                zbin: QUANT_ZBIN,
+                double_fwd: false,
+                inter_rd_skip: true,
+                inter_tx_types: *search_inter_tx,
+            },
+        );
+        // (recording samples, the search tries every type: they're what it chooses unpruned)
+        hook.tx_model = tx_model_eps
+            .filter(|_| tx_weights::TX_WEIGHTS.len() == tx_model::TX_FLOATS && tx_samples.is_none())
+            .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
+        hook.collect = tx_samples.as_ref().map(|(m, _)| m);
+        (hook.td_dist, hook.dct_zero_stops) = (*quick_tx_trials, *quick_tx_trials);
+        hook.tx_types = *tx_types;
+        if *rdoq {
+            if rdoq_costs.as_ref().is_none_or(|(q, _)| *q != qindex) {
+                *rdoq_costs = Some((qindex, rdoq::CoeffCosts::new(qindex)));
+            }
+            hook.rdoq = rdoq_costs.as_ref().map(|(_, c)| c);
+            hook.rdoq_trials = *rdoq_trials;
+            hook.rdoq_range = *rdoq_range;
+        }
+
+        // ---- palette blocks, by cost ----
+        if *pal_on {
+            let tp = Instant::now();
+            let costs = &**pal_costs.get_or_insert_with(palette::PalCosts::new);
+            let sb_shift = if sb128 { 5 } else { 4 };
+            pal_units.clear();
+            let mut map_len = 0usize;
+            for i in 0..ntiles {
+                let (b0, b1) = range(i);
+                let mut k = b0;
+                while k < b1 {
+                    let row = rec.blocks[k].mi_row >> sb_shift;
+                    let (start, base) = (k, map_len);
+                    while k < b1 && rec.blocks[k].mi_row >> sb_shift == row {
+                        map_len += palette::slot(&rec.blocks[k], is_inter(k)).unwrap_or(0);
+                        k += 1;
+                    }
+                    pal_units.push((i as u32, start as u32, k as u32, base as u32));
+                }
+            }
+            rec.palette.clear();
+            rec.palette.resize(n, BlockPalette::default());
+            // (only palette blocks' slots are read: the rest needn't be cleared)
+            rec.palette_map.resize(map_len, 0);
+            let cx = palette::Ctx {
+                hook: &hook,
+                src,
+                costs,
+                inter_frame,
+                mi_rows: mr,
+                mi_cols: mc,
+                width,
+                height,
+                sb_mi: 1 << sb_shift,
+                qindex: qmap.is_empty().then_some(qindex),
+            };
+            let mut units: Vec<palette::Unit> = Vec::with_capacity(pal_units.len());
+            {
+                let (mut bl, mut pl, mut ml): (&mut [Block], &mut [BlockPalette], &mut [u8]) =
+                    (&mut rec.blocks, &mut rec.palette, &mut rec.palette_map);
+                let (mut bat, mut pat, mut mat) = (0usize, 0usize, 0usize);
+                for (j, &(i, b0, b1, base)) in pal_units.iter().enumerate() {
+                    let (b0, b1) = (b0 as usize, b1 as usize);
+                    let end = pal_units.get(j + 1).map_or(map_len, |u| u.3 as usize);
+                    let (tr, tc) = (i as usize / tiles.cols as usize, i as usize % tiles.cols as usize);
+                    let r0 = (given[b0].mi_row as i32 >> sb_shift) << sb_shift;
+                    units.push(palette::Unit {
+                        blocks: take_range(&mut bl, &mut bat, b0, b1),
+                        inter: if inter.is_empty() { &[] } else { &inter[b0..b1] },
+                        pal: take_range(&mut pl, &mut pat, b0, b1),
+                        map: take_range(&mut ml, &mut mat, base as usize, end),
+                        map_base: base,
+                        c0: tiles.mi_col_starts[tc] as i32,
+                        c1: (tiles.mi_col_starts[tc + 1] as i32).min(mc),
+                        tile_r0: tiles.mi_row_starts[tr] as i32,
+                        r0,
+                        stats: palette::Stats::default(),
+                    });
+                }
+            }
+            let pool = &*pal_pool;
+            par_for(
+                *threads,
+                &mut units,
+                || Lease {
+                    pool,
+                    s: Some(pool.lock().unwrap().pop().unwrap_or_else(palette::PalScratch::new)),
+                },
+                |l, u| palette::decide_unit(&cx, l.s.as_mut().expect("leased"), u),
+            );
+            let mut st = palette::Stats::default();
+            for u in &units {
+                st.add(&u.stats);
+            }
+            drop(units);
+            pal_stats.add(&st);
+            if st.chosen == 0 {
+                rec.palette.clear();
+                rec.palette_map.clear();
+            } else {
+                rec.fp.allow_screen_content_tools = 1;
+            }
+            *pal_seconds += tp.elapsed().as_secs_f64();
+            *pal_frames += 1;
+        } else {
+            rec.palette.clear();
+            rec.palette_map.clear();
+        }
 
         // ---- tiles unchanged since they were last coded keep their closed loop ----
         *tiles_out = Some(tiles);
@@ -808,7 +1023,9 @@ impl Hybrid {
             let same_inter: Vec<bool> = (0..ntiles)
                 .map(|i| {
                     let ((b0, b1), (p0, p1)) = (range(i), prange(i));
-                    b1 - b0 == p1 - p0 && (0..b1 - b0).all(|k| entry(rec, b0 + k) == entry(prev, p0 + k))
+                    b1 - b0 == p1 - p0
+                        && (0..b1 - b0).all(|k| entry(rec, b0 + k) == entry(prev, p0 + k))
+                        && same_palettes(rec, b0, prev, p0, b1 - b0)
                 })
                 .collect();
             let mut parts = split_tiles(rec, tile_first);
@@ -866,34 +1083,6 @@ impl Hybrid {
                 reused[t.i] = t.kept;
                 *reused_count += t.kept as u32;
             }
-        }
-        let mut hook = QuantHook::new(
-            src,
-            HookOpts {
-                tx_types: true,
-                reduced_tx_set: false,
-                given_luma_tx: (luma_tx.is_some() && !*search_luma_tx) as i32,
-                rnd: *quant_rnd,
-                zbin: QUANT_ZBIN,
-                double_fwd: false,
-                inter_rd_skip: true,
-                inter_tx_types: *search_inter_tx,
-            },
-        );
-        // (recording samples, the search tries every type: they're what it chooses unpruned)
-        hook.tx_model = tx_model_eps
-            .filter(|_| tx_weights::TX_WEIGHTS.len() == tx_model::TX_FLOATS && tx_samples.is_none())
-            .map(|e| (&tx_weights::TX_WEIGHTS[..], e));
-        hook.collect = tx_samples.as_ref().map(|(m, _)| m);
-        (hook.td_dist, hook.dct_zero_stops) = (*quick_tx_trials, *quick_tx_trials);
-        hook.tx_types = *tx_types;
-        if *rdoq {
-            if rdoq_costs.as_ref().is_none_or(|(q, _)| *q != qindex) {
-                *rdoq_costs = Some((qindex, rdoq::CoeffCosts::new(qindex)));
-            }
-            hook.rdoq = rdoq_costs.as_ref().map(|(_, c)| c);
-            hook.rdoq_trials = *rdoq_trials;
-            hook.rdoq_range = *rdoq_range;
         }
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
         // (its coding would be discarded: write_ex codes the frame once the filters are chosen)
@@ -1072,6 +1261,10 @@ impl Hybrid {
         // a frame with intra block copies stays one: no post-filters, every cdef_idx 0
         let abc = rec.fp.allow_intrabc != 0;
         rec.fp = *fp;
+        if rec.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0) {
+            // palette blocks need screen content tools (a key frame's are otherwise off)
+            rec.fp.allow_screen_content_tools = 1;
+        }
         if abc {
             (rec.fp.allow_intrabc, rec.fp.allow_screen_content_tools) = (1, 1);
             rec.fp.loop_filter_level = [0; 4];
@@ -1203,6 +1396,35 @@ impl Hybrid {
     /// frame where blocks copy has no post-filters (the record's fp.allow_intrabc says so).
     pub fn set_intrabc(&mut self, on: bool) {
         self.intrabc = on;
+    }
+
+    /// av1enc_hybrid_set_palette: intra blocks may be palette blocks (luma), decided by cost before
+    /// the closed loop ([`palette`]; off by default: the output is as without it).
+    pub fn set_palette(&mut self, on: bool) {
+        self.palette = on;
+    }
+
+    /// av1enc_hybrid_palette_stats: the palette decisions' totals since the encoder was made:
+    /// pictures decided, intra blocks that may be palettes, of them tried (past the gate), palette
+    /// blocks, the eligible blocks' area and the palette blocks' (samples), the decisions' seconds;
+    /// then from writes, with GA_PALETTE_BITS set: all blocks' bits, intra blocks', palette
+    /// blocks'; then the palette blocks past the picture's right or bottom edge.
+    pub fn palette_stats(&self) -> [f64; 11] {
+        let s = &self.pal_stats;
+        let b = self.side.as_ref().map_or([0.0; 3], |w| w.bits);
+        [
+            self.pal_frames as f64,
+            s.eligible as f64,
+            s.tried as f64,
+            s.chosen as f64,
+            s.eligible_area as f64,
+            s.chosen_area as f64,
+            self.pal_seconds,
+            b[0],
+            b[1],
+            b[2],
+            s.at_edge as f64,
+        ]
     }
 
     /// av1enc_hybrid_set_tx_search: the closed loop searches intra blocks' luma tx types (else keeps
