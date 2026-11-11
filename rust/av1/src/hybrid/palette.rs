@@ -26,7 +26,7 @@ use crate::dsp::{EDGE_LEN, Edge, build_edges, is_directional, predict_intra};
 use crate::entropy::{Cdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::{Block, BlockInter, BlockPalette};
-use crate::writer::{color_context, map_dims};
+use crate::writer::map_dims;
 
 const NONE: u32 = u32::MAX;
 
@@ -268,6 +268,51 @@ fn color_bits(cache: &[u8], colors: &[u8]) -> f32 {
     bits as f32
 }
 
+/// [`color_context`]'s context of the index at (r, c) and that index's rank in its order, from
+/// the left, above-left and above neighbours alone: those (at most 3) colours by score (ties by
+/// index), then the rest by index.
+#[inline(always)]
+fn ctx_rank(map: &[u8], w: usize, r: usize, c: usize) -> (usize, usize) {
+    let (mut cols, mut sc, mut k) = ([0u8; 3], [0u8; 3], 0usize);
+    let mut add = |col: u8, s: u8| {
+        for i in 0..k {
+            if cols[i] == col {
+                sc[i] += s;
+                return;
+            }
+        }
+        (cols[k], sc[k]) = (col, s);
+        k += 1;
+    };
+    if c > 0 {
+        add(map[r * w + c - 1], 2);
+    }
+    if r > 0 && c > 0 {
+        add(map[(r - 1) * w + c - 1], 1);
+    }
+    if r > 0 {
+        add(map[(r - 1) * w + c], 2);
+    }
+    // by score, ties by colour
+    for i in 1..k {
+        let mut j = i;
+        while j > 0 && (sc[j] > sc[j - 1] || (sc[j] == sc[j - 1] && cols[j] < cols[j - 1])) {
+            sc.swap(j, j - 1);
+            cols.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    let hash = sc[0] as usize * Palette_Color_Hash_Multipliers[0] as usize
+        + sc[1] as usize * Palette_Color_Hash_Multipliers[1] as usize
+        + sc[2] as usize * Palette_Color_Hash_Multipliers[2] as usize;
+    let v = map[r * w + c];
+    let rank = match cols[..k].iter().position(|&x| x == v) {
+        Some(i) => i,
+        None => k + v as usize - cols[..k].iter().filter(|&&x| x < v).count(),
+    };
+    (Palette_Color_Context[hash] as usize, rank)
+}
+
 /// The colour index map's bits: the first index (NS(n)), then every other on-screen index with its
 /// colour context (the order the writer codes them in doesn't change any context).
 fn map_bits(costs: &PalCosts, map: &[u8], w: usize, ow: usize, oh: usize, n: usize) -> f32 {
@@ -280,37 +325,41 @@ fn map_bits(costs: &PalCosts, map: &[u8], w: usize, ow: usize, oh: usize, n: usi
             if r == 0 && c == 0 {
                 continue;
             }
-            let (order, ctx) = color_context(map, w, r, c, n);
-            let v = map[r * w + c];
-            let rank = order.iter().position(|&o| o == v).unwrap_or(0);
+            let (ctx, rank) = ctx_rank(map, w, r, c);
             bits += tab[ctx][rank];
         }
     }
     bits
 }
 
-/// k-means of the histogram's values into at most `k` colours (strictly increasing into `out`);
+/// A block's luma values: how many of each, and the values present in increasing order.
+pub(crate) struct Hist {
+    count: [u32; 256],
+    vals: [u8; 256],
+    n: usize,
+}
+
+/// k-means of the block's values into at most `k` colours (strictly increasing into `out`);
 /// returns how many.
-fn cluster(hist: &[u32; 256], lo: usize, hi: usize, k: usize, out: &mut [u8; 8]) -> usize {
+fn cluster(h: &Hist, k: usize, out: &mut [u8; 8]) -> usize {
+    let vals = &h.vals[..h.n];
+    let cnt = |v: u8| h.count[v as usize];
     let mut c = [0f64; 8];
     // seeds: the likeliest value, then each next the value with the most weight times squared
     // distance to the seeds so far
-    let mut best = lo;
-    for v in lo..=hi {
-        if hist[v] > hist[best] {
+    let mut best = vals[0];
+    for &v in vals {
+        if cnt(v) > cnt(best) {
             best = v;
         }
     }
     c[0] = best as f64;
     let mut n = 1;
     while n < k {
-        let (mut bv, mut bs) = (0usize, 0f64);
-        for v in lo..=hi {
-            if hist[v] == 0 {
-                continue;
-            }
+        let (mut bv, mut bs) = (0u8, 0f64);
+        for &v in vals {
             let d = c[..n].iter().map(|&x| (v as f64 - x).abs()).fold(f64::MAX, f64::min);
-            let s = hist[v] as f64 * d * d;
+            let s = cnt(v) as f64 * d * d;
             if s > bs {
                 (bv, bs) = (v, s);
             }
@@ -323,19 +372,19 @@ fn cluster(hist: &[u32; 256], lo: usize, hi: usize, k: usize, out: &mut [u8; 8])
     }
     for _ in 0..12 {
         c[..n].sort_by(|a, b| a.total_cmp(b));
-        let (mut sum, mut cnt) = ([0f64; 8], [0f64; 8]);
+        let (mut sum, mut num) = ([0f64; 8], [0f64; 8]);
         let mut j = 0;
-        for v in lo..=hi {
+        for &v in vals {
             while j + 1 < n && (v as f64 - c[j]).abs() > (v as f64 - c[j + 1]).abs() {
                 j += 1;
             }
-            sum[j] += hist[v] as f64 * v as f64;
-            cnt[j] += hist[v] as f64;
+            sum[j] += cnt(v) as f64 * v as f64;
+            num[j] += cnt(v) as f64;
         }
         let mut moved = false;
         for i in 0..n {
-            if cnt[i] > 0.0 {
-                let m = (sum[i] / cnt[i]).round();
+            if num[i] > 0.0 {
+                let m = (sum[i] / num[i]).round();
                 moved |= m != c[i];
                 c[i] = m;
             }
@@ -382,45 +431,48 @@ pub(crate) fn decide_unit(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit) {
 }
 
 /// A block's luma source past the gate (not flat; most samples near at most 8 values): its
-/// histogram, lowest and highest value and how many values.
-fn gate(s: &[u8], ss: usize, w: usize, h: usize) -> Option<([u32; 256], usize, usize, usize)> {
-    let mut hist = [0u32; 256];
+/// values.
+fn gate(s: &[u8], ss: usize, w: usize, h: usize) -> Option<Hist> {
+    let mut g = Hist {
+        count: [0; 256],
+        vals: [0; 256],
+        n: 0,
+    };
     for i in 0..h {
         for &v in &s[i * ss..][..w] {
-            hist[v as usize] += 1;
+            g.count[v as usize] += 1;
         }
     }
-    let (mut lo, mut hi, mut distinct) = (255usize, 0usize, 0usize);
-    for (v, &cnt) in hist.iter().enumerate() {
-        if cnt != 0 {
-            lo = lo.min(v);
-            hi = hi.max(v);
-            distinct += 1;
+    for v in 0..256 {
+        if g.count[v] != 0 {
+            g.vals[g.n] = v as u8;
+            g.n += 1;
         }
     }
-    if distinct < 2 {
+    if g.n < 2 {
         return None;
     }
     // the 8 likeliest values' ±2 neighbourhoods
     let mut taken = [false; 256];
     let mut covered = 0u32;
     for _ in 0..8 {
-        let Some((v, _)) = hist
-            .iter()
-            .enumerate()
-            .filter(|&(v, &c)| c > 0 && !taken[v])
-            .max_by_key(|&(v, &c)| (c, 255 - v))
-        else {
-            break;
-        };
+        let mut best: Option<(u32, u8)> = None;
+        for &v in &g.vals[..g.n] {
+            let c = g.count[v as usize];
+            if !taken[v as usize] && best.is_none_or(|(bc, _)| c > bc) {
+                best = Some((c, v));
+            }
+        }
+        let Some((_, v)) = best else { break };
+        let v = v as usize;
         for t in v.saturating_sub(2)..=(v + 2).min(255) {
             if !taken[t] {
                 taken[t] = true;
-                covered += hist[t];
+                covered += g.count[t];
             }
         }
     }
-    (covered * 100 >= GATE_COVER * (w * h) as u32).then_some((hist, lo, hi, distinct))
+    (covered * 100 >= GATE_COVER * (w * h) as u32).then_some(g)
 }
 
 /// The neighbours a block's contexts read: above and left (unit-local indices, NONE where outside
@@ -534,7 +586,7 @@ fn best_palette(
     bs: i32,
     r: i32,
     c: i32,
-    (hist, lo, hi, distinct): &([u32; 256], usize, usize, usize),
+    g: &Hist,
     fixed: f32,
     cache: &[u8],
     (dc_q, ac_q, lambda): (i32, i32, f64),
@@ -552,19 +604,19 @@ fn best_palette(
     let mut lut = [0u8; 256];
     let mut last_n = 0;
     let mut prev_j = f64::MAX;
-    for kk in 2..=8usize.min(*distinct) {
-        let n = cluster(hist, *lo, *hi, kk, &mut colors);
+    for kk in 2..=8usize.min(g.n) {
+        let n = cluster(g, kk, &mut colors);
         if n < 2 || n == last_n {
             continue;
         }
         last_n = n;
         // each value's nearest colour
         let mut j = 0;
-        for v in *lo..=*hi {
+        for &v in &g.vals[..g.n] {
             while j + 1 < n && (v as i32 - colors[j] as i32).abs() > (v as i32 - colors[j + 1] as i32).abs() {
                 j += 1;
             }
-            lut[v] = j as u8;
+            lut[v as usize] = j as u8;
         }
         // the map: the on-screen part from the source, repeated past it as the decoder does
         for yy in 0..h {
@@ -706,20 +758,54 @@ fn decide_block(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::writer::color_context;
 
     /// k-means finds a few exact values exactly, and splits a two-level block in two.
     #[test]
     fn cluster_values() {
-        let mut hist = [0u32; 256];
-        hist[10] = 30;
-        hist[200] = 20;
-        hist[90] = 14;
+        let mut h = Hist {
+            count: [0; 256],
+            vals: [0; 256],
+            n: 3,
+        };
+        (h.count[10], h.count[90], h.count[200]) = (30, 14, 20);
+        h.vals[..3].copy_from_slice(&[10, 90, 200]);
         let mut out = [0u8; 8];
-        assert_eq!(cluster(&hist, 10, 200, 3, &mut out), 3);
+        assert_eq!(cluster(&h, 3, &mut out), 3);
         assert_eq!(&out[..3], &[10, 90, 200]);
-        assert_eq!(cluster(&hist, 10, 200, 8, &mut out), 3);
-        assert_eq!(cluster(&hist, 10, 200, 2, &mut out), 2);
+        assert_eq!(cluster(&h, 8, &mut out), 3);
+        assert_eq!(cluster(&h, 2, &mut out), 2);
         assert_eq!(out[1], 200);
+    }
+
+    /// The context and rank shortcut gives get_palette_color_context's, on random maps of every
+    /// palette size.
+    #[test]
+    fn ctx_rank_is_color_context() {
+        let mut x = 0x2545_f491u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for n in 2..=8usize {
+            for _ in 0..50 {
+                let (w, h) = (16, 16);
+                // runs, as glyph maps have, and noise
+                let map: Vec<u8> = (0..w * h).map(|_| (next() % (n as u32 + 3)).min(n as u32 - 1) as u8).collect();
+                for r in 0..h {
+                    for c in 0..w {
+                        if r == 0 && c == 0 {
+                            continue;
+                        }
+                        let (order, ctx) = color_context(&map, w, r, c, n);
+                        let rank = order.iter().position(|&o| o == map[r * w + c]).unwrap();
+                        assert_eq!(ctx_rank(&map, w, r, c), (ctx, rank), "n {n} at ({r}, {c})");
+                    }
+                }
+            }
+        }
     }
 
     /// The colours' bits: a literal, then deltas; cached colours a bit each.
