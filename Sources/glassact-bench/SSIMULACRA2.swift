@@ -34,7 +34,8 @@ final class SSIMULACRA2Scorer {
             binary = URL(fileURLWithPath: "\(dir)/ssimulacra2")
         }
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("glassact-vquality-\(ProcessInfo.processInfo.processIdentifier)")
+            // (a directory a scorer: av1seq --two-steps has two at once)
+            .appendingPathComponent("glassact-vquality-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return SSIMULACRA2Scorer(binary: binary, dir: dir)
     }

@@ -483,6 +483,54 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
     }
 
+    /// A measurement (BENCHMARKS "a picture in two steps"), not a mode anything ships: one stream
+    /// that codes each picture twice, first at `coarseQindex` as `encode(count:)` would, then at
+    /// `qindex` as an inter frame that copies in place what the first copied and codes the rest,
+    /// its motion search from no shift against the first step's decoded picture (the analysis's reference too, so
+    /// one picture is finished before the next begins: nothing overlaps). `output` gets the
+    /// picture's index, the step (0 or 1) and the frame. Needs `interFrames`.
+    public func encodeTwoSteps(count: Int, coarseQindex: Int, qindex: Int, picture: (Int) throws -> Picture,
+                               output: (Int, Int, Frame) throws -> Void) throws {
+        guard count > 0, interFrames else { return }
+        previous = nil
+        goldenPlanes = []
+        copyFinder.golden = goldenFrames
+        copyFinder.reset()
+        streamSB128 = largeSuperblocks
+        metal.largeSuperblocks = streamSB128
+        func code(_ p: Picture, _ copies: Copies, _ q: Int) throws -> Frame {
+            metal.forgetAnalysis()  // (the same source at another q, or against another reference)
+            let pending = try begin(p, copies, qindex: q)
+            let partition = try pending.partition.wait()
+            var timing = Timing()
+            timing.analysis = metal.lastGPUSeconds
+            timing.motion = pending.motionSeconds
+            let (writing, _) = try finish(p, partition: partition, motion: pending.motion, refs: pending.refs, qindex: q,
+                                          qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: CACurrentMediaTime(),
+                                          writingBefore: nil, written: nil)
+            return try writing.end()
+        }
+        let searches = searchesMotion
+        defer { searchesMotion = searches }
+        var last: Picture?
+        for i in 0..<count {
+            let p = try picture(i)
+            var copies = Copies()
+            if let last {
+                copyFinder.start(p, after: last, searchesMotion: searches)
+                copies = copyFinder.wait()
+            }
+            searchesMotion = searches
+            try output(i, 0, try code(p, copies, coarseQindex))
+            let decoded = previousDecoded(width: p.width, height: p.height)
+            guard decoded.count == 3 else { throw Failure.encode("two steps: no decoded picture") }
+            try decoded[0].withUnsafeBufferPointer { try metal.setReference(y: $0.baseAddress!, width: p.width, height: p.height) }
+            searchesMotion = true  // (the frame's vectors are its motion search's, at its precision)
+            try output(i, 1, try code(p, copyFinder.again(p, after: copies), qindex))
+            last = p
+        }
+    }
+
     /// GA_TIMELINE (diagnostics): each picture's stages as they start and end, and the GPU's
     /// command buffers, on stderr as `tl <ms> <what>` (BENCHMARKS "where a new picture's period goes").
     static let traces = ProcessInfo.processInfo.environment["GA_TIMELINE"] != nil
@@ -686,6 +734,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
         /// Waits for any started picture (an encode that threw).
         func drain() { _ = wait() }
+
+        /// A frame that codes the last picture again (`encodeTwoSteps`): what `first` copied is
+        /// copied from it in place (it was already as good as what it copied) and the rest is
+        /// coded, with no shift as the motion search's one candidate. LAST_FRAME's slot is refreshed.
+        func again(_ p: Picture, after first: Copies) -> Copies {
+            let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
+            let g = goldenSource.flatMap { $0.width == p.width && $0.height == p.height ? $0 : nil }
+            let copied = (0..<nsb).map { i in UInt8(first.skip.map { $0[i] != 0 ? 1 : 0 } ?? 0) }
+            var m = [Int32](repeating: 0, count: 3 * nsb)
+            for i in 0..<nsb { m[3 * i] = Int32(copied[i]) }
+            return Copies(motion: m, skip: copied, candidates: [0, 0],
+                          refs: Refs(last: lastSlot, golden: g != nil ? goldenSlot + 1 : 0, refresh: 1 << lastSlot))
+        }
 
         private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
             guard prev.width == p.width, prev.height == p.height else { return Copies() }

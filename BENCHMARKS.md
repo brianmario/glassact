@@ -238,6 +238,7 @@ the numbers and the reasoning.
 | The analysis's thread kernel screening each mode as a constant (`pred_cand0`); `k_ml_stats` taking a sample's levels from its thread's (`metal-av1`) | kept | the same streams; a 5K picture of new content's 8x8s 2.03 → 1.93 ms of GPU, its learned pruning 2.00 → 1.95 (provisional: the Mac in use) | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | Unrolled loops in the thread kernel's flat check, SATD and mode loop (without constants) and in `k_ml_stats`; `k_ml_stats`'s seams summed a thread before one atomic add (`metal-av1`) | measured, not kept | no faster (the SATD's sub-blocks unrolled: slower at 8x8) | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | The thread kernel's blocks listed by learned mode mask, so a SIMD-group screens the same modes (`metal-av1`) | not built | at most 0.5 ms of a 5K picture of new content's 23 ms (every lane given its group's first mask: 4x4 1.50 → 1.33, 8x8 1.95 → 1.63), before the cost of sorting the list | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
+| A mostly-new picture in two steps: coded coarsely, then refined by the next frame (`metal-av1`, `av1seq --two-steps`) | measured, not adopted | both steps are 9–20 % more bytes than the picture coded once at the same quality (the rotation at 5K; after a q50 first step of 118 KB the second step at q20 is 484 KB against 508 KB); a coarse q alone leaves the first step's GPU stages at 21–22 ms of 23.0, and without the motion search it is 14.8 ms | [entry](#metal-av1-a-picture-in-two-steps-coarse-then-refined-measured-2026-11-10) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 
 **Rate control and transport**
@@ -302,6 +303,70 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a picture in two steps, coarse then refined, measured (2026-11-10)
+
+The cheap test, inside AV1, of making time the thing that gives: code a mostly-new picture
+coarsely and fast, and refine it in the next frame, so a frame always leaves on time and the
+quality follows. `av1seq --two-steps <q>` (`AV1HybridEncoder.encodeTwoSteps`, a measurement and
+not a mode anything ships) puts each picture in the stream twice: at the coarse q as any picture
+is coded, then at `--q` as an inter frame against the first step's decoded picture. The second
+step copies in place what the first copied, codes the rest with the motion search started from
+no shift, and its GPU analysis is given the first step's decoded luma as its reference (the
+analysis otherwise reads the previous picture's source, which here is the same picture), so one
+frame finishes before the next begins. Every frame of every stream decodes in libaom to the
+encoder's picture. The default path is untouched (the rotation's stream digest `93c5d5eeb49fd481`).
+
+The rotation at 5K (typing-cc, then scroll-win, photos and cursor-drag mixed in), 12 pictures,
+`--score-rgb --ssimulacra2-every 3`, the second step at q 8, 14, 20, 26 and 32. **BD-rate of both
+steps' bytes at the second step's quality, against the one-step streams** of
+[the levers' table](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09)
+(q20: 508.5 KB a picture, PSNR 44.55 dB, SSIMULACRA2 76.47). GPU stages as there (8 pictures at
+q20, the last picture's two steps, best of 10; provisional: the Mac was in use).
+
+| first step | BD-rate (PSNR / SSIMULACRA2) | first step: KB · PSNR · SSIMULACRA2 | second step at q20, KB | both at q20: KB · PSNR · SSIMULACRA2 | second step's blocks coded inter | GPU stages, first / second (ms) |
+|---|---|---|---|---|---|---|
+| q32 (second step q 8–26) | +14.9 % / +7.3 % | 314.5 · 40.92 · 64.5 | 187.6 | 502.0 · 43.06 · 75.17 | 64 % | 22.2 / 32.3 |
+| q40 | +18.6 % / +14.8 % | 207.5 · 37.59 · 46.7 | 366.7 | 574.2 · 44.07 · 75.67 | 52 % | 21.5 / 32.6 |
+| q50 | +20.3 % / +20.6 % | 117.6 · 32.91 · 16.5 | 483.7 | 601.3 · 44.42 · 76.23 | 42 % | 21.4 / 33.1 |
+| q63 | +9.3 % / +10.3 % | 30.9 · 25.27 · −46.4 | 522.0 | 552.9 · 44.55 · 76.36 | 20 % | 19.3 / 32.3 |
+
+With the first step's search lightened (`--no-motion-search` applies to the first step only;
+the mode threshold and the shapes to both):
+
+| first step | BD-rate (PSNR / SSIMULACRA2) | first step: KB · PSNR · SSIMULACRA2 | both at q20: KB · PSNR · SSIMULACRA2 | GPU stages, first / second (ms) |
+|---|---|---|---|---|
+| q50, `--no-motion-search` | +24.9 % / +25.6 % | 121.9 · 32.65 · 14.4 | 622.6 · 44.40 · 76.10 | **14.8** / 32.9 |
+| q63, `--no-motion-search` | +13.6 % / +16.5 % | 32.0 · 25.07 · −48.7 | 570.6 · 44.50 · 75.85 | **12.7** / 32.3 |
+| q50, `--no-motion-search --ml-mode-eps 0.10 --new-shapes 1248` | +31.6 % / +30.3 % | 117.3 · 31.91 · 13.7 | 636.4 · 44.15 · 75.79 | **12.2** / 30.0 |
+| q63, the same three | +28.6 % / +28.0 % | 31.6 · 25.05 · −48.7 | 622.6 · 44.19 · 75.65 | **10.9** / 28.7 |
+| q50, the second step without subpel (`--no-subpel`) | +19.9 % / +20.3 % | 117.5 · 32.91 · 16.5 | 600.5 · 44.45 · 76.22 | 21.1 / 29.9 |
+
+**What this says:**
+
+- **AV1 doesn't refine: it codes the picture again.** After a q50 first step the second step at
+  q20 is 484 KB against the one-step picture's 508 KB, so the first step's 118 KB bought 25 KB;
+  after q63 the second step is larger than the one-step picture (522 KB). What the second step
+  predicts from is the first step's quantization error, which is as costly as the detail it
+  stands in for, and the coarser the first step the less of the picture the second codes from
+  it at all (inter in 64 % of it after q32, 20 % after q63). The whole is 9–20 % more bytes for
+  the same quality; q63's 9 % is a first step nobody could look at, and q32's second step
+  leaves the picture 1.5 dB under the one-step stream at q20, because an error smaller than the
+  quantizer's step is kept.
+- **A coarse q is not what makes the first step fast.** Its GPU stages are 21–22 ms at q32–q50
+  against the defaults' 23.0 (19.3 at q63). The search levers are: without the motion search
+  the first step is 14.8 ms at q50, for 3.6 % more bytes and 0.26 dB less at that q
+  (121.9 KB · 32.65 dB against 117.6 KB · 32.91 dB), about what the lever costs at q 8–32.
+  No 4x4s and the mode threshold at 0.10 take it to 12.2 ms and cost another 0.7 dB.
+- **The second step as built is the slowest frame** (30–33 ms of GPU stages): all of the
+  picture is motion-searched (motion search 9 ms, inter candidates 7.6). Whole-sample vectors
+  change nothing in bytes or quality and take 3 ms off its motion search.
+- So in this encoder a frame that has to leave on time is a matter of q and the search levers
+  on that one frame, and what follows it should be coded as the next picture is, not as a
+  correction. A second step that costs nothing needs the first step's coefficients refined in
+  place (the same transform, finer steps), which AV1's syntax has no way to say: that is the
+  coarse-to-fine design in `docs/GPU-CODEC.md` on `gpu-codec`, and this is the number it has to
+  beat (a second step under 20 % of overhead, towards none).
 
 ### Metal AV1: the analysis's thread kernel and the learned pruning's statistics, by parts (2026-11-09)
 

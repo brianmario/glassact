@@ -65,6 +65,7 @@ let av1SeqCommand = Command(
         .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
+        .int("two-steps", "<0-63>", 0...63, "with --inter, a measurement: code each picture twice in one stream, at this q first (as the other options say) and then at --q against the first's decoded picture (no copies, motion searched from no shift), one picture at a time; each step's bytes and scores are printed, and with --profile its GPU stages"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
         .bool("no-ml-modes", "learned pruning of tree levels only (every block screens all 13 modes)"),
         .bool("no-ml-chroma", "no learned chroma pruning (every leaf screens all its chroma modes, and CfL)"),
@@ -252,15 +253,22 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     _ = try encoder.encode(picture(0), qindex: qindex)  // warm up: pipelines, caches, clocks
 
+    // --two-steps: frames 2i and 2i + 1 are picture i's two steps
+    let coarseQindex: Int? = opts.has("two-steps") ? (opts.int("two-steps", 0) == 63 ? 255 : 4 * opts.int("two-steps", 0)) : nil
+    if coarseQindex != nil, !inter { throw BenchError("--two-steps: with --inter") }
+    let steps = coarseQindex == nil ? 1 : 2
     var frames: [AV1HybridEncoder.Frame] = []
-    frames.reserveCapacity(pictures.count)
+    frames.reserveCapacity(pictures.count * steps)
     let repeats = opts.int("repeat", 1)
     var outputAt: [Double] = []  // when each frame came out (overlapped runs)
     var seconds = 0.0
     for r in 0..<repeats {
         if r > 0 { frames.removeAll(keepingCapacity: true) }
         let t0 = CACurrentMediaTime()
-        if serial {
+        if let coarseQindex {
+            try encoder.encodeTwoSteps(count: pictures.count, coarseQindex: coarseQindex, qindex: qindex, picture: { picture($0) },
+                                       output: { _, _, f in frames.append(f) })
+        } else if serial {
             for i in 0..<pictures.count { frames.append(try encoder.encode(picture(i), qindex: qindex)) }
         } else {
             outputAt.removeAll(keepingCapacity: true)
@@ -274,9 +282,15 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
 
     var psnr = 0.0
     let scoreRGB = opts.has("score-rgb")
-    let rgb = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
-                                       coded: stream == nil ? nil : (width, height),
-                                       ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
+    func scorer() throws -> RGBScorer {
+        try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, width: stream?.width ?? width, height: stream?.height ?? height,
+                      coded: stream == nil ? nil : (width, height),
+                      ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil)
+    }
+    let rgb = scoreRGB ? try scorer() : nil
+    // (--two-steps: the second step's, reading the trace again in step)
+    let rgbAgain = scoreRGB && steps == 2 ? try scorer() : nil
+    var psnrAgain = 0.0
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
     defer { glassact_aom_dec_destroy(decoder) }
     for (i, f) in frames.enumerated() {
@@ -286,8 +300,64 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         for p in 0..<3 where !f.planes.isEmpty && decoded.planes[p] != f.planes[p] {
             throw BenchError("frame \(i): libaom's decode differs from the encoder's picture in plane \(p)")
         }
-        psnr += decoded.psnrY(pictures[i])
+        if steps == 2, i % 2 == 1 {
+            psnrAgain += decoded.psnrY(pictures[i / 2])
+            try rgbAgain?.add(decoded)
+            continue
+        }
+        psnr += decoded.psnrY(pictures[i / steps])
         try rgb?.add(decoded)
+    }
+    if let coarseQindex {
+        // each step's bytes, quality and times, and the two together a picture
+        for step in 0..<2 {
+            let fs = stride(from: step, to: frames.count, by: 2).map { frames[$0] }
+            let m = Double(fs.count)
+            func ms(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { fs.map { f($0.timing) }.reduce(0, +) / m * 1000 }
+            print(String(format: "  step %d     qindex %d · %@ a frame · PSNR-Y %.2f · GPU analysis %.1f · closed loop %.1f · filters %.1f (GPU %.1f) · writer %.1f (ms) · motion-searched blocks %.1f %% of the picture",
+                         step + 1, step == 0 ? coarseQindex : qindex, formatBytes(fs.map(\.obu.count).reduce(0, +) / fs.count),
+                         (step == 0 ? psnr : psnrAgain) / m, ms { $0.analysis }, ms { $0.closedLoop }, ms { $0.filters },
+                         ms { $0.filtersGPU }, ms { $0.writer }, ms { $0.searched } / 10))
+            if let s = step == 0 ? rgb : rgbAgain { print(s.summary("step \(step + 1)")) }
+        }
+        print(String(format: "  both       %@ a picture · all %d frames decoded exactly",
+                     formatBytes(frames.map(\.obu.count).reduce(0, +) / pictures.count), frames.count))
+        if opts.has("digest") {
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for f in frames { for b in f.obu { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 } }
+            print(String(format: "             stream digest %016llx (%d frames)", h, frames.count))
+        }
+        if let path = opts.string("ivf") {
+            try writeIVF(frames.map(\.obu), width: stream?.width ?? width, height: stream?.height ?? height, to: path)
+            print("             stream written to \(path)")
+        }
+        if opts.has("profile"), pictures.count > 1 {
+            // the last picture's two steps after the one before it, each stage's best of 10
+            encoder.profilesStages = true
+            var best = [AV1MetalEncoder.StageTimes](repeating: AV1MetalEncoder.StageTimes(), count: 2)
+            for run in 0..<10 {
+                try encoder.encodeTwoSteps(count: 2, coarseQindex: coarseQindex, qindex: qindex,
+                                           picture: { picture(pictures.count - 2 + $0) }, output: { i, step, _ in
+                    guard i == 1 else { return }
+                    let s = encoder.lastStages
+                    if run == 0 { best[step] = s; return }
+                    best[step].motionSearch = min(best[step].motionSearch, s.motionSearch)
+                    best[step].interSearch = min(best[step].interSearch, s.interSearch)
+                    best[step].analysis = min(best[step].analysis, s.analysis)
+                    best[step].partition = min(best[step].partition, s.partition)
+                    best[step].leaves = min(best[step].leaves, s.leaves)
+                    best[step].mlPrune = min(best[step].mlPrune, s.mlPrune)
+                })
+            }
+            for (step, st) in best.enumerated() {
+                print(String(format: "  step %d GPU, stage by stage (ms): motion search %.2f · inter candidates %.2f · analysis %.1f · partition %.1f · leaves %.1f · learned pruning %.2f · sum %.1f",
+                             step + 1, st.motionSearch * 1000, st.interSearch * 1000, st.analysis * 1000, st.partition * 1000,
+                             st.leaves * 1000, st.mlPrune * 1000,
+                             (st.motionSearch + st.interSearch + st.analysis + st.partition + st.leaves + st.mlPrune) * 1000))
+            }
+            encoder.profilesStages = false
+        }
+        return
     }
     let n = Double(frames.count)
     func mean(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { frames.map { f($0.timing) }.reduce(0, +) / n * 1000 }

@@ -198,6 +198,21 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// predicts from it.
     var referenceSource: [any MTLBuffer]?
 
+    /// The next inter frame's motion search predicts from this luma plane instead (padded as a
+    /// source is): a decoded picture, for a frame that codes the same source again
+    /// (`AV1HybridEncoder.encodeTwoSteps`). Only luma is read from a reference.
+    func setReference(y: UnsafePointer<UInt8>, width: Int, height: Int) throws {
+        let aw = ((2 * ((width + 7) >> 3) + 15) >> 4) * 64, ah = ((2 * ((height + 7) >> 3) + 15) >> 4) * 64
+        let planes = try takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)])
+        let d = planes[0].contents().assumingMemoryBound(to: UInt8.self)
+        for row in 0..<ah {
+            let line = d + row * aw, from = y + min(row, height - 1) * width
+            line.update(from: from, count: width)
+            (line + width).update(repeating: from[width - 1], count: aw - width)
+        }
+        referenceSource = planes
+    }
+
     /// Orders pictures' analyses on the GPU behind the CPU's reading of the one before, which
     /// they overwrite (the cache's results): a picture's analysis is committed while the last one
     /// still runs, and its command buffer waits until the event reaches the last one's `seq`.
