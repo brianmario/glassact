@@ -69,6 +69,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var copied = 0.0, shifted = 0.0, motion = 0.0
         /// Inter frames: the share of the picture in blocks the motion search predicts (with a residual).
         public var searched = 0.0
+        /// Inter frames: whether the coded 64×64s were searched for motion (`searchesMotion`, and not
+        /// skipped by `skipsMotionSearchOver`).
+        public var searchedMotion = false
         /// Key frames with `intraBlockCopy`: the share of the picture in blocks that copy the frame itself.
         public var intraCopied = 0.0
         /// From the picture's partition being ready to its bitstream.
@@ -258,6 +261,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// place of an intra one where it costs less. Off: copies only.
     public var searchesMotion = true
 
+    /// With `searchesMotion`: an inter frame coding (not copying) more than this share of its
+    /// 64×64s codes without the motion search, as with `searchesMotion` off (copies only, whole
+    /// samples); the rest as with it on. A picture that is mostly new finds little motion: the
+    /// search's GPU time for a few % of its bytes. Nil (the default): every inter frame searches.
+    public var skipsMotionSearchOver: Double?
+
     /// With `interFrames`: an inter frame starts from the CDFs its reference frame
     /// saved instead of the defaults (on), so a picture that hardly changed costs
     /// few bits. Loss-safe as long as the reference is a frame the decoder has.
@@ -423,12 +432,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // decided (on the CPU, from the two sources alone) before that.
         var next = count > 1 ? try picture(1) : nil
         if let next {
-            if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
+            if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion, skipsOver: skipsMotionSearchOver) }
             let copies = interFrames ? copyFinder.wait() : Copies()
             starting = Later { try self.begin(next, copies, qindex: qindex) }
         }
         var upcoming = count > 2 ? try picture(2) : nil
-        if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
+        if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion, skipsOver: skipsMotionSearchOver) }
         for i in 0..<count {
             let partition = try pending.partition.wait()
             Self.trace("partition \(i)")
@@ -443,7 +452,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     return try self.begin(up, copies, qindex: qindex)
                 }
                 upcoming = i + 3 < count ? try picture(i + 3) : nil
-                if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
+                if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion, skipsOver: skipsMotionSearchOver) }
             }
             let t0 = CACurrentMediaTime()
             var timing = Timing()
@@ -459,7 +468,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 let index = i
                 onWritten = { frame in written(index, frame) }
             }
-            let (w, ended) = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex,
+            let (w, ended) = try finish(current, partition: partition, motion: motion, searchesMotion: pending.searchesMotion,
+                                        refs: pending.refs, qindex: qindex,
                                         qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
                                         written: onWritten)
             writing = w
@@ -505,27 +515,25 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             var timing = Timing()
             timing.analysis = metal.lastGPUSeconds
             timing.motion = pending.motionSeconds
-            let (writing, _) = try finish(p, partition: partition, motion: pending.motion, refs: pending.refs, qindex: q,
+            let (writing, _) = try finish(p, partition: partition, motion: pending.motion, searchesMotion: pending.searchesMotion,
+                                          refs: pending.refs, qindex: q,
                                           qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: CACurrentMediaTime(),
                                           writingBefore: nil, written: nil)
             return try writing.end()
         }
-        let searches = searchesMotion
-        defer { searchesMotion = searches }
         var last: Picture?
         for i in 0..<count {
             let p = try picture(i)
             var copies = Copies()
             if let last {
-                copyFinder.start(p, after: last, searchesMotion: searches)
+                copyFinder.start(p, after: last, searchesMotion: searchesMotion, skipsOver: skipsMotionSearchOver)
                 copies = copyFinder.wait()
             }
-            searchesMotion = searches
             try output(i, 0, try code(p, copies, coarseQindex))
             let decoded = previousDecoded(width: p.width, height: p.height)
             guard decoded.count == 3 else { throw Failure.encode("two steps: no decoded picture") }
             try decoded[0].withUnsafeBufferPointer { try metal.setReference(y: $0.baseAddress!, width: p.width, height: p.height) }
-            searchesMotion = true  // (the frame's vectors are its motion search's, at its precision)
+            // (the second step's vectors are its motion search's, at its precision: `again` searches)
             try output(i, 1, try code(p, copyFinder.again(p, after: copies), qindex))
             last = p
         }
@@ -671,6 +679,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var partition: AV1MetalEncoder.PendingPartition
         /// Per 64×64: copy, dx, dy (nil: a key frame or a still picture).
         var motion: [Int32]?
+        /// An inter frame's coded 64×64s are searched for motion (`Copies.searchesMotion`).
+        var searchesMotion = false
         var motionSeconds = 0.0
         /// The picture's qindex per 64×64 (`sbQindex`'s), or nil.
         var qmap: [UInt8]? = nil
@@ -714,11 +724,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
         deinit { av1enc_motion_destroy(motion) }
 
-        /// Starts deciding picture `p`'s 64×64s that copy `prev` (none unless they're the same size).
-        func start(_ p: Picture, after prev: Picture, searchesMotion: Bool) {
+        /// Starts deciding picture `p`'s 64×64s that copy `prev` (none unless they're the same size),
+        /// and whether its coded ones are searched for motion: with `searchesMotion`, unless they're
+        /// more than `skipsOver` of them (`skipsMotionSearchOver`).
+        func start(_ p: Picture, after prev: Picture, searchesMotion: Bool, skipsOver: Double?) {
             running = true
             DispatchQueue.global(qos: .userInitiated).async {
-                self.result = self.copies(of: p, after: prev, searchesMotion: searchesMotion)
+                self.result = self.copies(of: p, after: prev, searchesMotion: searchesMotion, skipsOver: skipsOver)
                 self.done.signal()
             }
         }
@@ -744,11 +756,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let copied = (0..<nsb).map { i in UInt8(first.skip.map { $0[i] != 0 ? 1 : 0 } ?? 0) }
             var m = [Int32](repeating: 0, count: 3 * nsb)
             for i in 0..<nsb { m[3 * i] = Int32(copied[i]) }
-            return Copies(motion: m, skip: copied, candidates: [0, 0],
+            return Copies(motion: m, skip: copied, candidates: [0, 0], searchesMotion: true,
                           refs: Refs(last: lastSlot, golden: g != nil ? goldenSlot + 1 : 0, refresh: 1 << lastSlot))
         }
 
-        private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
+        private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool, skipsOver: Double?) -> Copies {
             guard prev.width == p.width, prev.height == p.height else { return Copies() }
             let tm = CACurrentMediaTime()
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
@@ -776,13 +788,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 goldenSource = prev
                 (lastSlot, goldenSlot) = (goldenSlot, lastSlot)
             }
+            // the share coded (not copied from either reference): AV1MetalEncoder's `codedShare`
+            let coded = Double((0..<nsb).filter { m[3 * $0] == 0 }.count) / Double(max(1, nsb))
+            let searches = searchesMotion && !(skipsOver.map { coded > $0 } ?? false)
             var candidates: [Int32]?
-            if searchesMotion {
+            if searches {
                 var c = [Int32](repeating: 0, count: 2 * Int(GP_ME_CANDS))
                 c.removeLast(c.count - 2 * Int(av1enc_motion_candidates(motion, &c, GP_ME_CANDS)))
                 candidates = c
             }
-            return Copies(motion: m, skip: (0..<nsb).map { UInt8(m[3 * $0]) }, candidates: candidates,
+            return Copies(motion: m, skip: (0..<nsb).map { UInt8(m[3 * $0]) }, candidates: candidates, searchesMotion: searches,
                           seconds: CACurrentMediaTime() - tm, refs: refs)
         }
     }
@@ -793,8 +808,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var motion: [Int32]?
         /// Per 64×64: nonzero where it's a copy (not analyzed).
         var skip: [UInt8]?
-        /// The frame's shift candidates for the motion search.
+        /// The frame's shift candidates for the motion search (nil: no motion search).
         var candidates: [Int32]?
+        /// The coded 64×64s are searched for motion (`candidates` given), at `searchesSubpelMotion`'s
+        /// precision; otherwise the frame's vectors are whole samples.
+        var searchesMotion = false
         var seconds = 0.0
         /// The frame's reference slots.
         var refs: Refs?
@@ -820,11 +838,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             p.y.withUnsafeBufferPointer { av1enc_ibc_hashes_compute(h.handle, $0.baseAddress, UInt32(p.width), UInt32(p.height)) }
             hashes = h
         }
-        return Pending(partition: partition, motion: copies.motion, motionSeconds: copies.seconds, qmap: qmap, hashes: hashes,
-                       refs: copies.refs)
+        return Pending(partition: partition, motion: copies.motion, searchesMotion: copies.searchesMotion,
+                       motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs)
     }
 
-    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, refs: Refs?, qindex: Int,
+    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, searchesMotion: Bool,
+                        refs: Refs?, qindex: Int,
                         qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double, writingBefore: Writing?,
                         written: (@Sendable (Frame) -> Void)?) throws -> (Writing, Frame?) {
         var timing = timing
@@ -869,7 +888,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 video.lf_inter_off = 1
                 video.allow_screen_content_tools = 1
                 video.cdf_from_ref = carriesCDFs ? 1 : 0
+                // (the frame's: `skipsMotionSearchOver` decides it picture by picture)
                 video.mv_precision = searchesMotion && searchesSubpelMotion ? 1 : 0
+                timing.searchedMotion = searchesMotion
                 sbMotion = sbMotionIn
                 let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count
                 var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?

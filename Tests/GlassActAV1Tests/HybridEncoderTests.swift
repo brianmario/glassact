@@ -447,3 +447,66 @@ extension HybridEncoderTests {
         }
     }
 }
+
+extension HybridEncoderTests {
+    /// `skipsMotionSearchOver`: a stream of a scene whose photo drifts, with a picture of noise
+    /// (all new) every third, codes the noise pictures without the motion search (whole-sample
+    /// vectors) and the scene's with it (quarter samples, and blocks predicted at them), the search
+    /// switched picture by picture; libaom decodes the stream in order to exactly the pictures the
+    /// encoder reports.
+    @available(macOS 27, *)
+    @Test func motionSearchSkippedPictureByPictureStaysExact() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 384)
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (1, 1)
+        encoder.interFrames = true
+        encoder.skipsMotionSearchOver = 0.5
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x6e0_5ea7)
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<10 {
+            var y = base.y
+            if i % 3 == 2 {
+                for k in y.indices { y[k] = UInt8(clamping: 40 + (k % 53) + rng.int(0..<120)) }
+            } else {
+                // the photo: a smooth texture, moved (3, 1) and brightened by 2 a picture
+                for r in 100..<300 {
+                    for c in 64..<448 {
+                        let (u0, v0) = (c + 3 * i, r + i)
+                        y[r * width + c] = UInt8(clamping: 60 + 2 * i + (u0 * 7 + v0 * 3) % 50 + ((u0 / 9 + v0 / 7) % 3) * 20)
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var skipped: [Int] = [], searched = 0.0
+        try encoder.encode(count: pictures.count, qindex: 100, picture: { pictures[$0] }, output: { i, f in
+            if i > 0 {
+                let new = i % 3 == 2
+                #expect(f.timing.searchedMotion == !new, "frame \(i): searched \(f.timing.searchedMotion)")
+                #expect(f.params.mv_precision == (new ? 0 : 1), "frame \(i): mv_precision \(f.params.mv_precision)")
+                if !f.timing.searchedMotion {
+                    skipped.append(i)
+                    #expect(f.timing.searched == 0, "frame \(i): blocks predicted without a motion search")
+                } else {
+                    searched += f.timing.searched
+                }
+            }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        #expect(skipped == [2, 5, 8], "skipped the motion search in frames \(skipped)")
+        #expect(searched > 0, "no block was motion-searched in the frames that searched")
+    }
+}
