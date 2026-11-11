@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 
 **Rate control and transport**
@@ -306,6 +307,32 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: no motion search on mostly-new pictures, by coded share, measured, not adopted (2026-11-11)
+
+`AV1HybridEncoder.skipsMotionSearchOver` / `av1seq --no-motion-over <share>` (branch
+`motion-rule`, `d2146af`, not merged). It codes an inter frame without the motion search when it
+codes, rather than copies, more than the share of its 64x64s. The copy finder knows that before
+the GPU work, and the decision travels with the frame to the header's `mv_precision`. Off, the
+streams were unchanged; at 0 they were `--no-motion-search`'s, and at 1 today's. Every frame
+decoded exactly, and a test mixing searched and unsearched frames passes. BD-rate against today,
+by RGB PSNR / SSIMULACRA2, at q 8–32:
+
+| content | 0.5 | 0.9 | inter frames skipped at 0.5 / 0.9 |
+|---|---|---|---|
+| the rotation, 5K, 12 frames | +3.07 % / +3.02 % | −0.05 % / −0.15 % | 11 / 3 of 11 |
+| typing and scrolling in turn, 2900 | +6.8 % / +6.7 % | 0 | 1 / 0 of 29 |
+| scrolling, dragging, switching apps, 2900 | 0 | 0 | 0 |
+| video, 2900 | +16.9 % / +21.3 % | the same | 29 / 29 of 29 |
+| scrolling images, 2900 | +426 % / +554 % | 0 | 29 / 0 of 29 |
+
+GPU stages at 0.5 on the rotation (provisional): 21.8 → 16.2 ms, the motion search and inter
+candidates gone. Coded share is the wrong signal. Copies are exact matches only: resampled
+scrolling copies ≈ 20 % of its 64x64s, yet motion covers 79 % of the picture, and video codes over
+97 % of its 64x64s, more than any rotation picture. In the typing-and-scrolling pair, the one frame
+skipped was a whole-picture switch the search still found much in (160 → 203 KB). A rule would
+need a signal of whether the search finds anything, such as the share of blocks motion won in
+recent pictures, with periodic re-checks.
 
 ### Metal AV1: reviewers' ideas measured, inter candidates side by side kept (2026-11-11)
 
