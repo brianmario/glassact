@@ -27,6 +27,9 @@
 //!     other name: the level model's raw f32s, then the mode model's, then the chroma model's)
 //! EVAL=<raw weights> cargo run --release --example prune_train -- <dumps>
 //!     score raw weights (as EXPORT writes them) on the dumps
+//! MODEL=nodes SUB=8 cargo run --release --example prune_train -- <dumps>
+//!     an experiment: node-level rules for keeping the 32x32s' and 64x64s' shapes against k_ml_tree's
+//!     any-cell rule, held out as above (see nodes_experiment)
 use std::collections::HashMap;
 use std::fs;
 
@@ -274,18 +277,50 @@ fn sections(d: &[u8], path: &str) -> HashMap<String, Vec<u8>> {
     out
 }
 
+/// Threads for loading and scoring (THREADS, default 4: the Mac is shared).
+fn threads() -> usize {
+    std::env::var("THREADS").map_or(4, |v| v.parse().unwrap()).max(1)
+}
+
 fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
     let mut traces: Vec<String> = vec![];
-    let mut pics = vec![];
     let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
     entries.sort();
-    for e in entries {
+    let mut work = vec![];
+    // PICK=k: every k-th picture only (quick experiments)
+    let pick = std::env::var("PICK").map_or(1, |v| v.parse::<usize>().unwrap()).max(1);
+    for e in entries.into_iter().step_by(pick) {
         let name = e.file_name().unwrap().to_string_lossy().to_string();
         let tr = name.split('-').next().unwrap().to_string();
         if !traces.contains(&tr) {
             traces.push(tr.clone());
         }
-        let ti = traces.iter().position(|t| *t == tr).unwrap();
+        work.push((e, traces.iter().position(|t| *t == tr).unwrap()));
+    }
+    // pictures in parallel (MODEL=nodes needs only the level model's cells and the node costs)
+    let lite = std::env::var("MODEL").is_ok_and(|m| m == "nodes");
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut pics: Vec<Option<Pic>> = (0..work.len()).map(|_| None).collect();
+    let slots = std::sync::Mutex::new(&mut pics);
+    std::thread::scope(|s| {
+        for _ in 0..threads() {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= work.len() {
+                        break;
+                    }
+                    let p = load_pic(&work[i].0, work[i].1, sub, lite);
+                    slots.lock().unwrap()[i] = Some(p);
+                }
+            });
+        }
+    });
+    (traces, pics.into_iter().map(|p| p.unwrap()).collect())
+}
+
+fn load_pic(e: &std::path::Path, ti: usize, sub: usize, lite: bool) -> Pic {
+    {
         let path = e.join("p000.bin");
         let d = fs::read(&path).unwrap();
         let s = sections(&d, &path.display().to_string());
@@ -316,6 +351,7 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
             // a leaf with chroma (sub-8x8: the 8x8's last), k_leaf's chroma block
             let has_chroma = (bw > 4 || mi_col & 1 == 1) && (bh > 4 || mi_row & 1 == 1);
             if let Some(uv) = chro
+                && !lite
                 && has_chroma
                 && (sub <= 1 || (mi_row * 7 + mi_col * 13) % sub == 0)
             {
@@ -342,7 +378,7 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
                 (
                     cols,
                     (0..k).map(|k| stats(y, w, (k % cols) * n, (k / cols) * n, n, st2)).collect(),
-                    (0..k).map(|k| hog(y, w, (k % cols) * n, (k / cols) * n, n)).collect(),
+                    if lite { vec![] } else { (0..k).map(|k| hog(y, w, (k % cols) * n, (k / cols) * n, n)).collect() },
                 )
             })
             .collect();
@@ -406,7 +442,7 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
         }
         // the mode model: every analyzed block of a whole node's own shapes, its best mode
         let mut nodes = vec![];
-        if let Some(md) = s.get("MODE") {
+        if let Some(md) = s.get("MODE").filter(|_| !lite) {
             let mut o = 0;
             while o + 12 <= md.len() {
                 let (bs, cols, rows) = (u(md, o) as u8, u(md, o + 4), u(md, o + 8));
@@ -431,13 +467,12 @@ fn load(dir: &str, sub: usize) -> (Vec<String>, Vec<Pic>) {
             .iter()
             .filter(|&&(x, y0, li, _)| {
                 let n = 8 << li;
-                x + n <= (w / n) * n && y0 + n <= (h / n) * n
+                !lite && x + n <= (w / n) * n && y0 + n <= (h / n) * n
             })
             .map(|&(x, y0, li, m)| (node_features(li, x / (8 << li), y0 / (8 << li)), m))
             .collect();
-        pics.push(Pic { trace: ti, w, h, sbc, costs, cells, nodes, leaves, chroma });
+        Pic { trace: ti, w, h, sbc, costs, cells, nodes, leaves, chroma }
     }
-    (traces, pics)
 }
 
 /// A one-hidden-layer network (tanh, softmax), its inputs standardized.
@@ -496,6 +531,19 @@ impl Mlp {
 }
 
 fn train(data: &[(&[f32], u8)], nf: usize, hn: usize, c: usize, steps: usize, seed: u64) -> Mlp {
+    train_by(data, None, nf, hn, c, steps, seed)
+}
+
+/// `train`, with each step's sample drawn in proportion to its weight when `weights` are given.
+fn train_by(data: &[(&[f32], u8)], weights: Option<&[f64]>, nf: usize, hn: usize, c: usize, steps: usize, seed: u64) -> Mlp {
+    let cum: Option<Vec<f64>> = weights.map(|w| {
+        w.iter()
+            .scan(0f64, |a, &x| {
+                *a += x;
+                Some(*a)
+            })
+            .collect()
+    });
     let mut mu = vec![0f32; nf];
     let mut sd = vec![0f32; nf];
     for (f, _) in data {
@@ -538,7 +586,14 @@ fn train(data: &[(&[f32], u8)], nf: usize, hn: usize, c: usize, steps: usize, se
     let mut gh = vec![0f32; hn];
     for it in 0..steps {
         let lr = 0.03 * (1.0 - it as f32 / steps as f32) + 0.001;
-        let (f, y) = data[(rnd() as usize) % data.len()];
+        let pick = match &cum {
+            None => (rnd() as usize) % data.len(),
+            Some(cw) => {
+                let u = (rnd() >> 11) as f64 / (1u64 << 53) as f64 * cw[cw.len() - 1];
+                cw.partition_point(|&x| x <= u).min(cw.len() - 1)
+            }
+        };
+        let (f, y) = data[pick];
         m.fwd(f, &mut h, &mut p);
         let x: Vec<f32> = (0..nf).map(|k| (f[k] - m.mu[k]) / m.sd[k]).collect();
         gh.iter_mut().for_each(|g| *g = 0.0);
@@ -821,6 +876,751 @@ fn report_tx(m: &Mlp, data: &[&(usize, Vec<f32>, u8, u32)]) -> String {
     out
 }
 
+// MODEL=nodes (an offline experiment; the GPU runs none of it): whether the 32x32s and 64x64s keep
+// their own shapes by a node-level decision instead of k_ml_tree's "any cell keeps the level".
+// Every trace's cells get probabilities from the level model trained on the other traces (seeds as
+// the level report's), the 8x8s and 16x16s keep the cells' rule at eps, and each 64x64 and 32x32 is
+// kept by one of:
+// - any: a cell keeps its level (today's rule);
+// - mean / q50 / q75 / q90 / max: that statistic of its cells' probability of its level passes a
+//   threshold (one for both levels, then a grid of one per level);
+// - frac: a share of its cells keeps its level at eps;
+// - net: a small network per node (one for the 64x64s, one for the 32x32s, the 64x64 decided first)
+//   from its cells' probabilities, its keep bits and its statistics, trained on what skipping it
+//   costs the SB's best J (the DP over the dumped node costs) against the analysis it saves;
+// - oracle: per SB, the best of the 32 choices of its five large nodes for a trade of J for time
+//   (a bound for any node-level rule given the small levels).
+// A large node a cell keeps but the rule drops must split, as k_ml_tree's repair makes a node a cell
+// below needs (its children without a partition of their own keep theirs).
+// Reported: per level the share of nodes skipped as ms of LEVEL_MS (a 5K picture), totals over all
+// pictures (each picture weighted alike, as joint()) and over the 5K ones; the J the skips add,
+// pooled. ΔJ is the open-loop RD cost of the analysis's DP, a proxy for bytes.
+// NODE_STEPS (default STEPS), NODE_H (12), NODE_KMUL (1: the weight of J against time, the classes'
+// totals balanced), NODE_W (the weight of a node whose skip costs J: cap, its J capped at its SB's;
+// raw; log; flat, every sample alike), NODE_FEAT=p (the cells' outputs only, not the node's
+// statistics), NODE_EPS (0.02,0.05), NODE_ONLY (rules, net, oracle: some).
+
+const LVB: [usize; 4] = [0, 1, 5, 21];
+/// Nodes per SB at each level (8, 16, 32, 64).
+const PER_SB: [f64; 4] = [64.0, 16.0, 4.0, 1.0];
+
+fn child(lv: usize, t: usize, q: usize) -> usize {
+    let per = 1 << lv;
+    LVB[lv + 1] + ((t / per) * 2 + q / 2) * per * 2 + (t % per) * 2 + q % 2
+}
+
+/// An SB's nodes (by depth, as joint()) whose own level a cell keeps, and those where a cell keeps a
+/// level below theirs.
+fn sb_flags(pic: &Pic, keep: &[u8], sbx: usize, sby: usize) -> ([bool; 85], [bool; 85]) {
+    let cols8 = pic.w / 8;
+    let (mut own, mut below) = ([false; 85], [false; 85]);
+    for lv in 0..4 {
+        let (per, n, level) = (1 << lv, 64 >> lv, 3 - lv);
+        for t in 0..per * per {
+            let (x0, y0) = (sbx * 64 + (t % per) * n, sby * 64 + (t / per) * n);
+            for cy in y0 / 8..(y0 + n) / 8 {
+                for cx in x0 / 8..(x0 + n) / 8 {
+                    let b = keep[cy * cols8 + cx];
+                    own[LVB[lv] + t] |= b >> level & 1 != 0;
+                    below[LVB[lv] + t] |= b & ((1 << level) - 1) != 0;
+                }
+            }
+        }
+    }
+    (own, below)
+}
+
+/// k_ml_tree's repair of `own`, then the DP: (the best J with the shapes kept, with all of them).
+fn sb_dp(c: &[f32], own: &mut [bool; 85], below: &[bool; 85]) -> (f32, f32) {
+    let mut feas = [false; 85];
+    for lv in (0..4).rev() {
+        for t in 0..(1 << lv) * (1 << lv) {
+            let i = LVB[lv] + t;
+            feas[i] = own[i] || (lv < 3 && (0..4).all(|q| feas[child(lv, t, q)]));
+        }
+    }
+    for lv in 0..3 {
+        for t in 0..(1 << lv) * (1 << lv) {
+            if !below[LVB[lv] + t] {
+                continue;
+            }
+            for q in 0..4 {
+                let ci = child(lv, t, q);
+                if !feas[ci] {
+                    own[ci] = true;
+                    feas[ci] = true;
+                }
+            }
+        }
+    }
+    let (mut bo, mut bn) = ([0f32; 85], [0f32; 85]);
+    for lv in (0..4).rev() {
+        for t in 0..(1 << lv) * (1 << lv) {
+            let i = LVB[lv] + t;
+            bo[i] = c[2 * i].min(c[2 * i + 1]);
+            if lv == 3 {
+                bn[i] = if own[i] { bo[i] } else { f32::INFINITY };
+                continue;
+            }
+            let d: f32 = (0..4).map(|q| bn[child(lv, t, q)] - bo[child(lv, t, q)]).sum();
+            bn[i] = (if own[i] { c[2 * i] } else { f32::INFINITY }).min(c[2 * i + 1] + d);
+        }
+    }
+    (bn[0], bo[0])
+}
+
+/// An SB with the large nodes `d` decides (bit i: node i kept; 0 the 64x64, 1..5 the 32x32s), or as
+/// its cells say: (J added / λ, J / λ, nodes skipped per level 8..64).
+fn sb_eval(c: &[f32], own: &[bool; 85], below: &[bool; 85], d: Option<u8>) -> (f64, f64, [u8; 4]) {
+    let (mut own, mut below) = (*own, *below);
+    if let Some(d) = d {
+        for i in 0..5 {
+            let k = d >> i & 1 != 0;
+            if own[i] && !k {
+                below[i] = true;
+            }
+            own[i] = k;
+        }
+    }
+    let lam = c[170].max(1e-6) as f64;
+    let (bn, bo) = sb_dp(c, &mut own, &below);
+    let mut cnt = [0u8; 4];
+    for lv in 0..4 {
+        for t in 0..(1 << lv) * (1 << lv) {
+            cnt[3 - lv] += !own[LVB[lv] + t] as u8;
+        }
+    }
+    if !bo.is_finite() {
+        return (0.0, 0.0, cnt);
+    }
+    (((bn - bo) as f64 / lam).min(1e7), bo as f64 / lam, cnt)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Score {
+    added: f64,
+    total: f64,
+    /// the J added with each SB's capped at its own J, and the SBs whose J the skips more than double
+    capped: f64,
+    blowups: f64,
+    /// per level (8..64): the sum over pictures of the share of its nodes skipped
+    skip: [f64; 4],
+    pics: f64,
+}
+impl Score {
+    fn add(&mut self, o: &Score) {
+        self.added += o.added;
+        self.total += o.total;
+        self.capped += o.capped;
+        self.blowups += o.blowups;
+        for l in 0..4 {
+            self.skip[l] += o.skip[l];
+        }
+        self.pics += o.pics;
+    }
+    fn dj(&self) -> f64 {
+        self.added / self.total.max(1e-9) * 100.0
+    }
+    fn dj_capped(&self) -> f64 {
+        self.capped / self.total.max(1e-9) * 100.0
+    }
+    fn ms(&self, l: usize) -> f64 {
+        LEVEL_MS[l] * self.skip[l] / self.pics.max(1.0)
+    }
+    fn ms_total(&self) -> f64 {
+        (0..4).map(|l| self.ms(l)).sum()
+    }
+}
+
+/// Runs `f` on 0..n over threads(), in order.
+fn par_map<T: Send>(n: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: std::sync::Mutex<Vec<Option<T>>> = std::sync::Mutex::new((0..n).map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..threads().min(n.max(1)) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let v = f(i);
+                    out.lock().unwrap()[i] = Some(v);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap().into_iter().map(|v| v.unwrap()).collect()
+}
+
+/// The pictures' scores (all of them, the 5K ones) with the large nodes `decide` (picture, SB)
+/// returns, or the cells' rule where it returns None.
+fn score(pics: &[&Pic], keeps: &[Vec<u8>], decide: &(dyn Fn(usize, usize) -> Option<u8> + Sync)) -> (Score, Score) {
+    score_with(pics, keeps, decide, false)
+}
+
+/// `score`; with `and_any`, a large node is kept only where the cells' rule keeps it too.
+fn score_with(pics: &[&Pic], keeps: &[Vec<u8>], decide: &(dyn Fn(usize, usize) -> Option<u8> + Sync), and_any: bool) -> (Score, Score) {
+    let per: Vec<Score> = par_map(pics.len(), &|pi| {
+        let pic = pics[pi];
+        let nsb = ((pic.w / 64) * (pic.h / 64)) as f64;
+        let mut s = Score { pics: 1.0, ..Default::default() };
+        let mut cnt = [0f64; 4];
+        for sby in 0..pic.h / 64 {
+            for sbx in 0..pic.w / 64 {
+                let sb = sby * pic.sbc + sbx;
+                let (own, below) = sb_flags(pic, &keeps[pi], sbx, sby);
+                let own5 = (0..5).fold(0u8, |m, i| m | (own[i] as u8) << i);
+                let d = decide(pi, sb).map(|d| if and_any { d & own5 } else { d });
+                let (a, t, c) = sb_eval(&pic.costs[sb * 171..sb * 171 + 171], &own, &below, d);
+                s.added += a;
+                s.total += t;
+                s.capped += a.min(t);
+                s.blowups += (a > t) as u8 as f64;
+                for l in 0..4 {
+                    cnt[l] += c[l] as f64;
+                }
+            }
+        }
+        for l in 0..4 {
+            s.skip[l] = cnt[l] / (PER_SB[l] * nsb);
+        }
+        s
+    });
+    let (mut all, mut big) = (Score::default(), Score::default());
+    for (pi, s) in per.iter().enumerate() {
+        all.add(s);
+        if pics[pi].w >= 2560 {
+            big.add(s);
+        }
+    }
+    (all, big)
+}
+
+/// The best skipped ms at a ΔJ on a curve of (ΔJ, ms) points (its upper frontier, linear between
+/// points; NaN below its first).
+fn ms_at(points: &[(f64, f64)], dj: f64) -> f64 {
+    let mut p = points.to_vec();
+    p.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut f: Vec<(f64, f64)> = vec![];
+    for q in p {
+        if f.last().is_none_or(|l| q.1 > l.1) {
+            f.push(q);
+        }
+    }
+    let mut out = f64::NAN;
+    for k in 0..f.len() {
+        if f[k].0 <= dj {
+            out = f[k].1;
+            if k + 1 < f.len() && f[k + 1].0 > dj {
+                let (a, b) = (f[k], f[k + 1]);
+                out = a.1 + (b.1 - a.1) * (dj - a.0) / (b.0 - a.0);
+            }
+        }
+    }
+    out
+}
+
+/// The least ΔJ for a skipped ms on a curve of (ΔJ, ms) points (NaN past its last).
+fn dj_at(points: &[(f64, f64)], ms: f64) -> f64 {
+    let mut p = points.to_vec();
+    p.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // the frontier from the most skipped down: ΔJ falling
+    let mut f: Vec<(f64, f64)> = vec![];
+    for q in p {
+        if f.last().is_none_or(|l| q.0 < l.0) {
+            f.push(q);
+        }
+    }
+    let mut out = f64::NAN;
+    for k in 0..f.len() {
+        if f[k].1 >= ms {
+            out = f[k].0;
+            if k + 1 < f.len() && f[k + 1].1 < ms {
+                let (a, b) = (f[k + 1], f[k]);
+                out = a.0 + (b.0 - a.0) * (ms - a.1) / (b.1 - a.1);
+            }
+        }
+    }
+    out
+}
+
+/// A large node's cells' positions in `pic.cells` (64 for the 64x64, 16 for a 32x32).
+fn node_cells(pic: &Pic, sbx: usize, sby: usize, i: usize) -> Vec<usize> {
+    let cw = (pic.w / 64) * 8;
+    let (x0, y0, n) = if i == 0 { (0, 0, 8) } else { (((i - 1) % 2) * 4, ((i - 1) / 2) * 4, 4) };
+    let mut v = Vec::with_capacity(n * n);
+    for r in 0..n {
+        for c in 0..n {
+            v.push((sby * 8 + y0 + r) * cw + sbx * 8 + x0 + c);
+        }
+    }
+    v
+}
+
+const AGGS: [&str; 6] = ["mean", "q50", "q75", "q90", "max", "min"];
+
+/// A large node's statistics of its cells' probability of its level, in AGGS' order.
+fn node_aggs(probs: &[[f32; 4]], cells: &[usize], l: usize) -> [f32; 6] {
+    let mut v: Vec<f32> = cells.iter().map(|&c| probs[c][l]).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |f: f32| v[((v.len() - 1) as f32 * f).round() as usize];
+    [v.iter().sum::<f32>() / v.len() as f32, q(0.5), q(0.75), q(0.9), v[v.len() - 1], v[0]]
+}
+
+/// The node network's features (NODE_NF64 or NODE_NF32 with the parent's).
+fn node_features(pic: &Pic, probs: &[[f32; 4]], keep: &[u8], sbx: usize, sby: usize, i: usize, parent: Option<(bool, f32)>) -> Vec<f32> {
+    let l = if i == 0 { 3 } else { 2 };
+    let cells = node_cells(pic, sbx, sby, i);
+    let n = cells.len() as f32;
+    let mut f = Vec::with_capacity(21);
+    for k in 0..4 {
+        f.push(cells.iter().map(|&c| probs[c][k]).sum::<f32>() / n);
+    }
+    let a = node_aggs(probs, &cells, l);
+    f.extend_from_slice(&[a[4], a[5], a[2]]);
+    let cols8 = pic.w / 8;
+    let cw = (pic.w / 64) * 8;
+    let kb = |c: usize| keep[(c / cw) * cols8 + c % cw];
+    f.push(cells.iter().filter(|&&c| kb(c) >> l & 1 != 0).count() as f32 / n);
+    f.push(cells.iter().filter(|&&c| kb(c) & ((1 << l) - 1) != 0).count() as f32 / n);
+    if std::env::var("NODE_FEAT").map_or(true, |v| v != "p") {
+        f.extend_from_slice(&pic.cells[cells[0]].1[l * PF..l * PF + PF]);
+    }
+    if let Some((kept, p64)) = parent {
+        f.push(kept as u8 as f32);
+        f.push(p64);
+    }
+    f.push(1.0);
+    f
+}
+
+fn nodes_experiment(traces: &[String], pics: &[Pic], sub: usize, steps: usize) {
+    let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
+    let node_steps = env("NODE_STEPS", steps);
+    let node_h = env("NODE_H", 12);
+    let kmul: f64 = std::env::var("NODE_KMUL").map_or(1.0, |v| v.parse().unwrap());
+    let wmode = std::env::var("NODE_W").unwrap_or_default();
+    let only = std::env::var("NODE_ONLY").unwrap_or_default();
+    let run = |what: &str| only.is_empty() || only.split(',').any(|o| o == what);
+    let epss: Vec<f32> =
+        std::env::var("NODE_EPS").map_or(vec![0.02, 0.05], |v| v.split(',').map(|x| x.parse().unwrap()).collect());
+    for p in pics {
+        assert_eq!(p.cells.len(), (p.w / 64) * 8 * (p.h / 64) * 8, "MODEL=nodes needs every cell (no SUB at load)");
+    }
+    let pics: Vec<&Pic> = pics.iter().collect();
+    // an SB's index among its picture's whole SBs
+    let sbi = |pi: usize, sb: usize| {
+        let p = pics[pi];
+        (sb / p.sbc) * (p.w / 64) + sb % p.sbc
+    };
+    let t0 = std::time::Instant::now();
+    // every picture's cells' probabilities from the level model trained on the other traces
+    let models: Vec<Mlp> = par_map(traces.len(), &|t| {
+        let data: Vec<(&[f32], u8)> = pics
+            .iter()
+            .filter(|p| p.trace != t)
+            .flat_map(|p| p.cells.iter().enumerate().filter(|(i, _)| i % sub.max(1) == 0).map(|(_, c)| (c.1.as_slice(), c.2)))
+            .collect();
+        train(&data, level_nf(), LEVEL_H, 4, steps, 5 + t as u64)
+    });
+    let probs: Vec<Vec<[f32; 4]>> = par_map(pics.len(), &|pi| {
+        let m = &models[pics[pi].trace];
+        let (mut h, mut p) = (vec![0f32; m.h], vec![0f32; m.c]);
+        pics[pi]
+            .cells
+            .iter()
+            .map(|(_, f, _)| {
+                m.fwd(f, &mut h, &mut p);
+                [p[0], p[1], p[2], p[3]]
+            })
+            .collect()
+    });
+    eprintln!("nodes: level models trained and run, {:.0} s", t0.elapsed().as_secs_f64());
+    let all = &pics;
+    let keeps_at = |eps: f32| -> Vec<Vec<u8>> {
+        par_map(pics.len(), &|pi| {
+            let p = &pics[pi];
+            let mut k = vec![0xFu8; (p.w / 8) * (p.h / 8)];
+            for (ci, (cell, _, _)) in p.cells.iter().enumerate() {
+                k[*cell] = keep_classes(&probs[pi][ci], eps) as u8;
+            }
+            k
+        })
+    };
+    // the large nodes' statistics of their cells' probabilities, per picture and SB
+    let aggs: Vec<Vec<[[f32; 6]; 5]>> = par_map(pics.len(), &|pi| {
+        let p = &pics[pi];
+        let mut v = vec![[[0f32; 6]; 5]; p.sbc * (p.h / 64)];
+        for sby in 0..p.h / 64 {
+            for sbx in 0..p.w / 64 {
+                for i in 0..5 {
+                    v[sby * p.sbc + sbx][i] = node_aggs(&probs[pi], &node_cells(p, sbx, sby, i), if i == 0 { 3 } else { 2 });
+                }
+            }
+        }
+        v
+    });
+    let row = |name: &str, thr: &str, s: &(Score, Score)| {
+        let (a, b) = s;
+        println!(
+            "{name:7} {thr:>13} | 5K ms skipped 8 {:5.2} 16 {:5.2} 32 {:5.2} 64 {:5.2} = {:5.2} | dJ {:6.3} % capped {:6.3} % blowups {:3} | all: {:5.2} ms dJ {:6.3} % capped {:6.3} % | 32 {:5.2} 64 {:5.2}",
+            b.ms(0),
+            b.ms(1),
+            b.ms(2),
+            b.ms(3),
+            b.ms_total(),
+            b.dj(),
+            b.dj_capped(),
+            b.blowups,
+            a.ms_total(),
+            a.dj(),
+            a.dj_capped(),
+            a.ms(2),
+            a.ms(3)
+        );
+    };
+    // the current rule's curve, checked against joint()
+    let mut any_pts: Vec<(f32, Score, Score)> = vec![];
+    for &eps in &EPSS {
+        let keeps = keeps_at(eps);
+        let s = score(&all, &keeps, &|_, _| None);
+        if eps == 0.02 {
+            let (mut add, mut tot) = (0.0, 0.0);
+            for (pi, p) in pics.iter().enumerate() {
+                let (a, t, _) = joint(p, &keeps[pi]);
+                add += a;
+                tot += t;
+            }
+            assert!((add / tot * 100.0 - s.0.dj()).abs() < 1e-9, "the any rule differs from joint()");
+        }
+        if std::env::var("NODE_DEBUG").is_ok() {
+            let mut top: Vec<(f64, usize, usize, f64)> = vec![];
+            for (pi, p) in pics.iter().enumerate() {
+                for sby in 0..p.h / 64 {
+                    for sbx in 0..p.w / 64 {
+                        let sb = sby * p.sbc + sbx;
+                        let (own, below) = sb_flags(p, &keeps[pi], sbx, sby);
+                        let (a, t, _) = sb_eval(&p.costs[sb * 171..sb * 171 + 171], &own, &below, None);
+                        top.push((a, pi, sb, t));
+                    }
+                }
+            }
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let tot: f64 = top.iter().map(|t| t.3).sum();
+            for t in &top[..8] {
+                eprintln!("eps {eps}: pic {} ({}x{}) sb {}: added {:.1} ({:.4} % of all J), its J {:.1}", t.1, pics[t.1].w, pics[t.1].h, t.2, t.0, t.0 / tot * 100.0, t.3);
+            }
+        }
+        row("any", &format!("eps {eps}"), &s);
+        any_pts.push((eps, s.0, s.1));
+    }
+    let taus = [0.002f32, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5];
+    let fracs = [1.0f32 / 64.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75];
+    let pts = |v: &[(Score, Score)], big: bool| -> Vec<(f64, f64)> {
+        v.iter().map(|(a, b)| if big { (b.dj(), b.ms_total()) } else { (a.dj(), a.ms_total()) }).collect()
+    };
+    let pts_capped = |v: &[(Score, Score)], big: bool| -> Vec<(f64, f64)> {
+        v.iter().map(|(a, b)| if big { (b.dj_capped(), b.ms_total()) } else { (a.dj_capped(), a.ms_total()) }).collect()
+    };
+    // (family, eps) -> points
+    let mut curves: Vec<(String, f32, Vec<(Score, Score)>)> = vec![];
+    for &eps in &epss {
+        let keeps = keeps_at(eps);
+        let anchor = any_pts.iter().find(|p| p.0 == eps).map(|p| (p.1, p.2));
+        println!("-- small levels at eps {eps}; the large nodes:");
+        // 1: one threshold on a statistic of the cells' probabilities
+        for (ai, an) in AGGS.iter().enumerate().filter(|_| run("rules")) {
+            let mut v = vec![];
+            for &tau in &taus {
+                let s = score(&all, &keeps, &|pi, sb| {
+                    let a = &aggs[pi][sb];
+                    Some((0..5).fold(0u8, |m, i| m | ((a[i][ai] >= tau) as u8) << i))
+                });
+                row(an, &format!("{tau}"), &s);
+                v.push(s);
+            }
+            curves.push((an.to_string(), eps, v));
+            if ai == 0 || ai == 2 {
+                let mut v = vec![];
+                for &tau in &taus {
+                    let s = score_with(
+                        &all,
+                        &keeps,
+                        &|pi, sb| {
+                            let a = &aggs[pi][sb];
+                            Some((0..5).fold(0u8, |m, i| m | ((a[i][ai] >= tau) as u8) << i))
+                        },
+                        true,
+                    );
+                    row(&format!("{an}&any"), &format!("{tau}"), &s);
+                    v.push(s);
+                }
+                curves.push((format!("{an}&any"), eps, v));
+            }
+        }
+        // a share of the cells keeping the level at eps
+        if run("rules") {
+            let mut v = vec![];
+            for &fr in &fracs {
+                let s = score(&all, &keeps, &|pi, sb| {
+                    let p = pics[pi];
+                    let (sbx, sby) = (sb % p.sbc, sb / p.sbc);
+                    Some((0..5).fold(0u8, |m, i| {
+                        let l = if i == 0 { 3 } else { 2 };
+                        let cells = node_cells(p, sbx, sby, i);
+                        let n = cells.iter().filter(|&&c| keeps[pi][p.cells[c].0] >> l & 1 != 0).count();
+                        m | ((n as f32 >= fr * cells.len() as f32 - 1e-6) as u8) << i
+                    }))
+                });
+                row("frac", &format!("{fr:.3}"), &s);
+                v.push(s);
+            }
+            curves.push(("frac".into(), eps, v));
+        }
+        // 2: a threshold per level (32x32, 64x64) for mean and q75
+        for ai in [0usize, 2].into_iter().filter(|_| run("rules")) {
+            let mut v = vec![];
+            for &t32 in &taus {
+                for &t64 in &taus {
+                    let s = score(&all, &keeps, &|pi, sb| {
+                        let a = &aggs[pi][sb];
+                        Some((0..5).fold(0u8, |m, i| m | ((a[i][ai] >= if i == 0 { t64 } else { t32 }) as u8) << i))
+                    });
+                    v.push(s);
+                }
+            }
+            // its frontier only
+            let p = pts(&v, true);
+            let mut order: Vec<usize> = (0..v.len()).collect();
+            order.sort_by(|&a, &b| p[a].0.partial_cmp(&p[b].0).unwrap());
+            let mut best = -1.0;
+            for &k in &order {
+                if p[k].1 > best {
+                    best = p[k].1;
+                    let (t32, t64) = (taus[k / taus.len()], taus[k % taus.len()]);
+                    row(&format!("{}2", AGGS[ai]), &format!("{t32}/{t64}"), &v[k]);
+                }
+            }
+            curves.push((format!("{}2", AGGS[ai]), eps, v));
+        }
+        // 3: the node networks, each trace scored by ones trained on the others
+        if run("net") {
+            // per picture and SB: the features of the 64x64, of each 32x32 with it kept and dropped,
+            // and what dropping each costs (J / λ added, the SB's analysis saved, as shares)
+            let wl: Vec<f64> = (0..4).map(|l| LEVEL_MS[l] / PER_SB[l] / LEVEL_MS.iter().sum::<f64>()).collect();
+            struct NodeSet {
+                f: Vec<Vec<f32>>,
+                dj: Vec<f64>,
+                saved: Vec<f64>,
+                /// the SB's J (with every large node)
+                j: Vec<f64>,
+            }
+            let sets: Vec<NodeSet> = par_map(pics.len(), &|pi| {
+                let p = pics[pi];
+                let mut s = NodeSet { f: vec![], dj: vec![], saved: vec![], j: vec![] };
+                for sby in 0..p.h / 64 {
+                    for sbx in 0..p.w / 64 {
+                        let sb = sby * p.sbc + sbx;
+                        let c = &p.costs[sb * 171..sb * 171 + 171];
+                        let (own, below) = sb_flags(p, &keeps[pi], sbx, sby);
+                        let ev = |d: u8| sb_eval(c, &own, &below, Some(d));
+                        let sv = |a: &[u8; 4], b: &[u8; 4]| (0..4).map(|l| (b[l] as f64 - a[l] as f64) * wl[l]).sum::<f64>();
+                        let base = ev(0x1F);
+                        let no64 = ev(0x1E);
+                        let p64 = aggs[pi][sb][0][0];
+                        s.f.push(node_features(p, &probs[pi], &keeps[pi], sbx, sby, 0, None));
+                        s.dj.push(no64.0 - base.0);
+                        s.saved.push(sv(&base.2, &no64.2));
+                        s.j.extend([base.1; 9]);
+                        for i in 1..5 {
+                            let k = ev(0x1F & !(1 << i));
+                            s.f.push(node_features(p, &probs[pi], &keeps[pi], sbx, sby, i, Some((true, p64))));
+                            s.dj.push(k.0 - base.0);
+                            s.saved.push(sv(&base.2, &k.2));
+                            let d = ev(0x1E & !(1 << i));
+                            s.f.push(node_features(p, &probs[pi], &keeps[pi], sbx, sby, i, Some((false, p64))));
+                            s.dj.push(d.0 - no64.0);
+                            s.saved.push(sv(&no64.2, &d.2));
+                        }
+                    }
+                }
+                s
+            });
+            // per picture and SB: P(keep) of the 64x64, of each 32x32 with it kept, dropped
+            let outs: Vec<Vec<[f32; 9]>> = {
+                let nets: Vec<(Mlp, Mlp)> = par_map(traces.len(), &|t| {
+                    let mut by = [(vec![], vec![]), (vec![], vec![])];
+                    for (pi, s) in sets.iter().enumerate() {
+                        if pics[pi].trace == t {
+                            continue;
+                        }
+                        for (k, f) in s.f.iter().enumerate() {
+                            let sbk = k / 9;
+                            if sub > 1 && (sbk * 7 + pi * 13) % sub != 0 {
+                                continue;
+                            }
+                            let m = (k % 9 != 0) as usize;
+                            if s.dj[k] > 0.0 {
+                                let (d, j) = (s.dj[k], s.j[k].max(1e-6));
+                                by[m].0.push((f.as_slice(), 1u8));
+                                by[m].1.push(match wmode.as_str() {
+                                    "raw" => d,
+                                    "log" => (1.0 + 100.0 * d / j).ln() * j / 100.0,
+                                    "flat" => 1.0,
+                                    _ => d.min(j),
+                                });
+                            }
+                            if s.saved[k] > 0.0 {
+                                by[m].0.push((f.as_slice(), 0u8));
+                                by[m].1.push(if wmode == "flat" { 1.0 } else { s.saved[k] });
+                            }
+                        }
+                    }
+                    let mut nets = vec![];
+                    for (m, (data, w)) in by.iter_mut().enumerate() {
+                        // the classes' totals balanced, then NODE_KMUL more weight on J
+                        let (wj, ws) = data.iter().zip(w.iter()).fold((0f64, 0f64), |a, (d, &x)| if d.1 == 1 { (a.0 + x, a.1) } else { (a.0, a.1 + x) });
+                        let k = ws / wj.max(1e-12) * kmul;
+                        for (d, x) in data.iter().zip(w.iter_mut()) {
+                            if d.1 == 1 {
+                                *x *= k;
+                            }
+                        }
+                        let nf = data[0].0.len();
+                        nets.push(train_by(data, Some(w.as_slice()), nf, node_h, 2, node_steps, 17 + 2 * t as u64 + m as u64));
+                    }
+                    let n32 = nets.pop().unwrap();
+                    (nets.pop().unwrap(), n32)
+                });
+                par_map(pics.len(), &|pi| {
+                    let (n64, n32) = &nets[pics[pi].trace];
+                    let (mut h, mut p) = (vec![0f32; node_h], vec![0f32; 2]);
+                    sets[pi]
+                        .f
+                        .chunks(9)
+                        .map(|fs| {
+                            let mut o = [0f32; 9];
+                            for (k, f) in fs.iter().enumerate() {
+                                if k == 0 { n64 } else { n32 }.fwd(f, &mut h, &mut p);
+                                o[k] = p[1];
+                            }
+                            o
+                        })
+                        .collect()
+                })
+            };
+            let ntaus = [0.001f32, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+            let mut v = vec![];
+            for &tau in &ntaus {
+                let s = score(&all, &keeps, &|pi, sb| {
+                    let o = &outs[pi][sbi(pi, sb)];
+                    let k64 = o[0] >= tau;
+                    Some((0..4).fold(k64 as u8, |m, i| m | ((o[1 + 2 * i + !k64 as usize] >= tau) as u8) << (i + 1)))
+                });
+                row("net", &format!("{tau}"), &s);
+                v.push(s);
+            }
+            curves.push(("net".into(), eps, v.clone()));
+            let mut va = vec![];
+            for &tau in &ntaus {
+                let s = score_with(
+                    &all,
+                    &keeps,
+                    &|pi, sb| {
+                        let o = &outs[pi][sbi(pi, sb)];
+                        let k64 = o[0] >= tau;
+                        Some((0..4).fold(k64 as u8, |m, i| m | ((o[1 + 2 * i + !k64 as usize] >= tau) as u8) << (i + 1)))
+                    },
+                    true,
+                );
+                row("net&any", &format!("{tau}"), &s);
+                va.push(s);
+            }
+            curves.push(("net&any".into(), eps, va));
+            let mut v2 = vec![];
+            for &t32 in &ntaus {
+                for &t64 in &ntaus {
+                    v2.push(score(&all, &keeps, &|pi, sb| {
+                        let o = &outs[pi][sbi(pi, sb)];
+                        let k64 = o[0] >= t64;
+                        Some((0..4).fold(k64 as u8, |m, i| m | ((o[1 + 2 * i + !k64 as usize] >= t32) as u8) << (i + 1)))
+                    }));
+                }
+            }
+            let p = pts(&v2, true);
+            let mut order: Vec<usize> = (0..v2.len()).collect();
+            order.sort_by(|&a, &b| p[a].0.partial_cmp(&p[b].0).unwrap());
+            let mut best = -1.0;
+            for &k in &order {
+                if p[k].1 > best {
+                    best = p[k].1;
+                    row("net2", &format!("{}/{}", ntaus[k / ntaus.len()], ntaus[k % ntaus.len()]), &v2[k]);
+                }
+            }
+            curves.push(("net2".into(), eps, v2));
+        }
+        // the oracle: per SB the best choice of its large nodes for J against time
+        if run("oracle") {
+            let tot: f64 = anchor.map_or(1.0, |a| a.0.total);
+            let choices: Vec<Vec<[(f32, [u8; 4]); 32]>> = par_map(pics.len(), &|pi| {
+                let p = pics[pi];
+                let mut v = vec![];
+                for sby in 0..p.h / 64 {
+                    for sbx in 0..p.w / 64 {
+                        let sb = sby * p.sbc + sbx;
+                        let c = &p.costs[sb * 171..sb * 171 + 171];
+                        let (own, below) = sb_flags(p, &keeps[pi], sbx, sby);
+                        let mut a = [(0f32, [0u8; 4]); 32];
+                        for (d, x) in a.iter_mut().enumerate() {
+                            let (ad, _, cnt) = sb_eval(c, &own, &below, Some(d as u8));
+                            *x = (ad as f32, cnt);
+                        }
+                        v.push(a);
+                    }
+                }
+                v
+            });
+            let mut v = vec![];
+            for lam in [0.3f64, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0] {
+                let s = score(&all, &keeps, &|pi, sb| {
+                    let p = pics[pi];
+                    let nsb = ((p.w / 64) * (p.h / 64)) as f64;
+                    let a = &choices[pi][sbi(pi, sb)];
+                    let cost = |x: &(f32, [u8; 4])| {
+                        x.0 as f64 / tot * 100.0
+                            - lam / 1000.0 * (0..4).map(|l| LEVEL_MS[l] * x.1[l] as f64 / PER_SB[l] / nsb).sum::<f64>() / pics.len() as f64
+                    };
+                    Some((0..32).min_by(|&x, &y| cost(&a[x]).partial_cmp(&cost(&a[y])).unwrap()).unwrap() as u8)
+                });
+                row("oracle", &format!("{lam}"), &s);
+                v.push(s);
+            }
+            curves.push(("oracle".into(), eps, v));
+        }
+        // the comparison at the current rule's ΔJ and skipped ms at this eps
+        if let Some((a, b)) = anchor {
+            println!("-- against any at eps {eps}: 5K {:.2} ms dJ {:.3} %, all {:.2} ms dJ {:.3} %", b.ms_total(), b.dj(), a.ms_total(), a.dj());
+            println!("   (capped: each SB's added J at most its own J)");
+            for (name, _, v) in curves.iter().filter(|c| c.1 == eps) {
+                let (pb, pa, cb, ca) = (pts(v, true), pts(v, false), pts_capped(v, true), pts_capped(v, false));
+                println!(
+                    "{name:7} 5K: at equal dJ {:+6.2} ms, at equal ms {:+7.3} % dJ; capped {:+6.2} ms, {:+7.3} % | all: {:+6.2} ms, {:+7.3} %; capped {:+6.2} ms, {:+7.3} %",
+                    ms_at(&pb, b.dj()) - b.ms_total(),
+                    dj_at(&pb, b.ms_total()) - b.dj(),
+                    ms_at(&cb, b.dj_capped()) - b.ms_total(),
+                    dj_at(&cb, b.ms_total()) - b.dj_capped(),
+                    ms_at(&pa, a.dj()) - a.ms_total(),
+                    dj_at(&pa, a.ms_total()) - a.dj(),
+                    ms_at(&ca, a.dj_capped()) - a.ms_total(),
+                    dj_at(&ca, a.ms_total()) - a.dj_capped()
+                );
+            }
+        }
+    }
+    eprintln!("nodes: done, {:.0} s", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: prune_train <dumps> (see the file comment)");
     if let Ok(txdir) = std::env::var("TXDIR") {
@@ -935,6 +1735,10 @@ fn main() {
             mode_all.len(),
             chroma_all.len()
         );
+        return;
+    }
+    if model == "nodes" {
+        nodes_experiment(&traces, &pics, sub, steps);
         return;
     }
     for t in 0..traces.len() {
