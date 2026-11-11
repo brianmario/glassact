@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Where libaom's lead at q26–40 on the four-trace rotation at 2900 comes from (`metal-av1`, per-block counts) | measured; a reference policy is the lever | libaom keeps its key frame as GOLDEN_FRAME for the whole run and the rotation returns to its first trace every 4th picture; our GOLDEN is the picture before last; with GOLDEN kept on the key frame (a test) ours is −21.8 % against libaom at q20–40, and on the pictures libaom codes without GOLDEN ours is −20 % at every q | [entry](#metal-av1-where-libaoms-lead-at-low-rates-comes-from-its-long-term-reference-2026-11-11) |
 | Palette blocks with a residual, chosen by real cost before the closed loop (`metal-av1`, branch `palette-residual`, `av1seq --palette`) | measured, not adopted; the owner's choice | −0.1 to −0.9 % BD-rate (2900 and 5K) for 4–7 ms more CPU a 2900 picture (inter frames a second 64–81 → 45–60 on new content); libaom's lead at q26–40 on new pictures is untouched (q40: 109.1 KB, 33.95 dB against its 124.4 KB, 35.55 dB) and so isn't its palette | [entry](#metal-av1-palette-with-a-residual-by-real-cost-measured-not-adopted-2026-11-11) |
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
@@ -308,6 +309,75 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: where libaom's lead at low rates comes from: its long-term reference (2026-11-11)
+
+This supersedes the reading of the first row of "Metal AV1 against libaom at session size (2900
+px)". That row's "every picture new" is not every picture new to libaom.
+
+**Method.** A temporary decoder-side patch to the vendored libaom (not kept) counted both
+encoders' streams the same way: each frame's header, and each block's bits by part (partition,
+mode info, palette map, tx size, Y/U/V coefficients) with its decisions. `av1seq --dump-sse`
+(new, off by default; the streams unchanged) gave each 4x4's squared error. The run was the
+rotation at 2900, 40 pictures from 100, q 20–40.
+
+**The frame headers match.** base_q_idx is 80 / 128 / 160 at q20 / 32 / 40 in both encoders,
+key frames included. Neither uses delta-q, delta-lf, quantization matrices, chroma delta-q,
+superres or loop restoration. libaom's cyclic-refresh segmentation was on at q20 for frames 1–10
+with a zero q offset.
+
+The tools differ:
+
+| | ours | libaom |
+|---|---|---|
+| tx_mode | LARGEST | SELECT |
+| tx types | DCT, IDTX, V_DCT, H_DCT | DCT and IDTX |
+| blocks | 4x4 and up | 16x16 and up, with 8x8 transforms inside |
+| filter strengths at q40 | loop filter 20, sharpness 1; CDEF 21/21, 1/21 | loop filter 16, sharpness 0; CDEF 8/4, 0/0 |
+| references | LAST, and GOLDEN = the picture before last | LAST, and GOLDEN = the key frame, for all 40 pictures |
+
+**The cause.** The rotation returns to its first trace every 4th picture, and those pictures are
+nearly that trace's key frame. libaom codes them from GOLDEN in 6.3 KB at 38.3 dB, against our
+85.3 KB at 35.4. Its 4th trace takes 37 % of its area from the key frame too. Inter frames 1–39
+at q40:
+- GOLDEN-coded: libaom 20 % of the area for 11 % of its bits; ours 3 % of the area.
+- The 64x64s more than half GOLDEN in libaom: 17.5 % of them, but +322 % of the total ΔJ.
+- The 64x64s with no GOLDEN at all: 71 % of them, −192 % of ΔJ, so we win there.
+
+The rest is libaom's key frame. At the same qindex it spends 2.8× our bytes: 390 KB at 40.1 dB
+against our 140 KB at 35.5, while ours at q20 is 323 KB at 43.8 dB. So it sits higher on a curve
+that is no better, and its quality carries into everything later pictures copy: a third of the
+q40 squared-error gap is in 64x64s both encoders copy.
+
+By picture in the cycle, q40, KB and PSNR-Y, with the BD-rate ours vs libaom over q20–40:
+
+| picture | ours | libaom | BD-rate |
+|---|---|---|---|
+| the first trace's (libaom 43 % GOLDEN, 84 % skip) | 85.3 KB, 35.36 | 6.3 KB, 38.33 | libaom ≈ 5 % of our bytes |
+| the second's | 96.3 KB, 36.33 | 119.4 KB, 37.89 | −13.9 % |
+| the third's | 149.5 KB, 33.44 | 230.6 KB, 34.02 | −23.9 % |
+| the fourth's (libaom 37 % GOLDEN) | 101.3 KB, 35.93 | 102.7 KB, 37.23 | +5.5 % |
+| the second's and third's together | | | −20.6 % (also at q32–40) |
+
+**Tests** (temporary switches, reverted), the whole stream with its key frame, PSNR-Y, BD-rate
+against libaom:
+
+| ours | q40 | q20–40 | q32–40 |
+|---|---|---|---|
+| as is | 109.5 KB, 35.27 dB | +1.0 % | +5.0 % |
+| GOLDEN kept on the key frame | 84.3 KB, 35.32 dB | −21.8 % | −19.1 % |
+| key frame at q − 12 only | 112.1 KB, 35.95 dB | −3.9 % | −0.9 % |
+| both | 86.7 KB, 37.49 dB | −35.8 % | −35.0 % |
+
+**What it means.**
+- On new content at low rates we're ahead. The lever is a reference policy: a long-term
+  reference such as the key frame, or GOLDEN chosen by what matches, instead of always the picture
+  before last. That rule is what wins two screens in turn (2026-11-02), and keeping GOLDEN on the
+  key frame wasn't measured on those mixes.
+- Palette wasn't the cause.
+- `--ssimulacra2-every 4` on a 4-trace rotation scores only the first trace's pictures, the ones
+  libaom codes from its key frame, so the 35.2 against 43.3 SSIMULACRA2 at q40 was mostly
+  key-frame quality. Use a period coprime with the rotation (3 or 5).
 
 ### Metal AV1: palette with a residual, by real cost, measured, not adopted (2026-11-11)
 
