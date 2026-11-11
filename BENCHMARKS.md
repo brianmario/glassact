@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Palette blocks with a residual, chosen by real cost before the closed loop (`metal-av1`, branch `palette-residual`, `av1seq --palette`) | measured, not adopted; the owner's choice | −0.1 to −0.9 % BD-rate (2900 and 5K) for 4–7 ms more CPU a 2900 picture (inter frames a second 64–81 → 45–60 on new content); libaom's lead at q26–40 on new pictures is untouched (q40: 109.1 KB, 33.95 dB against its 124.4 KB, 35.55 dB) and so isn't its palette | [entry](#metal-av1-palette-with-a-residual-by-real-cost-measured-not-adopted-2026-11-11) |
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 
@@ -307,6 +308,49 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: palette with a residual, by real cost, measured, not adopted (2026-11-11)
+
+Built on branch `palette-residual` (`bf5437e`, `a583dec`, not merged), behind
+`AV1HybridEncoder.palette` / `av1seq --palette` (off, the streams unchanged). A pass before the
+closed loop runs at the GPU's partition, on the closed loop's threads. Each intra luma block that
+AV1 allows a palette (8–64 each way, and 4x16 and 16x4), that isn't flat and that has at least
+half its samples within ±2 of its 8 commonest values, gets two open-loop costs on the source:
+- its GPU mode, predicted from source edges;
+- palettes of 2–8 colours (k-means on its histogram).
+
+Both residuals go through the closed loop's own tx-type search, trial and rates
+(`QuantHook::intra_luma_j`). The palette's side bits count its colours as the writer codes them
+(the colour cache, literals, deltas) and its index map with its real colour contexts. The lower
+cost wins; luma only. Key frames turn on `allow_screen_content_tools` when a palette is chosen.
+Every frame decoded exactly, and a test covers key frames, inter frames and picture edges.
+
+At 2900 px, 40 pictures from 100, q 8–40, against the run without palette (the logs of "Metal
+AV1 against libaom at session size"), BD-rate by RGB PSNR / SSIMULACRA2:
+
+| content | palette vs off | q 8–20 | q 20–40 | vs libaom, q 20–40 (off: as before) | palette blocks: share of eligible blocks / of bits |
+|---|---|---|---|---|---|
+| every picture new | −0.35 % / −0.37 % | −0.23 % / −0.39 % | −0.42 % / −0.37 % | +0.5 % / −1.1 % (+0.9 % / −0.8 %) | 2.8–5.1 % / 4–6 % |
+| typing and scrolling in turn | −0.72 % / −0.70 % | −0.58 % / −0.48 % | −0.80 % / −0.74 % | −76.3 % / −77.9 % | 3.3–7.5 % / 5–11 % |
+| photos and dragging in turn | −0.10 % / −0.11 % | −0.01 % / +0.02 % | −0.16 % / −0.13 % | −46.9 % / −44.3 % | 0.8–2.5 % / 1.6–2.9 % |
+
+At 5K (the first mix, 12 frames, q 8–32) palette is −0.90 % / −0.67 %. The palettes average 2.2
+colours. The decision costs 4.4–7.0 ms a 2900 picture (9–18 ms at 5K; provisional), mostly the
+two tx searches per tried block, since ≈ 80 % of eligible blocks pass the gate. The closed loop
+goes from ≈ 8 to 14–15 ms, and new pictures go from 64–81 to 45–60 inter frames a second.
+
+Why it's small: our intra already codes this text well, with IDTX and the 1-D transforms, angle
+deltas and RDOQ. In the 2026-11-02 count, libaom without palette spent 570–600 KB where we spent
+319, so its palette makes up for its own intra. Diagnostics on short runs:
+- Open-loop J_intra matched the closed loop's (ratio ≈ 1.0).
+- The map's estimate is ≈ 6 % above the bits written.
+- Four 8x8 children against their 16x16 as one palette: the palette wins in 4–6 % of quads, for
+  0.3–0.5 % of their cost.
+- Tilting the choice toward palettes (15–30 % worse J allowed, or map bits × 0.6) moved q32–40 by
+  ≤ 0.5 %, trading bytes for dB.
+
+libaom's lead at q26–40 on new pictures is in luma too, as PSNR-Y in YUV: at q40 it gets
+36.91 dB for 124.4 KB against our 35.27 for 109.5. It isn't palette; where it comes from is open.
 
 ### Metal AV1: no motion search on mostly-new pictures, by coded share, measured, not adopted (2026-11-11)
 
