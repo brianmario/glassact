@@ -75,6 +75,7 @@ let av1SeqCommand = Command(
         .int("ml-min-sbs", "<n>", 0...1_000_000, "learned pruning only in pictures of at least this many 64x64s (default the encoder's, 900: 1440p and up)"),
         .int("ml-min-coded", "<n>", 1...1_000_000, "with --ml-prune: also in pictures coding at least this many 64x64s"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
+        .string("dump-sse", "<dir>", "also write each decoded frame's squared error by 4x4 (UInt32, Y then U then V, rows of ceil(w/4)), the hybrid's as hNNN.sse and libaom's as aNNN.sse, and each picture's 64x64 luma statistics as sNNN.stats (Float32 per 64x64: variance, distinct values, share of strong horizontal or vertical edges), for per-block study"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
     run: { opts in
@@ -307,6 +308,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         }
         psnr += decoded.psnrY(pictures[i / steps])
         try rgb?.add(decoded)
+        if let dir = opts.string("dump-sse") {
+            try writeSSE(decoded, pictures[i / steps], to: "\(dir)/h\(String(format: "%03d", i)).sse")
+            try write64Stats(pictures[i / steps], to: "\(dir)/s\(String(format: "%03d", i)).stats")
+        }
     }
     if let coarseQindex {
         // each step's bytes, quality and times, and the two together a picture
@@ -497,6 +502,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                                    : try YUV420.decode(full, width: width, height: height)
             aomPSNR += decoded.psnrY(pictures[i])
             try aomRGB?.add(decoded)
+            if let dir = opts.string("dump-sse") { try writeSSE(decoded, pictures[i], to: "\(dir)/a\(String(format: "%03d", i)).sse") }
         }
         print(String(format: "  libaom s%d  %.1f fps (%.1f ms a frame, %d threads) · %@ a frame · PSNR-Y %.2f (%@)",
                      speed, n / aomSeconds, aomSeconds / n * 1000, threads, formatBytes(total / pictures.count), aomPSNR / n,
@@ -509,6 +515,57 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                          Double(streams.count - 1) / (aomSeconds - keySeconds), Double(total) * 8 / span / 1e6))
         }
     }
+}
+
+/// `--dump-sse`: the decoded picture's squared error against the source by 4x4, plane by plane
+/// (UInt32, rows of ceil(w/4) for each plane's own width).
+func writeSSE(_ decoded: YUV420, _ source: YUV420, to path: String) throws {
+    var out: [UInt32] = []
+    for p in 0..<3 {
+        let (w, h) = p == 0 ? (decoded.width, decoded.height) : (decoded.chromaWidth, decoded.chromaHeight)
+        let (cols, rows) = ((w + 3) / 4, (h + 3) / 4)
+        var map = [UInt32](repeating: 0, count: cols * rows)
+        decoded.planes[p].withUnsafeBufferPointer { d in
+            source.planes[p].withUnsafeBufferPointer { s in
+                for y in 0..<h {
+                    for x in 0..<w {
+                        let e = Int(d[y * w + x]) - Int(s[y * w + x])
+                        map[(y / 4) * cols + x / 4] &+= UInt32(e * e)
+                    }
+                }
+            }
+        }
+        out += map
+    }
+    try out.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: path)) }
+}
+
+/// `--dump-sse`: each 64x64's luma statistics (Float32 ×3, raster order): variance, distinct
+/// values, and the share of samples with a horizontal or vertical step over 32.
+func write64Stats(_ source: YUV420, to path: String) throws {
+    let (w, h) = (source.width, source.height)
+    let (cols, rows) = ((w + 63) / 64, (h + 63) / 64)
+    var out = [Float](repeating: 0, count: cols * rows * 3)
+    source.planes[0].withUnsafeBufferPointer { y in
+        for sb in 0..<(cols * rows) {
+            let (x0, y0) = ((sb % cols) * 64, (sb / cols) * 64)
+            var seen = [Bool](repeating: false, count: 256)
+            var distinct = 0, edges = 0, n = 0, sum = 0, sum2 = 0
+            for r in y0..<min(y0 + 64, h) {
+                for c in x0..<min(x0 + 64, w) {
+                    let v = Int(y[r * w + c])
+                    if !seen[v] { seen[v] = true; distinct += 1 }
+                    if (c + 1 < w && abs(v - Int(y[r * w + c + 1])) > 32) || (r + 1 < h && abs(v - Int(y[(r + 1) * w + c])) > 32) { edges += 1 }
+                    sum += v; sum2 += v * v; n += 1
+                }
+            }
+            let mean = Double(sum) / Double(n)
+            out[sb * 3] = Float(Double(sum2) / Double(n) - mean * mean)
+            out[sb * 3 + 1] = Float(distinct)
+            out[sb * 3 + 2] = Float(edges) / Float(n)
+        }
+    }
+    try out.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: path)) }
 }
 
 /// `--mix`'s traces (comma-separated).
