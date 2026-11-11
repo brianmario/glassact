@@ -65,7 +65,9 @@ pub use layout::{
 pub(crate) use parse::{FrameHdr, LfDeltas, Seq, parse_frame_header, parse_seq_obu, tile_spans};
 pub use parse::{ParseState, Parsed, parse, parse_with};
 pub(crate) use tiles::choose_level;
-pub(crate) use walk::{color_context, map_dims};
+#[cfg(test)]
+pub(crate) use walk::color_context;
+pub(crate) use walk::map_dims;
 pub use tiles::{TileInfo, compute_tiles, tile_layout, tile_layout_ex};
 
 /// An error of the writer or the parser: one of the `ERR_*` codes and a message.
