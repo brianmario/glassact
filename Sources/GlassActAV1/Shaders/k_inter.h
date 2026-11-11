@@ -337,6 +337,14 @@ constexpr int ga_tx_of() {
          : AV1G_TX_64X16;
 }
 
+// k_inter's lanes per candidate: a power of two (at most a SIMD-group, and at most a candidate's n
+// loads) that puts every one of the block's ncm candidates on the NT threads at once
+constexpr int ga_inter_lanes(int n, int ncm, int nt) {
+    int g = 32;
+    while (g > 1 && (g > n || nt / g < ncm)) g >>= 1;
+    return g;
+}
+
 template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                     constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
@@ -376,36 +384,95 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         device const GpMeU &U = I.meU[I.sbBase + sbi];
         device const uint16_t *S8 = I.meSad + (size_t)(I.sbBase + sbi) * GP_ME_U * 64;
         const int bx8 = (x & 63) >> 3, by8 = (y & 63) >> 3;
-        ulong tried = 0;
-        float bestS = GP_INF;
+        auto candJ = [&](int c) -> int {  // candidate c's index into U
+            if (c == 0) return 0;
+            const int k = c - 1, cell = k / GP_ME_KEEP, kk = k % GP_ME_KEEP;
+            const int cx = c0x + cell % (c1x - c0x + 1), cy = c0y + cell / (c1x - c0x + 1);
+            return U.idx[((cy & 3) * 4 + (cx & 3)) * GP_ME_KEEP + kk];
+        };
+        // Glass Act: the candidates side by side, G lanes each (an aligned run of a SIMD-group) summing
+        // its 8x8s, then the ordered minimum of (s, c): the first candidate with the smallest s, as a
+        // walk in candidate order taking strictly smaller ones picks. A vector met again (the same j)
+        // has the same s and comes later, so it never wins and needn't be skipped. G puts all ncm
+        // candidates on the NT threads at once, so the loop runs once
+        constexpr int N8 = (W / 8) * (H / 8);
+        constexpr int NCM = 1 + (W > 16 ? W / 16 : 1) * (H > 16 ? H / 16 : 1) * GP_ME_KEEP;
+        constexpr int VEC = W / 8 < 4 ? W / 8 : 4;
+        constexpr int G = ga_inter_lanes(N8 / VEC, NCM, NT), CP = NT / G;
+        float bm = GP_INF;
+        uint bk = 0xFFFFFFFFu;  // the winner's c << 23 | its SAD (64 x 0xFFFF at most)
+        for (int base = 0; base < nc; base += CP) {
+            const int c = base + lane / G;
+            uint sad = 0;
+            int2 v = int2(0, 0);
+            bool ok = false;
+            if (c < nc) {
+                const int j = candJ(c);
+                v = int2(U.v[2 * j], U.v[2 * j + 1]);
+                ok = ga_ref_inside(I, x, y, v, W, H);
+                if (ok) {
+                    // VEC of a row's 8x8s a load (aligned: bx8 is a multiple of W / 8)
+                    device const uint16_t *r8 = S8 + j * 64 + by8 * 8 + bx8;
+                    for (int q = lane % G; q < N8 / VEC; q += G) {
+                        const int p = q * VEC, o = (p / (W / 8)) * 8 + p % (W / 8);
+                        if (VEC == 4) {
+                            const ushort4 t = *(device const ushort4 *)(r8 + o);
+                            sad += (uint)t.x + t.y + t.z + t.w;
+                        } else if (VEC == 2) {
+                            const ushort2 t = *(device const ushort2 *)(r8 + o);
+                            sad += (uint)t.x + t.y;
+                        } else sad += r8[o];
+                    }
+                }
+            }
+            for (int o = 1; o < G; o <<= 1) sad += simd_shuffle_xor(sad, (ushort)o);
+            float sv = GP_INF;
+            uint key = 0xFFFFFFFFu;
+            if (ok) {
+                const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
+                if (s < GP_INF) { sv = s; key = (uint)c << 23 | sad; }
+            }
+            const float m = simd_min(sv);
+            const uint k = simd_min(sv == m ? key : 0xFFFFFFFFu);
+            if (m < bm || (m == bm && k < bk)) { bm = m; bk = k; }
+        }
+        if (NT > 32) {  // the SIMD-groups' winners, in a fixed order
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // (red, redi free)
+            if ((lane & 31) == 0) { S.red[lane >> 5] = bm; S.redi[lane >> 5] = (int)bk; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            bm = S.red[0];
+            bk = (uint)S.redi[0];
+            for (int w = 1; w < NT / 32; w++) {
+                const float m = S.red[w];
+                const uint k = (uint)S.redi[w];
+                if (m < bm || (m == bm && k < bk)) { bm = m; bk = k; }
+            }
+        }
         uint bestSad = 1;
         int2 best = int2(0, 0);
-        for (int c = 0; c < nc; c++) {
-            int j = 0;
-            if (c > 0) {
-                const int k = c - 1, cell = k / GP_ME_KEEP, kk = k % GP_ME_KEEP;
-                const int cx = c0x + cell % (c1x - c0x + 1), cy = c0y + cell / (c1x - c0x + 1);
-                j = U.idx[((cy & 3) * 4 + (cx & 3)) * GP_ME_KEEP + kk];
-            }
-            if ((tried >> j) & 1) continue;
-            tried |= 1ul << j;
-            const int2 v = int2(U.v[2 * j], U.v[2 * j + 1]);
-            if (!ga_ref_inside(I, x, y, v, W, H)) continue;
-            uint sad = 0;
-            for (int p = lane; p < (W / 8) * (H / 8); p += NT)
-                sad += S8[j * 64 + (by8 + p / (W / 8)) * 8 + bx8 + p % (W / 8)];
-            sad = ga_sumu<NT>(sad, lane, S.redi);
-            const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
-            if (s < bestS) { bestS = s; bestSad = sad; best = v; }
+        if (bk != 0xFFFFFFFFu) {
+            const int j = candJ((int)(bk >> 23));
+            bestSad = bk & 0x7FFFFFu;
+            best = int2(U.v[2 * j], U.v[2 * j + 1]);
         }
+        // the block's source, a thread's samples in the order the loops below visit them: read once
+        // for the gate's mean and SAD to it, and the residual
+        static_assert((W * H) % NT == 0, "k_inter: a block's samples split evenly over its threads");
+        constexpr int NPX = W * H / NT;
+        uint8_t px[NPX];
+        uint s1 = 0;
+        if (bestSad > 0)
+            for (int i = 0; i < NPX; i++) {
+                const int p = lane + NT * i;
+                px[i] = src[(p / W) * sp + p % W];
+                s1 += px[i];
+            }
         // Glass Act: where the best candidate predicts worse than the block's own mean would (new
         // content), no RD for it: intra will code the block
         if (P.interGate > 0.f && bestSad > 0) {
-            uint s1 = 0;
-            for (int p = lane; p < W * H; p += NT) s1 += src[(p / W) * sp + p % W];
             const int mean = (int)((ga_sumu<NT>(s1, lane, S.redi) + W * H / 2) / (W * H));
             uint dc = 0;
-            for (int p = lane; p < W * H; p += NT) dc += (uint)abs((int)src[(p / W) * sp + p % W] - mean);
+            for (int i = 0; i < NPX; i++) dc += (uint)abs((int)px[i] - mean);
             dc = ga_sumu<NT>(dc, lane, S.redi);
             if ((float)bestSad > P.interGate * (float)dc) {
                 if (lane == 0) { ir.dx = (int16_t)best.x; ir.dy = (int16_t)best.y; ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
@@ -428,8 +495,9 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             o.D = 0.f; o.R = base_bits(e, 0); o.eob = 0;
         } else {
             float en = 0.f;
-            for (int p = lane; p < W * H; p += NT) {
-                const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, best);
+            for (int i = 0; i < NPX; i++) {
+                const int p = lane + NT * i;
+                const int d = (int)px[i] - ga_ref_px(I.ref, sp, x + p % W, y + p / W, best);
                 S.res[p] = (int16_t)d;
                 en += (float)(d * d);
             }
