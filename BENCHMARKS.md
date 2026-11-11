@@ -304,6 +304,30 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1 against libaom at session size (2900 px) (2026-11-11)
+
+Whether the hybrid could stand in for libaom at the size sessions run at. Both encoders ran on
+the same pictures in the same run: `av1seq --width 2900 --skip 100 --frames 40 --tiles 3x0
+--inter --score-rgb --ssimulacra2-every 4 --aom-speed 9 --aom-inter`, at q 8, 14, 20, 26, 32
+and 40. The hybrid used its defaults at `6961431`. libaom was realtime speed 9 with inter frames
+and 8 threads; its shim sets 8 tile columns at this width. The pictures were 2900×1630, and the
+mixes were those of 2026-11-02. BD-rate is by RGB PSNR / SSIMULACRA2, and every frame of every
+stream decoded exactly. The Mac was in use, so the speeds are provisional; they come from the same
+process, one encoder after the other. Bytes and quality don't depend on load.
+
+| content | BD-rate vs libaom | q 8–20 | q 20–40 | inter frames a second at q20: hybrid / libaom |
+|---|---|---|---|---|
+| every picture new (four traces in turn) | −2.9 % / −1.7 % | −8.3 % / −5.7 % | +0.9 % / −0.8 % | 69 / 52 |
+| typing and scrolling in turn | −78.0 % / −78.1 % | −80.6 % / −80.4 % | −76.1 % / −77.7 % | 178 / 68 |
+| photos and dragging in turn | −46.4 % / −43.9 % | −45.6 % / −42.8 % | −46.9 % / −44.2 % | 34 / 40 |
+
+At 5K (2026-11-03) the first row was −4.5 % / −9.6 %. On new pictures, the hybrid's lead is at
+high rates. From q26 up, libaom keeps more quality for its bytes: at q40 it spends 124 KB a
+picture for 35.6 dB and 43.3 SSIMULACRA2, against the hybrid's 110 KB, 33.9 dB and 35.2. That
+range is inside what the live AV1 path's quantizer ceiling (42) allows on a thin link. On two
+screens in turn the hybrid still leads by far, but by less than at 5K (−87 to −90 % there). Photos and dragging are the one
+mix where libaom codes more inter frames a second.
+
 ### Metal AV1: a picture in two steps, coarse then refined, measured (2026-11-10)
 
 The cheap test, inside AV1, of making time the thing that gives: code a mostly-new picture
