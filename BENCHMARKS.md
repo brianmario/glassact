@@ -239,6 +239,9 @@ the numbers and the reasoning.
 | Unrolled loops in the thread kernel's flat check, SATD and mode loop (without constants) and in `k_ml_stats`; `k_ml_stats`'s seams summed a thread before one atomic add (`metal-av1`) | measured, not kept | no faster (the SATD's sub-blocks unrolled: slower at 8x8) | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | The thread kernel's blocks listed by learned mode mask, so a SIMD-group screens the same modes (`metal-av1`) | not built | at most 0.5 ms of a 5K picture of new content's 23 ms (every lane given its group's first mask: 4x4 1.50 → 1.33, 8x8 1.95 → 1.63), before the cost of sorting the list | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | A mostly-new picture in two steps: coded coarsely, then refined by the next frame (`metal-av1`, `av1seq --two-steps`) | measured, not adopted | both steps are 9–20 % more bytes than the picture coded once at the same quality (the rotation at 5K; after a q50 first step of 118 KB the second step at q20 is 484 KB against 508 KB); a coarse q alone leaves the first step's GPU stages at 21–22 ms of 23.0, and without the motion search it is 14.8 ms | [entry](#metal-av1-a-picture-in-two-steps-coarse-then-refined-measured-2026-11-10) |
+| k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 
 **Rate control and transport**
@@ -303,6 +306,54 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: reviewers' ideas measured, inter candidates side by side kept (2026-11-11)
+
+codex and agy each proposed ideas from reading the code; four were taken up. Timings are on the
+rotation (four traces in turn, every picture new) at 5K, q20, `--profile` (best of 10 a run),
+alternating runs of an unchanged build and the change. The Mac was in use, so the numbers are
+provisional, but each pair ran back to back.
+
+**Kept: k_inter's candidates side by side** (`k_inter.h`). k_inter summed each candidate's 8x8
+SADs in turn, a threadgroup reduction per candidate: up to 33 for a 64x64, and for an 8x8 one
+working lane in 32. Now each candidate has its own run of 1–8 lanes, sized per shape so that all
+fit in one pass. The lanes sum with vector loads and a SIMD-group shuffle. The winner is the
+ordered minimum of (cost, candidate), which is the first candidate with the smallest cost, as
+before. The block's source is read once into registers, for the gate's mean, its SAD to the
+mean, and the residual. Inter candidates went from 3.82–3.84 to 2.59–2.61 ms over three
+alternated pairs, a saving of 1.2 ms. The stream digests matched on seven settings (the four
+mixes at 5K and 2900, with `--no-subpel`, `--inter-gate 0`, and single traces), and in a run that
+checked every block's choice against the old loop. The AV1 tests pass. What's left of the stage:
+≈ 0.7 ms is the 14 dispatches' fixed cost, ≈ 0.7 ms the candidate pick and per-block setup, and
+≈ 1.2 ms the RD.
+
+**Not kept, the same streams and no measurable time:**
+- k_leaf without the luma tx search's threadgroup memory. With the search off (the hybrid's
+  default), chroma reads only the edges, 1.7 of the threadgroup's 3.8 KB. A second kernel without
+  the rest measured leaves 2.87 → 2.82 ms (best of 4), inside the run-to-run noise (2.82–3.02).
+- No mode screening in the analysis's 32x32s and 64x64s when learned pruning leaves one mode: that
+  mode is the top-K whatever it screens at. 32x32 stayed at 3.12 ms and 64x64 at 2.44: few nodes
+  have one mode left.
+
+**Offline, not adopted: learned pruning's large nodes decided per node.** `k_ml_tree` keeps a
+32x32 or 64x64 if any of its cells keeps that level; on new 5K pictures those keep ≈ 75 % of their
+nodes and cost ≈ 5.6 ms. Measured on the training dumps (330 pictures, held out as prune_train
+holds out: each trace scored by models trained on the others), with the 8x8/16x16 levels as they
+are. ΔJ is the open-loop RD cost of the analysis's DP over the dumped node costs, a proxy for
+bytes, not a BD-rate. Skipped work is in today's GPU ms on 5K pictures, scaled from
+`LEVEL_MS`, whose 32 and 64 levels are ≈ 7× today's.
+
+| rule for 32x32s and 64x64s | at eps 0.02, against any cell | at eps 0.05 |
+|---|---|---|
+| any cell (today) | — | — |
+| cells' mean or 75th percentile over a threshold, one or per level | within ±0.02 ms | ≈ +0.1 ms at equal ΔJ; nothing once each SB's added J is capped at its own J |
+| a small network per node (16 hidden), labels the tree's ΔJ for skipping it | −0.2 ms (loses) | −0.3 ms (loses) |
+| oracle: per SB, the large nodes chosen knowing their costs | +1.6 ms at equal ΔJ | +1.4 ms |
+
+The cells' probabilities carry little about whether a whole node is needed. At eps 0.05 the
+thresholds' gain comes from avoiding a few SBs whose J the skips more than double. The oracle's
+headroom needs information the cells don't have, such as costs from a coarse pass. The scorer
+(`MODEL=nodes` in `rust/av1/examples/prune_train.rs`) is on branch `prune-nodes`, `35601e3`.
 
 ### Metal AV1 against libaom at session size (2900 px) (2026-11-11)
 

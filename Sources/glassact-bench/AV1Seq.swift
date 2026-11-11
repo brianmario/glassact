@@ -350,7 +350,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                 })
             }
             for (step, st) in best.enumerated() {
-                print(String(format: "  step %d GPU, stage by stage (ms): motion search %.2f · inter candidates %.2f · analysis %.1f · partition %.1f · leaves %.1f · learned pruning %.2f · sum %.1f",
+                print(String(format: "  step %d GPU, stage by stage (ms): motion search %.2f · inter candidates %.2f · analysis %.1f · partition %.1f · leaves %.2f · learned pruning %.2f · sum %.1f",
                              step + 1, st.motionSearch * 1000, st.interSearch * 1000, st.analysis * 1000, st.partition * 1000,
                              st.leaves * 1000, st.mlPrune * 1000,
                              (st.motionSearch + st.interSearch + st.analysis + st.partition + st.leaves + st.mlPrune) * 1000))
@@ -430,7 +430,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
         let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.2f", names[$0.key], $0.value * 1000) }
         let motion = inter ? String(format: "motion search %.2f · inter candidates %.2f · ", st.motionSearch * 1000, st.interSearch * 1000) : ""
-        print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.1f%@",
+        print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.2f%@",
                      motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000,
                      st.mlPrune > 0 ? String(format: " · learned pruning %.2f", st.mlPrune * 1000) : ""))
         encoder.profilesStages = false
