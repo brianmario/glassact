@@ -122,7 +122,8 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
     device const GpImage &I = B.img[0];
     // with kept analysis, a threadgroup per SB of the stale list (B.sbList)
     const uint sb = B.sbList ? (tg < B.nSbList ? B.sbList[tg] : 0xFFFFFFFFu) : tg;
-    if ((int)sb >= I.sbCols * I.sbRows) return;  // (the whole threadgroup)
+    // (unsigned: an empty stale list still dispatches one threadgroup, whose 0xFFFFFFFF is -1 as an int)
+    if (sb >= (uint)(I.sbCols * I.sbRows)) return;  // (the whole threadgroup)
     if (B.sbKeep && B.sbKeep[I.sbBase + (int)sb]) return;  // kept: its analysis is the last picture's
     // the 85 nodes' sums (cells, then 16, 4, 1), and the seams of the 21 above the cells
     threadgroup MlSums sums[85];
@@ -294,7 +295,7 @@ kernel void k_ml_tree(constant GpBatch &B [[buffer(0)]], device const uint8_t *k
     device const GpImage &I = B.img[0];
     // with kept analysis, a thread per SB of the stale list
     const uint gid = B.sbList ? (tid < B.nSbList ? B.sbList[tid] : 0xFFFFFFFFu) : tid;
-    if ((int)gid >= I.sbCols * I.sbRows) return;
+    if (gid >= (uint)(I.sbCols * I.sbRows)) return;  // (unsigned, as k_ml_stats)
     if (B.sbKeep && B.sbKeep[I.sbBase + (int)gid]) return;  // kept
     const int sbx = (int)gid % I.sbCols, sby = (int)gid / I.sbCols, cols8 = I.aw / 8, rows8 = I.ah / 8;
     uint8_t cell[64];
