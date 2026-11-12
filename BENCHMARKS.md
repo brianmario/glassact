@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Long-term references: up to N scenes' last pictures kept, GOLDEN_FRAME the one that matches best each frame (`metal-av1`, `longTermReferences`, `av1seq --long-term`) | kept, on (N = 4) | against N = 1 (today's rule): four traces in turn −49 % (2900) and −70 % (5K); app switching −33 %; tabs −0.9 %, windows −1.5 %, two screens in turn 0; finder time no higher (5K rotation 19.5 → 8–11 ms); +44 MB a slot at 5K | [entry](#metal-av1-long-term-references-golden_frame-the-stored-picture-that-matches-best-2026-11-11) |
 | Where libaom's lead at q26–40 on the four-trace rotation at 2900 comes from (`metal-av1`, per-block counts) | measured; a reference policy is the lever | libaom keeps its key frame as GOLDEN_FRAME for the whole run and the rotation returns to its first trace every 4th picture; our GOLDEN is the picture before last; with GOLDEN kept on the key frame (a test) ours is −21.8 % against libaom at q20–40, and on the pictures libaom codes without GOLDEN ours is −20 % at every q | [entry](#metal-av1-where-libaoms-lead-at-low-rates-comes-from-its-long-term-reference-2026-11-11) |
 | Palette blocks with a residual, chosen by real cost before the closed loop (`metal-av1`, branch `palette-residual`, `av1seq --palette`) | measured, not adopted; the owner's choice | −0.1 to −0.9 % BD-rate (2900 and 5K) for 4–7 ms more CPU a 2900 picture (inter frames a second 64–81 → 45–60 on new content); libaom's lead at q26–40 on new pictures is untouched (q40: 109.1 KB, 33.95 dB against its 124.4 KB, 35.55 dB) and so isn't its palette | [entry](#metal-av1-palette-with-a-residual-by-real-cost-measured-not-adopted-2026-11-11) |
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
@@ -309,6 +310,59 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: long-term references, GOLDEN_FRAME the stored picture that matches best (2026-11-11)
+
+`AV1HybridEncoder.longTermReferences` (1…7, default 4; `av1seq --long-term n`), `1a97d19`. The
+previous entry's lever.
+- **What is kept.** A mostly new picture, as before most of whose 64x64s don't copy the picture
+  before it, keeps that picture, the end of the scene it leaves, as a long-term picture in its own
+  AV1 slot. Each slot holds the source and the decoded planes.
+- **Where the new picture goes.** It takes the slot of the long-term picture it returns to (an
+  older state of its own scene), otherwise a free slot, otherwise the least recently used one.
+  With more than one slot, the key frame is the first.
+- **Which one is GOLDEN.** Each inter frame's GOLDEN_FRAME is the long-term picture that most of
+  its 64x64s not copying LAST_FRAME match at no shift, by a sample of their luma rows
+  (`av1enc_motion_classify_multi`). Then the copies are classified against that one only. A
+  temporary build that classified fully against every slot coded the same bytes.
+- **Exactness.** N = 1 is the previous rule, byte for byte: with `--long-term 1` the digests
+  `93c5d5eeb49fd481`, `7778330ab6d28ff0` and `c888ff4c1a3e2826` are unchanged. At the default the
+  5K rotation's digest is now `7c17df5c516aab0d`. Every frame of every run decoded exactly, and a
+  test cycles four synthetic screens.
+
+BD-rate by RGB PSNR / SSIMULACRA2 (`--ssimulacra2-every 3`), q 8–40, 2900 px, 40–60 coded
+frames. The single traces use `--step` to spread 60 frames over their switches; their first
+150 frames don't switch.
+
+| content | N = 4 vs N = 1 | N = 1 vs libaom | N = 4 vs libaom | copied from GOLDEN at q20, N = 1 → 4 |
+|---|---|---|---|---|
+| four traces in turn | −49.0 % / −50.6 % | −2.9 % / −6.8 % | −49.9 % / −53.6 % | 4.1 → 55.8 % of 64x64s |
+| four traces in turn, 5K, q 8–32 | −70.3 % / −70.1 % | −12.4 % / −12.5 % | −74.0 % / −73.8 % | 4.2 → 65.4 % |
+| app switching | −33.2 % / −33.3 % | −30.8 % / −31.9 % | −53.8 % / −54.6 % | 0.1 → 3.9 % |
+| tabs | −0.9 % / −0.9 % | −28.1 % / −29.1 % | −28.8 % / −29.8 % | 1.0 → 2.7 % |
+| windows opening and closing | −1.5 % / −1.6 % | −23.7 % / −26.7 % | −24.7 % / −27.8 % | 0.0 → 0.7 % |
+| two screens in turn (both mixes) | 0 | −78 % and −46 % | the same | unchanged |
+
+N = 2 gives the rotation −17.7 %, and N = 6 codes as N = 4. Windows opening and closing never make
+a picture mostly new, so the rule rarely runs there. The copy finder's time at 5K is provisional:
+the rotation went from 19.4–19.5 to 8.2–10.6 ms (more 64x64s copy early), and two screens from
+5.5–6.2 to 5.6–7.5 ms.
+
+**Memory.** A slot costs 3 bytes a pixel, 44 MB at 5K, so N = 4 is +132 MB on the Host. A decoder
+holds up to N + 1 frames instead of 2. Two leaks were found and fixed along the way:
+- The hybrid's picture loop now drains an autorelease pool per picture. Metal command buffers had
+  kept what they held for the whole stream; the product's encoder loop needs the same.
+- av1seq reads each trace frame in a pool of its own. FileHandle's autoreleased reads built up
+  until exit.
+
+The 2900 rotation's peak footprint at 60 frames went from 12.6 to 2.2 GB, and app switching at
+60 frames peaks at 1.6 GB with 1 or 4 slots.
+
+**For live use.** A long-term slot outlives many frames: if the Viewer loses the frame that
+filled it, every return copies the damage until the slot is replaced. A key frame (repair, or a
+size change) clears every long-term picture on both sides, so repair stays correct but drops the
+gain. The fix is long-term pictures only from acknowledged frames, once references are
+acknowledged.
 
 ### Metal AV1: where libaom's lead at low rates comes from: its long-term reference (2026-11-11)
 
