@@ -575,3 +575,162 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         ga_sync<NT>();
     }
 }
+
+// Glass Act: k_inter for the shapes of one 16x16 at most (8x8 to 16x16), Q blocks a SIMD-group
+// (32 / Q lanes each) for what comes before the RD (the set-up, the candidate pick and the gate):
+// most of such a block's time where the picture is new, and one SIMD-group's latency a block in
+// k_inter. Then each block that needs it gets the whole SIMD-group's RD, as k_inter<W, H> gives it.
+// The same choices: a block's candidates are costed and ordered as there, its SADs and source sums
+// are whole numbers (the same in any order), and the RD reads the source and residual on the same
+// lanes as k_inter.
+template <int W, int H, int BS, int NW, int Q>
+kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
+                     constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                     uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
+    static_assert(W <= 16 && H <= 16, "k_inter_q: blocks inside one 16x16");
+    constexpr int NT = 32, GL = 32 / Q;
+    threadgroup GaInterSmem<W, H> smem[NW];
+    const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;
+    threadgroup GaInterSmem<W, H> &S = smem[warp];
+    const int sub = lane / GL, sl = lane % GL;
+    constexpr int txSz = ga_tx_of<W, H>();
+    device const GpImage &I = B.img[0];
+    const int nbx = I.shNbx[BS], sp = I.spitch[0];
+    for (uint32_t g0 = (blockIdx_x * NW + warp) * Q; g0 < nTotal; g0 += gridDim_x * NW * Q) {
+        const uint32_t gb = g0 + (uint32_t)sub;
+        // this lane's block: live unless past the end, off the shape's grid, outside the picture or kept
+        bool live = gb < nTotal;
+        uint32_t li = gb;
+        if (live && B.sbList) {
+            const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
+            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            if (bx >= nbx || by >= I.shNby[BS]) live = false;
+            else li = (uint32_t)(by * nbx + bx);
+        }
+        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        device GpInterRes &ir = B.inter[I.shOff[BS] + li];
+        if (live && (x >= I.MiCols * 4 || y >= I.MiRows * 4)) {
+            if (sl == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
+            live = false;
+        }
+        if (live && B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) live = false;
+        float lambda = 0.f;
+        uint bestSad = 1;
+        int2 best = int2(0, 0);
+        bool rd = false;
+        if (live) {
+            const int qidx = sb_qindex(I, x, y);
+            lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
+            const float lamS = P.satdLambda * sqrtf(lambda);
+            // candidates 0..2 (no motion, its 16x16's k_me vectors), CG of the block's lanes each summing
+            // its 8x8s' SADs (as k_inter's G)
+            const int sbi = (y >> 6) * I.sbCols + (x >> 6);
+            device const GpMeU &U = I.meU[I.sbBase + sbi];
+            device const uint16_t *S8 = I.meSad + (size_t)(I.sbBase + sbi) * GP_ME_U * 64;
+            const int bx8 = (x & 63) >> 3, by8 = (y & 63) >> 3, cell = ((y & 63) >> 4) * 4 + ((x & 63) >> 4);
+            constexpr int nc = 1 + GP_ME_KEEP;
+            constexpr int N8 = (W / 8) * (H / 8), CG = ga_inter_lanes(N8, nc, GL);
+            static_assert(nc * CG <= GL, "k_inter_q: a block's candidates on its lanes at once");
+            const int c = sl / CG;
+            float sv = GP_INF;
+            uint key = 0xFFFFFFFFu;
+            uint sad = 0;
+            bool ok = false;
+            int2 v = int2(0, 0);
+            if (c < nc) {
+                const int j = c == 0 ? 0 : U.idx[cell * GP_ME_KEEP + c - 1];
+                v = int2(U.v[2 * j], U.v[2 * j + 1]);
+                ok = ga_ref_inside(I, x, y, v, W, H);
+                if (ok) {
+                    device const uint16_t *r8 = S8 + j * 64 + by8 * 8 + bx8;
+                    for (int p = sl % CG; p < N8; p += CG) sad += r8[(p / (W / 8)) * 8 + p % (W / 8)];
+                }
+            }
+            for (int o = 1; o < CG; o <<= 1) sad += simd_shuffle_xor(sad, (ushort)o);
+            if (ok) {
+                const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
+                if (s < GP_INF) { sv = s; key = (uint)c << 23 | sad; }
+            }
+            // the ordered minimum of (s, c) over the block's lanes
+            float m = sv;
+            for (int o = 1; o < GL; o <<= 1) m = min(m, simd_shuffle_xor(m, (ushort)o));
+            uint bk = sv == m ? key : 0xFFFFFFFFu;
+            for (int o = 1; o < GL; o <<= 1) bk = min(bk, simd_shuffle_xor(bk, (ushort)o));
+            if (bk != 0xFFFFFFFFu) {
+                const int cb = (int)(bk >> 23);
+                const int j = cb == 0 ? 0 : U.idx[cell * GP_ME_KEEP + cb - 1];
+                bestSad = bk & 0x7FFFFFu;
+                best = int2(U.v[2 * j], U.v[2 * j + 1]);
+            }
+            rd = true;
+            // the gate on the block's lanes: its mean and its SAD to it (whole numbers)
+            if (P.interGate > 0.f && bestSad > 0) {
+                device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
+                constexpr int NP = W * H / GL;
+                uint8_t px[NP];
+                uint s1 = 0;
+                for (int i = 0; i < NP; i++) {
+                    const int p = sl + GL * i;
+                    px[i] = src[(p / W) * sp + p % W];
+                    s1 += px[i];
+                }
+                for (int o = 1; o < GL; o <<= 1) s1 += simd_shuffle_xor(s1, (ushort)o);
+                const int mean = (int)((s1 + W * H / 2) / (W * H));
+                uint dc = 0;
+                for (int i = 0; i < NP; i++) dc += (uint)abs((int)px[i] - mean);
+                for (int o = 1; o < GL; o <<= 1) dc += simd_shuffle_xor(dc, (ushort)o);
+                if ((float)bestSad > P.interGate * (float)dc) {
+                    if (sl == 0) { ir.dx = (int16_t)best.x; ir.dy = (int16_t)best.y; ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
+                    rd = false;
+                }
+            }
+        }
+        // the RD, a block at a time on the whole SIMD-group, as k_inter<W, H>
+        for (int q = 0; q < Q; q++) {
+            const ushort ql = (ushort)(q * GL);
+            if (!simd_shuffle(rd ? 1 : 0, ql)) continue;
+            const int qx = simd_shuffle(x, ql), qy = simd_shuffle(y, ql);
+            const uint qSad = simd_shuffle(bestSad, ql);
+            const int2 qBest = int2(simd_shuffle(best.x, ql), simd_shuffle(best.y, ql));
+            const float qLambda = simd_shuffle(lambda, ql);
+            const uint32_t qli = simd_shuffle(li, ql);
+            const int qidx = sb_qindex(I, qx, qy);
+            EvalIn e;
+            e.txSz = txSz; e.plane = 0; e.txType = AV1G_DCT_DCT;
+            e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
+            e.rnd = P.rnd; e.zbin = P.zbin;
+            e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = g_cost[I.qctx];
+            e.qmDist = P.qmDist; e.qmRnd = P.qmRnd;
+            e.intraDir = AV1G_DC_PRED;
+            EvalOut o;
+            if (qSad == 0) {
+                o.D = 0.f; o.R = base_bits(e, 0); o.eob = 0;
+            } else {
+                device const uint8_t *src = I.src[0] + (size_t)qy * sp + qx;
+                float en = 0.f;
+                for (int i = 0; i < W * H / NT; i++) {
+                    const int p = lane + NT * i;
+                    const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, qx + p % W, qy + p / W, qBest);
+                    S.res[p] = (int16_t)d;
+                    en += (float)(d * d);
+                }
+                ga_sync<NT>();
+                e.resEnergy = ga_sum<NT>(en, lane, S.red);
+                e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
+                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+            }
+            const int hasC = av1g_has_chroma(BS, qy >> 2, qx >> 2, I.mono);
+            const float J = o.D + qLambda * (o.R + ga_mv_bits(qBest, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
+            if (lane == 0) {
+                device GpInterRes &qr = B.inter[I.shOff[BS] + qli];
+                qr.dx = (int16_t)qBest.x;
+                qr.dy = (int16_t)qBest.y;
+                qr.isInter = 0;
+                qr.zero = o.eob == 0 ? 1 : 0;
+                qr.J = J;
+            }
+            ga_sync<NT>();
+        }
+    }
+}

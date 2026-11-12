@@ -85,10 +85,17 @@ GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
         constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);
 
-GA_INTER(8, 8, AV1G_BLOCK_8X8, 4)
-GA_INTER(8, 16, AV1G_BLOCK_8X16, 4)
-GA_INTER(16, 8, AV1G_BLOCK_16X8, 4)
-GA_INTER(16, 16, AV1G_BLOCK_16X16, 4)
+// k_inter_<W>x<H>_w<NW>p<Q>: Q blocks a SIMD-group before the RD (k_inter_q)
+#define GA_INTER_Q(W, H, BS, NWS, Q)                                                                       \
+    template [[host_name("k_inter_" #W "x" #H "_w" #NWS "p" #Q)]] kernel void k_inter_q<W, H, BS, NWS, Q>( \
+        constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
+        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);
+
+GA_INTER_Q(8, 8, AV1G_BLOCK_8X8, 2, 8)
+GA_INTER_Q(8, 16, AV1G_BLOCK_8X16, 2, 4)
+GA_INTER_Q(16, 8, AV1G_BLOCK_16X8, 2, 4)
+GA_INTER_Q(16, 16, AV1G_BLOCK_16X16, 2, 4)
 GA_INTER(8, 32, AV1G_BLOCK_8X32, 4)
 GA_INTER(32, 8, AV1G_BLOCK_32X8, 4)
 GA_INTER_T(16, 32, AV1G_BLOCK_16X32, 64)

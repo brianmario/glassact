@@ -225,7 +225,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         interTables = (c, s)
         return (c, s)
     }
-    let inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)]
+    let inter: [Int: (pipeline: any MTLComputePipelineState, blocks: Int, threads: Int)]
     /// Keep each superblock's analysis, partition and leaf decisions from the
     /// previous picture when the source they read hasn't changed (the
     /// superblock itself and the left, above, above-left, above-right and
@@ -628,14 +628,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
         self.library = library
         self.analysisUsesMatrixUnits = try Self.forwardMMAIsExact(device: device, library: library)
-        var inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
+        var inter: [Int: (pipeline: any MTLComputePipelineState, blocks: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
             let prefix = "k_inter_\(size.w)x\(size.h)_w"  // as k_analysis's names
             guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }) else { throw Failure.metal("no \(prefix)…") }
-            let parts = name.dropFirst(prefix.count).split(separator: "t").compactMap { Int($0) }
-            guard let warps = parts.first, let function = library.makeFunction(name: name) else { throw Failure.metal("no \(prefix)…") }
-            let perBlock = parts.count > 1 ? parts[1] : 32
-            inter[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), warps, warps * perBlock)
+            // _w<NW>, _w1t<NT> (a block on NT threads) or _w<NW>p<B> (B blocks a SIMD-group)
+            let suffix = name.dropFirst(prefix.count)
+            let packed = suffix.split(separator: "p").compactMap { Int($0) }
+            let parts = suffix.split(separator: "t").compactMap { Int($0) }
+            guard let warps = packed.count > 1 ? packed.first : parts.first, let function = library.makeFunction(name: name)
+            else { throw Failure.metal("no \(prefix)…") }
+            let perBlock = packed.count > 1 ? 32 : parts.count > 1 ? parts[1] : 32
+            let blocks = packed.count > 1 ? warps * packed[1] : warps  // a threadgroup's
+            inter[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), blocks, warps * perBlock)
         }
         self.inter = inter
         guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj"),
@@ -1341,12 +1346,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             if isInter, analyzed > 0 {  // the inter candidates, which the intra analysis then weighs
                 e.memoryBarrier(scope: .buffers)
                 for s in 0..<Int(GP_NSHAPES) where shTotal[s] > 0 {
-                    guard let (pipeline, warps, threads) = encoder.inter[s] else { continue }
+                    guard let (pipeline, blocks, threads) = encoder.inter[s] else { continue }
                     let size = AV1MetalEncoder.blockSizes[s]
                     var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
-                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
+                    e.dispatchThreadgroups(MTLSize(width: (Int(n) + blocks - 1) / blocks, height: 1, depth: 1),
                                            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
                 }
                 if profiling {
