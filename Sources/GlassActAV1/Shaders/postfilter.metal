@@ -551,7 +551,10 @@ kernel void p_deblock_r(constant av1g_pf_frame &f [[buffer(0)]], constant int32_
     const int side = 16 >> sub;
     if ((int)k >= side * side) return;
     const uint32_t sb = list[j];
-    const int col = (int)(sb % R.sbCols) * side + (int)k % side, row = (int)(sb / R.sbCols) * side + (int)k / side;
+    // a 64-thread threadgroup takes an 8 x 8 of positions (a quarter of a luma 64x64, a chroma one),
+    // as p_deblock's 8 x 8 threadgroups do, not a 16 x 4 strip
+    const int q = (int)k >> 6, i = (int)k & 63;
+    const int col = (int)(sb % R.sbCols) * side + (q & 1) * 8 + (i & 7), row = (int)(sb / R.sbCols) * side + (q >> 1) * 8 + (i >> 3);
     if (col >= (f.MiCols >> sub) || row >= (f.MiRows >> sub)) return;
     av1g_lf_edge(&f, plane, pass, row << sub, col << sub);
 }
