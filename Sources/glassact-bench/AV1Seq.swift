@@ -34,10 +34,12 @@ let av1SeqCommand = Command(
         .string("deltas-up-to", "<share>", "search angle deltas only in pictures that analyze at most this share of their superblocks (0–1; default 0.5; 1: always)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
+        .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
+        .bool("motion-shares", "with --inter: print which inter frames searched for motion and what each found (as --motion-skip does)"),
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
@@ -235,6 +237,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     encoder.streamSize = stream
     encoder.searchesMotion = !opts.has("no-motion-search")
+    if let v = opts.string("motion-skip") {
+        let parts = v.split(separator: ",").map(String.init)
+        guard (2...3).contains(parts.count), let share = Double(parts[0]), (0...1).contains(share),
+              let every = Int(parts[1]), every >= 1, let k = parts.count > 2 ? Int(parts[2]) : 2, k >= 1
+        else { throw BenchError("--motion-skip \(v): <share 0-1>,<every >= 1>[,<k >= 1>]") }
+        encoder.motionSkip = (share, every)
+        encoder.motionSkipLookback = k
+    }
     encoder.carriesCDFs = !opts.has("no-cdf-carry")
     encoder.returnsPlanes = !opts.has("no-planes")
     encoder.interSkipsIntra = !opts.has("intra-everywhere")
@@ -410,6 +420,15 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count), steady,
                      avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.copiedGolden } * 100, avg { $0.motion } * 1000,
                      avg { $0.searched } * 100))
+        if encoder.motionSkip != nil || opts.has("motion-shares") {
+            // which frames searched, what each found (of what it coded), and their GPU analysis
+            let searched = rest.filter { $0.timing.searchedMotion }, skipped = rest.filter { !$0.timing.searchedMotion }
+            func gpu(_ fs: [AV1HybridEncoder.Frame]) -> String {
+                fs.isEmpty ? "-" : String(format: "%.1f", fs.map(\.timing.analysis).reduce(0, +) / Double(fs.count) * 1000)
+            }
+            let shares = rest.map { $0.timing.searchedMotion ? ($0.timing.motionFound < 0 ? "?" : String(format: "%.0f", $0.timing.motionFound * 100)) : "-" }
+            print("             motion search: \(skipped.count) of \(rest.count) inter frames skipped it · GPU analysis \(gpu(searched)) ms searched, \(gpu(skipped)) skipped · found (% of coded; -: skipped) \(shares.joined(separator: " "))")
+        }
         // GOLDEN_FRAME: how often each long-term picture was chosen, by its rank by use and by AV1 slot
         if !opts.has("no-golden") {
             var ranks = [Int](repeating: 0, count: 8), slots = [Int](repeating: 0, count: 8)
@@ -427,6 +446,11 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.profilesStages = true
         // isolated dispatches run at whatever clock the GPU is at, so take each stage's best of 10
         var st = AV1MetalEncoder.StageTimes()
+        // (with --motion-skip, the last picture as the stream coded it: searched or not)
+        let lastSearched = !inter || frames.count < 2 || frames[frames.count - 1].timing.searchedMotion
+        let searches = encoder.searchesMotion
+        encoder.searchesMotion = searches && lastSearched
+        defer { encoder.searchesMotion = searches }
         for run in 0..<10 {
             if inter, pictures.count > 1 {
                 try encoder.encode(count: 2, qindex: qindex, picture: { picture(pictures.count - 2 + $0) }, output: { _, _ in })
@@ -446,7 +470,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let names = ["4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32",
                      "64x64", "", "", "", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16"]
         let shapes = st.shapes.sorted { $0.key < $1.key }.map { String(format: "%@ %.2f", names[$0.key], $0.value * 1000) }
-        let motion = inter ? String(format: "motion search %.2f · inter candidates %.2f · ", st.motionSearch * 1000, st.interSearch * 1000) : ""
+        let motion = inter ? String(format: "motion search %.2f · inter candidates %.2f%@ · ", st.motionSearch * 1000, st.interSearch * 1000,
+                                    lastSearched ? "" : " (skipped)") : ""
         print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.2f%@",
                      motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000,
                      st.mlPrune > 0 ? String(format: " · learned pruning %.2f", st.mlPrune * 1000) : ""))

@@ -501,3 +501,75 @@ extension HybridEncoderTests {
         }
     }
 }
+
+extension HybridEncoderTests {
+    /// `motionSkip`: a stream of a scene whose photo drifts, then of stripes (each picture new),
+    /// then of the scene again, searches the scene's frames (quarter samples, blocks predicted at
+    /// them), skips the search once two frames that searched found almost nothing (whole samples,
+    /// no blocks predicted), two in a row and then searches one, two pictures late (the scene's
+    /// return is seen at the third search after it), the search switched frame by frame; libaom
+    /// decodes the stream in order to exactly the pictures the encoder reports.
+    @available(macOS 27, *)
+    @Test func motionSkipMixesSearchedAndSkippedFramesExactly() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 384)
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (1, 1)
+        encoder.interFrames = true
+        encoder.motionSkip = (threshold: 0.2, recheckEvery: 3)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x6e0_5ea7)
+        let noise = 5..<13
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<17 {
+            var y = base.y
+            if noise.contains(i) {
+                // stripes of random levels, new each picture: intra predicts them, the last picture doesn't
+                let levels = (0..<width).map { _ in UInt8(rng.int(0..<256)) }
+                for k in y.indices { y[k] = levels[k % width] }
+            } else {
+                // the photo: a smooth texture, moved (3, 1) and brightened by 2 a picture
+                for r in 100..<300 {
+                    for c in 64..<448 {
+                        let (u0, v0) = (c + 3 * i, r + i)
+                        y[r * width + c] = UInt8(clamping: 60 + 2 * i + (u0 * 7 + v0 * 3) % 50 + ((u0 / 9 + v0 / 7) % 3) * 20)
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var skipped: [Int] = [], run = 0, longest = 0, found: [String] = []
+        try encoder.encode(count: pictures.count, qindex: 100, picture: { pictures[$0] }, output: { i, f in
+            if i > 0 {
+                let t = f.timing
+                found.append(t.searchedMotion ? String(format: "%.2f", t.motionFound) : "-")
+                #expect(f.params.mv_precision == (t.searchedMotion ? 1 : 0), "frame \(i): mv_precision \(f.params.mv_precision)")
+                if t.searchedMotion {
+                    run = 0
+                    if (1..<5).contains(i) || i == 16 { #expect(t.motionFound >= 0.5 && t.searched > 0, "frame \(i): found \(t.motionFound)") }
+                } else {
+                    skipped.append(i)
+                    run += 1
+                    longest = max(longest, run)
+                    #expect(t.searched == 0 && t.motionFound < 0, "frame \(i): blocks predicted without a motion search")
+                }
+            }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        // frames 5 and 6 (stripes) find nothing, so 8 and 9 skip, 10 searches; 11 and 12 skip, 13
+        // (the scene against stripes) searches and finds nothing; 14 and 15 skip, 16 searches
+        #expect(skipped == [8, 9, 11, 12, 14, 15], "skipped the motion search in frames \(skipped), found \(found)")
+        #expect(longest <= 2, "skipped \(longest) frames in a row")
+    }
+}
