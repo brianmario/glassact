@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The motion search's and inter candidates' kernels: candidates and gate centres across the SIMD-group, `k_inter` with its own scratch and several blocks a SIMD-group up to the gate, the sub-sample steps from a window (`metal-av1`) | kept; three `k_proj` variants and two `k_me` ones not (no gain or slower) | the same streams; a new 5K picture's motion search 2.54 → 2.19 ms and inter candidates 2.73 → 1.33 (video 8.17 → 7.52 and 5.94 → 4.47; scrolling images 8.95 → 8.48 and 3.54 → 1.87); the GPU stages ≈ 18.7 ms | [entry](#metal-av1-the-motion-search-and-inter-candidates-the-same-bytes-in-two-thirds-of-the-time-2026-11-12) |
 | The closed loop's reconstruction in 32x32 groups, handed on as the plan walks (`metal-av1`) | kept; single-block and 64x64 groups not (longer critical paths) | the same streams; a new 5K picture's tasks from ≈ 100 thousand of 2 µs to groups; critical path 9.3–11.2 → 5.6–7.1 ms of thread CPU; the bench's user CPU −21 ms a picture; the wall unmeasurable on the day's loaded Mac | [entry](#metal-av1-the-closed-loops-reconstruction-in-32x32-groups-handed-on-as-the-plan-walks-2026-11-12) |
 | The closed loop's RDOQ contexts by tx class with neighbours read once, the residual pass with the source span in NEON, `build_edges` in fixed-size pieces (`metal-av1`) | kept; an RDOQ early exit by a bits bound not kept (+4.6 % in the encoder though faster alone) | the same streams; the blocks' thread CPU on a new 5K picture 148.0 → 136.9 core-ms (−7.5 %), RDOQ 16.8 → 12.9 % of the loop | [entry](#metal-av1-the-closed-loops-rdoq-contexts-residual-pass-and-edges-the-same-bytes-2026-11-12) |
 | RDOQ off on 4x4 tx blocks (`metal-av1`, `rdoqMinCoefficients`, `av1seq --rdoq-coeffs 17`) | kept as an option, off | within ±0.2 % on six contents, +0.4 % / +0.7 % on an IDE; the closed loop's work on new 5K pictures −2.0 % (q14), −2.5 % (q20), −9.8 % (q26) | [entry](#metal-av1-rdoq-off-on-4x4-tx-blocks-re-measured-kept-off-2026-11-12) |
@@ -320,6 +321,58 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the motion search and inter candidates, the same bytes in two thirds of the time (2026-11-12)
+
+GPU stage times (`--profile`, best of 10, each run under the timing lock; they held to ±0.05 ms
+on a loaded Mac), alternated against the previous build. The same streams: the five digests,
+and video, scrolling images, dragging and app switching at 2900 (q14, q26, and `--no-subpel`)
+and at 5K, against the previous build's.
+
+**Where the time was** (the rotation's new 5K picture, each kernel in its own command buffer).
+Motion search 2.50 ms: `k_proj_sums` 0.10, `k_proj` 0.66, `k_me` 1.24 (0.58 even when every cell
+stops at its gate), `k_inter_sad` 0.50. Inter candidates 2.70: the four squares, 8x8 1.05, 16x16
+0.53, 32x32 0.70, 64x64 0.46, and with every block stopped at the gate still 1.79: a SIMD-group
+a block waiting on a chain of dependent table reads, and the 128-thread shapes' barriers. The RD
+itself was ≈ 0.9. On moving content the cost is `k_me`: 5.1 ms on video, 7.5 on scrolling images
+(its sub-sample steps ≈ 2.7 there).
+
+**Kept:**
+- `k_inter_sad`'s distinct candidates listed on 32 lanes, not one thread (`5140250`): 0.50 → 0.42.
+- `k_me`'s gate centres each measured across the SIMD-group (`7af6e37`): 1.24 → 0.99.
+- `k_inter` with a threadgroup scratch of its own, not the analysis's (`43e4563`): 8x8 6.1 →
+  2.4 KB a threadgroup, 32x32 13.4 → 8.4; 16x16 0.52 → 0.42, 32x32 0.70 → 0.60.
+- `k_inter`'s shapes up to 16x16 several blocks a SIMD-group up to the gate (8 for 8x8, 4 for
+  the others), the blocks that pass then on the whole SIMD-group as before (`b5c4c95`): 8x8
+  1.05 → 0.33, 16x16 0.42 → 0.28.
+- Its larger shapes a block a SIMD-group up to the gate, without barriers, then the RD on all
+  the threads with the same float sums (`4a04470`): 32x32 0.60 → 0.45, 64x64 0.46 → 0.39.
+- `k_me`'s sub-sample steps read the reference from an 18x18 window in threadgroup memory
+  (`b6fa0bf`): video 5.10 → 4.88, scrolling images 7.46 → 7.14.
+
+| a new 5K picture (medians of 3 alternated pairs) | motion search | inter candidates |
+|---|---|---|
+| the rotation, `--no-golden` | 2.54 → 2.19 | 2.73 → 1.33 |
+| video, 30 frames | 8.17 → 7.52 | 5.94 → 4.47 |
+| scrolling images, 30 frames | 8.95 → 8.48 | 3.54 → 1.87 |
+
+Checked on the merged head: the rotation 2.51–2.53 → 2.16–2.18 and 2.70–2.78 → 1.31–1.35; video
+(16 frames) 6.31 → 5.78 and 5.23 → 3.75; scrolling images 9.52 → 9.12 and 3.40 → 1.75. The GPU
+stages on a new 5K picture now: motion search 2.17, inter candidates 1.34, analysis 10.2,
+partition 0.2, leaves 3.05, learned pruning 1.77, ≈ 18.7 ms (≈ 20.5 that morning; the analysis
+is 0.5 above the day before with the retrained weights), and the filters' ≈ 4.
+
+**Measured, not kept:** `k_proj`'s candidate SADs across the SIMD-group (0.666 → 0.673), its
+strips summed on all 256 threads (0.71), three projection offsets a thread (0.74, and other
+bytes: its float costs differ); `k_me`'s window search stopping a lane that can't make the best
+two (no change), unaligned packed loads of the reference (7.46 → 8.59 on scrolling images).
+
+**A trade, measured:** whole-sample vectors only (`--no-subpel`) take ≈ 2.5 ms off the motion
+search on moving content at 5K (video 7.5 → 5.0, scrolling images 8.5 → 6.0) for +0.5–0.6 % of
+video's bytes at the same PSNR and nothing on scrolling images (three q, PSNR only).
+
+Left: on moving content `k_me`'s window search (≈ 4.4 ms on scrolling images) and sub-sample
+steps (≈ 2.4); `k_proj` (0.66), which resisted three tries.
 
 ### Metal AV1: the closed loop's reconstruction in 32x32 groups, handed on as the plan walks (2026-11-12)
 
