@@ -14,9 +14,118 @@ fn at(e: &Edge, k: i32) -> i32 {
     e[(O as i32 + k) as usize] as i32
 }
 
-/// Builds AboveRow[-1 .. w+h-1] and LeftCol[-1 .. w+h-1] (spec 7.11.2). `plane` starts at sample
+/// `d.copy_from_slice(s)` for the edges' lengths (up to 128) as two fixed-size copies that may
+/// overlap, which compile to a few vector loads and stores: a copy of a variable length is a call to
+/// memmove, which was most of [`build_edges`]' time (LLVM turns a loop of byte copies back into
+/// that call).
+#[inline(always)]
+fn copy_small(d: &mut [u8], s: &[u8]) {
+    #[inline(always)]
+    fn two<const N: usize>(d: &mut [u8], s: &[u8]) {
+        let k = d.len();
+        let (a, b): (&[u8; N], &[u8; N]) = (s[..N].try_into().unwrap(), s[k - N..k].try_into().unwrap());
+        let (a, b) = (*a, *b);
+        d[..N].copy_from_slice(&a);
+        d[k - N..].copy_from_slice(&b);
+    }
+    let k = d.len();
+    assert_eq!(k, s.len());
+    match k {
+        64..=128 => two::<64>(d, s),
+        32..=63 => two::<32>(d, s),
+        16..=31 => two::<16>(d, s),
+        8..=15 => two::<8>(d, s),
+        4..=7 => two::<4>(d, s),
+        _ => d.copy_from_slice(s),
+    }
+}
+
+/// `d.fill(v)` as [`copy_small`] copies: two fixed-size fills that may overlap.
+#[inline(always)]
+fn fill_small(d: &mut [u8], v: u8) {
+    #[inline(always)]
+    fn two<const N: usize>(d: &mut [u8], v: u8) {
+        let k = d.len();
+        d[..N].copy_from_slice(&[v; N]);
+        d[k - N..].copy_from_slice(&[v; N]);
+    }
+    match d.len() {
+        64..=128 => two::<64>(d, v),
+        32..=63 => two::<32>(d, v),
+        16..=31 => two::<16>(d, v),
+        8..=15 => two::<8>(d, v),
+        4..=7 => two::<4>(d, v),
+        _ => d.fill(v),
+    }
+}
+
+/// Builds AboveRow[-1 .. w+h-1] and LeftCol[-1 .. w+h-1] (spec 7.11.2), the rows' copies and fills in fixed-size
+/// pieces (`build_edges_matches_the_reference`). `plane` starts at sample
 /// (0, 0) of the plane; (x, y) is the tx block's top-left sample.
 pub fn build_edges(
+    plane: &[u8],
+    stride: usize,
+    x: i32,
+    y: i32,
+    log2w: i32,
+    log2h: i32,
+    have_left: bool,
+    have_above: bool,
+    have_above_right: bool,
+    have_below_left: bool,
+    max_x: i32,
+    max_y: i32,
+    above: &mut Edge,
+    left: &mut Edge,
+) {
+    let (w, h) = (1i32 << log2w, 1i32 << log2h);
+    let n = (w + h) as usize;
+    let (xu, yu) = (x as usize, y as usize);
+    if !have_above && have_left {
+        fill_small(&mut above[O..O + n], plane[yu * stride + xu - 1]);
+    } else if !have_above && !have_left {
+        fill_small(&mut above[O..O + n], (1 << 7) - 1);
+    } else {
+        let above_limit = (x + if have_above_right { 2 * w } else { w } - 1).min(max_x);
+        let row = &plane[(yu - 1) * stride..];
+        // AboveRow[i] = CurrFrame[y - 1][Min(aboveLimit, x + i)]
+        let k = (above_limit - x + 1).clamp(0, n as i32) as usize;
+        copy_small(&mut above[O..O + k], &row[xu..xu + k]);
+        let last = row[above_limit as usize];
+        fill_small(&mut above[O + k..O + n], last);
+    }
+    if !have_left && have_above {
+        fill_small(&mut left[O..O + n], plane[(yu - 1) * stride + xu]);
+    } else if !have_left && !have_above {
+        fill_small(&mut left[O..O + n], (1 << 7) + 1);
+    } else {
+        let left_limit = (y + if have_below_left { 2 * h } else { h } - 1).min(max_y);
+        // LeftCol[i] = CurrFrame[Min(leftLimit, y + i)][x - 1]: the column down to the limit, then
+        // the limit's sample
+        let k = (left_limit - y + 1).clamp(0, n as i32) as usize;
+        let col = &plane[xu - 1..];
+        for (i, d) in left[O..O + k].iter_mut().enumerate() {
+            *d = col[(yu + i) * stride];
+        }
+        fill_small(&mut left[O + k..O + n], col[left_limit as usize * stride]);
+    }
+    let c = if have_above && have_left {
+        plane[(yu - 1) * stride + xu - 1]
+    } else if have_above {
+        plane[(yu - 1) * stride + xu]
+    } else if have_left {
+        plane[yu * stride + xu - 1]
+    } else {
+        1 << 7
+    };
+    above[O - 1] = c;
+    left[O - 1] = c;
+}
+
+/// [`build_edges`]' reference (its first version, for the tests): builds AboveRow[-1 .. w+h-1] and LeftCol[-1 .. w+h-1] (spec 7.11.2). `plane` starts at sample
+/// (0, 0) of the plane; (x, y) is the tx block's top-left sample.
+#[cfg(test)]
+pub fn build_edges_ref(
     plane: &[u8],
     stride: usize,
     x: i32,

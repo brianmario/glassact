@@ -1115,3 +1115,54 @@ mod oracle {
         }
     }
 }
+
+/// build_edges' fixed-size copies and fills give its reference's edges: every tx size and edge
+/// flag, blocks anywhere in the plane, with limits from the block's own edge to far beyond it.
+#[test]
+fn build_edges_matches_the_reference() {
+    const PW: usize = 300;
+    let mut r = Rng(29);
+    let plane: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
+    for _ in 0..200 {
+        for t in ALL_TX {
+            let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+            for k in 0..16 {
+                let (hl, ha, har, hbl) = (k & 1 != 0, k & 2 != 0, k & 4 != 0, k & 8 != 0);
+                let x = if hl { 1 + r.range(0, 150) } else { 0 };
+                let y = if ha { 1 + r.range(0, 150) } else { 0 };
+                let mx = (x + r.range(0, 140) - 1).clamp(x, PW as i32 - 1);
+                let my = (y + r.range(0, 140) - 1).clamp(y, PW as i32 - 1);
+                let fill = r.next() as u8;
+                let (mut a1, mut l1) = ([fill; EDGE_LEN], [fill; EDGE_LEN]);
+                let (mut a2, mut l2) = (a1, l1);
+                build_edges(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a1, &mut l1);
+                build_edges_ref(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a2, &mut l2);
+                assert!(a1 == a2 && l1 == l2, "tx {t} flags {k} at ({x}, {y}) limits ({mx}, {my})");
+            }
+        }
+    }
+}
+
+/// build_edges against its reference per call, interior blocks (`--ignored`).
+#[test]
+#[ignore]
+fn bench_build_edges() {
+    type F = fn(&[u8], usize, i32, i32, i32, i32, bool, bool, bool, bool, i32, i32, &mut Edge, &mut Edge);
+    const PW: usize = 512;
+    let plane: Vec<u8> = (0..PW * PW).map(|i| (i * 31 % 251) as u8).collect();
+    for (name, t) in [("4x4", TX_4X4), ("8x8", TX_8X8), ("16x16", TX_16X16), ("32x32", TX_32X32), ("8x4", TX_8X4)] {
+        let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+        let (mut a, mut l) = ([0u8; EDGE_LEN], [0u8; EDGE_LEN]);
+        let iters = 2_000_000;
+        for (which, f) in [("ref", build_edges_ref as F), ("new", build_edges as F)] {
+            let tm = std::time::Instant::now();
+            for i in 0..iters {
+                let (x, y) = (64 + (i % 5) as i32 * 64, 64 + (i % 3) as i32 * 64);
+                let f = std::hint::black_box(f);
+                f(&plane, PW, x, y, lw, lh, true, true, i % 2 == 0, i % 3 == 0, PW as i32 - 1, PW as i32 - 1, &mut a, &mut l);
+                std::hint::black_box((&a, &l));
+            }
+            println!("{name} {which}: {:.1} ns", tm.elapsed().as_nanos() as f64 / iters as f64);
+        }
+    }
+}
