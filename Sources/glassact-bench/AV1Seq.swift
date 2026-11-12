@@ -72,7 +72,7 @@ let av1SeqCommand = Command(
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
         .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
-        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, rdoq-coeffs=<n>, shapes=<hex>, eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level (default off)"),
+        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, no-subpel, shifts-ok, rdoq-coeffs=<n>, shapes=<hex>, eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level (default off)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .int("two-steps", "<0-63>", 0...63, "with --inter, a measurement: code each picture twice in one stream, at this q first (as the other options say) and then at --q against the first's decoded picture (no copies, motion searched from no shift), one picture at a time; each step's bytes and scores are printed, and with --profile its GPU stages"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
@@ -281,6 +281,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             case "shapes": guard let v = Int32(value, radix: 16) else { throw BenchError("--fast shapes=<hex>") }; e.analysis.shapeMask = v
             case "eps": guard let v = Float(value) else { throw BenchError("--fast eps=<p>") }; e.analysis.eps = v
             case "motionless": guard let n = Int(value), n >= 1 else { throw BenchError("--fast motionless=<n>") }; e.motionlessRun = n
+            case "shifts-ok": e.motionlessNeedsNoShifts = false
+            case "no-subpel": e.analysis.subpel = false
             case "run": guard let n = Int(value), n >= 1 else { throw BenchError("--fast run=<n>") }; e.runLimit = n
             case "preset":
                 guard let v = AV1MetalEncoder.Preset(rawValue: value) else { throw BenchError("--fast preset=<name>") }
@@ -483,7 +485,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      avg { $0.searched } * 100))
         if encoder.newPictureEffort != nil {
             let fast = frames.indices.filter { frames[$0].timing.fast }
-            print("             fast pictures: \(fast.count) of \(rest.count) inter frames (\(fast.map { "\($0)@\(frames[$0].timing.qindex)" }.joined(separator: " ")))")
+            print("             fast pictures: \(fast.count) of \(rest.count) inter frames (\(fast.map { "\($0)@\(frames[$0].timing.qindex)\(frames[$0].timing.searchedMotion ? "" : "m")" }.joined(separator: " ")))")
+            print("             shift candidates (-: no search): \(rest.map { $0.timing.shiftCandidates < 0 ? "-" : String($0.timing.shiftCandidates) }.joined(separator: " "))")
         }
         if encoder.motionSkip != nil || opts.has("motion-shares") {
             // which frames searched, what each found (of what it coded), and their GPU analysis

@@ -89,6 +89,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var fast = false
         /// The frame's qindex (with `newPictureEffort`'s offset where it took it).
         public var qindex = 0
+        /// An inter frame's whole-sample shifts the copy finder proposed to the motion search
+        /// (rows that match the last picture's exactly, shifted; -1: no search).
+        public var shiftCandidates = -1
     }
 
     /// An encoded picture.
@@ -358,6 +361,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var searchesMotion = true
         /// See `searchesMotion` (1: a run's first picture alone).
         public var motionlessRun = 1
+        /// With `searchesMotion` false: only where the copy finder proposed no shift (true). A
+        /// scroll's rows match the last picture's at a shift, which a switch's don't: the start of a
+        /// scroll of new images is a mostly-new picture after quiet ones too, and without its
+        /// search it costs 13–35× its bytes (BENCHMARKS "a mostly-new picture coded fast").
+        public var motionlessNeedsNoShifts = true
         /// The closed loop's luma tx type search (false: DCT_DCT, as `searchesTxTypes` off).
         public var searchesTxTypes = true
         /// RDOQ (false: the dead-zone quantizer's levels, as `usesRDOQ` off).
@@ -416,7 +424,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         run += 1
         guard effort.runLimit.map({ run <= $0 }) ?? true else { return false }
-        if !effort.searchesMotion && run <= effort.motionlessRun { copies.candidates = nil }
+        if !effort.searchesMotion && run <= effort.motionlessRun,
+           !effort.motionlessNeedsNoShifts || copies.candidates?.isEmpty != false {
+            copies.candidates = nil
+        }
         return true
     }
 
@@ -721,6 +732,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 timing.motionFound = found
                 timing.fast = pending.fast
                 timing.qindex = pending.qindex
+                timing.shiftCandidates = pending.shiftCandidates
                 let motion = pending.motion
                 // picture i - 1's write runs beside this closed loop; finish takes it back before
                 // picture i's write begins (until then `writing` holds it, for the defer)
@@ -960,6 +972,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// The picture's qindex, and whether it takes `newPictureEffort`.
         var qindex = 0
         var fast = false
+        /// The shifts its copies proposed to the motion search (-1: none searched).
+        var shiftCandidates = -1
     }
 
     /// An inter frame's reference slots: LAST_FRAME's, GOLDEN_FRAME's + 1 (0: none), the slots it
@@ -1214,7 +1228,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             hashes = h
         }
         return Pending(partition: partition, motion: copies.motion, searchesMotion: copies.candidates != nil,
-                       motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs, qindex: qindex, fast: fast)
+                       motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs, qindex: qindex, fast: fast,
+                       shiftCandidates: copies.candidates.map { $0.count / 2 } ?? -1)
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, applied pre: Applied? = nil, motion sbMotionIn: [Int32]?,
@@ -1273,7 +1288,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 video.allow_screen_content_tools = 1
                 video.cdf_from_ref = carriesCDFs ? 1 : 0
                 // (the frame's: `motionSkip` decides it frame by frame)
-                video.mv_precision = searchesMotion && searchesSubpelMotion ? 1 : 0
+                // (`newPictureEffort`'s, in a fast picture)
+                let subpel = (fast ? newPictureEffort?.analysis.subpel : nil) ?? searchesSubpelMotion
+                video.mv_precision = searchesMotion && subpel ? 1 : 0
                 timing.searchedMotion = searchesMotion
                 sbMotion = sbMotionIn
                 let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count

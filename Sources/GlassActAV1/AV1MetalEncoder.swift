@@ -485,7 +485,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                   Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0, leafTxSearchPixels,
                   leafChromaAngledModes ? 1 : 0, Int(shapeMask),
                   Int(newPicture?.eps?.bitPattern ?? 0xFFFF_FFFF), Int(newPicture?.modeEps?.bitPattern ?? 0xFFFF_FFFF),
-                  (newPicture?.preset).map { Int(AV1MetalEncoder.params(for: $0).txSearchCL) * 16 + Int(AV1MetalEncoder.params(for: $0).uvK) } ?? -1] {
+                  (newPicture?.preset).map { Int(AV1MetalEncoder.params(for: $0).txSearchCL) * 16 + Int(AV1MetalEncoder.params(for: $0).uvK) } ?? -1,
+                  (newPicture?.subpel).map { $0 ? 1 : 0 } ?? -1] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -540,8 +541,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The analysis's effort, in place of `interPreset`'s (its shapes still `shapeMask`'s or
         /// `newPictureShapeMask`'s).
         public var preset: Preset?
-        public init(shapeMask: Int32? = nil, eps: Float? = nil, modeEps: Float? = nil, preset: Preset? = nil) {
-            (self.shapeMask, self.eps, self.modeEps, self.preset) = (shapeMask, eps, modeEps, preset)
+        /// The motion search's quarter samples, in place of `searchesSubpelMotion` (false: whole
+        /// samples; the frame's header must say so).
+        public var subpel: Bool?
+        public init(shapeMask: Int32? = nil, eps: Float? = nil, modeEps: Float? = nil, preset: Preset? = nil, subpel: Bool? = nil) {
+            (self.shapeMask, self.eps, self.modeEps, self.preset, self.subpel) = (shapeMask, eps, modeEps, preset, subpel)
         }
     }
     let recon: any MTLComputePipelineState
@@ -1285,7 +1289,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
-            params.meSubpel = encoder.searchesSubpelMotion ? 1 : 0
+            params.meSubpel = newPictureAnalysis?.subpel ?? encoder.searchesSubpelMotion ? 1 : 0
             params.interSkipsIntra = encoder.interSkipsIntra ? 1 : 0
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
