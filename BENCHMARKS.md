@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, off by default; the owner's choice | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
 | No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`) | kept, off by default; the owner's choice | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
 | The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
@@ -313,6 +314,52 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: byte-identical speedups: analysis kernels for the hybrid, projections once a picture (2026-11-11)
+
+Five ideas from the reviewers' lists, one at a time, each against a baseline build with
+alternated runs. The streams were unchanged after each: `7c17df5c516aab0d`, `e6d1c15a33d8ee99`
+and `19a454f8604df9eb` at 5K q20, plus `043b6b1e2c0a51cc` at 2900 q32 and `c941eb17e507be34` at
+5K q8. The AV1, Postfilter, AV1Core and Rust tests pass, including the oracle differential run.
+Timings are `--profile` best of 10 on the rotation at 5K q20, provisional (the Mac in use).
+
+**Kept:**
+- **The analysis kernels compiled for the hybrid's settings** (`696c1ce`). A function constant,
+  `ga_fixed`, in k_analysis.h and k_analysis_small.h fixes K = 1, no tx-type search, no edge
+  filter, no quantization matrices and no external screener. `Run.analysisIsFixed` picks those
+  pipelines only when the params match. Each set compiles on first use, so an encoder compiles
+  one.
+  - Analysis 11.2–11.3 → 10.2–10.3 ms: 4x4 1.51 → 1.20, 8x8 1.92 → 1.75, 16x16 2.18 → 1.94,
+    32x32 3.12 → 2.93, 64x64 2.44 → 2.33.
+  - Checked again against the previous head: 11.2–11.3 → 10.3–10.6.
+- **The motion projections' reference strips summed once a picture** (`f4b863b`). `k_proj_sums`
+  sums every SB's 64 rows and columns of the previous picture into a table kept between
+  pictures, and `k_proj` reads its ranges from it. When fewer than 1/8 of the SBs are searched,
+  `k_proj` sums the strips itself as before. The integer sums, scoring and ties are the same.
+  - Motion search 2.89–2.90 → 2.45–2.46 ms; checked again: 2.88–2.91 → 2.44–2.48.
+- **No transform for a residual that quantizes to nothing** (`186e2da`, rust/av1). Each
+  coefficient is a row of the column matrix times the residual times a row of the row matrix. By
+  Cauchy-Schwarz it is at most scale × the largest kept rows' norms × √energy, with 1.001 for
+  float rounding. When that is under the quantizer's zero region at the smaller step (no
+  quantization matrix), the levels are zero with no transform. Nothing reads the coefficients
+  then, and the trial costs the block by its energy as before. `coeff_bound_holds` tests the
+  bound against both forward transforms (NEON and scalar).
+  - It fires on 26 % of the trials at 5K q20 (48 % of DCT_DCT trials, 71 % of those that
+    quantize to zero), 28 % at 2900 q32 and 18 % at 5K q8.
+  - The tx-block hook's CPU went 392–398 → 347–349 ms over 600 k blocks. The closed loop's wall
+    time moved −0.15 ms a frame on average, within noise. Kept as a byte-neutral gain off the
+    critical path.
+
+**Not kept, no measurable time:**
+- **CDEF's strength search with each block's neighbourhood in threadgroup memory.** `l_cdef_sse`
+  alone went from 1.372 / 2.175 / 1.275 to 1.348 / 2.146 / 1.266 ms, as with `p_cdef` before. The
+  identity candidate already reads no taps.
+- **The writer's threads capped at 3, 4, 6, 8 or 10.** The same frames a second and closed loop
+  as 14, within noise (63–68 fps, 4.5–5.7 ms at 32 frames).
+- **k_leaf compiled for the hybrid.** Leaves 2.89 → 2.82, under the 0.1 ms bar.
+
+The GPU stages on a new 5K picture, after these: motion search 2.46, inter candidates 2.62,
+analysis 10.3, partition 0.2, leaves 2.88, learned pruning 1.94, ≈ 20.4 ms (≈ 21.8 before).
 
 ### Metal AV1: key frames at a finer qindex (2026-11-11)
 
