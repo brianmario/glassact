@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The leaves' chroma screening: each mode compiled for itself, shifts for divisions, the proxy's rate term from a table; 64x64's integer work on 256 threads with its float sums on the same 128 (`metal-av1`) | kept; the pruning's orientation bins from a table not (under the bar) | the same streams; a new 5K picture's leaves 3.03 → 1.55 ms, 64x64 1.78 → 1.71 (2.37 → 2.21 with `--fast off`); the GPU stages ≈ 14.4 ms; the all-new stream ≈ 49 → 51 inter frames a second | [entry](#metal-av1-the-leaves-in-half-the-time-64x64s-integer-work-on-256-threads-2026-11-12) |
 | A mostly-new picture coded fast at a qindex of its own (`metal-av1`, `newPictureEffort`, `av1seq --fast`) | **level 1 on by default at Δ+7, every mostly-new picture** (looser learned pruning, no RDOQ, no CDEF); levels 2 (no motion search where no shift is proposed: +22–26 % on two text screens) and 3 (no tx type search: bytes swing with content) options | bytes −0.8 to −6.8 % on every content measured, quality −0.2 to −0.9 dB (the most on video, while it plays); a new 5K picture's GPU stages 18.1 → 15.9 ms, filters' GPU ≈ 4.4 → 0.8, closed loop −13 core-ms, 36 → 43 inter frames a second | [entry](#metal-av1-a-mostly-new-picture-coded-fast-and-paid-for-in-quality-level-1-on-by-default-2026-11-12) |
 | The analysis's threadgroup scratch by shape, the DCT matrix from a device buffer, 16x16 and 64x64 on the matrix units, 32 4x4s a lane each (`metal-av1`) | kept; 64x64 on 256 threads not (faster, the reference streams unchanged, but its float sums would split differently) | the same streams; a new 5K picture's analysis 10.2 → 9.6 ms | [entry](#metal-av1-the-analysiss-scratch-by-shape-16x16-and-64x64-on-the-matrix-units-2026-11-12) |
 | The motion search's and inter candidates' kernels: candidates and gate centres across the SIMD-group, `k_inter` with its own scratch and several blocks a SIMD-group up to the gate, the sub-sample steps from a window (`metal-av1`) | kept; three `k_proj` variants and two `k_me` ones not (no gain or slower) | the same streams; a new 5K picture's motion search 2.54 → 2.19 ms and inter candidates 2.73 → 1.33 (video 8.17 → 7.52 and 5.94 → 4.47; scrolling images 8.95 → 8.48 and 3.54 → 1.87); the GPU stages ≈ 18.7 ms | [entry](#metal-av1-the-motion-search-and-inter-candidates-the-same-bytes-in-two-thirds-of-the-time-2026-11-12) |
@@ -323,6 +324,54 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the leaves in half the time, 64x64's integer work on 256 threads (2026-11-12)
+
+GPU stage times, alternated against the previous build. The same streams: the five digests with
+the defaults and with `--fast off`, key frames (text at q14, photos at q20 and with
+`--chroma-angles`), and video, an IDE, maps and scrolling images, against the previous build's.
+
+**Where the leaves' 3.0 ms were** (a new 5K picture; parts switched off for timing): `k_leaf`'s
+chroma item loop 1.40, `k_leaf_small`'s mode loop 0.70, the rest ≈ 0.9 (scan, dispatches, the
+chroma model, edges, CfL).
+
+**Kept:**
+- **`k_leaf_small` screens each chroma mode compiled for itself** (`d2986de`): the 13 modes
+  written out in order, each a constant's predictor, a mode the chroma model doesn't keep
+  skipped by a mask. The same cost expressions on the same values in the same order.
+  Leaves 3.01 → 2.70.
+- **`k_leaf`'s chroma items by shifts, each item's predictor compiled for its mode**
+  (`4c8718b`): five run-time integer divisions and modulos an item were by powers of two. 2.70
+  → 2.13.
+- **The chroma proxy's rate term from a table** (`b64e60a`): the term is 2 + 2·log2(m/step + 1)
+  with m = |d|/4, |d| ≤ 4080 and step a function of qindex, so a 256 × 4096-float table, filled
+  once an encoder on the GPU by the same function, replaces a log2 and a division a
+  coefficient. The sums are in the same order. 2.13 → 1.55.
+- **64x64's integer work on 256 threads, its float sums on the same 128** (`7d74e01`): edges,
+  the flat check, screening, the residual and the matrix units' DCT run on all 256 (integers, or
+  the same chain of multiply-accumulates whichever SIMD-group runs a tile); every float sum
+  (variance, distortion, rate, energy) stays on threads 0–127 through the same partials in the
+  same order, the other 128 idle at the barriers. The start-up check runs the matrix units as
+  the kernel now does. Screening alone on 256 gained nothing (2.35 → 2.36); it is the whole
+  integer part that does.
+
+| a new 5K picture, medians of 3 alternated pairs | leaves | 64x64 | analysis |
+|---|---|---|---|
+| the defaults | 3.03 → 1.55 | 1.78 → 1.71 | 7.4 |
+| `--fast off` | 3.06 → 1.58 | 2.37 → 2.21 | 9.6 → 9.5 |
+| 5K key frames, `--no-reuse`, q14 | 3.29 → 1.74 | 2.12 → 1.99 | 27.8 → 25.7 (the first noisy) |
+
+Checked on the merged head, two alternated pairs at a load of 58: leaves 3.02 → 1.55–1.56, 64x64
+1.78 → 1.71, and the all-new stream 48.4 / 49.3 → 50.4 / 52.0 inter frames a second (the first
+frames a second taken without `GA_CRIT` since the fast pictures; 35–36 with `--fast off` the
+day's morning build). The GPU stages on a new 5K picture now: motion search 2.16, inter
+candidates 1.31, analysis 7.45, partition 0.2, leaves 1.55, learned pruning 1.71, ≈ 14.4 ms, and
+the filters' ≈ 1.
+
+**Measured, not kept:** the learned pruning's orientation bins from a table (1.71 → 1.67–1.70);
+`k_leaf_small` in threadgroups of 64 (no change). Left: `k_leaf`'s item loop ≈ 0.45 and the
+leaves' other ≈ 0.9; 64x64's quantizer and rate loop on 256 (≈ 0.13); lists so pruned 16x16s and
+up aren't dispatched; `k_ml_stats` (0.88).
 
 ### Metal AV1: a mostly-new picture coded fast and paid for in quality; level 1 on by default (2026-11-12)
 
