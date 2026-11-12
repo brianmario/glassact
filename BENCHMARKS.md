@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`) | kept, off by default; the owner's choice | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
 | The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
 | Long-term references: up to N scenes' last pictures kept, GOLDEN_FRAME the one that matches best each frame (`metal-av1`, `longTermReferences`, `av1seq --long-term`) | kept, on (N = 4) | against N = 1 (today's rule): four traces in turn −49 % (2900) and −70 % (5K); app switching −33 %; tabs −0.9 %, windows −1.5 %, two screens in turn 0; finder time no higher (5K rotation 19.5 → 8–11 ms); +44 MB a slot at 5K | [entry](#metal-av1-long-term-references-golden_frame-the-stored-picture-that-matches-best-2026-11-11) |
 | Where libaom's lead at q26–40 on the four-trace rotation at 2900 comes from (`metal-av1`, per-block counts) | measured; a reference policy is the lever | libaom keeps its key frame as GOLDEN_FRAME for the whole run and the rotation returns to its first trace every 4th picture; our GOLDEN is the picture before last; with GOLDEN kept on the key frame (a test) ours is −21.8 % against libaom at q20–40, and on the pictures libaom codes without GOLDEN ours is −20 % at every q | [entry](#metal-av1-where-libaoms-lead-at-low-rates-comes-from-its-long-term-reference-2026-11-11) |
@@ -311,6 +312,46 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: no motion search after frames whose search found nothing (2026-11-11)
+
+This is the follow-up to the coded-share rule (below, not adopted).
+`AV1HybridEncoder.motionSkip: (threshold, recheckEvery)?` (nil by default) with
+`motionSkipLookback` (K = 2), and `av1seq --motion-skip <share>,<every>[,<k>]`, `e07c072`.
+- **The signal**, `Timing.motionFound`: in a frame that searched, the area where an inter block
+  won the partition's decision, as a share of the coded (not copied) 64x64s.
+- **The rule.** A frame skips the search when the last K frames that searched were each below
+  the threshold. After `every − 1` skips in a row one frame searches again, and a key frame or a
+  size change clears the history.
+- **The lag.** Picture i + 2's search is decided when picture i's partition is read, so the
+  signal is two pictures late.
+- **The plumbing** comes from `d2146af`: the decision travels with the frame to the header's
+  `mv_precision`, and `Timing.searchedMotion` reports it.
+- **Exactness.** Off, the digests are unchanged. A test that mixes searched and skipped frames
+  decodes exactly.
+
+The signal at q20 with the rule off, per frame, as a share of the coded area: the rotation 0–17 %
+mostly, with occasional 49 % and 91 %; two screens in turn 0–16 %; scrolling 76–100 %, dragging
+27–88 %, video 23–59 %, scrolling images 95–98 %, app switching 95–100 %.
+
+BD-rate against off (RGB PSNR / SSIMULACRA2, q 8–32), with the inter frames skipped (the same at
+every q):
+
+| content | 0.05, 4 | 0.1, 4 | 0.2, 8 |
+|---|---|---|---|
+| the rotation, 5K, 16 frames | 0, 2 of 15 | −0.01 %, 4 of 15 | 0, 11 of 15 |
+| the rotation without long-term references (`--no-golden`: every picture new) | 0 of 15 | 0 of 15 | +2.44 % / +2.47 %, 11 of 15 |
+| two screens in turn, 2900 | −0.15 % / −0.13 %, 19 of 29 | the same | −0.15 % / −0.12 %, 23 of 29 |
+| scrolling, dragging, video, scrolling images, app switching (2900, 30 frames each) | none skipped | none | none |
+
+Checked again: video's stream is identical at 0.2,8 (none skipped), and the rotation skips 11 of
+15 at the same 141.6 KB and 46.39 dB. The earlier rule's +17 % on video and +426 % on scrolling
+images are gone. GPU stages on an all-new 5K picture, skipped against searched (provisional, the
+Mac in use, ±0.03 ms over 3 alternated runs): 21.9 → 16.2 ms, the motion search (2.93) and inter
+candidates (2.65) gone. The first 4 inter frames always search (K = 2 and the lag). On pure noise
+inter wins ≈ 96 % of the area, so the signal can read high on noise; screen content didn't show
+it. Off by default, because it trades bytes for time where every picture is new and nothing is
+copied.
 
 ### Metal AV1: the level model's q20 loss at eps 0.05, explained (2026-11-11)
 
