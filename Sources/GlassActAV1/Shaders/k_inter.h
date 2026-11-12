@@ -320,25 +320,47 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         simdgroup_barrier(mem_flags::mem_threadgroup);
         uint bestSad = 0xFFFFFFFFu;
         const int row = (int)lane >> 1, col0 = ((int)lane & 1) * 8;
+        const int bx = best[0].x >> 3, by = best[0].y >> 3;  // the whole-sample best: the window's (1, 1)
+        int cv[8];  // the lane's 8 samples of the cell
+        for (int col = 0; col < 8; col++) cv[col] = cur[warp][row * 16 + col0 + col];
         for (int step = 4; step >= 2; step >>= 1) {
             const int2 c = best[0];
             uint top = 0xFFFFFFFFu;
-            for (int l = 0; l < 9; l++) {
-                // the centre once (at the first step) and the 8 neighbours
-                uint sad = 0xFFFFFFFFu;
-                if (l == 4 && step != 4) sad = bestSad;  // the centre, as the last step measured it
-                else {
-                    const int2 v = c + int2((l % 3 - 1) * step, (l / 3 - 1) * step);
-                    if (ga_ref_inside(I, x, y, v, 16, 16)) {
-                        uint part = 0;
-                        for (int col = col0; col < col0 + 8; col++)
-                            part += (uint)abs((int)cur[warp][row * 16 + col] -
-                                              ga_ref_px_tg(win[warp], GA_ME_WIN, x + col - wx0, y + row - wy0, v));
-                        sad = simd_sum(part);
+            // Glass Act: ga_ref_px's bilinear sum as (8 - fy) h(top) + fy h(below) (+ 32, >> 6), h a
+            // row's (8 - fx) a + fx b: the same whole numbers. A step's 9 positions are 3 columns by
+            // 3 rows of offsets, so the lane makes each column's h once for the 2 or 3 rows they read
+            // and the column's 3 positions share them
+            const int oy0 = ((c.y - step) >> 3) - by + 1, span = (((c.y + step) >> 3) - by + 1) - oy0;  // rows oy0 .. oy0 + span + 1
+            for (int j = 0; j < 3; j++) {
+                const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1, fx = vx & 7;
+                int h[3][8];
+                for (int t = 0; t < 3; t++) {
+                    if (t > span + 1) {  // (a row no position reads, and maybe past the window)
+                        for (int col = 0; col < 8; col++) h[t][col] = 0;
+                        continue;
                     }
+                    threadgroup const uint8_t *w = win[warp] + (row + oy0 + t) * GA_ME_WIN + col0 + ox;
+                    for (int col = 0; col < 8; col++) h[t][col] = (8 - fx) * (int)w[col] + fx * (int)w[col + 1];
                 }
-                const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (l == 4 ? 0u : (uint)l + 1);  // centre first on ties
-                top = min(top, key);
+                for (int k = 0; k < 3; k++) {
+                    const int l = k * 3 + j;
+                    // the centre once (at the first step) and the 8 neighbours
+                    uint sad = 0xFFFFFFFFu;
+                    if (l == 4 && step != 4) sad = bestSad;  // the centre, as the last step measured it
+                    else {
+                        const int2 v = int2(vx, c.y + (k - 1) * step);
+                        if (ga_ref_inside(I, x, y, v, 16, 16)) {
+                            const int fy = v.y & 7, t = ((v.y >> 3) - by + 1) - oy0;
+                            uint part = 0;
+                            for (int col = 0; col < 8; col++)
+                                part += (uint)abs(cv[col] - (((8 - fy) * (t ? h[1][col] : h[0][col]) +
+                                                              fy * (t ? h[2][col] : h[1][col]) + 32) >> 6));
+                            sad = simd_sum(part);
+                        }
+                    }
+                    const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (l == 4 ? 0u : (uint)l + 1);  // centre first on ties
+                    top = min(top, key);
+                }
             }
             if (top != 0xFFFFFFFFu) {
                 const int l = (top & 15) == 0 ? 4 : (int)(top & 15) - 1;
