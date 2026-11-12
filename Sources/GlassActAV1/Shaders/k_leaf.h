@@ -25,8 +25,14 @@ struct LeafSmem {
     uint8_t ea[3][AV1G_EDGE_LEN], el[3][AV1G_EDGE_LEN];  // luma, U, V
 };
 
-// av1gpu's reference-engine RD proxy of one 4x4 residual (orthonormal Hadamard, dead zone 0.6 step)
-static inline float leaf_proxy4(thread int *d, float step, float lambda) {
+// the proxy's rate term for a coefficient of magnitude m, at step; k_leaf_rates tabulates it, by
+// qindex and 4 m (LEAF_RATE_N a qindex), with this same expression
+static inline float leaf_rate_term(float m, float step) { return 2.f + 2.f * log2(m / step + 1.f); }
+#define LEAF_RATE_N 4096  // |4 m| <= 16 * 255: a 4x4 Hadamard of residuals in [-255, 255]
+
+// av1gpu's reference-engine RD proxy of one 4x4 residual (orthonormal Hadamard, dead zone 0.6 step);
+// rt: the rate terms of step's qindex (leaf_rate_term(a / 4, step) at a = |4 m|), the same floats
+static inline float leaf_proxy4(thread int *d, float step, float lambda, device const float *rt) {
     for (int i = 0; i < 4; i++) {
         thread int *r = d + i * 4;
         const int s0 = r[0] + r[1], s1 = r[0] - r[1], s2 = r[2] + r[3], s3 = r[2] - r[3];
@@ -42,7 +48,7 @@ static inline float leaf_proxy4(thread int *d, float step, float lambda) {
         const float v = (float)d[k] * 0.25f;
         const float m = fabs(v);
         if (m < 0.6f * step) D += v * v;
-        else { D += step * step / 12.f; R += 2.f + 2.f * log2(m / step + 1.f); }
+        else { D += step * step / 12.f; R += rt[min(abs(d[k]), LEAF_RATE_N - 1)]; }
     }
     return D + lambda * R;
 }
@@ -228,17 +234,18 @@ static uint leaf_chroma_model(device const GpImage &I, int ym, int cx, int cy, i
 // one item of leaf_chroma's screening: the proxy of the 4x4 at (sx, sy) of a chroma block in mode M
 template <int M>
 static inline float leaf_item(device const uint8_t *s, int sp, int sx, int sy, int lw, int lh, threadgroup const uint8_t *A,
-                              threadgroup const uint8_t *L, int dc, float step, float lambda) {
+                              threadgroup const uint8_t *L, int dc, float step, float lambda, device const float *rt) {
     const PredCand pc = pred_cand0(M, lw, lh);
     int r[16];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) r[i * 4 + j] = (int)s[i * sp + j] - pred_fast(pc, sy + i, sx + j, A, L, dc);
-    return leaf_proxy4(r, step, lambda);
+    return leaf_proxy4(r, step, lambda, rt);
 }
 
 // Decider::best_chroma, lanes over 4x4 sub-blocks
 static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, int lumaMode,
-                        threadgroup LeafSmem &S, uint lane, thread GpLeafDecision &d) {
+                        threadgroup LeafSmem &S, uint lane, thread GpLeafDecision &d, device const float *rates) {
+    device const float *rt = rates + (size_t)qidx * LEAF_RATE_N;
     const int txSz = av1g_uv_tx_size(bs);
     const int lw = AV1G_T(Tx_Width_Log2)[txSz], lh = AV1G_T(Tx_Height_Log2)[txSz];
     const int w = 1 << lw, h = 1 << lh, nsx = w / 4, nsub = (w / 4) * (h / 4);
@@ -281,10 +288,10 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
         float v;
         // each mode's predictor compiled for itself (pred_cand0 of a constant)
         switch (m) {
-#define LEAF_ITEM(M) case M: v = leaf_item<M>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda); break;
+#define LEAF_ITEM(M) case M: v = leaf_item<M>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda, rt); break;
         LEAF_ITEM(0) LEAF_ITEM(1) LEAF_ITEM(2) LEAF_ITEM(3) LEAF_ITEM(4) LEAF_ITEM(5) LEAF_ITEM(6)
         LEAF_ITEM(7) LEAF_ITEM(8) LEAF_ITEM(9) LEAF_ITEM(10) LEAF_ITEM(11)
-        default: v = leaf_item<12>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda); break;
+        default: v = leaf_item<12>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda, rt); break;
 #undef LEAF_ITEM
         }
         part[m] += v;
@@ -334,7 +341,7 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
                     const int pr = av1g_clip1(dcv[pl] + av1g_round2signed(alpha[pl] * (lumaAt(sy + i, sx + j) - avg), 6));
                     r[i * 4 + j] = (int)s[(sy + i) * I.spitch[pl] + sx + j] - pr;
                 }
-            part += leaf_proxy4(r, step, lambda);
+            part += leaf_proxy4(r, step, lambda, rt);
         }
         J += simd_sum(part);
     }
@@ -371,17 +378,18 @@ static inline uint leaf_plain_mask(uint kept) {
 template <int M>
 static inline float leaf_cost4(thread const int *c0, thread const int *c1, thread const uint8_t *a0,
                                thread const uint8_t *l0, thread const uint8_t *a1, thread const uint8_t *l1,
-                               int dc0, int dc1, float step, float lambda) {
+                               int dc0, int dc1, float step, float lambda, device const float *rt) {
     const PredCand pc = pred_cand0(M, 2, 2);
     int r[16];
     for (int p = 0; p < 16; p++) r[p] = c0[p] - pred_fast(pc, p / 4, p % 4, a0, l0, dc0);
-    const float cost0 = leaf_proxy4(r, step, lambda);
+    const float cost0 = leaf_proxy4(r, step, lambda, rt);
     for (int p = 0; p < 16; p++) r[p] = c1[p] - pred_fast(pc, p / 4, p % 4, a1, l1, dc1);
-    const float cost1 = leaf_proxy4(r, step, lambda);
+    const float cost1 = leaf_proxy4(r, step, lambda, rt);
     return (cost0 + cost1) + lambda * (av1g_is_directional(M) ? 5.0f : 3.5f);
 }
 static void leaf_chroma4(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, int lumaMode,
-                         thread GpLeafDecision &d) {
+                         thread GpLeafDecision &d, device const float *rates) {
+    device const float *rt = rates + (size_t)qidx * LEAF_RATE_N;
     static_assert(ML_CHROMA_H == 16, "leaf_tree16 adds 16 hidden units");
     const int cx = ((x >> 2) >> 1) << 2, cy = ((y >> 2) >> 1) << 2;  // sub-8x8 blocks carry the 8x8's chroma
     const TileBox tb = tile_of(I, x, y);
@@ -442,7 +450,7 @@ static void leaf_chroma4(device const GpImage &I, constant GpParams &P, int x, i
     thread const uint8_t *a1 = ea[1] + AV1G_EDGE_OFF, *l1 = el[1] + AV1G_EDGE_OFF;
 #define LEAF4_MODE(M)                                                                                  \
     if (keep >> (M) & 1) {                                                                             \
-        const float J = leaf_cost4<M>(c[0], c[1], a0, l0, a1, l1, dcv[0], dcv[1], step, lambda);       \
+        const float J = leaf_cost4<M>(c[0], c[1], a0, l0, a1, l1, dcv[0], dcv[1], step, lambda, rt);       \
         if (J < best) { best = J; bestMode = (M); }                                                    \
     }
     LEAF4_MODE(0) LEAF4_MODE(1) LEAF4_MODE(2) LEAF4_MODE(3) LEAF4_MODE(4) LEAF4_MODE(5) LEAF4_MODE(6)
@@ -469,7 +477,7 @@ static void leaf_chroma4(device const GpImage &I, constant GpParams &P, int x, i
         int r[16];
         for (int p = 0; p < 16; p++)
             r[p] = c[pl][p] - av1g_clip1(dcv[pl] + av1g_round2signed(alpha[pl] * ((lum[p] << 1) - avg), 6));
-        J += leaf_proxy4(r, step, lambda);
+        J += leaf_proxy4(r, step, lambda, rt);
     }
     if ((alpha[0] || alpha[1]) && J < best) {
         d.uvMode = AV1G_UV_CFL_PRED;
@@ -520,7 +528,8 @@ kernel void k_leaf_scan(constant GpBatch &B [[buffer(0)]], device uint32_t *leaf
 // any order: each leaf's result is its own), counted in k_leaf's dispatch.
 kernel void k_leaf_small(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                          device const uint32_t *leafOff [[buffer(2)]], device atomic_uint *dispatch [[buffer(3)]],
-                         device uint32_t *rest [[buffer(4)]], uint g [[thread_position_in_grid]]) {
+                         device uint32_t *rest [[buffer(4)]], device const float *rates [[buffer(5)]],
+                         uint g [[thread_position_in_grid]]) {
     if (g >= leafOff[B.nSb]) return;
     uint32_t lo = 0, hi = B.nSb;  // its SB: the last with leafOff <= g
     while (hi - lo > 1) {
@@ -549,14 +558,14 @@ kernel void k_leaf_small(constant GpBatch &B [[buffer(0)]], constant GpParams &P
             return;
         }
         device const GpBlockRes &r = B.blk[bi];
-        if (chroma) leaf_chroma4(I, P, x, y, bs, sb_qindex(I, x, y), r.ncand > 0 ? cand_mode(r.cand[0]) : AV1G_DC_PRED, d);
+        if (chroma) leaf_chroma4(I, P, x, y, bs, sb_qindex(I, x, y), r.ncand > 0 ? cand_mode(r.cand[0]) : AV1G_DC_PRED, d, rates);
     }
     B.leafDec[sb * GP_MAX_LEAVES + k] = d;
 }
 
 // A threadgroup (one SIMD-group) per leaf k_leaf_small left.
 kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                   device const uint32_t *rest [[buffer(4)]],
+                   device const uint32_t *rest [[buffer(4)]], device const float *rates [[buffer(5)]],
                    uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
                    uint warp [[simdgroup_index_in_threadgroup]]) {
     static_assert(LEAF_NW == 1, "k_leaf_small counts a threadgroup per leaf");
@@ -596,7 +605,15 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
             }
         }
         if (av1g_has_chroma(bs, y >> 2, x >> 2, I.mono))
-            leaf_chroma(I, P, x, y, bs, sb_qindex(I, x, y), r.ncand > 0 ? cand_mode(r.cand[0]) : AV1G_DC_PRED, S, lane, d);
+            leaf_chroma(I, P, x, y, bs, sb_qindex(I, x, y), r.ncand > 0 ? cand_mode(r.cand[0]) : AV1G_DC_PRED, S, lane, d, rates);
         if (lane == 0) B.leafDec[sb * GP_MAX_LEAVES + k] = d;
     }
+}
+
+// the proxy's rate terms (leaf_rate_term), by qindex then |4 m|, once an encoder
+kernel void k_leaf_rates(device float *out [[buffer(0)]], uint t [[thread_position_in_grid]]) {
+    if (t >= 256 * LEAF_RATE_N) return;
+    const int qidx = (int)t / LEAF_RATE_N, a = (int)t % LEAF_RATE_N;
+    const float v = (float)a * 0.25f, m = fabs(v), step = (float)av1g_ac_q(qidx) / 8.f;
+    out[t] = leaf_rate_term(m, step);
 }

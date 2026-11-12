@@ -118,14 +118,22 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the shaders' tables hold them), in device memory rather than a threadgroup copy a block.
     let forwardMatrices: any MTLBuffer
 
+    /// The leaves' chroma proxy's rate terms (k_leaf.h `k_leaf_rates`: 256 qindices × `LEAF_RATE_N`),
+    /// worked out on the GPU by the expression k_leaf would otherwise evaluate a coefficient at a time.
+    let leafRates: any MTLBuffer
+
     /// Copies the shaders' forward DCT matrices into a buffer (dev_tx.h `GA_FWD_MATRIX_FLOATS`).
     static func makeForwardMatrices(device: any MTLDevice, library: any MTLLibrary) throws -> any MTLBuffer {
-        guard let function = library.makeFunction(name: "k_fwd_matrices") else { throw Failure.metal("no k_fwd_matrices") }
+        try makeTable("k_fwd_matrices", floats: 256 + 1024 + 4096, device: device, library: library)
+    }
+
+    /// A table a kernel fills, a thread a float (`function`'s buffer 0), once an encoder.
+    static func makeTable(_ name: String, floats: Int, device: any MTLDevice, library: any MTLLibrary) throws -> any MTLBuffer {
+        guard let function = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }
         let pipeline = try Self.pipeline(function, threads: 256, device: device)
-        let floats = 256 + 1024 + 4096
         guard let buffer = device.makeBuffer(length: floats * 4, options: .storageModeShared),
               let queue = device.makeCommandQueue(), let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder()
-        else { throw Failure.metal("no buffers for k_fwd_matrices") }
+        else { throw Failure.metal("no buffers for \(name)") }
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(buffer, offset: 0, index: 0)
         enc.dispatchThreadgroups(MTLSize(width: (floats + 255) / 256, height: 1, depth: 1),
@@ -133,7 +141,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()
-        guard cb.status == .completed else { throw Failure.metal("k_fwd_matrices failed") }
+        guard cb.status == .completed else { throw Failure.metal("\(name) failed") }
         return buffer
     }
 
@@ -678,6 +686,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.library = library
         self.analysisUsesMatrixUnits = try Self.forwardMMAIsExact(device: device, library: library)
         self.forwardMatrices = try Self.makeForwardMatrices(device: device, library: library)
+        self.leafRates = try Self.makeTable("k_leaf_rates", floats: 256 * 4096, device: device, library: library)
         var inter: [Int: (pipeline: any MTLComputePipelineState, blocks: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
             let prefix = "k_inter_\(size.w)x\(size.h)_w"  // as k_analysis's names
@@ -1544,6 +1553,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.memoryBarrier(scope: .buffers)
                 e.setComputePipelineState(encoder.leafSmall)  // a leaf a thread; it lists the rest
                 e.setBuffer(leafRest, offset: 0, index: 4)
+                e.setBuffer(encoder.leafRates, offset: 0, index: 5)
                 e.dispatchThreadgroups(indirectBuffer: leafDispatch, indirectBufferOffset: 0,
                                        threadsPerThreadgroup: MTLSize(width: AV1MetalEncoder.leafSmallThreads, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)
