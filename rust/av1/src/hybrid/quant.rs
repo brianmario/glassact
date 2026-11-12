@@ -426,6 +426,17 @@ impl QuantHook<'_> {
         let nz = if self.o.double_fwd {
             forward(self.f, &w.resi, tx_sz, ty, &mut w.dd, &mut w.dtmp);
             quantize_d(&w.dd[..n], q, den, dc_q, ac_q, m, rnd, zbin)
+        } else if m.is_none() && {
+            // Glass Act: a residual too small for any coefficient to reach the quantizer's zero
+            // region (FwdTx::coeff_bound, zero_below at the smaller step) quantizes to all zeros
+            // whatever its transform: no transform. Nothing reads its coefficients (w.df) then: RDOQ
+            // and skip_if_cheaper leave all-zero levels be, and the trial costs it by its energy.
+            let b = self.f.coeff_bound(tx_sz, ty);
+            let thr = zero_below(dc_q.min(ac_q), den, rnd, zbin);
+            b * b * (w.energy as f64) < thr * thr
+        } {
+            q[..n].fill(0);
+            false
         } else {
             forward_f_cached(self.f, &w.resf, tx_sz, ty, &mut w.df, &mut w.ftmp, &mut w.s1);
             let mut nz = quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin);
@@ -738,6 +749,55 @@ mod tests {
             },
             o,
         )
+    }
+
+    /// FwdTx::coeff_bound bounds every coefficient of forward_f (scalar and NEON), so the all-zero
+    /// shortcut in `trial` skips only transforms that quantize to nothing: residuals of every size
+    /// and type, from one sample to dense, and one concentrated in a coefficient's own pattern.
+    #[test]
+    fn coeff_bound_holds() {
+        let f = fwd();
+        let mut r = 0x2545_f491u32;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        let (mut res, mut out, mut tmp) = (vec![0f32; 4096], vec![0f32; 1024], vec![0f32; FWD_F_TMP]);
+        for case in 0..6_000 {
+            let tx = (next() % TX_SIZES_ALL as u32) as i32;
+            let ty = (next() % 16) as i32;
+            let b = f.coeff_bound(tx, ty);
+            if !b.is_finite() {
+                continue;
+            }
+            let (wf, hf) = (tx_w(tx) as usize, tx_h(tx) as usize);
+            let (n, nc) = (wf * hf, tx_coeffs(tx));
+            let density = 1 + next() % 8;
+            let amp = 1 + next() % 255;
+            for (i, v) in res[..n].iter_mut().enumerate() {
+                let x = next();
+                *v = if case % 3 == 0 {
+                    // a smooth pattern (a DC or a slow ramp: one coefficient takes most of it)
+                    ((i / wf + i % wf) as u32 % (1 + amp / 32)) as f32 + (amp / 2) as f32
+                } else if x % 8 < density {
+                    ((x >> 8) % (2 * amp + 1)) as f32 - amp as f32
+                } else {
+                    0.0
+                };
+            }
+            let e: f64 = res[..n].iter().map(|&v| v as f64 * v as f64).sum();
+            let lim = b * e.sqrt();
+            forward_f(f, &res, tx, ty, &mut out, &mut tmp);
+            for &c in &out[..nc] {
+                assert!((c.abs() as f64) <= lim, "tx {tx} type {ty}: |{c}| > {lim}");
+            }
+            super::super::fwd::forward_f_scalar(f, &res, tx, ty, &mut out, &mut tmp);
+            for &c in &out[..nc] {
+                assert!((c.abs() as f64) <= lim, "tx {tx} type {ty} (scalar): |{c}| > {lim}");
+            }
+        }
     }
 
     /// The rate proxy in raster order sums what walking the scan to its last nonzero does.

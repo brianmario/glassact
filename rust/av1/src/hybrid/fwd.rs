@@ -16,6 +16,9 @@ pub(crate) struct FwdTx {
     pub f: [[Vec<f64>; 7]; 3],
     pub ff: [[Vec<f32>; 7]; 3],
     pub fft: [[Vec<f32>; 7]; 3],
+    /// [tx size][tx type]: a bound on how much of a residual's norm reaches any one coefficient of
+    /// [`forward_f`] (see [`FwdTx::coeff_bound`]); infinite for a type the size doesn't have
+    pub bound: [[f64; 16]; 19],
 }
 
 /// Gauss-Jordan inverse with partial pivoting, as the C++'s (row updates contracted).
@@ -63,6 +66,7 @@ impl FwdTx {
             f: Default::default(),
             ff: Default::default(),
             fft: Default::default(),
+            bound: [[f64::INFINITY; 16]; 19],
         };
         for k in 0..3 {
             for ln in 2..=6usize {
@@ -93,7 +97,35 @@ impl FwdTx {
                 t.f[k][ln] = f;
             }
         }
+        // the largest 2-norm of a matrix's first min(n, 32) rows (the outputs kept), in f64
+        let rows = |m: &[f32], n: usize| -> f64 {
+            (0..n.min(32))
+                .map(|i| m[i * n..][..n].iter().map(|&v| v as f64 * v as f64).sum::<f64>().sqrt())
+                .fold(0.0, f64::max)
+        };
+        for tx_sz in 0..19 {
+            let (lw, lh, w, h, _, _) = dims(tx_sz as i32);
+            let rect = if lw.abs_diff(lh) == 1 { 2896.0 / 4096.0 } else { 1.0 };
+            let scale = (1 << (Transform_Row_Shift[tx_sz] + 4)) as f64 / rect;
+            for ty in 0..16 {
+                let (rk, ck) = (row_kind(ty) as usize, col_kind(ty) as usize);
+                let (fr, fc) = (&t.ff[rk][lw], &t.ff[ck][lh]);
+                if fr.len() == w * w && fc.len() == h * h {
+                    t.bound[tx_sz][ty as usize] = scale * rows(fc, h) * rows(fr, w) * 1.001;
+                }
+            }
+        }
         t
+    }
+
+    /// A bound on every coefficient of [`forward_f`] (or its cached form) of a residual R:
+    /// |c_ij| = scale |Fc_i . R . Fr_j| <= scale ||Fc_i|| ||Fr_j|| ||R||_F (Cauchy-Schwarz, with
+    /// Fc_i and Fr_j the rows of the column and row matrices that make the coefficient), so
+    /// `coeff_bound(tx_sz, ty) * sqrt(sum of R^2)`. The float products and sums round by under
+    /// 1e-5 of that for 64 terms a pass, and 1.001 covers it.
+    #[inline]
+    pub fn coeff_bound(&self, tx_sz: i32, tx_type: i32) -> f64 {
+        self.bound[tx_sz as usize][tx_type as usize]
     }
 }
 
