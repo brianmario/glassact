@@ -47,6 +47,8 @@ let av1SeqCommand = Command(
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
         .bool("no-golden", "with --inter: inter frames copy only the picture before them, not GOLDEN_FRAME (a long-term picture: the end of a scene left)"),
+        .int("key-delta", "<n>", -255...255, "the key frame's qindex this much from the inter frames' (AV1HybridEncoder.keyFrameQindexDelta; default 0; negative: finer)"),
+        .bool("per-frame", "with --score-rgb: also each frame's bytes, RGB PSNR and SSIMULACRA2 (where scored), the hybrid's and libaom's, as lines \"frame <who> <i> <bytes> <psnr> <ssimulacra2 or ->\""),
         .int("long-term", "<n>", 1...7, "with --inter: long-term pictures kept for GOLDEN_FRAME (default the encoder's; 1: the end of the last scene left)"),
         .string("crop", "<w>x<h>+<x>+<y>", "code this rectangle of the trace's frames at their own size (not with --width or --score-rgb)"),
         .bool("no-reuse", "analyze every superblock of every picture (no reuse where the source is unchanged)"),
@@ -188,6 +190,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.goldenFrames = !opts.has("no-golden")
     if opts.has("long-term") { encoder.longTermReferences = opts.int("long-term", 1) }
+    encoder.keyFrameQindexDelta = opts.int("key-delta", 0)
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("no-ml-prune") {
         encoder.learnedPrune = nil
@@ -383,6 +386,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
     if let rgb { print(rgb.summary(stream.map { "hybrid at \(width)×\(height) shown at \($0.width)×\($0.height)" } ?? "hybrid")) }
+    if let rgb, opts.has("per-frame") { rgb.printFrames("hybrid", bytes: frames.map(\.obu.count)) }
+    if encoder.keyFrameQindexDelta != 0 {
+        print("             key frame at qindex \(encoder.keyFrameQindex(qindex)), inter frames at \(qindex)")
+    }
     if let path = opts.string("ivf") {
         try writeIVF(frames.map(\.obu), width: stream?.width ?? width, height: stream?.height ?? height, to: path)
         print("             stream written to \(path)")
@@ -545,6 +552,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      speed, n / aomSeconds, aomSeconds / n * 1000, threads, formatBytes(total / pictures.count), aomPSNR / n,
                      aomInter ? "inter frames" : "key frames"))
         if let aomRGB { print(aomRGB.summary("libaom")) }
+        if let aomRGB, opts.has("per-frame") { aomRGB.printFrames("libaom", bytes: streams.map(\.count)) }
         if aomInter, streams.count > 1, let first = stamps.first, let last = stamps.last, last > first {
             let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
             print(String(format: "             key frame %@ · inter frames %@ on average · %.1f inter frames a second · %.2f Mbit/s at the trace's timing",
@@ -634,6 +642,10 @@ final class RGBScorer {
     let small: UnsafeMutableRawBufferPointer
     var rects: [DirtyRect] = []
     var ssim = 0.0, psnr = 0.0, frames = 0
+    /// Each frame's PSNR (`--per-frame`), and the SSIMULACRA2 scores (scored once: the scorer's
+    /// files go when it has)
+    var psnrs: [Double] = []
+    private var ssimu2Scores: [Double]?
     /// `--step`: the trace's frames apart (its pictures read so far)
     let step: Int
     var read = 0
@@ -688,13 +700,31 @@ final class RGBScorer {
         }
         ssim += s
         if p.isFinite { psnr += p }
+        psnrs.append(p)
         frames += 1
+    }
+
+    func ssimulacra2Scores() throws -> [Double] {
+        if let ssimu2Scores { return ssimu2Scores }
+        let scores = try ssimu2?.scoreAll() ?? []
+        ssimu2Scores = scores
+        return scores
+    }
+
+    /// `--per-frame`: a line a frame, `frame <name> <i> <bytes> <psnr> <ssimulacra2 or ->`.
+    func printFrames(_ name: String, bytes: [Int]) {
+        let scores = (try? ssimulacra2Scores()) ?? []
+        for (i, p) in psnrs.enumerated() {
+            let k = ssimu2Every > 0 && i % ssimu2Every == 0 ? i / ssimu2Every : -1
+            let s = k >= 0 && k < scores.count ? String(format: "%.3f", scores[k]) : "-"
+            print(String(format: "frame %@ %d %d %.4f %@", name, i, i < bytes.count ? bytes[i] : 0, p, s))
+        }
     }
 
     func summary(_ name: String) -> String {
         var line = String(format: "             %@, scored as vquality: SSIM mean %.4f · PSNR mean %.2f dB", name,
                           ssim / Double(max(1, frames)), psnr / Double(max(1, frames)))
-        if let ssimu2, let scores = try? ssimu2.scoreAll(), !scores.isEmpty {
+        if ssimu2 != nil, let scores = try? ssimulacra2Scores(), !scores.isEmpty {
             line += String(format: " · SSIMULACRA2 mean %.2f, min %.2f (%d frames)", scores.reduce(0, +) / Double(scores.count),
                            scores.min() ?? 0, scores.count)
         }

@@ -349,6 +349,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var longTermReferences = 4 {
         didSet { longTermReferences = min(7, max(1, longTermReferences)) }
     }
+    /// Key frames' qindex against the one `encode` is given (0, the default: the same; negative:
+    /// finer). Without `interFrames` every picture is a key frame. Everything a frame derives
+    /// from its qindex follows its own: the analysis's lambda and learned pruning, the closed
+    /// loop's quantizer and RDOQ, deblocking and CDEF. Clamped to 1…255 (a qindex of 0,
+    /// lossless, stays 0). A key frame coded finer than the inter frames that copy from it for
+    /// long passes its quality on to them (BENCHMARKS "libaom's lead at low rates"); the first
+    /// inter frame after it analyzes all its 64×64s (the analysis kept is a picture's at one qindex).
+    public var keyFrameQindexDelta = 0
+
+    /// A key frame's qindex, for frames at `qindex` (`keyFrameQindexDelta`).
+    public func keyFrameQindex(_ qindex: Int) -> Int {
+        qindex <= 0 || keyFrameQindexDelta == 0 ? qindex : min(255, max(1, qindex + keyFrameQindexDelta))
+    }
+
     /// The long-term pictures' decoded planes (tight) by AV1 slot ([] where there's none), for the
     /// inter frames whose copies choose them.
     private var slotPlanes: [[[UInt8]]] = Array(repeating: [], count: 8)
@@ -509,8 +523,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         // `motionSkip`: picture i + 2's search is decided once picture i's analysis is read
         var rule = MotionRule()
+        // picture i's qindex: a key frame's for the first, or every one without inter frames
+        let keyQindex = keyFrameQindex(qindex)
+        func qindexOf(_ i: Int) -> Int { interFrames && i > 0 ? qindex : keyQindex }
         var current = try picture(0)
-        var pending = try begin(current, Copies(), qindex: qindex)
+        var pending = try begin(current, Copies(), qindex: keyQindex)
         // picture i + 1's analysis is set up while picture i - 1 is finished, and committed: its
         // command buffer waits on the GPU until picture i's results are read
         // (AV1MetalEncoder.readEvent), so its GPU work starts as soon as they are. Its copies are
@@ -520,7 +537,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
             var copies = interFrames ? copyFinder.wait() : Copies()
             if interFrames { rule.decide(1, &copies, rule: motionSkip, lookback: motionSkipLookback) }
-            starting = Later { [copies] in try self.begin(next, copies, qindex: qindex) }
+            let q = qindexOf(1)
+            starting = Later { [copies] in try self.begin(next, copies, qindex: q) }
         }
         var upcoming = count > 2 ? try picture(2) : nil
         if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
@@ -539,9 +557,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     var copies = interFrames ? copyFinder.wait() : Copies()
                     if interFrames { rule.decide(i + 2, &copies, rule: motionSkip, lookback: motionSkipLookback) }
                     let before = starting
+                    let q = qindexOf(i + 2)
                     following = Later { [copies] in
                         _ = try before?.wait()
-                        return try self.begin(up, copies, qindex: qindex)
+                        return try self.begin(up, copies, qindex: q)
                     }
                     upcoming = i + 3 < count ? try picture(i + 3) : nil
                     if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
@@ -562,7 +581,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     onWritten = { frame in written(index, frame) }
                 }
                 let (w, ended) = try finish(current, partition: partition, motion: motion, searchesMotion: pending.searchesMotion,
-                                            refs: pending.refs, qindex: qindex,
+                                            refs: pending.refs, qindex: qindexOf(i),
                                             qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
                                             written: onWritten)
                 writing = w
@@ -625,7 +644,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 copyFinder.start(p, after: last, searchesMotion: searchesMotion)
                 copies = copyFinder.wait()
             }
-            try output(i, 0, try code(p, copies, coarseQindex))
+            try output(i, 0, try code(p, copies, i == 0 ? keyFrameQindex(coarseQindex) : coarseQindex))
             let decoded = previousDecoded(width: p.width, height: p.height)
             guard decoded.count == 3 else { throw Failure.encode("two steps: no decoded picture") }
             try decoded[0].withUnsafeBufferPointer { try metal.setReference(y: $0.baseAddress!, width: p.width, height: p.height) }

@@ -572,4 +572,59 @@ extension HybridEncoderTests {
         #expect(skipped == [8, 9, 11, 12, 14, 15], "skipped the motion search in frames \(skipped), found \(found)")
         #expect(longest <= 2, "skipped \(longest) frames in a row")
     }
+
+    /// A key frame at another qindex than its inter frames (`keyFrameQindexDelta`): its header's
+    /// base_q_idx is the given qindex plus the delta (clamped to 1…255), the inter frames' the
+    /// given one, and the stream (a screen typed into, another screen, then the first again, which
+    /// copies the key frame from GOLDEN_FRAME) decodes in libaom to exactly the pictures the
+    /// encoder reports. Finer, the key frame comes out closer to its picture than at the given qindex.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(1280, 720, 120, -40, 2), (333, 201, 20, -48, -1), (1280, 720, 80, 16, 1)])
+    func keyFramesAtTheirOwnQindexDecodeToTheirPictures(width: Int, height: Int, qindex: Int, delta: Int, tilesLog2: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interFrames = true
+        var rng = SplitMix64(seed: 0x6e7)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var screens: [[UInt8]] = (0..<2).map { _ in base.y.map { _ in UInt8(rng.int(30..<220)) } }
+        let schedule = [0, 0, 0, 1, 1, 0, 0]
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for s in schedule {
+            let x0 = rng.int(0..<max(1, width - 24)), y0 = rng.int(0..<max(1, height - 12))
+            for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { screens[s][r * width + c] = 16 } }
+            pictures.append(AV1HybridEncoder.Picture(y: screens[s], u: base.u, v: base.v, width: width, height: height))
+        }
+        let label = "\(width)×\(height) q\(qindex) key delta \(delta) tiles \(tilesLog2)"
+        func sse(_ f: AV1HybridEncoder.Frame, _ p: AV1HybridEncoder.Picture) -> Int {
+            zip(f.planes[0], p.y).reduce(0) { $0 + (Int($1.0) - Int($1.1)) * (Int($1.0) - Int($1.1)) }
+        }
+        let plain = try encoder.encode(pictures[0], qindex: qindex)
+        encoder.keyFrameQindexDelta = delta
+        let keyQindex = min(255, max(1, qindex + delta))
+        #expect(encoder.keyFrameQindex(qindex) == keyQindex, "\(label)")
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var keySSE = 0
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            #expect(Int(f.params.base_q_idx) == (i == 0 ? keyQindex : qindex), "\(label): frame \(i) at qindex \(f.params.base_q_idx)")
+            if i == 0 { keySSE = sse(f, pictures[0]) }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        if delta < 0 {
+            #expect(keySSE < sse(plain, pictures[0]), "\(label): the key frame's SSE \(keySSE), at the given qindex \(sse(plain, pictures[0]))")
+        }
+        // a picture alone is a key frame too
+        let alone = try encoder.encode(pictures[0], qindex: qindex)
+        #expect(Int(alone.params.base_q_idx) == keyQindex, "\(label): a picture alone at qindex \(alone.params.base_q_idx)")
+    }
 }
