@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| `k_inter`'s 16x16, 32x32 and 64x64 DCTs on the matrix units; the RD's end of block from the quantization loop; the thread kernels' rate from padded levels (`metal-av1`) | kept; the matrix tile loaded once a SIMD-group not (no gain) | the same streams; inter candidates 1.32 → 1.17 ms on a new 5K picture and 3.71 → 2.93 on video; 4x4 1.00 → 0.93, 8x8 1.54 → 1.48; the GPU stages ≈ 13.7 ms | [entry](#metal-av1-the-inter-candidates-dcts-on-the-matrix-units-the-rds-end-of-block-and-rate-2026-11-12) |
 | `k_me`'s window search dropping vectors that can't make the best two and starting where the gate found best; its sub-sample steps sharing horizontal sums; `k_inter_sad` a loop a sub-sample case; `k_proj`'s minimum by `simd_min` (`metal-av1`) | kept; a dozen variants not (no gain or slower); half-sample steps only not taken (+92 % on scrolling images scaled) | the same streams; the motion search at 5K: video 5.81 → 3.87 ms, scrolling images 9.13 → 5.67, a screen switch 2.16 → 1.75; video ≈ 46 → 53 inter frames a second | [entry](#metal-av1-the-motion-search-on-moving-content-the-same-bytes-in-two-thirds-of-the-time-again-2026-11-12) |
 | The leaves' chroma screening: each mode compiled for itself, shifts for divisions, the proxy's rate term from a table; 64x64's integer work on 256 threads with its float sums on the same 128 (`metal-av1`) | kept; the pruning's orientation bins from a table not (under the bar) | the same streams; a new 5K picture's leaves 3.03 → 1.55 ms, 64x64 1.78 → 1.71 (2.37 → 2.21 with `--fast off`); the GPU stages ≈ 14.4 ms; the all-new stream ≈ 49 → 51 inter frames a second | [entry](#metal-av1-the-leaves-in-half-the-time-64x64s-integer-work-on-256-threads-2026-11-12) |
 | A mostly-new picture coded fast at a qindex of its own (`metal-av1`, `newPictureEffort`, `av1seq --fast`) | **level 1 on by default at Δ+7, every mostly-new picture** (looser learned pruning, no RDOQ, no CDEF); levels 2 (no motion search where no shift is proposed: +22–26 % on two text screens) and 3 (no tx type search: bytes swing with content) options | bytes −0.8 to −6.8 % on every content measured, quality −0.2 to −0.9 dB (the most on video, while it plays); a new 5K picture's GPU stages 18.1 → 15.9 ms, filters' GPU ≈ 4.4 → 0.8, closed loop −13 core-ms, 36 → 43 inter frames a second | [entry](#metal-av1-a-mostly-new-picture-coded-fast-and-paid-for-in-quality-level-1-on-by-default-2026-11-12) |
@@ -325,6 +326,54 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the inter candidates' DCTs on the matrix units, the RD's end of block and rate (2026-11-12)
+
+GPU stage times at 5K q20, alternated against the previous build, one process at a time. The
+same streams: the ten digests, video at 5K, 2900 and 1280, scrolling images, dragging, maps and
+photos' key frames against the previous build's.
+
+**Where the RD's time was.** The inter candidates on video, by shape (8x8 / 16x16 / 32x32 /
+64x64): 0.58 / 0.56 / 1.46 / 1.21 ms, of which the forward transform 0.14 / 0.20 / 0.82 / 0.96:
+`k_inter` still ran the fma passes where the analysis has had the matrix units since 2026-11-11.
+Quantization and distortion 0.10 / 0.13 / 0.19 / 0.06, the end-of-block scan and base bits 0.05
+/ 0.06 / 0.19 / 0.05, the coefficient rate 0.07 / 0.06 / 0.14 / 0.04. The analysis's RD on the
+rotation is 0.32 / 0.51 / 0.47 of 16x16 / 32x32 / 64x64's 1.15 / 1.97 / 1.71 (the splits ± 0.05:
+an early return changes how a kernel compiles); the thread kernels' is 0.28 / 0.53 of 4x4 / 8x8's
+1.00 / 1.54, their rate loop 0.15 / 0.23.
+
+**Kept:**
+- **`k_inter`'s 16x16, 32x32 and 64x64 DCT_DCT on the matrix units** (`baedd42`), behind the
+  same `ga_mma` constant and start-up check as the analysis, which gains the 64x64 on 128
+  threads as `k_inter_s` runs it. The check finds these coefficients bit-identical to the
+  passes', so what follows has the same inputs. Inter candidates 1.32 → 1.17 on the rotation,
+  3.68 → 2.94 on video (32x32 1.46 → 0.91, 64x64 1.21 → 1.09).
+- **The end of block from the quantization loop, one exchange instead of three** (`7767c50`):
+  each thread takes the largest scan index of its nonzero levels (the scan's inverse beside the
+  matrices, a whole-number maximum), and distortion, kept energy and end of block cross the
+  SIMD-groups together, the float sums' partials made and added as before. 32x32 1.97 → 1.94.
+- **The thread kernel's coefficient rate from padded levels** (`659108d`): for the 2D class the
+  neighbours are read from a copy of min(|level|, 15) with two zero columns and rows past the
+  block, the same contexts without bounds checks. 4x4 0.99 → 0.93, 8x8 1.54 → 1.48.
+
+| medians of 3 alternated pairs | inter candidates | analysis | 4x4 | 8x8 | 32x32 |
+|---|---|---|---|---|---|
+| the rotation, every picture new | 1.32 → 1.17 | 7.4 → 7.3 | 1.00 → 0.93 | 1.54 → 1.48 | 1.97 → 1.93 |
+| the same, `--fast off` | 1.31 → 1.17 | 9.4 | 1.17 → 1.10 | 1.71 → 1.63 | 2.46 → 2.43 |
+| video, 16 frames | 3.71 → 2.93 | 8.1 (noise) | 0.20 | 0.71 | 3.02 → 2.95 |
+
+Checked on the merged head: the rotation's inter candidates 1.31 → 1.17, 4x4 0.99 → 0.92–0.93,
+8x8 1.54 → 1.46–1.47, 32x32 1.97 → 1.93; video's inter candidates 3.74 → 2.94. The GPU stages on
+a new 5K picture ≈ 13.7 ms: motion search 1.74, inter candidates 1.17, analysis 7.3, partition
+0.2, leaves 1.57, learned pruning 1.71.
+
+**Measured, not kept:** the shared matrix tile loaded once a SIMD-group in `warp_fwd_mma`
+(32x32 1.94 → 1.96). The one exchange alone gains nothing: barriers aren't where this goes.
+
+Left in the RD: quantization and rate on 64x64's idle threads (≈ 0.13), the SIMD shapes' rate
+loop (≈ 0.11–0.13 each), the matrix units' transform itself (0.4 ms each for 32x32 and 64x64 on
+video). Most of the analysis outside the RD is screening and residual (≈ 0.8 / 1.5 / 1.2 ms for
+16x16 / 32x32 / 64x64).
 
 ### Metal AV1: the motion search on moving content, the same bytes in two thirds of the time again (2026-11-12)
 
