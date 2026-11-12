@@ -17,7 +17,9 @@
 //            the analysis's exact-rate RD (DCT_DCT) of the best, into GpInterRes (J, and zero when
 //            the residual quantizes to nothing). The intra analysis skips a zero one (libaom
 //            realtime tries no intra where the best inter is skip) and otherwise keeps the cheaper,
-//            so the partition DP weighs the inter block as any other
+//            so the partition DP weighs the inter block as any other. (8x8 to 16x16 run as k_inter_q,
+//            several blocks a SIMD-group up to the RD, and 16x32, 32x16, 32x32 and 64x64 as
+//            k_inter_s, a block a SIMD-group up to an RD on the threadgroup: the same results)
 // Sub-sample positions are predicted bilinearly here: an estimate of AV1's 8-tap filter, which only
 // the closed loop needs exactly. (The 8-tap filter here measured 1 % smaller frames than bilinear
 // on 720p photos for a third of the frame rate: BENCHMARKS.)
@@ -732,5 +734,189 @@ kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
             }
             ga_sync<NT>();
         }
+    }
+}
+
+// Glass Act: k_inter for the shapes whose RD takes NT > 32 threads (32x32, 64x64), NT / 32 blocks a
+// threadgroup: each SIMD-group takes one block's set-up, candidate pick and gate on its own (no
+// threadgroup barriers: as k_inter<W, H> at NT 32, the same ordered minimum and whole-number sums),
+// then the threadgroup gives each block that needs it the RD on all NT threads, exactly as
+// k_inter<W, H, BS, 1, NT> does (the source and residual on the same threads, the same sums).
+template <int W, int H, int BS, int NT>
+kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
+                      constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                      uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
+    static_assert(NT > 32 && NT % 32 == 0, "k_inter_s: a block's RD on several SIMD-groups");
+    constexpr int NB = NT / 32;  // blocks a threadgroup
+    struct Slot {
+        int rd;  // 1: the RD wanted
+        uint sad;
+        int bx, by;
+        float lambda;
+        uint li;
+    };
+    threadgroup GaInterSmem<W, H> S;
+    threadgroup Slot slot[NB];
+    const int tid = (int)threadIdx_x, sg = tid / 32, l32 = tid % 32;
+    constexpr int txSz = ga_tx_of<W, H>();
+    device const GpImage &I = B.img[0];
+    const int nbx = I.shNbx[BS], sp = I.spitch[0];
+    for (uint32_t g0 = blockIdx_x * NB; g0 < nTotal; g0 += gridDim_x * NB) {
+        // (one SIMD-group's block: uniform across its lanes)
+        const uint32_t gb = g0 + (uint32_t)sg;
+        bool live = gb < nTotal;
+        uint32_t li = gb;
+        if (live && B.sbList) {
+            const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
+            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            if (bx >= nbx || by >= I.shNby[BS]) live = false;
+            else li = (uint32_t)(by * nbx + bx);
+        }
+        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        device GpInterRes &ir = B.inter[I.shOff[BS] + li];
+        if (live && (x >= I.MiCols * 4 || y >= I.MiRows * 4)) {
+            if (l32 == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
+            live = false;
+        }
+        if (live && B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) live = false;
+        int rd = 0;
+        uint bestSad = 1;
+        int2 best = int2(0, 0);
+        float lambda = 0.f;
+        if (live) {
+            const int qidx = sb_qindex(I, x, y);
+            lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
+            const float lamS = P.satdLambda * sqrtf(lambda);
+            const int c0x = x >> 4, c0y = y >> 4, c1x = (x + W - 1) >> 4, c1y = (y + H - 1) >> 4;
+            const int nc = 1 + (c1x - c0x + 1) * (c1y - c0y + 1) * GP_ME_KEEP;
+            const int sbi = (y >> 6) * I.sbCols + (x >> 6);
+            device const GpMeU &U = I.meU[I.sbBase + sbi];
+            device const uint16_t *S8 = I.meSad + (size_t)(I.sbBase + sbi) * GP_ME_U * 64;
+            const int bx8 = (x & 63) >> 3, by8 = (y & 63) >> 3;
+            auto candJ = [&](int c) -> int {  // candidate c's index into U
+                if (c == 0) return 0;
+                const int k = c - 1, cell = k / GP_ME_KEEP, kk = k % GP_ME_KEEP;
+                const int cx = c0x + cell % (c1x - c0x + 1), cy = c0y + cell / (c1x - c0x + 1);
+                return U.idx[((cy & 3) * 4 + (cx & 3)) * GP_ME_KEEP + kk];
+            };
+            // the candidates side by side on the SIMD-group, as k_inter's (its G at 32 threads)
+            constexpr int N8 = (W / 8) * (H / 8);
+            constexpr int NCM = 1 + (W > 16 ? W / 16 : 1) * (H > 16 ? H / 16 : 1) * GP_ME_KEEP;
+            constexpr int VEC = W / 8 < 4 ? W / 8 : 4;
+            constexpr int G = ga_inter_lanes(N8 / VEC, NCM, 32), CP = 32 / G;
+            float bm = GP_INF;
+            uint bk = 0xFFFFFFFFu;
+            for (int base = 0; base < nc; base += CP) {
+                const int c = base + l32 / G;
+                uint sad = 0;
+                int2 v = int2(0, 0);
+                bool ok = false;
+                if (c < nc) {
+                    const int j = candJ(c);
+                    v = int2(U.v[2 * j], U.v[2 * j + 1]);
+                    ok = ga_ref_inside(I, x, y, v, W, H);
+                    if (ok) {
+                        device const uint16_t *r8 = S8 + j * 64 + by8 * 8 + bx8;
+                        for (int q = l32 % G; q < N8 / VEC; q += G) {
+                            const int p = q * VEC, o = (p / (W / 8)) * 8 + p % (W / 8);
+                            if (VEC == 4) {
+                                const ushort4 t = *(device const ushort4 *)(r8 + o);
+                                sad += (uint)t.x + t.y + t.z + t.w;
+                            } else if (VEC == 2) {
+                                const ushort2 t = *(device const ushort2 *)(r8 + o);
+                                sad += (uint)t.x + t.y;
+                            } else sad += r8[o];
+                        }
+                    }
+                }
+                for (int o = 1; o < G; o <<= 1) sad += simd_shuffle_xor(sad, (ushort)o);
+                float sv = GP_INF;
+                uint key = 0xFFFFFFFFu;
+                if (ok) {
+                    const float s = (float)sad + lamS * ga_mv_bits(v, P.meSubpel);
+                    if (s < GP_INF) { sv = s; key = (uint)c << 23 | sad; }
+                }
+                const float m = simd_min(sv);
+                const uint k = simd_min(sv == m ? key : 0xFFFFFFFFu);
+                if (m < bm || (m == bm && k < bk)) { bm = m; bk = k; }
+            }
+            if (bk != 0xFFFFFFFFu) {
+                const int j = candJ((int)(bk >> 23));
+                bestSad = bk & 0x7FFFFFu;
+                best = int2(U.v[2 * j], U.v[2 * j + 1]);
+            }
+            rd = 1;
+            // the gate on the SIMD-group: the block's mean and its SAD to it (whole numbers)
+            if (P.interGate > 0.f && bestSad > 0) {
+                device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
+                constexpr int NP = W * H / 32;
+                uint s1 = 0;
+                for (int i = 0; i < NP; i++) {
+                    const int p = l32 + 32 * i;
+                    s1 += src[(p / W) * sp + p % W];
+                }
+                const int mean = (int)((simd_sum(s1) + W * H / 2) / (W * H));
+                uint dc = 0;
+                for (int i = 0; i < NP; i++) {
+                    const int p = l32 + 32 * i;
+                    dc += (uint)abs((int)src[(p / W) * sp + p % W] - mean);
+                }
+                dc = simd_sum(dc);
+                if ((float)bestSad > P.interGate * (float)dc) {
+                    if (l32 == 0) { ir.dx = (int16_t)best.x; ir.dy = (int16_t)best.y; ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
+                    rd = 0;
+                }
+            }
+        }
+        if (l32 == 0) slot[sg] = Slot{rd, bestSad, best.x, best.y, lambda, li};
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // the RD, a block at a time on all NT threads, as k_inter<W, H, BS, 1, NT>
+        for (int q = 0; q < NB; q++) {
+            if (!slot[q].rd) continue;  // (uniform: the slot is the threadgroup's)
+            const uint qli = slot[q].li, qSad = slot[q].sad;
+            const int2 qBest = int2(slot[q].bx, slot[q].by);
+            const float qLambda = slot[q].lambda;
+            const int qx = (int)(qli % nbx) * W, qy = (int)(qli / nbx) * H;
+            const int qidx = sb_qindex(I, qx, qy);
+            const int lane = tid;
+            constexpr int NPX = W * H / NT;
+            EvalIn e;
+            e.txSz = txSz; e.plane = 0; e.txType = AV1G_DCT_DCT;
+            e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
+            e.rnd = P.rnd; e.zbin = P.zbin;
+            e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = g_cost[I.qctx];
+            e.qmDist = P.qmDist; e.qmRnd = P.qmRnd;
+            e.intraDir = AV1G_DC_PRED;
+            EvalOut o;
+            if (qSad == 0) {
+                o.D = 0.f; o.R = base_bits(e, 0); o.eob = 0;
+            } else {
+                device const uint8_t *src = I.src[0] + (size_t)qy * sp + qx;
+                float en = 0.f;
+                for (int i = 0; i < NPX; i++) {
+                    const int p = lane + NT * i;
+                    const int d = (int)src[(p / W) * sp + p % W] - ga_ref_px(I.ref, sp, qx + p % W, qy + p / W, qBest);
+                    S.res[p] = (int16_t)d;
+                    en += (float)(d * d);
+                }
+                ga_sync<NT>();
+                e.resEnergy = ga_sum<NT>(en, lane, S.red);
+                e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
+                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+            }
+            const int hasC = av1g_has_chroma(BS, qy >> 2, qx >> 2, I.mono);
+            const float J = o.D + qLambda * (o.R + ga_mv_bits(qBest, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
+            if (lane == 0) {
+                device GpInterRes &qr = B.inter[I.shOff[BS] + qli];
+                qr.dx = (int16_t)qBest.x;
+                qr.dy = (int16_t)qBest.y;
+                qr.isInter = 0;
+                qr.zero = o.eob == 0 ? 1 : 0;
+                qr.J = J;
+            }
+            ga_sync<NT>();
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // (the slots read)
     }
 }
