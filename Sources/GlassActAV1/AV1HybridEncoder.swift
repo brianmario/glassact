@@ -384,15 +384,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
         /// that holds the default's bytes (BENCHMARKS "a mostly-new picture coded fast"):
         /// 1. the levers whose bytes don't depend on the content: learned pruning looser (levels
-        ///    eps 0.05, modes 0.10), no RDOQ, no CDEF, the motion search in whole samples; +3 (the
-        ///    offset that holds the bytes is +1 to +5 on every switch and all-new picture measured).
+        ///    eps 0.05, modes 0.10), no RDOQ, no CDEF; +3 (the offset that holds the bytes is +1 to
+        ///    +5 on every switch and all-new picture measured). Not whole-sample motion: free on 5K
+        ///    pictures at their own size, but scrolling images scaled cost 3.4× without quarter samples.
         /// 2. and no motion search where no shift is proposed: the GPU's largest cut, but on a switch
         ///    between screens of the same kind (two text screens) the search finds a sixth of the
         ///    picture and the picture costs a quarter more; +4.
         /// 3. and no luma tx type search: the closed loop's largest cut, whose bytes depend on the
         ///    content (screen text +11 %, video +2 %); +10.
         public static func level(_ n: Int) -> NewPictureEffort? {
-            let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10, subpel: false)
+            let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10)
             var e = NewPictureEffort(qindexDelta: 3, usesRDOQ: false, analysis: cheap)
             e.cdef = false
             switch n {
