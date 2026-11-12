@@ -393,6 +393,47 @@ extension HybridEncoderTests {
     }
 }
 
+    /// A picture's analysis waits on the GPU for the filters of the picture two before it, and is
+    /// read on a thread of its own: a stream that stops early (here its fifth picture can't be
+    /// had) must release the analyses already committed behind filters that won't come, and the
+    /// next stream on the same encoder codes as it would on a fresh one.
+    @available(macOS 27, *)
+    @Test func aStreamThatStopsEarlyLeavesTheEncoderAsNew() throws {
+        struct Stop: Error {}
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        func make() throws -> AV1HybridEncoder {
+            let e = try AV1HybridEncoder(device: device)
+            e.tiling = (1, 1)
+            e.interFrames = true
+            return e
+        }
+        let (width, height) = (640, 360)
+        var rng = SplitMix64(seed: 0x6a7e)
+        // (the stream that stops codes other pictures: a key frame of the picture the last closed
+        // loop coded keeps its tiles, and codes differently from a fresh encoder's)
+        let all = (0..<12).map { _ -> AV1HybridEncoder.Picture in
+            var p = PartitionTests.Picture(width: width, height: height)
+            for k in p.y.indices where rng.int(0..<3) == 0 { p.y[k] = UInt8(rng.int(0..<256)) }  // all new each time
+            return AV1HybridEncoder.Picture(y: p.y, u: p.u, v: p.v, width: width, height: height)
+        }
+        let (stopping, pictures) = (Array(all[6...]), Array(all[..<6]))
+        let used = try make()
+        let started = ContinuousClock.now
+        #expect(throws: Stop.self) {
+            try used.encode(count: stopping.count, qindex: 80, picture: { i in
+                if i == 4 { throw Stop() }
+                return stopping[i]
+            }, output: { _, _ in })
+        }
+        // (an analysis left waiting would hold the stream's end until the GPU gives up on it: seconds)
+        #expect(ContinuousClock.now - started < .seconds(3), "the stream that stopped took \(ContinuousClock.now - started) to end")
+        var again: [[UInt8]] = [], fresh: [[UInt8]] = []
+        try used.encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { _, f in again.append(f.obu) })
+        try make().encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { _, f in fresh.append(f.obu) })
+        #expect(again.count == pictures.count)
+        #expect(again == fresh, "a stream after one that stopped codes differently")
+    }
+
 extension HybridEncoderTests {
     /// Learned pruning (on in pictures of 2,000 superblocks and up) changes the
     /// analysis, and the streams stay the decoder's pictures; kept analysis is

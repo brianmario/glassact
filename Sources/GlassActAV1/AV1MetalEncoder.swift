@@ -49,10 +49,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var blockModes: [(shape: Int, columns: Int, rows: Int, modes: [UInt8])] = []
         /// The source the analysis read (`beginPartition`'s): Y, U and V padded to whole 64×64s
         /// by edge replication, rows `sourceStrides` apart. It's the encoder's until the next
-        /// picture's partition is read, and then goes back to its pool (the picture after next
-        /// reuses it), so the caller may read it until then.
+        /// picture's partition is read (or, read with `wait(keepsSource: false)`, until the caller
+        /// hands the next one to `keepSource`), and then goes back to its pool (the picture after
+        /// next reuses it), so the caller may read it until then.
         public var source: [any MTLBuffer] = []
         public var sourceStrides: [Int] = []
+        /// The analysis's GPU time (`PendingPartition.wait`'s; 0 without GPU work).
+        public var gpuSeconds = 0.0
     }
 
     /// An encoded picture: the decisions, ready for av1core's writer, and the
@@ -319,6 +322,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// they overwrite (the cache's results): a picture's analysis is committed while the last one
     /// still runs, and its command buffer waits until the event reaches the last one's `seq`.
     let readEvent: any MTLSharedEvent
+    /// What a caller orders analyses behind on the GPU besides the reading of the one before
+    /// (`beginPartition(after:)`): it raises the value with `openGate` as the work they're
+    /// ordered behind ends. `AV1HybridEncoder` orders a picture's analysis behind the filters of
+    /// the picture two before, so that those, which the next closed loop waits for, have the GPU
+    /// as soon as their closed loop ends rather than queueing behind an analysis.
+    let gate: any MTLSharedEvent
+    /// Raises `gate` to `value` (never lowers it).
+    public func openGate(_ value: UInt64) {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        if gate.signaledValue < value { gate.signaledValue = value }
+    }
     /// Analyses set up so far (each Run's `seq`).
     var runCount: UInt64 = 0
     /// Run `seq`'s results are read (or never will be).
@@ -607,6 +622,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.queue = queue
         guard let readEvent = device.makeSharedEvent() else { throw Failure.metal("no shared event") }
         self.readEvent = readEvent
+        guard let gate = device.makeSharedEvent() else { throw Failure.metal("no shared event") }
+        self.gate = gate
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
         self.library = library
@@ -813,8 +830,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             self.commands = commands
         }
 
-        /// The partition, once the GPU is done.
-        public func wait() throws -> Partition {
+        /// The partition, once the GPU is done. With `keepsSource` false the analysis's source
+        /// isn't handed to the encoder's pool here: the caller hands it on with `keepSource` once
+        /// it's done with it (`AV1HybridEncoder` reads partitions on a thread of its own, ahead of
+        /// the picture before's closed loop and filters, which still read that one's).
+        public func wait(keepsSource: Bool = true) throws -> Partition {
+            var gpuSeconds = 0.0
             if let commands {
                 commands.waitUntilCompleted()
                 if let error = commands.error { throw Failure.metal("\(error)") }
@@ -823,17 +844,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 AV1HybridEncoder.trace("analysis gpu \(String(format: "%.3f %.3f", commands.gpuStartTime * 1000, commands.gpuEndTime * 1000))")
                 run.encoder.lastStages = stages
                 run.encoder.lastGPUSeconds = stages.analysis
+                gpuSeconds = stages.analysis
             } else if !run.encoder.profilesStages {
                 run.encoder.lastGPUSeconds = 0  // every SB kept: no GPU work
             }
             let (blocks, types, inter) = run.leafBlocks()
             let source = run.source
             if !run.source.isEmpty {  // the GPU is done with it (or never used it)
-                run.encoder.keepSource(run.source)
+                if keepsSource { run.encoder.keepSource(run.source) }
                 run.source = []
             }
             return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter,
-                             source: source, sourceStrides: [run.aw, run.aw / 2, run.aw / 2])
+                             source: source, sourceStrides: [run.aw, run.aw / 2, run.aw / 2], gpuSeconds: gpuSeconds)
         }
     }
 
@@ -844,11 +866,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// `motion` (an inter frame's shift candidates, (dx, dy) pairs): search for motion
     /// from the last picture waited on, of the same size (its source); the partition
     /// then mixes inter blocks with intra ones (`Partition.inter`).
+    /// `after` (nonzero): the analysis's GPU work also waits until `gate` reaches it.
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
-                               motion: [Int32]? = nil, sbQindex: [UInt8]? = nil) throws -> PendingPartition {
+                               motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
                           skip: skip, motion: motion, sbQindex: sbQindex)
+        run.gateValue = gateValue
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
 
@@ -910,6 +934,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var steps: [[UInt32]] = []
         /// This analysis's place in the encoder's order (`readEvent`).
         let seq: UInt64
+        /// `gate`'s value its GPU work waits for (0: none).
+        var gateValue: UInt64 = 0
         /// The cache it keeps results in, and its SBs' kept flags (the cache's `keep` then).
         let cacheRef: AnalysisCache?
         let keptFlags: (any MTLBuffer)?
@@ -1233,6 +1259,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 guard let c = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
                 // the last picture's results, which this one's overwrite, are read
                 if seq > 1 { c.encodeWaitForEvent(encoder.readEvent, value: seq - 1) }
+                // and whatever the caller orders it behind (`beginPartition(after:)`)
+                if gateValue > 0 { c.encodeWaitForEvent(encoder.gate, value: gateValue) }
                 guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
