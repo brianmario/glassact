@@ -106,6 +106,84 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the general code), each set made on first use: an encoder uses one, and a set takes
     /// seconds to compile.
     private var analysisSets: [AnalysisKernels?] = [nil, nil]
+    /// The analysis's 32x32 forward DCT runs on the SIMD-group matrix units (k_analysis.h's
+    /// `ga_mma`) only where `forwardMMAIsExact` found them bit-identical on this GPU to the passes
+    /// they replace: the byte identity rests on an accumulation order Metal doesn't promise.
+    /// Otherwise, and on GPUs without them, the old passes.
+    public let analysisUsesMatrixUnits: Bool
+
+    /// The check's answers by device (`registryID`): once a device, not a picture or an encoder.
+    private final class MMAVerdicts: @unchecked Sendable {
+        let lock = NSLock()
+        var byDevice: [UInt64: Bool] = [:]
+    }
+    private static let mmaVerdicts = MMAVerdicts()
+
+    /// Whether k_fwd_mma_check's two 32x32 forward DCTs agree bit for bit on every output, over a
+    /// fixed set of residuals: random in ±255, sparse ±255, small values, constant blocks, ramps.
+    /// The reference is the passes k_analysis otherwise runs; its row pass takes the column
+    /// pass's non-integer outputs, so both passes' float order is tested. `forceMismatch` flips
+    /// one output's low bit before the comparison (the fallback's test); its answer isn't cached.
+    public static func forwardMMAIsExact(device: any MTLDevice, library: any MTLLibrary, forceMismatch: Bool = false) throws -> Bool {
+        if forceMismatch { return try runForwardMMACheck(device: device, library: library, forceMismatch: true) }
+        mmaVerdicts.lock.lock()
+        defer { mmaVerdicts.lock.unlock() }
+        if let v = mmaVerdicts.byDevice[device.registryID] { return v }
+        let v = try runForwardMMACheck(device: device, library: library, forceMismatch: false)
+        mmaVerdicts.byDevice[device.registryID] = v
+        return v
+    }
+
+    private static func runForwardMMACheck(device: any MTLDevice, library: any MTLLibrary, forceMismatch: Bool) throws -> Bool {
+        guard let function = library.makeFunction(name: "k_fwd_mma_check") else { throw Failure.metal("no k_fwd_mma_check") }
+        let pipeline = try Self.pipeline(function, threads: 128, device: device)
+        let blocks = 96, n = blocks * 1024
+        var res = [Int16](repeating: 0, count: n)
+        var seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func next() -> Int {
+            seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Int(truncatingIfNeeded: seed >> 33)
+        }
+        for b in 0..<blocks {
+            for p in 0..<1024 {
+                let i = p / 32, j = p % 32, r = next()
+                let v: Int
+                switch b % 6 {
+                case 0, 1: v = r % 511 - 255                                // anything
+                case 2: v = r % 4 == 0 ? (r & 8 == 0 ? 255 : -255) : 0      // sparse extremes
+                case 3: v = r % 7 - 3                                       // small
+                case 4: v = (b * 37) % 511 - 255                            // constant
+                default: v = (i * 13 + j * 7 + b) % 511 - 255               // ramps
+                }
+                res[b * 1024 + p] = Int16(v)
+            }
+        }
+        guard let queue = device.makeCommandQueue(),
+              let resBuf = device.makeBuffer(bytes: res, length: n * 2, options: .storageModeShared),
+              let mma = device.makeBuffer(length: n * 4, options: .storageModeShared),
+              let ref = device.makeBuffer(length: n * 4, options: .storageModeShared),
+              let have = device.makeBuffer(length: 4, options: .storageModeShared),
+              let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder()
+        else { throw Failure.metal("no buffers for k_fwd_mma_check") }
+        have.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(resBuf, offset: 0, index: 0)
+        enc.setBuffer(mma, offset: 0, index: 1)
+        enc.setBuffer(ref, offset: 0, index: 2)
+        enc.setBuffer(have, offset: 0, index: 3)
+        enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        guard cb.status == .completed else { throw Failure.metal("k_fwd_mma_check failed") }
+        guard have.contents().load(as: UInt32.self) == 1 else { return false }  // (no matrix units)
+        let a = mma.contents().bindMemory(to: UInt32.self, capacity: n)
+        let b = ref.contents().bindMemory(to: UInt32.self, capacity: n)
+        if forceMismatch { a[n / 2] ^= 1 }
+        for p in 0..<n where a[p] != b[p] { return false }
+        return true
+    }
     private let analysisLock = NSLock()
     private let library: any MTLLibrary
     static let smallThreads = 128
@@ -532,6 +610,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
         self.library = library
+        self.analysisUsesMatrixUnits = try Self.forwardMMAIsExact(device: device, library: library)
         var inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
             let prefix = "k_inter_\(size.w)x\(size.h)_w"  // as k_analysis's names
@@ -579,6 +658,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let values = MTLFunctionConstantValues()
         var value = fixed
         values.setConstantValue(&value, type: .bool, index: 0)
+        var mma = analysisUsesMatrixUnits
+        values.setConstantValue(&mma, type: .bool, index: 1)
         var simd: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 {
             // k_analysis_<W>x<H>_w<NW>: NW blocks a threadgroup, a SIMD-group each; or _w1t<NT>: a

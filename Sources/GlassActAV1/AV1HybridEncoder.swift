@@ -407,6 +407,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.profilesStages }
         set { metal.profilesStages = newValue }
     }
+    /// The analysis's 32x32 forward DCT runs on the matrix units (`AV1MetalEncoder.analysisUsesMatrixUnits`).
+    public var analysisUsesMatrixUnits: Bool { metal.analysisUsesMatrixUnits }
     /// The last picture's GPU stages (with `profilesStages`).
     public var lastStages: AV1MetalEncoder.StageTimes { metal.lastStages }
 

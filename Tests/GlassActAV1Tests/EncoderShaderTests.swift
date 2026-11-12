@@ -35,4 +35,20 @@ struct EncoderShaderTests {
             Issue.record("\(error)")
         }
     }
+
+    /// The analysis's matrix-unit forward DCT is chosen only by its start-up check: a mismatch
+    /// (forced, one output's low bit) picks the old passes, and the encoder follows the cached
+    /// check. (On this suite's GPUs the matrix path exists; whether it matches is the GPU's.)
+    @available(macOS 27, *)
+    @Test func matrixUnitsNeedTheirCheck() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let main = AV1ShaderSource.sourceRootForTests.appending(path: "GlassActAV1/Shaders/encoder.metal")
+        let library = try AV1ShaderSource.library(main, device: device)
+        #expect(try !AV1MetalEncoder.forwardMMAIsExact(device: device, library: library, forceMismatch: true))
+        let exact = try AV1MetalEncoder.forwardMMAIsExact(device: device, library: library)
+        #expect(try AV1MetalEncoder(device: device).analysisUsesMatrixUnits == exact)
+        #expect(try AV1MetalEncoder.forwardMMAIsExact(device: device, library: library) == exact)  // (cached)
+        // an M4 Pro, where the probe found the order sequential: the check should pass there
+        if device.name.contains("M4") { #expect(exact, "\(device.name)") }
+    }
 }

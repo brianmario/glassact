@@ -19,6 +19,11 @@
 // host takes the fixed pipelines only where the settings are those, so the results are the same.
 constant bool ga_fixed_fc [[function_constant(0)]];
 constant bool ga_fixed = is_function_constant_defined(ga_fixed_fc) && ga_fixed_fc;
+// Glass Act: the 32x32 forward DCT on the matrix units (warp_fwd_mma), only where the host's
+// start-up check found it bit-identical to the passes it replaces on this GPU
+// (AV1MetalEncoder.forwardMMAIsExact, k_fwd_mma_check); undefined is false.
+constant bool ga_mma_fc [[function_constant(1)]];
+constant bool ga_mma = is_function_constant_defined(ga_mma_fc) && ga_mma_fc;
 
 template <int W, int H>
 struct ASmem {
@@ -458,7 +463,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
 #ifdef GA_FWD_MMA
             // (DCT_DCT on the matrix units, the same coefficients. 32x32 only: on 16x16 and 64x64
             // they were slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
-            if (W == 32 && H == 32) {
+            if (ga_mma && W == 32 && H == 32) {
                 if (!fmReady) {
                     AV1G_CONST const float *F = g_fwd + g_fwdOff[AV1G_K_DCT][T::lw];
                     for (int p = lane; p < T::th * W; p += NT) S.fm[p] = F[p];
