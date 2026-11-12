@@ -636,16 +636,17 @@ impl TxbHook for QuantHook<'_> {
                 }
             }
         } else {
-            let mut e = 0u64;
+            // (at most 64 x 64 x 255^2 < 2^28: a u32 sum, which vectorizes without widening)
+            let mut e = 0u32;
             for i in 0..th {
                 let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resf[i * tw..][..tw]);
                 for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
                     let v = s as i32 - p as i32;
-                    e += (v * v) as u64;
+                    e += (v * v) as u32;
                     *d = v as f32;
                 }
             }
-            w.energy = e;
+            w.energy = e as u64;
             w.s1.reset();
         }
         w.rdoq_here = 0;
