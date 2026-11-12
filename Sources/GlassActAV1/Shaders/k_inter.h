@@ -195,6 +195,17 @@ static inline int ga_ref_px(device const uint8_t *ref, int sp, int x, int y, int
     return ((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32) >> 6;
 }
 
+// ga_ref_px from a window of the reference in threadgroup memory (pitch wp; x, y relative to it):
+// the same arithmetic, the same values
+static inline int ga_ref_px_tg(threadgroup const uint8_t *w, int wp, int x, int y, int2 v) {
+    const int px = (x << 3) + v.x, py = (y << 3) + v.y;
+    const int ix = px >> 3, iy = py >> 3, fx = px & 7, fy = py & 7;
+    threadgroup const uint8_t *r = w + iy * wp + ix;
+    if ((fx | fy) == 0) return r[0];
+    const int a = r[0], b = r[1], c = r[wp], d = r[wp + 1];
+    return ((8 - fx) * (8 - fy) * a + fx * (8 - fy) * b + (8 - fx) * fy * c + fx * fy * d + 32) >> 6;
+}
+
 // whether a W x H block at (x, y) + v reads only the padded reference (one more sample across a
 // fractional position, for bilinear)
 static inline bool ga_ref_inside(device const GpImage &I, int x, int y, int2 v, int W, int H) {
@@ -203,10 +214,12 @@ static inline bool ga_ref_inside(device const GpImage &I, int x, int y, int2 v, 
 }
 
 #define GA_ME_NW 4
+#define GA_ME_WIN 18  // k_me's sub-sample window: 16 + 1 sample either side
 kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                  constant uint32_t &nCells [[buffer(2)]], uint tg [[threadgroup_position_in_grid]],
                  uint lane [[thread_index_in_simdgroup]], uint warp [[simdgroup_index_in_threadgroup]]) {
     threadgroup uint8_t cur[GA_ME_NW][256];
+    threadgroup uint8_t win[GA_ME_NW][GA_ME_WIN * GA_ME_WIN];
     const uint32_t g = tg * GA_ME_NW + warp;
     if (g >= nCells) return;
     device const GpImage &I = B.img[0];
@@ -276,6 +289,16 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     if (P.meSubpel && b0 != 0xFFFFFFFFu) {
         // the best one to half, then quarter samples: the 8 neighbours at each step, every row. Each
         // lane measures 8 samples of each (a row's half), and the SIMD-group sums them
+        // Glass Act: every position the two steps reach (within 6/8 of the whole-sample best), and
+        // their bilinear neighbours, read from the reference once: an 18x18 window from one sample
+        // above and left of the best's block, in threadgroup memory (outside the picture: unread,
+        // as ga_ref_inside keeps those positions out)
+        const int wx0 = x + (best[0].x >> 3) - 1, wy0 = y + (best[0].y >> 3) - 1;
+        for (int p = (int)lane; p < GA_ME_WIN * GA_ME_WIN; p += 32) {
+            const int wy = wy0 + p / GA_ME_WIN, wx = wx0 + p % GA_ME_WIN;
+            win[warp][p] = wx >= 0 && wy >= 0 && wx < I.aw && wy < I.ah ? I.ref[(size_t)wy * sp + wx] : (uint8_t)0;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
         uint bestSad = 0xFFFFFFFFu;
         const int row = (int)lane >> 1, col0 = ((int)lane & 1) * 8;
         for (int step = 4; step >= 2; step >>= 1) {
@@ -290,7 +313,8 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                     if (ga_ref_inside(I, x, y, v, 16, 16)) {
                         uint part = 0;
                         for (int col = col0; col < col0 + 8; col++)
-                            part += (uint)abs((int)cur[warp][row * 16 + col] - ga_ref_px(I.ref, sp, x + col, y + row, v));
+                            part += (uint)abs((int)cur[warp][row * 16 + col] -
+                                              ga_ref_px_tg(win[warp], GA_ME_WIN, x + col - wx0, y + row - wy0, v));
                         sad = simd_sum(part);
                     }
                 }
