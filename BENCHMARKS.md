@@ -208,7 +208,7 @@ the numbers and the reasoning.
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | The Metal AV1 filters' CDEF preset search on the GPU (`metal-av1`) | kept | one command buffer a picture instead of 2–3: +3–18 % inter frames a second, streams unchanged | [entry](#metal-av1-the-filters-preset-search-on-the-gpu-one-command-buffer-a-picture-2026-11-01) |
 | Palette blocks in the Metal AV1 encoder (`metal-av1`) | writer and parser support kept; decisions not taken; **reopened for inter frames at 5K** (libaom's palette + residual halves its intra coding of new text there; a first proxy-chosen prototype saved nothing) | exact palettes' best case ≤ 0.05 % of a key frame's bits (DCT codes few-colour blocks in ~11 bits); lossy ones 0.1–0.7 % at q20, 1–5 % at q40; libaom realtime's palette costs 6–34 % BD-rate | [measured](#metal-av1-palette-decisions-measured-not-taken-2026-11-01), [libaom](#metal-av1-palette-blocks-in-the-writer-and-parser-libaoms-palette-measured-2026-11-01) |
-| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 900 superblocks (1440p) and up since its one-pass statistics (2,000 before) | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 1440p's GPU analysis −8 to −22 % at ±0.3 %; 720p only loses (photos streams −23 %, before the one-pass statistics); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02) |
+| Learned pruning of the analysis (`metal-av1`): a network per 8×8 cell picks the likely tree levels, one per node the likely luma modes, one per leaf the likely chroma modes | kept, on at 900 superblocks (1440p) and up since its one-pass statistics (2,000 before) | 5K key frames 35–39 % faster on screen content (photos 15 %), BD −0.6 to 0.0 % against none; 1440p's GPU analysis −8 to −22 % at ±0.3 %; 720p only loses (photos streams −23 %, before the one-pass statistics); a first version, a yes/no per node, cost +2–6 % because its skips compound; `scripts/train-pruner` retrains both; **weights retrained on eleven traces installed 2026-11-12** (stream BD −1.2 % app switching, −0.9 % tabs, +0.4 % dragging, +0.25 % video, the rest within ±0.05 %) | [entry](#metal-av1-learned-pruning-of-the-analysis-offline-feasibility-2026-11-02), [retrained](#metal-av1-learned-prunings-weights-retrained-on-eleven-traces-installed-2026-11-12) |
 | Angle deltas only where a picture changes in places (`metal-av1`) | kept (half the superblocks) | 5K full-screen change or key frame 150–170 → 105–127 ms for +0.3–1.7 % of its bytes; whole streams ≤ +0.3 %; turbo2 / turbo3 cost +11–45 % on text | [entry](#metal-av1-every-superblock-changing-at-5k-where-the-time-goes-and-angle-deltas-gated-2026-11-02) |
 | Reduced frames (coded smaller, shown at the stream's size) for full-screen change at 5K (`metal-av1`) | writer and parser support kept; not used | half size: 35 ms a picture, HEVC's latency, but 5K quality caps near 30 dB, below HEVC at any rate; 3/4 size 76–90 ms, caps at 34–36 dB; VideoToolbox decodes scaled references and superres exactly | [entry](#metal-av1-reduced-frames-for-full-screen-change-at-5k-measured-2026-11-02) |
 | RDOQ in the closed loop (`metal-av1`), only in tx blocks whose source spans ≥ 40 values | kept, on | BD-rate by SSIMULACRA2: 5K key frames −0.7 to −2.1 %, 5K streams −0.6 to −1.9 %, 720p streams −2.6 to +0.2 %; 5K key frame +0–2.7 % picture time. Ungated, it banded flat areas (photos +1.5 %); a distinct-values gate was worse; RDOQ in the tx type trials saves less for 9–22 ms more | [entry](#metal-av1-rdoq-in-the-closed-loop-where-the-source-has-contrast-2026-11-02) |
@@ -317,6 +317,41 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: learned pruning's weights retrained on eleven traces, installed (2026-11-12)
+
+The weights of 2026-11-09's retraining (`scripts/train-pruner`, the eleven traces of
+`scripts/pruner-traces.txt`; the shipped ones knew the first four), installed on the owner's
+word. They are the ones whose level model doesn't narrow an edge over a two-value area to 64x64s
+alone (the q18–20 loss at eps 0.05, below). `scripts/train-pruner compare` at `21e60fc` (today's
+defaults), each trace's test frames (0–109), BD-rate over q 8–32 by RGB PSNR, new against
+shipped:
+
+| trace | key frames | stream | key ms shipped → new | inter frames a second shipped → new |
+|---|---|---|---|---|
+| typing-cc | −0.11 % | 0.00 % | 61.1 → 47.7 | 349 → 368 |
+| scroll-win | −0.06 % | −0.01 % | 45.6 → 46.7 | 289 → 273 |
+| photos | +0.02 % | +0.02 % | 78.3 → 75.6 | 110 → 106 |
+| cursor-drag | +0.07 % | +0.43 % | 45.3 → 47.8 | 366 → 319 |
+| movie | +0.90 % | +0.25 % | 42.4 → 43.4 | 36 → 37 |
+| app-switch | −1.31 % | −1.20 % | 36.9 → 37.2 | 338 → 336 |
+| tabs | −0.70 % | −0.88 % | 42.6 → 42.5 | 364 → 359 |
+| window-open-close | −0.04 % | +0.04 % | 48.9 → 49.0 | 333 → 206 |
+| ide | +0.09 % | +0.02 % | 39.4 → 37.0 | 311 → 306 |
+| maps | +0.16 % | −0.03 % | 77.2 → 70.7 | 260 → 220 |
+| images-scroll | +0.03 % | +0.03 % | 75.6 → 75.8 | 240 → 238 |
+
+The speed columns were taken with the Mac in use and loaded (the script's wait for a locked
+screen bypassed, each run under the builders' timing lock), so they say nothing: the same binary
+varied more than these differences that day. The earlier measurement stands until a quiet run:
+at eps 0.02 the new weights keep more 16x16s and up, GPU analysis 23.0 → 23.8 ms on a new 5K
+picture (2026-11-11). The tx type model's weights (off by default) were installed with them.
+
+The reference digests (the rotation, `--tiles 3x0 --inter --no-planes`), before → now: 5K q20 24
+frames `--no-golden` `fd2a0aa931bf1402` → `a61cee2cbf8df351`; 5K q20 8 frames `0ebbbcdad618169b`
+→ `384e81d2e4ff2b62`; 2900 q32 `6ebac49593108b54` → `68beb6c1416c3fa9`; 5K q8
+`0138e10a56d8cc66` → `6336ccaac1b0e59c`; 1280 q20 `2b2204ec80f2134d`, unchanged (no learned
+pruning under 900 superblocks). AV1 tests 31, Rust 58.
 
 ### Metal AV1: the partition read as its analysis ends, the analysis behind the filters; a reference the closed loop overwrote (2026-11-12)
 
