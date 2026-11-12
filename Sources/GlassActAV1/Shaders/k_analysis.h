@@ -154,7 +154,9 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
     constexpr int nsx = W / 4, nsub0 = (W / 4) * (H / 4);
     // sub == 2: checkerboard of 4x4 sub-blocks (nsx is even for every shape >= 256 pixels)
     const int nsub = sub == 2 ? nsub0 / 2 : nsub0;
-    if (nsub >= 8) {
+    // (32 4x4s, a SIMD-group's lanes, take the loop below a lane a 4x4: one candidate a SIMD-group
+    // too, without the shuffles; 32x32 at screenSub 2: 2.55 -> 2.47 ms. 64x64's 128 were slower so)
+    if (nsub >= 8 && nsub != 32) {
         // Glass Act: four lanes a 4x4, a row each (its prediction, then the Hadamard's row pass;
         // the column pass across the four by shuffles), so a SIMD-group takes one candidate at a
         // time: no divergence between candidates' predictions. Integer transforms, then quarters
