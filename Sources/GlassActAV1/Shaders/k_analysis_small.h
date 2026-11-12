@@ -55,6 +55,77 @@ __device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txT
         }
 }
 
+// Glass Act: coeff_bits for a 2D-class transform of a thread kernel's size, the rate of scan positions
+// 0..eob-1 added to `bits` one coefficient at a time in scan order, as eval_scalar's loop over
+// coeff_bits adds them. The neighbours' magnitudes come from a copy of the levels as min(|q|, 15)
+// with two zero columns right and two zero rows below: the 2D class's neighbours (Sig_Ref_Diff_Offset
+// and Mag_Ref_Offset_With_Tx_Class) are all right and below, so a neighbour outside the block reads
+// 0, as coeff_bits skips it. The same whole-number contexts, so the same table entries in the same
+// order of adds.
+template <int W, int H>
+__device__ __forceinline__ void rate_2d_small(thread float &bits, int eob, const thread int16_t *q, AV1G_CONST const uint16_t *scan,
+                                              int txSz, int dcCtx, AV1G_CONST const float *C) {
+    constexpr int PW = W + 2, lw = TxD<W, H>::lw;
+    uint8_t lv[PW * (H + 2)];
+#pragma unroll
+    for (int i = 0; i < H + 2; i++)
+#pragma unroll
+        for (int j = 0; j < PW; j++) {
+            int a = 0;
+            if (i < H && j < W) {
+                a = q[i * W + j];
+                a = a < 0 ? -a : a;
+                a = min(a, 15);
+            }
+            lv[i * PW + j] = (uint8_t)a;
+        }
+    const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
+    const int brsz = min(txSzCtx, (int)AV1G_TX_32X32);
+    for (int c = 0; c < eob; c++) {
+        const int pos = scan[c];
+        const int qv = q[pos];
+        const int v = qv < 0 ? -qv : qv;
+        const int level = v < 15 ? v : 15;
+        const int row = pos >> lw, col = pos - (row << lw);
+        const int p = row * PW + col;
+        float b;
+        if (c == eob - 1) {
+            const int bctx = c == 0 ? 0 : c <= (H << lw) / 8 ? 1 : c <= (H << lw) / 4 ? 2 : 3;
+            b = C[CID(coeff_base_eob[txSzCtx][0][bctx]) + min(level, 3) - 1];
+        } else {
+            const int mag = min((int)lv[p + 1], 3) + min((int)lv[p + PW], 3) + min((int)lv[p + PW + 1], 3) + min((int)lv[p + 2], 3) +
+                            min((int)lv[p + 2 * PW], 3);
+            int bctx = min((mag + 1) >> 1, 4);
+            if (row == 0 && col == 0) bctx = 0;
+            else bctx += AV1G_T(Coeff_Base_Ctx_Offset)[txSz][min(row, 4)][min(col, 4)];
+            b = C[CID(coeff_base[txSzCtx][0][bctx]) + min(level, 3)];
+        }
+        if (level > 2) {
+            int mag = (int)lv[p + 1] + (int)lv[p + PW] + (int)lv[p + PW + 1];
+            mag = min((mag + 1) >> 1, 6);
+            const int brctx = pos == 0 ? mag : (row < 2 && col < 2) ? mag + 7 : mag + 14;
+            const uint32_t cid = CID(coeff_br[brsz][0][brctx]);
+            int rem = level - 3;
+            for (int i = 0; i < 4; i++) {
+                const int k = min(rem, 3);
+                b += C[cid + k];
+                rem -= k;
+                if (k < 3) break;
+            }
+        }
+        if (v) {
+            if (c == 0) b += C[CID(dc_sign[0][dcCtx]) + (qv < 0)];
+            else b += 1.0f;
+            if (v > 14) {
+                const int xg = v - 14;
+                const int len = 31 - __clz(xg);
+                b += (float)(2 * len + 1);
+            }
+        }
+        bits += b;
+    }
+}
+
 template <int W, int H>
 __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const EvalIn &e) {
     constexpr int n = W * H;
@@ -80,7 +151,9 @@ __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const 
     float bits = base_bits(e, eob);
     if (eob > 0) {
         const int txClass = av1g_tx_class(e.txType);
-        for (int k = 0; k < eob; k++) bits += coeff_bits(k, eob, q, scan, e.txSz, txClass, 0, e.dcCtx, e.C);
+        if (txClass == AV1G_TX_CLASS_2D) rate_2d_small<W, H>(bits, eob, q, scan, e.txSz, e.dcCtx, e.C);
+        else
+            for (int k = 0; k < eob; k++) bits += coeff_bits(k, eob, q, scan, e.txSz, txClass, 0, e.dcCtx, e.C);
     }
     EvalOut o;
     o.D = g_txg[e.txSz][e.txType] * dist;
