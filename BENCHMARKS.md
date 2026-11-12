@@ -243,6 +243,7 @@ the numbers and the reasoning.
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
+| The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, off by default; the owner's choice | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
 | No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`) | kept, off by default; the owner's choice | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
 | The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
@@ -314,6 +315,58 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: matrix units for the 32x32 DCT, less threadgroup memory for the pruning, and where the period goes (2026-11-11)
+
+Measured with nobody connected (screen locked), every timed run serialized by a lock. The
+all-new stream is the four-trace rotation at 5K q20 with `--no-golden`, 24 frames, so each
+picture is new against the one before it. Streams unchanged: `c2b0b3bda5f8a1fd` (that stream),
+`7c17df5c516aab0d` (5K q20), `043b6b1e2c0a51cc` (2900 q32), `c941eb17e507be34` (5K q8),
+`2dd0679554ec9fee` (1280 q20). The AV1 tests (29) and AV1Core tests pass.
+
+**Where the period goes on all-new pictures** (`GA_TIMELINE=1`, medians over 14 pictures, builds
+running beside it): 30 ms a picture = the closed loop 19.5 + the filters 6.5 (wall, waiting
+behind the next analysis on the GPU) + about 3 to read the analysis and run the partition. The
+next picture's GPU analysis (20 ms) runs beside the closed loop. So the period is the serial
+chain closed loop → filters → partition → closed loop, not the GPU's throughput: GPU time saved
+shows up only where the analysis ran past the closed loop into the filters' turn. The filters'
+`(GPU x)` figure (7.1 ms) is a command buffer's span that includes analysis work; their own
+passes add up to 3.5–4 ms (CDEF strength search ≈ 1.05, CDEF ≈ 0.75, deblocking ≈ 0.5–0.9, the
+change marks 0.2–0.7). End to end, 34.6–36 inter frames a second (26–29 on 2026-11-03).
+
+**Kept:**
+- **The analysis's 32x32 forward DCT on the matrix units** (`d75d997`, `de638ca`). The RD
+  transform is float32: each output is an fma chain over k in order from +0, with non-integer
+  coefficients, so only the same order gives the same bits. On the M4 Pro, chained
+  `simdgroup_multiply_accumulate` over 8-blocks of k equalled the sequential fma on 2,097,152 of
+  2,097,152 outputs (unfused multiply-add: 35 %; fma per block then summed: 18 %). Metal doesn't
+  promise that order, so `AV1MetalEncoder.forwardMMAIsExact` runs both transforms on 96 fixed
+  residuals at start-up (once a device), compares all 98,304 outputs bit for bit, and sets the
+  function constant `ga_mma` only if they all match. Otherwise, and on GPUs without matrix units
+  (`__HAVE_SIMDGROUP_MATRIX__` unset), the old passes run. `--profile` says which ran.
+  - 32x32 2.94 → 2.43 ms (3 alternated pairs, then 3 more on the merged head), analysis
+    10.2 → 9.7. The 32x32 kernel's four SIMD-groups now share the tiles (the old passes ran on
+    one while three waited).
+  - Not kept: the same for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26), likely from the
+    threadgroup copy of the matrix lowering occupancy (64x64's is 8 KB).
+  - The fallback still declares the 4 KB copy (a threadgroup array can't follow a function
+    constant); untimed, since this Mac passes the check.
+- **k_ml_stats keeps less threadgroup memory** (`ecfceb5`): a node's record drops the quadrant
+  sums a parent never reads back (its quadrants are its children's own sums), and the SB's own
+  record isn't stored, 11.4 → 8.6 KB a threadgroup. Learned pruning 1.93 → 1.75 ms. Its passes
+  now: statistics ≈ 0.97, the mode network ≈ 0.38 (beside the cells'), the tree ≈ 0.15.
+- **A changed search's deblocking in 8×8 threadgroups** (`f09ff6d`), as `p_deblock` already
+  was, not 16×4 strips: that pass ≈ 0.59 → 0.35 ms (per-pass timing; the filters' total swings
+  ±1 ms and can't show it).
+
+Merged head against a 43f811d build, 3 alternated pairs: analysis 10.2 → 9.7, learned pruning
+1.93–1.94 → 1.75, inter frames a second 35.9–36.0 against 34.9–36.2 (unchanged, as the period
+says).
+
+**Measured, not kept (same bytes, no gain):** `p_mark` a thread per row of a block;
+k_ml_stats's bits and orientation bins in threadgroup memory (1.94 → 2.03), or updated by
+constant indices; its 16x16s from SIMD shuffles (threadgroup memory 2.7 KB, 1.75 → 1.74); the
+networks' loops unrolled; their weights in `constant` memory.
 
 ### Metal AV1: byte-identical speedups: analysis kernels for the hybrid, projections once a picture (2026-11-11)
 
