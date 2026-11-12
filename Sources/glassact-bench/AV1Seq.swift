@@ -543,7 +543,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         print(String(format: "  GPU, stage by stage (ms): %@analysis %.1f [%@] · partition %.1f · leaves %.2f%@",
                      motion, st.analysis * 1000, shapes.joined(separator: " · "), st.partition * 1000, st.leaves * 1000,
                      st.mlPrune > 0 ? String(format: " · learned pruning %.2f", st.mlPrune * 1000) : ""))
-        print("             analysis's 32x32 forward DCT: \(encoder.analysisUsesMatrixUnits ? "matrix units (checked exact on this GPU)" : "fma passes")")
+        print("             analysis's 16x16, 32x32 and 64x64 forward DCTs: \(encoder.analysisUsesMatrixUnits ? "matrix units (checked exact on this GPU)" : "fma passes")")
         encoder.profilesStages = false
         encoder.reusesAnalysis = !opts.has("no-reuse")
     }

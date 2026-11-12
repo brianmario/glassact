@@ -418,6 +418,9 @@ extension HybridEncoderTests {
         }
         let (stopping, pictures) = (Array(all[6...]), Array(all[..<6]))
         let used = try make()
+        // (the kernels compiled before the clock starts: an encoder's first pictures wait for
+        // them, seconds beside other tests, and Metal keeps them for the next encoder)
+        try make().encode(count: 3, qindex: 80, picture: { stopping[$0] }, output: { _, _ in })
         let started = ContinuousClock.now
         #expect(throws: Stop.self) {
             try used.encode(count: stopping.count, qindex: 80, picture: { i in
