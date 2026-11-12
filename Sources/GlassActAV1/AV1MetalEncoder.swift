@@ -476,13 +476,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// The cache for a picture of this geometry and these settings (made anew
     /// when they change, so its first picture keeps nothing); nil unless
     /// `reusesAnalysis`.
-    func analysisCache(width: Int, height: Int, qindex: Int, shapeMask: Int32, blocks: Int, superblocks: Int) throws -> AnalysisCache? {
+    func analysisCache(width: Int, height: Int, qindex: Int, shapeMask: Int32, blocks: Int, superblocks: Int,
+                       newPicture: NewPictureAnalysis? = nil) throws -> AnalysisCache? {
         guard reusesAnalysis else { cache = nil; return nil }
         var p = params
         var key = withUnsafeBytes(of: &p) { Array($0) }
         for v in [width, height, qindex, tiling.columnsLog2, tiling.rowsLog2, decidesLeaves ? 1 : 0,
                   Int(busyBlockPrune.bitPattern), searchesAngleDeltas ? 1 : 0, leafTxSearchPixels,
-                  leafChromaAngledModes ? 1 : 0, Int(shapeMask)] {
+                  leafChromaAngledModes ? 1 : 0, Int(shapeMask),
+                  Int(newPicture?.eps?.bitPattern ?? 0xFFFF_FFFF), Int(newPicture?.modeEps?.bitPattern ?? 0xFFFF_FFFF),
+                  (newPicture?.preset).map { Int(AV1MetalEncoder.params(for: $0).txSearchCL) * 16 + Int(AV1MetalEncoder.params(for: $0).uvK) } ?? -1] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -527,6 +530,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// shapes (GpParams.shapeMask bits; nil: their preset's). Fewer shapes cost a little more of
     /// such a picture's bytes for less analysis (BENCHMARKS "fewer shapes in mostly new pictures").
     public var newPictureShapeMask: Int32?
+    /// One mostly-new picture's analysis made cheaper (`beginPartition(newPicture:)`; the hybrid
+    /// encoder's `newPictureEffort`): each field set replaces the encoder's own for that picture.
+    public struct NewPictureAnalysis: Sendable, Equatable {
+        /// The shapes analyzed (GpParams.shapeMask bits), in place of `newPictureShapeMask`.
+        public var shapeMask: Int32?
+        /// The learned pruning's level and mode eps, in place of `learnedPrune`'s.
+        public var eps: Float?, modeEps: Float?
+        /// The analysis's effort, in place of `interPreset`'s (its shapes still `shapeMask`'s or
+        /// `newPictureShapeMask`'s).
+        public var preset: Preset?
+        public init(shapeMask: Int32? = nil, eps: Float? = nil, modeEps: Float? = nil, preset: Preset? = nil) {
+            (self.shapeMask, self.eps, self.modeEps, self.preset) = (shapeMask, eps, modeEps, preset)
+        }
+    }
     let recon: any MTLComputePipelineState
     let mlStats: any MTLComputePipelineState, mlCell: any MTLComputePipelineState
     let mlTree: any MTLComputePipelineState, mlList: any MTLComputePipelineState, mlMode: any MTLComputePipelineState
@@ -874,9 +891,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// `after` (nonzero): the analysis's GPU work also waits until `gate` reaches it.
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
-                               motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0) throws -> PendingPartition {
+                               motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0,
+                               newPicture: NewPictureAnalysis? = nil) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
-                          skip: skip, motion: motion, sbQindex: sbQindex)
+                          skip: skip, motion: motion, sbQindex: sbQindex, newPicture: newPicture)
         run.gateValue = gateValue
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
@@ -923,6 +941,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let decidesLeaves: Bool
         /// SBs the caller replaces (`beginPartition(skip:)`): the partition gives each one block.
         let skipped: [UInt8]?
+        /// A mostly-new inter frame's cheaper analysis (`beginPartition(newPicture:)`), or nil.
+        let newPictureAnalysis: NewPictureAnalysis?
         /// Learned pruning's buffers, when this picture uses it: per-8x8 skip flags (4 levels),
         /// node statistics (per level from `mlBases`), the cells' kept levels, the small shapes'
         /// lists and their counts.
@@ -949,7 +969,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
-             motion: [Int32]? = nil, sbQindex: [UInt8]? = nil) throws {
+             motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, newPicture: NewPictureAnalysis? = nil) throws {
             self.encoder = encoder
             encoder.runCount += 1
             seq = encoder.runCount
@@ -957,6 +977,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             self.height = height
             self.qindex = qindex
             skipped = skip
+            // (an inter frame's that codes more than `interGateOverShare` of its superblocks)
+            newPictureAnalysis = skip.flatMap { m in
+                Double(m.count(where: { $0 == 0 })) > encoder.interGateOverShare * Double(max(1, m.count)) ? newPicture : nil
+            }
             miCols = 2 * ((width + 7) >> 3)
             miRows = 2 * ((height + 7) >> 3)
             sbCols = (miCols + 15) >> 4
@@ -1081,9 +1105,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 last.map(\.length) == src.map(\.length) && last[0] !== src[0] ? last : nil
             }
             // analysis grids: every enabled shape over the coded area (inter frames': interPreset's)
-            let newPicture = skipped != nil && encoder.newPictureShapeMask != nil
+            let newPictureMask = newPictureAnalysis?.shapeMask ?? encoder.newPictureShapeMask
+            let newPicture = skipped != nil && newPictureMask != nil
                 && Double(skipped?.count(where: { $0 == 0 }) ?? 1) > encoder.interGateOverShare * Double(max(1, skipped?.count ?? 1))
-            let shapeMask = newPicture ? encoder.newPictureShapeMask!
+            let shapeMask = newPicture ? newPictureMask!
                 : last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
                 : encoder.params.shapeMask
             var nbx = [Int32](repeating: 0, count: Int(GP_NSHAPES)), nby = nbx
@@ -1128,7 +1153,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             imageIsFixed = image.edgeFilter == 0 && (image.usingQm == 0 || image.qm.0 >= 15)
             // the analysis's results: the previous picture's, kept where its source is unchanged
             let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, shapeMask: shapeMask, blocks: Int(blkTotal),
-                                                  superblocks: sbCols * sbRows)
+                                                  superblocks: sbCols * sbRows, newPicture: newPictureAnalysis)
             func keep(_ b: any MTLBuffer) -> any MTLBuffer { made.append(b); return b }
             let blk = try cache.map { keep($0.blockResults) } ?? make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)
             blockResults = blk
@@ -1246,13 +1271,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var commands: (any MTLCommandBuffer)?
             var compute: (any MTLComputeCommandEncoder)?
             var params = isInter && encoder.interPreset != nil ? AV1MetalEncoder.params(for: encoder.interPreset!) : encoder.params
+            if let preset = newPictureAnalysis?.preset { params = AV1MetalEncoder.params(for: preset) }
             params.leafDecide = decidesLeaves ? 1 : 0
             params.pruneVar = mlMask != nil ? 0 : encoder.busyBlockPrune
             // the share of the picture coded (not copied): the same with kept analysis as without
             let codedShare = skipped.map { m in Double(m.count(where: { $0 == 0 })) / Double(max(1, m.count)) } ?? 1
             if !encoder.searchesAngleDeltas || codedShare > encoder.angleDeltasUpToShare { params.deltas = 0; params.uvDeltas = 0 }
             // (an inter frame has copies decided, with or without a motion search)
-            if skipped != nil, codedShare > encoder.interGateOverShare, let m = encoder.newPictureShapeMask { params.shapeMask = m }
+            if skipped != nil, codedShare > encoder.interGateOverShare, let m = newPictureAnalysis?.shapeMask ?? encoder.newPictureShapeMask {
+                params.shapeMask = m
+            }
             // the inter gate where most of the picture is new (a switch of Spaces, apps or windows)
             params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)
@@ -1378,7 +1406,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 e.memoryBarrier(scope: .buffers)
                 if let modes = mlModes, let modeWeights = encoder.mlModeWeights {
                     // each whole node's modes, beside the cells' network
-                    var modeEps = lp.modeEps
+                    var modeEps = newPictureAnalysis?.modeEps ?? lp.modeEps
                     e.setComputePipelineState(encoder.mlMode)
                     e.setBuffer(stats, offset: 0, index: 3)
                     e.setBuffer(modeWeights, offset: 0, index: 5)
@@ -1393,7 +1421,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                         e.dispatchThreads(g, threadsPerThreadgroup: t)
                     }
                 }
-                var eps = lp.eps
+                var eps = newPictureAnalysis?.eps ?? lp.eps
                 e.setComputePipelineState(encoder.mlCell)
                 e.setBytes(mlBases, length: 16, index: 4)
                 e.setBuffer(weights, offset: 0, index: 5)

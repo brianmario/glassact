@@ -730,3 +730,76 @@ extension HybridEncoderTests {
         #expect(Int(alone.params.base_q_idx) == keyQindex, "\(label): a picture alone at qindex \(alone.params.base_q_idx)")
     }
 }
+
+extension HybridEncoderTests {
+    /// `newPictureEffort`: a stream of a scene whose photo drifts, broken twice by three pictures
+    /// of stripes (each new), takes the fast levers (no motion search, no tx type search, no RDOQ,
+    /// no 4x4s, looser learned pruning) and a coarser qindex in the first two mostly-new pictures
+    /// of each run (`runLimit`) and in no other, the levers switched frame by frame; libaom decodes
+    /// the stream in order to exactly the pictures the encoder reports. An effort that changes
+    /// nothing codes the stream without one, byte for byte.
+    @available(macOS 27, *)
+    @Test func newPictureEffortMixesFastAndNormalPicturesExactly() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 384)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0xfa57_9e3)
+        let stripes: Set = [5, 6, 7, 11, 12, 13]
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<16 {
+            var y = base.y
+            if stripes.contains(i) {
+                let levels = (0..<width).map { _ in UInt8(rng.int(0..<256)) }
+                for k in y.indices { y[k] = levels[k % width] }
+            } else {
+                for r in 100..<300 {
+                    for c in 64..<448 {
+                        let (u0, v0) = (c + 3 * i, r + i)
+                        y[r * width + c] = UInt8(clamping: 60 + 2 * i + (u0 * 7 + v0 * 3) % 50 + ((u0 / 9 + v0 / 7) % 3) * 20)
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        func make(_ effort: AV1HybridEncoder.NewPictureEffort?) throws -> AV1HybridEncoder {
+            let encoder = try AV1HybridEncoder(device: device)
+            encoder.tiling = (1, 1)
+            encoder.interFrames = true
+            encoder.newPictureEffort = effort
+            return encoder
+        }
+        let qindex = 100
+        var effort = AV1HybridEncoder.NewPictureEffort(
+            qindexDelta: 24, searchesMotion: false, searchesTxTypes: false, usesRDOQ: false,
+            analysis: .init(shapeMask: 0x1248, eps: 0.1, modeEps: 0.1))
+        effort.runLimit = 2
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        var fast: [Int] = []
+        try make(effort).encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            let t = f.timing
+            if t.fast { fast.append(i) }
+            if i > 0 {
+                #expect(Int(f.params.base_q_idx) == (t.fast ? qindex + 24 : qindex), "frame \(i): qindex \(f.params.base_q_idx)")
+                if t.fast { #expect(!t.searchedMotion && t.searched == 0, "frame \(i): searched for motion") }
+            }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        // each run of stripes: its first two pictures (the third is past `runLimit`)
+        #expect(fast == [5, 6, 11, 12], "fast pictures \(fast)")
+        var plain: [[UInt8]] = [], neutral: [[UInt8]] = []
+        try make(nil).encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { _, f in plain.append(f.obu) })
+        try make(AV1HybridEncoder.NewPictureEffort()).encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] },
+                                                               output: { _, f in neutral.append(f.obu) })
+        #expect(neutral == plain, "an effort that changes nothing changed the stream")
+    }
+}

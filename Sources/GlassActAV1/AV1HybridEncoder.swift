@@ -85,6 +85,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var intraCopied = 0.0
         /// From the picture's partition being ready to its bitstream.
         public var wall = 0.0
+        /// The frame took `newPictureEffort` (an inter frame coding more than half its 64×64s).
+        public var fast = false
+        /// The frame's qindex (with `newPictureEffort`'s offset where it took it).
+        public var qindex = 0
     }
 
     /// An encoded picture.
@@ -335,6 +339,63 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.newPictureShapeMask = newValue }
     }
 
+    /// A mostly-new picture coded fast, paying in quality rather than in bytes (BENCHMARKS "a
+    /// mostly-new picture coded fast"): an inter frame coding more than half its 64×64s
+    /// (`AV1MetalEncoder.interGateOverShare`: the share `newPictureShapeMask` and the inter gate
+    /// follow) takes these levers, each in place of the encoder's own setting for that picture,
+    /// and is coded at qindex + `qindexDelta`, so that it spends no more bytes than the default
+    /// would have. Glass Act settles static content to lossless tiles after the video layer, so
+    /// such a picture arriving a little soft is repaired within moments; its time is what's dear.
+    /// Key frames and the other inter frames are coded as without it. Nil (the default): off.
+    public struct NewPictureEffort: Sendable, Equatable {
+        /// The picture's qindex against the stream's (positive: coarser), clamped to 1…255.
+        public var qindexDelta = 0
+        /// Search the coded 64×64s for motion (false: copies only, as `searchesMotion` off).
+        public var searchesMotion = true
+        /// The closed loop's luma tx type search (false: DCT_DCT, as `searchesTxTypes` off).
+        public var searchesTxTypes = true
+        /// RDOQ (false: the dead-zone quantizer's levels, as `usesRDOQ` off).
+        public var usesRDOQ = true
+        /// With `usesRDOQ`: the fewest coefficients a tx block's RDOQ needs (nil: `rdoqMinCoefficients`).
+        public var rdoqMinCoefficients: Int?
+        /// The analysis's shapes, learned pruning's level and mode eps (nil: the encoder's).
+        public var analysis = AV1MetalEncoder.NewPictureAnalysis()
+        /// Only the first this many mostly-new pictures in a row (nil: every one). A screen switch
+        /// is one mostly-new picture after quiet ones, which the next pictures copy and the tiles
+        /// settle; video or scrolling new images make every picture mostly new, and their softness
+        /// would last as long as the motion does.
+        public var runLimit: Int?
+        /// The measured levels (nil above the last): 1 the cheapest in quality, higher faster.
+        public static func level(_ n: Int) -> NewPictureEffort? {
+            switch n {
+            case 0: return NewPictureEffort()
+            default: return nil
+            }
+        }
+        public init(qindexDelta: Int = 0, searchesMotion: Bool = true, searchesTxTypes: Bool = true, usesRDOQ: Bool = true,
+                    rdoqMinCoefficients: Int? = nil, analysis: AV1MetalEncoder.NewPictureAnalysis = .init()) {
+            (self.qindexDelta, self.searchesMotion, self.searchesTxTypes) = (qindexDelta, searchesMotion, searchesTxTypes)
+            (self.usesRDOQ, self.rdoqMinCoefficients, self.analysis) = (usesRDOQ, rdoqMinCoefficients, analysis)
+        }
+    }
+    /// See `NewPictureEffort` (nil: off, the default).
+    public var newPictureEffort: NewPictureEffort?
+
+    /// Whether an inter frame with these copies takes `newPictureEffort`, given `run`: the
+    /// mostly-new pictures in a row before it (counted here, in the stream's order).
+    private func takesEffort(_ copies: Copies, run: inout Int) -> Bool {
+        guard interFrames, let effort = newPictureEffort, let skip = copies.skip else {
+            run = 0
+            return false
+        }
+        guard Double(skip.count(where: { $0 == 0 })) > metal.interGateOverShare * Double(max(1, skip.count)) else {
+            run = 0
+            return false
+        }
+        run += 1
+        return effort.runLimit.map { run <= $0 } ?? true
+    }
+
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false
 
@@ -563,9 +624,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         // `motionSkip`: picture i + 2's search is decided once picture i's analysis is read
         var rule = MotionRule()
+        // `newPictureEffort`: the mostly-new inter frames in a row so far
+        var newRun = 0
         // picture i's qindex: a key frame's for the first, or every one without inter frames
         let keyQindex = keyFrameQindex(qindex)
-        func qindexOf(_ i: Int) -> Int { interFrames && i > 0 ? qindex : keyQindex }
+        func qindexOf(_ i: Int, fast: Bool = false) -> Int {
+            guard interFrames && i > 0 else { return keyQindex }
+            guard fast, let d = newPictureEffort?.qindexDelta, d != 0, qindex > 0 else { return qindex }
+            return min(255, max(1, qindex + d))
+        }
         var current = try picture(0)
         var pending = try begin(current, Copies(), qindex: keyQindex)
         read(&pending, of: current, after: nil)
@@ -580,10 +647,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
             var copies = interFrames ? copyFinder.wait() : Copies()
             if interFrames { rule.decide(1, &copies, rule: motionSkip, lookback: motionSkipLookback) }
-            let q = qindexOf(1)
+            let fast = takesEffort(copies, run: &newRun)
+            let q = qindexOf(1, fast: fast)
+            if fast, newPictureEffort?.searchesMotion == false { copies.candidates = nil }
             let first = pending.read
             starting = Later { [copies] in
-                var p = try self.begin(next, copies, qindex: q)
+                var p = try self.begin(next, copies, qindex: q, fast: fast)
                 self.read(&p, of: next, after: first)
                 return p
             }
@@ -609,10 +678,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     var copies = interFrames ? copyFinder.wait() : Copies()
                     if interFrames { rule.decide(i + 2, &copies, rule: motionSkip, lookback: motionSkipLookback) }
                     let before = starting
-                    let q = qindexOf(i + 2), g = gate(i + 2)
+                    let fast = takesEffort(copies, run: &newRun)
+                    if fast, newPictureEffort?.searchesMotion == false { copies.candidates = nil }
+                    let q = qindexOf(i + 2, fast: fast), g = gate(i + 2)
                     following = Later { [copies] in
                         let previous = try before?.wait()
-                        var p = try self.begin(up, copies, qindex: q, after: g)
+                        var p = try self.begin(up, copies, qindex: q, after: g, fast: fast)
                         self.read(&p, of: up, after: previous?.read)
                         return p
                     }
@@ -626,6 +697,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
                 timing.motion = pending.motionSeconds
                 timing.motionFound = found
+                timing.fast = pending.fast
+                timing.qindex = pending.qindex
                 let motion = pending.motion
                 // picture i - 1's write runs beside this closed loop; finish takes it back before
                 // picture i's write begins (until then `writing` holds it, for the defer)
@@ -636,7 +709,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 }
                 let (w, ended) = try finish(current, partition: partition, applied: got.applied, motion: motion,
                                             searchesMotion: pending.searchesMotion,
-                                            refs: pending.refs, qindex: qindexOf(i),
+                                            refs: pending.refs, qindex: pending.qindex, fast: pending.fast,
                                             qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
                                             written: onWritten)
                 writing = w
@@ -862,6 +935,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var hashes: IbcHashes? = nil
         /// An inter frame's reference slots (nil: a key frame or a still picture).
         var refs: Refs? = nil
+        /// The picture's qindex, and whether it takes `newPictureEffort`.
+        var qindex = 0
+        var fast = false
     }
 
     /// An inter frame's reference slots: LAST_FRAME's, GOLDEN_FRAME's + 1 (0: none), the slots it
@@ -1095,7 +1171,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
     /// Starts picture `p`'s analysis, without its copies; its GPU work waits for `gate` to reach
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
-    private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0) throws -> Pending {
+    private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
+        let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         let partition = try p.y.withUnsafeBufferPointer { y in
@@ -1103,7 +1180,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
-                                             motion: copies.candidates, sbQindex: qmap, after: gateValue)
+                                             motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort)
                 }
             }
         }
@@ -1115,12 +1192,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             hashes = h
         }
         return Pending(partition: partition, motion: copies.motion, searchesMotion: copies.candidates != nil,
-                       motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs)
+                       motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs, qindex: qindex, fast: fast)
     }
 
     private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, applied pre: Applied? = nil, motion sbMotionIn: [Int32]?,
                         searchesMotion: Bool,
-                        refs: Refs?, qindex: Int,
+                        refs: Refs?, qindex: Int, fast: Bool = false,
                         qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double, writingBefore: Writing?,
                         written: (@Sendable (Frame) -> Void)?) throws -> (Writing, Frame?) {
         var timing = timing
@@ -1216,6 +1293,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let swapsOut = refs.map { $0.swaps } == true && reference != nil
         let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && !aliased
             ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
+        // `newPictureEffort`'s closed-loop levers, for this picture's closed loop only
+        let effort = fast ? newPictureEffort : nil
+        if let effort {
+            av1enc_hybrid_set_tx_search(cpu, effort.searchesTxTypes && searchesTxTypes ? 1 : 0, effort.searchesTxTypes && searchesTxTypes ? 1 : 0)
+            av1enc_hybrid_set_rdoq(cpu, effort.usesRDOQ && usesRDOQ ? 1 : 0, rdoqInTrials ? 1 : 0, Int32(rdoqMinRange),
+                                   Int32(effort.rdoqMinCoefficients ?? rdoqMinCoefficients))
+        }
         Self.trace("closed loop start")
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
@@ -1241,6 +1325,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     }
                 }
             }
+        }
+        if effort != nil {
+            av1enc_hybrid_set_tx_search(cpu, searchesTxTypes ? 1 : 0, searchesTxTypes ? 1 : 0)
+            applyRDOQ()
         }
         guard rc == AV1G_OK, let record = av1enc_hybrid_record(cpu) else {
             throw Failure.encode("closed loop (\(rc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
