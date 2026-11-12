@@ -50,8 +50,10 @@ pub(crate) struct Work {
     /// whether RDOQ applies to this tx block (its source spans [`QuantHook::rdoq_range`]), once
     /// asked ([`QuantHook::rdoq_here`]): 0 not yet, 1 no, 2 yes
     rdoq_here: u8,
-    /// the residual's energy (sum of squares), with [`QuantHook::td_dist`]
+    /// the residual's energy (sum of squares; not with `double_fwd`)
     energy: u64,
+    /// the source block's smallest and largest values (not with `double_fwd`)
+    span: (u8, u8),
     /// the residual's first forward products, shared by the types a search tries
     s1: Stage1Cache,
     /// RDOQ's level map
@@ -82,6 +84,7 @@ impl Scratch {
                 rr: vec![0; 64 * 64],
                 rdoq_here: 0,
                 energy: 0,
+                span: (0, 0),
                 s1: Stage1Cache::default(),
                 lev: Box::new([0; rdoq::LEV]),
             },
@@ -275,9 +278,16 @@ impl<'a> QuantHook<'a> {
     fn rdoq_here(&self, w: &mut Work, s: &[u8], ss: usize, tx_sz: i32) -> bool {
         if w.rdoq_here == 0 {
             let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
+            let spans = || {
+                if self.o.double_fwd {
+                    spans(s, ss, tw, th, self.rdoq_range)
+                } else {
+                    w.span.1.saturating_sub(w.span.0) >= self.rdoq_range
+                }
+            };
             let on = self.rdoq.is_some()
                 && tw * th >= self.rdoq_min_coeffs as usize
-                && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
+                && (self.rdoq_range == 0 || spans());
             w.rdoq_here = 1 + on as u8;
         }
         w.rdoq_here == 2
@@ -304,6 +314,88 @@ fn spans(s: &[u8], ss: usize, tw: usize, th: usize, min_range: u8) -> bool {
         }
     }
     hi.saturating_sub(lo) >= min_range
+}
+
+/// The residual s - p of a tw x th block (tw a multiple of 4) as floats, rows of tw, into `out`;
+/// returns its energy (at most 64 x 64 x 255^2 < 2^28: a u32 sum) and the source's smallest and
+/// largest values (RDOQ's span check). One pass over the source and the prediction.
+#[inline]
+fn residual_f(s: &[u8], ss: usize, p: &[u8], ps: usize, tw: usize, th: usize, out: &mut [f32]) -> (u32, u8, u8) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        residual_f_neon(s, ss, p, ps, tw, th, out)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        residual_f_scalar(s, ss, p, ps, tw, th, out)
+    }
+}
+
+/// [`residual_f`]'s scalar reference (and the path off aarch64).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn residual_f_scalar(s: &[u8], ss: usize, p: &[u8], ps: usize, tw: usize, th: usize, out: &mut [f32]) -> (u32, u8, u8) {
+    let (mut e, mut lo, mut hi) = (0u32, 255u8, 0u8);
+    for i in 0..th {
+        let (sr, p, d) = (&s[i * ss..][..tw], &p[i * ps..][..tw], &mut out[i * tw..][..tw]);
+        for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
+            let v = s as i32 - p as i32;
+            e += (v * v) as u32;
+            *d = v as f32;
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+    }
+    (e, lo, hi)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn residual_f_neon(s: &[u8], ss: usize, p: &[u8], ps: usize, tw: usize, th: usize, out: &mut [f32]) -> (u32, u8, u8) {
+    use core::arch::aarch64::*;
+    // 8 samples: their residual into `d` as floats; squares into `acc`, the source into lo / hi
+    #[inline(always)]
+    fn eight(sv: uint8x8_t, pv: uint8x8_t, d: &mut [f32], acc: &mut int32x4_t, lo: &mut uint8x8_t, hi: &mut uint8x8_t) {
+        let d = &mut d[..8];
+        // SAFETY: NEON is part of the aarch64 baseline; `d` holds 8 floats.
+        unsafe {
+            let r = vreinterpretq_s16_u16(vsubl_u8(sv, pv));
+            let (rl, rh) = (vget_low_s16(r), vget_high_s16(r));
+            *acc = vmlal_s16(vmlal_s16(*acc, rl, rl), rh, rh);
+            vst1q_f32(d.as_mut_ptr(), vcvtq_f32_s32(vmovl_s16(rl)));
+            vst1q_f32(d.as_mut_ptr().add(4), vcvtq_f32_s32(vmovl_s16(rh)));
+            *lo = vmin_u8(*lo, sv);
+            *hi = vmax_u8(*hi, sv);
+        }
+    }
+    // SAFETY: NEON is part of the aarch64 baseline.
+    let (mut acc, mut lo, mut hi) = unsafe { (vdupq_n_s32(0), vdup_n_u8(255), vdup_n_u8(0)) };
+    if tw == 4 {
+        // two rows a vector (every tx size 4 wide is 4, 8 or 16 high)
+        let row = |b: &[u8], st: usize, i: usize| u32::from_le_bytes(b[i * st..][..4].try_into().unwrap()) as u64;
+        for i in (0..th).step_by(2) {
+            // SAFETY: NEON is part of the aarch64 baseline; vcreate_u8 puts the low byte in lane 0.
+            let (sv, pv) = unsafe {
+                (
+                    vcreate_u8(row(s, ss, i) | row(s, ss, i + 1) << 32),
+                    vcreate_u8(row(p, ps, i) | row(p, ps, i + 1) << 32),
+                )
+            };
+            eight(sv, pv, &mut out[i * 4..], &mut acc, &mut lo, &mut hi);
+        }
+    } else {
+        for i in 0..th {
+            let (sr, pr) = (&s[i * ss..][..tw], &p[i * ps..][..tw]);
+            for c in (0..tw).step_by(8) {
+                let (sx, px): (&[u8; 8], &[u8; 8]) =
+                    (sr[c..c + 8].try_into().unwrap(), pr[c..c + 8].try_into().unwrap());
+                // SAFETY: NEON is part of the aarch64 baseline; 8 bytes each.
+                let (sv, pv) = unsafe { (vld1_u8(sx.as_ptr()), vld1_u8(px.as_ptr())) };
+                eight(sv, pv, &mut out[i * tw + c..], &mut acc, &mut lo, &mut hi);
+            }
+        }
+    }
+    // SAFETY: NEON is part of the aarch64 baseline. (A 4-wide block's two rows: all 8 lanes are
+    // samples.)
+    unsafe { (vaddvq_s32(acc) as u32, vminv_u8(lo), vmaxv_u8(hi)) }
 }
 
 fn qcoef(v: f64, rnd: f64, zbin: f64) -> i16 {
@@ -596,22 +688,29 @@ impl QuantHook<'_> {
         tw: usize,
         th: usize,
         ac_q: i32,
+        energy: u64,
     ) {
         if q.iter().all(|&c| c == 0) {
             return;
         }
         let lambda = 0.12 * (ac_q as f64 / 8.0) * (ac_q as f64 / 8.0);
-        let mut sse = 0u64;
-        for i in 0..th {
-            sse += pred[i * ps..][..tw]
-                .iter()
-                .zip(&s[i * ss..][..tw])
-                .map(|(&p, &v)| {
-                    let d = v as i32 - p as i32;
-                    (d * d) as u64
-                })
-                .sum::<u64>();
-        }
+        // (the prediction's error is the residual's energy, where on_txb summed it)
+        let sse = if !self.o.double_fwd {
+            energy
+        } else {
+            let mut sse = 0u64;
+            for i in 0..th {
+                sse += pred[i * ps..][..tw]
+                    .iter()
+                    .zip(&s[i * ss..][..tw])
+                    .map(|(&p, &v)| {
+                        let d = v as i32 - p as i32;
+                        (d * d) as u64
+                    })
+                    .sum::<u64>();
+            }
+            sse
+        };
         if fmac(lambda, 1.0, sse as f64) <= j {
             q.fill(0);
         }
@@ -642,17 +741,9 @@ impl TxbHook for QuantHook<'_> {
                 }
             }
         } else {
-            // (at most 64 x 64 x 255^2 < 2^28: a u32 sum, which vectorizes without widening)
-            let mut e = 0u32;
-            for i in 0..th {
-                let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resf[i * tw..][..tw]);
-                for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
-                    let v = s as i32 - p as i32;
-                    e += (v * v) as u32;
-                    *d = v as f32;
-                }
-            }
+            let (e, lo, hi) = residual_f(s, ss, pred, ps, tw, th, &mut w.resf);
             w.energy = e as u64;
+            w.span = (lo, hi);
             w.s1.reset();
         }
         w.rdoq_here = 0;
@@ -678,7 +769,7 @@ impl TxbHook for QuantHook<'_> {
             );
             self.optimize(w, coeffs, s, ss, tx_sz, ty, plane, dc_q, ac_q, qm_level, lam, false);
             if rd_skip {
-                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q, w.energy);
             }
             return;
         }
@@ -711,7 +802,7 @@ impl TxbHook for QuantHook<'_> {
             self.collect_sample(w, tw, th, ac_q, true, best_type, tx_sz);
             self.optimize(w, coeffs, s, ss, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
             if rd_skip {
-                self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+                self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q, w.energy);
             }
             return;
         }
@@ -723,7 +814,7 @@ impl TxbHook for QuantHook<'_> {
             );
             self.optimize(w, coeffs, s, ss, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, rd_skip);
             if rd_skip {
-                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
+                self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q, w.energy);
             }
             return;
         }
@@ -854,6 +945,42 @@ mod tests {
         }
     }
 
+    /// residual_f (NEON) gives the scalar reference's residual, energy and span, for every tx size
+    /// at random strides and contents (flat to full range).
+    #[test]
+    fn residual_matches_the_reference() {
+        let mut r = 0x7f4a_7c15u32;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        let (mut a, mut b) = (vec![0f32; 64 * 64], vec![0f32; 64 * 64]);
+        for case in 0..20_000 {
+            let tx = (next() % TX_SIZES_ALL as u32) as i32;
+            let (tw, th) = (tx_w(tx) as usize, tx_h(tx) as usize);
+            let (ss, ps) = (tw + (next() % 70) as usize, tw + (next() % 70) as usize);
+            let (base, amp) = ((next() % 256) as i32, 1 + next() % 256);
+            let mut px = |n: usize| -> Vec<u8> {
+                (0..n)
+                    .map(|_| (base + (next() % amp) as i32 - amp as i32 / 2).clamp(0, 255) as u8)
+                    .collect()
+            };
+            let (s, p) = (px(ss * (th - 1) + tw), px(ps * (th - 1) + tw));
+            let x = residual_f(&s, ss, &p, ps, tw, th, &mut a);
+            let y = residual_f_scalar(&s, ss, &p, ps, tw, th, &mut b);
+            assert_eq!(x, y, "case {case} tx {tx}");
+            assert!(
+                a[..tw * th]
+                    .iter()
+                    .zip(&b[..tw * th])
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "case {case} tx {tx}"
+            );
+        }
+    }
+
     /// td_taken's grouped sum is bit for bit the coded coefficients' one by one, on quantized
     /// residuals of every density (and -0 coefficients).
     #[test]
@@ -935,6 +1062,29 @@ mod tests {
                 want.to_bits(),
                 "case {case} tx {tx} type {ty}"
             );
+        }
+    }
+
+    /// residual_f against its scalar reference, per tx size (`--ignored`).
+    #[test]
+    #[ignore]
+    fn bench_residual() {
+        let s: Vec<u8> = (0..128 * 64).map(|i| (i * 37 % 251) as u8).collect();
+        let p: Vec<u8> = (0..128 * 64).map(|i| (i * 53 % 241) as u8).collect();
+        let mut out = vec![0f32; 64 * 64];
+        for (name, tx) in [("4x4", TX_4X4), ("8x8", TX_8X8), ("16x16", TX_16X16), ("32x32", TX_32X32), ("4x16", TX_4X16)] {
+            let (tw, th) = (tx_w(tx) as usize, tx_h(tx) as usize);
+            let iters = 20_000_000 / (tw * th);
+            for (which, f) in [
+                ("scalar", residual_f_scalar as fn(&[u8], usize, &[u8], usize, usize, usize, &mut [f32]) -> (u32, u8, u8)),
+                ("new", residual_f),
+            ] {
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    std::hint::black_box(f(&s[i % 7..], 128, &p, 128, tw, th, &mut out));
+                }
+                println!("{name} {which}: {:.1} ns", t.elapsed().as_nanos() as f64 / iters as f64);
+            }
         }
     }
 
