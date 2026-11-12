@@ -171,8 +171,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     private static func runForwardMMACheck(device: any MTLDevice, library: any MTLLibrary, forceMismatch: Bool) throws -> Bool {
         let matrices = try makeForwardMatrices(device: device, library: library)
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no queue for k_fwd_mma_check") }
-        // (size, threads a block: as k_analysis runs it)
-        for (w, threads) in [(16, 32), (32, 128), (64, 128)] {
+        // (size, threads a block: as k_analysis runs it; 64x64's RD on the first 128 of its 256)
+        for (w, threads) in [(16, 32), (32, 128), (64, 256)] {
             guard let function = library.makeFunction(name: "k_fwd_mma_check_\(w)") else { throw Failure.metal("no k_fwd_mma_check_\(w)") }
             let pipeline = try Self.pipeline(function, threads: threads, device: device)
             let blocks = 96, area = w * w, n = blocks * area, outputs = blocks * min(w, 32) * min(w, 32)

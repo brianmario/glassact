@@ -12,6 +12,14 @@
 // more for the big shapes, k_analysis): NT > 32 syncs with threadgroup barriers and reduces
 // through `red` / `redi` (NT / 32 entries of threadgroup memory), the SIMD-groups' partials summed
 // in a fixed order. NT == 32 is the SIMD-group code as it was.
+//
+// A block may run on more threads than NT (k_analysis's NTS) where only part of its work wants
+// them: the others take ga_idle_lane's lane, past every loop's end (no shape has GA_IDLE_LANE
+// items), and so reach the same barriers, keep out of the reductions' partials (tid < NT) and
+// of the matrix units' tiles (warp_fwd_mma), and read the same results.
+#define GA_IDLE_LANE (1 << 20)
+template <int NT>
+static inline int ga_idle_lane(int t) { return t < NT ? t : GA_IDLE_LANE + t; }
 template <int NT>
 __device__ __forceinline__ void ga_sync() {
     if (NT > 32) threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -22,7 +30,7 @@ __device__ __forceinline__ float ga_sum(float v, int tid, float *red) {
     v = warp_sum(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);  // (red free)
-    if ((tid & 31) == 0) red[tid >> 5] = v;
+    if ((tid & 31) == 0 && tid < NT) red[tid >> 5] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float t = 0.f;
     for (int w = 0; w < NT / 32; w++) t += red[w];
@@ -33,7 +41,7 @@ __device__ __forceinline__ uint ga_sumu(uint v, int tid, int *redi) {
     v = simd_sum(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if ((tid & 31) == 0) redi[tid >> 5] = (int)v;
+    if ((tid & 31) == 0 && tid < NT) redi[tid >> 5] = (int)v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint t = 0;
     for (int w = 0; w < NT / 32; w++) t += (uint)redi[w];
@@ -44,7 +52,7 @@ __device__ __forceinline__ int ga_max(int v, int tid, int *redi) {
     v = warp_max(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if ((tid & 31) == 0) redi[tid >> 5] = v;
+    if ((tid & 31) == 0 && tid < NT) redi[tid >> 5] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     int t = redi[0];
     for (int w = 1; w < NT / 32; w++) t = max(t, redi[w]);
@@ -455,6 +463,7 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
     // a SIMD-group's tiles (column pass, row pass); (at least 1 so that the unused shapes compile)
     constexpr int T1 = RT * CT / NS > 0 ? RT * CT / NS : 1, T2 = RT * RT / NS > 0 ? RT * RT / NS : 1;
     const int sg = lane / 32;
+    const bool sgOn = sg < NS;  // (an idle SIMD-group: no tiles; it keeps to the barriers)
     simdgroup_float8x8 acc[T1];
 #pragma unroll
     for (int u = 0; u < T1; u++) acc[u] = simdgroup_float8x8(0.f);
@@ -464,7 +473,7 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
         for (int p = lane; p < th * W; p += NT) tmp[(p / W) * TS + p % W] = (float)res[(c0 + p / W) * W + p % W];
         ga_sync<NT>();
 #pragma unroll
-        for (int u = 0; u < T1; u++) {
+        for (int u = 0; u < T1 && sgOn; u++) {
             const int t = sg * T1 + u, ti = t / CT, tj = t % CT;
             for (int kb = 0; kb < th; kb += 8) {
                 simdgroup_float8x8 a, b;
@@ -476,7 +485,7 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
     }
     ga_sync<NT>();
 #pragma unroll
-    for (int u = 0; u < T1; u++) {
+    for (int u = 0; u < T1 && sgOn; u++) {
         const int t = sg * T1 + u;
         simdgroup_store(acc[u], tmp, TS, ulong2((t % CT) * 8, (t / CT) * 8));
     }
@@ -484,7 +493,7 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
     // row pass: out(th x th) = tmp(th x W) * F^T(W x th)
     simdgroup_float8x8 o[T2];
 #pragma unroll
-    for (int u = 0; u < T2; u++) {
+    for (int u = 0; u < T2 && sgOn; u++) {
         o[u] = simdgroup_float8x8(0.f);
         const int t = sg * T2 + u, ti = t / RT, tj = t % RT;
         for (int kb = 0; kb < W; kb += 8) {
@@ -496,7 +505,7 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
     }
     ga_sync<NT>();
 #pragma unroll
-    for (int u = 0; u < T2; u++) {
+    for (int u = 0; u < T2 && sgOn; u++) {
         const int t = sg * T2 + u;
         simdgroup_store(o[u], tmp, TS, ulong2((t % RT) * 8, (t / RT) * 8));
     }

@@ -230,11 +230,14 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
 
 // residual of candidate c into res (W x H), returns sum r^2 (all lanes).  With the intra edge filter,
 // directional candidates use edges prepared by lane 0 into pa/pl (filter type 0: neighbour modes unknown).
-template <int W, int H, int NT = 32>
+// Glass Act: NTS > NT (k_analysis's screening threads, tsc each): the residual on all NTS, then
+// the sum of squares read back from res by the first NT, each over the samples and in the order
+// it would have computed them (p = lane, lane + NT, ...): the same float sum.
+template <int W, int H, int NT = 32, int NTS = NT>
 __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c, int16_t *res, const uint8_t *A,
                                                const uint8_t *L, int dcv, int lane, uint8_t *pa = nullptr, uint8_t *pl = nullptr,
                                                int *up = nullptr, int edgeFilter = 0, int haveL = 0, int haveA = 0, int x = 0,
-                                               int y = 0, int maxX = 0, int maxY = 0, float *red = nullptr) {
+                                               int y = 0, int maxX = 0, int maxY = 0, float *red = nullptr, int tsc = 0) {
     typedef TxD<W, H> T;
     const int m = cand_mode(c);
     const bool ef = edgeFilter && av1g_is_directional(m);
@@ -248,6 +251,21 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
     }
     const PredCand pc = pred_cand(c, T::lw, T::lh);
     float e = 0.f;
+    if (NTS != NT) {
+        for (int p = tsc; p < W * H; p += NTS) {
+            const int i = p / W, j = p % W;
+            const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
+                                                   pl + AV1G_EDGE_OFF, up[0], up[1])
+                              : pred_fast(pc, i, j, A, L, dcv);
+            res[p] = (int16_t)((int)src[i * sp + j] - pr);
+        }
+        ga_sync<NT>();
+        for (int p = lane; p < W * H; p += NT) {
+            const int r = res[p];
+            e += (float)(r * r);
+        }
+        return ga_sum<NT>(e, lane, red);
+    }
     for (int p = lane; p < W * H; p += NT) {
         const int i = p / W, j = p % W;
         const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
@@ -277,14 +295,18 @@ static inline void ga_merge_inter(device GpBlockRes &out, device GpInterRes *ir,
 }
 
 // NT: threads to a block (32, or more for the big shapes, which then take one block a threadgroup)
-template <int W, int H, int BS, int NW, int NT = 32>
+// NTS: the threads a block screens on (NT, or 2 NT: 64x64), the rest of its work on the first NT;
+// the others (ga_idle_lane) follow its every barrier and reduction without a part in them
+template <int W, int H, int BS, int NW, int NT = 32, int NTS = NT>
 kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                        constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],
                        uint blockIdx_x [[threadgroup_position_in_grid]],
                        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     typedef TxD<W, H> T;
     threadgroup ASmem<W, H> smem[NW];
-    const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;  // the block's slot, its thread
+    static_assert(NTS == NT || (NW == 1 && NTS == 2 * NT && NT >= 64), "screening on more threads: one block a threadgroup");
+    const int warp = (int)threadIdx_x / NTS, tsc = (int)threadIdx_x % NTS;  // the block's slot, its screening thread
+    const int lane = ga_idle_lane<NT>(tsc);  // its thread in the rest
     threadgroup ASmem<W, H> &S = smem[warp];
     threadgroup uint8_t *A = S.ea + AV1G_EDGE_OFF, *L = S.el + AV1G_EDGE_OFF;
     device const uint32_t *starts = B.shImgStart + (size_t)BS * (B.nimg + 1);
@@ -360,7 +382,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 continue;
             }
         }
-        build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, lane, NT);
+        build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, tsc, NTS);  // (integers: any threads)
         ga_sync<NT>();
         if (lane == 0) S.dcv = av1g_dc_value(A, L, haveLeft, haveAbove, T::lw, T::lh);
         ga_sync<NT>();
@@ -372,10 +394,10 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         {
             const uint8_t v = src[0];
             int bad = 0;
-            for (int p = lane; p < W * H; p += NT) bad |= src[(p / W) * sp + p % W] != v;
-            for (int i = lane - 1; i < W + H; i += NT) bad |= A[i] != v;
-            for (int i = lane; i < W + H; i += NT) bad |= L[i] != v;
-            flat = ga_max<NT>(bad, lane, S.redi) == 0;
+            for (int p = tsc; p < W * H; p += NTS) bad |= src[(p / W) * sp + p % W] != v;
+            for (int i = tsc - 1; i < W + H; i += NTS) bad |= A[i] != v;
+            for (int i = tsc; i < W + H; i += NTS) bad |= L[i] != v;
+            flat = ga_max<NTS>(bad, tsc, S.redi) == 0;
         }
         device const GpExtCand *ext = ga_fixed ? nullptr : (device const GpExtCand *)B.extCand[BS];
         int K = ga_fixed ? 1 : min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
@@ -410,7 +432,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
         int ncand = (int)popcount(mm);
-        if (!flat) warp_screen<W, H, NT>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, lane, ssub);
+        if (!flat) warp_screen<W, H, NTS>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, tsc, ssub);
         // (angle deltas read S.satd by mode: only with every mode screened)
         const bool allowDelta = P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
         if (allowDelta) {
@@ -429,7 +451,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 S.cand[13 + lane] = cand_pack(m, d);
             }
             ga_sync<NT>();
-            if (!flat) warp_screen<W, H, NT>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, lane, ssub);
+            if (!flat) warp_screen<W, H, NTS>(src, sp, S.cand, 13, 25, S.satd, A, L, dcv, tsc, ssub);
             ncand = 25;
         }
         // ---- top-K by screening cost (every lane computes the same selection) ----
@@ -465,7 +487,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 if (J < bestJ) { bestJ = J; bestK = k; }
                 continue;
             }
-            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, paOf(S), plOf(S), S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            e.resEnergy = warp_residual<W, H, NT, NTS>(src, sp, c, S.res, A, L, dcv, lane, paOf(S), plOf(S), S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red, tsc);
             // Glass Act: a prediction that is exact (common on screens: stripes, a repeated row or
             // column) leaves nothing to transform: no distortion and an all-zero block's bits,
             // which is what the transform and the quantizer would arrive at
@@ -483,7 +505,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             // matrix read from device memory. With a threadgroup copy of it 16x16 and 64x64 were
             // slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
             if (ga_mma && W == H && W >= 16) {
-                warp_fwd_mma<W, NT>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(T::lw), g_txScale[txSz], lane);
+                warp_fwd_mma<W, NTS>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(T::lw), g_txScale[txSz], tsc);
                 warp_quant_rate_rt<NT>(S.tmp, qOf(S), e, o, W, H, lane, S.red, S.redi);
             } else
 #endif

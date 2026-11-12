@@ -17,7 +17,8 @@
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
     static_assert(NWS <= GA_AN_NW(W, H), "k_analysis_" #W "x" #H ": its NW warps' scratch must fit");
 
-// A block on NT threads (one block a threadgroup): k_analysis_<W>x<H>_w1t<NT>
+// A block on NT threads (one block a threadgroup): k_analysis_<W>x<H>_w1t<NT>; with GA_ANALYSIS_TS,
+// its screening on NTS threads, the threadgroup's (k_analysis_<W>x<H>_w1t<NTS>), the rest on NT
 #define GA_ANALYSIS_T(W, H, BS, NT)                                                                         \
     template [[host_name("k_analysis_" #W "x" #H "_w1t" #NT)]] kernel void k_analysis<W, H, BS, 1, NT>(     \
         constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
@@ -26,12 +27,21 @@
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
     static_assert(sizeof(ASmem<W, H>) <= 32768, "k_analysis_" #W "x" #H ": its scratch must fit");
 
+#define GA_ANALYSIS_TS(W, H, BS, NT, NTS)                                                                   \
+    template [[host_name("k_analysis_" #W "x" #H "_w1t" #NTS)]] kernel void k_analysis<W, H, BS, 1, NT, NTS>( \
+        constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
+        constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],                    \
+        uint blockIdx_x [[threadgroup_position_in_grid]],                                                   \
+        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
+    static_assert(sizeof(ASmem<W, H>) <= 32768, "k_analysis_" #W "x" #H ": its scratch must fit");
+
 // Glass Act: the start-up check of warp_fwd_mma (AV1MetalEncoder.forwardMMAIsExact): a WxW residual
-// a threadgroup of NT (as k_analysis runs the shape: 16x16 a SIMD-group, 32x32 and 64x64 on 128),
-// through the matrix units and through the passes k_analysis otherwise runs (warp_eval's: warp_fwd_rt
-// below 64 points, whose row pass takes the column pass's non-integer outputs, and warp_fwd_ct at
-// 64), both results out as they leave tmp (scaled). have[0] = 1 where the matrix path is compiled.
-template <int W, int NT>
+// a threadgroup of NTM (as k_analysis runs the shape: 16x16 a SIMD-group, 32x32 on 128, 64x64 on 256),
+// through the matrix units and through the passes k_analysis otherwise runs on NT (warp_eval's:
+// warp_fwd_rt below 64 points, whose row pass takes the column pass's non-integer outputs, and
+// warp_fwd_ct at 64, on 128 with the rest idle as in k_analysis), both results out as they leave
+// tmp (scaled). have[0] = 1 where the matrix path is compiled.
+template <int W, int NT, int NTM = NT>
 kernel void k_fwd_mma_check(device const int16_t *res [[buffer(0)]], device float *outMMA [[buffer(1)]],
                             device float *outRef [[buffer(2)]], device uint *have [[buffer(3)]],
                             device const float *fwdM [[buffer(4)]],
@@ -40,27 +50,27 @@ kernel void k_fwd_mma_check(device const int16_t *res [[buffer(0)]], device floa
     constexpr int txSz = W == 16 ? AV1G_TX_16X16 : W == 32 ? AV1G_TX_32X32 : AV1G_TX_64X64;
     threadgroup int16_t r[N];
     threadgroup float tmp[th * TS];
-    const int lane = (int)t;
-    for (int p = lane; p < N; p += NT) r[p] = res[g * N + p];
+    const int tm = (int)t, lane = ga_idle_lane<NT>(tm);
+    for (int p = tm; p < N; p += NTM) r[p] = res[g * N + p];
 #ifdef GA_FWD_MMA
-    ga_sync<NT>();
-    warp_fwd_mma<W, NT>(r, tmp, fwdM + ga_fwd_matrix_offset(lw), g_txScale[txSz], lane);
-    for (int p = lane; p < NO; p += NT) outMMA[g * NO + p] = tmp[(p / th) * TS + p % th];
-    if (g == 0 && lane == 0) have[0] = 1;
+    ga_sync<NTM>();
+    warp_fwd_mma<W, NTM>(r, tmp, fwdM + ga_fwd_matrix_offset(lw), g_txScale[txSz], tm);
+    for (int p = tm; p < NO; p += NTM) outMMA[g * NO + p] = tmp[(p / th) * TS + p % th];
+    if (g == 0 && tm == 0) have[0] = 1;
 #endif
-    ga_sync<NT>();
+    ga_sync<NTM>();
     if (W == 64) warp_fwd_ct<W, W, NT>(r, tmp, txSz, AV1G_DCT_DCT, lane);
     else warp_fwd_rt<NT>(r, tmp, W, W, txSz, AV1G_DCT_DCT, lane);
     for (int p = lane; p < NO; p += NT) outRef[g * NO + p] = tmp[(p / th) * TS + p % th];
 }
-#define GA_MMA_CHECK(W, NT)                                                                                      \
-    template [[host_name("k_fwd_mma_check_" #W)]] kernel void k_fwd_mma_check<W, NT>(                            \
+#define GA_MMA_CHECK(W, NT, NTM)                                                                                 \
+    template [[host_name("k_fwd_mma_check_" #W)]] kernel void k_fwd_mma_check<W, NT, NTM>(                       \
         device const int16_t *res [[buffer(0)]], device float *outMMA [[buffer(1)]], device float *outRef [[buffer(2)]], \
         device uint *have [[buffer(3)]], device const float *fwdM [[buffer(4)]], uint g [[threadgroup_position_in_grid]], \
         uint t [[thread_position_in_threadgroup]]);
-GA_MMA_CHECK(16, 32)
-GA_MMA_CHECK(32, 128)
-GA_MMA_CHECK(64, 128)
+GA_MMA_CHECK(16, 32, 32)
+GA_MMA_CHECK(32, 128, 128)
+GA_MMA_CHECK(64, 128, 256)
 
 // Glass Act: the DCT matrices warp_fwd_mma reads, into a device buffer (dev_tx.h)
 kernel void k_fwd_matrices(device float *out [[buffer(0)]], uint t [[thread_position_in_grid]]) {
@@ -85,7 +95,7 @@ GA_ANALYSIS_T(32, 16, AV1G_BLOCK_32X16, 64)
 GA_ANALYSIS_T(32, 32, AV1G_BLOCK_32X32, 128)
 GA_ANALYSIS(32, 64, AV1G_BLOCK_32X64, 2)
 GA_ANALYSIS(64, 32, AV1G_BLOCK_64X32, 2)
-GA_ANALYSIS_T(64, 64, AV1G_BLOCK_64X64, 128)
+GA_ANALYSIS_TS(64, 64, AV1G_BLOCK_64X64, 128, 256)  // (screening on 256: 5K new picture, see BENCHMARKS)
 GA_ANALYSIS(16, 64, AV1G_BLOCK_16X64, 3)
 GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
 
