@@ -551,9 +551,26 @@ struct GaInterSmem {
     int redi[8];
 };
 
+// Glass Act: k_inter's RD of a DCT_DCT block: warp_eval, with the squares of 16 and up on the matrix
+// units where the analysis has them (ga_mma: the host's start-up check found them bit-identical to
+// the passes warp_eval runs, at the thread counts k_inter runs them on), so the same coefficients
+template <int W, int H, int NT>
+__device__ __forceinline__ void ga_inter_eval(threadgroup GaInterSmem<W, H> &S, device const float *fwdM, thread const EvalIn &e,
+                                              thread EvalOut &o, int lane) {
+#ifdef GA_FWD_MMA
+    if (ga_mma && W == H && W >= 16) {
+        warp_fwd_mma<W, NT>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(TxD<W, H>::lw), g_txScale[e.txSz], lane);
+        warp_quant_rate_rt<NT>(S.tmp, S.q, e, o, W, H, lane, S.red, S.redi);
+        return;
+    }
+#endif
+    warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+}
+
 template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                    constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                    constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],
+                    uint blockIdx_x [[threadgroup_position_in_grid]],
                     uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     threadgroup GaInterSmem<W, H> smem[NW];
     const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;  // the block's slot, its thread (k_analysis's NT)
@@ -710,7 +727,7 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
             ga_sync<NT>();
             e.resEnergy = ga_sum<NT>(en, lane, S.red);
             e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
-            warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+            ga_inter_eval<W, H, NT>(S, fwdM, e, o, lane);
         }
         const int hasC = av1g_has_chroma(BS, y >> 2, x >> 2, I.mono);
         const float J = o.D + lambda * (o.R + ga_mv_bits(best, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
@@ -734,7 +751,8 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
 // lanes as k_inter.
 template <int W, int H, int BS, int NW, int Q>
 kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                     constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                     constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],
+                    uint blockIdx_x [[threadgroup_position_in_grid]],
                      uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     static_assert(W <= 16 && H <= 16, "k_inter_q: blocks inside one 16x16");
     constexpr int NT = 32, GL = 32 / Q;
@@ -867,7 +885,7 @@ kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
                 ga_sync<NT>();
                 e.resEnergy = ga_sum<NT>(en, lane, S.red);
                 e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
-                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+                ga_inter_eval<W, H, NT>(S, fwdM, e, o, lane);
             }
             const int hasC = av1g_has_chroma(BS, qy >> 2, qx >> 2, I.mono);
             const float J = o.D + qLambda * (o.R + ga_mv_bits(qBest, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);
@@ -891,7 +909,8 @@ kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
 // k_inter<W, H, BS, 1, NT> does (the source and residual on the same threads, the same sums).
 template <int W, int H, int BS, int NT>
 kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                      constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                      constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],
+                    uint blockIdx_x [[threadgroup_position_in_grid]],
                       uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     static_assert(NT > 32 && NT % 32 == 0, "k_inter_s: a block's RD on several SIMD-groups");
     constexpr int NB = NT / 32;  // blocks a threadgroup
@@ -1050,7 +1069,7 @@ kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
                 ga_sync<NT>();
                 e.resEnergy = ga_sum<NT>(en, lane, S.red);
                 e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
-                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+                ga_inter_eval<W, H, NT>(S, fwdM, e, o, lane);
             }
             const int hasC = av1g_has_chroma(BS, qy >> 2, qx >> 2, I.mono);
             const float J = o.D + qLambda * (o.R + ga_mv_bits(qBest, P.meSubpel) + (hasC ? P.uvOverheadBits : 0.f) + g_avgSkip0);

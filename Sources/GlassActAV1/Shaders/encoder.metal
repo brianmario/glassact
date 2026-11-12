@@ -36,7 +36,8 @@
     static_assert(sizeof(ASmem<W, H>) <= 32768, "k_analysis_" #W "x" #H ": its scratch must fit");
 
 // Glass Act: the start-up check of warp_fwd_mma (AV1MetalEncoder.forwardMMAIsExact): a WxW residual
-// a threadgroup of NTM (as k_analysis runs the shape: 16x16 a SIMD-group, 32x32 on 128, 64x64 on 256),
+// a threadgroup of NTM (as k_analysis runs the shape: 16x16 a SIMD-group, 32x32 on 128, 64x64 on 256;
+// and as k_inter runs it: 16x16 and 32x32 the same, 64x64 on 128),
 // through the matrix units and through the passes k_analysis otherwise runs on NT (warp_eval's:
 // warp_fwd_rt below 64 points, whose row pass takes the column pass's non-integer outputs, and
 // warp_fwd_ct at 64, on 128 with the rest idle as in k_analysis), both results out as they leave
@@ -63,14 +64,15 @@ kernel void k_fwd_mma_check(device const int16_t *res [[buffer(0)]], device floa
     else warp_fwd_rt<NT>(r, tmp, W, W, txSz, AV1G_DCT_DCT, lane);
     for (int p = lane; p < NO; p += NT) outRef[g * NO + p] = tmp[(p / th) * TS + p % th];
 }
-#define GA_MMA_CHECK(W, NT, NTM)                                                                                 \
-    template [[host_name("k_fwd_mma_check_" #W)]] kernel void k_fwd_mma_check<W, NT, NTM>(                       \
+#define GA_MMA_CHECK(NAME, W, NT, NTM)                                                                           \
+    template [[host_name(NAME)]] kernel void k_fwd_mma_check<W, NT, NTM>(                      \
         device const int16_t *res [[buffer(0)]], device float *outMMA [[buffer(1)]], device float *outRef [[buffer(2)]], \
         device uint *have [[buffer(3)]], device const float *fwdM [[buffer(4)]], uint g [[threadgroup_position_in_grid]], \
         uint t [[thread_position_in_threadgroup]]);
-GA_MMA_CHECK(16, 32, 32)
-GA_MMA_CHECK(32, 128, 128)
-GA_MMA_CHECK(64, 128, 256)
+GA_MMA_CHECK("k_fwd_mma_check_16", 16, 32, 32)
+GA_MMA_CHECK("k_fwd_mma_check_32", 32, 128, 128)
+GA_MMA_CHECK("k_fwd_mma_check_64", 64, 128, 256)
+GA_MMA_CHECK("k_fwd_mma_check_64t128", 64, 128, 128)  // (k_inter's 64x64: a block's RD on 128)
 
 // Glass Act: the DCT matrices warp_fwd_mma reads, into a device buffer (dev_tx.h)
 kernel void k_fwd_matrices(device float *out [[buffer(0)]], uint t [[thread_position_in_grid]]) {
@@ -107,7 +109,8 @@ GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
 #define GA_INTER(W, H, BS, NWS)                                                                            \
     template [[host_name("k_inter_" #W "x" #H "_w" #NWS)]] kernel void k_inter<W, H, BS, NWS>(            \
         constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
-        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],                    \
+        uint blockIdx_x [[threadgroup_position_in_grid]],                                                   \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);    \
     static_assert(NWS <= GA_AN_NW(W, H), "k_inter_" #W "x" #H ": its NW warps' scratch must fit");
 
@@ -115,14 +118,16 @@ GA_ANALYSIS(64, 16, AV1G_BLOCK_64X16, 3)
 #define GA_INTER_Q(W, H, BS, NWS, Q)                                                                       \
     template [[host_name("k_inter_" #W "x" #H "_w" #NWS "p" #Q)]] kernel void k_inter_q<W, H, BS, NWS, Q>( \
         constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
-        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],                    \
+        uint blockIdx_x [[threadgroup_position_in_grid]],                                                   \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);
 
 // k_inter_<W>x<H>_w<NW>p1: a block a SIMD-group before an RD on all NW SIMD-groups (k_inter_s)
 #define GA_INTER_S(W, H, BS, NWS)                                                                          \
     template [[host_name("k_inter_" #W "x" #H "_w" #NWS "p1")]] kernel void k_inter_s<W, H, BS, NWS * 32>( \
         constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],                              \
-        constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],          \
+        constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],                    \
+        uint blockIdx_x [[threadgroup_position_in_grid]],                                                   \
         uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]);
 
 GA_INTER_Q(8, 8, AV1G_BLOCK_8X8, 2, 8)

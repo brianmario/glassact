@@ -171,9 +171,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     private static func runForwardMMACheck(device: any MTLDevice, library: any MTLLibrary, forceMismatch: Bool) throws -> Bool {
         let matrices = try makeForwardMatrices(device: device, library: library)
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no queue for k_fwd_mma_check") }
-        // (size, threads a block: as k_analysis runs it; 64x64's RD on the first 128 of its 256)
-        for (w, threads) in [(16, 32), (32, 128), (64, 256)] {
-            guard let function = library.makeFunction(name: "k_fwd_mma_check_\(w)") else { throw Failure.metal("no k_fwd_mma_check_\(w)") }
+        // (size, threads a block: as k_analysis runs it, 64x64's RD on the first 128 of its 256; and
+        // as k_inter runs it, 16x16 and 32x32 the same, 64x64 on 128)
+        for (w, threads, name) in [(16, 32, "16"), (32, 128, "32"), (64, 256, "64"), (64, 128, "64t128")] {
+            guard let function = library.makeFunction(name: "k_fwd_mma_check_\(name)") else { throw Failure.metal("no k_fwd_mma_check_\(name)") }
             let pipeline = try Self.pipeline(function, threads: threads, device: device)
             let blocks = 96, area = w * w, n = blocks * area, outputs = blocks * min(w, 32) * min(w, 32)
             var res = [Int16](repeating: 0, count: n)
@@ -688,6 +689,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.forwardMatrices = try Self.makeForwardMatrices(device: device, library: library)
         self.leafRates = try Self.makeTable("k_leaf_rates", floats: 256 * 4096, device: device, library: library)
         var inter: [Int: (pipeline: any MTLComputePipelineState, blocks: Int, threads: Int)] = [:]
+        // (k_inter's 16x16, 32x32 and 64x64 DCT_DCT on the matrix units where the analysis's are: `ga_mma`)
+        let interConstants = MTLFunctionConstantValues()
+        var interMMA = analysisUsesMatrixUnits
+        interConstants.setConstantValue(&interMMA, type: .bool, index: 1)
         for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
             let prefix = "k_inter_\(size.w)x\(size.h)_w"  // as k_analysis's names
             guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }) else { throw Failure.metal("no \(prefix)…") }
@@ -695,8 +700,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let suffix = name.dropFirst(prefix.count)
             let packed = suffix.split(separator: "p").compactMap { Int($0) }
             let parts = suffix.split(separator: "t").compactMap { Int($0) }
-            guard let warps = packed.count > 1 ? packed.first : parts.first, let function = library.makeFunction(name: name)
-            else { throw Failure.metal("no \(prefix)…") }
+            guard let warps = packed.count > 1 ? packed.first : parts.first else { throw Failure.metal("no \(prefix)…") }
+            let function = try library.makeFunction(name: name, constantValues: interConstants)
             let perBlock = packed.count > 1 ? 32 : parts.count > 1 ? parts[1] : 32
             let blocks = packed.count > 1 ? warps * packed[1] : warps  // a threadgroup's
             inter[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), blocks, warps * perBlock)
@@ -1421,6 +1426,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     var n = staleSuperblocks != nil ? UInt32(analyzed * (64 / size.w) * (64 / size.h)) : shTotal[s]
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
+                    e.setBuffer(encoder.forwardMatrices, offset: 0, index: 3)
                     e.dispatchThreadgroups(MTLSize(width: (Int(n) + blocks - 1) / blocks, height: 1, depth: 1),
                                            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1))
                 }
