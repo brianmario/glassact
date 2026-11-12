@@ -243,6 +243,7 @@ the numbers and the reasoning.
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
+| The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
 | The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
 | The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, **−16 by default in streams since 2026-11-12** (the owner's choice; −16: the rotation −7.5 % / −9.6 %, one screen −10.0 % / −13.4 %, the key frame ≈ 1.14× at q20) | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
@@ -316,6 +317,65 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the partition read as its analysis ends, the analysis behind the filters; a reference the closed loop overwrote (2026-11-12)
+
+The all-new stream (the rotation at 5K q20, `--no-golden`, 24 frames, `--motion-skip off
+--key-delta 0`). Timings are provisional: the Mac was in use and loaded throughout (the same
+binary's closed loop read 15–40 ms a picture between runs), so they are alternated runs' medians.
+
+**The waits** (`GA_TIMELINE`). Picture N+1's analysis finished on the GPU about 10 ms before the
+encoder's thread read it, after picture N's filters; the read (2.5–3 ms) was on the chain; and
+picture N+2's analysis waited for that read (`readEvent` protects the analysis cache's shared
+results and the learned pruning's scratch, which the read takes on the CPU and the next analysis
+overwrites), so it started at the next closed loop's start and ran into the filters' turn.
+
+**Kept, the same streams** (the five digests and 60-picture streams with and without long-term
+references, repeated; AV1 tests 31):
+- **Each partition is read on a thread of its own as soon as its analysis ends**, in order, and
+  **picture k's analysis also waits on the GPU for picture k − 2's filters**
+  (`AV1MetalEncoder.gate`, `e2051e2`). One commit: the read alone moves the next analysis ahead
+  of the filters on the GPU and is slower than before (31.1 against 32.2 inter frames a second,
+  the filters' wall 6.5 → 7.5–8.4 ms). A stream that stops opens the gate before it waits for
+  its readers; `aStreamThatStopsEarlyLeavesTheEncoderAsNew` checks it ends promptly.
+- **An inter frame's motion applied by the partition's reader**, and **a long-term picture
+  copied out beside the closed loop**, not between it and the filters (`8c2e94d`): 0.5–0.6 ms
+  and 0.5–2 ms off the chain.
+
+| 6 alternated runs | inter frames a second, median | range |
+|---|---|---|
+| before | 33.1 | 32.4–34.6 |
+| the read and the gate | 34.5 | 33.4–35.4 |
+| and the motion and the copy | 35.0 | 34.3–35.4 |
+
+`GA_TIMELINE` medians, before → after: from the filters' end to the next closed loop 3.0 →
+0.25 ms; the period 31.2 → 29.5; the closed loop 18.4 → 20.6 (the reader's ≈ 3 ms of a core and
+the copy now run beside it; the reader's QoS, userInitiated against userInteractive, made no
+difference: 34.9 against 35.0); the filters' wall 6.5, the analysis's GPU span 20.7, unchanged.
+The GPU is busy 24.7 ms a picture and idle ≈ 4.6 (6.2 before). On the merged head in two
+quieter runs: 34.4 → 36.9–37.2 inter frames a second, and 40.5 with today's defaults (the
+motion search skipped in 18 of 23 frames of this stream, at its +2.4 %).
+
+**Not built: the next closed loop starting before the filters end.** The closed loop is a
+per-block task graph, so blocks that predict from LAST could wait on a "LAST is filtered" signal
+while intra blocks and GOLDEN_FRAME's run. It needs the record's lifetime split, the filters'
+reconstruction buffers alternating, and the CDF-from-reference decision kept in order. It would
+recover the ≈ 5.5 ms the closed loop's threads idle through the filters, but the GPU's 24.7 ms
+a picture bounds it at ≈ 3.5 ms: ≈ 35 → ≈ 40 inter frames a second, GPU-bound from there.
+
+**A reference the closed loop overwrote, fixed** (`fb70023`; found by this work, older than it).
+At qindex 32 and under there is no CDEF, so the filters' output is the buffers they deblocked in
+place, the ones the next inter frame is reconstructed into. A stream coded without its pictures
+handed back (`returnsPlanes` off, `av1seq --no-planes`, which isn't decode-checked) reads its
+reference there: its closed loop predicted from samples it had overwritten, and the long-term
+slot kept afterwards held the new picture. The 5K q8 digest used as a reference since 2026-11-11
+(`c941eb17e507be34`) was such a stream. The closed loop now takes a copy first where the buffers
+coincide; that stream has the bytes of the decode-checked one, `3cb48e1107bd8f63` (today's
+defaults: `0138e10a56d8cc66`, with and without planes), and no other digest moved.
+`aStreamWithoutItsPicturesHasTheSameBytes` codes two screens in turn both ways at qindex 24 and
+fails without the fix. Byte checks at q8 and under before this used a wrong stream; nothing at
+q above 8 was affected, except that a key frame coded finer than qindex 33 (today's −16 at q 9–12)
+would have met it.
 
 ### Metal AV1: the closed loop's CPU on new pictures, by function; byte-identical cuts (2026-11-12)
 
@@ -407,7 +467,7 @@ reproduce with `--motion-skip off --key-delta 0`:
 | 5K q20, 24 frames, `--no-golden` | `c2b0b3bda5f8a1fd` | `fd2a0aa931bf1402` |
 | 5K q20, 8 frames | `7c17df5c516aab0d` | `0ebbbcdad618169b` |
 | 2900 q32, 8 frames | `043b6b1e2c0a51cc` | `6ebac49593108b54` |
-| 5K q8, 8 frames | `c941eb17e507be34` | `4f0de8dd64aa48d9` |
+| 5K q8, 8 frames | `c941eb17e507be34` | `4f0de8dd64aa48d9` (both from streams the entry above found wrong: `3cb48e1107bd8f63` and `0138e10a56d8cc66` since) |
 | 1280 q20, 8 frames | `2dd0679554ec9fee` | `2b2204ec80f2134d` |
 
 ### Metal AV1: matrix units for the 32x32 DCT, less threadgroup memory for the pruning, and where the period goes (2026-11-11)
