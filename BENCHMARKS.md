@@ -248,7 +248,7 @@ the numbers and the reasoning.
 | The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
 | The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, **−16 by default in streams since 2026-11-12** (the owner's choice; −16: the rotation −7.5 % / −9.6 %, one screen −10.0 % / −13.4 %, the key frame ≈ 1.14× at q20) | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
-| No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`, `off`) | kept, **on at 0.2,8 by default since 2026-11-12** (the owner's choice) | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
+| No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`, `off`) | kept as an option, **off by default** (on at 0.2,8 for a day, 2026-11-12: after a switch from two screens in turn it costs +4–6 % on video and +148 % on scrolling images over the next 12 frames; [entry](#metal-av1-the-motion-search-skip-after-a-switch-measured-off-by-default-again-2026-11-12)) | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
 | The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
 | Long-term references: up to N scenes' last pictures kept, GOLDEN_FRAME the one that matches best each frame (`metal-av1`, `longTermReferences`, `av1seq --long-term`) | kept, on (N = 4) | against N = 1 (today's rule): four traces in turn −49 % (2900) and −70 % (5K); app switching −33 %; tabs −0.9 %, windows −1.5 %, two screens in turn 0; finder time no higher (5K rotation 19.5 → 8–11 ms); +44 MB a slot at 5K | [entry](#metal-av1-long-term-references-golden_frame-the-stored-picture-that-matches-best-2026-11-11) |
 | Where libaom's lead at q26–40 on the four-trace rotation at 2900 comes from (`metal-av1`, per-block counts) | measured; a reference policy is the lever | libaom keeps its key frame as GOLDEN_FRAME for the whole run and the rotation returns to its first trace every 4th picture; our GOLDEN is the picture before last; with GOLDEN kept on the key frame (a test) ours is −21.8 % against libaom at q20–40, and on the pictures libaom codes without GOLDEN ours is −20 % at every q | [entry](#metal-av1-where-libaoms-lead-at-low-rates-comes-from-its-long-term-reference-2026-11-11) |
@@ -318,6 +318,49 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the motion-search skip after a switch, measured; off by default again (2026-11-12)
+
+`av1seq --then <trace>[:<frames>[:<skip>]][,...]` (`60eb233`) continues a stream with another
+trace's pictures, so a change of content can be measured: the case the entry of 2026-11-11 left
+open. At 2900, `--tiles 3x0 --inter`, 24 pictures, then 12 of the next content.
+
+- **Typing never makes 0.2,8 skip** (its search finds 62–100 % of its small coded area), so
+  typing → video, scrolling images or dragging are the streams of `off`, byte for byte, at q
+  14–32; so are tabs, an IDE, maps and photos alone. The quiet stretches where it skips are
+  whole-screen switches: two screens in turn, and the rotation.
+- **Two screens in turn → video**: it skips 6 of the first 7 frames after the switch. The 12
+  frames, off → 0.2,8: q14 1174.6 → 1219.4 KB (+3.8 %), q20 892.9 → 933.1 (+4.5 %), q26 677.6 →
+  713.6 (+5.3 %), q32 480.7 → 510.7 (+6.2 %), at the same quality within 0.1 dB.
+- **Two screens in turn → scrolling images, q14**: 1902 → 4720 KB over the 12 frames (+148 %).
+  Frames 25–28 and 30 skip the search and cost 664–666 KB each against 71–136: nothing but the
+  search finds a scroll of new images at a fraction of a 64x64.
+
+And where it skips, it saves little: the search's cost follows the coded share, and the frames
+it skips on the rotation (83 % of 64x64s copied) and on two screens (97 %) code little. The
+5.7 ms of the earlier entry is an all-new picture's, and the all-new content measured (the
+rotation without long-term references, video, scrolling images) finds motion worth its bytes.
+
+**`motionSkip` is nil by default again** (the owner had it on at 0.2,8 from 21e60fc, on my
+summary that it lost nothing; it loses +2.4 % without long-term references and the above). The
+reference digests, with it on → the default now: 5K q20 24 frames `--no-golden`
+`a61cee2cbf8df351` → `5e1030c7429bc420`; 5K q20 8 frames `384e81d2e4ff2b62` →
+`ab40bdf3a13fcbad`; 2900 q32 `68beb6c1416c3fa9` → `33c3d884c3d0ca8c`; 5K q8 `6336ccaac1b0e59c`
+→ `eba158d3c2d7881f`; 1280 q20 `2b2204ec80f2134d` → `862da50b8c92dbed`. `--motion-skip 0.2,8`
+gives the left ones.
+
+**A probe instead of a blind skip, built, not merged** (branch `motion-probe`, `2b77801`,
+`6a7e557`): a skipped frame searches a moving 1-in-8 sample of its coded 64x64s; the signal is
+the share of the picture motion predicts (not of the coded area, which reads 84–100 % on typing);
+a frame coding at most 1/16 of its 64x64s searches them all. A searched 64x64's results don't
+depend on which others search, and the sample estimates the full share within a point on the
+rotation (video 25.5 against 34.4 at worst). At 0.02: the rotation −0.04 to −0.07 %, the
+rotation without long-term references, two screens, scrolling, dragging, video, scrolling images
+and app switching identical to off. A 1/8 probe of an all-new 5K picture costs 1.68 ms of the
+search's 5.2 (k_inter still runs over every coded 64x64: ≈ 0.7 if it took the list). But it
+probes only 2–3 of the rotation's 15 frames, and the frames where the search is dear are ones no
+lossless rule should probe. Its transitions were not finished. The search's cost on new
+pictures has to come from the search, not from skipping it.
 
 ### Metal AV1: RDOQ off on 4x4 tx blocks, re-measured, kept off (2026-11-12)
 
@@ -510,7 +553,8 @@ blocks on while it walks.
 
 The owner's choices on the two entries of 2026-11-11 below. Nothing new is measured here beyond
 the digests.
-- `AV1HybridEncoder.motionSkip` defaults to (0.2, every 8th). `av1seq --motion-skip off` gives
+- (Reverted the same day: see "the motion-search skip after a switch" above.)
+  `AV1HybridEncoder.motionSkip` defaults to (0.2, every 8th). `av1seq --motion-skip off` gives
   every inter frame its search back. Its one measured cost stands: +2.4 % where every picture is
   new and nothing is copied (the rotation with `--no-golden`), for −5.7 ms of GPU on a skipped
   picture; no bytes on the default rotation, two screens, scrolling, dragging, video, scrolling

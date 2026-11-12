@@ -35,7 +35,7 @@ let av1SeqCommand = Command(
         .string("deltas-up-to", "<share>", "search angle deltas only in pictures that analyze at most this share of their superblocks (0–1; default 0.5; 1: always)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
-        .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default the encoder's, 0.2,8); off: every inter frame searches"),
+        .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),

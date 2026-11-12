@@ -285,10 +285,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// searches again, so motion returning is seen. A frame's search is set up while the one
     /// before it is analyzed, so frame i decides from frames up to i - 2. After a key frame (or
     /// a size change) the first frames search. It saves the search's GPU time (the motion search
-    /// and the inter candidates) on frames that would find nothing; on by default at 0.2,
-    /// re-checking every 8th frame, which lost no bytes on any content measured (BENCHMARKS "no
-    /// motion search after frames whose search found nothing"). Nil: every inter frame searches.
-    public var motionSkip: (threshold: Double, recheckEvery: Int)? = (threshold: 0.2, recheckEvery: 8)
+    /// and the inter candidates), and it trades bytes for it: at 0.2 re-checking every 8th frame,
+    /// the frames after a switch from two screens in turn to scrolling images cost 2.5× (the
+    /// skipped ones 665 KB against 100), and video after it +4–6 % (BENCHMARKS "the motion-search
+    /// skip after a switch"). Nil (the default): every inter frame searches.
+    public var motionSkip: (threshold: Double, recheckEvery: Int)?
     /// With `motionSkip`: how many frames that searched must all have found less than its
     /// threshold (2).
     public var motionSkipLookback = 2
