@@ -243,6 +243,7 @@ the numbers and the reasoning.
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
+| The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
 | The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, **−16 by default in streams since 2026-11-12** (the owner's choice; −16: the rotation −7.5 % / −9.6 %, one screen −10.0 % / −13.4 %, the key frame ≈ 1.14× at q20) | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
 | No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`, `off`) | kept, **on at 0.2,8 by default since 2026-11-12** (the owner's choice) | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
@@ -315,6 +316,73 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop's CPU on new pictures, by function; byte-identical cuts (2026-11-12)
+
+The all-new stream (the rotation at 5K q20, `--no-golden`, 24 frames, before the defaults of the
+entry below), the writer overlapped. The Mac was heavily loaded throughout (load 37–56), so the
+measure is thread CPU a picture (`GA_CRIT=1` now prints a `cpu:` line, `3614d03`), and wall times
+are provisional.
+
+**Where it goes**, per picture: the tile plan 16.5 core-ms, the blocks ≈ 160, all workers ≈ 215
+(the other ≈ 38 is the ready queue spinning and yielding). About 8.3 cores do work over a
+≈ 20.5 ms wall, 1.8 more spin or yield, of 14. The critical path is 8.7–9.9 ms (the plan 3.1 of
+it) against the 19–20 ms wall: work-bound today, but at 10 ms the path would bind too. By
+`sample` (25.7 k samples, scaled to 215 core-ms):
+
+| stage | share | core-ms |
+|---|---|---|
+| tx hook: RDOQ | 12.8 % | 27.6 |
+| tx hook: forward transform | 12.4 % | 26.7 |
+| tx hook: `on_txb` (residual, energy, span check, search loop, copies) | 11.4 % | 24.5 |
+| intra prediction (`build_edges` and its copies ≈ 5 %, predictors, CfL) | 9.4 % | 20.1 |
+| tx hook: `trial` (bounds, transform-domain distortion) | 9.1 % | 19.6 |
+| scheduling: yield | 8.6 % | 18.4 |
+| reconstruction (dequantize, inverse, add) | 7.7 % | 16.5 |
+| scheduling: spin | 7.2 % | 15.4 |
+| plan and walk (syntax, partition, tx blocks) | 6.6 % | 14.3 |
+| tx hook: quantizer | 5.7 % | 12.3 |
+| reconstruction bookkeeping | 3.1 % | 6.6 |
+| inter prediction, walk levels, rate proxy, other | ≈ 6 % | ≈ 13 |
+
+No single hot spot: the hook is 53 %, in five parts.
+
+**Kept, the same streams** (the five digests with `--motion-skip off --key-delta 0`, and the
+defaults' five; Rust tests 58, with the oracle 128; AV1 tests 29):
+- RDOQ's source span checked only where RDOQ would run, and never for all-zero levels (`33dd4d9`).
+- RDOQ's level map kept per thread, only the block's rows and padding cleared: a 4x4 clears 64
+  bytes, not 1.3 KB (`7a15aec`).
+- The transform-domain distortion's sum skips all-zero groups of 8 levels (`06c6d60`). A zero
+  level adds exactly +0 and the sum is never −0, so it is the same float sum in the same order;
+  `td_taken_matches_the_reference` checks it bit for bit. 16 coefficients 9.1 → 4.4 ns, 64:
+  29.1 → 17.6, 256: 89 → 66 (1024 at uniform density 348 → 365). `trial`'s own share 10.5 → 4.6 %.
+- A tx block's residual energy summed in u32 (at most 64 × 64 × 255² < 2²⁸), so NEON adds 4 lanes
+  (`5be370d`).
+
+Together, 4 alternated pairs: the blocks' thread CPU 160.2 (158.4–162.5) → 154.6 (153.5–155.9)
+core-ms a picture, −3.5 %, the ranges apart; the closed loop's wall 21.1 → 20.6 ms, inside the
+noise of a loaded Mac.
+
+**Measured, not kept (same bytes):** a tighter all-zero bound for IDTX, V_DCT and H_DCT (blocks
+159.1 → 163.4: IDTX's transform is one multiply already); the quantizer by reciprocal multiply
+with an exact fallback (4x4 12 → 17 ns, 32x32 659 → 1155: the f64 divide is cheap here); the
+ready queue's idle loop without its yield (blocks 155.4 → 159.2, wall 20.8 → 22.2).
+
+**Trades, measured for the owner, not taken** (24 frames, q 14 / 20 / 26 / 32, BD-rate PSNR-Y /
+RGB / SSIMULACRA2 against the switch off; one run a point, the core-ms ± 5 %):
+
+| trade | BD-rate | plan + blocks, core-ms at each q |
+|---|---|---|
+| no RDOQ on 4x4 tx blocks | −0.18 % / −0.28 % / +0.40 % | 182 / 173 / 161 / 150 → 167 / 163 / 158 / 147 |
+| no RDOQ below 256 coefficients | −0.13 % / −0.14 % / +0.84 % | → 159 / 158 / 136 / 145 |
+| no tx type search on 4x4 tx blocks | +6.4 % (PSNR-Y) | → 170 / 160 / 150 / 140 |
+
+**What 10 ms needs.** The work is ≈ 171 core-ms a picture. Byte-identical headroom looks like
+another 10–15 % (NEON for RDOQ's contexts, `build_edges`' copies, the residual and span passes,
+the walk's bookkeeping): ≈ 140–150 core-ms, 12.5–13.5 ms on 13 cores. 10 ms is ≈ 110 core-ms,
+−35 %: trials traded away (`--no-tx-search` alone was 18.5 → 10.9 ms at +8.9 %), or RDOQ's scope.
+The plan (≈ 3 ms on the critical path before any of its blocks start) would also have to hand
+blocks on while it walks.
 
 ### Metal AV1: the motion-search skip and finer key frames on by default (2026-11-12)
 
