@@ -17,9 +17,19 @@ struct EncoderShaderTests {
             let small = analysis.filter { $0.hasPrefix("k_analysis_small_") }
             #expect(analysis.count == 19 + 8 && small.count == 8, "\(analysis.sorted())")
             #expect(library.functionNames.contains("k_recon") && library.functionNames.contains("k_dp"))
-            for name in analysis + ["k_recon", "k_dp"] {
+            for name in ["k_recon", "k_dp"] {
                 let pipeline = try device.makeComputePipelineState(function: try #require(library.makeFunction(name: name)))
                 #expect(pipeline.staticThreadgroupMemoryLength <= device.maxThreadgroupMemoryLength, "\(name)")
+            }
+            // the analysis kernels, general and at the fixed settings (k_analysis.h's function constant)
+            for name in analysis {
+                for var fixed in [false, true] {
+                    let values = MTLFunctionConstantValues()
+                    values.setConstantValue(&fixed, type: .bool, index: 0)
+                    let function = try library.makeFunction(name: name, constantValues: values)
+                    let pipeline = try device.makeComputePipelineState(function: function)
+                    #expect(pipeline.staticThreadgroupMemoryLength <= device.maxThreadgroupMemoryLength, "\(name) fixed \(fixed)")
+                }
             }
         } catch {
             Issue.record("\(error)")

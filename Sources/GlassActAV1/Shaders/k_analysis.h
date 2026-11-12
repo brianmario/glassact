@@ -12,6 +12,14 @@
 #pragma once
 #include "dev_tx.h"
 
+// Glass Act: the analysis at the hybrid encoder's settings (AV1MetalEncoder.fixedAnalysis): one
+// candidate (K 1), no tx-type search, no intra edge filter, no quantizer matrices, no external
+// screener. A function constant, so that those pipelines are compiled without the general code
+// (the kernels are register-bound: BENCHMARKS); the others leave it undefined, which is false. The
+// host takes the fixed pipelines only where the settings are those, so the results are the same.
+constant bool ga_fixed_fc [[function_constant(0)]];
+constant bool ga_fixed = is_function_constant_defined(ga_fixed_fc) && ga_fixed_fc;
+
 template <int W, int H>
 struct ASmem {
     int16_t res[W * H];
@@ -341,8 +349,8 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             for (int i = lane; i < W + H; i += NT) bad |= L[i] != v;
             flat = ga_max<NT>(bad, lane, S.redi) == 0;
         }
-        device const GpExtCand *ext = (device const GpExtCand *)B.extCand[BS];
-        int K = min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
+        device const GpExtCand *ext = ga_fixed ? nullptr : (device const GpExtCand *)B.extCand[BS];
+        int K = ga_fixed ? 1 : min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
         int top[GP_MAXK];
         auto mbits = [&](int c) -> float {
             const int m = cand_mode(c);
@@ -416,7 +424,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
         e.rnd = P.rnd; e.zbin = P.zbin;
         e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = C;
-        e.qmDist = P.qmDist; e.qmRnd = P.qmRnd;
+        e.qmDist = ga_fixed ? 0 : P.qmDist; e.qmRnd = ga_fixed ? 0 : P.qmRnd;  // (without a matrix they weigh by 1)
         float bestJ = GP_INF;
         int bestK = 0, bestTx = AV1G_DCT_DCT;
         // (a flat block's: no distortion, and an all-zero block's bits whatever the mode or type)
@@ -429,7 +437,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 if (J < bestJ) { bestJ = J; bestK = k; }
                 continue;
             }
-            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             // Glass Act: a prediction that is exact (common on screens: stripes, a repeated row or
             // column) leaves nothing to transform: no distortion and an all-zero block's bits,
             // which is what the transform and the quantizer would arrive at
@@ -440,16 +448,16 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             }
             e.txType = AV1G_DCT_DCT;
             e.intraDir = cand_mode(c);
-            e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
+            e.qm = ga_fixed ? nullptr : av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
             EvalOut o;
             warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
             const float J = o.D + lambda * (o.R + mbits(c) + overhead);
             if (J < bestJ) { bestJ = J; bestK = k; }
         }
         // ---- tx-type search for the winner ----
-        if (P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
+        if (!ga_fixed && P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
             const int c = S.cand[top[bestK]];
-            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             e.intraDir = cand_mode(c);
             for (int t = 1; t < 16; t++) {
                 if (!av1g_tx_type_in_set_intra(set, t)) continue;

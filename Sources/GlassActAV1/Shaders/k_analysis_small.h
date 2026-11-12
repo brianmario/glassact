@@ -202,8 +202,8 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         return t;
     };
     auto satd_of = [&](int c) -> float { return satd_pc(pred_cand(c, T::lw, T::lh)); };
-    device const GpExtCand *ext = (device const GpExtCand *)B.extCand[BS];
-    int K = min(P.K, GP_MAXK);
+    device const GpExtCand *ext = ga_fixed ? nullptr : (device const GpExtCand *)B.extCand[BS];
+    int K = ga_fixed ? 1 : min(P.K, GP_MAXK);
     int cands[GP_MAXK];
     int nc = 0;
     if (ext) {
@@ -259,12 +259,12 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     e.dcQ = av1g_dc_q(qidx); e.acQ = av1g_ac_q(qidx);
     e.rnd = P.rnd; e.zbin = P.zbin;
     e.skipCtx = 0; e.dcCtx = 0; e.reduced = 0; e.C = C;
-    e.qmDist = P.qmDist; e.qmRnd = P.qmRnd; e.resEnergy = 0;
+    e.qmDist = ga_fixed ? 0 : P.qmDist; e.qmRnd = ga_fixed ? 0 : P.qmRnd;  // (without a matrix they weigh by 1) e.resEnergy = 0;
     int16_t res[W * H];
     uint8_t pa[EL], pl[EL];
     auto residual = [&](int c) {
         const int m = cand_mode(c);
-        const bool ef = I.edgeFilter && av1g_is_directional(m);
+        const bool ef = !ga_fixed && I.edgeFilter && av1g_is_directional(m);
         int upA = 0, upL = 0;
         if (ef) {
             for (int k = 0; k < EL; k++) { pa[k] = ea[k]; pl[k] = el[k]; }
@@ -295,12 +295,12 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
         residual(c);
         e.txType = AV1G_DCT_DCT;
         e.intraDir = cand_mode(c);
-        e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
+        e.qm = ga_fixed ? nullptr : av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
         const EvalOut o = eval_scalar<W, H>(res, e);
         const float J = o.D + lambda * (o.R + mbits(c) + overhead);
         if (J < bestJ) { bestJ = J; bestK = k; }
     }
-    if (nc > 0 && P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
+    if (nc > 0 && !ga_fixed && P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
         const int c = cands[bestK];
         residual(c);
         e.intraDir = cand_mode(c);

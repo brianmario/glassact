@@ -94,10 +94,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     let device: any MTLDevice
     let queue: any MTLCommandQueue
-    /// Per AV1 block size: the analysis kernel and its warps per threadgroup.
-    let analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)]
-    /// The thread-per-block analysis kernels of the shapes up to 64 pixels.
-    let analysisSmall: [Int: any MTLComputePipelineState]
+    /// The analysis's kernels.
+    struct AnalysisKernels {
+        /// Per AV1 block size: the analysis kernel and its warps per threadgroup.
+        let simd: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)]
+        /// The thread-per-block analysis kernels of the shapes up to `smallMaxPixels`.
+        let small: [Int: any MTLComputePipelineState]
+    }
+    /// The analysis kernels, general ([0]) and compiled for the hybrid encoder's settings ([1]:
+    /// k_analysis.h's `ga_fixed`, which `Run.analysisIsFixed` checks; the same results, without
+    /// the general code), each set made on first use: an encoder uses one, and a set takes
+    /// seconds to compile.
+    private var analysisSets: [AnalysisKernels?] = [nil, nil]
+    private let analysisLock = NSLock()
+    private let library: any MTLLibrary
     static let smallThreads = 128
     /// The largest shape (in pixels) the thread-per-block kernel takes: av1gpu's 64, and 8x16 / 16x8.
     static let smallMaxPixels = 128
@@ -507,18 +517,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.readEvent = readEvent
         let library = try AV1ShaderSource.library(
             AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
-        var analysis: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
-        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 {
-            // k_analysis_<W>x<H>_w<NW>: NW blocks a threadgroup, a SIMD-group each; or _w1t<NT>: a
-            // block a threadgroup, on NT threads
-            let prefix = "k_analysis_\(size.w)x\(size.h)_w"
-            guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }) else { throw Failure.metal("no \(prefix)…") }
-            let parts = name.dropFirst(prefix.count).split(separator: "t").compactMap { Int($0) }
-            guard let warps = parts.first, let function = library.makeFunction(name: name) else { throw Failure.metal("no \(prefix)…") }
-            let perBlock = parts.count > 1 ? parts[1] : 32
-            analysis[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), warps, warps * perBlock)
-        }
-        self.analysis = analysis
+        self.library = library
         var inter: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
         for (bsize, size) in Self.blockSizes.enumerated() where size.w >= 8 && size.h >= 8 {
             let prefix = "k_inter_\(size.w)x\(size.h)_w"  // as k_analysis's names
@@ -535,13 +534,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         guard let sadFunction = library.makeFunction(name: "k_inter_sad") else { throw Failure.metal("no k_inter_sad") }
         candidateSAD = try Self.pipeline(sadFunction, threads: 128, device: device)
         projectionSearch = try Self.pipeline(projFunction, threads: 256, device: device)
-        var small: [Int: any MTLComputePipelineState] = [:]
-        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
-            guard let function = library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)")
-            else { throw Failure.metal("no k_analysis_small_\(size.w)x\(size.h)") }
-            small[bsize] = try Self.pipeline(function, threads: Self.smallThreads, device: device)
-        }
-        analysisSmall = small
         guard let leafFunction = library.makeFunction(name: "k_leaf"),
               let leafSmallFunction = library.makeFunction(name: "k_leaf_small"),
               let leafScanFunction = library.makeFunction(name: "k_leaf_scan")
@@ -560,6 +552,37 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         dp = try Self.pipeline(dpFunction, threads: 128, device: device)
         recon = try Self.pipeline(reconFunction, threads: Self.reconThreads, device: device)
         params = Self.defaultParams()
+    }
+
+    /// The analysis kernels, general or at the fixed settings (`analysisSets`), compiled the first
+    /// time they're asked for.
+    func analysisKernels(fixed: Bool) throws -> AnalysisKernels {
+        analysisLock.lock()
+        defer { analysisLock.unlock() }
+        if let kernels = analysisSets[fixed ? 1 : 0] { return kernels }
+        let values = MTLFunctionConstantValues()
+        var value = fixed
+        values.setConstantValue(&value, type: .bool, index: 0)
+        var simd: [Int: (pipeline: any MTLComputePipelineState, warps: Int, threads: Int)] = [:]
+        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 {
+            // k_analysis_<W>x<H>_w<NW>: NW blocks a threadgroup, a SIMD-group each; or _w1t<NT>: a
+            // block a threadgroup, on NT threads
+            let prefix = "k_analysis_\(size.w)x\(size.h)_w"
+            guard let name = library.functionNames.first(where: { $0.hasPrefix(prefix) }) else { throw Failure.metal("no \(prefix)…") }
+            let parts = name.dropFirst(prefix.count).split(separator: "t").compactMap { Int($0) }
+            guard let warps = parts.first else { throw Failure.metal("no \(prefix)…") }
+            let function = try library.makeFunction(name: name, constantValues: values)
+            let perBlock = parts.count > 1 ? parts[1] : 32
+            simd[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), warps, warps * perBlock)
+        }
+        var small: [Int: any MTLComputePipelineState] = [:]
+        for (bsize, size) in Self.blockSizes.enumerated() where size.w > 0 && size.w * size.h <= Self.smallMaxPixels {
+            let function = try library.makeFunction(name: "k_analysis_small_\(size.w)x\(size.h)", constantValues: values)
+            small[bsize] = try Self.pipeline(function, threads: Self.smallThreads, device: device)
+        }
+        let kernels = AnalysisKernels(simd: simd, small: small)
+        analysisSets[fixed ? 1 : 0] = kernels
+        return kernels
     }
 
     /// A pipeline compiled for exactly the threads its threadgroups have: the
@@ -748,6 +771,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var tiles = av1g_tiles()
         var buffers: [any MTLBuffer] = []
         var batch = GpBatch()
+        /// The image has the fixed analysis's settings (`analysisIsFixed`).
+        var imageIsFixed = false
         var shTotal = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
         let rec: [any MTLBuffer]
         /// The padded source planes (the encoder's pool's, returned once a partition is read).
@@ -971,6 +996,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let nSb = sbCols * sbRows
             let imageBuffer = try make(MemoryLayout<GpImage>.stride)
             imageBuffer.contents().storeBytes(of: image, as: GpImage.self)
+            // (luma's matrix: none without matrices or at level 15)
+            imageIsFixed = image.edgeFilter == 0 && (image.usingQm == 0 || image.qm.0 >= 15)
             // the analysis's results: the previous picture's, kept where its source is unchanged
             let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, shapeMask: shapeMask, blocks: Int(blkTotal),
                                                   superblocks: sbCols * sbRows)
@@ -1073,6 +1100,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         // (a run whose results are never read mustn't hold up the next picture's)
         deinit { encoder.markRead(seq) }
 
+        /// Whether the analysis runs at the settings its fixed kernels are compiled for (k_analysis.h's
+        /// `ga_fixed`): one candidate (K and kLarge), no tx-type search, no intra edge filter, no luma
+        /// quantizer matrix, no external screener.
+        func analysisIsFixed(_ p: GpParams) -> Bool {
+            let external = withUnsafeBytes(of: batch.extCand) { $0.contains { $0 != 0 } }
+            return imageIsFixed && !external && p.K == 1 && p.kLarge <= 1 && p.txSearch == 0
+        }
+
         /// Encodes the stages. With `wait` false (and no profiling), returns the
         /// committed command buffer instead of waiting for it.
         @discardableResult
@@ -1126,6 +1161,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if wait { encoder.lastGPUSeconds = 0 }
                 return nil
             }
+            let kernels = try encoder.analysisKernels(fixed: analysisIsFixed(params))  // (compiled the first time)
             let t0 = CACurrentMediaTime()
             var e = try open()
             // the shapes the thread-per-block kernel takes (the analysis loop below decides the same):
@@ -1137,7 +1173,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 isInter && (n < 4096 || (size.w * size.h >= 64 && !(newPicture && size.w * size.h <= 128)))
             }
             func smallKernel(_ s: Int) -> Bool {
-                guard shTotal[s] > 0, params.smallKernel != 0, encoder.analysisSmall[s] != nil else { return false }
+                guard shTotal[s] > 0, params.smallKernel != 0, kernels.small[s] != nil else { return false }
                 let size = AV1MetalEncoder.blockSizes[s]
                 let n = staleSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
                 return n > 0 && !takesSIMDGroup(size, n)
@@ -1256,7 +1292,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // slowest block (8x8 to 16x8 3-6x slower there; BENCHMARKS)
                 let size = AV1MetalEncoder.blockSizes[s]
                 let fewBlocks = takesSIMDGroup(size, Int(n))
-                if params.smallKernel != 0, !fewBlocks, let pipeline = encoder.analysisSmall[s] {
+                if params.smallKernel != 0, !fewBlocks, let pipeline = kernels.small[s] {
                     if mlListBuffer != nil { n = shTotal[s] }  // the list's count bounds it
                     e.setComputePipelineState(pipeline)
                     e.setBytes(&n, length: 4, index: 2)
@@ -1270,7 +1306,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                     continue
                 }
-                guard let (pipeline, warps, threads) = encoder.analysis[s] else { continue }
+                guard let (pipeline, warps, threads) = kernels.simd[s] else { continue }
                 e.setComputePipelineState(pipeline)
                 e.setBytes(&n, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(n) + warps - 1) / warps, height: 1, depth: 1),
