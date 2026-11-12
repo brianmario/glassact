@@ -225,6 +225,17 @@ static uint leaf_chroma_model(device const GpImage &I, int ym, int cx, int cy, i
     return leaf_chroma_keep(p, I.mlChromaEps);
 }
 
+// one item of leaf_chroma's screening: the proxy of the 4x4 at (sx, sy) of a chroma block in mode M
+template <int M>
+static inline float leaf_item(device const uint8_t *s, int sp, int sx, int sy, int lw, int lh, threadgroup const uint8_t *A,
+                              threadgroup const uint8_t *L, int dc, float step, float lambda) {
+    const PredCand pc = pred_cand0(M, lw, lh);
+    int r[16];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) r[i * 4 + j] = (int)s[i * sp + j] - pred_fast(pc, sy + i, sx + j, A, L, dc);
+    return leaf_proxy4(r, step, lambda);
+}
+
 // Decider::best_chroma, lanes over 4x4 sub-blocks
 static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, int lumaMode,
                         threadgroup LeafSmem &S, uint lane, thread GpLeafDecision &d) {
@@ -258,18 +269,25 @@ static void leaf_chroma(device const GpImage &I, constant GpParams &P, int x, in
     if (!nkept) keptModes[nkept++] = AV1G_DC_PRED;
     const int nmodes = P.leafChromaAngled ? AV1G_INTRA_MODES : nkept;
     const int items = nmodes * 2 * nsub;
+    // (nsub, nsx are powers of two: shifts for the divisions)
+    const int lsub = (lw - 2) + (lh - 2), lsx = lw - 2;
     for (int it = (int)lane; it < items; it += 32) {
-        const int mi = it / (2 * nsub), m = P.leafChromaAngled ? mi : keptModes[mi];
-        const int pl = 1 + (it / nsub) % 2, sb = it % nsub;
-        const int sx = (sb % nsx) * 4, sy = (sb / nsx) * 4;
-        device const uint8_t *s = I.src[pl] + (size_t)cy * I.spitch[pl] + cx;
-        threadgroup uint8_t *A = S.ea[pl] + AV1G_EDGE_OFF, *L = S.el[pl] + AV1G_EDGE_OFF;
-        const PredCand pc = pred_cand(cand_pack(m, 0), lw, lh);
-        int r[16];
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++)
-                r[i * 4 + j] = (int)s[(sy + i) * I.spitch[pl] + sx + j] - pred_fast(pc, sy + i, sx + j, A, L, dcv[pl]);
-        part[m] += leaf_proxy4(r, step, lambda);
+        const int mi = it >> (lsub + 1), m = P.leafChromaAngled ? mi : keptModes[mi];
+        const int pl = 1 + ((it >> lsub) & 1), sb = it & (nsub - 1);
+        const int sx = (sb & (nsx - 1)) * 4, sy = (sb >> lsx) * 4;
+        device const uint8_t *s = I.src[pl] + (size_t)(cy + sy) * I.spitch[pl] + cx + sx;
+        threadgroup const uint8_t *A = S.ea[pl] + AV1G_EDGE_OFF, *L = S.el[pl] + AV1G_EDGE_OFF;
+        const int sp = I.spitch[pl], dc = dcv[pl];
+        float v;
+        // each mode's predictor compiled for itself (pred_cand0 of a constant)
+        switch (m) {
+#define LEAF_ITEM(M) case M: v = leaf_item<M>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda); break;
+        LEAF_ITEM(0) LEAF_ITEM(1) LEAF_ITEM(2) LEAF_ITEM(3) LEAF_ITEM(4) LEAF_ITEM(5) LEAF_ITEM(6)
+        LEAF_ITEM(7) LEAF_ITEM(8) LEAF_ITEM(9) LEAF_ITEM(10) LEAF_ITEM(11)
+        default: v = leaf_item<12>(s, sp, sx, sy, lw, lh, A, L, dc, step, lambda); break;
+#undef LEAF_ITEM
+        }
+        part[m] += v;
     }
     float best = GP_INF;
     int bestMode = AV1G_DC_PRED;
