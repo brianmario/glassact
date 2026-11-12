@@ -228,19 +228,22 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         for (int p = (int)lane; p < 128; p += 32) dc += (uint)abs((int)cur[warp][(p >> 4) * 32 + (p & 15)] - mean);
         dc = simd_sum(dc);
         const int nw = 1 + (n - GA_ME_ZERO) / 81;
+        // (each centre's SAD on the whole SIMD-group: 4 of its 128 samples a lane)
         uint best = 0xFFFFFFFFu;
-        for (int w = (int)lane; w < nw; w += 32) {
+        for (int w = 0; w < nw; w++) {
             const int i = w == 0 ? GA_ME_ZERO / 2 : GA_ME_ZERO + 81 * (w - 1) + 40;  // the window's centre
             const int2 v = ga_me_vector(I, i, sbv);
             const int rx = x + v.x, ry = y + v.y;
             if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
             device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
             uint sad = 0;
-            for (int row = 0; row < 16; row += 2)
-                for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-            best = min(best, sad);
+            for (int p = (int)lane; p < 128; p += 32) {
+                const int row = (p >> 4) * 2, col = p & 15;
+                sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
+            }
+            best = min(best, simd_sum(sad));
         }
-        if ((float)simd_min(best) > P.interGate * (float)dc) nSearch = 0;
+        if ((float)best > P.interGate * (float)dc) nSearch = 0;
     }
     for (int i = (int)lane; i < nSearch; i += 32) {
         const int2 v = ga_me_vector(I, i, sbv);
