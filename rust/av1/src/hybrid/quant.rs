@@ -47,8 +47,9 @@ pub(crate) struct Work {
     dtmp: Vec<f64>,
     dq: Vec<i32>,
     rr: Vec<i32>,
-    /// RDOQ applies to this tx block (its source spans [`QuantHook::rdoq_range`])
-    rdoq_here: bool,
+    /// whether RDOQ applies to this tx block (its source spans [`QuantHook::rdoq_range`]), once
+    /// asked ([`QuantHook::rdoq_here`]): 0 not yet, 1 no, 2 yes
+    rdoq_here: u8,
     /// the residual's energy (sum of squares), with [`QuantHook::td_dist`]
     energy: u64,
     /// the residual's first forward products, shared by the types a search tries
@@ -77,7 +78,7 @@ impl Scratch {
                 dtmp: vec![0.0; FWD_TMP],
                 dq: vec![0; 1024],
                 rr: vec![0; 64 * 64],
-                rdoq_here: true,
+                rdoq_here: 0,
                 energy: 0,
                 s1: Stage1Cache::default(),
             },
@@ -232,15 +233,19 @@ impl<'a> QuantHook<'a> {
     /// `w.df` (the trial's); quantizer matrices and the double forward leave them be.
     /// `trialed`: the levels are a compared trial's, which `rdoq_trials` optimized already.
     #[allow(clippy::too_many_arguments)]
-    fn optimize(&self, w: &mut Work, q: &mut [i16], tx_sz: i32, ty: i32, plane: usize, dc_q: i32, ac_q: i32, qm_level: i32, lam: f64, trialed: bool) {
+    fn optimize(&self, w: &mut Work, q: &mut [i16], s: &[u8], ss: usize, tx_sz: i32, ty: i32, plane: usize, dc_q: i32, ac_q: i32, qm_level: i32, lam: f64, trialed: bool) {
         let Some(cc) = self.rdoq else { return };
-        if !w.rdoq_here || self.rdoq_trials && plane == 0 && trialed {
+        if self.rdoq_trials && plane == 0 && trialed {
             return;
         }
         if self.o.double_fwd || qm(true, qm_level, plane as i32, tx_sz, ty).is_some() {
             return;
         }
         let n = tx_coeffs(tx_sz);
+        // (RDOQ leaves all-zero levels be: no need to look at the source for them)
+        if q[..n].iter().all(|&v| v == 0) || !self.rdoq_here(w, s, ss, tx_sz) {
+            return;
+        }
         rdoq::optimize(
             cc,
             &mut q[..n],
@@ -254,6 +259,18 @@ impl<'a> QuantHook<'a> {
             coeff_gain(self.f, tx_sz),
             lam as f32,
         );
+    }
+
+    /// Whether RDOQ applies to the tx block (`s`, its source): asked once a tx block, and only
+    /// where levels would be optimized.
+    #[inline]
+    fn rdoq_here(&self, w: &mut Work, s: &[u8], ss: usize, tx_sz: i32) -> bool {
+        if w.rdoq_here == 0 {
+            let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
+            let on = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
+            w.rdoq_here = 1 + on as u8;
+        }
+        w.rdoq_here == 2
     }
 
     /// Research: records the block's features and the type the search chose.
@@ -440,7 +457,7 @@ impl QuantHook<'_> {
         } else {
             forward_f_cached(self.f, &w.resf, tx_sz, ty, &mut w.df, &mut w.ftmp, &mut w.s1);
             let mut nz = quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin);
-            if let Some(cc) = self.rdoq.filter(|_| self.rdoq_trials && w.rdoq_here && need_j && plane == 0 && m.is_none() && nz) {
+            if let Some(cc) = self.rdoq.filter(|_| self.rdoq_trials && need_j && plane == 0 && m.is_none() && nz && self.rdoq_here(w, s, ss, tx_sz)) {
                 let lam = 0.12 * (ac_q as f32 / 8.0) * (ac_q as f32 / 8.0);
                 rdoq::optimize(cc, &mut q[..n], &w.df[..n], tx_sz, ty, 0, dc_q as f32, ac_q as f32, den as f32, coeff_gain(self.f, tx_sz), lam);
                 nz = q[..n].iter().any(|&v| v != 0);
@@ -601,7 +618,7 @@ impl TxbHook for QuantHook<'_> {
             w.energy = e;
             w.s1.reset();
         }
-        w.rdoq_here = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
+        w.rdoq_here = 0;
         let n = tx_coeffs(tx_sz);
         let coeffs = &mut coeffs[..n];
         let rd_skip = ctx.is_inter && self.o.inter_rd_skip;
@@ -622,7 +639,7 @@ impl TxbHook for QuantHook<'_> {
                 qm_level,
                 rd_skip,
             );
-            self.optimize(w, coeffs, tx_sz, ty, plane, dc_q, ac_q, qm_level, lam, false);
+            self.optimize(w, coeffs, s, ss, tx_sz, ty, plane, dc_q, ac_q, qm_level, lam, false);
             if rd_skip {
                 self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -655,7 +672,7 @@ impl TxbHook for QuantHook<'_> {
             t.tx_type = best_type as u8;
             coeffs.copy_from_slice(&best[..n]);
             self.collect_sample(w, tw, th, ac_q, true, best_type, tx_sz);
-            self.optimize(w, coeffs, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
+            self.optimize(w, coeffs, s, ss, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
             if rd_skip {
                 self.skip_if_cheaper(best_j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -667,7 +684,7 @@ impl TxbHook for QuantHook<'_> {
             let j = self.trial(
                 w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, rd_skip,
             );
-            self.optimize(w, coeffs, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, rd_skip);
+            self.optimize(w, coeffs, s, ss, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, rd_skip);
             if rd_skip {
                 self.skip_if_cheaper(j, coeffs, pred, ps, s, ss, tw, th, ac_q);
             }
@@ -696,7 +713,7 @@ impl TxbHook for QuantHook<'_> {
             self.trial(
                 w, tx_sz, DCT_DCT, dc_q, ac_q, coeffs, pred, ps, s, ss, 0, qm_level, false,
             );
-            self.optimize(w, coeffs, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, false);
+            self.optimize(w, coeffs, s, ss, tx_sz, DCT_DCT, 0, dc_q, ac_q, qm_level, lam, false);
             return;
         }
         let mask = self.tx_mask(w, tw, th, ac_q, false, in_set);
@@ -722,7 +739,7 @@ impl TxbHook for QuantHook<'_> {
         t.tx_type = best_type as u8;
         coeffs.copy_from_slice(&best[..n]);
         self.collect_sample(w, tw, th, ac_q, false, best_type, tx_sz);
-        self.optimize(w, coeffs, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
+        self.optimize(w, coeffs, s, ss, tx_sz, best_type, 0, dc_q, ac_q, qm_level, lam, true);
     }
 }
 
