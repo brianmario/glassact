@@ -94,6 +94,7 @@ impl CoeffCosts {
 }
 
 /// Bits of the levels above 2 at a coefficient: the BR symbols and the Golomb remainder.
+#[cfg(test)]
 #[inline(always)]
 fn high_bits(cc: &CoeffCosts, bri: usize, l: i32) -> f32 {
     if l <= NUM_BASE_LEVELS {
@@ -142,12 +143,244 @@ fn eob_bits(cc: &CoeffCosts, multi: usize, ptype: usize, ectx: usize, tx_sz_ctx:
 /// [`optimize`]'s level map: a 32x32's, padded by 4 to the right and below.
 pub(crate) const LEV: usize = (32 + 4) * (32 + 4);
 
+/// One tx block's fixed parts: the cost rows its contexts index and its level map's geometry.
+struct Blk<'a> {
+    /// coeff_base's 42 contexts, coeff_base_eob's 4 and coeff_br's 21, of the block's size and plane
+    base: &'a [[f32; 4]],
+    base_eob: &'a [[f32; 3]],
+    br: &'a [[f32; 4]],
+    base_ctx_off: &'a [[u8; 5]; 5],
+    bwl: usize,
+    width: usize,
+    /// the level map's row stride
+    ls: usize,
+    area: i32,
+    /// Sig_Ref_Diff_Offset's 5 neighbours as level map offsets; Mag_Ref_Offset's 3 are the first 3
+    /// in every class
+    off: [usize; 5],
+}
+
+/// A coefficient's (coeff_base, coeff_br) contexts from the levels decided so far (the writer's
+/// get_coeff_base_ctx and get_br_ctx; the level map holds min(|level|, 15), so the BR sum's min(15)
+/// is the map's own).
+#[inline(always)]
+fn ctxs<const CLASS: i32>(b: &Blk<'_>, lev: &[u8], pos: usize) -> (usize, usize) {
+    let (row, col) = (pos >> b.bwl, pos & (b.width - 1));
+    let lp = row * b.ls + col;
+    let a: [u8; 5] = core::array::from_fn(|k| lev[lp + b.off[k]]);
+    let sig = a.iter().map(|&x| x.min(3) as u32).sum::<u32>();
+    let mut bctx = ((sig + 1) >> 1).min(4) as usize;
+    if CLASS == TX_CLASS_2D {
+        bctx = if pos == 0 { 0 } else { bctx + b.base_ctx_off[row.min(4)][col.min(4)] as usize };
+    } else {
+        let id = if CLASS == TX_CLASS_VERT { row } else { col };
+        bctx += Coeff_Base_Pos_Ctx_Offset[id.min(2)] as usize;
+    }
+    let mag = (a[0] as u32 + a[1] as u32 + a[2] as u32 + 1) >> 1;
+    let mag = mag.min(6) as usize;
+    let near = if CLASS == TX_CLASS_2D {
+        row < 2 && col < 2
+    } else if CLASS == TX_CLASS_HORIZ {
+        col == 0
+    } else {
+        row == 0
+    };
+    let brctx = if pos == 0 {
+        mag
+    } else if near {
+        mag + 7
+    } else {
+        mag + 14
+    };
+    (bctx, brctx)
+}
+
+/// A level's bits at scan position `c` with its contexts (the last: coeff_base_eob), sign
+/// included; the same sums in the same order as [`optimize_ref`]'s.
+#[inline(always)]
+fn bits_at(b: &Blk<'_>, (bctx, brctx): (usize, usize), c: usize, last: bool, l: i32) -> f32 {
+    if l == 0 {
+        return b.base[bctx][0];
+    }
+    let base = if last {
+        let c = c as i32;
+        let e = if c == 0 {
+            0
+        } else if c <= b.area / 8 {
+            1
+        } else if c <= b.area / 4 {
+            2
+        } else {
+            3
+        };
+        b.base_eob[e][(l.min(3) - 1) as usize]
+    } else {
+        b.base[bctx][l.min(3) as usize]
+    };
+    base + high_bits_row(&b.br[brctx], l) + 1.0
+}
+
+/// [`high_bits`] from the coefficient's coeff_br cost row.
+#[inline(always)]
+fn high_bits_row(br: &[f32; 4], l: i32) -> f32 {
+    if l <= NUM_BASE_LEVELS {
+        return 0.0;
+    }
+    let mut b = 0f32;
+    let mut rem = l - (NUM_BASE_LEVELS + 1);
+    for _ in 0..COEFF_BASE_RANGE / (BR_CDF_SIZE - 1) {
+        let k = rem.min(BR_CDF_SIZE - 1);
+        b += br[k as usize];
+        rem -= k;
+        if k < BR_CDF_SIZE - 1 {
+            break;
+        }
+    }
+    if l > NUM_BASE_LEVELS + COEFF_BASE_RANGE {
+        let x = (l - NUM_BASE_LEVELS - COEFF_BASE_RANGE) as u32;
+        b += (2 * (31 - x.leading_zeros()) + 1) as f32;
+    }
+    b
+}
+
 /// Optimizes the levels `q` (a tw x th tx block of `tx_sz`, `tx_type`, plane `plane`) quantized from
+/// the transform coefficients `v` with dequantization `step(i) / den`: `dist` is the sample-domain
+/// SSE of a unit coefficient error, `lambda` the weight of a bit. `lev` is scratch (its contents
+/// don't matter: the part the block reads is cleared). The same levels as [`optimize_ref`], with
+/// the contexts' class a constant and each coefficient's neighbours read once
+/// (`optimize_matches_the_reference`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize(
+    lev: &mut [u8; LEV],
+    cc: &CoeffCosts,
+    q: &mut [i16],
+    v: &[f32],
+    tx_sz: i32,
+    tx_type: i32,
+    plane: usize,
+    dc_step: f32,
+    ac_step: f32,
+    den: f32,
+    dist: f32,
+    lambda: f32,
+) {
+    match tx_class(tx_type) {
+        TX_CLASS_2D => optimize_c::<TX_CLASS_2D>(lev, cc, q, v, tx_sz, tx_type, plane, dc_step, ac_step, den, dist, lambda),
+        TX_CLASS_HORIZ => {
+            optimize_c::<TX_CLASS_HORIZ>(lev, cc, q, v, tx_sz, tx_type, plane, dc_step, ac_step, den, dist, lambda)
+        }
+        _ => optimize_c::<TX_CLASS_VERT>(lev, cc, q, v, tx_sz, tx_type, plane, dc_step, ac_step, den, dist, lambda),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimize_c<const CLASS: i32>(
+    lev: &mut [u8; LEV],
+    cc: &CoeffCosts,
+    q: &mut [i16],
+    v: &[f32],
+    tx_sz: i32,
+    tx_type: i32,
+    plane: usize,
+    dc_step: f32,
+    ac_step: f32,
+    den: f32,
+    dist: f32,
+    lambda: f32,
+) {
+    let tsz = tx_sz as usize;
+    let scan = get_scan(tx_sz, tx_type);
+    let n = scan.len().min(q.len());
+    let scan = &scan[..n];
+    let Some(last) = scan.iter().rposition(|&pos| q[pos as usize] != 0) else { return };
+    let mut eob = last + 1;
+    let ptype = (plane > 0) as usize;
+    let tx_sz_ctx = (Tx_Size_Sqr[tsz] as usize + Tx_Size_Sqr_Up[tsz] as usize + 1) >> 1;
+    let brsz = tx_sz_ctx.min(TX_32X32 as usize);
+    let multi = ((Tx_Width_Log2[tsz] as i32).min(5) + (Tx_Height_Log2[tsz] as i32).min(5) - 4) as usize;
+    let ectx = (CLASS != TX_CLASS_2D) as usize;
+    let adj = Adjusted_Tx_Size[tsz] as usize;
+    let bwl = Tx_Width_Log2[adj] as usize;
+    let (width, height) = (1usize << bwl, Tx_Height[adj] as usize);
+    let ls = width + 4;
+    // the levels decided so far and their padding: what the contexts read (rows up to 4 below the
+    // block's last, columns up to 4 right of its last, inside a row of `ls`)
+    let lev = &mut lev[..(height + 4) * ls];
+    lev.fill(0);
+    let sig = &Sig_Ref_Diff_Offset[CLASS as usize];
+    let bi = (tx_sz_ctx * 2 + ptype) * 42;
+    let ei = (tx_sz_ctx * 2 + ptype) * 4;
+    let ri = (brsz * 2 + ptype) * 21;
+    let b = Blk {
+        base: &cc.base[bi..bi + 42],
+        base_eob: &cc.base_eob[ei..ei + 4],
+        br: &cc.br[ri..ri + 21],
+        base_ctx_off: &Coeff_Base_Ctx_Offset[tsz],
+        bwl,
+        width,
+        ls,
+        area: (height << bwl) as i32,
+        off: core::array::from_fn(|k| sig[k][0] as usize * ls + sig[k][1] as usize),
+    };
+    let derr = |pos: usize, l: i32| {
+        let e = v[pos].abs() - l as f32 * if pos == 0 { dc_step } else { ac_step } / den;
+        e * e * dist
+    };
+    let lp_of = |pos: usize| (pos >> bwl) * ls + (pos & (width - 1));
+    // reverse scan: each nonzero level against one lower
+    for c in (0..eob).rev() {
+        let pos = scan[c] as usize;
+        let l = (q[pos] as i32).abs();
+        if l == 0 {
+            continue;
+        }
+        let last = c == eob - 1;
+        if !(last && l == 1) {
+            // one lower (a 2 straight to nothing measured the same: BENCHMARKS)
+            let cx = ctxs::<CLASS>(&b, lev, pos);
+            let j0 = derr(pos, l) + lambda * bits_at(&b, cx, c, last, l);
+            let j1 = derr(pos, l - 1) + lambda * bits_at(&b, cx, c, last, l - 1);
+            if j1 < j0 {
+                let nl = l - 1;
+                q[pos] = (if q[pos] < 0 { -nl } else { nl }) as i16;
+            }
+        }
+        lev[lp_of(pos)] = (q[pos] as i32).abs().min(15) as u8;
+    }
+    // the end of block: drop a last level of 1 while that pays (never the block's only level)
+    let level_bits = |lev: &[u8], pos: usize, c: usize, last: bool, l: i32| bits_at(&b, ctxs::<CLASS>(&b, lev, pos), c, last, l);
+    loop {
+        let pos = scan[eob - 1] as usize;
+        if (q[pos] as i32).abs() != 1 {
+            break;
+        }
+        let Some(prev) = scan[..eob - 1].iter().rposition(|&p| q[p as usize] != 0) else { break };
+        let ppos = scan[prev] as usize;
+        let pl = (q[ppos] as i32).abs();
+        // with it: its own bits and the end at eob; the previous level coded as a plain one
+        lev[lp_of(pos)] = 1;
+        let r_with = eob_bits(cc, multi, ptype, ectx, tx_sz_ctx, eob as i32)
+            + level_bits(lev, pos, eob - 1, true, 1)
+            + (prev + 1..eob - 1).map(|c| level_bits(lev, scan[c] as usize, c, false, 0)).sum::<f32>()
+            + level_bits(lev, ppos, prev, false, pl);
+        lev[lp_of(pos)] = 0;
+        let r_without = eob_bits(cc, multi, ptype, ectx, tx_sz_ctx, prev as i32 + 1) + level_bits(lev, ppos, prev, true, pl);
+        let dj = derr(pos, 0) - derr(pos, 1) + lambda * (r_without - r_with);
+        if dj >= 0.0 {
+            break;
+        }
+        q[pos] = 0;
+        eob = prev + 1;
+    }
+}
+
+/// [`optimize`]'s reference (its first version, kept for the tests): optimizes the levels `q` (a tw x th tx block of `tx_sz`, `tx_type`, plane `plane`) quantized from
 /// the transform coefficients `v` with dequantization `step(i) / den`: `dist` is the sample-domain
 /// SSE of a unit coefficient error, `lambda` the weight of a bit. `lev` is scratch (its contents
 /// don't matter: the part the block reads is cleared).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize(
+#[cfg(test)]
+pub(crate) fn optimize_ref(
     lev: &mut [u8; LEV],
     cc: &CoeffCosts,
     q: &mut [i16],
@@ -341,6 +574,113 @@ mod tests {
                     }
                     assert_eq!(before.iter().any(|&x| x != 0), q.iter().any(|&x| x != 0), "tx {tx_sz} type {tx_type}: emptied");
                 }
+            }
+        }
+    }
+
+    /// Random quantized blocks of every tx size and type (sparse to dense, small to large levels,
+    /// a few coefficients far over or under their level), at several quantizers, gains and lambdas,
+    /// for each plane type: the same levels as the reference, from the same scratch either way.
+    #[test]
+    fn optimize_matches_the_reference() {
+        let mut r = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let costs = [CoeffCosts::new(20), CoeffCosts::new(80), CoeffCosts::new(200)];
+        let (mut lev, mut lev_ref) = ([0u8; LEV], [0u8; LEV]);
+        let mut checked = 0;
+        for case in 0..60_000 {
+            let tx_sz = (rnd() % TX_SIZES_ALL as u64) as i32;
+            let tx_type = (rnd() % 16) as i32;
+            let n = crate::dsp::tx_coeffs(tx_sz);
+            if crate::dsp::get_scan(tx_sz, tx_type).len() < n {
+                continue;
+            }
+            let cc = &costs[case % 3];
+            let plane = (rnd() % 2) as usize;
+            let step = 4.0 + (rnd() % 400) as f32;
+            let den = [1.0f32, 2.0, 4.0][(rnd() % 3) as usize];
+            let dc_step = step * (0.8 + (rnd() % 40) as f32 / 100.0);
+            let dist = (1 + rnd() % 64) as f32 / 64.0;
+            let lambda = 0.12 * step * step / 64.0 * (0.25 + (rnd() % 16) as f32 / 4.0);
+            let density = 1 + rnd() % 16;
+            let big = rnd() % 4 == 0;
+            let mut v = vec![0f32; n];
+            let mut q = vec![0i16; n];
+            for i in 0..n {
+                let x = rnd();
+                if x % 16 < density {
+                    let a = if big { (x >> 8) % 600 } else { (x >> 8) % 8 } as f32 + ((x >> 20) % 1000) as f32 / 1000.0;
+                    let s = if i == 0 { dc_step } else { step } / den;
+                    let l = (a + 0.45).floor();
+                    q[i] = (if x >> 40 & 1 == 0 { l } else { -l }) as i16;
+                    v[i] = (if x >> 40 & 1 == 0 { a } else { -a }) * s;
+                }
+            }
+            let mut q_ref = q.clone();
+            optimize(&mut lev, cc, &mut q, &v, tx_sz, tx_type, plane, dc_step, step, den, dist, lambda);
+            optimize_ref(&mut lev_ref, cc, &mut q_ref, &v, tx_sz, tx_type, plane, dc_step, step, den, dist, lambda);
+            assert_eq!(q, q_ref, "case {case}: tx {tx_sz} type {tx_type} plane {plane}");
+            checked += 1;
+        }
+        assert!(checked > 20_000);
+    }
+
+    /// RDOQ per call on q20's steps, the new against the reference (`--ignored`).
+    #[test]
+    #[ignore]
+    fn bench_optimize() {
+        let cc = CoeffCosts::new(80);
+        let mut r = 0x1234_5678u64;
+        let mut rnd = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let mut lev = [0u8; LEV];
+        for (name, tx_sz, tx_type, density) in [
+            ("4x4 DCT", TX_4X4, DCT_DCT, 8),
+            ("8x8 DCT", TX_8X8, DCT_DCT, 6),
+            ("16x16 DCT", TX_16X16, DCT_DCT, 3),
+            ("32x32 DCT", TX_32X32, DCT_DCT, 2),
+            ("16x16 IDTX", TX_16X16, IDTX, 4),
+            ("8x8 V_DCT", TX_8X8, V_DCT, 6),
+        ] {
+            let n = crate::dsp::tx_coeffs(tx_sz);
+            let step = 50.0f32;
+            let blocks: Vec<(Vec<i16>, Vec<f32>)> = (0..64)
+                .map(|_| {
+                    let mut v = vec![0f32; n];
+                    let mut q = vec![0i16; n];
+                    for i in 0..n {
+                        let x = rnd();
+                        if x % 16 < density {
+                            let a = ((x >> 8) % 6) as f32 + ((x >> 20) % 1000) as f32 / 1000.0;
+                            let l = (a + 0.45).floor();
+                            q[i] = l as i16;
+                            v[i] = a * step;
+                        }
+                    }
+                    (q, v)
+                })
+                .collect();
+            let lambda = 0.12 * step * step / 64.0;
+            let iters = 4_000_000 / n;
+            for (which, f) in [("ref", optimize_ref as fn(&mut [u8; LEV], &CoeffCosts, &mut [i16], &[f32], i32, i32, usize, f32, f32, f32, f32, f32)), ("new", optimize)] {
+                let mut q = vec![0i16; n];
+                let t = std::time::Instant::now();
+                for i in 0..iters {
+                    let (q0, v) = &blocks[i % 64];
+                    q.copy_from_slice(q0);
+                    f(&mut lev, &cc, &mut q, v, tx_sz, tx_type, 0, step, step, 1.0, 1.0 / 8.0, lambda);
+                    std::hint::black_box(&q);
+                }
+                println!("{name} {which}: {:.1} ns", t.elapsed().as_nanos() as f64 / iters as f64);
             }
         }
     }
