@@ -152,10 +152,13 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public func search(params: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], source: [UnsafePointer<UInt8>],
                        sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
-                       direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true) throws -> Search {
+                       direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true,
+                       cdef: Bool = true) throws -> Search {
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
+        // (`cdef` false: as libaom at qindex 32 and under, one all-zero preset, signalled but inactive)
+        if !cdef { tf.cdef_mode = 0 }
         let level = UInt8(tf.lf_level), mono = fp.monochrome != 0
         fp.loop_filter_level = (level, level, mono ? 0 : level, mono ? 0 : level)
         fp.loop_filter_sharpness = UInt8(tf.lf_sharpness)

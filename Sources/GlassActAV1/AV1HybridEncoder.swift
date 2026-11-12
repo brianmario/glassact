@@ -350,8 +350,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public struct NewPictureEffort: Sendable, Equatable {
         /// The picture's qindex against the stream's (positive: coarser), clamped to 1…255.
         public var qindexDelta = 0
-        /// Search the coded 64×64s for motion (false: copies only, as `searchesMotion` off).
+        /// Search the coded 64×64s for motion (false: copies only, as `searchesMotion` off), in the
+        /// first `motionlessRun` mostly-new pictures in a row. A switch's picture is new against
+        /// the last (its search finds 0–2 % of it: BENCHMARKS), but a run of mostly-new pictures is
+        /// motion (video, scrolling new images: 25–97 %), which only the search finds: without it
+        /// a scroll of new images costs 2.5× (BENCHMARKS "the motion-search skip after a switch").
         public var searchesMotion = true
+        /// See `searchesMotion` (1: a run's first picture alone).
+        public var motionlessRun = 1
         /// The closed loop's luma tx type search (false: DCT_DCT, as `searchesTxTypes` off).
         public var searchesTxTypes = true
         /// RDOQ (false: the dead-zone quantizer's levels, as `usesRDOQ` off).
@@ -360,15 +366,31 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var rdoqMinCoefficients: Int?
         /// The analysis's shapes, learned pruning's level and mode eps (nil: the encoder's).
         public var analysis = AV1MetalEncoder.NewPictureAnalysis()
+        /// CDEF (false: none in this picture, its search skipped; deblocking stays).
+        public var cdef = true
         /// Only the first this many mostly-new pictures in a row (nil: every one). A screen switch
         /// is one mostly-new picture after quiet ones, which the next pictures copy and the tiles
         /// settle; video or scrolling new images make every picture mostly new, and their softness
         /// would last as long as the motion does.
         public var runLimit: Int?
-        /// The measured levels (nil above the last): 1 the cheapest in quality, higher faster.
+        /// The measured levels (nil above the last; 0 changes nothing), each with its qindex offset
+        /// calibrated on 5K pictures that are all new to hold the default's bytes (BENCHMARKS "a
+        /// mostly-new picture coded fast"):
+        /// 1. learned pruning looser (levels eps 0.05, modes 0.10) and RDOQ from 17 coefficients:
+        ///    the analysis's cheapest cuts, about free in quality; +1.
+        /// 2. and no motion search in a run's first picture (a switch's): +4.
+        /// 3. and no luma tx type search or RDOQ in the closed loop: its largest cut; +12.
+        /// 4. and no CDEF: +12.
         public static func level(_ n: Int) -> NewPictureEffort? {
+            let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10)
             switch n {
             case 0: return NewPictureEffort()
+            case 1: return NewPictureEffort(qindexDelta: 1, rdoqMinCoefficients: 17, analysis: cheap)
+            case 2: return NewPictureEffort(qindexDelta: 4, searchesMotion: false, rdoqMinCoefficients: 17, analysis: cheap)
+            case 3, 4:
+                var e = NewPictureEffort(qindexDelta: 12, searchesMotion: false, searchesTxTypes: false, usesRDOQ: false, analysis: cheap)
+                e.cdef = n == 3
+                return e
             default: return nil
             }
         }
@@ -383,7 +405,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
     /// Whether an inter frame with these copies takes `newPictureEffort`, given `run`: the
     /// mostly-new pictures in a row before it (counted here, in the stream's order).
-    private func takesEffort(_ copies: Copies, run: inout Int) -> Bool {
+    private func takesEffort(_ copies: inout Copies, run: inout Int) -> Bool {
         guard interFrames, let effort = newPictureEffort, let skip = copies.skip else {
             run = 0
             return false
@@ -393,7 +415,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             return false
         }
         run += 1
-        return effort.runLimit.map { run <= $0 } ?? true
+        guard effort.runLimit.map({ run <= $0 }) ?? true else { return false }
+        if !effort.searchesMotion && run <= effort.motionlessRun { copies.candidates = nil }
+        return true
     }
 
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
@@ -647,9 +671,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
             var copies = interFrames ? copyFinder.wait() : Copies()
             if interFrames { rule.decide(1, &copies, rule: motionSkip, lookback: motionSkipLookback) }
-            let fast = takesEffort(copies, run: &newRun)
+            let fast = takesEffort(&copies, run: &newRun)
             let q = qindexOf(1, fast: fast)
-            if fast, newPictureEffort?.searchesMotion == false { copies.candidates = nil }
             let first = pending.read
             starting = Later { [copies] in
                 var p = try self.begin(next, copies, qindex: q, fast: fast)
@@ -678,8 +701,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     var copies = interFrames ? copyFinder.wait() : Copies()
                     if interFrames { rule.decide(i + 2, &copies, rule: motionSkip, lookback: motionSkipLookback) }
                     let before = starting
-                    let fast = takesEffort(copies, run: &newRun)
-                    if fast, newPictureEffort?.searchesMotion == false { copies.candidates = nil }
+                    let fast = takesEffort(&copies, run: &newRun)
                     let q = qindexOf(i + 2, fast: fast), g = gate(i + 2)
                     following = Later { [copies] in
                         let previous = try before?.wait()
@@ -1400,7 +1422,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            sourceBuffers: analysisSource.isEmpty ? nil : partition.source,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
-                                           cropsOutput: returnsPlanes)
+                                           cropsOutput: returnsPlanes, cdef: !fast || newPictureEffort?.cdef != false)
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         Self.trace("filters end")

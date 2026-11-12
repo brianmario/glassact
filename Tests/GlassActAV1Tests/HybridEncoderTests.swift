@@ -735,7 +735,8 @@ extension HybridEncoderTests {
     /// `newPictureEffort`: a stream of a scene whose photo drifts, broken twice by three pictures
     /// of stripes (each new), takes the fast levers (no motion search, no tx type search, no RDOQ,
     /// no 4x4s, looser learned pruning) and a coarser qindex in the first two mostly-new pictures
-    /// of each run (`runLimit`) and in no other, the levers switched frame by frame; libaom decodes
+    /// of each run (`runLimit`) and in no other, without the motion search in the first alone
+    /// (`motionlessRun`), the levers switched frame by frame; libaom decodes
     /// the stream in order to exactly the pictures the encoder reports. An effort that changes
     /// nothing codes the stream without one, byte for byte.
     @available(macOS 27, *)
@@ -781,7 +782,8 @@ extension HybridEncoderTests {
             if t.fast { fast.append(i) }
             if i > 0 {
                 #expect(Int(f.params.base_q_idx) == (t.fast ? qindex + 24 : qindex), "frame \(i): qindex \(f.params.base_q_idx)")
-                if t.fast { #expect(!t.searchedMotion && t.searched == 0, "frame \(i): searched for motion") }
+                // (the motion search off in a run's first picture alone: `motionlessRun`)
+                #expect(t.searchedMotion == ![5, 11].contains(i), "frame \(i): searched for motion: \(t.searchedMotion)")
             }
             var frame = glassact_aom_frame()
             try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")
