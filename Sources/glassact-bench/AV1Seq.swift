@@ -34,7 +34,7 @@ let av1SeqCommand = Command(
         .string("deltas-up-to", "<share>", "search angle deltas only in pictures that analyze at most this share of their superblocks (0–1; default 0.5; 1: always)"),
         .bool("inter", "inter frames after the first: 64x64s that are exact copies of the previous picture (unchanged, scrolled, dragged) as skip inter blocks, the rest intra or motion-searched"),
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
-        .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip)"),
+        .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default the encoder's, 0.2,8); off: every inter frame searches"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),
@@ -47,7 +47,7 @@ let av1SeqCommand = Command(
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
         .bool("no-golden", "with --inter: inter frames copy only the picture before them, not GOLDEN_FRAME (a long-term picture: the end of a scene left)"),
-        .int("key-delta", "<n>", -255...255, "the key frame's qindex this much from the inter frames' (AV1HybridEncoder.keyFrameQindexDelta; default 0; negative: finer)"),
+        .int("key-delta", "<n>", -255...255, "the key frame's qindex this much from the inter frames' (AV1HybridEncoder.keyFrameQindexDelta; default the encoder's, -16; negative: finer)"),
         .bool("per-frame", "with --score-rgb: also each frame's bytes, RGB PSNR and SSIMULACRA2 (where scored), the hybrid's and libaom's, as lines \"frame <who> <i> <bytes> <psnr> <ssimulacra2 or ->\""),
         .int("long-term", "<n>", 1...7, "with --inter: long-term pictures kept for GOLDEN_FRAME (default the encoder's; 1: the end of the last scene left)"),
         .string("crop", "<w>x<h>+<x>+<y>", "code this rectangle of the trace's frames at their own size (not with --width or --score-rgb)"),
@@ -190,7 +190,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.goldenFrames = !opts.has("no-golden")
     if opts.has("long-term") { encoder.longTermReferences = opts.int("long-term", 1) }
-    encoder.keyFrameQindexDelta = opts.int("key-delta", 0)
+    if opts.has("key-delta") { encoder.keyFrameQindexDelta = opts.int("key-delta", 0) }
     encoder.searchesAngleDeltas = !opts.has("no-deltas")
     if opts.has("no-ml-prune") {
         encoder.learnedPrune = nil
@@ -240,11 +240,13 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     encoder.streamSize = stream
     encoder.searchesMotion = !opts.has("no-motion-search")
-    if let v = opts.string("motion-skip") {
+    if let v = opts.string("motion-skip"), v == "off" {
+        encoder.motionSkip = nil
+    } else if let v = opts.string("motion-skip") {
         let parts = v.split(separator: ",").map(String.init)
         guard (2...3).contains(parts.count), let share = Double(parts[0]), (0...1).contains(share),
               let every = Int(parts[1]), every >= 1, let k = parts.count > 2 ? Int(parts[2]) : 2, k >= 1
-        else { throw BenchError("--motion-skip \(v): <share 0-1>,<every >= 1>[,<k >= 1>]") }
+        else { throw BenchError("--motion-skip \(v): <share 0-1>,<every >= 1>[,<k >= 1>], or off") }
         encoder.motionSkip = (share, every)
         encoder.motionSkipLookback = k
     }
@@ -387,7 +389,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
     if let rgb { print(rgb.summary(stream.map { "hybrid at \(width)×\(height) shown at \($0.width)×\($0.height)" } ?? "hybrid")) }
     if let rgb, opts.has("per-frame") { rgb.printFrames("hybrid", bytes: frames.map(\.obu.count)) }
-    if encoder.keyFrameQindexDelta != 0 {
+    if encoder.keyFrameQindex(qindex) != qindex {
         print("             key frame at qindex \(encoder.keyFrameQindex(qindex)), inter frames at \(qindex)")
     }
     if let path = opts.string("ivf") {

@@ -276,9 +276,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// what they coded (`Timing.motionFound`); after `recheckEvery - 1` skipped in a row, one
     /// searches again, so motion returning is seen. A frame's search is set up while the one
     /// before it is analyzed, so frame i decides from frames up to i - 2. After a key frame (or
-    /// a size change) the first frames search. It trades bytes for the search's GPU time (the
-    /// motion search and the inter candidates). Nil (the default): every inter frame searches.
-    public var motionSkip: (threshold: Double, recheckEvery: Int)?
+    /// a size change) the first frames search. It saves the search's GPU time (the motion search
+    /// and the inter candidates) on frames that would find nothing; on by default at 0.2,
+    /// re-checking every 8th frame, which lost no bytes on any content measured (BENCHMARKS "no
+    /// motion search after frames whose search found nothing"). Nil: every inter frame searches.
+    public var motionSkip: (threshold: Double, recheckEvery: Int)? = (threshold: 0.2, recheckEvery: 8)
     /// With `motionSkip`: how many frames that searched must all have found less than its
     /// threshold (2).
     public var motionSkipLookback = 2
@@ -349,18 +351,21 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var longTermReferences = 4 {
         didSet { longTermReferences = min(7, max(1, longTermReferences)) }
     }
-    /// Key frames' qindex against the one `encode` is given (0, the default: the same; negative:
-    /// finer). Without `interFrames` every picture is a key frame. Everything a frame derives
+    /// With `interFrames`: the stream's key frames' qindex against the one `encode` is given
+    /// (-16, the default; 0: the same; negative: finer). Everything a frame derives
     /// from its qindex follows its own: the analysis's lambda and learned pruning, the closed
     /// loop's quantizer and RDOQ, deblocking and CDEF. Clamped to 1…255 (a qindex of 0,
     /// lossless, stays 0). A key frame coded finer than the inter frames that copy from it for
     /// long passes its quality on to them (BENCHMARKS "libaom's lead at low rates"); the first
     /// inter frame after it analyzes all its 64×64s (the analysis kept is a picture's at one qindex).
-    public var keyFrameQindexDelta = 0
+    /// -16 keeps the key frame at 1.1–1.4× (its size is latency on a session's start or a repair)
+    /// for 5–10 % fewer bytes over streams that return to it (BENCHMARKS "key frames at a finer
+    /// qindex"). Pictures coded alone (no `interFrames`) take the qindex given: nothing copies them.
+    public var keyFrameQindexDelta = -16
 
     /// A key frame's qindex, for frames at `qindex` (`keyFrameQindexDelta`).
     public func keyFrameQindex(_ qindex: Int) -> Int {
-        qindex <= 0 || keyFrameQindexDelta == 0 ? qindex : min(255, max(1, qindex + keyFrameQindexDelta))
+        qindex <= 0 || keyFrameQindexDelta == 0 || !interFrames ? qindex : min(255, max(1, qindex + keyFrameQindexDelta))
     }
 
     /// The long-term pictures' decoded planes (tight) by AV1 slot ([] where there's none), for the
