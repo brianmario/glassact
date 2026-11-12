@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
 | Long-term references: up to N scenes' last pictures kept, GOLDEN_FRAME the one that matches best each frame (`metal-av1`, `longTermReferences`, `av1seq --long-term`) | kept, on (N = 4) | against N = 1 (today's rule): four traces in turn −49 % (2900) and −70 % (5K); app switching −33 %; tabs −0.9 %, windows −1.5 %, two screens in turn 0; finder time no higher (5K rotation 19.5 → 8–11 ms); +44 MB a slot at 5K | [entry](#metal-av1-long-term-references-golden_frame-the-stored-picture-that-matches-best-2026-11-11) |
 | Where libaom's lead at q26–40 on the four-trace rotation at 2900 comes from (`metal-av1`, per-block counts) | measured; a reference policy is the lever | libaom keeps its key frame as GOLDEN_FRAME for the whole run and the rotation returns to its first trace every 4th picture; our GOLDEN is the picture before last; with GOLDEN kept on the key frame (a test) ours is −21.8 % against libaom at q20–40, and on the pictures libaom codes without GOLDEN ours is −20 % at every q | [entry](#metal-av1-where-libaoms-lead-at-low-rates-comes-from-its-long-term-reference-2026-11-11) |
 | Palette blocks with a residual, chosen by real cost before the closed loop (`metal-av1`, branch `palette-residual`, `av1seq --palette`) | measured, not adopted; the owner's choice | −0.1 to −0.9 % BD-rate (2900 and 5K) for 4–7 ms more CPU a 2900 picture (inter frames a second 64–81 → 45–60 on new content); libaom's lead at q26–40 on new pictures is untouched (q40: 109.1 KB, 33.95 dB against its 124.4 KB, 35.55 dB) and so isn't its palette | [entry](#metal-av1-palette-with-a-residual-by-real-cost-measured-not-adopted-2026-11-11) |
@@ -310,6 +311,53 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the level model's q20 loss at eps 0.05, explained (2026-11-11)
+
+The levers table of 2026-11-09 left one point open. With the shipped level model at
+`--ml-eps 0.05`, the rotation at 5K lost 0.6 dB at q20 at the same bytes. It still does at
+today's default (long-term references): 44.51 → 43.89 dB, BD-rate +1.80 % / +1.15 % over q 8–32.
+At 2900 it doesn't appear (+0.08 % / +0.19 %).
+
+**Where it is.** Six of the 12 frames carry it: the key frame (−1.43 dB), and every later picture
+of the same two traces (−1.38, −1.41 dB), each lost again by its own analysis, not inherited. In
+each, about 70 of 3600 64x64s hold 96–99 % of the extra error, in two adjacent rows of 64x64s. Each
+has one horizontal edge in its top 8 rows across a two-value area. At 0.05 all 64 cells keep only
+the 64 level, so the analysis offers nothing but a 64x64 block, which rings down its whole height:
+≈ 100 K of squared error against 576. At 0.02 the cells also keep the 32 level (32x16 and 32x32
+blocks), and the full search splits the edge into 8x4s and 8x8s.
+
+**Why.** The model is confidently wrong on the edge's cell (p(64) = 0.986), and the flat cells
+below it give 0.95–0.97. A level is searched where any cell keeps it, and in every one of these
+64x64s the least sure cell sits at 1 − p(64) = 0.049. The features scale with the quantizer
+(log(1 + v / step²)), so those probabilities drift with q, and all of a 64x64's cells are over
+0.95 only for q18–20. All 70 64x64s have the same pattern, so they cross together. Mean PSNR at
+eps 0.05 against 0.02, by q:
+
+| q | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
+|---|---|---|---|---|---|---|---|
+| change (dB) | −0.04 | −0.69 | −0.66 | −0.62 | −0.04 | −0.03 | −0.03 |
+
+Checked again at the default: q19 46.76 → 45.98 dB, and q22 45.85 → 45.80, at the same bytes.
+`k_ml_tree`'s repair plays no part (nothing below needs repairing), and neither do the quantizer
+tables (the probabilities move smoothly).
+
+**The retrained weights** (eleven traces, not installed) give the edge's cell p(32) of 0.10–0.17 at
+every q, so none of these 64x64s is narrowed to 64x64s alone. BD-rate on the rotation, 12 frames,
+q 8–32, against the shipped weights at 0.02:
+
+| | retrained at 0.02 | retrained at 0.05 | shipped at 0.05 |
+|---|---|---|---|
+| 5K, `--long-term 1` | +0.01 % / +0.04 % | +0.24 % / +0.26 % | +1.85 % / +1.31 % |
+| 5K, today's default | −0.04 % / −0.09 % | +0.24 % / +0.19 % | +1.80 % / +1.15 % |
+| 2900, today's default | −0.02 % / +0.07 % | −0.02 % / +0.07 % | +0.08 % / +0.19 % |
+
+The retrained model's own least sure cell in these 64x64s is at 0.054–0.116, so a window like this
+could exist for it on other content. Any eps above 0.02 should be checked with a q scan in steps
+of 1. A guard independent of the model, never a 64x64 alone where one of its cells isn't flat,
+would change bytes only where it fires; it isn't built. From the levers table, the retrained
+weights cost GPU time at 0.02 (23.0 → 23.8 ms, keeping more 16x16s and up) and save some at 0.05
+(22.6). Installing them is a speed choice.
 
 ### Metal AV1: long-term references, GOLDEN_FRAME the stored picture that matches best (2026-11-11)
 
