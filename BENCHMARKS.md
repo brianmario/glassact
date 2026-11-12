@@ -242,6 +242,7 @@ the numbers and the reasoning.
 | k_inter's candidates side by side and the source read once (`metal-av1`) | kept | inter candidates 3.82 → 2.59 ms on new 5K pictures, the same streams | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | k_leaf without the luma tx search's threadgroup memory; no mode screening where learned pruning leaves one mode (`metal-av1`) | measured, not kept | the same streams and no measurable time: leaves 2.87 → 2.82 ms within run-to-run noise of ±0.1, 32x32 and 64x64 analysis unchanged | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
+| Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, off by default; the owner's choice | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
 | No motion search after frames whose search found nothing, re-checked every M frames (`metal-av1`, `motionSkip`, `av1seq --motion-skip <share>,<every>`) | kept, off by default; the owner's choice | at 0.2,8: the default rotation at 5K skips 11 of 15 inter frames at the same bytes (141.6 KB, 46.39 dB), −5.7 ms of GPU a skipped picture; two screens in turn −0.15 %; scrolling, dragging, video, scrolling images and app switching skip nothing (streams unchanged); every picture new without long-term references +2.4 % | [entry](#metal-av1-no-motion-search-after-frames-whose-search-found-nothing-2026-11-11) |
 | The shipped level model's 0.6 dB loss at q20 with `--ml-eps 0.05`, explained (`metal-av1`) | measured; not a bug | the model is confidently wrong (p(64) = 0.986) on 64x64s whose top rows hold one edge across a two-value area; for q18–20 only, every cell of such a 64x64 lands above 0.95, so at 0.05 it is searched as a 64x64 alone and rings (q19: 46.76 → 45.98 dB at the same bytes); the retrained weights don't (5K: −0.04 % / −0.09 % at 0.02, +0.24 % at 0.05 against +1.80 %); check any eps change with a q scan in steps of 1 | [entry](#metal-av1-the-level-models-q20-loss-at-eps-005-explained-2026-11-11) |
 | Long-term references: up to N scenes' last pictures kept, GOLDEN_FRAME the one that matches best each frame (`metal-av1`, `longTermReferences`, `av1seq --long-term`) | kept, on (N = 4) | against N = 1 (today's rule): four traces in turn −49 % (2900) and −70 % (5K); app switching −33 %; tabs −0.9 %, windows −1.5 %, two screens in turn 0; finder time no higher (5K rotation 19.5 → 8–11 ms); +44 MB a slot at 5K | [entry](#metal-av1-long-term-references-golden_frame-the-stored-picture-that-matches-best-2026-11-11) |
@@ -312,6 +313,56 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: key frames at a finer qindex (2026-11-11)
+
+`AV1HybridEncoder.keyFrameQindexDelta` (0, the default: as before; negative: finer), clamped to
+1…255. `av1seq --key-delta <n>` is in qindex units, and `--per-frame` prints each frame's bytes and
+scores. `89865f2`.
+- **What it covers.** A stream's key frame, and every picture when inter frames are off. The GPU
+  analysis, the closed loop and the filters all take the key frame's own qindex. The first step
+  of `--two-steps` takes it too.
+- **One cost.** With a delta, the first inter frame after a key frame analyzes every 64x64,
+  because kept analysis is keyed by qindex. That costs time, not bytes.
+- **Exactness.** At 0 the digest is unchanged. A test checks each frame's base_q_idx and that
+  every frame decodes exactly.
+
+The earlier entry's test, before long-term references, gave −3.9 % against libaom at q − 12.
+Measured now on today's default (long-term references on). BD-rate against delta 0, RGB PSNR /
+SSIMULACRA2, q 8–40, 2900 px, the whole stream and [the inter frames alone]:
+
+| content | −16 | −32 | −48 | +16 |
+|---|---|---|---|---|
+| four traces in turn | −7.5 % / −9.6 % [−8.4 / −10.1] | −13.5 % / −15.9 % [−15.4 / −17.1] | −17.9 % / −19.0 % [−20.8 / −20.8] | +8.8 % / +12.7 % |
+| typing and scrolling in turn | −4.6 / −6.4 [−7.7 / −9.0] | −7.9 / −10.9 [−14.0 / −16.2] | −9.7 / −12.6 [−18.9 / −20.6] | +5.6 / +7.6 |
+| photos and dragging in turn | +0.6 / −0.2 [0.0 / −0.1] | +1.6 / +0.2 [0.0 / −0.1] | +2.8 / +1.0 [0.0 / 0.0] | −0.4 / +0.7 |
+| app switching | −2.4 / −2.3 [−4.9 / −4.6] | −2.9 / −1.8 [−8.6 / −6.9] | −2.4 / −0.5 [−11.3 / −8.3] | +3.6 / +4.0 |
+| one screen (scrolling), 40 frames | −10.0 / −13.4 [−15.8 / −20.3] | −16.7 / −23.0 [−27.2 / −34.5] | −20.6 / −27.8 [−34.9 / −42.2] | +12.8 / +17.6 |
+
+Most of the gain is inherited: the inter frames gain more than the whole stream wherever they
+copy the key frame. Photos and dragging never copy it again (its slot is superseded by frame 2),
+so there the bigger key frame is pure cost.
+
+Against libaom realtime (its streams the same in every run), the whole stream:
+- the rotation goes from −49.9 % / −53.6 % at 0 to −56.7 % / −60.6 % at −32;
+- the single screen goes from −8.1 % / −8.1 % to −23.4 % / −29.8 %. Its inter frames alone were
+  behind libaom at 0 (+7.9 % / +12.3 %); −16 already reverses that (−8.2 % / −9.3 %).
+
+The key frame, KB / RGB PSNR, the rotation's first picture (`−32` and `−48` both clamp to qindex
+1 at q8):
+
+| delta | q8 | q20 | q32 | q40 |
+|---|---|---|---|---|
+| 0 | 525 / 46.5 | 323 / 42.1 | 206 / 37.6 | 140 / 34.1 |
+| −16 | 715 / 48.7 | 367 / 43.3 | 244 / 39.3 | 171 / 35.9 |
+| −32 | 1378 / 50.9 | 430 / 44.8 | 289 / 41.0 | 206 / 37.6 |
+| −48 | 1378 / 50.9 | 525 / 46.5 | 323 / 42.1 | 244 / 39.3 |
+| libaom | 854 / 46.2 | 645 / 42.8 | 492 / 40.4 | 390 / 38.5 |
+
+A key frame's size is latency on a session start or a repair, and BD-rate over a stream with one
+key frame favours big key frames, so this is the owner's choice. −16 to −32 keeps the key frame
+at 1.1–1.4× today's from q14 up, under libaom's. An option not measured: a normal key frame, then
+later frames refining what it left, to get the inherited gain without the latency.
 
 ### Metal AV1: no motion search after frames whose search found nothing (2026-11-11)
 
