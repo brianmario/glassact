@@ -116,6 +116,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     let leafSmall: any MTLComputePipelineState
     /// Inter frames' motion search: k_me, and per block size of 8×8 and up k_inter and its warps.
     let motionSearch: any MTLComputePipelineState, projectionSearch: any MTLComputePipelineState
+    /// k_proj_sums: the previous picture's 64-sample strips, every SB's, which k_proj then reads
+    let projectionSums: any MTLComputePipelineState
+    /// k_proj_sums's table (128 sums an SB of the picture), kept across pictures: the kernel writes
+    /// every entry k_proj reads.
+    private var projectionTable: (any MTLBuffer)?
+    /// k_proj_sums runs where at least 1 / projectionTableShare of the SBs search: below that,
+    /// summing the strips a search reads (~20 SBs' worth) costs less than summing the picture's.
+    static let projectionTableShare = 8
+    func projectionTable(superblocks n: Int) throws -> any MTLBuffer {
+        if let t = projectionTable, t.length >= n * 512 { return t }
+        guard let t = device.makeBuffer(length: n * 512, options: .storageModePrivate) else { throw Failure.metal("no projection table for \(n) SBs") }
+        projectionTable = t
+        return t
+    }
     /// k_inter_sad: an SB's distinct inter candidates and its 8x8s' SAD at each, which k_inter sums.
     let candidateSAD: any MTLComputePipelineState
     /// k_inter_sad's tables (GpMeU and the SADs, per SB of the picture), kept across pictures: the
@@ -528,8 +542,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             inter[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), warps, warps * perBlock)
         }
         self.inter = inter
-        guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj")
+        guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj"),
+              let sumsFunction = library.makeFunction(name: "k_proj_sums")
         else { throw Failure.metal("no k_me / k_proj") }
+        projectionSums = try Self.pipeline(sumsFunction, threads: 128, device: device)
         motionSearch = try Self.pipeline(meFunction, threads: 128, device: device)
         guard let sadFunction = library.makeFunction(name: "k_inter_sad") else { throw Failure.metal("no k_inter_sad") }
         candidateSAD = try Self.pipeline(sadFunction, threads: 128, device: device)
@@ -1180,9 +1196,22 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             let analyzed = staleSuperblocks ?? (sbCols * sbRows)
             if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
-                var sbs = UInt32(analyzed)
+                // the previous picture's strips summed once, where enough SBs search that neighbours'
+                // ranges overlap (a search reads ~20 SBs' strips; the same sums either way)
+                let table = analyzed * AV1MetalEncoder.projectionTableShare >= sbCols * sbRows
+                    ? try encoder.projectionTable(superblocks: sbCols * sbRows) : nil
+                if let table {
+                    e.setComputePipelineState(encoder.projectionSums)
+                    e.setBuffer(table, offset: 0, index: 3)
+                    e.dispatchThreadgroups(MTLSize(width: sbCols * sbRows, height: 1, depth: 1),
+                                           threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+                    e.memoryBarrier(scope: .buffers)
+                }
+                var sbs = UInt32(analyzed), useTable: UInt32 = table != nil ? 1 : 0
                 e.setComputePipelineState(encoder.projectionSearch)
                 e.setBytes(&sbs, length: 4, index: 2)
+                if let table { e.setBuffer(table, offset: 0, index: 3) } else { e.setBytes(&useTable, length: 4, index: 3) }
+                e.setBytes(&useTable, length: 4, index: 4)
                 e.dispatchThreadgroups(MTLSize(width: analyzed, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)

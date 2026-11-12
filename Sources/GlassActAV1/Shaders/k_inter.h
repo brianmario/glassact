@@ -48,8 +48,29 @@ static inline float ga_proj_cost(threadgroup const int *a, threadgroup const int
     return s2 - s * s / 64.f;
 }
 
+// Glass Act: the previous picture's 64-sample strips, every SB's once (k_proj_sums): row k of
+// SB s sums to sums[s * 128 + k], column k to sums[s * 128 + 64 + k]. k_proj's search ranges are
+// strips at its SB's column (rows) and row (columns) of SBs, so neighbouring SBs' ranges, which
+// overlap, read them from here instead of summing them again. Whole numbers: the same sums.
+kernel void k_proj_sums(constant GpBatch &B [[buffer(0)]], device int *sums [[buffer(3)]],
+                        uint sb [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    device const GpImage &I = B.img[0];
+    if ((int)sb >= I.sbCols * I.sbRows) return;
+    const int x = (int)(sb % I.sbCols) * 64, y = (int)(sb / I.sbCols) * 64, sp = I.spitch[0];
+    device const uint8_t *ref = I.ref;
+    const int k = (int)tid & 63;
+    int t = 0;
+    if (tid < 64)
+        for (int j = 0; j < 64; j++) t += ref[(size_t)(y + k) * sp + x + j];
+    else
+        for (int j = 0; j < 64; j++) t += ref[(size_t)(y + j) * sp + x + k];
+    sums[sb * 128 + tid] = t;
+}
+
+// (with useSums, the reference's strips from k_proj_sums's `sums`; else summed here)
 kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                   constant uint32_t &nSbs [[buffer(2)]], uint tg [[threadgroup_position_in_grid]],
+                   constant uint32_t &nSbs [[buffer(2)]], device const int *sums [[buffer(3)]],
+                   constant uint32_t &useSums [[buffer(4)]], uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_position_in_threadgroup]]) {
     constexpr int RYMAX = 2 * GA_PROJ_RY, RXMAX = 2 * GA_PROJ_RX;
     threadgroup int srow[64], scol[64], rrow[64 + 2 * RYMAX], rcol[64 + 2 * RXMAX];
@@ -72,12 +93,17 @@ kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
         srow[k] = r;
         scol[k] = c;
     }
+    // (aw and ah are whole SBs: a row or column of the picture is one of an SB's strips)
+    const int sbx = x >> 6, sby = y >> 6;
     for (int k = (int)tid; k < 64 + 2 * ry; k += GA_PROJ_T) {
         const int row = y - ry + k;
         int r = -1;
         if (row >= 0 && row < I.ah) {
-            r = 0;
-            for (int j = 0; j < 64; j++) r += ref[(size_t)row * sp + x + j];
+            if (useSums) r = sums[((row >> 6) * I.sbCols + sbx) * 128 + (row & 63)];
+            else {
+                r = 0;
+                for (int j = 0; j < 64; j++) r += ref[(size_t)row * sp + x + j];
+            }
         }
         rrow[k] = r;
     }
@@ -85,8 +111,11 @@ kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
         const int col = x - rx + k;
         int c = -1;
         if (col >= 0 && col < I.aw) {
-            c = 0;
-            for (int j = 0; j < 64; j++) c += ref[(size_t)(y + j) * sp + col];
+            if (useSums) c = sums[(sby * I.sbCols + (col >> 6)) * 128 + 64 + (col & 63)];
+            else {
+                c = 0;
+                for (int j = 0; j < 64; j++) c += ref[(size_t)(y + j) * sp + col];
+            }
         }
         rcol[k] = c;
     }
