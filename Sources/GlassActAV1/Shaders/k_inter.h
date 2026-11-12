@@ -318,28 +318,42 @@ kernel void k_inter_sad(constant GpBatch &B [[buffer(0)]], constant GpParams &P 
                         uint tg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
     threadgroup int16_t u[2 * GP_ME_U];
     threadgroup int nu;
+    threadgroup uint vk[16 * GP_ME_KEEP];
+    threadgroup uchar first[16 * GP_ME_KEEP];
     device const GpImage &I = B.img[0];
     const uint32_t sb = B.sbList ? B.sbList[tg] : tg;
     const int sbx = (int)(sb % I.sbCols) * 64, sby = (int)(sb / I.sbCols) * 64;
     device GpMeU &U = I.meU[sb];
-    if (tid == 0) {
-        int n = 1;
-        u[0] = 0; u[1] = 0;
-        for (int k = 0; k < 16; k++) {
-            device const int16_t *m = I.meBest + ((size_t)((sby >> 4) + k / 4) * (I.aw >> 4) + (sbx >> 4) + k % 4) * 2 * GP_ME_KEEP;
-            for (int kk = 0; kk < GP_ME_KEEP; kk++) {
-                const int16_t vx = m[2 * kk], vy = m[2 * kk + 1];
-                int j = 0;
-                while (j < n && (u[2 * j] != vx || u[2 * j + 1] != vy)) j++;
-                if (j == n) { u[2 * n] = vx; u[2 * n + 1] = vy; n++; }
-                U.idx[k * GP_ME_KEEP + kk] = (uint8_t)j;
-            }
-        }
-        nu = n;
-        U.n = (uint8_t)n;
-        for (int j = 0; j < 2 * n; j++) U.v[j] = u[j];
+    // Glass Act: the distinct list on 32 threads, as a walk in raster order builds it: vector t is
+    // new where it isn't no motion and no earlier one is the same; its slot is 1 + the new ones before
+    // it, and each vector's index is its first occurrence's slot (no motion's: 0)
+    constexpr int NV = 16 * GP_ME_KEEP;
+    static_assert(NV <= 32, "k_inter_sad: a SIMD-group of vectors");
+    if (tid < NV) {
+        const int k = (int)tid / GP_ME_KEEP, kk = (int)tid % GP_ME_KEEP;
+        device const int16_t *m = I.meBest + ((size_t)((sby >> 4) + k / 4) * (I.aw >> 4) + (sbx >> 4) + k % 4) * 2 * GP_ME_KEEP;
+        vk[tid] = (uint)(uint16_t)m[2 * kk] | (uint)(uint16_t)m[2 * kk + 1] << 16;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < NV) {  // (the first SIMD-group)
+        const int t = (int)tid;
+        const uint v = vk[t];
+        int f = t;
+        for (int e = 0; e < t && f == t; e++)
+            if (vk[e] == v) f = e;
+        const bool isNew = v != 0u && f == t;
+        const int below = simd_prefix_exclusive_sum(isNew ? 1 : 0), total = simd_sum(isNew ? 1 : 0);
+        if (isNew) {
+            u[2 * (1 + below)] = (int16_t)(v & 0xFFFFu);
+            u[2 * (1 + below) + 1] = (int16_t)(v >> 16);
+        }
+        first[t] = (uchar)(1 + below);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        U.idx[t] = v == 0u ? (uint8_t)0 : (uint8_t)first[f];  // a repeat: its first occurrence's slot
+        if (t == 0) { u[0] = 0; u[1] = 0; nu = 1 + total; U.n = (uint8_t)(1 + total); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = (int)tid; j < 2 * nu; j += GA_SAD_T) U.v[j] = u[j];
     const int sp = I.spitch[0];
     device uint16_t *out = I.meSad + (size_t)sb * GP_ME_U * 64;
     for (int it = (int)tid; it < nu * 64; it += GA_SAD_T) {
