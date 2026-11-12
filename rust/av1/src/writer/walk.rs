@@ -11,7 +11,7 @@ mod palette;
 use super::mvstack::{
     MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack_ref, mv_class,
 };
-use super::recon::TilePlan;
+use super::recon::PlanCtx;
 use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
 use crate::blockinfo::*;
@@ -74,7 +74,7 @@ impl Frame<'_> {
     }
     /// the superblock's size in luma 4x4 units (sbSize4)
     #[inline(always)]
-    fn sb_size4(&self) -> i32 {
+    pub(super) fn sb_size4(&self) -> i32 {
         if self.sb128 { 32 } else { 16 }
     }
 }
@@ -430,7 +430,7 @@ pub(crate) struct Walk<'a, S: Sink, H: TxbHook> {
     pub hs: &'a mut H::Scratch,
     /// planning ([`super::recon`]): no symbols are coded and nothing is reconstructed; the walk
     /// records what the tile's reconstruction needs
-    pub plan: Option<&'a mut TilePlan>,
+    pub plan: Option<PlanCtx<'a>>,
 }
 
 /// What an inter block's prediction reads of its tile's maps (sub-8x8 chroma: the motion of the
@@ -2401,7 +2401,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 }
             }
         }
-        if let Some(p) = self.plan.as_deref_mut() {
+        if let Some(p) = self.plan.as_mut() {
             let st = &*self.st;
             let dv = (is_inter && f.intrabc).then_some([bi.mv_row as i32, bi.mv_col as i32]);
             p.block(st.b_idx, r, c, bsize, is_inter, has_chroma_, st.block_q, dv);
@@ -2503,8 +2503,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                             "block {b_idx}: coefficients of tx block {ti} outside the record"
                         );
                     };
-                    if let Some(p) = self.plan.as_deref_mut() {
-                        p.coeffs_at(off, n);
+                    if let Some(p) = self.plan.as_mut() {
+                        p.plan.coeffs_at(off, n);
                     }
                     self.st.cur_txb = ti as u32;
                     self.txb(&b, t, q, x, y)?;
@@ -2660,12 +2660,12 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
 
         if plane == 0
             && b.skip == 0
-            && let Some(p) = self.plan.as_deref_mut()
+            && let Some(p) = self.plan.as_mut()
         {
             // a luma type outside its set fails coding (if the levels aren't all zero): such a
             // record is coded in one pass
             let (ty, reduced) = (t.tx_type as i32, fp.reduced_tx_set != 0);
-            p.ok &= ty < TX_TYPES
+            p.plan.ok &= ty < TX_TYPES
                 && if is_inter {
                     tx_type_in_set_inter(get_tx_set_inter(tx_sz, reduced), ty)
                 } else {
@@ -2674,8 +2674,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         }
         if (f.do_recon || self.plan.is_some()) && !is_inter {
             let e = self.intra_edges(b, t, xi, yi, sbr, sbc, (step_x, step_y))?;
-            if let Some(p) = self.plan.as_deref_mut() {
-                p.edges[self.st.cur_txb as usize - p.txb_base] = e.pack();
+            if let Some(p) = self.plan.as_ref() {
+                p.set_edges(self.st.cur_txb as usize, e.pack());
             } else if [self.st.pal.size_y, self.st.pal.size_uv][(plane > 0) as usize] != 0 {
                 // predict_palette (palette_tokens filled the maps)
                 let st = &*self.st;

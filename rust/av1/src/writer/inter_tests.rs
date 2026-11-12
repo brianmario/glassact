@@ -321,6 +321,80 @@ fn split_reconstruction_is_the_walks() {
     assert!(split > 300);
 }
 
+/// A split picture's schedule raced: the same small pictures, again and again on 2 to 32 threads
+/// and in groups of one block to a superblock, give the one-pass walk's outputs and record every
+/// time. A schedule that is only usually right is a data race.
+#[test]
+fn split_schedules_are_the_walks_under_stress() {
+    let before = super::recon::SPLIT.load(std::sync::atomic::Ordering::Relaxed);
+    let threads = [2usize, 3, 4, 7, 14, 32];
+    let units = [1, 2, 4, 8, 16, 32];
+    let flags = ENC_FIX_RANGE | ENC_TD;
+    for seed in 0..40u64 {
+        let still = if seed % 2 == 0 {
+            FuzzCase::make(seed, 300, 20).map(|mut case| {
+                let mut rec = Record {
+                    fp: case.fp,
+                    blocks: core::mem::take(&mut case.blocks),
+                    block_txb: core::mem::take(&mut case.block_txb),
+                    txb: core::mem::take(&mut case.txb),
+                    coeffs: core::mem::take(&mut case.coeffs),
+                    inter: Vec::new(),
+                    palette: Vec::new(),
+                    palette_map: Vec::new(),
+                };
+                rec.coeffs.truncate(case.n_coeffs as usize);
+                rec
+            })
+        } else {
+            sb128_still(seed, 300)
+        };
+        let opts = |f| EncodeOpts {
+            flags: f,
+            seq_level_idx: -1,
+        };
+        if let Some(rec) = still {
+            let mut b = rec.clone();
+            let mut ob = Output::default();
+            let rb = Writer::with_threads(1).encode(b.as_mut(), &opts(flags | ENC_ONE_PASS), &mut ob);
+            for round in 0..12 {
+                let mut w = Writer::with_threads(threads[round % threads.len()]);
+                w.set_group_unit(units[(round + seed as usize) % units.len()]);
+                let mut a = rec.clone();
+                let mut oa = Output::default();
+                let ra = w.encode(a.as_mut(), &opts(flags), &mut oa);
+                assert_eq!(ra.is_ok(), rb.is_ok(), "seed {seed} round {round}: result");
+                assert!(oa == ob, "seed {seed} round {round}: outputs");
+                assert!(
+                    a.txb == b.txb && a.coeffs == b.coeffs,
+                    "seed {seed} round {round}: record"
+                );
+            }
+        }
+        let Some(seq) = InterSeq::make(seed, 200, 4) else {
+            continue;
+        };
+        let mut want_seq = seq.clone();
+        let want = encode_seq(&mut Writer::with_threads(1), &mut want_seq, flags | ENC_ONE_PASS).unwrap();
+        for round in 0..12 {
+            let mut w = Writer::with_threads(threads[(round + 1) % threads.len()]);
+            w.set_group_unit(units[(round * 5 + seed as usize) % units.len()]);
+            let mut got_seq = seq.clone();
+            let got = encode_seq(&mut w, &mut got_seq, flags).unwrap();
+            assert!(got == want, "seed {seed} round {round}: inter outputs");
+            for (k, (a, b)) in got_seq.frames.iter().zip(&want_seq.frames).enumerate() {
+                assert!(
+                    a.txb == b.txb && a.coeffs == b.coeffs,
+                    "seed {seed} round {round} frame {k}: record"
+                );
+            }
+        }
+    }
+    let split = super::recon::SPLIT.load(std::sync::atomic::Ordering::Relaxed) - before;
+    eprintln!("{split} pictures split");
+    assert!(split > 300);
+}
+
 /// A key frame in video mode codes a still picture's tile data and reconstructs exactly as it.
 #[test]
 fn video_key_frames_are_still_pictures() {

@@ -1,17 +1,19 @@
 //! The encoder (Encoder::run, av1g::encode_with_hook): frame checks, tiles on parallel threads,
 //! the OBUs, the post-filters of the reconstruction and the outputs.
 use super::headers::{BitWriter, frame_obus};
-use super::recon::{Ready, ReconBufs, ReconRec, ReconTile, TilePlan, recon_block};
+use super::recon::{PlanCtx, PlanOut, Ready, ReconBufs, ReconRec, ReconTile, TilePlan, recon_block};
 use super::sink::{EcSink, NullSink, TeeSink};
 use super::walk::{Frame, Rec, TileBufs, TileState, Walk};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
-use crate::dsp::{RefPlane, tx_coeffs, tx_h, tx_w};
+use crate::dsp::{
+    RefPlane, get_tx_set_inter, get_tx_set_intra, tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
+};
 use crate::entropy::{Ec, FrameCdfs};
 use crate::postfilter::{PF_BLK_INTER, PF_BLK_LF_ZERO, PfFrame, PfMaps, cdef_frame, deblock_frame, pf_skip_value};
-use crate::tables::{LAST_FRAME, TX_SIZES_ALL};
+use crate::tables::{LAST_FRAME, TX_SIZES_ALL, TX_TYPES};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Symbol coding only (validation): AV1G_ENC_SKIP_RECON.
 pub const ENC_SKIP_RECON: u32 = ENC_BITSTREAM_ONLY;
@@ -86,6 +88,9 @@ pub struct Writer {
     tile_order: Vec<(u32, usize)>,
     /// the tiles' reconstruction plans and the split pictures' task queue
     plans: Vec<TilePlan>,
+    plan_outs: Vec<PlanOut>,
+    /// a split picture's groups' side in 4x4s, or 0 for [`group_unit`]'s
+    group_unit: i32,
     ready: Ready,
     /// [`ENC_BLOCK_BITS`]
     block_bits: Vec<AtomicU32>,
@@ -103,15 +108,14 @@ struct TileTask<'a> {
     bufs: &'a mut TileBufs,
     payload: &'a mut Vec<u8>,
     syms: Option<&'a mut Vec<u32>>,
-    plan: Option<&'a mut TilePlan>,
     nsym: u64,
     nfixed: u64,
     err: Option<Box<Error>>,
 }
 
 /// Codes tile `i` (raster order) of the frame into `payload`, its tile buffers' planes sized when
-/// `planes`; with `plan`, plans its reconstruction instead (nothing coded). Returns (symbols,
-/// repaired tx blocks).
+/// `planes`; with `plan`, plans its reconstruction instead (nothing coded), the tile buffers and
+/// the plan set up by the caller. Returns (symbols, repaired tx blocks).
 #[allow(clippy::too_many_arguments)]
 fn code_tile<H: TxbHook>(
     w: &mut Worker,
@@ -125,23 +129,20 @@ fn code_tile<H: TxbHook>(
     i: usize,
     first: u32,
     end: u32,
-    plan: Option<&mut TilePlan>,
+    plan: Option<PlanCtx>,
     planes: bool,
 ) -> Res<(u64, u64)> {
     let cols = f.tiles.cols as usize;
     let (tr, tc) = (i / cols, i % cols);
-    bufs.setup(f, tr, tc, planes);
+    if plan.is_none() {
+        bufs.setup(f, tr, tc, planes);
+    }
     w.st.cursor = first;
     w.st.tile_end = end;
     w.st.n_fixed = 0;
     w.ec.reset();
     let nsym = match (plan, syms) {
         (Some(p), _) => {
-            let Rec::Write { block_txb, .. } = rec else {
-                unreachable!()
-            };
-            let (t0, t1) = (block_txb[first as usize] as usize, block_txb[end as usize] as usize);
-            p.setup(bufs, first as usize, end as usize, t0, t1);
             let mut walk = Walk {
                 st: &mut w.st,
                 sk: NullSink,
@@ -149,10 +150,9 @@ fn code_tile<H: TxbHook>(
                 bufs,
                 hook,
                 hs,
-                plan: Some(&mut *p),
+                plan: Some(p),
             };
             walk.tile(rec, tr, tc)?;
-            p.finish();
             0
         }
         (None, Some(out)) => {
@@ -202,7 +202,7 @@ fn code_tile<H: TxbHook>(
     Ok((nsym, w.st.n_fixed))
 }
 
-/// Codes (or with `plans`, plans) the tiles not `skipped`, on the workers in parallel with the
+/// Codes the tiles not `skipped`, on the workers in parallel with the
 /// record's `ranges` (tile_ranges), else one after the other. Returns (symbols, repaired tx
 /// blocks); the first error in tile order.
 #[allow(clippy::too_many_arguments)]
@@ -211,7 +211,6 @@ fn code_tiles<H: TxbHook>(
     tiles: &mut [TileBufs],
     payloads: &mut [Vec<u8>],
     syms: &mut [Vec<u32>],
-    mut plans: Option<&mut [TilePlan]>,
     ranges: Option<&[(usize, usize, usize, usize)]>,
     tile_first: &[u32],
     rec: &mut RecordMut,
@@ -239,7 +238,6 @@ fn code_tiles<H: TxbHook>(
             if skipped(i) {
                 continue;
             }
-            let plan = plans.as_deref_mut().map(|p| &mut p[i]);
             let (s, x) = code_tile(
                 w,
                 f,
@@ -252,7 +250,7 @@ fn code_tiles<H: TxbHook>(
                 i,
                 tile_first[i],
                 tile_first[i + 1],
-                plan,
+                None,
                 planes,
             )?;
             nsym += s;
@@ -266,7 +264,6 @@ fn code_tiles<H: TxbHook>(
     let (mut txb_at, mut coeff_at) = (0usize, 0usize);
     let mut tasks = Vec::with_capacity(tiles.len());
     let mut syms_iter = syms.iter_mut();
-    let mut plans_iter = plans.into_iter().flatten();
     for (i, ((bufs, payload), &(t0, t1, c0, c1))) in tiles.iter_mut().zip(payloads.iter_mut()).zip(ranges).enumerate() {
         let (_, rest) = core::mem::take(&mut txb_rest).split_at_mut(t0 - txb_at);
         let (tx, rest) = rest.split_at_mut(t1 - t0);
@@ -277,7 +274,6 @@ fn code_tiles<H: TxbHook>(
         coeff_rest = rest;
         coeff_at = c1;
         let syms = syms_iter.next();
-        let plan = plans_iter.next();
         if skipped(i) {
             continue;
         }
@@ -298,7 +294,6 @@ fn code_tiles<H: TxbHook>(
                 bufs,
                 payload,
                 syms,
-                plan,
                 nsym: 0,
                 nfixed: 0,
                 err: None,
@@ -329,7 +324,7 @@ fn code_tiles<H: TxbHook>(
                 *i,
                 tile_first[*i],
                 tile_first[*i + 1],
-                t.plan.as_deref_mut(),
+                None,
                 planes,
             ) {
                 Ok((s, x)) => {
@@ -372,23 +367,28 @@ struct TileJob {
     /// the tile's tx blocks and coefficients: record ranges
     txb: (usize, usize),
     coeffs: (usize, usize),
-    /// the tile's planes, once planned
-    planes: [AtomicPtr<u8>; 3],
-    lens: [AtomicUsize; 3],
-    /// blocks not reconstructed yet
+    /// what its groups read of its plan
+    pout: *mut PlanOut,
+    /// holds on its coding: its plan's, and its published groups not done
     left: AtomicU32,
+    /// coded in one pass, its plan having rejected it
+    one_pass: AtomicBool,
+    /// GA_CRIT: its plan's thread CPU time at its start
+    plan_cpu0: AtomicU64,
     /// symbols, repaired tx blocks, the error
     out: Mutex<(u64, u64, Option<Box<Error>>)>,
 }
 
-/// A split picture's tasks: blocks by record index, then three per tile.
+/// A split picture's tasks: group g of a tile at its first block's record index plus g (a tile has
+/// at most as many groups as blocks), then three per tile.
 const TASK_PLAN: usize = 0;
 const TASK_CODE: usize = 1;
 const TASK_ONE_PASS: usize = 2;
 
-/// A split picture: its tiles' tasks on every thread. A tile's plan queues its blocks that read
-/// no other; a block queues the readers it was the last wait of (taking one on itself); a tile's
-/// last block queues its coding. A tile the plan rejects is coded in one pass instead.
+/// A split picture: its tiles' tasks on every thread. A tile's plan publishes its groups as it
+/// closes them, each queued once the groups it reads are done (by the last of them, which takes one
+/// on itself); a tile's last hold released (its plan's or a group's) queues its coding. A tile the
+/// plan rejects is coded in one pass instead.
 struct Split<'a, H: TxbHook> {
     /// the reconstruction's (and one-pass walks')
     f: Frame<'a>,
@@ -412,11 +412,34 @@ struct Split<'a, H: TxbHook> {
     n_fixed: AtomicU64,
     /// [`ENC_NO_CODE`]
     no_code: bool,
+    /// a group's side in 4x4s ([`TilePlan`])
+    unit: i32,
     /// GA_CRIT: per task its start and end (ns from t0), or empty
     prof: &'a [AtomicU64],
     t0: std::time::Instant,
     /// GA_CRIT: the workers' thread CPU time (ns) in plans, blocks, codings, and in all
     cpu: [AtomicU64; 4],
+    /// GA_CRIT: each thread's time in the loop (ns from t0: entry, exit)
+    live: [[AtomicU64; 2]; 64],
+    nlive: AtomicUsize,
+    /// GA_CRIT: wall and CPU ns spinning, yielding and sleeping for a task
+    idle_ns: [AtomicU64; 6],
+}
+
+/// A split picture's groups' side in 4x4s: 8 (32x32 luma samples), or (diagnostics) GA_GROUP's, a
+/// power of two; at most the superblock's. On new 5K pictures (`--tiles 3x0`), 32x32s gave the
+/// shortest critical path: one block a group costs 2.4x the CPU in the order's lock, 64x64s
+/// lengthen the wavefront.
+fn group_unit(sb4: i32) -> i32 {
+    static UNIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let u = *UNIT.get_or_init(|| {
+        std::env::var("GA_GROUP")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&u| u > 0 && u & (u - 1) == 0)
+            .unwrap_or(8)
+    });
+    u.min(sb4)
 }
 
 /// GA_CRIT: this thread's CPU time in ns (0 where there's no such clock).
@@ -444,6 +467,21 @@ impl<H: TxbHook> Split<'_, H> {
         (self.n_blocks + 3 * tile + kind) as u32
     }
 
+    /// GA_CRIT: task k is ready from now
+    #[inline]
+    fn mark(&self, k: u32) {
+        if !self.prof.is_empty() {
+            self.prof[6 * k as usize + 2].store(self.t0.elapsed().as_nanos() as u64 + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// Queues task k.
+    #[inline]
+    fn push(&self, k: u32) {
+        self.mark(k);
+        self.ready.push(k);
+    }
+
     /// The tile's part of the record.
     ///
     /// # Safety
@@ -467,6 +505,14 @@ impl<H: TxbHook> Split<'_, H> {
     /// Runs tasks until every tile is coded.
     fn work(&self, w: &mut Worker) {
         let c0 = if self.prof.is_empty() { 0 } else { thread_cpu_ns() };
+        let me = if self.prof.is_empty() {
+            64
+        } else {
+            self.nlive.fetch_add(1, Ordering::Relaxed)
+        };
+        if me < 64 {
+            self.live[me][0].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         let mut hs = H::Scratch::default();
         let (mut next, mut idle, mut n_fixed) = (None, 0u32, 0u64);
         let done = || self.left.load(Ordering::SeqCst) == 0;
@@ -476,8 +522,23 @@ impl<H: TxbHook> Split<'_, H> {
                     break;
                 }
                 idle += 1;
-                self.ready.idle(idle, done);
-                if idle >= 96 {
+                if self.prof.is_empty() {
+                    self.ready.idle(idle, done);
+                } else {
+                    let (t, c) = (std::time::Instant::now(), thread_cpu_ns());
+                    self.ready.idle(idle, done);
+                    let (spin, yields) = super::recon::idle_limits();
+                    let ph = if idle < spin {
+                        0
+                    } else if idle < yields {
+                        1
+                    } else {
+                        2
+                    };
+                    self.idle_ns[ph].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.idle_ns[3 + ph].fetch_add(thread_cpu_ns() - c, Ordering::Relaxed);
+                }
+                if idle >= super::recon::idle_limits().1 {
                     idle = 0;
                 }
                 continue;
@@ -486,12 +547,12 @@ impl<H: TxbHook> Split<'_, H> {
             let k = task as usize;
             let mut tc = 0;
             if !self.prof.is_empty() {
-                self.prof[2 * k].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.prof[6 * k].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 tc = thread_cpu_ns();
             }
             self.task_run(w, k, &mut hs, &mut n_fixed, &mut next);
             if !self.prof.is_empty() {
-                self.prof[2 * k + 1].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.prof[6 * k + 1].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let kind = if k < self.n_blocks {
                     1
                 } else if (k - self.n_blocks) % 3 == TASK_PLAN {
@@ -499,11 +560,16 @@ impl<H: TxbHook> Split<'_, H> {
                 } else {
                     2
                 };
-                self.cpu[kind].fetch_add(thread_cpu_ns() - tc, Ordering::Relaxed);
+                let dc = thread_cpu_ns() - tc;
+                self.prof[6 * k + 4].store(dc, Ordering::Relaxed);
+                self.cpu[kind].fetch_add(dc, Ordering::Relaxed);
             }
         }
         if !self.prof.is_empty() {
             self.cpu[3].fetch_add(thread_cpu_ns() - c0, Ordering::Relaxed);
+        }
+        if me < 64 {
+            self.live[me][1].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         self.n_fixed.fetch_add(n_fixed, Ordering::Relaxed);
     }
@@ -511,7 +577,7 @@ impl<H: TxbHook> Split<'_, H> {
     /// One task: a block's reconstruction, a tile's plan, or its coding or one-pass walk.
     fn task_run(&self, w: &mut Worker, k: usize, hs: &mut H::Scratch, n_fixed: &mut u64, next: &mut Option<u32>) {
         if k < self.n_blocks {
-            self.block(w, k, hs, n_fixed, next);
+            self.group(w, k, hs, n_fixed, next);
             return;
         }
         let (i, kind) = ((k - self.n_blocks) / 3, (k - self.n_blocks) % 3);
@@ -545,10 +611,32 @@ impl<H: TxbHook> Split<'_, H> {
         }
     }
 
-    /// Tile i's plan: its first blocks queued, or (rejected) its one-pass walk.
+    /// Tile i's plan, its groups published as the walk closes them (or, for a tile [`Self::accepts`]
+    /// can't vouch for, once the walk has accepted it); a tile the plan rejects is coded in one
+    /// pass once its published groups are done.
     fn plan(&self, w: &mut Worker, i: usize, j: &TileJob, hs: &mut H::Scratch) {
-        // SAFETY: the tile's plan: its first task
+        // SAFETY: the tile's plan: its first task, before any of its groups is published, so
+        // nothing else uses its buffers, plan or payload
         let (bufs, plan, payload) = unsafe { (&mut *j.bufs, &mut *j.plan, &mut *j.payload) };
+        let cols = self.plan_f.tiles.cols as usize;
+        bufs.setup(&self.plan_f, i / cols, i % cols, true);
+        let (first, end) = (j.first as usize, j.end as usize);
+        let (t0, t1) = (self.block_txb[first] as usize, self.block_txb[end] as usize);
+        // SAFETY: as above; the &mut ends before the groups' shared reads start
+        plan.setup(unsafe { &mut *j.pout }, bufs, first, end, t0, t1, self.unit);
+        // SAFETY: from here on, only shared: the plan's walk writes its atomics, and the groups it
+        // publishes read them
+        let out: &PlanOut = unsafe { &*j.pout };
+        if !self.prof.is_empty() {
+            j.plan_cpu0.store(thread_cpu_ns(), Ordering::Relaxed);
+        }
+        static STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let stream = *STREAM.get_or_init(|| std::env::var_os("GA_NO_STREAM").is_none()) && self.accepts(j);
+        // the plan's hold on the tile's coding
+        j.left.store(1, Ordering::Relaxed);
+        let publish = |p: &TilePlan, g: u32| self.publish(j, out, p, g);
+        // SAFETY: the plan's walk reads the tile's tx blocks in walk order and writes none; the
+        // published groups write only their own, which the walk has passed
         let mut rec = unsafe { self.rec(j) };
         let planned = code_tile(
             w,
@@ -562,45 +650,135 @@ impl<H: TxbHook> Split<'_, H> {
             i,
             j.first,
             j.end,
-            Some(&mut *plan),
+            Some(PlanCtx {
+                plan: &mut *plan,
+                out,
+                publish: stream.then_some(&publish),
+            }),
             true,
         );
+        let last = plan.end(out);
         // a tile the plan rejects, or whose tx blocks can't own their coefficients, is coded in
         // one pass (which fails where the walk does)
-        if planned.is_err() || !plan.ok {
-            self.ready.push(self.task(i, TASK_ONE_PASS));
-            return;
+        let ok = planned.is_ok() && plan.ok;
+        debug_assert!(
+            !stream || planned.is_err() || plan.ok,
+            "tile {i}: accepted, then rejected"
+        );
+        if ok {
+            #[cfg(test)]
+            super::recon::SPLIT.fetch_add(1, Ordering::Relaxed);
+            if stream {
+                if let Some(g) = last {
+                    publish(plan, g);
+                }
+            } else {
+                for g in 0..plan.n_groups as u32 {
+                    publish(plan, g);
+                }
+            }
+        } else {
+            j.one_pass.store(true, Ordering::Relaxed);
         }
-        #[cfg(test)]
-        super::recon::SPLIT.fetch_add(1, Ordering::Relaxed);
-        for (p, v) in bufs.plane.iter_mut().enumerate() {
-            j.planes[p].store(v.as_mut_ptr(), Ordering::Relaxed);
-            j.lens[p].store(v.len(), Ordering::Relaxed);
+        self.release(i, j);
+    }
+
+    /// Whether tile j's plan accepts it ([`TilePlan::ok`]) if its walk succeeds: its tx blocks'
+    /// coefficients in order and disjoint, its coded luma tx types in their sets. Then its groups
+    /// can be reconstructed as the walk closes them, since nothing will code it in one pass.
+    fn accepts(&self, j: &TileJob) -> bool {
+        let fp = &self.f.fp;
+        let reduced = fp.reduced_tx_set != 0;
+        // SAFETY: the tile's plan, before any of its groups is published: nothing writes its tx
+        // blocks
+        let txb = unsafe { core::slice::from_raw_parts(self.txb.add(j.txb.0), j.txb.1 - j.txb.0) };
+        let mut end = 0usize;
+        for k in j.first as usize..j.end as usize {
+            let b = &self.blocks[k];
+            // as the walk's read_is_inter writes it
+            let is_inter = (self.f.inter || self.f.intrabc) && self.inter.get(k).is_some_and(|x| x.is_inter != 0);
+            for ti in self.block_txb[k] as usize..self.block_txb[k + 1] as usize {
+                let Some(t) = txb.get(ti.wrapping_sub(j.txb.0)) else {
+                    return false;
+                };
+                let tx_sz = t.tx_size as i32;
+                if tx_sz >= TX_SIZES_ALL {
+                    return false;
+                }
+                let off = (t.coeff_off as usize).wrapping_sub(j.coeffs.0);
+                if off < end {
+                    return false;
+                }
+                end = off.wrapping_add(tx_coeffs(tx_sz));
+                if t.plane == 0 && b.skip == 0 {
+                    let ty = t.tx_type as i32;
+                    let in_set = ty < TX_TYPES
+                        && if is_inter {
+                            tx_type_in_set_inter(get_tx_set_inter(tx_sz, reduced), ty)
+                        } else {
+                            tx_type_in_set_intra(get_tx_set_intra(tx_sz, reduced), ty)
+                        };
+                    if !in_set {
+                        return false;
+                    }
+                }
+            }
         }
-        let n = j.end - j.first;
-        j.left.store(n, Ordering::Relaxed);
-        if n == 0 {
-            self.ready.push(self.task(i, TASK_CODE));
+        true
+    }
+
+    /// Group g of tile j, closed by its plan: queued if the groups it reads are done, else left
+    /// to the last of them.
+    fn publish(&self, j: &TileJob, out: &PlanOut, plan: &TilePlan, g: u32) {
+        if !self.prof.is_empty() {
+            let k = j.first as usize + g as usize;
+            self.prof[6 * k + 3].store(self.t0.elapsed().as_nanos() as u64 + 1, Ordering::Relaxed);
+            let c0 = j.plan_cpu0.load(Ordering::Relaxed);
+            self.prof[6 * k + 5].store(thread_cpu_ns().saturating_sub(c0), Ordering::Relaxed);
         }
-        for &b in &plan.roots {
-            self.ready.push(j.first + b);
+        // (the group's own hold on the coding, before it can finish)
+        j.left.fetch_add(1, Ordering::Relaxed);
+        let mut o = out.order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waits = 0;
+        for &d in plan.deps(g as usize) {
+            let d = d as usize;
+            if !o.done[d] {
+                let (n, h) = (o.nodes.len() as u32, o.head[d]);
+                o.nodes.push((g, h));
+                o.head[d] = n;
+                waits += 1;
+            }
+        }
+        o.waits[g as usize] = waits;
+        drop(o);
+        if waits == 0 {
+            self.push(j.first + g);
         }
     }
 
-    /// Block k's reconstruction; the readers it was the last wait of queued (one into `next`),
-    /// and after the tile's last block its coding.
-    fn block(&self, w: &mut Worker, k: usize, hs: &mut H::Scratch, n_fixed: &mut u64, next: &mut Option<u32>) {
+    /// A hold on tile i's coding released: after the last (its plan's and its groups'), its
+    /// coding or one-pass walk queued.
+    fn release(&self, i: usize, j: &TileJob) {
+        if j.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let kind = if j.one_pass.load(Ordering::Relaxed) {
+                TASK_ONE_PASS
+            } else {
+                TASK_CODE
+            };
+            self.push(self.task(i, kind));
+        }
+    }
+
+    /// Group task k's blocks reconstructed in order; the groups it was the last wait of queued
+    /// (one into `next`), and its hold on the coding released.
+    fn group(&self, w: &mut Worker, k: usize, hs: &mut H::Scratch, n_fixed: &mut u64, next: &mut Option<u32>) {
         let i = self.tile_first.partition_point(|&s| s as usize <= k) - 1;
         let j = self.jobs[i].as_ref().unwrap();
-        // SAFETY: planned (the plan queued the tile's first blocks after it finished), and nothing
-        // writes the plan or the maps until the tile's coding, after its last block
-        let (bufs, plan) = unsafe { (&*j.bufs, &*j.plan) };
-        let t = ReconTile {
-            planes: core::array::from_fn(|p| j.planes[p].load(Ordering::Relaxed)),
-            lens: core::array::from_fn(|p| j.lens[p].load(Ordering::Relaxed)),
-            bufs,
-            plan,
-        };
+        // SAFETY: published, so its plan set the tile's view up and wrote the group's entries;
+        // nothing takes `&mut` of the plan's output until the next picture
+        let out = unsafe { &*j.pout };
+        let g = k - j.first as usize;
+        let t = ReconTile::new(out);
         let rec = ReconRec {
             blocks: self.blocks,
             palette: self.palette,
@@ -609,37 +787,49 @@ impl<H: TxbHook> Split<'_, H> {
             txb: self.txb,
             coeffs: self.coeffs,
         };
-        // SAFETY: block k is queued once, after the blocks it reads (their waits' AcqRel
-        // decrements and the queue order their writes before this); its tx blocks, coefficients
-        // and samples are its own; the plan's walk checked them
-        let r = unsafe { recon_block(&self.f, self.hook, rec, t, k, &mut w.rb, hs, n_fixed) };
-        if let Err(e) = r {
-            // (not reached: a split tile's reconstruction can't fail)
-            let mut out = j.out.lock().unwrap_or_else(|e| e.into_inner());
-            out.2 = out.2.take().or(Some(e));
-        }
-        for &m in plan.readers(k - plan.first) {
-            if plan.waits[m as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
-                let m = j.first + m;
-                match next {
-                    None => *next = Some(m),
-                    Some(_) => self.ready.push(m),
-                }
+        for b in out.group(g) {
+            // SAFETY: the group is queued once, after the groups its blocks read (the order's
+            // lock and the queue order their writes before this), and its blocks run in walk
+            // order here; their tx blocks, coefficients and samples are their own; the plan's
+            // walk checked them
+            let r = unsafe { recon_block(&self.f, self.hook, rec, t, j.first as usize + b, &mut w.rb, hs, n_fixed) };
+            if let Err(e) = r {
+                // (not reached: a split tile's reconstruction can't fail)
+                let mut o = j.out.lock().unwrap_or_else(|e| e.into_inner());
+                o.2 = o.2.take().or(Some(e));
             }
         }
-        if j.left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.ready.push(self.task(i, TASK_CODE));
+        let mut o = out.order.lock().unwrap_or_else(|e| e.into_inner());
+        o.done[g] = true;
+        let mut h = o.head[g];
+        while h != u32::MAX {
+            let (r, nx) = o.nodes[h as usize];
+            let wr = &mut o.waits[r as usize];
+            *wr -= 1;
+            if *wr == 0 {
+                let m = j.first + r;
+                match next {
+                    None => {
+                        self.mark(m);
+                        *next = Some(m)
+                    }
+                    Some(_) => self.push(m),
+                }
+            }
+            h = nx;
         }
+        drop(o);
+        self.release(i, j);
     }
 }
 
 /// GA_CRIT: the split picture's wall time, work and critical path (plan, then its blocks by their
 /// reads, then its coding), on stderr.
-fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize) {
+fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize, threads: usize) {
     let t = |k: usize| {
         (
-            prof[2 * k].load(Ordering::Relaxed),
-            prof[2 * k + 1].load(Ordering::Relaxed),
+            prof[6 * k].load(Ordering::Relaxed),
+            prof[6 * k + 1].load(Ordering::Relaxed),
         )
     };
     let d = |k: usize| {
@@ -651,6 +841,7 @@ fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize)
     let mut cp = 0u64;
     let (mut cp_plan, mut cp_rec, mut cp_code) = (0u64, 0u64, 0u64);
     let mut longest_block = 0u64;
+    let (mut cpu_cp, mut cpu_plan_max) = (0u64, 0u64);
     for i in 0..ntiles {
         let Some(j) = sp.jobs[i].as_ref() else { continue };
         // SAFETY: every task is done (the pool returned), so nothing writes the plan
@@ -667,42 +858,166 @@ fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize)
         let (pd, cd) = (d(tp), d(tc));
         wplan += pd;
         wcode += cd;
-        let (first, n) = (j.first as usize, (j.end - j.first) as usize);
-        let mut es = vec![pd; n];
+        let first = j.first as usize;
+        let plan_start = t(tp).0;
+        // per group: its earliest finish given its publication and the groups it reads, and the
+        // groups' durations along that chain
+        let ng = plan.n_groups;
+        let (mut ef, mut chain) = (vec![0u64; ng], vec![0u64; ng]);
+        // the same in thread CPU time: the path on a machine with nothing else running
+        let mut efc = vec![0u64; ng];
+        for g in 0..ng {
+            let k = first + g;
+            let mut s0 = prof[6 * k + 5].load(Ordering::Relaxed);
+            for &dd in plan.deps(g) {
+                s0 = s0.max(efc[dd as usize]);
+            }
+            efc[g] = s0 + prof[6 * k + 4].load(Ordering::Relaxed);
+            cpu_cp = cpu_cp.max(efc[g]);
+        }
+        cpu_plan_max = cpu_plan_max.max(prof[6 * tp + 4].load(Ordering::Relaxed));
         let mut rmax = pd;
-        for b in 0..n {
-            let k = first + b;
+        let mut rchain = 0;
+        for g in 0..ng {
+            let k = first + g;
             let (a, e) = t(k);
             lo = lo.min(a);
             hi = hi.max(e);
             let bd = e.saturating_sub(a);
             wblk += bd;
             longest_block = longest_block.max(bd);
-            let ef = es[b] + bd;
-            rmax = rmax.max(ef);
-            for &m in plan.readers(b) {
-                let m = m as usize;
-                es[m] = es[m].max(ef);
+            let pubt = prof[6 * k + 3]
+                .load(Ordering::Relaxed)
+                .saturating_sub(1)
+                .saturating_sub(plan_start);
+            let (mut s0, mut c0) = (pubt, 0);
+            for &dd in plan.deps(g) {
+                let dd = dd as usize;
+                if ef[dd] > s0 {
+                    (s0, c0) = (ef[dd], chain[dd]);
+                }
+            }
+            ef[g] = s0 + bd;
+            chain[g] = c0 + bd;
+            if ef[g] > rmax {
+                rmax = ef[g];
+                rchain = chain[g];
             }
         }
         let tcp = rmax + cd;
         if tcp > cp {
             cp = tcp;
-            cp_plan = pd;
-            cp_rec = rmax - pd;
+            cp_plan = rmax - rchain;
+            cp_rec = rchain;
             cp_code = cd;
         }
     }
     work += wplan + wblk + wcode;
     let wall = hi.saturating_sub(lo);
     let ms = |x: u64| x as f64 / 1e6;
+    // the ready queue over the picture: tasks ready (queued or handed on, not started), running,
+    // and the threads in the loop
+    {
+        let ntask = prof.len() / 6;
+        // (time, d ready, d running, d plans, d threads)
+        let mut ev: Vec<(u64, i32, i32, i32, i32)> = Vec::with_capacity(3 * ntask + 128);
+        for k in 0..ntask {
+            let (a, b) = t(k);
+            if b == 0 {
+                continue;
+            }
+            let r = prof[6 * k + 2].load(Ordering::Relaxed).saturating_sub(1).min(a);
+            let pl = (k >= sp.n_blocks && (k - sp.n_blocks) % 3 == TASK_PLAN) as i32;
+            ev.push((r, 1, 0, 0, 0));
+            ev.push((a, -1, 1, pl, 0));
+            ev.push((b, 0, -1, -pl, 0));
+        }
+        let nlive = sp.nlive.load(Ordering::Relaxed).min(64);
+        for l in &sp.live[..nlive] {
+            let (a, b) = (l[0].load(Ordering::Relaxed), l[1].load(Ordering::Relaxed));
+            ev.push((a.max(lo), 0, 0, 0, 1));
+            ev.push((b.max(lo), 0, 0, 0, -1));
+        }
+        ev.sort_unstable();
+        let nb = 20usize;
+        let span = wall.max(1);
+        let (mut rq, mut run, mut pl, mut th) = (0i64, 0i64, 0i64, 0i64);
+        let mut last = lo;
+        let thr = threads as i64;
+        // core-ns: threads not in the loop; in it, idle with nothing ready; idle with tasks ready
+        let (mut absent, mut starved, mut lag) = (0u64, 0u64, 0u64);
+        let (mut sum_r, mut sum_run) = (0f64, 0f64);
+        // per 20th: running, ready, plans, threads
+        let mut bk = vec![[0f64; 4]; nb];
+        for &(tt, dr, drun, dpl, dth) in &ev {
+            let (a0, a1) = (last.clamp(lo, hi), tt.clamp(lo, hi));
+            if a1 > a0 {
+                let d = a1 - a0;
+                let idle = (th - run).max(0) as u64;
+                absent += d * (thr - th).max(0) as u64;
+                if rq == 0 {
+                    starved += d * idle;
+                } else {
+                    lag += d * idle.min(rq as u64);
+                    starved += d * idle.saturating_sub(rq as u64);
+                }
+                sum_r += d as f64 * rq as f64;
+                sum_run += d as f64 * run as f64;
+                let mut a = a0;
+                while a < a1 {
+                    let bi = (((a - lo) as u128 * nb as u128) / span as u128).min(nb as u128 - 1) as usize;
+                    let be = lo + ((bi as u128 + 1) * span as u128 / nb as u128) as u64;
+                    let e = be.min(a1).max(a + 1);
+                    let x = (e - a) as f64;
+                    for (q, v) in bk[bi].iter_mut().zip([run, rq, pl, th]) {
+                        *q += x * v as f64;
+                    }
+                    a = e;
+                }
+            }
+            last = last.max(tt);
+            rq += dr as i64;
+            run += drun as i64;
+            pl += dpl as i64;
+            th += dth as i64;
+        }
+        let w = span as f64;
+        eprintln!(
+            "queue: {} blocks; running {:.1} ready {:.1} on average; core-ms of {} threads: absent {:.1}, idle with nothing ready {:.1}, idle with tasks ready {:.1}",
+            sp.n_blocks,
+            sum_run / w,
+            sum_r / w,
+            threads,
+            ms(absent),
+            ms(starved),
+            ms(lag)
+        );
+        let bw = w / nb as f64;
+        let line: Vec<String> = bk
+            .iter()
+            .map(|v| format!("{:.1}/{:.0}/{:.0}/{:.0}", v[0] / bw, v[1] / bw, v[2] / bw, v[3] / bw))
+            .collect();
+        eprintln!("queue by 20ths (running/ready/plans/threads): {}", line.join(" "));
+        let id = |k: usize| ms(sp.idle_ns[k].load(Ordering::Relaxed));
+        eprintln!(
+            "idle: spin {:.1} ({:.1} CPU) yield {:.1} ({:.1} CPU) sleep {:.1} ({:.1} CPU) thread-ms",
+            id(0),
+            id(3),
+            id(1),
+            id(4),
+            id(2),
+            id(5)
+        );
+    }
     let cpu = |k: usize| ms(sp.cpu[k].load(Ordering::Relaxed));
     eprintln!(
-        "cpu: plan {:.2} blocks {:.2} code {:.2} all {:.2} (ms of thread CPU)",
+        "cpu: plan {:.2} blocks {:.2} code {:.2} all {:.2} (ms of thread CPU), critical path {:.2} (longest plan {:.2})",
         cpu(0),
         cpu(1),
         cpu(2),
-        cpu(3)
+        cpu(3),
+        ms(cpu_cp),
+        ms(cpu_plan_max)
     );
     eprintln!(
         "crit: wall {:.2} ms, work {:.2} (plan {:.2} blocks {:.2} code {:.2}), {:.1} busy, critical path {:.2} (plan {:.2} + blocks {:.2} + code {:.2}), longest block {:.3}, tiles {}",
@@ -974,12 +1289,21 @@ impl Writer {
             saved: Mutex::new((false, Box::new(FrameCdfs::new(0)))),
             tile_order: Vec::new(),
             plans: Vec::new(),
+            plan_outs: Vec::new(),
+            group_unit: 0,
             ready: Ready::default(),
             block_bits: Vec::new(),
             seq: BitWriter::default(),
             fh: BitWriter::default(),
             threads,
         }
+    }
+
+    /// Split pictures' groups of `unit` x `unit` 4x4s (a power of two; 0: the default), for the
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn set_group_unit(&mut self, unit: i32) {
+        self.group_unit = unit;
     }
 
     /// Block `k`'s bits in the last encode with [`ENC_BLOCK_BITS`].
@@ -1341,6 +1665,8 @@ impl Writer {
                 w.st.setup(mi_cols, mi_rows);
             }
             self.plans.resize_with(ntiles.max(self.plans.len()), TilePlan::default);
+            self.plan_outs
+                .resize_with(ntiles.max(self.plan_outs.len()), PlanOut::default);
             self.ready.reset(n_blocks + 3 * ntiles);
             let (txb, coeffs) = (rec.txb.as_mut_ptr(), rec.coeffs.as_mut_ptr());
             let mut syms = self.syms.iter_mut();
@@ -1348,11 +1674,12 @@ impl Writer {
                 .tiles
                 .iter_mut()
                 .zip(&mut self.plans)
+                .zip(&mut self.plan_outs)
                 .zip(&mut self.payloads)
                 .zip(&self.ranges)
                 .take(ntiles)
                 .enumerate()
-                .map(|(i, (((bufs, plan), payload), &(t0, t1, c0, c1)))| {
+                .map(|(i, ((((bufs, plan), pout), payload), &(t0, t1, c0, c1)))| {
                     let syms = syms.next();
                     (!skipped(i)).then(|| TileJob {
                         first: self.tile_first[i],
@@ -1363,9 +1690,10 @@ impl Writer {
                         syms: syms.map_or(core::ptr::null_mut(), |s| s as *mut _),
                         txb: (t0, t1),
                         coeffs: (c0, c1),
-                        planes: Default::default(),
-                        lens: Default::default(),
+                        pout,
                         left: AtomicU32::new(0),
+                        one_pass: AtomicBool::new(false),
+                        plan_cpu0: AtomicU64::new(0),
                         out: Mutex::new((0, 0, None)),
                     })
                 })
@@ -1374,7 +1702,7 @@ impl Writer {
             static CRIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let crit = *CRIT.get_or_init(|| std::env::var_os("GA_CRIT").is_some());
             let prof: Vec<AtomicU64> = if crit {
-                (0..2 * (n_blocks + 3 * ntiles)).map(|_| AtomicU64::new(0)).collect()
+                (0..6 * (n_blocks + 3 * ntiles)).map(|_| AtomicU64::new(0)).collect()
             } else {
                 Vec::new()
             };
@@ -1401,18 +1729,26 @@ impl Writer {
                 left: AtomicUsize::new(ncoded),
                 n_fixed: AtomicU64::new(0),
                 no_code: opts.flags & ENC_NO_CODE != 0,
+                unit: if self.group_unit > 0 {
+                    self.group_unit.min(f.sb_size4())
+                } else {
+                    group_unit(f.sb_size4())
+                },
                 prof: &prof,
                 t0: std::time::Instant::now(),
                 cpu: Default::default(),
+                live: core::array::from_fn(|_| Default::default()),
+                nlive: AtomicUsize::new(0),
+                idle_ns: Default::default(),
             };
             for i in 0..ntiles {
                 if !skipped(i) {
-                    sp.ready.push(sp.task(i, TASK_PLAN));
+                    sp.push(sp.task(i, TASK_PLAN));
                 }
             }
             crate::pool::each(&mut self.workers[..nthreads], |w| sp.work(w));
             if crit {
-                crit_report(&sp, &prof, ntiles);
+                crit_report(&sp, &prof, ntiles, nthreads);
             }
             // the first error in tile order, as sequential coding reports
             let (mut nsym, mut nfixed) = (0, sp.n_fixed.into_inner());
@@ -1435,7 +1771,6 @@ impl Writer {
                 &mut self.tiles[..ntiles],
                 &mut self.payloads,
                 &mut self.syms,
-                None,
                 ranges,
                 &self.tile_first,
                 rec,
