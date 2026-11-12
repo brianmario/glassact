@@ -18,6 +18,7 @@ let av1SeqCommand = Command(
         .trace,
         .int("frames", "<n>", 1...10_000, "frames to encode (default 60)"),
         .string("mix", "<trace.scap>[,<trace.scap>...]", "interleave the pictures with these traces' (each from the same --skip, resampled the same), in turn: every superblock changes from picture to picture"),
+        .string("then", "<trace.scap>[:<frames>[:<skip>]][,...]", "after the first --frames pictures (the trace's, with --mix's), continue the stream with these traces' pictures in order, each from its own skip (default --skip) for its frames (default --frames), resampled the same: motion starting after a quiet stretch"),
         .int("skip", "<n>", 0...100_000, "trace frames to skip first (default 0)"),
         .int("step", "<n>", 1...1000, "after --skip, every nth trace frame (default 1: each), for a long stretch of a trace in few pictures"),
         .int("width", "<px>", 64...8192, "resample frames to this width (default 1280)"),
@@ -163,6 +164,24 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         pictures.append(try YUV420(bgra: bgra, width: width, height: height))
     }
     guard !pictures.isEmpty else { throw BenchError("no frames after --skip \(skip)") }
+    // --then: the following traces' pictures, each from its own skip, after the first's
+    let thens = try thenTraces(opts, frames: count, skip: skip)
+    if !thens.isEmpty, crop != nil { throw BenchError("--then: not with --crop") }
+    for t in thens {
+        let r = try openTrace(t.path)
+        let f = UnsafeMutableRawBufferPointer.allocate(byteCount: r.header.width * r.header.height * 4, alignment: 64)
+        defer { f.deallocate() }
+        var k = 0, taken = 0
+        while taken < t.frames, let meta = try pooledRead(r, &rects, into: f) {
+            defer { k += 1 }
+            guard k >= t.skip, (k - t.skip) % every == 0 else { continue }
+            resample(f, r.header.width, r.header.height, into: bgra, width, height)
+            pictures.append(try YUV420(bgra: bgra, width: width, height: height))
+            stamps.append(meta.timestampUS)
+            taken += 1
+        }
+        guard taken == t.frames else { throw BenchError("--then \(t.path): \(taken) frames after skip \(t.skip), not \(t.frames)") }
+    }
     func picture(_ i: Int) -> AV1HybridEncoder.Picture {
         AV1HybridEncoder.Picture(y: pictures[i].planes[0], u: pictures[i].planes[1], v: pictures[i].planes[2],
                                  width: width, height: height)
@@ -176,7 +195,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         guard inter, crop == nil, w >= width else { throw BenchError("--stream-width: with --inter, at least --width, not with --crop") }
         stream = (w, (srcH * w / srcW) & ~1)
     }
-    print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")\(opts.has("cpu-decides") ? ", CPU decides chroma and tx" : ", GPU decides chroma and tx")\(inter ? ", inter frames" : ", intra frames")")
+    print("av1seq: \(traceName) frames \(skip)..<\(skip + pictures.count - thens.map(\.frames).reduce(0, +))\(thens.map { " then \(($0.path as NSString).lastPathComponent) \($0.skip)..<\($0.skip + $0.frames)" }.joined()), \(width)×\(height), q\(q), \(preset.rawValue), tiles \(tileParts[0])x\(tileParts[1])\(serial ? ", serial" : ", overlapped")\(opts.has("cpu-decides") ? ", CPU decides chroma and tx" : ", GPU decides chroma and tx")\(inter ? ", inter frames" : ", intra frames")")
 
     if let dir = opts.string("dump-partition") {
         try dumpPartitions(pictures, width: width, height: height, qindex: qindex, preset: preset, device: device, to: dir)
@@ -304,7 +323,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var psnr = 0.0
     let scoreRGB = opts.has("score-rgb")
     func scorer() throws -> RGBScorer {
-        try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, step: every, width: stream?.width ?? width, height: stream?.height ?? height,
+        try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens, firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every, width: stream?.width ?? width, height: stream?.height ?? height,
                       coded: stream == nil ? nil : (width, height),
                       ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil)
     }
@@ -404,7 +423,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         print(String(format: "             stream digest %016llx (%d frames)", h, frames.count))
     }
     // the trace's own timing: frames arrive when the screen changes, at most ~60 a second
-    if let first = stamps.first, let last = stamps.last, last > first, stamps.count > 1 {
+    if thens.isEmpty, let first = stamps.first, let last = stamps.last, last > first, stamps.count > 1 {
         let span = Double(last - first) / 1e6 * Double(stamps.count) / Double(stamps.count - 1)
         print(String(format: "             the trace's timing: %d frames over %.2f s · %.1f Mbit/s",
                      stamps.count, span, Double(bytes) * 8 / span / 1e6))
@@ -543,7 +562,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let headerSize = Int(glassact_aom_enc_sequence_header(enc, &header, header.count))
         guard let aomDecoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
         defer { glassact_aom_dec_destroy(aomDecoder) }
-        let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), skip: skip, step: every, width: width, height: height,
+        let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens, firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every, width: width, height: height,
                                               ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
         for (i, s) in streams.enumerated() {
             let full = headerSize > 0 && (!aomInter || i == 0) ? Array(header.prefix(headerSize)) + s : s
@@ -618,6 +637,18 @@ func write64Stats(_ source: YUV420, to path: String) throws {
     try out.withUnsafeBytes { try Data($0).write(to: URL(fileURLWithPath: path)) }
 }
 
+/// `--then`'s traces: path, frames and skip each.
+func thenTraces(_ opts: Options, frames: Int, skip: Int) throws -> [(path: String, frames: Int, skip: Int)] {
+    guard let v = opts.string("then") else { return [] }
+    return try v.split(separator: ",").map { item in
+        let parts = item.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard (1...3).contains(parts.count), let n = parts.count > 1 ? Int(parts[1]) : frames, n >= 1,
+              let s = parts.count > 2 ? Int(parts[2]) : skip, s >= 0
+        else { throw BenchError("--then \(item): <trace.scap>[:<frames >= 1>[:<skip >= 0>]]") }
+        return (parts[0], n, s)
+    }
+}
+
 /// `--mix`'s traces (comma-separated).
 func mixTraces(_ opts: Options) -> [String] {
     opts.string("mix").map { $0.split(separator: ",").map(String.init) } ?? []
@@ -637,6 +668,11 @@ final class RGBScorer {
     let reader: ScapReader
     /// `--mix`: the traces whose pictures come in turn after each of the trace's, and their frames
     let mix: [ScapReader], mixFull: [UnsafeMutableRawBufferPointer]
+    /// `--then`: the traces whose pictures follow the first `firstCount` frames, in order, their
+    /// frames each, and their own frames' buffers
+    let then: [(reader: ScapReader, frames: Int, full: UnsafeMutableRawBufferPointer)]
+    let firstCount: Int
+    private var thenRead: [Int]
     /// `--ssimulacra2-every`: its scorer and period, and the pairs added
     let ssimu2: SSIMULACRA2Scorer?, ssimu2Every: Int
     var ssimu2Count = 0
@@ -655,11 +691,18 @@ final class RGBScorer {
     let step: Int
     var read = 0
 
-    init(trace: String, mix mixTraces: [String] = [], skip: Int, step: Int = 1, width: Int, height: Int,
+    init(trace: String, mix mixTraces: [String] = [], then thens: [(path: String, frames: Int, skip: Int)] = [], firstCount: Int = .max,
+         skip: Int, step: Int = 1, width: Int, height: Int,
          coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil) throws {
         reader = try openTrace(trace)
         mix = try mixTraces.map { try ScapReader(url: URL(fileURLWithPath: $0)) }
         mixFull = mix.map { .allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
+        then = try thens.map { t in
+            let r = try openTrace(t.path)
+            return (r, t.frames, .allocate(byteCount: r.header.width * r.header.height * 4, alignment: 64))
+        }
+        thenRead = [Int](repeating: 0, count: thens.count)
+        self.firstCount = thens.isEmpty ? .max : firstCount
         ssimu2 = try ssimulacra2Every.flatMap { _ in try SSIMULACRA2Scorer.make(setting: nil) }
         ssimu2Every = ssimulacra2Every ?? 0
         if ssimulacra2Every != nil, ssimu2 == nil { throw BenchError("--ssimulacra2-every: no ssimulacra2 on PATH") }
@@ -673,22 +716,35 @@ final class RGBScorer {
         small = .allocate(byteCount: coded.map { $0.width * $0.height * 4 } ?? 0, alignment: 64)
         for _ in 0..<skip { _ = try pooledRead(reader, &rects, into: full) }
         for (m, f) in zip(mix, mixFull) { for _ in 0..<skip { _ = try pooledRead(m, &rects, into: f) } }
+        for (t, s) in zip(then, thens) { for _ in 0..<s.skip { _ = try pooledRead(t.reader, &rects, into: t.full) } }
     }
 
     deinit {
         full.deallocate()
         mixFull.forEach { $0.deallocate() }
+        then.forEach { $0.full.deallocate() }
         reference.deallocate()
         shown.deallocate()
         small.deallocate()
     }
 
     func add(_ decoded: YUV420) throws {
-        let k = frames % (mix.count + 1)
-        let (r, f) = k == 0 ? (reader, full) : (mix[k - 1], mixFull[k - 1])
-        if k == 0 {
-            if read > 0 { for _ in 1..<step { _ = try pooledRead(r, &rects, into: f) } }
-            read += 1
+        let r: ScapReader, f: UnsafeMutableRawBufferPointer
+        if frames >= firstCount {
+            // --then: the segment this frame is in
+            var at = frames - firstCount, t = 0
+            while t < then.count, at >= then[t].frames { at -= then[t].frames; t += 1 }
+            guard t < then.count else { throw BenchError("--score-rgb: more frames than --then's") }
+            (r, f) = (then[t].reader, then[t].full)
+            if thenRead[t] > 0 { for _ in 1..<step { _ = try pooledRead(r, &rects, into: f) } }
+            thenRead[t] += 1
+        } else {
+            let k = frames % (mix.count + 1)
+            (r, f) = k == 0 ? (reader, full) : (mix[k - 1], mixFull[k - 1])
+            if k == 0 {
+                if read > 0 { for _ in 1..<step { _ = try pooledRead(r, &rects, into: f) } }
+                read += 1
+            }
         }
         guard try pooledRead(r, &rects, into: f) != nil else { throw BenchError("--score-rgb: the trace ended early") }
         resample(f, r.header.width, r.header.height, into: reference, width, height)
