@@ -442,7 +442,7 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
 // the streams' digests, and the host checks each size at start-up (k_fwd_mma_check). F is the DCT
 // matrix's first th rows (th x W, stride W), in device memory (k_fwd_matrices; simdgroup_load reads
 // no constant address space) or threadgroup memory; the residual goes through tmp as floats, th
-// rows at a time (all of it below 64 points). k_analysis takes it for 32x32 only
+// rows at a time (all of it below 64 points). k_analysis takes it for 16x16, 32x32 and 64x64
 // (BENCHMARKS, "the analysis's forward DCT on the matrix units"). Where the compiler has no
 // SIMD-group matrices (AMD and Intel GPUs), the old passes.
 #if defined(__HAVE_SIMDGROUP_MATRIX__)

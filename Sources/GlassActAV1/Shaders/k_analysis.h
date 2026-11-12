@@ -19,8 +19,8 @@
 // host takes the fixed pipelines only where the settings are those, so the results are the same.
 constant bool ga_fixed_fc [[function_constant(0)]];
 constant bool ga_fixed = is_function_constant_defined(ga_fixed_fc) && ga_fixed_fc;
-// Glass Act: the 32x32 forward DCT on the matrix units (warp_fwd_mma), only where
-// the host's start-up check found it bit-identical to the passes it replaces on this GPU
+// Glass Act: the 16x16, 32x32 and 64x64 forward DCTs on the matrix units (warp_fwd_mma), only where
+// the host's start-up check found them all bit-identical to the passes they replace on this GPU
 // (AV1MetalEncoder.forwardMMAIsExact, k_fwd_mma_check); undefined is false.
 constant bool ga_mma_fc [[function_constant(1)]];
 constant bool ga_mma = is_function_constant_defined(ga_mma_fc) && ga_mma_fc;
@@ -477,10 +477,10 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             e.qm = ga_fixed ? nullptr : av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
             EvalOut o;
 #ifdef GA_FWD_MMA
-            // (DCT_DCT on the matrix units, the same coefficients: 32x32 only, its matrix read from
-            // device memory. With a threadgroup copy of the matrix 16x16 and 64x64 were
+            // (DCT_DCT on the matrix units, the same coefficients: the squares of 16 and up, their
+            // matrix read from device memory. With a threadgroup copy of it 16x16 and 64x64 were
             // slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
-            if (ga_mma && W == 32 && H == 32) {
+            if (ga_mma && W == H && W >= 16) {
                 warp_fwd_mma<W, NT>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(T::lw), g_txScale[txSz], lane);
                 warp_quant_rate_rt<NT>(S.tmp, qOf(S), e, o, W, H, lane, S.red, S.redi);
             } else

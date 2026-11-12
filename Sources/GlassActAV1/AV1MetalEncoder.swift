@@ -109,7 +109,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the general code), each set made on first use: an encoder uses one, and a set takes
     /// seconds to compile.
     private var analysisSets: [AnalysisKernels?] = [nil, nil]
-    /// The analysis's 32x32 forward DCT runs on the SIMD-group matrix units (k_analysis.h's
+    /// The analysis's 16x16, 32x32 and 64x64 forward DCTs run on the SIMD-group matrix units (k_analysis.h's
     /// `ga_mma`) only where `forwardMMAIsExact` found them bit-identical on this GPU to the passes
     /// they replace: the byte identity rests on an accumulation order Metal doesn't promise.
     /// Otherwise, and on GPUs without them, the old passes.
@@ -164,7 +164,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let matrices = try makeForwardMatrices(device: device, library: library)
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no queue for k_fwd_mma_check") }
         // (size, threads a block: as k_analysis runs it)
-        for (w, threads) in [(32, 128)] {
+        for (w, threads) in [(16, 32), (32, 128), (64, 128)] {
             guard let function = library.makeFunction(name: "k_fwd_mma_check_\(w)") else { throw Failure.metal("no k_fwd_mma_check_\(w)") }
             let pipeline = try Self.pipeline(function, threads: threads, device: device)
             let blocks = 96, area = w * w, n = blocks * area, outputs = blocks * min(w, 32) * min(w, 32)
