@@ -249,6 +249,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     // Glass Act: where no window's centre (no motion, each candidate) predicts better than the
     // cell's own mean (P.interGate times its SAD to it), new content: the centres only
     int nSearch = n;
+    int wb = 0;  // the window whose centre measured best (with the gate; else no motion's)
     if (P.interGate > 0.f) {
         uint s1 = 0;
         for (int p = (int)lane; p < 128; p += 32) s1 += cur[warp][(p >> 4) * 32 + (p & 15)];  // the even rows'
@@ -270,20 +271,33 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 const int row = (p >> 4) * 2, col = p & 15;
                 sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
             }
-            best = min(best, simd_sum(sad));
+            sad = simd_sum(sad);
+            if (sad < best) { best = sad; wb = w; }
         }
         if ((float)best > P.interGate * (float)dc) nSearch = 0;
     }
-    // Glass Act: 32 vectors a round, each window from its centre; after each round the SIMD-group's
+    // Glass Act: 32 vectors a round, each window from a centre; after each round the SIMD-group's
     // second best key so far, `thr`, and a lane stops measuring a vector once its partial SAD is
     // above thr's: its key would be above two already measured, so it can't be one of the best
     // two. The same vectors, indices and full SADs for every one that can, so the same best two
+    // Glass Act: the window whose centre the gate measured best first (from its centre), so the
+    // bound is tight early: where no motion's window has that centre, no motion's from it, else
+    // that candidate's window, then no motion's; the other windows after, in order. (Any order
+    // measures the same vectors, with the same indices.)
     uint thr = 0xFFFFFFFFu;
+    const int2 cb = wb == 0 ? int2(0, 0) : ga_me_vector(I, GA_ME_ZERO + 81 * (wb - 1) + 40, sbv);
+    const bool inZero = abs(cb.x) <= 8 && abs(cb.y) <= 8;
+    const int f = inZero ? 0 : 81, z0 = inZero ? (cb.y + 8) * 17 + cb.x + 8 : GA_ME_ZERO / 2;
     for (int q0 = 0; q0 < nSearch; q0 += 32) {
         const int q = q0 + (int)lane;
         if (q < nSearch) {
-            const int i = q < GA_ME_ZERO ? (q + GA_ME_ZERO / 2) % GA_ME_ZERO
-                                         : GA_ME_ZERO + ((q - GA_ME_ZERO) / 81) * 81 + ((q - GA_ME_ZERO) % 81 + 40) % 81;
+            int i;
+            if (q >= f && q < f + GA_ME_ZERO) i = (q - f + z0) % GA_ME_ZERO;
+            else {
+                const int u = q < f ? 0 : q - GA_ME_ZERO - f;  // the candidate windows' order
+                const int w = q < f ? wb : 1 + u / 81 + (f != 0 && 1 + u / 81 >= wb ? 1 : 0);
+                i = GA_ME_ZERO + (w - 1) * 81 + ((q < f ? q : u % 81) + 40) % 81;
+            }
             const int2 v = ga_me_vector(I, i, sbv);
             bool seen = false;
             if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
