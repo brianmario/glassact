@@ -439,15 +439,16 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
 // gives exactly that (a probe on M4 Pro: 2,097,152 of 2,097,152 outputs bit-identical, with integer
 // and with float right-hand sides; a sum of the 8-blocks' fma chains matched 18 %, unfused
 // products 35 %). The specification leaves the order open, so this rests on that probe and on
-// the streams' digests. Operands come from threadgroup memory (simdgroup_load reads no constant
-// address space): F is the DCT matrix's first th rows (th x W, stride W), copied there by the
-// kernel; the residual goes through tmp as floats, th rows at a time (all of it below 64 points).
-// k_analysis takes it for 32x32 only (BENCHMARKS, "the analysis's forward DCT on the matrix
-// units"). Where the compiler has no SIMD-group matrices (AMD and Intel GPUs), the old passes.
+// the streams' digests, and the host checks each size at start-up (k_fwd_mma_check). F is the DCT
+// matrix's first th rows (th x W, stride W), in device memory (k_fwd_matrices; simdgroup_load reads
+// no constant address space) or threadgroup memory; the residual goes through tmp as floats, th
+// rows at a time (all of it below 64 points). k_analysis takes it for 32x32 only
+// (BENCHMARKS, "the analysis's forward DCT on the matrix units"). Where the compiler has no
+// SIMD-group matrices (AMD and Intel GPUs), the old passes.
 #if defined(__HAVE_SIMDGROUP_MATRIX__)
 #define GA_FWD_MMA 1
-template <int W, int NT>
-__device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, threadgroup float *tmp, const threadgroup float *F,
+template <int W, int NT, typename FPtr>
+__device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, threadgroup float *tmp, FPtr F,
                                              float scale, int lane) {
     constexpr int th = W > 32 ? 32 : W, TS = W + 1, NS = NT / 32;
     constexpr int RT = th / 8, CT = W / 8;               // output tiles of the column pass: RT x CT
@@ -504,6 +505,13 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
     ga_sync<NT>();
 }
 #endif
+
+// Glass Act: the forward DCT matrices warp_fwd_mma reads (16, 32 and 64 points, n x n row-major as
+// in g_fwd), copied into a device buffer once an encoder (k_fwd_matrices): simdgroup_load reads
+// device and threadgroup memory but not constant, and a threadgroup copy a block took threadgroup
+// memory (4 KB at 32x32) from every threadgroup of the shape.
+#define GA_FWD_MATRIX_FLOATS (256 + 1024 + 4096)
+static inline int ga_fwd_matrix_offset(int lw) { return lw == 4 ? 0 : lw == 5 ? 256 : 1280; }
 
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
 template <int W, int H, int NT = 32>

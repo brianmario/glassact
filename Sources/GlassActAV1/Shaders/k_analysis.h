@@ -19,30 +19,46 @@
 // host takes the fixed pipelines only where the settings are those, so the results are the same.
 constant bool ga_fixed_fc [[function_constant(0)]];
 constant bool ga_fixed = is_function_constant_defined(ga_fixed_fc) && ga_fixed_fc;
-// Glass Act: the 32x32 forward DCT on the matrix units (warp_fwd_mma), only where the host's
-// start-up check found it bit-identical to the passes it replaces on this GPU
+// Glass Act: the 32x32 forward DCT on the matrix units (warp_fwd_mma), only where
+// the host's start-up check found it bit-identical to the passes it replaces on this GPU
 // (AV1MetalEncoder.forwardMMAIsExact, k_fwd_mma_check); undefined is false.
 constant bool ga_mma_fc [[function_constant(1)]];
 constant bool ga_mma = is_function_constant_defined(ga_mma_fc) && ga_mma_fc;
 
+// Glass Act: a block's scratch, no more than its shape uses (threadgroup memory limits how many
+// threadgroups a core holds):
+// - the edges as long as the shape reads them (k_analysis_small's EL: the edge filter's upsampling
+//   included), not the 64x64's;
+// - shapes with a side of 32 or 64 have DCT_DCT only (av1g_get_tx_set_intra), so no tx-type
+//   search re-reads the residual after its transform: their quantized levels go over it (`qOf`);
+// - the edge filter's prepared edges are made before a residual and read only while it's made, so
+//   where the transform's tmp holds both they live there (`paOf`, `plOf`).
 template <int W, int H>
 struct ASmem {
+    static constexpr constant int EL = AV1G_EDGE_OFF + 2 * (W + H) + 8 < AV1G_EDGE_LEN ? AV1G_EDGE_OFF + 2 * (W + H) + 8 : AV1G_EDGE_LEN;
+    static constexpr constant bool qInRes = W >= 32 || H >= 32;
+    static constexpr constant bool edgesInTmp = (int)(TxD<W, H>::th * TxD<W, H>::TS * sizeof(float)) >= 2 * EL;
     int16_t res[W * H];
     float tmp[TxD<W, H>::th * TxD<W, H>::TS];
-    int16_t q[TxD<W, H>::n];
-    uint8_t ea[AV1G_EDGE_LEN], el[AV1G_EDGE_LEN];
-    uint8_t pa[AV1G_EDGE_LEN], pl[AV1G_EDGE_LEN];   // edge-filter prepared edges (RD stage)
+    int16_t q[qInRes ? 1 : TxD<W, H>::n];
+    uint8_t ea[EL], el[EL];
+    uint8_t pa[edgesInTmp ? 1 : EL], pl[edgesInTmp ? 1 : EL];   // edge-filter prepared edges (RD stage)
     int up[2];
     float satd[32];
     int cand[32];
     int dcv;
     float red[8];  // ga_sum / ga_max across a block's SIMD-groups (NT > 32)
     int redi[8];
-#ifdef GA_FWD_MMA
-    // Glass Act: the DCT matrix for warp_fwd_mma (32x32 only), copied on first use
-    float fm[(W == 32 && H == 32) ? 32 * 32 : 1];
-#endif
 };
+
+template <int W, int H>
+static inline threadgroup int16_t *qOf(threadgroup ASmem<W, H> &S) { return ASmem<W, H>::qInRes ? S.res : S.q; }
+template <int W, int H>
+static inline threadgroup uint8_t *paOf(threadgroup ASmem<W, H> &S) { return ASmem<W, H>::edgesInTmp ? (threadgroup uint8_t *)S.tmp : S.pa; }
+template <int W, int H>
+static inline threadgroup uint8_t *plOf(threadgroup ASmem<W, H> &S) {
+    return ASmem<W, H>::edgesInTmp ? (threadgroup uint8_t *)S.tmp + ASmem<W, H>::EL : S.pl;
+}
 
 __device__ __forceinline__ float hadamard4_abs(int *d) {
     // rows
@@ -222,7 +238,7 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
     const bool ef = edgeFilter && av1g_is_directional(m);
     if (ef) {
         if (lane == 0) {
-            for (int k = 0; k < AV1G_EDGE_LEN; k++) { pa[k] = A[k - AV1G_EDGE_OFF]; pl[k] = L[k - AV1G_EDGE_OFF]; }
+            for (int k = 0; k < ASmem<W, H>::EL; k++) { pa[k] = A[k - AV1G_EDGE_OFF]; pl[k] = L[k - AV1G_EDGE_OFF]; }
             av1g_edge_prepare(pangle_of(m, cand_delta(c)), T::lw, T::lh, 0, haveL, haveA, x, y, maxX, maxY, pa + AV1G_EDGE_OFF,
                               pl + AV1G_EDGE_OFF, &up[0], &up[1]);
         }
@@ -261,7 +277,8 @@ static inline void ga_merge_inter(device GpBlockRes &out, device GpInterRes *ir,
 // NT: threads to a block (32, or more for the big shapes, which then take one block a threadgroup)
 template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
-                       constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
+                       constant uint32_t &nTotal [[buffer(2)]], device const float *fwdM [[buffer(3)]],
+                       uint blockIdx_x [[threadgroup_position_in_grid]],
                        uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
     typedef TxD<W, H> T;
     threadgroup ASmem<W, H> smem[NW];
@@ -276,7 +293,6 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                        : (W == 16 && H == 4) ? AV1G_TX_16X4 : (W == 8 && H == 32) ? AV1G_TX_8X32 : (W == 32 && H == 8) ? AV1G_TX_32X8
                        : (W == 16 && H == 64) ? AV1G_TX_16X64 : AV1G_TX_64X16;
     const int set = av1g_get_tx_set_intra(txSz, 0);
-    bool fmReady = false;  // (S.fm copied: uniform over a block's threads)
 
     for (uint32_t gb = blockIdx_x * NW + warp; gb < nTotal; gb += gridDim_x * NW) {
         // image of this block (binary search over the per-image starts of this shape)
@@ -447,7 +463,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 if (J < bestJ) { bestJ = J; bestK = k; }
                 continue;
             }
-            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, paOf(S), plOf(S), S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             // Glass Act: a prediction that is exact (common on screens: stripes, a repeated row or
             // column) leaves nothing to transform: no distortion and an all-zero block's bits,
             // which is what the transform and the quantizer would arrive at
@@ -461,34 +477,29 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             e.qm = ga_fixed ? nullptr : av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
             EvalOut o;
 #ifdef GA_FWD_MMA
-            // (DCT_DCT on the matrix units, the same coefficients. 32x32 only: on 16x16 and 64x64
-            // they were slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
+            // (DCT_DCT on the matrix units, the same coefficients: 32x32 only, its matrix read from
+            // device memory. With a threadgroup copy of the matrix 16x16 and 64x64 were
+            // slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
             if (ga_mma && W == 32 && H == 32) {
-                if (!fmReady) {
-                    AV1G_CONST const float *F = g_fwd + g_fwdOff[AV1G_K_DCT][T::lw];
-                    for (int p = lane; p < T::th * W; p += NT) S.fm[p] = F[p];
-                    ga_sync<NT>();
-                    fmReady = true;
-                }
-                warp_fwd_mma<W, NT>(S.res, S.tmp, S.fm, g_txScale[txSz], lane);
-                warp_quant_rate_rt<NT>(S.tmp, S.q, e, o, W, H, lane, S.red, S.redi);
+                warp_fwd_mma<W, NT>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(T::lw), g_txScale[txSz], lane);
+                warp_quant_rate_rt<NT>(S.tmp, qOf(S), e, o, W, H, lane, S.red, S.redi);
             } else
 #endif
-            warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+            warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi);
             const float J = o.D + lambda * (o.R + mbits(c) + overhead);
             if (J < bestJ) { bestJ = J; bestK = k; }
         }
         // ---- tx-type search for the winner ----
         if (!ga_fixed && P.txSearch && set != AV1G_TX_SET_DCTONLY && !flat) {
             const int c = S.cand[top[bestK]];
-            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, S.pa, S.pl, S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
+            e.resEnergy = warp_residual<W, H, NT>(src, sp, c, S.res, A, L, dcv, lane, paOf(S), plOf(S), S.up, ga_fixed ? 0 : I.edgeFilter, haveLeft, haveAbove, x, y, maxX, maxY, S.red);
             e.intraDir = cand_mode(c);
             for (int t = 1; t < 16; t++) {
                 if (!av1g_tx_type_in_set_intra(set, t)) continue;
                 e.txType = t;
                 e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, t);
                 EvalOut o;
-                warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+                warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi);
                 const float J = o.D + lambda * (o.R + mbits(c) + overhead);
                 if (J < bestJ) { bestJ = J; bestTx = t; }
             }
