@@ -135,9 +135,9 @@ void av1enc_hybrid_set_reuse(av1enc_hybrid *h, int on);
 void av1enc_hybrid_set_tx_search(av1enc_hybrid *h, int luma, int inter);
 // The closed loop's levels optimized by rate and distortion after the dead-zone quantizer, with
 // costs from the frame's coefficient CDFs (off by default), in tx blocks whose source spans at
-// least min_range values (0: all); with trials, the luma tx type search compares each type's
-// levels after RDOQ.
-void av1enc_hybrid_set_rdoq(av1enc_hybrid *h, int on, int trials, int min_range);
+// least min_range values (0: all) and that have at least min_coeffs coefficients (0: all); with
+// trials, the luma tx type search compares each type's levels after RDOQ.
+void av1enc_hybrid_set_rdoq(av1enc_hybrid *h, int on, int trials, int min_range, int min_coeffs);
 // A picture's write as a job, so that it codes beside the next closed loop:
 // av1enc_hybrid_write_begin takes what av1enc_hybrid_write_ex does and gives *job (the last closed
 // loop's record goes with it: av1enc_hybrid_record is empty until the job is ended);

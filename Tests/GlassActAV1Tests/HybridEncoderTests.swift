@@ -525,21 +525,26 @@ extension HybridEncoderTests {
         let none = try AV1HybridEncoder(device: device)
         none.usesRDOQ = false
         let plain = try none.encode(picture, qindex: 80).obu
-        for (range, trials) in [(40, false), (0, false), (0, true)] {
+        var streams: [[UInt8]] = []
+        for (range, trials, coeffs) in [(40, false, 0), (0, false, 0), (0, true, 0), (0, false, 17)] {
             let e = try AV1HybridEncoder(device: device)
             e.rdoqMinRange = range
             e.rdoqInTrials = trials
+            e.rdoqMinCoefficients = coeffs
             let frame = try e.encode(picture, qindex: 80)
-            #expect(frame.obu != plain, "range \(range), trials \(trials): RDOQ changed nothing")
+            streams.append(frame.obu)
+            #expect(frame.obu != plain, "range \(range), trials \(trials), coefficients \(coeffs): RDOQ changed nothing")
             let decoder = try #require(glassact_aom_dec_create(1))
             defer { glassact_aom_dec_destroy(decoder) }
             var decoded = glassact_aom_frame()
-            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "range \(range), trials \(trials): libaom")
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &decoded) == 0, "range \(range), trials \(trials), coefficients \(coeffs): libaom")
             let theirs = try #require(decoded.planesTuple(0))
             let stride = Int(decoded.stridesTuple(0))
             let rows = (0..<height).filter { r in (0..<width).contains { frame.planes[0][r * width + $0] != theirs[r * stride + $0] } }
-            #expect(rows.isEmpty, "range \(range), trials \(trials): luma differs from libaom on \(rows.count) rows")
+            #expect(rows.isEmpty, "range \(range), trials \(trials), coefficients \(coeffs): luma differs from libaom on \(rows.count) rows")
         }
+        // (the 4x4s left to the quantizer: another stream than every tx block's RDOQ)
+        #expect(streams[3] != streams[1], "RDOQ from 17 coefficients changed nothing")
     }
 }
 

@@ -175,9 +175,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var rdoqMinRange = 40 {
         didSet { applyRDOQ() }
     }
+    /// With `usesRDOQ`: the fewest coefficients a tx block's RDOQ needs (0: every block). 17
+    /// leaves the 4x4s their quantizer's levels: RDOQ there costs its share of the closed loop
+    /// for no bytes (BENCHMARKS "RDOQ off on 4x4 tx blocks").
+    public var rdoqMinCoefficients = 0 {
+        didSet { applyRDOQ() }
+    }
 
     private func applyRDOQ() {
-        av1enc_hybrid_set_rdoq(cpu, usesRDOQ ? 1 : 0, rdoqInTrials ? 1 : 0, Int32(rdoqMinRange))
+        av1enc_hybrid_set_rdoq(cpu, usesRDOQ ? 1 : 0, rdoqInTrials ? 1 : 0, Int32(rdoqMinRange), Int32(rdoqMinCoefficients))
     }
 
     /// The learned tx type pruning's eps (rust/av1 hybrid::tx_model): the closed

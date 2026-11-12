@@ -67,6 +67,7 @@ let av1SeqCommand = Command(
         .bool("no-rdoq", "the closed loop keeps the dead-zone quantizer's levels (no RDOQ)"),
         .bool("rdoq-trials", "the luma tx type search compares each type after RDOQ"),
         .int("rdoq-range", "<0-255>", 0...255, "RDOQ only in tx blocks whose source spans this many values (default 40; 0: all)"),
+        .int("rdoq-coeffs", "<n>", 0...4096, "RDOQ only in tx blocks of at least this many coefficients (default the encoder's; 0: all; 17: not 4x4s)"),
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
         .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
@@ -226,6 +227,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     if let v = opts.string("inter-gate").flatMap(Float.init) { encoder.interGate = v }
     if opts.has("rdoq-trials") { encoder.rdoqInTrials = true }
     encoder.rdoqMinRange = opts.int("rdoq-range", encoder.rdoqMinRange)
+    encoder.rdoqMinCoefficients = opts.int("rdoq-coeffs", encoder.rdoqMinCoefficients)
     if let v = opts.string("tx-model-eps").flatMap(Float.init) { encoder.txModelEps = v }
     if opts.has("exact-tx-trials") { encoder.quickTxTrials = false }
     if let m = opts.string("tx-types") {

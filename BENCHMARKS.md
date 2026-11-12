@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| RDOQ off on 4x4 tx blocks (`metal-av1`, `rdoqMinCoefficients`, `av1seq --rdoq-coeffs 17`) | kept as an option, off | within ±0.2 % on six contents, +0.4 % / +0.7 % on an IDE; the closed loop's work on new 5K pictures −2.0 % (q14), −2.5 % (q20), −9.8 % (q26) | [entry](#metal-av1-rdoq-off-on-4x4-tx-blocks-re-measured-kept-off-2026-11-12) |
 | The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
 | The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
 | Key frames at a finer qindex than inter frames (`metal-av1`, `keyFrameQindexDelta`, `av1seq --key-delta`) | kept, **−16 by default in streams since 2026-11-12** (the owner's choice; −16: the rotation −7.5 % / −9.6 %, one screen −10.0 % / −13.4 %, the key frame ≈ 1.14× at q20) | at −32 (q − 8): the rotation −13.5 % / −15.9 %, one screen −16.7 % / −23.0 %, typing and scrolling −7.9 % / −10.9 %, photos and dragging (whose inter frames never copy the key frame) +1.6 % / +0.2 %; the key frame ≈ 1.3× today's at q20 (323 → 430 KB), still under libaom's 645 | [entry](#metal-av1-key-frames-at-a-finer-qindex-2026-11-11) |
@@ -317,6 +318,32 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: RDOQ off on 4x4 tx blocks, re-measured, kept off (2026-11-12)
+
+`AV1HybridEncoder.rdoqMinCoefficients` (0, the default: every tx block; 17: not the 4x4s),
+`av1seq --rdoq-coeffs <n>`. The trade from the closed loop's profile below, measured again on
+today's defaults (the retrained weights, the motion-search skip, key frames −16) and on more
+content. BD-rate of 17 against 0, q 8–32, RGB PSNR / SSIMULACRA2 (every 3rd frame):
+
+| content | BD-rate | at q20: bytes a frame · PSNR · SSIMULACRA2 |
+|---|---|---|
+| the rotation, 5K, 12 frames | −0.15 % / +0.22 % | 178.0 → 178.5 KB · 45.07 → 45.11 · 77.82 → 77.83 |
+| the rotation, every picture new (`--no-golden`) | −0.20 % / +0.22 % | 558.1 → 559.5 KB · 44.74 → 44.78 · 77.37 → 77.36 |
+| two screens in turn, 2900, 30 frames | −0.16 % / −0.17 % | 17.8 → 17.8 KB · 43.93 → 43.97 · 78.01 → 78.00 |
+| an IDE, 2900 | +0.39 % / +0.66 % | 8.0 → 8.1 KB · 47.66 → 47.70 · 79.63 → 79.69 |
+| browser tabs, 2900 | −0.17 % / −0.03 % | 16.8 → 16.8 KB · 45.18 → 45.21 · 78.61 → 78.76 |
+| video, 2900 | −0.11 % / 0.00 % | 66.0 → 66.0 KB · 46.77 → 46.77 · 75.66 → 75.61 |
+| scrolling images, 2900 | +0.06 % / +0.19 % | 87.7 → 87.7 KB · 38.78 → 38.78 · 75.42 → 75.43 |
+
+The closed loop's thread CPU a picture (`GA_CRIT`'s plan + blocks, the inter frames' median, 3
+alternated runs), every picture new at 5K: q14 189.3 → 185.6 core-ms (−2.0 %), q20 185.0 → 180.3
+(−2.5 %), q26 180.7 → 163.0 (−9.8 %).
+
+Within ±0.2 % on six contents, but +0.4 % / +0.7 % on the IDE (small text, where 4x4s carry
+the most), for 2.5 % of the closed loop's work at q20: about half a millisecond of the period.
+The owner asked for both bytes and speed, so it stays off, and the work goes into RDOQ's own
+cost with the same levels (its contexts are ≈ 28 core-ms a picture).
 
 ### Metal AV1: learned pruning's weights retrained on eleven traces, installed (2026-11-12)
 

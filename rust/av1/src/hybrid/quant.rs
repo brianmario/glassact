@@ -109,6 +109,9 @@ pub(crate) struct QuantHook<'a> {
     /// with `rdoq`, only tx blocks whose source spans at least this many values: text and UI edges,
     /// not the flat gradients (sky, shading) whose small coefficients RDOQ would drop into bands
     pub rdoq_range: u8,
+    /// with `rdoq`, only tx blocks of at least this many coefficients (0: all; 17: not the 4x4s,
+    /// where it costs its share of the time for no bytes)
+    pub rdoq_min_coeffs: u16,
     /// compared trials' distortion in the transform domain (libaom's tx_domain_dist): the
     /// residual's energy less what the coded coefficients take of it, at the transform's gain,
     /// with no inverse transform (else the exact reconstruction's SSE)
@@ -210,6 +213,7 @@ impl<'a> QuantHook<'a> {
             rdoq: None,
             rdoq_trials: false,
             rdoq_range: 0,
+            rdoq_min_coeffs: 0,
             td_dist: false,
             dct_zero_stops: false,
             tx_types: u32::MAX,
@@ -271,7 +275,9 @@ impl<'a> QuantHook<'a> {
     fn rdoq_here(&self, w: &mut Work, s: &[u8], ss: usize, tx_sz: i32) -> bool {
         if w.rdoq_here == 0 {
             let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
-            let on = self.rdoq.is_some() && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
+            let on = self.rdoq.is_some()
+                && tw * th >= self.rdoq_min_coeffs as usize
+                && (self.rdoq_range == 0 || spans(s, ss, tw, th, self.rdoq_range));
             w.rdoq_here = 1 + on as u8;
         }
         w.rdoq_here == 2

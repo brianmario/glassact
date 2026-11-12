@@ -169,6 +169,7 @@ pub struct Hybrid {
     rdoq: bool,
     rdoq_trials: bool,
     rdoq_range: u8,
+    rdoq_min_coeffs: u16,
     rdoq_costs: Option<(i32, rdoq::CoeffCosts)>,
     /// research: with GA_TX_SAMPLES naming a file, every searched luma tx block's features and
     /// chosen type, appended to it after each picture (examples/prune_train.rs, MODEL=tx)
@@ -332,6 +333,7 @@ impl Hybrid {
             rdoq: false,
             rdoq_trials: false,
             rdoq_range: 0,
+            rdoq_min_coeffs: 0,
             rdoq_costs: None,
             tx_samples: std::env::var("GA_TX_SAMPLES").ok().map(|p| (std::sync::Mutex::new(Vec::new()), p)),
             ibc: intrabc::IntraBc::default(),
@@ -534,6 +536,7 @@ impl Hybrid {
             rdoq,
             rdoq_trials,
             rdoq_range,
+            rdoq_min_coeffs,
             rdoq_costs,
             ..
         } = self;
@@ -894,6 +897,7 @@ impl Hybrid {
             hook.rdoq = rdoq_costs.as_ref().map(|(_, c)| c);
             hook.rdoq_trials = *rdoq_trials;
             hook.rdoq_range = *rdoq_range;
+            hook.rdoq_min_coeffs = *rdoq_min_coeffs;
         }
         let skips: Vec<TileSkip> = reused.iter().map(|&skip| TileSkip { skip, payload: None }).collect();
         // (its coding would be discarded: write_ex codes the frame once the filters are chosen)
@@ -1221,9 +1225,10 @@ impl Hybrid {
     /// av1enc_hybrid_set_rdoq: the closed loop's levels optimized by rate and distortion ([`rdoq`])
     /// after the dead-zone quantizer (off by default).
     /// With `trials`, luma tx type trials optimize their levels before they're compared; only tx
-    /// blocks whose source spans at least `min_range` values are optimized (0: all).
-    pub fn set_rdoq(&mut self, on: bool, trials: bool, min_range: u8) {
-        (self.rdoq, self.rdoq_trials, self.rdoq_range) = (on, trials, min_range);
+    /// blocks whose source spans at least `min_range` values are optimized (0: all), and only
+    /// those of at least `min_coeffs` coefficients (0: all).
+    pub fn set_rdoq(&mut self, on: bool, trials: bool, min_range: u8, min_coeffs: u16) {
+        (self.rdoq, self.rdoq_trials, self.rdoq_range, self.rdoq_min_coeffs) = (on, trials, min_range, min_coeffs);
     }
 
     /// av1enc_hybrid_set_tx_model: the luma tx type search tries only the types the learned model

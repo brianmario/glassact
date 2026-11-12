@@ -989,9 +989,9 @@ pub unsafe extern "C" fn av1enc_hybrid_write_end(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(h: *mut HybridHandle, on: c_int, trials: c_int, min_range: c_int) {
+pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(h: *mut HybridHandle, on: c_int, trials: c_int, min_range: c_int, min_coeffs: c_int) {
     // SAFETY: the handle
-    unsafe { (*h).h.set_rdoq(on != 0, trials != 0, min_range.clamp(0, 255) as u8) }
+    unsafe { (*h).h.set_rdoq(on != 0, trials != 0, min_range.clamp(0, 255) as u8, min_coeffs.clamp(0, 4096) as u16) }
 }
 
 #[unsafe(no_mangle)]
