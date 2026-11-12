@@ -244,6 +244,8 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| A mostly-new picture coded fast at a qindex of its own (`metal-av1`, `newPictureEffort`, `av1seq --fast`) | **level 1 on by default at Δ+7, every mostly-new picture** (looser learned pruning, no RDOQ, no CDEF); levels 2 (no motion search where no shift is proposed: +22–26 % on two text screens) and 3 (no tx type search: bytes swing with content) options | bytes −0.8 to −6.8 % on every content measured, quality −0.2 to −0.9 dB (the most on video, while it plays); a new 5K picture's GPU stages 18.1 → 15.9 ms, filters' GPU ≈ 4.4 → 0.8, closed loop −13 core-ms, 36 → 43 inter frames a second | [entry](#metal-av1-a-mostly-new-picture-coded-fast-and-paid-for-in-quality-level-1-on-by-default-2026-11-12) |
+| The analysis's threadgroup scratch by shape, the DCT matrix from a device buffer, 16x16 and 64x64 on the matrix units, 32 4x4s a lane each (`metal-av1`) | kept; 64x64 on 256 threads not (faster, the reference streams unchanged, but its float sums would split differently) | the same streams; a new 5K picture's analysis 10.2 → 9.6 ms | [entry](#metal-av1-the-analysiss-scratch-by-shape-16x16-and-64x64-on-the-matrix-units-2026-11-12) |
 | The motion search's and inter candidates' kernels: candidates and gate centres across the SIMD-group, `k_inter` with its own scratch and several blocks a SIMD-group up to the gate, the sub-sample steps from a window (`metal-av1`) | kept; three `k_proj` variants and two `k_me` ones not (no gain or slower) | the same streams; a new 5K picture's motion search 2.54 → 2.19 ms and inter candidates 2.73 → 1.33 (video 8.17 → 7.52 and 5.94 → 4.47; scrolling images 8.95 → 8.48 and 3.54 → 1.87); the GPU stages ≈ 18.7 ms | [entry](#metal-av1-the-motion-search-and-inter-candidates-the-same-bytes-in-two-thirds-of-the-time-2026-11-12) |
 | The closed loop's reconstruction in 32x32 groups, handed on as the plan walks (`metal-av1`) | kept; single-block and 64x64 groups not (longer critical paths) | the same streams; a new 5K picture's tasks from ≈ 100 thousand of 2 µs to groups; critical path 9.3–11.2 → 5.6–7.1 ms of thread CPU; the bench's user CPU −21 ms a picture; the wall unmeasurable on the day's loaded Mac | [entry](#metal-av1-the-closed-loops-reconstruction-in-32x32-groups-handed-on-as-the-plan-walks-2026-11-12) |
 | The closed loop's RDOQ contexts by tx class with neighbours read once, the residual pass with the source span in NEON, `build_edges` in fixed-size pieces (`metal-av1`) | kept; an RDOQ early exit by a bits bound not kept (+4.6 % in the encoder though faster alone) | the same streams; the blocks' thread CPU on a new 5K picture 148.0 → 136.9 core-ms (−7.5 %), RDOQ 16.8 → 12.9 % of the loop | [entry](#metal-av1-the-closed-loops-rdoq-contexts-residual-pass-and-edges-the-same-bytes-2026-11-12) |
@@ -321,6 +323,112 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a mostly-new picture coded fast and paid for in quality; level 1 on by default (2026-11-12)
+
+The owner's order since today: speed (60 fps at 5K on a full-screen change) and bytes first;
+quality is what can give, because a still screen settles to lossless tiles. So a lever that
+costs BD-rate is paid in quality at the default's bytes, on the pictures that need the speed.
+`AV1HybridEncoder.newPictureEffort` (`av1seq --fast <levers>|level=<n>|off`): an inter frame
+coding more than half its 64x64s takes its own levers and qindex + Δ. The GPU's levers go to
+that picture's analysis alone, the closed loop's are set for its closed loop and restored, and
+"no CDEF" signals one all-zero preset. A stream that switches levers frame by frame decodes
+exactly (`newPictureEffortMixesFastAndNormalPicturesExactly`).
+
+**The frontier** (the rotation at 5K without long-term references, 15 mostly-new inter frames;
+quality at the default's bytes, q 14 / 20 / 26 / 32; GPU from `--profile`'s stages, default
+20.4 ms; CPU from `GA_CRIT`, default 148–160 core-ms):
+
+| lever | GPU saved (ms) | CPU saved (core-ms) | ΔPSNR at equal bytes (dB) | BD-rate PSNR / SSIMULACRA2 |
+|---|---|---|---|---|
+| mode eps 0.05 | 0.9 | | −0.01 to −0.02 | +0.11 % / +0.02 % |
+| level eps 0.05 | 1.0 | | 0.00 to −0.09 | +0.20 % / +0.11 % |
+| mode eps 0.10 | 1.4 | | −0.03 to −0.06 | +0.39 % / +0.26 % |
+| no motion search | 5.3 | ≈ 0 | −0.27 to −0.31 | +3.3 % / +3.2 % |
+| no CDEF | the filters' 4.9 → 0.8 | | −0.20 to −0.25 | +2.6 % / +1.5 % |
+| level eps 0.10 | 1.8 | | −0.27 to −0.50 | +4.5 % / +3.4 % |
+| no 4x4s | 1.8 | 33 | −0.72 to −0.85 | +8.9 % / +6.7 % |
+| no RDOQ | | 18 | −0.03 to −0.06 | +0.5 % / +2.1 % |
+| no tx type search | | 33 | −0.64 to −0.69 | +7.6 % / +5.8 % |
+
+Turbo2 and turbo3 change nothing in these pictures; whole-sample motion is free at 5K but costs
++243 % on scrolling images scaled to 2900; no 4x4s with no tx type search is +35 %.
+
+**What the bytes do across content decides the level.** The motion search off is free on a
+switch to video, scrolling images or app switching but +27 % on a switch between two text
+screens (the search finds a sixth of the picture), and 13–35× at the start of a scroll unless
+gated on the copy finder proposing no shift. No tx type search needs anything from +1 to +17 of
+qindex to hold its bytes, by content. Level 1 is the levers whose bytes don't depend on the
+content: level eps 0.05, mode eps 0.10, no RDOQ, no CDEF. Levels 2 (and no motion search where
+no shift is proposed) and 3 (and no tx type search) stay as options.
+
+**Level 1 by Δ and by how long a run takes it** (bytes / RGB PSNR / SSIMULACRA2 against the
+mode off, over q 14–32; a run is mostly-new pictures in a row):
+
+| content | every one, Δ+3 | every one, Δ+5 | every one, Δ+7 | a run's first only, Δ+3 |
+|---|---|---|---|---|
+| video, 2900 | −0.1 to +1.4 % · −0.55 to −0.62 dB | −2.5 to −0.3 % · −0.66 to −0.78 | −4.8 to −2.1 % · −0.74 to −0.94 dB · −1.7 to −4.9 | 0 % · −0.01 dB |
+| scrolling images, 2900 | 0 to +3.8 % · −0.11 to −0.22 | −3.6 to +1.0 % · −0.25 to −0.35 | −6.8 to −1.5 % · −0.34 to −0.54 · −0.6 to −1.5 | 0 % · 0.00 |
+| the rotation, 5K, all new | −0.5 to +1.6 % · −0.22 to −0.31 | −2.1 to −0.5 % · −0.33 to −0.50 | −3.7 to −1.6 % · −0.44 to −0.73 · −0.9 to −2.7 | 0 % · −0.02 to −0.04 |
+| the rotation, 5K | −0.3 to +1.6 % · −0.14 to −0.21 | −1.4 to −0.1 % · −0.21 to −0.33 | −2.6 to −1.0 % · −0.27 to −0.50 · −0.4 to −1.3 | +0.1 % · −0.07 to −0.15 |
+| two screens → scrolling images | +0.4 to +2.9 % · −0.04 to −0.11 | −2.0 to +1.0 % · −0.12 to −0.23 | −4.4 to −0.8 % · −0.19 to −0.34 · −0.4 to −1.6 | −0.1 to +0.8 % · −0.01 to −0.06 |
+| typing → video | −0.7 to +0.6 % · −0.16 to −0.19 | −2.4 to −0.6 % · −0.19 to −0.24 | −4.1 to −2.0 % · −0.22 to −0.30 · −0.6 to −1.7 | −0.5 to 0 % · −0.01 |
+| app switching, 5K | no mostly-new picture: the same stream | | | |
+
+A soft picture stays soft in the stream: every return to its screen copies it exactly, and only
+the tiles repair it. On video nothing does while it plays.
+
+**The default: level 1 at Δ+7 on every mostly-new picture.** Δ+7 is the offset at which no
+content measured costs more bytes than without the mode (−0.8 to −6.8 %); at +3 the bytes match
+on average but rise up to 3.8 %. Every picture, not a run's first, because the speed is wanted
+on each frame of a full-screen change that lasts, and by the owner's order quality gives first:
+−0.2 to −0.9 dB, the most on video (`runLimit` would spare it). A new 5K picture at q20, the mode
+off → on (two runs each, with `GA_CRIT`, the Mac at load 9): the GPU's stages 18.1 → 15.9 ms
+(analysis 9.6 → 7.5: 16x16 1.79 → 1.15, 32x32 2.46 → 1.96, 64x64 2.35 → 1.78), the filters' GPU
+4.1–4.7 → 0.7–0.9, the closed loop's blocks 120–122 → 106–109 core-ms, and 35.4–36.0 → 42.9–43.3
+inter frames a second. Not measured: the picture after a fast one filters the whole picture and
+rebuilds the analysis cache (its qindex differs).
+
+The reference digests (the rotation, `--tiles 3x0 --inter --no-planes`), with `--fast off` → the
+default now: 5K q20 24 frames `--no-golden` `5e1030c7429bc420` → `cf4d6ebc3490e6b3`; 5K q20 8
+frames `ab40bdf3a13fcbad` → `39d5541a9eae08a5`; 2900 q32 `33c3d884c3d0ca8c` →
+`f129f7f2b94391bd`; 5K q8 `eba158d3c2d7881f` → `1fd80abca3e35c82`; 1280 q20 `862da50b8c92dbed`
+→ `be5861165c862b42` (each the same with its pictures decoded).
+
+### Metal AV1: the analysis's scratch by shape, 16x16 and 64x64 on the matrix units (2026-11-12)
+
+GPU stage times, alternated against the previous build; the same streams (the five digests, key
+frames at q14 and at q32 with turbo2, video and an IDE at 2900, scrolling images at 5K).
+
+**Where the analysis's time was** (a new 5K picture; by stage switched off): 16x16 2.16 ms =
+screening 0.93 + the one candidate's RD 0.65 + set-up, edges and exits ≈ 0.3; 32x32 2.62 = 1.13
++ 0.91 + ≈ 0.5; 64x64 2.43 = 1.34 + 0.66 + ≈ 0.35. Every shape carried the 64x64's 160-byte
+edges and the edge filter's prepared edges, and 32x32 a 4 KB copy of the DCT matrix. Learned
+pruning 1.77: `k_ml_stats` ≈ 0.88, `k_ml_mode` ≈ 0.45, cells and tree ≈ 0.25, the lists ≈ 0.2.
+Leaves 3.06: `k_leaf_small` ≈ 1.08, `k_leaf` ≈ 1.97, of which the chroma modes' screening ≈ 1.45.
+
+**Kept:**
+- **Each shape's scratch holds only what it uses** (`fa9d344`): edges as long as the shape reads,
+  the levels written over the residual where a side is 32 or 64, the DCT matrix read from a
+  device buffer filled once an encoder. Threadgroup memory: 4x4 4480 → 2256 bytes, 8x8 6080 →
+  3984, 16x16 12352 → 5248, 32x32 13392 → 6912, 64x64 19536 → 17168. 16x16 2.16 → 1.96 ms.
+- **16x16 and 64x64 forward DCTs on the matrix units too** (`7697e01`), now that the matrix
+  isn't a threadgroup copy (that made them slower on 2026-11-11). The start-up check runs all
+  three sizes against the passes each shape would otherwise use; all match or none is used.
+  16x16 1.96 → 1.87, 64x64 2.43 → 2.35.
+- **Screening a candidate of exactly 32 4x4s a lane a 4x4** (`f18fcd7`): 32x32 2.55 → 2.47.
+- **`k_analysis_16x16` with two SIMD-groups a threadgroup, not four** (`ae846dc`): 1.87 → 1.79.
+
+A new 5K picture: analysis 10.2 → 9.5–9.6 ms (16x16 2.16 → 1.79, 32x32 2.62 → 2.46, 64x64 2.42
+→ 2.36); 5K key frames (`--no-reuse`) 26.1 → 24.8; a 2900 stream 4.1 → 4.0.
+
+**Measured, not kept:** `warp_screen`'s subsampling as a template parameter (−0.02 to −0.03); a
+lane a 4x4 for 64x64's 128 (2.35 → 2.39); `k_leaf` reading each chroma 4x4 once for all its
+modes (3.06 → 3.18) or with no threadgroup memory (3.09); the learned pruning's passes in
+threadgroups of 32 (no change); 32x32 on 256 threads (2.46 → 3.53). **64x64 on 256 threads** is
+2.35 → 2.08 with the reference digests unchanged, but its float sums then split over 256
+threads, so a near tie could fall the other way on other content: not kept. Screening on 256 and
+the RD on 128 would keep the sums.
 
 ### Metal AV1: the motion search and inter candidates, the same bytes in two thirds of the time (2026-11-12)
 

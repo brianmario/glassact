@@ -349,7 +349,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// and is coded at qindex + `qindexDelta`, so that it spends no more bytes than the default
     /// would have. Glass Act settles static content to lossless tiles after the video layer, so
     /// such a picture arriving a little soft is repaired within moments; its time is what's dear.
-    /// Key frames and the other inter frames are coded as without it. Nil (the default): off.
+    /// Key frames and the other inter frames are coded as without it. Nil: off.
     public struct NewPictureEffort: Sendable, Equatable {
         /// The picture's qindex against the stream's (positive: coarser), clamped to 1…255.
         public var qindexDelta = 0
@@ -384,9 +384,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
         /// that holds the default's bytes (BENCHMARKS "a mostly-new picture coded fast"):
         /// 1. the levers whose bytes don't depend on the content: learned pruning looser (levels
-        ///    eps 0.05, modes 0.10), no RDOQ, no CDEF; +3 (the offset that holds the bytes is +1 to
-        ///    +5 on every switch and all-new picture measured). Not whole-sample motion: free on 5K
-        ///    pictures at their own size, but scrolling images scaled cost 3.4× without quarter samples.
+        ///    eps 0.05, modes 0.10), no RDOQ, no CDEF; +7, the offset at which no content measured
+        ///    costs more bytes than without the mode (−0.8 to −6.8 %; at +3 the bytes are the
+        ///    default's on average but up to +3.8 % on scrolling images). Not whole-sample motion:
+        ///    free on 5K pictures at their own size, but scrolling images scaled cost 3.4× without
+        ///    quarter samples. The encoder's default.
         /// 2. and no motion search where no shift is proposed: the GPU's largest cut, but on a switch
         ///    between screens of the same kind (two text screens) the search finds a sixth of the
         ///    picture and the picture costs a quarter more; +4.
@@ -394,7 +396,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         ///    content (screen text +11 %, video +2 %); +10.
         public static func level(_ n: Int) -> NewPictureEffort? {
             let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10)
-            var e = NewPictureEffort(qindexDelta: 3, usesRDOQ: false, analysis: cheap)
+            var e = NewPictureEffort(qindexDelta: 7, usesRDOQ: false, analysis: cheap)
             e.cdef = false
             switch n {
             case 0: return NewPictureEffort()
@@ -414,8 +416,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             (self.usesRDOQ, self.rdoqMinCoefficients, self.analysis) = (usesRDOQ, rdoqMinCoefficients, analysis)
         }
     }
-    /// See `NewPictureEffort` (nil: off, the default).
-    public var newPictureEffort: NewPictureEffort?
+    /// See `NewPictureEffort` (nil: off). Level 1 by default, on every mostly-new picture: the
+    /// owner's order is speed and bytes first, quality where it can give (the tiles settle a still
+    /// screen to lossless; a video's softness lasts while it plays: `runLimit` would spare it).
+    public var newPictureEffort: NewPictureEffort? = .level(1)
 
     /// Whether an inter frame with these copies takes `newPictureEffort`, given `run`: the
     /// mostly-new pictures in a row before it (counted here, in the stream's order).

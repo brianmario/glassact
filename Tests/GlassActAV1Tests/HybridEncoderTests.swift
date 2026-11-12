@@ -690,6 +690,7 @@ extension HybridEncoderTests {
         let encoder = try AV1HybridEncoder(device: device)
         encoder.tiling = (tilesLog2, tilesLog2)
         encoder.interFrames = true
+        encoder.newPictureEffort = nil  // (its mostly-new pictures would take a qindex of their own)
         var rng = SplitMix64(seed: 0x6e7)
         let base = PartitionTests.Picture(width: width, height: height)
         var screens: [[UInt8]] = (0..<2).map { _ in base.y.map { _ in UInt8(rng.int(30..<220)) } }

@@ -72,7 +72,7 @@ let av1SeqCommand = Command(
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
         .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
-        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, no-subpel, shifts-ok, rdoq-coeffs=<n>, shapes=<hex>, eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level (default off)"),
+        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, no-subpel, shifts-ok, rdoq-coeffs=<n>, shapes=<hex>, eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level; off: none (default the encoder's, level 1)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .int("two-steps", "<0-63>", 0...63, "with --inter, a measurement: code each picture twice in one stream, at this q first (as the other options say) and then at --q against the first's decoded picture (no copies, motion searched from no shift), one picture at a time; each step's bytes and scores are printed, and with --profile its GPU stages"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
@@ -261,7 +261,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.sbQindex = deltaQMap(kind: String(parts[0]), amount: amount)
     }
     encoder.streamSize = stream
-    if let spec = opts.string("fast") {
+    if let spec = opts.string("fast"), spec == "off" {
+        encoder.newPictureEffort = nil
+    } else if let spec = opts.string("fast") {
         var e = AV1HybridEncoder.NewPictureEffort()
         for item in spec.split(separator: ",").map(String.init) {
             let kv = item.split(separator: "=", maxSplits: 1).map(String.init)
