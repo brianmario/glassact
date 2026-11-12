@@ -433,6 +433,78 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
     ga_sync<NT>();
 }
 
+// Glass Act: the square DCT_DCT forward transform (16, 32, 64 points) on the SIMD-group matrix
+// units, the same coefficients as fwd_col_pass / fwd_row_pass: each output there is a sequential
+// fma over k from 0, and simdgroup_multiply_accumulate chained over the 8-blocks of k in order
+// gives exactly that (a probe on M4 Pro: 2,097,152 of 2,097,152 outputs bit-identical, with integer
+// and with float right-hand sides; a sum of the 8-blocks' fma chains matched 18 %, unfused
+// products 35 %). The specification leaves the order open, so this rests on that probe and on
+// the streams' digests. Operands come from threadgroup memory (simdgroup_load reads no constant
+// address space): F is the DCT matrix's first th rows (th x W, stride W), copied there by the
+// kernel; the residual goes through tmp as floats, th rows at a time (all of it below 64 points).
+// k_analysis takes it for 32x32 only (BENCHMARKS, "the analysis's forward DCT on the matrix
+// units"). Where the compiler has no SIMD-group matrices (AMD and Intel GPUs), the old passes.
+#if defined(__HAVE_SIMDGROUP_MATRIX__)
+#define GA_FWD_MMA 1
+template <int W, int NT>
+__device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, threadgroup float *tmp, const threadgroup float *F,
+                                             float scale, int lane) {
+    constexpr int th = W > 32 ? 32 : W, TS = W + 1, NS = NT / 32;
+    constexpr int RT = th / 8, CT = W / 8;               // output tiles of the column pass: RT x CT
+    // a SIMD-group's tiles (column pass, row pass); (at least 1 so that the unused shapes compile)
+    constexpr int T1 = RT * CT / NS > 0 ? RT * CT / NS : 1, T2 = RT * RT / NS > 0 ? RT * RT / NS : 1;
+    const int sg = lane / 32;
+    simdgroup_float8x8 acc[T1];
+#pragma unroll
+    for (int u = 0; u < T1; u++) acc[u] = simdgroup_float8x8(0.f);
+    // column pass: tmp(th x W) = F(th x W) * R(W x W), over chunks of th rows of R
+    for (int c0 = 0; c0 < W; c0 += th) {
+        if (c0 > 0) ga_sync<NT>();  // (the previous chunk read)
+        for (int p = lane; p < th * W; p += NT) tmp[(p / W) * TS + p % W] = (float)res[(c0 + p / W) * W + p % W];
+        ga_sync<NT>();
+#pragma unroll
+        for (int u = 0; u < T1; u++) {
+            const int t = sg * T1 + u, ti = t / CT, tj = t % CT;
+            for (int kb = 0; kb < th; kb += 8) {
+                simdgroup_float8x8 a, b;
+                simdgroup_load(a, F, W, ulong2(c0 + kb, ti * 8));
+                simdgroup_load(b, tmp, TS, ulong2(tj * 8, kb));
+                simdgroup_multiply_accumulate(acc[u], a, b, acc[u]);
+            }
+        }
+    }
+    ga_sync<NT>();
+#pragma unroll
+    for (int u = 0; u < T1; u++) {
+        const int t = sg * T1 + u;
+        simdgroup_store(acc[u], tmp, TS, ulong2((t % CT) * 8, (t / CT) * 8));
+    }
+    ga_sync<NT>();
+    // row pass: out(th x th) = tmp(th x W) * F^T(W x th)
+    simdgroup_float8x8 o[T2];
+#pragma unroll
+    for (int u = 0; u < T2; u++) {
+        o[u] = simdgroup_float8x8(0.f);
+        const int t = sg * T2 + u, ti = t / RT, tj = t % RT;
+        for (int kb = 0; kb < W; kb += 8) {
+            simdgroup_float8x8 a, b;
+            simdgroup_load(a, tmp, TS, ulong2(kb, ti * 8));
+            simdgroup_load(b, F, W, ulong2(kb, tj * 8), true);
+            simdgroup_multiply_accumulate(o[u], a, b, o[u]);
+        }
+    }
+    ga_sync<NT>();
+#pragma unroll
+    for (int u = 0; u < T2; u++) {
+        const int t = sg * T2 + u;
+        simdgroup_store(o[u], tmp, TS, ulong2((t % RT) * 8, (t / RT) * 8));
+    }
+    ga_sync<NT>();
+    for (int p = lane; p < th * th; p += NT) tmp[(p / th) * TS + p % th] *= scale;
+    ga_sync<NT>();
+}
+#endif
+
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
 template <int W, int H, int NT = 32>
 __device__ __forceinline__ void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,

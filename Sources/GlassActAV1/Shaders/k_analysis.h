@@ -33,6 +33,10 @@ struct ASmem {
     int dcv;
     float red[8];  // ga_sum / ga_max across a block's SIMD-groups (NT > 32)
     int redi[8];
+#ifdef GA_FWD_MMA
+    // Glass Act: the DCT matrix for warp_fwd_mma (32x32 only), copied on first use
+    float fm[(W == 32 && H == 32) ? 32 * 32 : 1];
+#endif
 };
 
 __device__ __forceinline__ float hadamard4_abs(int *d) {
@@ -267,6 +271,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                        : (W == 16 && H == 4) ? AV1G_TX_16X4 : (W == 8 && H == 32) ? AV1G_TX_8X32 : (W == 32 && H == 8) ? AV1G_TX_32X8
                        : (W == 16 && H == 64) ? AV1G_TX_16X64 : AV1G_TX_64X16;
     const int set = av1g_get_tx_set_intra(txSz, 0);
+    bool fmReady = false;  // (S.fm copied: uniform over a block's threads)
 
     for (uint32_t gb = blockIdx_x * NW + warp; gb < nTotal; gb += gridDim_x * NW) {
         // image of this block (binary search over the per-image starts of this shape)
@@ -450,6 +455,20 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             e.intraDir = cand_mode(c);
             e.qm = ga_fixed ? nullptr : av1g_qm(I.usingQm, I.qm[0], 0, txSz, AV1G_DCT_DCT);
             EvalOut o;
+#ifdef GA_FWD_MMA
+            // (DCT_DCT on the matrix units, the same coefficients. 32x32 only: on 16x16 and 64x64
+            // they were slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
+            if (W == 32 && H == 32) {
+                if (!fmReady) {
+                    AV1G_CONST const float *F = g_fwd + g_fwdOff[AV1G_K_DCT][T::lw];
+                    for (int p = lane; p < T::th * W; p += NT) S.fm[p] = F[p];
+                    ga_sync<NT>();
+                    fmReady = true;
+                }
+                warp_fwd_mma<W, NT>(S.res, S.tmp, S.fm, g_txScale[txSz], lane);
+                warp_quant_rate_rt<NT>(S.tmp, S.q, e, o, W, H, lane, S.red, S.redi);
+            } else
+#endif
             warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
             const float J = o.D + lambda * (o.R + mbits(c) + overhead);
             if (J < bestJ) { bestJ = J; bestK = k; }
