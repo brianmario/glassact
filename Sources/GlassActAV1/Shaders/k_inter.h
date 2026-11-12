@@ -260,26 +260,45 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         }
         if ((float)best > P.interGate * (float)dc) nSearch = 0;
     }
-    for (int i = (int)lane; i < nSearch; i += 32) {
-        const int2 v = ga_me_vector(I, i, sbv);
-        if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
-            bool seen = abs(v.x) <= 8 && abs(v.y) <= 8;
-            const int c = (i - GA_ME_ZERO) / 81;
-            for (int e = 0; e < c && !seen; e++) {
-                const int2 ce = e < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * e], I.meCand[2 * e + 1]) : sbv;
-                seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
+    // Glass Act: 32 vectors a round, each window from its centre; after each round the SIMD-group's
+    // second best key so far, `thr`, and a lane stops measuring a vector once its partial SAD is
+    // above thr's: its key would be above two already measured, so it can't be one of the best
+    // two. The same vectors, indices and full SADs for every one that can, so the same best two
+    uint thr = 0xFFFFFFFFu;
+    for (int q0 = 0; q0 < nSearch; q0 += 32) {
+        const int q = q0 + (int)lane;
+        if (q < nSearch) {
+            const int i = q < GA_ME_ZERO ? (q + GA_ME_ZERO / 2) % GA_ME_ZERO
+                                         : GA_ME_ZERO + ((q - GA_ME_ZERO) / 81) * 81 + ((q - GA_ME_ZERO) % 81 + 40) % 81;
+            const int2 v = ga_me_vector(I, i, sbv);
+            bool seen = false;
+            if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
+                seen = abs(v.x) <= 8 && abs(v.y) <= 8;
+                const int c = (i - GA_ME_ZERO) / 81;
+                for (int e = 0; e < c && !seen; e++) {
+                    const int2 ce = e < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * e], I.meCand[2 * e + 1]) : sbv;
+                    seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
+                }
             }
-            if (seen) continue;
+            const int rx = x + v.x, ry = y + v.y;
+            if (!seen && rx >= 0 && ry >= 0 && rx <= I.aw - 16 && ry <= I.ah - 16) {
+                device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
+                const uint lim = thr >> 11;
+                uint sad = 0;
+                bool done = true;
+                for (int row = 0; row < 16; row += 2) {
+                    for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
+                    if (sad > lim) { done = false; break; }
+                }
+                if (done) {
+                    const uint key = (sad << 11) | (uint)i;
+                    if (key < k0) { k1 = k0; k0 = key; }
+                    else if (key < k1) k1 = key;
+                }
+            }
         }
-        const int rx = x + v.x, ry = y + v.y;
-        if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
-        device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
-        uint sad = 0;
-        for (int row = 0; row < 16; row += 2)
-            for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-        const uint key = (sad << 11) | (uint)i;
-        if (key < k0) { k1 = k0; k0 = key; }
-        else if (key < k1) k1 = key;
+        const uint t0 = simd_min(k0);
+        thr = simd_min(k0 == t0 ? k1 : k0);
     }
     const uint b0 = simd_min(k0);
     const uint b1 = simd_min(k0 == b0 ? k1 : k0);
