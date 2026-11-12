@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The closed loop's RDOQ contexts by tx class with neighbours read once, the residual pass with the source span in NEON, `build_edges` in fixed-size pieces (`metal-av1`) | kept; an RDOQ early exit by a bits bound not kept (+4.6 % in the encoder though faster alone) | the same streams; the blocks' thread CPU on a new 5K picture 148.0 → 136.9 core-ms (−7.5 %), RDOQ 16.8 → 12.9 % of the loop | [entry](#metal-av1-the-closed-loops-rdoq-contexts-residual-pass-and-edges-the-same-bytes-2026-11-12) |
 | RDOQ off on 4x4 tx blocks (`metal-av1`, `rdoqMinCoefficients`, `av1seq --rdoq-coeffs 17`) | kept as an option, off | within ±0.2 % on six contents, +0.4 % / +0.7 % on an IDE; the closed loop's work on new 5K pictures −2.0 % (q14), −2.5 % (q20), −9.8 % (q26) | [entry](#metal-av1-rdoq-off-on-4x4-tx-blocks-re-measured-kept-off-2026-11-12) |
 | The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
 | The analysis's 32x32 forward DCT on the SIMD-group matrix units, behind a start-up exactness check; k_ml_stats in less threadgroup memory; a changed search's deblocking in 8×8 threadgroups (`metal-av1`) | kept | the same streams; 32x32 2.94 → 2.43 ms, learned pruning 1.93 → 1.75, the deblocking pass ≈ 0.59 → 0.35; inter frames a second unchanged (the period is the CPU chain: closed loop → filters → partition). Matrix units for 16x16 (1.94 → 2.56) and 64x64 (2.33 → 4.26) slower, not kept | [entry](#metal-av1-matrix-units-for-the-32x32-dct-less-threadgroup-memory-for-the-pruning-and-where-the-period-goes-2026-11-11) |
@@ -318,6 +319,48 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop's RDOQ contexts, residual pass and edges, the same bytes (2026-11-12)
+
+The second round on the closed loop's CPU (the profile is two entries below). Thread CPU a
+picture (`GA_CRIT`), the all-new stream's 23 inter frames (the rotation at 5K q20,
+`--no-golden`), binaries alternated; the Mac was in use, so no wall times. The same streams
+(today's five digests, a 60-frame stream, and two with their pictures decoded); Rust tests 61,
+with the oracle 131; AV1 tests 31; the crate still checks for x86_64.
+
+**Kept:**
+- **RDOQ's contexts with the tx class a constant, each neighbour read once** (`8edc4e4`).
+  `optimize` is specialised by class; the magnitude context's 3 offsets are the first 3 of the
+  significance context's 5 in every class, and the level map already holds min(|level|, 15), so
+  a coefficient's neighbours are read once for both. Cost rows are sliced once a block, and the
+  end of block is found from the back. The old function stays as `optimize_ref`, and
+  `optimize_matches_the_reference` compares them on 60 k random blocks of every size, type,
+  plane, quantizer, gain and lambda. Per call: 4x4 97 → 61 ns, 8x8 270 → 153, 16x16 676 → 348,
+  32x32 2234 → 1226. The blocks' CPU 147.0 → 138.1 core-ms a picture (per frame ×0.946).
+- **A tx block's residual, energy and source span in one NEON pass** (`ba6ed1a`): the span RDOQ's
+  check read in a second pass comes from the residual's, and `skip_if_cheaper` reuses the energy
+  (the same integer). Scalar reference kept (the path off aarch64), compared on 20 k random
+  blocks. 4x4 7.3 → 4.0 ns, 8x8 22 → 11, 16x16 81 → 34, 32x32 unchanged.
+- **`build_edges`' copies and fills in fixed-size pieces** (`c0879ce`): two fixed-size copies
+  that may overlap instead of a memmove or memset call (16x16 21.1 → 15.1 ns, 32x32 34.0 → 20.8,
+  4x4 unchanged). In the encoder its share didn't move (small blocks dominate, and the left
+  column's strided reads are the cost); kept as the same bytes for less work at the large sizes.
+
+Together, 4 alternated rounds: the blocks' CPU 148.0 (144.0–153.0) → 136.9 (134.9–139.6)
+core-ms a picture, −7.5 % (per frame ×0.915); all workers 197.1 → 190.5 (idle threads spin
+more). Checked on the merged head, three runs each, not alternated: 138.7 / 148.8 / 150.1 →
+139.8 / 140.9 / 142.3.
+
+**Measured, not kept:** RDOQ skipping a coefficient whose added distortion is at least λ times
+a bound on the bits lowering it could save. The same bytes, and 4x4 119 → 50 ns in isolation,
+but in the encoder the blocks' CPU rose 4.6–4.7 % per frame, twice.
+
+The profile after (≈ 186 core-ms of workers): forward transform 27.3, RDOQ 24.0 (16.8 → 12.9 %),
+intra prediction 21.6, reconstruction 16.7, plan and walk 16.4, spinning 15.4, `on_txb` 13.8,
+the quantizer 12.5, yielding 9.4, `trial` 9.2. Next by size: the scheduler's ≈ 25 core-ms of
+spin and yield (the plan handing blocks on as it walks, not ≈ 3 ms a tile up front), RDOQ's
+level-map clear and division, the left column's gather in intra prediction, zero rows and
+columns in the inverse transform.
 
 ### Metal AV1: the motion-search skip after a switch, measured; off by default again (2026-11-12)
 
