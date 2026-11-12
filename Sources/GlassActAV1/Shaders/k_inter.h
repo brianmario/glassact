@@ -391,13 +391,24 @@ constexpr int ga_inter_lanes(int n, int ncm, int nt) {
     return g;
 }
 
+// Glass Act: k_inter's scratch, what warp_eval and the sums use of the analysis's ASmem (no edges,
+// screening lists or DCT matrix): less threadgroup memory a block, so more blocks a core
+template <int W, int H>
+struct GaInterSmem {
+    int16_t res[W * H];
+    float tmp[TxD<W, H>::th * TxD<W, H>::TS];
+    int16_t q[TxD<W, H>::n];
+    float red[8];
+    int redi[8];
+};
+
 template <int W, int H, int BS, int NW, int NT = 32>
 kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                     constant uint32_t &nTotal [[buffer(2)]], uint blockIdx_x [[threadgroup_position_in_grid]],
                     uint gridDim_x [[threadgroups_per_grid]], uint threadIdx_x [[thread_position_in_threadgroup]]) {
-    threadgroup ASmem<W, H> smem[NW];
+    threadgroup GaInterSmem<W, H> smem[NW];
     const int warp = (int)threadIdx_x / NT, lane = (int)threadIdx_x % NT;  // the block's slot, its thread (k_analysis's NT)
-    threadgroup ASmem<W, H> &S = smem[warp];
+    threadgroup GaInterSmem<W, H> &S = smem[warp];
     constexpr int txSz = ga_tx_of<W, H>();
     for (uint32_t gb = blockIdx_x * NW + warp; gb < nTotal; gb += gridDim_x * NW) {
         device const GpImage &I = B.img[0];
