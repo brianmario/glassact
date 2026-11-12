@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The closed loop's reconstruction in 32x32 groups, handed on as the plan walks (`metal-av1`) | kept; single-block and 64x64 groups not (longer critical paths) | the same streams; a new 5K picture's tasks from ≈ 100 thousand of 2 µs to groups; critical path 9.3–11.2 → 5.6–7.1 ms of thread CPU; the bench's user CPU −21 ms a picture; the wall unmeasurable on the day's loaded Mac | [entry](#metal-av1-the-closed-loops-reconstruction-in-32x32-groups-handed-on-as-the-plan-walks-2026-11-12) |
 | The closed loop's RDOQ contexts by tx class with neighbours read once, the residual pass with the source span in NEON, `build_edges` in fixed-size pieces (`metal-av1`) | kept; an RDOQ early exit by a bits bound not kept (+4.6 % in the encoder though faster alone) | the same streams; the blocks' thread CPU on a new 5K picture 148.0 → 136.9 core-ms (−7.5 %), RDOQ 16.8 → 12.9 % of the loop | [entry](#metal-av1-the-closed-loops-rdoq-contexts-residual-pass-and-edges-the-same-bytes-2026-11-12) |
 | RDOQ off on 4x4 tx blocks (`metal-av1`, `rdoqMinCoefficients`, `av1seq --rdoq-coeffs 17`) | kept as an option, off | within ±0.2 % on six contents, +0.4 % / +0.7 % on an IDE; the closed loop's work on new 5K pictures −2.0 % (q14), −2.5 % (q20), −9.8 % (q26) | [entry](#metal-av1-rdoq-off-on-4x4-tx-blocks-re-measured-kept-off-2026-11-12) |
 | The closed loop's CPU by function on new pictures, and byte-identical cuts in the tx hook (`metal-av1`) | kept: RDOQ's span check on need, its level map per thread, the distortion sum skipping zero groups, energy in u32. Trades not taken (the owner's): no RDOQ on 4x4 (−0.2 % / −0.3 % / +0.4 %, −2 to −8 % work) | the blocks' thread CPU 160.2 → 154.6 core-ms a new 5K picture (−3.5 %); no hot spot (the tx hook 53 % in five parts); 10 ms needs ≈ −35 % work, byte-identical headroom ≈ 10–15 % more | [entry](#metal-av1-the-closed-loops-cpu-on-new-pictures-by-function-byte-identical-cuts-2026-11-12) |
@@ -319,6 +320,50 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the closed loop's reconstruction in 32x32 groups, handed on as the plan walks (2026-11-12)
+
+The closed loop's scheduler, on the all-new stream (the rotation at 5K q20, `--no-golden`). The
+Mac was in use and oversubscribed throughout (load 20–50; tasks' wall 1.5× their thread CPU), so
+the wall figures say little and the structure's are in thread CPU.
+
+**What the ready queue looked like** (`GA_CRIT` with queue tracing added): a new 5K picture was
+64–121 thousand single-block tasks of ≈ 2 µs through one shared queue, so the per-task overhead
+rivalled the work (≈ 36 ms of CPU a picture inside the loop but outside tasks and idling; the
+tracing's own ≈ 250 ns a task is in that). The queue was rarely empty (20–10,000 ready in
+mid-picture) with ≈ 11.5 of 14 threads running; for the first 10–15 % of the wall only the 8
+plans ran; and on 2 pictures of 3 the loop's threads joined 3–8 ms late, held by the pool's
+earlier job, the overlapped writer's tile coding.
+
+**Kept** (`7a89b44`): a task is the blocks of one 32x32 (or one larger block), run in walk order
+on one thread, waiting only for the earlier groups its blocks read; and the plan hands each group
+on as its walk closes it, not after the whole tile (a tile the plan could reject still waits for
+its walk). The same streams: the five digests, a 60-frame stream, `--tiles 2x2`, and video,
+scrolling images and app switching at 2900 against the previous build, each two or three times;
+`split_schedules_are_the_walks_under_stress` compares the outputs with the one-pass walk over
+2–32 threads and groups from one block to 128x128. Rust tests 62, with the oracle 132; AV1 31.
+ThreadSanitizer was not run (the nightly's build-std fails here).
+
+| group, by `GA_CRIT`, 3 runs | critical path in thread CPU (ms) |
+|---|---|
+| one block, the plan first (as before, under the new locks) | 9.3–11.2 |
+| 64x64, the plan first | 8.5–10.5 |
+| 64x64, handed on as walked | 7.7–8.9 |
+| **32x32, handed on as walked** | **5.6–7.1** |
+
+Six alternated pairs with `GA_CRIT` (which overstates the old tasks' cost): the closed loop's
+wall 26.0 (19.6–34.0) → 18.7 (16.6–29.6) ms, busy cores 6.9 → 8.45, the blocks' thread CPU
+130.0 → 108.9 core-ms, all workers 172.9 → 131.0. Without it: the whole bench's user CPU 9.29 →
+8.77 s over 24 frames in each of 4 pairs (≈ −21 ms of CPU a picture), and the closed loop's wall
+and the frames a second inside the day's noise (22.3 → 23.9 ms over 10 pairs; my own 5 pairs at
+load 53: 14–30 → 12–35 inter frames a second, meaningless). The structure now allows ≈ 6.5 ms
+of critical path over ≈ 110–125 core-ms of work, 8–9 ms on 14 cores; what the wall is on a quiet
+Mac is to be measured.
+
+**Not done:** a spin-then-park idle policy (with 25× fewer queue operations the old result,
+yield beats sleep, may change; `GA_IDLE` is there to measure it), and the pool's order: the
+loop's late threads are workers the writer's tile coding holds, so a priority for the closed
+loop's job moves wall time from the loop to the writer.
 
 ### Metal AV1: the closed loop's RDOQ contexts, residual pass and edges, the same bytes (2026-11-12)
 
