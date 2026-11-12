@@ -359,6 +359,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
             // 3 rows of offsets, so the lane makes each column's h once for the 2 or 3 rows they read
             // and the column's 3 positions share them
             const int oy0 = ((c.y - step) >> 3) - by + 1, span = (((c.y + step) >> 3) - by + 1) - oy0;  // rows oy0 .. oy0 + span + 1
+            uint pt[9];  // the lane's part of each position's SAD
             for (int j = 0; j < 3; j++) {
                 const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1, fx = vx & 7;
                 int h[3][8];
@@ -372,23 +373,31 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 }
                 for (int k = 0; k < 3; k++) {
                     const int l = k * 3 + j;
-                    // the centre once (at the first step) and the 8 neighbours
-                    uint sad = 0xFFFFFFFFu;
-                    if (l == 4 && step != 4) sad = bestSad;  // the centre, as the last step measured it
-                    else {
-                        const int2 v = int2(vx, c.y + (k - 1) * step);
-                        if (ga_ref_inside(I, x, y, v, 16, 16)) {
-                            const int fy = v.y & 7, t = ((v.y >> 3) - by + 1) - oy0;
-                            uint part = 0;
-                            for (int col = 0; col < 8; col++)
-                                part += (uint)abs(cv[col] - (((8 - fy) * (t ? h[1][col] : h[0][col]) +
-                                                              fy * (t ? h[2][col] : h[1][col]) + 32) >> 6));
-                            sad = simd_sum(part);
-                        }
-                    }
-                    const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (l == 4 ? 0u : (uint)l + 1);  // centre first on ties
-                    top = min(top, key);
+                    pt[l] = 0;
+                    if (l == 4 && step != 4) continue;  // the centre, as the last step measured it
+                    const int2 v = int2(vx, c.y + (k - 1) * step);
+                    const int fy = v.y & 7, t = ((v.y >> 3) - by + 1) - oy0;
+                    for (int col = 0; col < 8; col++)
+                        pt[l] += (uint)abs(cv[col] - (((8 - fy) * (t ? h[1][col] : h[0][col]) +
+                                                       fy * (t ? h[2][col] : h[1][col]) + 32) >> 6));
                 }
+            }
+            // Glass Act: two positions' sums in one simd_sum, 16 bits each (a lane's part is at most
+            // 8 * 255, the SIMD-group's 32 * 2040 < 65536: no carry between them)
+            uint sum[9];
+            for (int l = 0; l < 9; l += 2) {
+                const uint both = simd_sum(pt[l] | (l + 1 < 9 ? pt[l + 1] << 16 : 0u));
+                sum[l] = both & 0xFFFFu;
+                if (l + 1 < 9) sum[l + 1] = both >> 16;
+            }
+            for (int l = 0; l < 9; l++) {
+                // the centre once (at the first step) and the 8 neighbours; outside the padded
+                // reference: none
+                uint sad = 0xFFFFFFFFu;
+                if (l == 4 && step != 4) sad = bestSad;
+                else if (ga_ref_inside(I, x, y, c + int2((l % 3 - 1) * step, (l / 3 - 1) * step), 16, 16)) sad = sum[l];
+                const uint key = sad == 0xFFFFFFFFu ? 0xFFFFFFFFu : (sad << 4) | (l == 4 ? 0u : (uint)l + 1);  // centre first on ties
+                top = min(top, key);
             }
             if (top != 0xFFFFFFFFu) {
                 const int l = (top & 15) == 0 ? 4 : (int)(top & 15) - 1;
