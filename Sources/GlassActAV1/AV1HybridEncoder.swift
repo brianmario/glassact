@@ -102,6 +102,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     let postfilter: AV1MetalPostfilter
     let cpu: OpaquePointer
     let motion: OpaquePointer
+    /// The partition readers' (`read(_:of:after:)`, one at a time): their inter frames' motion applied.
+    private let readerMotion: OpaquePointer
     private let copyFinder: CopyFinder
 
     /// The analysis's search effort; `turbo` by default.
@@ -438,9 +440,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.interGate = 2
         metal.newPictureShapeMask = Self.defaultNewPictureShapeMask
         postfilter = try AV1MetalPostfilter(device: device)
-        guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create() else { throw Failure.encode("no CPU state") }
+        guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create(), let readerMotion = av1enc_motion_create()
+        else { throw Failure.encode("no CPU state") }
         self.cpu = cpu
         self.motion = motion
+        self.readerMotion = readerMotion
         av1enc_hybrid_set_intrabc(cpu, 1)
         copyFinder = try CopyFinder()
         applyRDOQ()
@@ -451,6 +455,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     deinit {
         av1enc_hybrid_destroy(cpu)
         av1enc_motion_destroy(motion)
+        av1enc_motion_destroy(readerMotion)
     }
 
     /// `motionSkip`'s state in a stream: what the searched frames found, newest last, and the
@@ -537,7 +542,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let gateBase = filtersDone
         func gate(_ k: Int) -> UInt64 { k >= 2 ? gateBase + UInt64(k - 1) : 0 }
         // picture i's partition, read on a thread of its own as soon as its analysis ends
-        var reading: Later<AV1MetalEncoder.Partition>?
+        var reading: Later<Read>?
         defer {
             // (no analysis waits for filters that won't come)
             filtersDone = max(filtersDone, gateBase + UInt64(count) + 1)
@@ -556,7 +561,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         func qindexOf(_ i: Int) -> Int { interFrames && i > 0 ? qindex : keyQindex }
         var current = try picture(0)
         var pending = try begin(current, Copies(), qindex: keyQindex)
-        Self.read(&pending, after: nil)
+        read(&pending, of: current, after: nil)
         reading = pending.read
         // picture i + 1's analysis is set up while picture i - 1 is finished, and committed: its
         // command buffer waits on the GPU until picture i's results are read
@@ -572,7 +577,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let first = pending.read
             starting = Later { [copies] in
                 var p = try self.begin(next, copies, qindex: q)
-                Self.read(&p, after: first)
+                self.read(&p, of: next, after: first)
                 return p
             }
         }
@@ -582,7 +587,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             // (each picture's autoreleased objects, its Metal command buffers and what they hold,
             // go with it, not when the stream ends: a caller's thread may never drain them)
             try autoreleasepool {
-                let partition = try pending.read?.wait() ?? pending.partition.wait()
+                let got = try pending.read?.wait() ?? Read(partition: pending.partition.wait())
+                let partition = got.partition
                 // the picture before's source back to the pool: its closed loop and filters, and
                 // this picture's analysis (whose motion search read it), are done
                 if pending.read != nil { metal.keepSource(partition.source) }
@@ -600,7 +606,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     following = Later { [copies] in
                         let previous = try before?.wait()
                         var p = try self.begin(up, copies, qindex: q, after: g)
-                        Self.read(&p, after: previous?.read)
+                        self.read(&p, of: up, after: previous?.read)
                         return p
                     }
                     upcoming = i + 3 < count ? try picture(i + 3) : nil
@@ -621,7 +627,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     let index = i
                     onWritten = { frame in written(index, frame) }
                 }
-                let (w, ended) = try finish(current, partition: partition, motion: motion, searchesMotion: pending.searchesMotion,
+                let (w, ended) = try finish(current, partition: partition, applied: got.applied, motion: motion,
+                                            searchesMotion: pending.searchesMotion,
                                             refs: pending.refs, qindex: qindexOf(i),
                                             qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
                                             written: onWritten)
@@ -835,7 +842,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     private struct Pending {
         var partition: AV1MetalEncoder.PendingPartition
         /// The partition, read on a thread of its own (`read(_:after:)`), or nil: read on the caller's.
-        var read: Later<AV1MetalEncoder.Partition>? = nil
+        var read: Later<Read>? = nil
         /// Per 64×64: copy, dx, dy (nil: a key frame or a still picture).
         var motion: [Int32]?
         /// An inter frame's coded 64×64s are searched for motion (its copies had candidates): the
@@ -1017,19 +1024,65 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var refs: Refs?
     }
 
-    /// Reads `p`'s partition on a thread of its own as soon as its analysis ends, after the
-    /// picture before's (`previous`: their kept analysis is read in order). Its source isn't
-    /// handed back: the caller does that (`AV1MetalEncoder.keepSource`) when the picture before's
-    /// closed loop and filters are done with theirs.
-    private static func read(_ p: inout Pending, after previous: Later<AV1MetalEncoder.Partition>?) {
-        let partition = p.partition
+    /// A partition as its reader leaves it: with an inter frame's motion applied (the blocks in
+    /// decode order with the copies' and the searched blocks' motion), or nil: `finish` applies it.
+    private struct Read {
+        var partition: AV1MetalEncoder.Partition
+        var applied: Applied? = nil
+    }
+
+    /// An inter frame's blocks with its motion applied (`av1enc_motion_apply_ex`), and the area of
+    /// its coded inter blocks in samples.
+    private struct Applied {
+        var blocks: [av1g_block], inter: [av1g_block_inter], lumaTx: [UInt8]
+        var searchedArea = 0
+    }
+
+    /// Picture `p`'s motion (`sbMotion`: per 64×64 copy, dx, dy) applied to its partition with
+    /// `handle`'s scratch.
+    private func apply(_ handle: OpaquePointer, _ sbMotion: [Int32], to partition: AV1MetalEncoder.Partition,
+                       width: Int, height: Int) throws -> Applied {
+        var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?
+        let n = partition.blocks.withUnsafeBufferPointer { b in
+            partition.lumaTxTypes.withUnsafeBufferPointer { t in
+                partition.inter.withUnsafeBufferPointer { searched in
+                    av1enc_motion_apply_ex(handle, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
+                                           searched.count == b.count ? searched.baseAddress : nil,
+                                           Int32(width), Int32(height), streamSB128 ? 1 : 0,
+                                           Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &outBlocks, &outInter, &outTx)
+                }
+            }
+        }
+        guard n > 0, let outBlocks, let outInter, let outTx else { throw Failure.encode("motion: no blocks") }
+        var applied = Applied(blocks: Array(UnsafeBufferPointer(start: outBlocks, count: Int(n))),
+                              inter: Array(UnsafeBufferPointer(start: outInter, count: Int(n))),
+                              lumaTx: Array(UnsafeBufferPointer(start: outTx, count: Int(n))))
+        for (b, i) in zip(applied.blocks, applied.inter) where i.is_inter != 0 && b.skip == 0 {
+            let size = AV1MetalEncoder.blockSizes[Int(b.bsize)]
+            applied.searchedArea += size.w * size.h
+        }
+        return applied
+    }
+
+    /// Reads `p`'s partition (of `picture`) on a thread of its own as soon as its analysis ends,
+    /// after the picture before's (`previous`: their kept analysis is read in order, and they
+    /// share `readerMotion`), and applies an inter frame's motion to it. Its source isn't handed
+    /// back: the caller does that (`AV1MetalEncoder.keepSource`) when the picture before's closed
+    /// loop and filters are done with theirs.
+    private func read(_ p: inout Pending, of picture: Picture, after previous: Later<Read>?) {
+        let partition = p.partition, motion = interFrames ? p.motion : nil
+        let (width, height) = (picture.width, picture.height)
         // (above the closed loop's threads, which take every core: it's short, and the next
         // analysis and closed loop wait for it)
         p.read = Later(qos: .userInteractive) {
             _ = try previous?.wait()
-            let part = try partition.wait(keepsSource: false)
+            var read = Read(partition: try partition.wait(keepsSource: false))
             AV1HybridEncoder.trace("read")
-            return part
+            if let motion {
+                read.applied = try self.apply(self.readerMotion, motion, to: read.partition, width: width, height: height)
+                AV1HybridEncoder.trace("applied")
+            }
+            return read
         }
     }
 
@@ -1058,7 +1111,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        motionSeconds: copies.seconds, qmap: qmap, hashes: hashes, refs: copies.refs)
     }
 
-    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, motion sbMotionIn: [Int32]?, searchesMotion: Bool,
+    private func finish(_ p: Picture, partition: AV1MetalEncoder.Partition, applied pre: Applied? = nil, motion sbMotionIn: [Int32]?,
+                        searchesMotion: Bool,
                         refs: Refs?, qindex: Int,
                         qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double, writingBefore: Writing?,
                         written: (@Sendable (Frame) -> Void)?) throws -> (Writing, Frame?) {
@@ -1117,27 +1171,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 timing.searchedMotion = searchesMotion
                 sbMotion = sbMotionIn
                 let copies = (0..<(sbCols0 * sbRows0)).filter { sbMotion[3 * $0] != 0 }.count
-                var outBlocks: UnsafePointer<av1g_block>?, outInter: UnsafePointer<av1g_block_inter>?, outTx: UnsafePointer<UInt8>?
-                let n = partition.blocks.withUnsafeBufferPointer { b in
-                    partition.lumaTxTypes.withUnsafeBufferPointer { t in
-                        partition.inter.withUnsafeBufferPointer { searched in
-                            av1enc_motion_apply_ex(motion, sbMotion, b.baseAddress, UInt32(b.count), gpuDecides ? t.baseAddress : nil,
-                                                   searched.count == b.count ? searched.baseAddress : nil,
-                                                   Int32(p.width), Int32(p.height), streamSB128 ? 1 : 0,
-                                                   Int32(tiling.columnsLog2), Int32(tiling.rowsLog2), &outBlocks, &outInter, &outTx)
-                        }
-                    }
-                }
-                guard n > 0, let outBlocks, let outInter, let outTx else { throw Failure.encode("motion: no blocks") }
-                blocks = Array(UnsafeBufferPointer(start: outBlocks, count: Int(n)))
-                inter = Array(UnsafeBufferPointer(start: outInter, count: Int(n)))
-                var area = 0
-                for (b, i) in zip(blocks, inter) where i.is_inter != 0 && b.skip == 0 {
-                    let size = AV1MetalEncoder.blockSizes[Int(b.bsize)]
-                    area += size.w * size.h
-                }
-                timing.searched = Double(area) / Double(p.width * p.height)
-                lumaTx = Array(UnsafeBufferPointer(start: outTx, count: Int(n)))
+                // (applied by the partition's reader, or here)
+                let applied = try pre ?? apply(motion, sbMotion, to: partition, width: p.width, height: p.height)
+                (blocks, inter, lumaTx) = (applied.blocks, applied.inter, applied.lumaTx)
+                timing.searched = Double(applied.searchedArea) / Double(p.width * p.height)
                 let nsb = sbCols0 * sbRows0
                 timing.copied = Double(copies) / Double(nsb)
                 timing.copiedGolden = Double((0..<nsb).filter { sbMotion[3 * $0] == 2 }.count) / Double(nsb)
@@ -1157,6 +1194,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
         let store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
         let into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
+        // a frame that swaps the slots keeps the previous picture as a long-term one (below): its
+        // decoded planes, copied out of the filters' buffers beside the closed loop, which only
+        // reads them (unless it reconstructs into them: with CDEF off they're the same buffers)
+        let swapsOut = refs.map { $0.swaps } == true && reference != nil
+        let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && postfilter.outputPlanes.first.map { out in
+            !into.contains { $0.map { UnsafePointer($0) == out } == true }
+        } == true ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
         Self.trace("closed loop start")
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
@@ -1191,8 +1235,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.closedLoop = av1enc_hybrid_seconds(cpu, 1)
         // a frame that swaps the slots keeps the previous picture as a long-term one: its decoded
         // planes, before this one's filters overwrite them (and the slot this one goes into drops its)
-        if let refs, refs.swaps, reference != nil {
-            slotPlanes[refs.last] = previousDecoded(width: p.width, height: p.height)
+        if let refs, swapsOut {
+            slotPlanes[refs.last] = try keeping?.wait() ?? previousDecoded(width: p.width, height: p.height)
             slotPlanes[refs.refresh.trailingZeroBitCount] = []
         }
         let tileCount = (1 << max(0, tiling.columnsLog2)) * (1 << max(0, tiling.rowsLog2))
