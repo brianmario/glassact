@@ -318,12 +318,13 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
             const int rx = x + v.x, ry = y + v.y;
             if (!seen && rx >= 0 && ry >= 0 && rx <= I.aw - 16 && ry <= I.ah - 16) {
                 device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
-                const uint lim = thr >> 11;
+                // (the key so far, partial SAD << 11 | i, is at most the vector's: above thr, it can't
+                // be one of the two; so where thr's SAD is 0, nothing after thr's index is measured)
                 uint sad = 0;
-                bool done = true;
-                for (int row = 0; row < 16; row += 2) {
+                bool done = (uint)i < thr;
+                for (int row = 0; row < (done ? 16 : 0); row += 2) {
                     for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-                    if (sad > lim) { done = false; break; }
+                    if (((sad << 11) | (uint)i) > thr) { done = false; break; }
                 }
                 if (done) {
                     const uint key = (sad << 11) | (uint)i;
