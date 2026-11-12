@@ -339,6 +339,29 @@ static inline float leaf_tree16(thread const float *v) {
     for (int k = 0; k < 8; k++) a[k] = v[2 * k] + v[2 * k + 1];
     return ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
 }
+// k_leaf's plain modes (DC, V, H, SMOOTH, SMOOTH_V, SMOOTH_H, PAETH: bits 0..6 of the chroma
+// model's kept classes) as a mask over AV1 modes; DC alone if none is kept
+static inline uint leaf_plain_mask(uint kept) {
+    constexpr int plain[7] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED, AV1G_SMOOTH_V_PRED,
+                              AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
+    uint m = 0;
+    for (int k = 0; k < 7; k++)
+        if (kept >> k & 1) m |= 1u << plain[k];
+    return m ? m : 1u << AV1G_DC_PRED;
+}
+// a 4x4 chroma block's cost in mode M (both planes' proxies, then the mode's rate)
+template <int M>
+static inline float leaf_cost4(thread const int *c0, thread const int *c1, thread const uint8_t *a0,
+                               thread const uint8_t *l0, thread const uint8_t *a1, thread const uint8_t *l1,
+                               int dc0, int dc1, float step, float lambda) {
+    const PredCand pc = pred_cand0(M, 2, 2);
+    int r[16];
+    for (int p = 0; p < 16; p++) r[p] = c0[p] - pred_fast(pc, p / 4, p % 4, a0, l0, dc0);
+    const float cost0 = leaf_proxy4(r, step, lambda);
+    for (int p = 0; p < 16; p++) r[p] = c1[p] - pred_fast(pc, p / 4, p % 4, a1, l1, dc1);
+    const float cost1 = leaf_proxy4(r, step, lambda);
+    return (cost0 + cost1) + lambda * (av1g_is_directional(M) ? 5.0f : 3.5f);
+}
 static void leaf_chroma4(device const GpImage &I, constant GpParams &P, int x, int y, int bs, int qidx, int lumaMode,
                          thread GpLeafDecision &d) {
     static_assert(ML_CHROMA_H == 16, "leaf_tree16 adds 16 hidden units");
@@ -391,28 +414,22 @@ static void leaf_chroma4(device const GpImage &I, constant GpParams &P, int x, i
         }
         kept = leaf_chroma_keep(z, I.mlChromaEps);
     }
-    constexpr int plain[7] = {AV1G_DC_PRED, AV1G_V_PRED, AV1G_H_PRED, AV1G_SMOOTH_PRED, AV1G_SMOOTH_V_PRED,
-                              AV1G_SMOOTH_H_PRED, AV1G_PAETH_PRED};
-    int keptModes[7], nkept = 0;
-    for (int k = 0; k < 7; k++)
-        if (kept >> k & 1) keptModes[nkept++] = plain[k];
-    if (!nkept) keptModes[nkept++] = AV1G_DC_PRED;
-    const int nmodes = P.leafChromaAngled ? AV1G_INTRA_MODES : nkept;
+    // the modes in k_leaf's order, each compiled for itself (a constant mode: pred_cand0), the ones
+    // the model doesn't keep skipped; the same costs, compared in the same order, as a loop over
+    // the kept modes with pred_cand
+    const uint keep = P.leafChromaAngled ? 0x1FFFu : leaf_plain_mask(kept);
     float best = GP_INF;
     int bestMode = AV1G_DC_PRED;
-    for (int mi = 0; mi < nmodes; mi++) {
-        const int m = P.leafChromaAngled ? mi : keptModes[mi];
-        const PredCand pc = pred_cand(cand_pack(m, 0), 2, 2);
-        float cost[2];
-        for (int pl = 0; pl < 2; pl++) {
-            int r[16];
-            for (int p = 0; p < 16; p++)
-                r[p] = c[pl][p] - pred_fast(pc, p / 4, p % 4, ea[pl] + AV1G_EDGE_OFF, el[pl] + AV1G_EDGE_OFF, dcv[pl]);
-            cost[pl] = leaf_proxy4(r, step, lambda);
-        }
-        const float J = (cost[0] + cost[1]) + lambda * (av1g_is_directional(m) ? 5.0f : 3.5f);
-        if (J < best) { best = J; bestMode = m; }
+    thread const uint8_t *a0 = ea[0] + AV1G_EDGE_OFF, *l0 = el[0] + AV1G_EDGE_OFF;
+    thread const uint8_t *a1 = ea[1] + AV1G_EDGE_OFF, *l1 = el[1] + AV1G_EDGE_OFF;
+#define LEAF4_MODE(M)                                                                                  \
+    if (keep >> (M) & 1) {                                                                             \
+        const float J = leaf_cost4<M>(c[0], c[1], a0, l0, a1, l1, dcv[0], dcv[1], step, lambda);       \
+        if (J < best) { best = J; bestMode = (M); }                                                    \
     }
+    LEAF4_MODE(0) LEAF4_MODE(1) LEAF4_MODE(2) LEAF4_MODE(3) LEAF4_MODE(4) LEAF4_MODE(5) LEAF4_MODE(6)
+    LEAF4_MODE(7) LEAF4_MODE(8) LEAF4_MODE(9) LEAF4_MODE(10) LEAF4_MODE(11) LEAF4_MODE(12)
+#undef LEAF4_MODE
     d.uvMode = (uint8_t)bestMode;
     d.angleUV = 0;
     d.cflU = d.cflV = 0;
