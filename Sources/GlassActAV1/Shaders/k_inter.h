@@ -288,21 +288,28 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     const int2 cb = wb == 0 ? int2(0, 0) : ga_me_vector(I, GA_ME_ZERO + 81 * (wb - 1) + 40, sbv);
     const bool inZero = abs(cb.x) <= 8 && abs(cb.y) <= 8;
     const int f = inZero ? 0 : 81, z0 = inZero ? (cb.y + 8) * 17 + cb.x + 8 : GA_ME_ZERO / 2;
+    // (the lane's vector: offset o, from the window's first, in the window at place wi of that
+    // order; stepped 32 a round, each window larger than 32)
+    int wi = 0, o = (int)lane;
     for (int q0 = 0; q0 < nSearch; q0 += 32) {
         const int q = q0 + (int)lane;
+        const int w = f ? (wi == 0 ? wb : wi == 1 ? 0 : wi - 1 + (wi - 1 >= wb ? 1 : 0)) : wi;
         if (q < nSearch) {
             int i;
-            if (q >= f && q < f + GA_ME_ZERO) i = (q - f + z0) % GA_ME_ZERO;
-            else {
-                const int u = q < f ? 0 : q - GA_ME_ZERO - f;  // the candidate windows' order
-                const int w = q < f ? wb : 1 + u / 81 + (f != 0 && 1 + u / 81 >= wb ? 1 : 0);
-                i = GA_ME_ZERO + (w - 1) * 81 + ((q < f ? q : u % 81) + 40) % 81;
+            int2 v;
+            if (w == 0) {
+                const int io = o + z0 - (o + z0 >= GA_ME_ZERO ? GA_ME_ZERO : 0);
+                i = io;
+                v = int2(io % 17 - 8, io / 17 - 8);
+            } else {
+                const int io = o + 40 - (o + 40 >= 81 ? 81 : 0), c = w - 1;
+                i = GA_ME_ZERO + 81 * c + io;
+                v = (c < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * c], I.meCand[2 * c + 1]) : sbv) + int2(io % 9 - 4, io / 9 - 4);
             }
-            const int2 v = ga_me_vector(I, i, sbv);
             bool seen = false;
-            if (i >= GA_ME_ZERO) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
+            if (w > 0) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
                 seen = abs(v.x) <= 8 && abs(v.y) <= 8;
-                const int c = (i - GA_ME_ZERO) / 81;
+                const int c = w - 1;
                 for (int e = 0; e < c && !seen; e++) {
                     const int2 ce = e < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * e], I.meCand[2 * e + 1]) : sbv;
                     seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
@@ -325,6 +332,8 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 }
             }
         }
+        o += 32;
+        if (o >= (w == 0 ? GA_ME_ZERO : 81)) { o -= w == 0 ? GA_ME_ZERO : 81; wi++; }
         const uint t0 = simd_min(k0);
         thr = simd_min(k0 == t0 ? k1 : k0);
     }
