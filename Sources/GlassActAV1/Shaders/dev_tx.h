@@ -311,13 +311,20 @@ __device__ __forceinline__ void warp_fwd_rt(const int16_t *res, float *tmp, int 
 }
 
 // Quantize tmp -> q, return distortion / rate.  All lanes get the results.
+// Glass Act: with `iscan` (ga_iscan: the scan's inverse, by the same av1g_get_scan), the end of block
+// comes from the quantization loop, the largest scan index of a nonzero level plus one, instead of a
+// pass over the scan: the same whole number, in any order. Then it, the distortion and (64-point
+// sizes) the kept energy cross the SIMD-groups in one exchange instead of three. (red: 2 NT / 32
+// floats then.)
 template <int NT = 32>
 __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o, int W, int H,
-                                                   int lane, float *red = nullptr, int *redi = nullptr) {
+                                                   int lane, float *red = nullptr, int *redi = nullptr,
+                                                   device const uint16_t *iscan = nullptr) {
     const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1, n = tw * th;
     const int lt = log2i(tw);
     const int den = av1g_dq_denom(e.txSz);
     float dist = 0.f, kept = 0.f;
+    int last = 0;
     for (int idx = lane; idx < n; idx += NT) {
         const int i = idx >> lt, j = idx & (tw - 1);
         const float v = tmp[i * TS + j];
@@ -328,18 +335,51 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
         l = min(l, 16383);
         const int qv = v < 0 ? -l : l;
         q[idx] = (int16_t)qv;
+        if (iscan && l) last = max(last, (int)iscan[idx] + 1);
         const float dq = l ? (float)av1g_dequant_coef(qv, step, den) : 0.f;
         const float d = v - dq;
         dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
         kept = fmaf(v, v, kept);
     }
-    dist = ga_sum<NT>(dist, lane, red);
-    ga_sync<NT>();
+    const bool k64 = W == 64 || H == 64;
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
-    int last = 0;
-    for (int c = lane; c < n; c += NT)
-        if (q[scan[c]]) last = c + 1;
-    const int eob = ga_max<NT>(last, lane, redi);
+    int eob;
+    if (iscan) {
+        // (the distortion, the kept energy and the end of block in one exchange: each sum's partials
+        // as ga_sum makes them, added in the same order)
+        dist = warp_sum(dist);
+        if (k64) kept = warp_sum(kept);
+        last = warp_max(last);
+        if (NT > 32) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // (red, redi free)
+            if ((lane & 31) == 0 && lane < NT) {
+                red[lane >> 5] = dist;
+                if (k64) red[NT / 32 + (lane >> 5)] = kept;
+                redi[lane >> 5] = last;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // (and the levels written)
+            float t = 0.f;
+            for (int w = 0; w < NT / 32; w++) t += red[w];
+            dist = t;
+            if (k64) {
+                t = 0.f;
+                for (int w = 0; w < NT / 32; w++) t += red[NT / 32 + w];
+                kept = t;
+            }
+            int m = redi[0];
+            for (int w = 1; w < NT / 32; w++) m = max(m, redi[w]);
+            last = m;
+        } else {
+            ga_sync<NT>();
+        }
+        eob = last;
+    } else {
+        dist = ga_sum<NT>(dist, lane, red);
+        ga_sync<NT>();
+        for (int c = lane; c < n; c += NT)
+            if (q[scan[c]]) last = c + 1;
+        eob = ga_max<NT>(last, lane, redi);
+    }
     float bits = lane == 0 ? base_bits(e, eob) : 0.f;
     if (eob > 0) {
         const int txClass = av1g_tx_class(e.txType);
@@ -348,8 +388,8 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
     bits = ga_sum<NT>(bits, lane, red);
     const float g = g_txg[e.txSz][e.txType];
     float D = g * dist;
-    if (W == 64 || H == 64) {
-        kept = ga_sum<NT>(kept, lane, red);
+    if (k64) {
+        if (!iscan) kept = ga_sum<NT>(kept, lane, red);
         D += fmaxf(0.f, e.resEnergy - g * kept);
     }
     o.D = D;
@@ -522,15 +562,28 @@ __device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, thr
 #define GA_FWD_MATRIX_FLOATS (256 + 1024 + 4096)
 static inline int ga_fwd_matrix_offset(int lw) { return lw == 4 ? 0 : lw == 5 ? 256 : 1280; }
 
+// Glass Act: after the matrices in the same buffer, each scan's inverse (warp_quant_rate_rt's
+// `iscan`): GA_ISCAN_SLOTS of 1024 uint16 (a slot a tx size and a scan class, as av1g_get_scan
+// chooses: 2D, VERT, HORIZ), iscan[scan[c]] = c for c < the tx's coded area; filled by
+// k_fwd_matrices with av1g_get_scan itself.
+#define GA_ISCAN_SLOTS (AV1G_TX_SIZES_ALL * 3)
+#define GA_FWD_TABLE_FLOATS (GA_FWD_MATRIX_FLOATS + GA_ISCAN_SLOTS * 512)
+static inline int ga_scan_class(int txType) { return txType == AV1G_IDTX ? AV1G_TX_CLASS_2D : av1g_tx_class(txType); }
+static inline device const uint16_t *ga_iscan(device const float *fwdM, int txSz, int txType) {
+    return (device const uint16_t *)(fwdM + GA_FWD_MATRIX_FLOATS) + (txSz * 3 + ga_scan_class(txType)) * 1024;
+}
+
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
 template <int W, int H, int NT = 32>
 __device__ __forceinline__ void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
-                                          int lane, float *red = nullptr, int *redi = nullptr) {
+                                          int lane, float *red = nullptr, int *redi = nullptr,
+                                          device const uint16_t *iscan = nullptr) {
     if (W != H || W == 64) {
         warp_fwd_ct<W, H, NT>(res, tmp, e.txSz, e.txType, lane);
-        warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi);
+        warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi, iscan);
     } else {
-        warp_eval_rt<NT>(res, tmp, q, e, o, W, H, lane, red, redi);
+        warp_fwd_rt<NT>(res, tmp, W, H, e.txSz, e.txType, lane);
+        warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi, iscan);
     }
 }
 

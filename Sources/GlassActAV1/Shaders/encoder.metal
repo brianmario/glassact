@@ -74,9 +74,21 @@ GA_MMA_CHECK("k_fwd_mma_check_32", 32, 128, 128)
 GA_MMA_CHECK("k_fwd_mma_check_64", 64, 128, 256)
 GA_MMA_CHECK("k_fwd_mma_check_64t128", 64, 128, 128)  // (k_inter's 64x64: a block's RD on 128)
 
-// Glass Act: the DCT matrices warp_fwd_mma reads, into a device buffer (dev_tx.h)
+// Glass Act: the DCT matrices warp_fwd_mma reads, into a device buffer (dev_tx.h), then the scans'
+// inverses (ga_iscan), two entries a thread
 kernel void k_fwd_matrices(device float *out [[buffer(0)]], uint t [[thread_position_in_grid]]) {
-    if (t >= GA_FWD_MATRIX_FLOATS) return;
+    if (t >= GA_FWD_TABLE_FLOATS) return;
+    if (t >= GA_FWD_MATRIX_FLOATS) {
+        const int u = (int)t - GA_FWD_MATRIX_FLOATS, slot = u / 512, txSz = slot / 3, cls = slot % 3;
+        const int txType = cls == AV1G_TX_CLASS_2D ? AV1G_DCT_DCT : cls == AV1G_TX_CLASS_VERT ? AV1G_V_DCT : AV1G_H_DCT;
+        const int w = AV1G_T(Tx_Width)[txSz], h = AV1G_T(Tx_Height)[txSz];
+        const int n = (w > 32 ? 32 : w) * (h > 32 ? 32 : h);
+        AV1G_CONST const uint16_t *scan = av1g_get_scan(txSz, txType);
+        device uint16_t *is = (device uint16_t *)(out + GA_FWD_MATRIX_FLOATS) + slot * 1024;
+        for (int c = 2 * (u % 512); c < 2 * (u % 512) + 2; c++)
+            if (c < n) is[scan[c]] = (uint16_t)c;
+        return;
+    }
     const int lw = t < 256 ? 4 : t < 1280 ? 5 : 6;
     out[t] = g_fwd[g_fwdOff[AV1G_K_DCT][lw] + ((int)t - ga_fwd_matrix_offset(lw))];
 }

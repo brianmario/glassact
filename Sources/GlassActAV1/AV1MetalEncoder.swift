@@ -124,7 +124,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     /// Copies the shaders' forward DCT matrices into a buffer (dev_tx.h `GA_FWD_MATRIX_FLOATS`).
     static func makeForwardMatrices(device: any MTLDevice, library: any MTLLibrary) throws -> any MTLBuffer {
-        try makeTable("k_fwd_matrices", floats: 256 + 1024 + 4096, device: device, library: library)
+        // (dev_tx.h's GA_FWD_TABLE_FLOATS: the matrices, then 19 x 3 scans' inverses of 1024 uint16)
+        try makeTable("k_fwd_matrices", floats: 256 + 1024 + 4096 + 19 * 3 * 512, device: device, library: library)
     }
 
     /// A table a kernel fills, a thread a float (`function`'s buffer 0), once an encoder.

@@ -506,10 +506,10 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             // slower, 1.94 -> 2.56 and 2.33 -> 4.26 ms of a 5K picture of new content)
             if (ga_mma && W == H && W >= 16) {
                 warp_fwd_mma<W, NTS>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(T::lw), g_txScale[txSz], tsc);
-                warp_quant_rate_rt<NT>(S.tmp, qOf(S), e, o, W, H, lane, S.red, S.redi);
+                warp_quant_rate_rt<NT>(S.tmp, qOf(S), e, o, W, H, lane, S.red, S.redi, ga_iscan(fwdM, txSz, AV1G_DCT_DCT));
             } else
 #endif
-            warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi);
+            warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi, ga_iscan(fwdM, txSz, AV1G_DCT_DCT));
             const float J = o.D + lambda * (o.R + mbits(c) + overhead);
             if (J < bestJ) { bestJ = J; bestK = k; }
         }
@@ -523,7 +523,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
                 e.txType = t;
                 e.qm = av1g_qm(I.usingQm, I.qm[0], 0, txSz, t);
                 EvalOut o;
-                warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi);
+                warp_eval<W, H, NT>(S.res, S.tmp, qOf(S), e, o, lane, S.red, S.redi, ga_iscan(fwdM, txSz, t));
                 const float J = o.D + lambda * (o.R + mbits(c) + overhead);
                 if (J < bestJ) { bestJ = J; bestTx = t; }
             }

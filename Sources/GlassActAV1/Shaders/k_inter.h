@@ -553,18 +553,19 @@ struct GaInterSmem {
 
 // Glass Act: k_inter's RD of a DCT_DCT block: warp_eval, with the squares of 16 and up on the matrix
 // units where the analysis has them (ga_mma: the host's start-up check found them bit-identical to
-// the passes warp_eval runs, at the thread counts k_inter runs them on), so the same coefficients
+// the passes warp_eval runs, at the thread counts k_inter runs them on), so the same coefficients;
+// the end of block from the quantization loop (ga_iscan)
 template <int W, int H, int NT>
 __device__ __forceinline__ void ga_inter_eval(threadgroup GaInterSmem<W, H> &S, device const float *fwdM, thread const EvalIn &e,
                                               thread EvalOut &o, int lane) {
 #ifdef GA_FWD_MMA
     if (ga_mma && W == H && W >= 16) {
         warp_fwd_mma<W, NT>(S.res, S.tmp, fwdM + ga_fwd_matrix_offset(TxD<W, H>::lw), g_txScale[e.txSz], lane);
-        warp_quant_rate_rt<NT>(S.tmp, S.q, e, o, W, H, lane, S.red, S.redi);
+        warp_quant_rate_rt<NT>(S.tmp, S.q, e, o, W, H, lane, S.red, S.redi, ga_iscan(fwdM, e.txSz, e.txType));
         return;
     }
 #endif
-    warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi);
+    warp_eval<W, H, NT>(S.res, S.tmp, S.q, e, o, lane, S.red, S.redi, ga_iscan(fwdM, e.txSz, e.txType));
 }
 
 template <int W, int H, int BS, int NW, int NT = 32>
