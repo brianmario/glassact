@@ -415,6 +415,22 @@ struct Split<'a, H: TxbHook> {
     /// GA_CRIT: per task its start and end (ns from t0), or empty
     prof: &'a [AtomicU64],
     t0: std::time::Instant,
+    /// GA_CRIT: the workers' thread CPU time (ns) in plans, blocks, codings, and in all
+    cpu: [AtomicU64; 4],
+}
+
+/// GA_CRIT: this thread's CPU time in ns (0 where there's no such clock).
+fn thread_cpu_ns() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        unsafe extern "C" {
+            fn clock_gettime_nsec_np(clock: u32) -> u64;
+        }
+        // SAFETY: a libc call with no pointers; 16 is CLOCK_THREAD_CPUTIME_ID
+        unsafe { clock_gettime_nsec_np(16) }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    0
 }
 
 // SAFETY: the raw pointers are the record's and the writer's buffers, which the tasks' order keeps
@@ -450,6 +466,7 @@ impl<H: TxbHook> Split<'_, H> {
 
     /// Runs tasks until every tile is coded.
     fn work(&self, w: &mut Worker) {
+        let c0 = if self.prof.is_empty() { 0 } else { thread_cpu_ns() };
         let mut hs = H::Scratch::default();
         let (mut next, mut idle, mut n_fixed) = (None, 0u32, 0u64);
         let done = || self.left.load(Ordering::SeqCst) == 0;
@@ -467,13 +484,26 @@ impl<H: TxbHook> Split<'_, H> {
             };
             idle = 0;
             let k = task as usize;
+            let mut tc = 0;
             if !self.prof.is_empty() {
                 self.prof[2 * k].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                tc = thread_cpu_ns();
             }
             self.task_run(w, k, &mut hs, &mut n_fixed, &mut next);
             if !self.prof.is_empty() {
                 self.prof[2 * k + 1].store(self.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let kind = if k < self.n_blocks {
+                    1
+                } else if (k - self.n_blocks) % 3 == TASK_PLAN {
+                    0
+                } else {
+                    2
+                };
+                self.cpu[kind].fetch_add(thread_cpu_ns() - tc, Ordering::Relaxed);
             }
+        }
+        if !self.prof.is_empty() {
+            self.cpu[3].fetch_add(thread_cpu_ns() - c0, Ordering::Relaxed);
         }
         self.n_fixed.fetch_add(n_fixed, Ordering::Relaxed);
     }
@@ -666,6 +696,14 @@ fn crit_report<H: TxbHook>(sp: &Split<'_, H>, prof: &[AtomicU64], ntiles: usize)
     work += wplan + wblk + wcode;
     let wall = hi.saturating_sub(lo);
     let ms = |x: u64| x as f64 / 1e6;
+    let cpu = |k: usize| ms(sp.cpu[k].load(Ordering::Relaxed));
+    eprintln!(
+        "cpu: plan {:.2} blocks {:.2} code {:.2} all {:.2} (ms of thread CPU)",
+        cpu(0),
+        cpu(1),
+        cpu(2),
+        cpu(3)
+    );
     eprintln!(
         "crit: wall {:.2} ms, work {:.2} (plan {:.2} blocks {:.2} code {:.2}), {:.1} busy, critical path {:.2} (plan {:.2} + blocks {:.2} + code {:.2}), longest block {:.3}, tiles {}",
         ms(wall),
@@ -1365,6 +1403,7 @@ impl Writer {
                 no_code: opts.flags & ENC_NO_CODE != 0,
                 prof: &prof,
                 t0: std::time::Instant::now(),
+                cpu: Default::default(),
             };
             for i in 0..ntiles {
                 if !skipped(i) {
