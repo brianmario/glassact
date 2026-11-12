@@ -472,30 +472,39 @@ kernel void k_inter_sad(constant GpBatch &B [[buffer(0)]], constant GpParams &P 
             device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
             // Glass Act: ga_ref_px's bilinear sum as (8 - fy) h(row) + fy h(row + 1) (+ 32, >> 6), h a
             // row's (8 - fx) a + fx b: the same whole numbers, each reference row read once (and the
-            // samples ga_ref_px reads only: no next column without fx, no next row without fy)
+            // samples ga_ref_px reads only: no next column without fx, no next row without fy), in a loop
+            // of its own for each case (selects between the cases cost as much as the loads)
             const int fx = v.x & 7, fy = v.y & 7;
             device const uint8_t *ref = I.ref + (size_t)(y + (v.y >> 3)) * sp + x + (v.x >> 3);
             sad = 0;
             if ((fx | fy) == 0) {
                 for (int r = 0; r < 8; r++)
                     for (int c = 0; c < 8; c++) sad += (uint)abs((int)src[r * sp + c] - (int)ref[r * sp + c]);
+            } else if (fy == 0) {  // (8 h + 32) >> 6 a row
+                for (int r = 0; r < 8; r++)
+                    for (int c = 0; c < 8; c++)
+                        sad += (uint)abs((int)src[r * sp + c] -
+                                         ((8 * ((8 - fx) * (int)ref[r * sp + c] + fx * (int)ref[r * sp + c + 1]) + 32) >> 6));
+            } else if (fx == 0) {  // h = 8 a
+                int h0[8];
+                for (int c = 0; c < 8; c++) h0[c] = 8 * (int)ref[c];
+                for (int r = 0; r < 8; r++) {
+                    device const uint8_t *n = ref + (size_t)(r + 1) * sp;
+                    for (int c = 0; c < 8; c++) {
+                        const int h1 = 8 * (int)n[c];
+                        sad += (uint)abs((int)src[r * sp + c] - (((8 - fy) * h0[c] + fy * h1 + 32) >> 6));
+                        h0[c] = h1;
+                    }
+                }
             } else {
                 int h0[8];
-                for (int c = 0; c < 8; c++) h0[c] = fx ? (8 - fx) * (int)ref[c] + fx * (int)ref[c + 1] : 8 * (int)ref[c];
+                for (int c = 0; c < 8; c++) h0[c] = (8 - fx) * (int)ref[c] + fx * (int)ref[c + 1];
                 for (int r = 0; r < 8; r++) {
-                    int h1[8];
-                    if (fy) {
-                        device const uint8_t *n = ref + (size_t)(r + 1) * sp;
-                        for (int c = 0; c < 8; c++) h1[c] = fx ? (8 - fx) * (int)n[c] + fx * (int)n[c + 1] : 8 * (int)n[c];
-                    } else
-                        for (int c = 0; c < 8; c++) h1[c] = 0;
-                    for (int c = 0; c < 8; c++)
-                        sad += (uint)abs((int)src[r * sp + c] - (((8 - fy) * h0[c] + fy * h1[c] + 32) >> 6));
-                    if (fy)
-                        for (int c = 0; c < 8; c++) h0[c] = h1[c];
-                    else if (r < 7) {
-                        device const uint8_t *n = ref + (size_t)(r + 1) * sp;
-                        for (int c = 0; c < 8; c++) h0[c] = fx ? (8 - fx) * (int)n[c] + fx * (int)n[c + 1] : 8 * (int)n[c];
+                    device const uint8_t *n = ref + (size_t)(r + 1) * sp;
+                    for (int c = 0; c < 8; c++) {
+                        const int h1 = (8 - fx) * (int)n[c] + fx * (int)n[c + 1];
+                        sad += (uint)abs((int)src[r * sp + c] - (((8 - fy) * h0[c] + fy * h1 + 32) >> 6));
+                        h0[c] = h1;
                     }
                 }
             }
