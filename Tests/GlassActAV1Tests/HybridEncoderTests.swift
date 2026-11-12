@@ -734,7 +734,7 @@ extension HybridEncoderTests {
 extension HybridEncoderTests {
     /// `newPictureEffort`: a stream of a scene whose photo drifts, broken twice by three pictures
     /// of stripes (each new), takes the fast levers (no motion search, no tx type search, no RDOQ,
-    /// no 4x4s, looser learned pruning) and a coarser qindex in the first two mostly-new pictures
+    /// no 4x4s, looser learned pruning, no CDEF, whole-sample motion) and a coarser qindex in the first two mostly-new pictures
     /// of each run (`runLimit`) and in no other, without the motion search in the first alone
     /// (`motionlessRun`), the levers switched frame by frame; libaom decodes
     /// the stream in order to exactly the pictures the encoder reports. An effort that changes
@@ -772,8 +772,9 @@ extension HybridEncoderTests {
         let qindex = 100
         var effort = AV1HybridEncoder.NewPictureEffort(
             qindexDelta: 24, searchesMotion: false, searchesTxTypes: false, usesRDOQ: false,
-            analysis: .init(shapeMask: 0x1248, eps: 0.1, modeEps: 0.1))
+            analysis: .init(shapeMask: 0x1248, eps: 0.1, modeEps: 0.1, subpel: false))
         effort.runLimit = 2
+        effort.cdef = false
         let decoder = try #require(glassact_aom_dec_create(1))
         defer { glassact_aom_dec_destroy(decoder) }
         var fast: [Int] = []
@@ -784,6 +785,8 @@ extension HybridEncoderTests {
                 #expect(Int(f.params.base_q_idx) == (t.fast ? qindex + 24 : qindex), "frame \(i): qindex \(f.params.base_q_idx)")
                 // (the motion search off in a run's first picture alone: `motionlessRun`)
                 #expect(t.searchedMotion == ![5, 11].contains(i), "frame \(i): searched for motion: \(t.searchedMotion)")
+                // (whole samples in the fast pictures that search: 6 and 12)
+                #expect(f.params.mv_precision == (t.searchedMotion && !t.fast ? 1 : 0), "frame \(i): mv_precision \(f.params.mv_precision)")
             }
             var frame = glassact_aom_frame()
             try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")

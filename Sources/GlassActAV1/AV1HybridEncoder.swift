@@ -381,23 +381,28 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// settle; video or scrolling new images make every picture mostly new, and their softness
         /// would last as long as the motion does.
         public var runLimit: Int?
-        /// The measured levels (nil above the last; 0 changes nothing), each with its qindex offset
-        /// calibrated on 5K pictures that are all new to hold the default's bytes (BENCHMARKS "a
-        /// mostly-new picture coded fast"):
-        /// 1. learned pruning looser (levels eps 0.05, modes 0.10) and RDOQ from 17 coefficients:
-        ///    the analysis's cheapest cuts, about free in quality; +1.
-        /// 2. and no motion search in a run's first picture (a switch's): +4.
-        /// 3. and no luma tx type search or RDOQ in the closed loop: its largest cut; +12.
-        /// 4. and no CDEF: +12.
+        /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
+        /// that holds the default's bytes (BENCHMARKS "a mostly-new picture coded fast"):
+        /// 1. the levers whose bytes don't depend on the content: learned pruning looser (levels
+        ///    eps 0.05, modes 0.10), no RDOQ, no CDEF, the motion search in whole samples; +3 (the
+        ///    offset that holds the bytes is +1 to +5 on every switch and all-new picture measured).
+        /// 2. and no motion search where no shift is proposed: the GPU's largest cut, but on a switch
+        ///    between screens of the same kind (two text screens) the search finds a sixth of the
+        ///    picture and the picture costs a quarter more; +4.
+        /// 3. and no luma tx type search: the closed loop's largest cut, whose bytes depend on the
+        ///    content (screen text +11 %, video +2 %); +10.
         public static func level(_ n: Int) -> NewPictureEffort? {
-            let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10)
+            let cheap = AV1MetalEncoder.NewPictureAnalysis(eps: 0.05, modeEps: 0.10, subpel: false)
+            var e = NewPictureEffort(qindexDelta: 3, usesRDOQ: false, analysis: cheap)
+            e.cdef = false
             switch n {
             case 0: return NewPictureEffort()
-            case 1: return NewPictureEffort(qindexDelta: 1, rdoqMinCoefficients: 17, analysis: cheap)
-            case 2: return NewPictureEffort(qindexDelta: 4, searchesMotion: false, rdoqMinCoefficients: 17, analysis: cheap)
-            case 3, 4:
-                var e = NewPictureEffort(qindexDelta: 12, searchesMotion: false, searchesTxTypes: false, usesRDOQ: false, analysis: cheap)
-                e.cdef = n == 3
+            case 1: return e
+            case 2:
+                (e.qindexDelta, e.searchesMotion) = (4, false)
+                return e
+            case 3:
+                (e.qindexDelta, e.searchesMotion, e.searchesTxTypes) = (10, false, false)
                 return e
             default: return nil
             }
