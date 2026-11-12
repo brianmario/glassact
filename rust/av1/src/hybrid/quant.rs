@@ -401,6 +401,38 @@ pub(crate) fn quantize_f(
     nz
 }
 
+/// sum(c^2 - (c - c')^2) over the coded coefficients (q != 0), c' = q dcs (DC) or q acs, in
+/// coefficient order. A zero level adds exactly 0 (c' = 0: c^2 - c^2, and the sum is never -0), so
+/// a group of levels with any coded one adds them all, and an all-zero group is skipped: the
+/// same sum with a branch per 8 levels.
+#[inline]
+fn td_taken(d: &[f32], q: &[i16], dcs: f32, acs: f32) -> f32 {
+    let mut acc = 0f32;
+    for (g, (dg, qg)) in d.chunks_exact(8).zip(q.chunks_exact(8)).enumerate() {
+        if qg.iter().fold(0, |a, &l| a | l) == 0 {
+            continue;
+        }
+        for (k, (&c, &l)) in dg.iter().zip(qg).enumerate() {
+            let e = c - l as f32 * if g == 0 && k == 0 { dcs } else { acs };
+            acc += c * c - e * e;
+        }
+    }
+    acc
+}
+
+/// [`td_taken`]'s reference: the coded coefficients one by one.
+#[cfg(test)]
+fn td_taken_ref(d: &[f32], q: &[i16], dcs: f32, acs: f32) -> f32 {
+    let mut acc = 0f32;
+    for (i, (&c, &l)) in d.iter().zip(q).enumerate() {
+        if l != 0 {
+            let e = c - l as f32 * if i == 0 { dcs } else { acs };
+            acc += c * c - e * e;
+        }
+    }
+    acc
+}
+
 /// The quantizer over double coefficients (the reference engine's).
 fn quantize_d(d: &[f64], q: &mut [i16], den: i32, dc_q: i32, ac_q: i32, m: Option<&[u8]>, rnd: f64, zbin: f64) -> bool {
     let thr = if m.is_none() {
@@ -479,13 +511,7 @@ impl QuantHook<'_> {
             // E - g sum(c^2 - (c - c')^2), c' = q step / den: what the coded coefficients take of
             // the residual's energy E
             let (dcs, acs) = (dc_q as f32 / den as f32, ac_q as f32 / den as f32);
-            let mut acc = 0f32;
-            for (i, (&c, &l)) in w.df[..n].iter().zip(&q[..n]).enumerate() {
-                if l != 0 {
-                    let e = c - l as f32 * if i == 0 { dcs } else { acs };
-                    acc += c * c - e * e;
-                }
-            }
+            let acc = td_taken(&w.df[..n], &q[..n], dcs, acs);
             let d = w.energy as f64 - coeff_gain_t(self.f, tx_sz, ty) as f64 * acc as f64;
             r = self.rate(q, tx_sz, ty, n);
             return fmac(lambda, r, d.max(0.0));
@@ -818,6 +844,38 @@ mod tests {
             for &c in &out[..nc] {
                 assert!((c.abs() as f64) <= lim, "tx {tx} type {ty} (scalar): |{c}| > {lim}");
             }
+        }
+    }
+
+    /// td_taken's grouped sum is bit for bit the coded coefficients' one by one, on quantized
+    /// residuals of every density (and -0 coefficients).
+    #[test]
+    fn td_taken_matches_the_reference() {
+        let mut r = 0x51ed_270bu32;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 17;
+            r ^= r << 5;
+            r
+        };
+        let (mut d, mut q) = (vec![0f32; 1024], vec![0i16; 1024]);
+        for case in 0..20_000 {
+            let n = 16usize << (next() % 7);
+            let (dcs, acs) = (1.0 + (next() % 4000) as f32 / 37.0, 1.0 + (next() % 4000) as f32 / 41.0);
+            let density = next() % 9;
+            for (c, l) in d[..n].iter_mut().zip(&mut q[..n]) {
+                let x = next();
+                *c = ((x >> 4) % 20_000) as f32 / 7.0 - 1428.0;
+                *l = if x % 8 < density { (*c / acs).round() as i16 } else { 0 };
+                if x % 61 == 0 {
+                    *c = -0.0;
+                }
+            }
+            assert_eq!(
+                td_taken(&d[..n], &q[..n], dcs, acs).to_bits(),
+                td_taken_ref(&d[..n], &q[..n], dcs, acs).to_bits(),
+                "case {case}"
+            );
         }
     }
 
