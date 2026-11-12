@@ -211,6 +211,16 @@ int av1enc_motion_classify_ex(av1enc_motion *m, const uint8_t *const cur[3], con
                               const uint8_t *const prev[3], const int prev_stride[3],
                               const uint8_t *const golden[3], const int golden_stride[3], int width, int height,
                               int planes, int max_candidates, int32_t *out);
+// av1enc_motion_classify, then GOLDEN_FRAME's picture chosen among `count` older ones (the
+// long-term references, most recently used first: goldens and golden_strides hold 3 planes each,
+// in order) and the 64x64s that don't copy prev classified against it as
+// av1enc_motion_classify_ex does. One: it (exactly av1enc_motion_classify_ex). More: the one most
+// of those 64x64s equal at no shift, by a sample of their luma rows; ties go to the earlier.
+// *chosen (optional): its index, -1 with none.
+int av1enc_motion_classify_multi(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
+                                 const uint8_t *const prev[3], const int prev_stride[3],
+                                 const uint8_t *const *goldens, const int *golden_strides, int count, int width,
+                                 int height, int planes, int max_candidates, int32_t *out, int *chosen);
 // The last classify's shift candidates (dx, dy pairs, best first), up to max; returns the count.
 int av1enc_motion_candidates(const av1enc_motion *m, int32_t *out, int max);
 // A classify's decisions (sb_motion, as its out) applied to a partition in coding order (and its

@@ -275,6 +275,60 @@ extension HybridEncoderTests {
 }
 
 extension HybridEncoderTests {
+    /// Long-term references: four screens (the key frame's and three more, each a different
+    /// noise, with a word typed into it every time it's shown) in turn, one of them for two
+    /// pictures each time. Every picture of a screen shown before copies most of itself from
+    /// GOLDEN_FRAME (the screens share nothing, so only the long-term picture of its own screen
+    /// can give it copies), and the stream decodes in libaom to exactly the pictures the encoder
+    /// reports. With one long-term picture (GOLDEN_FRAME is the screen before the last one), a
+    /// cycle of four copies almost nothing from it.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(1280, 720, 80, 2, 4), (333, 201, 120, -1, 3), (1280, 720, 80, 2, 1)])
+    func longTermReferencesDecodeToTheirPictures(width: Int, height: Int, qindex: Int, tilesLog2: Int, longTerm: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (tilesLog2, tilesLog2)
+        encoder.interFrames = true
+        encoder.longTermReferences = longTerm
+        var rng = SplitMix64(seed: 0x10e7)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var screens: [[UInt8]] = (0..<4).map { _ in base.y.map { _ in UInt8(rng.int(30..<220)) } }
+        let schedule = [0, 1, 1, 2, 3, 0, 1, 1, 2, 3, 0, 1, 2, 3, 3, 0]
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for s in schedule {
+            let x0 = rng.int(0..<max(1, width - 24)), y0 = rng.int(0..<max(1, height - 12))
+            for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { screens[s][r * width + c] = 16 } }
+            pictures.append(AV1HybridEncoder.Picture(y: screens[s], u: base.u, v: base.v, width: width, height: height))
+        }
+        let label = "\(width)×\(height) q\(qindex) tiles \(tilesLog2), \(longTerm) long-term"
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        // the pictures of a screen shown before (not the one before them): where they copy GOLDEN_FRAME
+        let returns = schedule.indices.filter { i in i > 0 && schedule[i] != schedule[i - 1] && schedule[..<i].contains(schedule[i]) }
+        var golden: [Double] = []
+        try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { i, f in
+            if returns.contains(i) { golden.append(f.timing.copiedGolden) }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(label): libaom rejected frame \(i)")
+            let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+            for p in 0..<3 {
+                let (w, h) = sizes[p]
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        })
+        #expect(golden.count == returns.count, "\(label): \(golden.count) of \(returns.count) returns output")
+        if longTerm >= 3 {
+            #expect(golden.allSatisfy { $0 > 0.7 }, "\(label): the returns copied \(golden) of their 64×64s from GOLDEN_FRAME")
+        } else {
+            #expect(golden.reduce(0, +) / Double(max(1, golden.count)) < 0.2, "\(label): the returns copied \(golden) from GOLDEN_FRAME")
+        }
+    }
+}
+
+extension HybridEncoderTests {
     /// Intra block copy: pictures whose text repeats (at even and odd offsets) copy it, with no
     /// post-filters, and decode in libaom to exactly the pictures the encoder reports: as still
     /// pictures (the same one again, keeping its tiles; a photo after it, which doesn't copy and

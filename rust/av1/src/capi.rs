@@ -1418,6 +1418,59 @@ pub unsafe extern "C" fn av1enc_motion_classify_ex(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_classify_multi(
+    m: *mut crate::motion::Motion,
+    cur: *const *const u8,
+    cur_stride: *const c_int,
+    prev: *const *const u8,
+    prev_stride: *const c_int,
+    goldens: *const *const u8,
+    golden_strides: *const c_int,
+    count: c_int,
+    width: c_int,
+    height: c_int,
+    planes: c_int,
+    max_candidates: c_int,
+    out: *mut i32,
+    chosen: *mut c_int,
+) -> c_int {
+    if m.is_null() || width < 1 || height < 1 || (planes != 1 && planes != 3) || count < 0 {
+        return -1;
+    }
+    if count > 0 && (goldens.is_null() || golden_strides.is_null()) {
+        return -1;
+    }
+    // SAFETY: the handle; the pictures' planes (count goldens', 3 pointers and 3 strides each, in
+    // order); out holds 3 ints per 64x64 (av1enc.h)
+    let (c, q) = unsafe {
+        (
+            motion_planes(cur, cur_stride, width, height, planes),
+            motion_planes(prev, prev_stride, width, height, planes),
+        )
+    };
+    let g: Vec<[crate::motion::Plane; 3]> = (0..count as usize)
+        // SAFETY: as above, golden k's 3 pointers and strides
+        .map(|k| unsafe { motion_planes(goldens.add(3 * k), golden_strides.add(3 * k), width, height, planes) })
+        .collect();
+    // SAFETY: the handle
+    let m = unsafe { &mut *m };
+    let (n, k) = m.classify_multi(&c, &q, &g, planes as usize, max_candidates.max(0) as usize);
+    if !out.is_null() {
+        // SAFETY: out holds 3 ints per 64x64
+        let o = unsafe { slice::from_raw_parts_mut(out, 3 * m.sbs.len()) };
+        for (i, s) in m.sbs.iter().enumerate() {
+            let copy = if s.golden { 2 } else { s.copy as i32 };
+            o[3 * i..3 * i + 3].copy_from_slice(&[copy, s.shift.dx, s.shift.dy]);
+        }
+    }
+    if !chosen.is_null() {
+        // SAFETY: the caller's int
+        unsafe { *chosen = k.map_or(-1, |k| k as c_int) };
+    }
+    n as c_int
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_motion_candidates(m: *const crate::motion::Motion, out: *mut i32, max: c_int) -> c_int {
     if m.is_null() || out.is_null() || max <= 0 {
         return 0;

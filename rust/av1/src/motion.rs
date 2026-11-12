@@ -66,6 +66,26 @@ pub fn sb_matches(cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, sb_x: usiz
     true
 }
 
+/// Whether the 64x64 at (sb_x, sb_y) of luma plane `cur` looks like `old`'s at no shift: a sample
+/// of its rows (every 8th, from the 5th) equal. A cheap test for choosing among older pictures
+/// ([`Motion::classify_multi`]), not a copy's check ([`sb_matches`] is). Planes of another size
+/// don't match.
+pub fn golden_score(cur: &Plane, old: &Plane, sb_x: usize, sb_y: usize) -> bool {
+    if old.width != cur.width || old.height != cur.height {
+        return false;
+    }
+    let (x0, y0) = (sb_x * 64, sb_y * 64);
+    if x0 >= cur.width || y0 >= cur.height {
+        return false;
+    }
+    let (w, h) = (64.min(cur.width - x0), 64.min(cur.height - y0));
+    let first = if h > 4 { 4 } else { 0 };
+    (first..h).step_by(8).all(|r| {
+        let y = y0 + r;
+        cur.data[y * cur.stride + x0..][..w] == old.data[y * old.stride + x0..][..w]
+    })
+}
+
 /// The blocks that cover superblock (sb_row, sb_col) with the largest legal partition (decisions.h's
 /// rules): NONE where it fits, HORZ / VERT where only the top / left half is inside the coded area,
 /// SPLIT where neither is. Every block is 8x8 or larger (MiCols and MiRows are even). Fields other
@@ -341,6 +361,63 @@ impl Motion {
             }
             _ => n,
         }
+    }
+
+    /// [`Motion::classify`], then GOLDEN_FRAME's picture chosen among `goldens` (the long-term
+    /// references, most recently used first) and the 64x64s that don't copy `prev` classified
+    /// against it as [`Motion::classify_ex`] does. With one, it (exactly `classify_ex`); with more,
+    /// the one that the most of those 64x64s equal at no shift by [`golden_score`]'s sample, ties
+    /// going to the earlier (the first when nothing is left to copy). Returns the copies' count
+    /// and the chosen index (None: no `goldens`).
+    pub fn classify_multi(
+        &mut self,
+        cur: &[Plane; 3],
+        prev: &[Plane; 3],
+        goldens: &[[Plane; 3]],
+        planes: usize,
+        max_candidates: usize,
+    ) -> (usize, Option<usize>) {
+        let n = self.classify_last(cur, prev, planes, max_candidates);
+        if goldens.is_empty() {
+            return (n, None);
+        }
+        let mut chosen = 0;
+        if goldens.len() > 1 && n < self.sbs.len() {
+            let scores = self.golden_scores(cur, goldens);
+            for (k, &s) in scores.iter().enumerate() {
+                if s > scores[chosen] {
+                    chosen = k;
+                }
+            }
+        }
+        let g = &goldens[chosen];
+        if n < self.sbs.len() && g[0].width == cur[0].width && g[0].height == cur[0].height {
+            return (n + self.classify_golden(cur, g, planes, max_candidates), Some(chosen));
+        }
+        (n, Some(chosen))
+    }
+
+    /// Per picture of `goldens`: how many of the 64x64s that aren't copies match it at no shift by
+    /// [`golden_score`]'s sample (its rows of SB rows on several threads).
+    fn golden_scores(&self, cur: &[Plane; 3], goldens: &[[Plane; 3]]) -> Vec<u32> {
+        let sb_cols = self.sb_cols;
+        let rows_per = self.sb_rows.div_ceil(self.threads.max(1)).max(1);
+        let sbs = &self.sbs;
+        let mut parts: Vec<(usize, Vec<u32>)> = (0..self.sb_rows.div_ceil(rows_per))
+            .map(|k| (k, vec![0; goldens.len()]))
+            .collect();
+        crate::pool::each(&mut parts, |(k, out)| {
+            let range = *k * rows_per * sb_cols..((*k + 1) * rows_per * sb_cols).min(sbs.len());
+            for s in range.filter(|&s| !sbs[s].copy) {
+                for (o, g) in out.iter_mut().zip(goldens) {
+                    *o += golden_score(&cur[0], &g[0], s % sb_cols, s / sb_cols) as u32;
+                }
+            }
+        });
+        parts.iter().fold(vec![0; goldens.len()], |mut a, (_, p)| {
+            a.iter_mut().zip(p).for_each(|(x, y)| *x += y);
+            a
+        })
     }
 
     /// The copies of `golden` among the 64x64s that aren't copies yet; returns how many.
@@ -890,5 +967,39 @@ mod tests {
         assert!(!sb_matches(&y, &prev, 1, 2, 1, Shift { dx: 0, dy: 72 }));
         // the bottom superblocks read past the previous picture: no match
         assert!(!sb_matches(&y, &prev, 1, 2, 5, Shift { dx: 0, dy: 74 }));
+    }
+
+    #[test]
+    fn classify_multi_chooses_the_matching_golden() {
+        let (w, h) = (333usize, 201usize);
+        let mut s = 11u64;
+        let mut noise = || -> Vec<u8> { (0..w * h).map(|_| (rng(&mut s) & 0xff) as u8).collect() };
+        let scenes: Vec<Vec<u8>> = (0..4).map(|_| noise()).collect();
+        // the new picture: scene 2, but the previous picture's top-left 64x64
+        let prev = noise();
+        let mut cur = scenes[2].clone();
+        for r in 0..64 {
+            cur[r * w..r * w + 64].copy_from_slice(&prev[r * w..r * w + 64]);
+        }
+        fn p(d: &[u8], w: usize, h: usize) -> [Plane<'_>; 3] {
+            let q = plane(d, w, h);
+            [q, q, q]
+        }
+        let goldens: Vec<[Plane; 3]> = [0, 1, 2, 3].iter().map(|&k| p(&scenes[k], w, h)).collect();
+        let mut m = Motion::new();
+        let (n, chosen) = m.classify_multi(&p(&cur, w, h), &p(&prev, w, h), &goldens, 1, 8);
+        assert_eq!(chosen, Some(2));
+        assert_eq!(n, m.sbs.len());
+        assert!(m.sbs[0].copy && !m.sbs[0].golden);
+        assert!(m.sbs[1..].iter().all(|x| x.copy && x.golden));
+        // one golden: classify_ex's decisions, whichever it is
+        let (n1, c1) = m.classify_multi(&p(&cur, w, h), &p(&prev, w, h), &goldens[..1], 1, 8);
+        let multi = m.sbs.clone();
+        let n2 = m.classify_ex(&p(&cur, w, h), &p(&prev, w, h), Some(&goldens[0]), 1, 8);
+        assert_eq!((n1, c1), (n2, Some(0)));
+        assert_eq!(multi, m.sbs);
+        // nothing to choose by: the first
+        let (_, c) = m.classify_multi(&p(&prev, w, h), &p(&prev, w, h), &goldens, 1, 8);
+        assert_eq!(c, Some(0));
     }
 }

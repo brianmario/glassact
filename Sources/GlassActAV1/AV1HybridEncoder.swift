@@ -64,6 +64,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var filtersGPU = 0.0
         /// Inter frames: the share of 64×64s copied from the GOLDEN_FRAME picture (`goldenFrames`).
         public var copiedGolden = 0.0
+        /// Inter frames: GOLDEN_FRAME's long-term picture by use, as it was chosen (0: the most
+        /// recently used or kept; `longTermReferences`), -1 with none.
+        public var goldenRank = -1
+        /// Inter frames: GOLDEN_FRAME's AV1 slot (0…7), -1 with none.
+        public var goldenSlot = -1
         /// Inter frames: the share of 64×64s copied from the previous picture (unchanged or
         /// shifted), and of those at a shift; the time deciding them.
         public var copied = 0.0, shifted = 0.0, motion = 0.0
@@ -302,13 +307,31 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false
 
-    /// Inter frames also copy from an older picture, GOLDEN_FRAME's: the last one before the
-    /// latest picture that was mostly new (most of whose 64×64s didn't copy the picture before
-    /// it). Switching back to what was on the screen before (another app, a Space, a tab) copies
-    /// it (on).
+    /// Inter frames also copy from an older picture, GOLDEN_FRAME's: one of the long-term
+    /// pictures (`longTermReferences`), each the last picture of a scene that a mostly new picture
+    /// (most of whose 64×64s didn't copy the picture before it) left. Switching back to what was
+    /// on the screen before (another app, a Space, a tab) copies it (on).
     public var goldenFrames = true
-    /// GOLDEN_FRAME's decoded planes (tight), for the inter frame whose copies chose it.
-    private var goldenPlanes: [[UInt8]] = []
+
+    /// With `goldenFrames`: how many long-term pictures inter frames keep, each in an AV1 slot of
+    /// its own (1…7: the 8 slots less LAST_FRAME's). A mostly new picture keeps the one before
+    /// it, the end of the scene it leaves, where it is (LAST_FRAME's slot), and goes itself into
+    /// the slot of the long-term picture it returns to, if it does (it copied at least half of
+    /// what it didn't copy from LAST_FRAME from GOLDEN_FRAME): an older state of its own scene,
+    /// which it supersedes; else into a free slot, or the least recently used one's. So a scene
+    /// left keeps only its newest state. Each inter frame's GOLDEN_FRAME is the long-term picture
+    /// the most of its 64×64s not copying LAST_FRAME look like (a sample of their rows, at no
+    /// shift; ties to the most recently used). With more than one, the key frame is the first
+    /// (its scene's end replaces it). 1: GOLDEN_FRAME is the end of the last scene left, none
+    /// before the first (the rule before there were more). Each costs a picture's source and
+    /// decoded planes (3 bytes a pixel: 44 MB at 5K, 14 MB at 2900 × 1630). 4 by default: on four
+    /// screens in turn, 2 saves 18 % of the bytes at equal RGB PSNR, 4 and 6 49 % (2900 px).
+    public var longTermReferences = 4 {
+        didSet { longTermReferences = min(7, max(1, longTermReferences)) }
+    }
+    /// The long-term pictures' decoded planes (tight) by AV1 slot ([] where there's none), for the
+    /// inter frames whose copies choose them.
+    private var slotPlanes: [[[UInt8]]] = Array(repeating: [], count: 8)
 
     /// The current stream's superblock size (set when it starts).
     private var streamSB128 = false
@@ -399,8 +422,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        written: (@Sendable (Int, Frame) -> Void)? = nil, output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
-        goldenPlanes = []
+        slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = interFrames && goldenFrames
+        copyFinder.limit = longTermReferences
         copyFinder.reset()
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
@@ -430,51 +454,55 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var upcoming = count > 2 ? try picture(2) : nil
         if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
         for i in 0..<count {
-            let partition = try pending.partition.wait()
-            Self.trace("partition \(i)")
-            // picture i + 2's analysis, set up after picture i + 1's (two at most are set up and not
-            // yet read: their kept-analysis buffers alternate)
-            let afterNext = upcoming
-            if let up = upcoming {
-                let copies = interFrames ? copyFinder.wait() : Copies()
-                let before = starting
-                following = Later {
-                    _ = try before?.wait()
-                    return try self.begin(up, copies, qindex: qindex)
+            // (each picture's autoreleased objects, its Metal command buffers and what they hold,
+            // go with it, not when the stream ends: a caller's thread may never drain them)
+            try autoreleasepool {
+                let partition = try pending.partition.wait()
+                Self.trace("partition \(i)")
+                // picture i + 2's analysis, set up after picture i + 1's (two at most are set up and not
+                // yet read: their kept-analysis buffers alternate)
+                let afterNext = upcoming
+                if let up = upcoming {
+                    let copies = interFrames ? copyFinder.wait() : Copies()
+                    let before = starting
+                    following = Later {
+                        _ = try before?.wait()
+                        return try self.begin(up, copies, qindex: qindex)
+                    }
+                    upcoming = i + 3 < count ? try picture(i + 3) : nil
+                    if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
                 }
-                upcoming = i + 3 < count ? try picture(i + 3) : nil
-                if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
-            }
-            let t0 = CACurrentMediaTime()
-            var timing = Timing()
-            timing.analysis = metal.lastGPUSeconds
-            let sbs = ((2 * ((current.width + 7) >> 3) + 15) >> 4) * ((2 * ((current.height + 7) >> 3) + 15) >> 4)
-            timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
-            timing.motion = pending.motionSeconds
-            let motion = pending.motion
-            // picture i - 1's write runs beside this closed loop; finish takes it back before
-            // picture i's write begins (until then `writing` holds it, for the defer)
-            var onWritten: (@Sendable (Frame) -> Void)?
-            if let written {
-                let index = i
-                onWritten = { frame in written(index, frame) }
-            }
-            let (w, ended) = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex,
-                                        qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
-                                        written: onWritten)
-            writing = w
-            if let ended {
-                try output(i - 1, ended)
-                Self.trace("written \(i - 1)")
-            }
-            if let s = starting {
-                starting = following
-                following = nil
-                pending = try s.wait()
-            }
-            if let n = next {
-                current = n
-                next = afterNext
+                let t0 = CACurrentMediaTime()
+                var timing = Timing()
+                timing.analysis = metal.lastGPUSeconds
+                let sbs = ((2 * ((current.width + 7) >> 3) + 15) >> 4) * ((2 * ((current.height + 7) >> 3) + 15) >> 4)
+                timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
+                timing.motion = pending.motionSeconds
+                let motion = pending.motion
+                // picture i - 1's write runs beside this closed loop; finish takes it back before
+                // picture i's write begins (until then `writing` holds it, for the defer)
+                var onWritten: (@Sendable (Frame) -> Void)?
+                if let written {
+                    let index = i
+                    onWritten = { frame in written(index, frame) }
+                }
+                let (w, ended) = try finish(current, partition: partition, motion: motion, refs: pending.refs, qindex: qindex,
+                                            qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
+                                            written: onWritten)
+                writing = w
+                if let ended {
+                    try output(i - 1, ended)
+                    Self.trace("written \(i - 1)")
+                }
+                if let s = starting {
+                    starting = following
+                    following = nil
+                    pending = try s.wait()
+                }
+                if let n = next {
+                    current = n
+                    next = afterNext
+                }
             }
         }
         if let w = writing {
@@ -493,8 +521,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                output: (Int, Int, Frame) throws -> Void) throws {
         guard count > 0, interFrames else { return }
         previous = nil
-        goldenPlanes = []
+        slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = goldenFrames
+        copyFinder.limit = longTermReferences
         copyFinder.reset()
         streamSB128 = largeSuperblocks
         metal.largeSuperblocks = streamSB128
@@ -681,11 +710,17 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// An inter frame's reference slots: LAST_FRAME's, GOLDEN_FRAME's + 1 (0: none), the slots it
-    /// refreshes, and whether it swaps them (it was mostly new: the previous picture becomes
-    /// GOLDEN_FRAME's and this one LAST_FRAME's, in the slot GOLDEN_FRAME's had).
+    /// refreshes, and whether it swaps (it was mostly new: the previous picture, in LAST_FRAME's
+    /// slot, is kept there as a long-term picture, and this one goes into `refresh`'s slot, which
+    /// becomes LAST_FRAME's: the long-term picture it held is replaced or evicted).
     struct Refs {
         var last = 0, golden = 0, refresh = 1
         var swaps = false
+        /// A stream's first inter frame, with more than one long-term picture: the key frame (its
+        /// reference) is the first, in this slot (-1: none).
+        var keepsKey = -1
+        /// GOLDEN_FRAME's long-term picture's rank by use (`Timing.goldenRank`).
+        var goldenRank = -1
     }
 
     /// Decides inter frames' copies on a thread of its own, with a motion handle of its own (the
@@ -695,16 +730,31 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         private var result: Copies?
         private var running = false
         private let done = DispatchSemaphore(value: 0)
-        /// `goldenFrames`: GOLDEN_FRAME's source and the two slots, as of the next picture (the
-        /// pictures are classified in order)
+        /// `goldenFrames`, and `longTermReferences`: the long-term pictures and the slots, as of the
+        /// next picture (the pictures are classified in order)
         var golden = false
-        private var goldenSource: Picture?
-        private var lastSlot = 0, goldenSlot = 1
+        var limit = 1
+        private struct LongTerm {
+            var slot: Int
+            var source: Picture
+        }
+        /// Most recently used (copied from, or kept) first.
+        private var longTerm: [LongTerm] = []
+        private var lastSlot = 0
+        /// The slot of a long-term picture that holds the current scene's older state, which the
+        /// scene's end replaces when it's left: the key frame's, in the first scene. (A scene
+        /// entered from a long-term picture replaces it with its first picture, as LAST_FRAME's.)
+        private var sceneSlot: Int?
+        /// The next picture classified is the stream's first inter frame, and its reference, the
+        /// key frame, becomes the first long-term picture (with `limit` > 1).
+        private var keyPending = false
 
         /// A stream starts (after its key frame every slot holds it; no GOLDEN_FRAME yet).
         func reset() {
-            goldenSource = nil
-            (lastSlot, goldenSlot) = (0, 1)
+            longTerm = []
+            lastSlot = 0
+            sceneSlot = nil
+            keyPending = golden && limit > 1
         }
 
         init() throws {
@@ -740,41 +790,67 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// coded, with no shift as the motion search's one candidate. LAST_FRAME's slot is refreshed.
         func again(_ p: Picture, after first: Copies) -> Copies {
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
-            let g = goldenSource.flatMap { $0.width == p.width && $0.height == p.height ? $0 : nil }
+            let g = longTerm.first.flatMap { $0.source.width == p.width && $0.source.height == p.height ? $0 : nil }
             let copied = (0..<nsb).map { i in UInt8(first.skip.map { $0[i] != 0 ? 1 : 0 } ?? 0) }
             var m = [Int32](repeating: 0, count: 3 * nsb)
             for i in 0..<nsb { m[3 * i] = Int32(copied[i]) }
             return Copies(motion: m, skip: copied, candidates: [0, 0],
-                          refs: Refs(last: lastSlot, golden: g != nil ? goldenSlot + 1 : 0, refresh: 1 << lastSlot))
+                          refs: Refs(last: lastSlot, golden: g.map { $0.slot + 1 } ?? 0, refresh: 1 << lastSlot))
         }
 
         private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
-            guard prev.width == p.width, prev.height == p.height else { return Copies() }
+            guard prev.width == p.width, prev.height == p.height else {
+                reset()  // (a key frame, which every slot then holds)
+                return Copies()
+            }
             let tm = CACurrentMediaTime()
+            var keepsKey = -1
+            if keyPending {
+                keyPending = false
+                (longTerm, sceneSlot, keepsKey) = ([LongTerm(slot: 1, source: prev)], 1, 1)
+            }
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
             var m = [Int32](repeating: 0, count: 3 * nsb)
             let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
-            let g = goldenSource.flatMap { $0.width == p.width && $0.height == p.height ? $0 : nil }
+            var chosen: Int32 = -1
             AV1HybridEncoder.planes(p) { cur in
                 AV1HybridEncoder.planes(prev) { before in
-                    if let g {
-                        AV1HybridEncoder.planes(g) { old in
-                            _ = av1enc_motion_classify_ex(motion, cur, strides, before, strides, old, strides,
-                                                          Int32(p.width), Int32(p.height), 3, 8, &m)
-                        }
-                    } else {
-                        _ = av1enc_motion_classify(motion, cur, strides, before, strides, Int32(p.width), Int32(p.height), 3, 8, &m)
+                    AV1HybridEncoder.planes(longTerm.map(\.source)[...]) { olds in
+                        let oldStrides = [[Int32]](repeating: strides, count: longTerm.count).flatMap { $0 }
+                        _ = av1enc_motion_classify_multi(motion, cur, strides, before, strides, olds, oldStrides,
+                                                         Int32(longTerm.count), Int32(p.width), Int32(p.height), 3, 8,
+                                                         &m, &chosen)
                     }
                 }
             }
-            // the reference slots, and GOLDEN_FRAME's for the next picture
+            // the reference slots, and the long-term pictures for the next picture
             let fromLast = (0..<nsb).filter { m[3 * $0] == 1 }.count
-            let swaps = golden && 2 * fromLast < nsb
-            let refs = Refs(last: lastSlot, golden: g != nil ? goldenSlot + 1 : 0,
-                            refresh: 1 << (swaps ? goldenSlot : lastSlot), swaps: swaps)
-            if swaps {
-                goldenSource = prev
-                (lastSlot, goldenSlot) = (goldenSlot, lastSlot)
+            let fromGolden = (0..<nsb).filter { m[3 * $0] == 2 }.count
+            let k = Int(chosen)
+            var refs = Refs(last: lastSlot, golden: k >= 0 ? longTerm[k].slot + 1 : 0, refresh: 1 << lastSlot,
+                            keepsKey: keepsKey, goldenRank: k)
+            if k > 0, fromGolden > 0 { longTerm.insert(longTerm.remove(at: k), at: 0) }
+            if golden && 2 * fromLast < nsb {
+                // the previous picture, the end of the scene this one leaves, is kept where it is.
+                // This one goes into the slot of the long-term picture it returns to (an earlier
+                // state of its scene: GOLDEN_FRAME's, if that gave it at least half of what
+                // LAST_FRAME didn't), which it supersedes; else the slot of the older state of the
+                // scene it leaves, a free one, or the least recently used one's.
+                let entered = k >= 0 && 2 * fromGolden >= nsb - fromLast ? refs.golden - 1 : -1
+                let target: Int
+                if let i = longTerm.firstIndex(where: { $0.slot == entered }) {
+                    target = longTerm.remove(at: i).slot
+                } else if let s = sceneSlot, let i = longTerm.firstIndex(where: { $0.slot == s }) {
+                    target = longTerm.remove(at: i).slot
+                } else if longTerm.count < limit {
+                    target = (0..<8).first { t in t != lastSlot && !longTerm.contains { $0.slot == t } } ?? 0
+                } else {
+                    target = longTerm.removeLast().slot
+                }
+                sceneSlot = nil
+                longTerm.insert(LongTerm(slot: lastSlot, source: prev), at: 0)
+                (refs.refresh, refs.swaps) = (1 << target, true)
+                lastSlot = target
             }
             var candidates: [Int32]?
             if searchesMotion {
@@ -840,6 +916,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var blocks = partition.blocks, lumaTx = partition.lumaTxTypes, inter: [av1g_block_inter] = []
         var sbMotion: [Int32] = []
         let reference = sbMotionIn != nil ? previous : nil
+        if interFrames, reference == nil {
+            slotPlanes = Array(repeating: [], count: 8)  // (a key frame: every slot holds it)
+        }
         if interFrames {
             video.video = 1
             video.sb128 = streamSB128 ? 1 : 0
@@ -863,8 +942,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             if reference != nil, let sbMotionIn {
                 video.frame_type = UInt8(AV1G_FRAME_INTER)
                 let refs = refs ?? Refs()
+                if refs.keepsKey >= 0 {
+                    slotPlanes[refs.keepsKey] = previousDecoded(width: p.width, height: p.height)
+                }
                 video.ref_slot = UInt8(refs.last)
-                video.golden_slot = goldenPlanes.count == 3 ? UInt8(refs.golden) : 0
+                video.golden_slot = refs.golden > 0 && slotPlanes[refs.golden - 1].count == 3 ? UInt8(refs.golden) : 0
+                timing.goldenRank = video.golden_slot != 0 ? refs.goldenRank : -1
+                timing.goldenSlot = Int(video.golden_slot) - 1
                 video.refresh_frame_flags = UInt8(refs.refresh)
                 video.lf_inter_off = 1
                 video.allow_screen_content_tools = 1
@@ -919,7 +1003,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                     blocks.withUnsafeBufferPointer { blocks in
                         lumaTx.withUnsafeBufferPointer { types in
                             inter.withUnsafeBufferPointer { inter in
-                                Self.reference(refPlanes, gpu: gpuRef, golden: video.golden_slot != 0 ? goldenPlanes : [],
+                                Self.reference(refPlanes, gpu: gpuRef, golden: video.golden_slot != 0 ? slotPlanes[Int(video.golden_slot) - 1] : [],
                                                width: p.width) { ref in
                                     withUnsafePointer(to: video) { vp in
                                     av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
@@ -944,10 +1028,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         Self.trace("closed loop end")
         timing.chroma = av1enc_hybrid_seconds(cpu, 0)
         timing.closedLoop = av1enc_hybrid_seconds(cpu, 1)
-        // a frame that swaps the slots makes the previous picture GOLDEN_FRAME's: its decoded
-        // planes, before this one's filters overwrite them
-        if refs?.swaps == true, reference != nil {
-            goldenPlanes = previousDecoded(width: p.width, height: p.height)
+        // a frame that swaps the slots keeps the previous picture as a long-term one: its decoded
+        // planes, before this one's filters overwrite them (and the slot this one goes into drops its)
+        if let refs, refs.swaps, reference != nil {
+            slotPlanes[refs.last] = previousDecoded(width: p.width, height: p.height)
+            slotPlanes[refs.refresh.trailingZeroBitCount] = []
         }
         let tileCount = (1 << max(0, tiling.columnsLog2)) * (1 << max(0, tiling.rowsLog2))
         timing.keptTiles = Double(av1enc_hybrid_reused_tiles(cpu)) / Double(tileCount)
@@ -1071,6 +1156,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 try p.v.withUnsafeBufferPointer { v in try body([y.baseAddress, u.baseAddress, v.baseAddress]) }
             }
         }
+    }
+
+    /// Pictures' planes as C pointers, three each, in order.
+    static func planes<R>(_ ps: ArraySlice<Picture>, _ before: [UnsafePointer<UInt8>?] = [],
+                          _ body: ([UnsafePointer<UInt8>?]) throws -> R) rethrows -> R {
+        guard let first = ps.first else { return try body(before) }
+        return try planes(first) { try planes(ps.dropFirst(), before + $0, body) }
     }
 
     /// The reference picture (cropped planes, tight) as av1g_ref_planes; nil when there's none.
