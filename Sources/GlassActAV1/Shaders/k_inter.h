@@ -76,8 +76,9 @@ kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
                    uint tid [[thread_position_in_threadgroup]]) {
     constexpr int RYMAX = 2 * GA_PROJ_RY, RXMAX = 2 * GA_PROJ_RX;
     threadgroup int srow[64], scol[64], rrow[64 + 2 * RYMAX], rcol[64 + 2 * RXMAX];
-    threadgroup float bestCost[GA_PROJ_T];
-    threadgroup int bestOff[GA_PROJ_T];
+    threadgroup float bestCost[GA_PROJ_T / 32];
+    threadgroup int bestOff[GA_PROJ_T / 32 + 1];
+    threadgroup uint rankOf[GA_PROJ_T / 32];
     threadgroup uint sadOf[4];
     if (tg >= nSbs) return;
     device const GpImage &I = B.img[0];
@@ -132,18 +133,31 @@ kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
             const float c = ga_proj_cost(a, t) * (1.f + 0.0005f * (float)abs(d));
             if (c < bc) { bc = c; bo = d; }
         }
-        bestCost[tid] = bc;
-        bestOff[tid] = bo;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = GA_PROJ_T / 2; s > 0; s >>= 1) {
-            if (tid < s && (bestCost[tid + s] < bestCost[tid] ||
-                            (bestCost[tid + s] == bestCost[tid] && abs(bestOff[tid + s]) < abs(bestOff[tid])))) {
-                bestCost[tid] = bestCost[tid + s];
-                bestOff[tid] = bestOff[tid + s];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Glass Act: the threads' best by (cost, |d|), and among equals the one a strided halving
+        // (tid against tid + s, s = 128 .. 1, the lower kept unless the other is better) keeps: the
+        // lowest tid bit-reversed. Each SIMD-group's by simd_min, then the 8 on the first
+        const uint rank = reverse_bits(tid) >> 24;
+        float m = simd_min(bc);
+        uint ad = simd_min(bc == m ? (uint)abs(bo) : 0xFFFFFFFFu);
+        uint rk = simd_min(bc == m && (uint)abs(bo) == ad ? rank : 0xFFFFFFFFu);
+        if (rank == rk) {  // (one lane a SIMD-group)
+            bestCost[tid / 32] = bc;
+            bestOff[tid / 32] = bo;
+            rankOf[tid / 32] = rank;
         }
-        const int o = bestOff[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32) {
+            const int w = (int)tid;
+            const float c = w < GA_PROJ_T / 32 ? bestCost[w] : GP_INF;
+            const int oo = w < GA_PROJ_T / 32 ? bestOff[w] : 0;
+            const uint rr = w < GA_PROJ_T / 32 ? rankOf[w] : 0xFFFFFFFFu;
+            m = simd_min(c);
+            ad = simd_min(c == m ? (uint)abs(oo) : 0xFFFFFFFFu);
+            rk = simd_min(c == m && (uint)abs(oo) == ad ? rr : 0xFFFFFFFFu);
+            if (rr == rk) bestOff[GA_PROJ_T / 32] = oo;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int o = bestOff[GA_PROJ_T / 32];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         return o;
     };
