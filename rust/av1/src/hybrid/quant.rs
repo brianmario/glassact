@@ -54,6 +54,8 @@ pub(crate) struct Work {
     energy: u64,
     /// the residual's first forward products, shared by the types a search tries
     s1: Stage1Cache,
+    /// RDOQ's level map
+    lev: Box<[u8; rdoq::LEV]>,
 }
 
 /// A tile thread's scratch (what the C++ keeps in thread_locals).
@@ -81,6 +83,7 @@ impl Scratch {
                 rdoq_here: 0,
                 energy: 0,
                 s1: Stage1Cache::default(),
+                lev: Box::new([0; rdoq::LEV]),
             },
             cur: vec![0; 1024],
             best: vec![0; 1024],
@@ -247,6 +250,7 @@ impl<'a> QuantHook<'a> {
             return;
         }
         rdoq::optimize(
+            &mut w.lev,
             cc,
             &mut q[..n],
             &w.df[..n],
@@ -459,7 +463,7 @@ impl QuantHook<'_> {
             let mut nz = quantize_f(&w.df[..n], q, den, dc_q, ac_q, m, rnd, zbin);
             if let Some(cc) = self.rdoq.filter(|_| self.rdoq_trials && need_j && plane == 0 && m.is_none() && nz && self.rdoq_here(w, s, ss, tx_sz)) {
                 let lam = 0.12 * (ac_q as f32 / 8.0) * (ac_q as f32 / 8.0);
-                rdoq::optimize(cc, &mut q[..n], &w.df[..n], tx_sz, ty, 0, dc_q as f32, ac_q as f32, den as f32, coeff_gain(self.f, tx_sz), lam);
+                rdoq::optimize(&mut w.lev, cc, &mut q[..n], &w.df[..n], tx_sz, ty, 0, dc_q as f32, ac_q as f32, den as f32, coeff_gain(self.f, tx_sz), lam);
                 nz = q[..n].iter().any(|&v| v != 0);
             }
             nz

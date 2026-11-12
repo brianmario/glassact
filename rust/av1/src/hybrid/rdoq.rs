@@ -139,11 +139,16 @@ fn eob_bits(cc: &CoeffCosts, multi: usize, ptype: usize, ectx: usize, tx_sz_ctx:
     b
 }
 
+/// [`optimize`]'s level map: a 32x32's, padded by 4 to the right and below.
+pub(crate) const LEV: usize = (32 + 4) * (32 + 4);
+
 /// Optimizes the levels `q` (a tw x th tx block of `tx_sz`, `tx_type`, plane `plane`) quantized from
 /// the transform coefficients `v` with dequantization `step(i) / den`: `dist` is the sample-domain
-/// SSE of a unit coefficient error, `lambda` the weight of a bit.
+/// SSE of a unit coefficient error, `lambda` the weight of a bit. `lev` is scratch (its contents
+/// don't matter: the part the block reads is cleared).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn optimize(
+    lev: &mut [u8; LEV],
     cc: &CoeffCosts,
     q: &mut [i16],
     v: &[f32],
@@ -179,7 +184,10 @@ pub(crate) fn optimize(
     let (width, height) = (1usize << bwl, Tx_Height[adj] as usize);
     let area = (height << bwl) as i32;
     let ls = width + 4;
-    let mut lev = [0u8; (32 + 4) * (32 + 4)];
+    // the levels decided so far and their padding: what the contexts read (rows up to 4 below the
+    // block's last, columns up to 4 right of its last, inside a row of `ls`)
+    let lev = &mut lev[..(height + 4) * ls];
+    lev.fill(0);
     let sig = &Sig_Ref_Diff_Offset[class as usize];
     let magoff = &Mag_Ref_Offset_With_Tx_Class[class as usize];
     let base_ctx_off = &Coeff_Base_Ctx_Offset[tsz];
@@ -260,7 +268,7 @@ pub(crate) fn optimize(
         let last = c == eob - 1;
         if !(last && l == 1) {
             // one lower (a 2 straight to nothing measured the same: BENCHMARKS)
-            let cx = ctxs(&lev, pos, c);
+            let cx = ctxs(lev, pos, c);
             let j0 = derr(pos, l) + lambda * bits_at(cx, c, last, l);
             let j1 = derr(pos, l - 1) + lambda * bits_at(cx, c, last, l - 1);
             if j1 < j0 {
@@ -282,11 +290,11 @@ pub(crate) fn optimize(
         // with it: its own bits and the end at eob; the previous level coded as a plain one
         lev[lp_of(pos)] = 1;
         let r_with = eob_bits(cc, multi, ptype, ectx, tx_sz_ctx, eob as i32)
-            + level_bits(&lev, pos, eob - 1, true, 1)
-            + (prev + 1..eob - 1).map(|c| level_bits(&lev, scan[c] as usize, c, false, 0)).sum::<f32>()
-            + level_bits(&lev, ppos, prev, false, pl);
+            + level_bits(lev, pos, eob - 1, true, 1)
+            + (prev + 1..eob - 1).map(|c| level_bits(lev, scan[c] as usize, c, false, 0)).sum::<f32>()
+            + level_bits(lev, ppos, prev, false, pl);
         lev[lp_of(pos)] = 0;
-        let r_without = eob_bits(cc, multi, ptype, ectx, tx_sz_ctx, prev as i32 + 1) + level_bits(&lev, ppos, prev, true, pl);
+        let r_without = eob_bits(cc, multi, ptype, ectx, tx_sz_ctx, prev as i32 + 1) + level_bits(lev, ppos, prev, true, pl);
         let dj = derr(pos, 0) - derr(pos, 1) + lambda * (r_without - r_with);
         if dj >= 0.0 {
             break;
@@ -327,7 +335,7 @@ mod tests {
                     }
                     let v: Vec<f32> = q.iter().map(|&l| l as f32 * 40.0 / 8.0 + ((rnd() % 100) as f32 - 50.0) / 20.0).collect();
                     let before = q.clone();
-                    optimize(&cc, &mut q, &v, tx_sz, tx_type, 0, 40.0, 40.0, 8.0, 1.0, 150.0);
+                    optimize(&mut [0x55; LEV], &cc, &mut q, &v, tx_sz, tx_type, 0, 40.0, 40.0, 8.0, 1.0, 150.0);
                     for (a, b) in before.iter().zip(&q) {
                         assert!(b.abs() <= a.abs() && (*b == 0 || b.signum() == a.signum()), "tx {tx_sz} type {tx_type}: {a} -> {b}");
                     }
