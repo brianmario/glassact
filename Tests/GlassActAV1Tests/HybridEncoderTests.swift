@@ -614,6 +614,62 @@ extension HybridEncoderTests {
         #expect(longest <= 2, "skipped \(longest) frames in a row")
     }
 
+    /// A stream coded without its pictures handed back (`returnsPlanes` off: the closed loop reads
+    /// its reference where the filters left it, on the GPU) has the bytes of the same stream coded
+    /// with them, which the tests above decode. At qindex 32 and under there's no CDEF, so the
+    /// filters' output is the buffers the next picture is reconstructed into: the closed loop must
+    /// not predict from what it has overwritten (a page scrolled down reads above itself; a key
+    /// frame finer than its inter frames puts only the key frame there).
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(1280, 720, 24, 0), (1280, 720, 44, -16), (333, 201, 16, 0), (1280, 720, 80, 0)])
+    func aStreamWithoutItsPicturesHasTheSameBytes(width: Int, height: Int, qindex: Int, keyDelta: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        var rng = SplitMix64(seed: 0xa11a5)
+        let base = PartitionTests.Picture(width: width, height: height)
+        // two screens in turn, so pictures go to long-term slots and come back from GOLDEN_FRAME:
+        // glyph-like noise with a word typed into it each time, and a page taller than the screen
+        // scrolled down then up 64 rows (copies at a shift from above and below)
+        var a = base.y
+        for k in a.indices where rng.int(0..<4) == 0 { a[k] = UInt8(rng.int(20..<90)) }
+        var page = [UInt8](repeating: 200, count: width * (height + 256))
+        for k in page.indices where rng.int(0..<3) == 0 { page[k] = UInt8(rng.int(60..<180)) }
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for (i, top) in [192, 192, 128, 64, 64, 0, 64, 128, 128, 192].enumerated() {
+            if i % 3 == 1 {
+                let x0 = rng.int(0..<max(1, width - 24)), y0 = rng.int(0..<max(1, height - 12))
+                for r in y0..<min(height, y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { a[r * width + c] = 40 } }
+                pictures.append(AV1HybridEncoder.Picture(y: a, u: base.u, v: base.v, width: width, height: height))
+            } else {
+                let x0 = rng.int(0..<max(1, width - 24)), y0 = top + rng.int(0..<max(1, height - 12))
+                for r in y0..<(y0 + 10) { for c in x0..<min(width, x0 + 20) where rng.int(0..<2) == 0 { page[r * width + c] = 16 } }
+                pictures.append(AV1HybridEncoder.Picture(y: Array(page[(top * width)..<((top + height) * width)]), u: base.u, v: base.v,
+                                                         width: width, height: height))
+            }
+        }
+        func stream(planes: Bool) throws -> (bytes: [[UInt8]], shifted: Double, golden: Double) {
+            let encoder = try AV1HybridEncoder(device: device)
+            encoder.tiling = (width > 640 ? 1 : -1, width > 640 ? 1 : -1)
+            encoder.interFrames = true
+            encoder.keyFrameQindexDelta = keyDelta
+            encoder.returnsPlanes = planes
+            var bytes: [[UInt8]] = [], shifted = 0.0, golden = 0.0
+            try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { _, f in
+                bytes.append(f.obu)
+                shifted += f.timing.shifted
+                golden += f.timing.copiedGolden
+            })
+            return (bytes, shifted, golden)
+        }
+        let label = "\(width)×\(height) q\(qindex) key delta \(keyDelta)"
+        let with = try stream(planes: true), without = try stream(planes: false)
+        #expect(with.shifted > 0, "\(label): no picture copied at a shift")
+        #expect(with.golden > 0, "\(label): no picture copied from GOLDEN_FRAME")
+        #expect(with.bytes.count == pictures.count && without.bytes.count == pictures.count, "\(label)")
+        for (i, (a, b)) in zip(with.bytes, without.bytes).enumerated() {
+            #expect(a == b, "\(label): frame \(i) differs without its pictures (\(a.count) and \(b.count) bytes)")
+        }
+    }
+
     /// A key frame at another qindex than its inter frames (`keyFrameQindexDelta`): its header's
     /// base_q_idx is the given qindex plus the delta (clamped to 1…255), the inter frames' the
     /// given one, and the stream (a screen typed into, another screen, then the first again, which

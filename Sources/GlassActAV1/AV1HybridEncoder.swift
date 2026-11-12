@@ -1181,8 +1181,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 timing.shifted = Double((0..<nsb).filter { sbMotion[3 * $0] != 0 && (sbMotion[3 * $0 + 1] != 0 || sbMotion[3 * $0 + 2] != 0) }.count) / Double(nsb)
             }
         }
-        let refPlanes = reference?.planes ?? []
-        let gpuRef = reference != nil && previousOnGPU ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
         // the filters read the analysis's padded source, and so does an inter frame's closed loop
         // (a key frame's pads its own, which the next picture's compares tiles with)
         let analysisSource: [UnsafePointer<UInt8>?] = partition.source.count == 3
@@ -1194,13 +1192,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
         let store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
         let into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
+        // The previous picture where the filters left it is the closed loop's reference. Without
+        // CDEF (qindex 32 and under) that is the buffers they deblocked in place, the ones this
+        // picture is reconstructed into: the closed loop would predict from samples it has
+        // overwritten, and a decoder wouldn't. It then reads a copy taken first.
+        let aliased = reference != nil && previousOnGPU && postfilter.outputPlanes.contains { out in
+            into.contains { $0.map { UnsafePointer($0) == out } == true }
+        }
+        let ownReference = aliased ? previousDecoded(width: p.width, height: p.height) : []
+        let refPlanes = ownReference.count == 3 ? ownReference : reference?.planes ?? []
+        let gpuRef = reference != nil && previousOnGPU && ownReference.count != 3
+            ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
         // a frame that swaps the slots keeps the previous picture as a long-term one (below): its
         // decoded planes, copied out of the filters' buffers beside the closed loop, which only
-        // reads them (unless it reconstructs into them: with CDEF off they're the same buffers)
+        // reads them (or the copy above)
         let swapsOut = refs.map { $0.swaps } == true && reference != nil
-        let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && postfilter.outputPlanes.first.map { out in
-            !into.contains { $0.map { UnsafePointer($0) == out } == true }
-        } == true ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
+        let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && !aliased
+            ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
         Self.trace("closed loop start")
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
@@ -1236,7 +1244,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // a frame that swaps the slots keeps the previous picture as a long-term one: its decoded
         // planes, before this one's filters overwrite them (and the slot this one goes into drops its)
         if let refs, swapsOut {
-            slotPlanes[refs.last] = try keeping?.wait() ?? previousDecoded(width: p.width, height: p.height)
+            slotPlanes[refs.last] = try keeping?.wait()
+                ?? (ownReference.count == 3 ? ownReference : previousDecoded(width: p.width, height: p.height))
             slotPlanes[refs.refresh.trailingZeroBitCount] = []
         }
         let tileCount = (1 << max(0, tiling.columnsLog2)) * (1 << max(0, tiling.rowsLog2))
