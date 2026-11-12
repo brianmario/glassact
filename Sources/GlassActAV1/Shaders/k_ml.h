@@ -125,8 +125,23 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
     // (unsigned: an empty stale list still dispatches one threadgroup, whose 0xFFFFFFFF is -1 as an int)
     if (sb >= (uint)(I.sbCols * I.sbRows)) return;  // (the whole threadgroup)
     if (B.sbKeep && B.sbKeep[I.sbBase + (int)sb]) return;  // kept: its analysis is the last picture's
-    // the 85 nodes' sums (cells, then 16, 4, 1), and the seams of the 21 above the cells
-    threadgroup MlSums sums[85];
+    // the sums of the 84 nodes below the SB (cells, then 16, 4) that a parent reads (a node's
+    // quadrants are its children's own sums, so they aren't kept: less threadgroup memory, more
+    // threadgroups a core), and the seams of the 21 above the cells
+    struct MlNode { uint s1, s2, bits[8], lo, hi, dx, dy, ob[ML_OB], total; };
+    threadgroup MlNode sums[84];
+    auto keepNode = [&](int i, thread const MlSums &m) {
+        threadgroup MlNode &o = sums[i];
+        o.s1 = m.s1;
+        o.s2 = m.s2;
+        for (int b = 0; b < 8; b++) o.bits[b] = m.bits[b];
+        o.lo = m.lo;
+        o.hi = m.hi;
+        o.dx = m.dx;
+        o.dy = m.dy;
+        for (int b = 0; b < ML_OB; b++) o.ob[b] = m.ob[b];
+        o.total = m.total;
+    };
     threadgroup atomic_uint seam[21][2 + ML_OB + 1];  // dx, dy, the bins, their total
     const bool orientations = I.mlModes != nullptr;
     const int sbx = (int)sb % I.sbCols * 64, sby = (int)sb / I.sbCols * 64, sp = I.spitch[0];
@@ -148,19 +163,18 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
         const int iy0 = ga_ml_inner_level(cy), iy7 = ga_ml_inner_level(cy + 7);
         MlSums m;
         ga_ml_sums_clear(m);
+        // (the quadrants' sums by half rows, so a sample's quadrant isn't an index at run time)
         device const uint8_t *src = I.src[0] + (size_t)(sby + cy) * sp + sbx + cx;
         for (int r = 0; r < 8; r++) {
             device const uint8_t *row = src + (size_t)r * sp;
             const int y = cy + r;
             const int ly = r == 0 ? iy0 : r == 7 ? iy7 : 0;
+            uint h1[2] = {0, 0}, h2[2] = {0, 0};
             for (int c = 0; c < 8; c++) {
                 const int x = cx + c;
                 const uint v = row[c], v2 = v * v;
-                m.s1 += v;
-                m.s2 += v2;
-                const int q = (r >= 4 ? 2 : 0) + (c >= 4 ? 1 : 0);
-                m.q1[q] += v;
-                m.q2[q] += v2;
+                if (c < 4) { h1[0] += v; h2[0] += v2; }
+                else { h1[1] += v; h2[1] += v2; }
                 m.bits[v >> 5] |= 1u << (v & 31);
                 m.lo = min(m.lo, v);
                 m.hi = max(m.hi, v);
@@ -189,8 +203,12 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
                     }
                 }
             }
+            if (r < 4) { m.q1[0] += h1[0]; m.q1[1] += h1[1]; m.q2[0] += h2[0]; m.q2[1] += h2[1]; }
+            else { m.q1[2] += h1[0]; m.q1[3] += h1[1]; m.q2[2] += h2[0]; m.q2[3] += h2[1]; }
         }
-        sums[t] = m;
+        m.s1 = m.q1[0] + m.q1[1] + m.q1[2] + m.q1[3];
+        m.s2 = m.q2[0] + m.q2[1] + m.q2[2] + m.q2[3];
+        keepNode((int)t, m);
         if (sbx + cx + 8 <= I.W / 8 * 8 && sby + cy + 8 <= I.H / 8 * 8)
             ga_ml_features(m, 8, st2, orientations, stats + bases[0] + ((sby + cy) / 8 * (I.W / 8) + (sbx + cx) / 8) * ML_STRIDE);
     }
@@ -204,7 +222,7 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
             MlSums m;
             ga_ml_sums_clear(m);
             for (int k = 0; k < 4; k++) {
-                threadgroup const MlSums &c = sums[at[k]];
+                threadgroup const MlNode &c = sums[at[k]];
                 m.s1 += c.s1;
                 m.s2 += c.s2;
                 m.q1[k] = c.s1;
@@ -221,7 +239,7 @@ kernel void k_ml_stats(constant GpBatch &B [[buffer(0)]], device float *stats [[
             m.dy += atomic_load_explicit(&seam[i][1], memory_order_relaxed);
             for (int b = 0; b < ML_OB; b++) m.ob[b] += atomic_load_explicit(&seam[i][2 + b], memory_order_relaxed);
             m.total += atomic_load_explicit(&seam[i][2 + ML_OB], memory_order_relaxed);
-            sums[first[level] + (int)t] = m;
+            if (level < 3) keepNode(first[level] + (int)t, m);
             const int x0 = sbx + nx * n, y0 = sby + ny * n, cols = I.W / n;
             if (x0 / n < cols && y0 / n < I.H / n)
                 ga_ml_features(m, n, st2, orientations, stats + bases[level] + ((y0 / n) * cols + x0 / n) * ML_STRIDE);
