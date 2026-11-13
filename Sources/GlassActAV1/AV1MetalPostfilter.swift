@@ -530,6 +530,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         body(compute)
         compute.endEncoding()
         commands.commit()
+        AV1HybridEncoder.trace("filters commit")
         return commands
     }
 

@@ -47,6 +47,55 @@ struct PartitionTests {
         }
     }
 
+    /// A picture's analysis runs on the GPU while the one before is still to be read on the CPU
+    /// (`AV1MetalEncoder.Readout`): partitions read after the next pictures' analyses have run,
+    /// and overwritten the analysis's buffers, are those read one picture at a time. With kept
+    /// analysis, three pictures, so that the third reuses the first's readout.
+    @available(macOS 27, *)
+    @Test func aPartitionReadAfterTheNextAnalysisIsTheSame() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 360)
+        let a = Picture(width: width, height: height)
+        var b = a
+        for row in 100..<300 { for col in 0..<400 { b.y[row * width + col] = UInt8((row * 7 + col * 3) & 255) } }
+        var c = b
+        for row in 0..<64 { for col in 320..<640 { c.y[row * width + col] = UInt8((row * 5 + col) & 255) } }
+        func make() throws -> AV1MetalEncoder {
+            let e = try AV1MetalEncoder(device: device)
+            e.reusesAnalysis = true
+            return e
+        }
+        func begin(_ e: AV1MetalEncoder, _ p: Picture) throws -> AV1MetalEncoder.PendingPartition {
+            try p.y.withUnsafeBufferPointer { y in
+                try p.u.withUnsafeBufferPointer { u in
+                    try p.v.withUnsafeBufferPointer { v in
+                        try e.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
+                                             width: width, height: height, qindex: 120)
+                    }
+                }
+            }
+        }
+        func bytes(_ p: AV1MetalEncoder.Partition) -> [UInt8] {
+            p.blocks.withUnsafeBytes { Array($0) } + p.lumaTxTypes
+        }
+        // one at a time
+        let alone = try make()
+        var expected: [[UInt8]] = []
+        for p in [a, b, c] { expected.append(bytes(try begin(alone, p).wait())) }
+        // each read once the next picture's analysis has had time to run
+        let overlapped = try make()
+        let pa = try begin(overlapped, a), pb = try begin(overlapped, b)
+        Thread.sleep(forTimeInterval: 0.2)
+        let ra = bytes(try pa.wait())
+        let pc = try begin(overlapped, c)
+        Thread.sleep(forTimeInterval: 0.2)
+        let rb = bytes(try pb.wait()), rc = bytes(try pc.wait())
+        #expect(ra == expected[0])
+        #expect(rb == expected[1])
+        #expect(rc == expected[2])
+        #expect(overlapped.lastKeptSuperblocks > 0, "the third picture keeps some of the second's analysis")
+    }
+
     @available(macOS 27, *)
     @Test(arguments: [(333, 201), (1280, 720)])
     func partitionIsLegalAndSensible(width: Int, height: Int) throws {

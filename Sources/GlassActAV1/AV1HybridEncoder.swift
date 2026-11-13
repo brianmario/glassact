@@ -730,9 +730,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                         self.read(&p, of: up, after: previous?.read)
                         return p
                     }
+                    Self.trace("following")
                     upcoming = i + 3 < count ? try picture(i + 3) : nil
+                    Self.trace("fetched")
                     if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
                 }
+                Self.trace("set up")
                 let t0 = CACurrentMediaTime()
                 var timing = Timing()
                 timing.analysis = partition.gpuSeconds
@@ -1205,6 +1208,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // analysis and closed loop wait for it)
         p.read = Later(qos: .userInteractive) {
             _ = try previous?.wait()
+            AV1HybridEncoder.trace("read wait")
             var read = Read(partition: try partition.wait(keepsSource: false))
             AV1HybridEncoder.trace("read")
             if let motion {
@@ -1218,6 +1222,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// Starts picture `p`'s analysis, without its copies; its GPU work waits for `gate` to reach
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
     private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
+        Self.trace("begin")
         let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }

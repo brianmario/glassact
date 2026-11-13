@@ -522,6 +522,56 @@ kernel void k_leaf_scan(constant GpBatch &B [[buffer(0)]], device uint32_t *leaf
     }
 }
 
+// Glass Act: the partition as the CPU reads it (AV1MetalEncoder.Run.leafBlocks), every SB's leaves
+// written out at the end of the analysis into buffers of the picture's own (two, alternating), so
+// that the next picture's analysis, which overwrites the leaves and results here, needn't wait for
+// the CPU's read. Per SB its leaf count (oCount), and per leaf (sb * GP_MAX_LEAVES + k) its block,
+// its luma tx type and, with flags & 1 (an inter frame), its motion. flags & 2: the leaves'
+// decisions (B.leafDec) are k_leaf's. The same arithmetic as the CPU's, which it replaces.
+kernel void k_leaf_out(constant GpBatch &B [[buffer(0)]], device av1g_block *oBlk [[buffer(2)]],
+                       device uint8_t *oTx [[buffer(3)]], device av1g_block_inter *oInter [[buffer(4)]],
+                       device uint16_t *oCount [[buffer(5)]], constant uint32_t &flags [[buffer(6)]],
+                       uint2 g [[thread_position_in_grid]]) {
+    const uint32_t sb = g.y, k = g.x;
+    if (sb >= B.nSb) return;
+    const uint32_t count = B.leafCountW[sb];
+    if (k == 0) oCount[sb] = (uint16_t)count;
+    if (k >= count || k >= GP_MAX_LEAVES) return;
+    const int sbCols = B.img[0].sbCols;
+    const uint32_t r = (sb / sbCols) * 16, c = (sb % sbCols) * 16, i = sb * GP_MAX_LEAVES + k;
+    const GpLeaf leaf = B.leaves[i];
+    av1g_block b = {};
+    b.mi_row = (uint16_t)(r + leaf.y4);
+    b.mi_col = (uint16_t)(c + leaf.x4);
+    b.bsize = leaf.bsize;
+    const int s = leaf.bsize, w = 4 * av1g_bw4(s), h = 4 * av1g_bh4(s);
+    const uint32_t li = B.img[0].shOff[s] + (uint32_t)(((int)b.mi_row * 4 / h) * B.img[0].shNbx[s] + (int)b.mi_col * 4 / w);
+    const GpBlockRes res = B.blk[li];
+    av1g_block_inter bi = {};
+    const bool inter = (flags & 1) && w >= 8 && h >= 8 && B.inter[li].isInter != 0;
+    if (inter) {
+        bi.is_inter = 1;
+        bi.mv_row = B.inter[li].dy;
+        bi.mv_col = B.inter[li].dx;
+    } else if (res.ncand > 0) {
+        const int cand = res.cand[0];
+        b.y_mode = (uint8_t)(cand >> 3);
+        b.angle_delta_y = (int8_t)((cand & 7) - 3);
+    }
+    uint8_t lumaTx = res.ncand > 0 ? res.tx : 0;
+    if (flags & 2) {
+        const GpLeafDecision d = B.leafDec[i];
+        b.uv_mode = d.uvMode;
+        b.angle_delta_uv = d.angleUV;
+        b.cfl_alpha_u = d.cflU;
+        b.cfl_alpha_v = d.cflV;
+        lumaTx = d.lumaTx;
+    }
+    oBlk[i] = b;
+    oTx[i] = inter ? 0 : lumaTx;
+    if (flags & 1) oInter[i] = bi;
+}
+
 // A thread per leaf of the list: the leaf's decisions where one thread makes them as well as a
 // SIMD-group would (an inter block's defaults; without a luma tx search, a block with no chroma or
 // a 4x4 chroma block's); the others go to `rest` (as sb * GP_MAX_LEAVES + the leaf's index, in
