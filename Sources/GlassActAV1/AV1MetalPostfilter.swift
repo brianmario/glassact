@@ -80,14 +80,6 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// doesn't take `Search.planes` reads instead.
     public private(set) var outputPlanes: [UnsafePointer<UInt8>] = [], outputStrides: [Int] = []
 
-    /// With `keepsReferenceCopy`, a search whose output is its deblocking buffers (no CDEF: they
-    /// are `reconstructionBuffers`, which the next closed loop reconstructs into) also copies them
-    /// on the GPU, at the end of its command buffer, into buffers of their own: `referenceCopy`,
-    /// `outputPlanes`' samples at `outputStrides`, for the next closed loop to predict from
-    /// instead of a copy taken on the CPU before it. Empty after any other search.
-    public var keepsReferenceCopy = false
-    public private(set) var referenceCopy: [UnsafePointer<UInt8>] = []
-
     /// A search's planes: `planes` cropped into arrays, or (crop false) none; either way it's
     /// `outputPlanes`.
     private func output(_ job: Job, _ planes: [any MTLBuffer], crop: Bool) -> [[UInt8]] {
@@ -162,7 +154,6 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                        sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
                        direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true,
                        cdef: Bool = true) throws -> Search {
-        referenceCopy = []
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -195,18 +186,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         lastGPUSeconds = 0
         guard tf.cdef_mode != 0 else {
             // libaom CDEF_ADAPTIVE at qindex <= 32: one all-zero preset, signalled but inactive
-            let copies = keepsReferenceCopy
-                ? try (0..<job.nPlanes).map { try job.scratch("reference\($0)", job.pw[$0] * job.ph[$0]) } : []
-            try wait(commit({ compute in
+            try run { compute in
                 job.mark(compute)
                 job.normalizeCDEF(compute)
                 job.deblock(compute)
-            }, blit: copies.isEmpty ? nil : { blit in
-                for p in 0..<job.nPlanes {
-                    blit.copy(from: job.source[p], sourceOffset: 0, to: copies[p], destinationOffset: 0, size: job.pw[p] * job.ph[p])
-                }
-            }))
-            referenceCopy = copies.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) }
+            }
             return Search(params: fp, superblockCDEF: job.superblockCDEF(), planes: output(job, job.source, crop: cropsOutput),
                           lumaSSE: [], chromaSSE: [], presets: [], presetSSE: [])
         }
@@ -545,20 +529,13 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// The value only rises: the caller raises it on the CPU no sooner than the search returns.
     public var signalsWhenDone: (event: any MTLSharedEvent, value: UInt64)?
 
-    /// `body`'s work, then `blit`'s, in one command buffer, committed; the search's last one
-    /// (`last`) signals `signalsWhenDone`.
-    private func commit(_ body: (any MTLComputeCommandEncoder) -> Void,
-                        blit: ((any MTLBlitCommandEncoder) -> Void)? = nil, last: Bool = true) throws -> any MTLCommandBuffer {
+    /// `body`'s work, committed; the search's last command buffer (`last`) signals `signalsWhenDone`.
+    private func commit(_ body: (any MTLComputeCommandEncoder) -> Void, last: Bool = true) throws -> any MTLCommandBuffer {
         guard let commands = queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
         else { throw Failure.metal("no command encoder") }
         commands.label = "AV1 filters"  // for Instruments
         body(compute)
         compute.endEncoding()
-        if let blit {
-            guard let b = commands.makeBlitCommandEncoder() else { throw Failure.metal("no blit encoder") }
-            blit(b)
-            b.endEncoding()
-        }
         if last, let signal = signalsWhenDone {
             commands.encodeSignalEvent(signal.event, value: signal.value)
             signalsWhenDone = nil

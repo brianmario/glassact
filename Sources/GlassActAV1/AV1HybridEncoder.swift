@@ -493,9 +493,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The post-filters' output is the last picture's (false after a picture with intra block
     /// copies, which has none: the next one is filtered whole).
     private var filteredLast = true
-    /// The filters' `referenceCopy` is the last picture's decoded planes (they filtered it, and
-    /// no closed loop has run since).
-    private var referenceCopied = false
     /// Pictures whose filters are done (or that have none), over the encoder's life: the
     /// analyses' gate (`AV1MetalEncoder.gate`) is raised to it as each one's are.
     private var filtersDone: UInt64 = 0
@@ -640,7 +637,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                        written: (@Sendable (Int, Frame) -> Void)? = nil, output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
         previous = nil
-        referenceCopied = false
         slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = interFrames && goldenFrames
         copyFinder.limit = longTermReferences
@@ -796,7 +792,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                output: (Int, Int, Frame) throws -> Void) throws {
         guard count > 0, interFrames else { return }
         previous = nil
-        referenceCopied = false
         slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = goldenFrames
         copyFinder.limit = longTermReferences
@@ -1338,22 +1333,18 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // The previous picture where the filters left it is the closed loop's reference. Without
         // CDEF (qindex 32 and under) that is the buffers they deblocked in place, the ones this
         // picture is reconstructed into: the closed loop would predict from samples it has
-        // overwritten, and a decoder wouldn't. It then reads a copy: the one the filters took on
-        // the GPU (`AV1MetalPostfilter.referenceCopy`), or one taken here, on the CPU, before it
-        // (a frame that keeps the previous picture as a long-term one takes its planes from that).
+        // overwritten, and a decoder wouldn't. It then reads a copy taken first.
         let aliased = reference != nil && previousOnGPU && postfilter.outputPlanes.contains { out in
             into.contains { $0.map { UnsafePointer($0) == out } == true }
         }
-        let swapsOut = refs.map { $0.swaps } == true && reference != nil
-        let copied = aliased && !swapsOut && referenceCopied && postfilter.referenceCopy.count == 3 ? postfilter.referenceCopy : nil
-        let ownReference = aliased && copied == nil ? previousDecoded(width: p.width, height: p.height) : []
+        let ownReference = aliased ? previousDecoded(width: p.width, height: p.height) : []
         let refPlanes = ownReference.count == 3 ? ownReference : reference?.planes ?? []
         let gpuRef = reference != nil && previousOnGPU && ownReference.count != 3
-            ? (copied ?? postfilter.outputPlanes, postfilter.outputStrides) : nil
+            ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
         // a frame that swaps the slots keeps the previous picture as a long-term one (below): its
         // decoded planes, copied out of the filters' buffers beside the closed loop, which only
         // reads them (or the copy above)
-        referenceCopied = false  // (the closed loop below may reconstruct into the buffers copied)
+        let swapsOut = refs.map { $0.swaps } == true && reference != nil
         let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && !aliased
             ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
         // `newPictureEffort`'s closed-loop levers, for this picture's closed loop only
@@ -1457,7 +1448,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         filteredLast = true
         Self.trace("filters start")
-        postfilter.keepsReferenceCopy = interFrames  // (for the next inter frame's closed loop)
         // (the analyses ordered behind these filters start as their GPU work ends: `filtered`
         // raises the gate the same, once they're done on the CPU too)
         postfilter.signalsWhenDone = (metal.gate, filtersDone + 1)
@@ -1470,7 +1460,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
                                            cropsOutput: returnsPlanes, cdef: !fast || newPictureEffort?.cdef != false)
-        referenceCopied = postfilter.referenceCopy.count == 3
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         Self.trace("filters end")
