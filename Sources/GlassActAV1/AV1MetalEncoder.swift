@@ -448,8 +448,17 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The last picture's qindex per 64x64 (delta-q), or nil.
         var previousQ: [UInt8]? = nil
         var keptCount = 0
-        /// Each SB's blocks, luma tx types and motion as the last partition read them, for SBs kept since.
-        var sbBlocks: [[av1g_block]] = [], sbTypes: [[UInt8]] = [], sbInter: [[av1g_block_inter]] = []
+        /// Each SB's blocks, luma tx types and motion as the last partition that analyzed it read
+        /// them, for SBs kept since: `count` of them from `start` in a partition's arrays
+        /// (`generations[generation]`, which they keep; count 0: none).
+        struct Entry {
+            var generation: Int32 = -1, start: Int32 = 0, count: Int32 = 0
+        }
+        var entries: [Entry] = []
+        /// Partitions' arrays that entries point into (motion empty: not an inter frame's), and
+        /// the entries that do; a slot nothing points into is free (`users` 0, arrays empty).
+        var generations: [(blocks: [av1g_block], types: [UInt8], inter: [av1g_block_inter])] = []
+        var users: [Int] = []
 
         init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
             self.key = key
@@ -1688,8 +1697,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
 
         /// The partition's blocks, luma tx types and (an inter frame's) motion, in decode order. It
-        /// is on the critical path twice (the closed loop and the next analysis wait for it): two
-        /// passes, counting then writing in place, and the cache's per-SB copies keep their storage.
+        /// is on the critical path (the closed loop waits for it): two passes, counting then
+        /// writing in place, and the cache keeps the arrays it returns rather than copies.
         func leafBlocks() -> ([av1g_block], [UInt8], [av1g_block_inter]) {
             let interRes = interResults.contents().assumingMemoryBound(to: GpInterRes.self)
             let leafPtr = leaves.contents().assumingMemoryBound(to: GpLeaf.self)
@@ -1702,30 +1711,31 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                  types: UnsafePointer(r.types.contents().assumingMemoryBound(to: UInt8.self)),
                  inter: UnsafePointer(r.inter.contents().assumingMemoryBound(to: av1g_block_inter.self)))
             }
-            // SBs whose analysis was kept have last picture's blocks
+            // SBs whose analysis was kept have the blocks of the last picture that analyzed them
             let cache = cacheRef
             let kept = keptFlags?.contents().assumingMemoryBound(to: UInt8.self)
             defer { encoder.markRead(seq) }
             let nSb = sbCols * sbRows
-            if let cache, cache.sbBlocks.count != nSb {
-                cache.sbBlocks = Array(repeating: [], count: nSb)
-                cache.sbTypes = Array(repeating: [], count: nSb)
-                cache.sbInter = Array(repeating: [], count: nSb)
+            if let cache, cache.entries.count != nSb {
+                cache.entries = Array(repeating: AnalysisCache.Entry(), count: nSb)
+                cache.generations = []
+                cache.users = []
             }
             let skips = skipped.flatMap { $0.count == nSb ? $0 : nil }
             let order = decodeOrder()
             // each SB's blocks: 0 skipped (one block stands for it), 1 kept (the cache's), 2 its leaves
             var how = [UInt8](repeating: 2, count: nSb)
-            var total = 0
+            var total = 0, analyzed = 0
             for sb in order {
                 if let skips, skips[sb] != 0 {
                     how[sb] = 0
                     total += 1
-                } else if let cache, let kept, kept[sb] != 0, !cache.sbBlocks[sb].isEmpty {
+                } else if let cache, let kept, kept[sb] != 0, cache.entries[sb].count > 0 {
                     how[sb] = 1
-                    total += cache.sbBlocks[sb].count
+                    total += Int(cache.entries[sb].count)
                 } else {
                     total += Int(counts[sb])
+                    analyzed += 1
                 }
             }
             let inter = isInter, leafDecide = decidesLeaves
@@ -1735,6 +1745,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var blocks = [av1g_block](repeating: av1g_block(), count: total)
             var types = [UInt8](repeating: 0, count: total)
             var motion = [av1g_block_inter](repeating: av1g_block_inter(), count: inter ? total : 0)
+            // the slot this partition's arrays take in the cache, if any SB is analyzed
+            var generation = -1
+            if let cache, analyzed > 0 {
+                generation = cache.users.firstIndex(of: 0) ?? cache.users.count
+                if generation == cache.users.count {
+                    cache.users.append(0)
+                    cache.generations.append(([], [], []))
+                }
+            }
             blocks.withUnsafeMutableBufferPointer { bp in
                 types.withUnsafeMutableBufferPointer { tp in
                     motion.withUnsafeMutableBufferPointer { ip in
@@ -1748,19 +1767,17 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                 bp[n] = b
                                 n += 1
                             case 1:
-                                let cb = cache!.sbBlocks[sb], ct = cache!.sbTypes[sb]
-                                for k in 0..<cb.count {
-                                    bp[n + k] = cb[k]
-                                    tp[n + k] = ct[k]
+                                let e = cache!.entries[sb]
+                                let g = Int(e.generation), at = Int(e.start), count = Int(e.count)
+                                cache!.generations[g].blocks.withUnsafeBufferPointer { (bp.baseAddress! + n).update(from: $0.baseAddress! + at, count: count) }
+                                cache!.generations[g].types.withUnsafeBufferPointer { (tp.baseAddress! + n).update(from: $0.baseAddress! + at, count: count) }
+                                // (an intra picture's blocks have no motion: none, in an inter frame)
+                                if inter, !cache!.generations[g].inter.isEmpty {
+                                    cache!.generations[g].inter.withUnsafeBufferPointer { (ip.baseAddress! + n).update(from: $0.baseAddress! + at, count: count) }
                                 }
-                                if inter {
-                                    let ci = cache!.sbInter[sb]
-                                    if ci.count == cb.count { for k in 0..<ci.count { ip[n + k] = ci[k] } }
-                                }
-                                n += cb.count
+                                n += count
                             default:
                                 let first = n
-                                let r = (sb / sbCols) * 16, c = (sb % sbCols) * 16
                                 if let out {  // k_leaf_out's: the same blocks, made on the GPU
                                     let count = Int(counts[sb]), at = sb * maxLeaves
                                     if count > 0 {
@@ -1769,56 +1786,61 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                         if inter { (ip.baseAddress! + n).update(from: out.inter + at, count: count) }
                                     }
                                     n += count
-                                }
-                                for k in 0..<(out == nil ? Int(counts[sb]) : 0) {
-                                    let leaf = leafPtr[sb * maxLeaves + k]
-                                    var b = av1g_block()
-                                    b.mi_row = UInt16(r + Int(leaf.y4))
-                                    b.mi_col = UInt16(c + Int(leaf.x4))
-                                    b.bsize = leaf.bsize
-                                    // the analysis's best luma mode for this shape at this position
-                                    let s = Int(leaf.bsize), size = sizes[s]
-                                    let li = Int(offsets[s]) + (Int(b.mi_row) * 4 / size.h) * Int(columns[s]) + Int(b.mi_col) * 4 / size.w
-                                    let res = results[li]
-                                    var isInterBlock = false
-                                    if inter, size.w >= 8, size.h >= 8, interRes[li].isInter != 0 {
-                                        let m = interRes[li]
-                                        var bi = av1g_block_inter()
-                                        bi.is_inter = 1
-                                        bi.mv_row = m.dy
-                                        bi.mv_col = m.dx
-                                        ip[n] = bi
-                                        isInterBlock = true
-                                    } else if res.ncand > 0 {
-                                        let cand = Int(res.cand.0)
-                                        b.y_mode = UInt8(cand >> 3)
-                                        b.angle_delta_y = Int8((cand & 7) - 3)
+                                } else {
+                                    let r = (sb / sbCols) * 16, c = (sb % sbCols) * 16
+                                    for k in 0..<Int(counts[sb]) {
+                                        let leaf = leafPtr[sb * maxLeaves + k]
+                                        var b = av1g_block()
+                                        b.mi_row = UInt16(r + Int(leaf.y4))
+                                        b.mi_col = UInt16(c + Int(leaf.x4))
+                                        b.bsize = leaf.bsize
+                                        // the analysis's best luma mode for this shape at this position
+                                        let s = Int(leaf.bsize), size = sizes[s]
+                                        let li = Int(offsets[s]) + (Int(b.mi_row) * 4 / size.h) * Int(columns[s]) + Int(b.mi_col) * 4 / size.w
+                                        let res = results[li]
+                                        var isInterBlock = false
+                                        if inter, size.w >= 8, size.h >= 8, interRes[li].isInter != 0 {
+                                            let m = interRes[li]
+                                            var bi = av1g_block_inter()
+                                            bi.is_inter = 1
+                                            bi.mv_row = m.dy
+                                            bi.mv_col = m.dx
+                                            ip[n] = bi
+                                            isInterBlock = true
+                                        } else if res.ncand > 0 {
+                                            let cand = Int(res.cand.0)
+                                            b.y_mode = UInt8(cand >> 3)
+                                            b.angle_delta_y = Int8((cand & 7) - 3)
+                                        }
+                                        var lumaTx: UInt8 = res.ncand > 0 ? res.tx : 0
+                                        if leafDecide {
+                                            let d = decisions[sb * maxLeaves + k]
+                                            b.uv_mode = d.uvMode
+                                            b.angle_delta_uv = d.angleUV
+                                            b.cfl_alpha_u = d.cflU
+                                            b.cfl_alpha_v = d.cflV
+                                            lumaTx = d.lumaTx
+                                        }
+                                        bp[n] = b
+                                        tp[n] = isInterBlock ? 0 : lumaTx
+                                        n += 1
                                     }
-                                    var lumaTx: UInt8 = res.ncand > 0 ? res.tx : 0
-                                    if leafDecide {
-                                        let d = decisions[sb * maxLeaves + k]
-                                        b.uv_mode = d.uvMode
-                                        b.angle_delta_uv = d.angleUV
-                                        b.cfl_alpha_u = d.cflU
-                                        b.cfl_alpha_v = d.cflV
-                                        lumaTx = d.lumaTx
-                                    }
-                                    bp[n] = b
-                                    tp[n] = isInterBlock ? 0 : lumaTx
-                                    n += 1
                                 }
-                                if let cache {  // (in place: each SB's arrays keep their storage)
-                                    cache.sbBlocks[sb].removeAll(keepingCapacity: true)
-                                    cache.sbBlocks[sb].append(contentsOf: UnsafeBufferPointer(rebasing: bp[first..<n]))
-                                    cache.sbTypes[sb].removeAll(keepingCapacity: true)
-                                    cache.sbTypes[sb].append(contentsOf: UnsafeBufferPointer(rebasing: tp[first..<n]))
-                                    cache.sbInter[sb].removeAll(keepingCapacity: true)
-                                    if inter { cache.sbInter[sb].append(contentsOf: UnsafeBufferPointer(rebasing: ip[first..<n])) }
+                                if let cache {  // its entry: these arrays, from `first`
+                                    let old = Int(cache.entries[sb].generation)
+                                    if old >= 0 { cache.users[old] -= 1 }
+                                    cache.users[generation] += 1
+                                    cache.entries[sb] = AnalysisCache.Entry(generation: Int32(generation), start: Int32(first),
+                                                                            count: Int32(n - first))
                                 }
                             }
                         }
                     }
                 }
+            }
+            if let cache {
+                if generation >= 0 { cache.generations[generation] = (blocks, types, inter ? motion : []) }
+                for g in cache.users.indices where cache.users[g] == 0 { cache.generations[g] = ([], [], []) }
             }
             return (blocks, types, motion)
         }
