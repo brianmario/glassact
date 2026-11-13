@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The hybrid against libaom realtime and hardware HEVC with the defaults of 2026-11-12 (`metal-av1`) | measured | real 5K streams: 16–58 % fewer bytes than libaom and 17–77 % fewer than HEVC at equal quality on all eight, at 54–337 frames a second against libaom's 35–217 and HEVC's 31–56; at 2900 (resampled) HEVC needs 4–10 % fewer bytes on video and 24–31 % fewer on scrolling images | [entry](#metal-av1-against-libaom-and-hardware-hevc-with-the-days-defaults-real-streams-at-5k-mixes-at-session-size-2026-11-12) |
 | The picture pipeline's waits: the partition read out to alternating buffers so the next analysis doesn't wait for the CPU, the motion search ahead of the filters' gate, the kept analysis without array copies, a spare set of deblocking buffers (`metal-av1`) | kept; the reference by a GPU blit not (the closed loop reads GPU-written memory slower); no gate not (44.6 fps) | the same streams; the period 21.5 → 19.0 ms; all-new 5K 51.7 → 54.3 inter frames a second, 5K video 56 → 61; the closed loop bounds the period now | [entry](#metal-av1-where-the-gpu-waits-in-the-picture-pipeline-the-readout-the-motion-search-ahead-of-the-gate-2026-11-12) |
 | A mostly-new picture coded at half resolution and upscaled at the Viewer (`metal-av1`; measured with `av1seq --stream-width --upscale`) | measured, not built; the form to build if 60 fps isn't reached at 5K or a link forces under ≈ 200 KB a picture is in the entry | bytes −59 % at the same q, closed loop −65 % (105 → 37 core-ms), GPU −41 %; but 30 dB against 44 at 5K, and at the same bytes full resolution coded coarser is as good or better down to ≈ 200 KB a picture; scaled references save nothing on the way back | [entry](#metal-av1-a-mostly-new-picture-at-half-resolution-upscaled-measured-not-built-2026-11-12) |
 | The analysis's screening with each mode compiled for itself and DC, V and H from the source's Hadamard; its set-up in three barriers; the residual's mode compiled in (`metal-av1`) | kept; lists for the SIMD-group shapes and a 16-bit-pair column pass not (no gain) | the same streams; a new 5K picture's analysis 7.3 → 6.8 ms (9.7 → 9.2 with `--fast off`); the GPU stages ≈ 13.2 ms | [entry](#metal-av1-the-analysiss-screening-by-mode-dc-v-and-h-in-the-transform-domain-2026-11-12) |
@@ -329,6 +330,71 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1 against libaom and hardware HEVC with the day's defaults: real streams at 5K, mixes at session size (2026-11-12)
+
+The hybrid at `35a7234` (long-term references, key frames 16 finer, the retrained weights, fast
+mostly-new pictures) against libaom realtime speed 9 (inter frames, 8 threads; the same pictures
+in the same `av1seq --aom-speed 9 --aom-inter` run) and VideoToolbox hardware HEVC (`vquality
+--qp`, every frame at one QP). Quality is of the decoded stream, key frame and inter frames
+alike, by RGB PSNR and SSIMULACRA2. One process at a time; bytes and quality don't depend on
+load, the speeds do (the Mac was in use, load 8–40 through the 5K run).
+
+**Real streams at 5K** (one trace each, 60 consecutive frames, `--tiles 3x0`; hybrid and libaom
+at q 14 / 20 / 28 / 36, HEVC at QP 20 / 26 / 32 / 38; bitrate at the trace's own timing). The
+hybrid at q20, and what the others need for the same SSIMULACRA2:
+
+| stream | hybrid: Mbit/s · PSNR · SSIMULACRA2 | libaom Mbit/s | HEVC Mbit/s | BD-rate vs libaom | BD-rate vs HEVC |
+|---|---|---|---|---|---|
+| typing | 0.57 · 45.9 dB · 79.5 | 1.37 | 1.35 | −57.9 % / −58.5 % | −61.9 % / −55.9 % |
+| scrolling | 0.98 · 47.6 · 78.8 | 1.80 | 3.82 | −42.1 / −44.0 | −76.5 / −72.6 |
+| dragging | 1.47 · 46.1 · 79.3 | 3.43 | 3.16 | −55.3 / −57.5 | −61.2 / −52.7 |
+| photos | 8.90 · 41.9 · 76.5 | 13.58 | 27.07 | −36.8 / −39.7 | −68.4 / −65.0 |
+| video | 21.42 · 47.8 · 74.8 | 28.85 | 29.10 | −16.1 / −23.0 | −16.6 / −21.9 |
+| scrolling images | 16.52 · 42.1 · 77.6 | 27.82 | 22.13 | −40.6 / −43.8 | −31.8 / −21.3 |
+| app switching | 2.29 · 50.4 · 77.3 | 3.06 | 3.49 | −25.1 / −29.9 | −56.3 / −43.0 |
+| an IDE | 0.78 · 50.3 · 81.3 | 1.14 | 1.67 | −22.2 / −31.8 | −61.1 / −51.4 |
+
+Frames a second on the same streams (unscored runs; the hybrid's and libaom's inter frames a
+second at q20; HEVC by `vquality --throughput 48`, new: pictures read first, then handed to the
+encoder with three in flight, and in brackets one at a time, `ef6b7c1`):
+
+| stream | hybrid | libaom | HEVC |
+|---|---|---|---|
+| typing | 292 | 194 | 32 (21) |
+| scrolling | 239 | 148 | 32 (20) |
+| dragging | 337 | 206 | 55 (29) |
+| photos | 102 | 81 | 51 (27) |
+| video | 54 | 35 | 55 (28) |
+| scrolling images | 124 | 87 | 56 (27) |
+| app switching | 320 | 217 | 55 (30) |
+| an IDE | 304 | 200 | 31 (21) |
+
+HEVC's 5K throughput is ≈ 55 a second where it has work (50.6 on video with 3 in flight on a
+quieter run, 49.8 with 6, 24.5 one at a time) and slower on near-still streams (not looked
+into). The hybrid is ahead of it on every stream but video, where they are level (60.7–60.9 on
+24 frames in the pipeline entry below).
+
+**Mixes and streams at session size** (2900 wide, resampled from the 5K traces; 40 or 30 frames;
+q 8 / 14 / 20 / 28 / 40 and QP 18 / 24 / 30 / 36 / 42), BD-rate by PSNR / SSIMULACRA2:
+
+| content | against libaom | against HEVC |
+|---|---|---|
+| four screens in turn | −54.0 % / −57.7 % | −60.5 % / −59.3 % |
+| typing and scrolling in turn | −79.1 / −79.5 | −85.5 / −84.4 |
+| photos and dragging in turn | −45.2 / −49.7 | −44.7 / −42.3 |
+| app switching | −27.7 / −28.6 | −26.3 / −18.6 |
+| video | −14.6 / −15.1 | **+10.0 / +4.1** |
+| scrolling images | +2.5 / −16.5 | **+30.7 / +24.2** |
+
+Against the same libaom runs the day before, four screens in turn were ≈ −50 %. **At 2900 HEVC
+needs fewer bytes than the hybrid on video and on scrolling images**, the first time either was
+set against HEVC; at 5K, the traces' own size, the hybrid leads on both. The resampling to 2900
+puts the scroll between samples (2026-11-12's other entries: whole-sample motion costs scrolling
+images at 2900 +243 %, half-sample steps +92 %), so there the stream leans on sub-sample motion
+search and interpolation, where HEVC is strong; a session's own display is rendered at its size,
+not resampled, so which of the two a live 2880-wide session resembles is not established. The
+fast pictures apply to every frame of both; their share of the gap was not separated.
 
 ### Metal AV1: where the GPU waits in the picture pipeline; the readout, the motion search ahead of the gate (2026-11-12)
 
