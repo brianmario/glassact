@@ -1458,6 +1458,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         filteredLast = true
         Self.trace("filters start")
         postfilter.keepsReferenceCopy = interFrames  // (for the next inter frame's closed loop)
+        // (the analyses ordered behind these filters start as their GPU work ends: `filtered`
+        // raises the gate the same, once they're done on the CPU too)
+        postfilter.signalsWhenDone = (metal.gate, filtersDone + 1)
+        Self.trace("filters signal \(filtersDone + 1)")
+        defer { postfilter.signalsWhenDone = nil }
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,

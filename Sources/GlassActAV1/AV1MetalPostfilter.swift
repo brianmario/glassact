@@ -532,16 +532,23 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private func run(_ first: (any MTLComputeCommandEncoder) -> Void, meanwhile: (() -> Void)?,
                      then: (any MTLComputeCommandEncoder) -> Void) throws {
         guard let meanwhile else { return try run { first($0); then($0) } }
-        let commands = try commit(first)
+        let commands = try commit(first, last: false)
         meanwhile()
         let next = try commit(then)
         try wait(commands)
         try wait(next)
     }
 
-    /// `body`'s work, then `blit`'s, in one command buffer, committed.
+    /// Raised on the GPU as the next search's work ends (its last command buffer signals it), then
+    /// cleared: what a caller orders other GPU work behind (`AV1HybridEncoder`'s analyses, by
+    /// `AV1MetalEncoder.gate`) starts without waiting for the CPU to learn the filters are done.
+    /// The value only rises: the caller raises it on the CPU no sooner than the search returns.
+    public var signalsWhenDone: (event: any MTLSharedEvent, value: UInt64)?
+
+    /// `body`'s work, then `blit`'s, in one command buffer, committed; the search's last one
+    /// (`last`) signals `signalsWhenDone`.
     private func commit(_ body: (any MTLComputeCommandEncoder) -> Void,
-                        blit: ((any MTLBlitCommandEncoder) -> Void)? = nil) throws -> any MTLCommandBuffer {
+                        blit: ((any MTLBlitCommandEncoder) -> Void)? = nil, last: Bool = true) throws -> any MTLCommandBuffer {
         guard let commands = queue.makeCommandBuffer(), let compute = commands.makeComputeCommandEncoder()
         else { throw Failure.metal("no command encoder") }
         commands.label = "AV1 filters"  // for Instruments
@@ -551,6 +558,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             guard let b = commands.makeBlitCommandEncoder() else { throw Failure.metal("no blit encoder") }
             blit(b)
             b.endEncoding()
+        }
+        if last, let signal = signalsWhenDone {
+            commands.encodeSignalEvent(signal.event, value: signal.value)
+            signalsWhenDone = nil
         }
         commands.commit()
         AV1HybridEncoder.trace("filters commit")
