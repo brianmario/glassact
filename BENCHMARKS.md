@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The analysis's screening with each mode compiled for itself and DC, V and H from the source's Hadamard; its set-up in three barriers; the residual's mode compiled in (`metal-av1`) | kept; lists for the SIMD-group shapes and a 16-bit-pair column pass not (no gain) | the same streams; a new 5K picture's analysis 7.3 → 6.8 ms (9.7 → 9.2 with `--fast off`); the GPU stages ≈ 13.2 ms | [entry](#metal-av1-the-analysiss-screening-by-mode-dc-v-and-h-in-the-transform-domain-2026-11-12) |
 | `k_inter`'s 16x16, 32x32 and 64x64 DCTs on the matrix units; the RD's end of block from the quantization loop; the thread kernels' rate from padded levels (`metal-av1`) | kept; the matrix tile loaded once a SIMD-group not (no gain) | the same streams; inter candidates 1.32 → 1.17 ms on a new 5K picture and 3.71 → 2.93 on video; 4x4 1.00 → 0.93, 8x8 1.54 → 1.48; the GPU stages ≈ 13.7 ms | [entry](#metal-av1-the-inter-candidates-dcts-on-the-matrix-units-the-rds-end-of-block-and-rate-2026-11-12) |
 | `k_me`'s window search dropping vectors that can't make the best two and starting where the gate found best; its sub-sample steps sharing horizontal sums; `k_inter_sad` a loop a sub-sample case; `k_proj`'s minimum by `simd_min` (`metal-av1`) | kept; a dozen variants not (no gain or slower); half-sample steps only not taken (+92 % on scrolling images scaled) | the same streams; the motion search at 5K: video 5.81 → 3.87 ms, scrolling images 9.13 → 5.67, a screen switch 2.16 → 1.75; video ≈ 46 → 53 inter frames a second | [entry](#metal-av1-the-motion-search-on-moving-content-the-same-bytes-in-two-thirds-of-the-time-again-2026-11-12) |
 | The leaves' chroma screening: each mode compiled for itself, shifts for divisions, the proxy's rate term from a table; 64x64's integer work on 256 threads with its float sums on the same 128 (`metal-av1`) | kept; the pruning's orientation bins from a table not (under the bar) | the same streams; a new 5K picture's leaves 3.03 → 1.55 ms, 64x64 1.78 → 1.71 (2.37 → 2.21 with `--fast off`); the GPU stages ≈ 14.4 ms; the all-new stream ≈ 49 → 51 inter frames a second | [entry](#metal-av1-the-leaves-in-half-the-time-64x64s-integer-work-on-256-threads-2026-11-12) |
@@ -326,6 +327,55 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the analysis's screening by mode, DC, V and H in the transform domain (2026-11-12)
+
+GPU stage times at 5K q20, alternated against the previous build, one process at a time (the
+Mac at load 10–70 from other work: single runs swung ± 0.2 ms). The same streams: the ten
+digests, key frames of text, photos and scrolling under the turbo, turbo2, base, fast and slow
+presets and with `--chroma-angles`, and video, an IDE, maps, tabs, windows opening and scrolling
+images against the previous build's.
+
+**Where the analysis's time is** (a new 5K picture, the defaults; 16x16 / 32x32 / 64x64, by
+stage switched off): visiting blocks and the learned pruning's exit 0.18 / 0.17 / 0.09; set-up
+after it (edges, the DC value, the flat check, the candidate list, barriers) 0.20 / 0.36 / 0.27;
+the one candidate's RD with its residual ≈ 0.32 / 0.70 / 0.63; screening 0.40 / 0.69 / 0.70
+before, of which DC, V and H with the source's load now 0.08 / 0.13 / 0.16 and the other ten
+modes 0.30 / 0.52 / 0.53 (0.03–0.05 ms a mode a shape: directional, smooth and Paeth predictors
+don't split into rows and columns). Angle deltas never run on these pictures.
+
+**Kept:**
+- **Each mode screened with its own compiled predictor, and DC, V and H in the transform
+  domain** (`7938dad`). The source is read once for all the modes the mask leaves; a mode is a
+  constant, so the division by the candidates a thread is gone. The Hadamard is linear and
+  integer, so H(source − prediction) = H(source) − H(prediction) exactly, and those three
+  predictions' transforms are one coefficient (DC), a row (V) and a column (H): one pass over
+  each 4x4's source Hadamard gives all three. The SATD is a whole number scaled by a quarter at
+  the end, every partial below 2²², so any order sums it exactly. `k_analysis_small` does the
+  same for its three. Shapes with fewer than 32 items a mode keep the old screening.
+- **The set-up in three barriers a block, not six** (`f8e3f98`): the SATDs' zeroing and the
+  candidate list behind the edges' barrier, the DC value's edge sums on one SIMD-group with
+  `simd_sum` (the same integer as the serial loop).
+- **The chosen candidate's residual with its mode compiled in** (`78acda7`): the same samples on
+  the same threads, the same sum of squares in the same order.
+
+| a new 5K picture, medians of 3 alternated pairs | 4x4 | 8x8 | 16x16 | 32x32 | 64x64 | analysis |
+|---|---|---|---|---|---|---|
+| the defaults | 0.93 → 0.87 | 1.47 → 1.39 | 1.14 → 1.06 | 1.93 → 1.83 | 1.72 → 1.60 | 7.3 → 6.8 |
+| `--fast off` (one pair) | 1.11 → 1.04 | 1.67 → 1.59 | 1.78 → 1.72 | 2.59 → 2.25 | 2.22 → 2.00 | 9.7 → 9.2 |
+
+(The table is the merged head's check; the builder's own medians agree for the defaults, and its
+key-frame and `--fast off` runs were too noisy to quote.) The GPU stages on a new 5K picture
+≈ 13.2 ms: motion search 1.74, inter candidates 1.17, analysis 6.8, partition 0.2, leaves 1.56,
+learned pruning 1.72.
+
+**Measured, not kept (the same bytes):** learned pruning's lists for the SIMD-group shapes, so
+pruned 16x16s and up aren't visited (no gain inside the noise); two 16-bit values a shuffle in
+the Hadamard's column pass (16x16 1.06 → 1.03, 64x64 1.60 → 1.64–1.69).
+
+Left: the ten prediction-bound modes' screening (≈ 0.30 / 0.52 / 0.53), the set-up (0.36 at
+32x32), and 8x8, now the largest shape at 1.39 (its lanes wait on other lanes' mode masks:
+the list sorted by mask is bounded at 0.45).
 
 ### Metal AV1: the inter candidates' DCTs on the matrix units, the RD's end of block and rate (2026-11-12)
 
