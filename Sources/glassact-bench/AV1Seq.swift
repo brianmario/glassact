@@ -61,6 +61,10 @@ let av1SeqCommand = Command(
         .int("ssimulacra2-every", "<n>", 1...1000, "with --score-rgb: also SSIMULACRA2 (the ssimulacra2 binary on PATH) on every nth frame"),
         .int("stream-width", "<px>", 64...8192, "with --inter: the stream's width; the pictures are coded at --width inside it and shown scaled up to it (AV1 reduced frames), and --score-rgb scores them at its size"),
         .string("ivf", "<path>", "also write the hybrid's stream as IVF"),
+        .string("upscale", "<name>[,<name>...]", "with --stream-width and --score-rgb: show the reduced frames at the stream's size with this scaler (bilinear, lanczos3, lanczos5, ci: Core Image's Lanczos, metalfx: MetalFX's spatial scaler; default: vImage's high-quality resampling, as lanczos5); several: the first is scored as usual, each also scored by PSNR and SSIM (\"upscaled <name>\" lines); with --ref-from-half, the first is its reference's scaler"),
+        .bool("frame-scores", "with --score-rgb: also a line a frame, \"fscore <i> <bytes> <qindex> <fast 0/1> <psnr> <ssim> <ssimulacra2 or -> <closed loop ms> <filters GPU ms> <GPU analysis ms>\", and with several --upscale scalers \"fscore-up <name> <i> <psnr> <ssim>\""),
+        .string("save-png", "<dir>:<tag>[:<i>,...]", "with --score-rgb: write each frame's (or these frames') reference as <dir>/ref<i>.png and the decoded picture as shown as <dir>/<tag><i>.png (with several --upscale scalers, <tag>-<name><i>.png for each)"),
+        .string("ref-from-half", "<width>[:<q>]", "with --inter, a measurement: the first picture is replaced by the source's first picture coded alone at this width (a key frame at --q, or <q>), decoded and scaled back up (--upscale's scaler, default vImage's): the reference a half-size transient would leave, for the bytes of the full-size picture after it (code the key frame fine with --key-delta)"),
         .string("ml-prune", "<weights.bin>", "learned pruning of the analysis with these weights instead of the shipped ones (prune_train's raw export: the level model, then the mode model's if present)"),
         .string("ml-mode-eps", "<p>", "learned mode pruning: a node keeps its likeliest modes until all but this much probability is kept (default: the encoder's)"),
         .string("dq", "<kind>:<n>", "per-64x64 qindex (delta-q): random:<n> offsets of up to ±n (a correctness check), or text:<n>, n finer where a 64x64 looks like text or UI (few distinct values, strong edges) and n coarser where it looks like a photo"),
@@ -126,6 +130,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var pictures: [YUV420] = []
     var index = 0
     var stamps: [UInt64] = []
+    var firstBGRA: [UInt8] = []
     // --mix: after each of the trace's pictures, one from each of these traces in turn (their own
     // frames from --skip), the same size
     let mixes = try mixTraces(opts).map { try ScapReader(url: URL(fileURLWithPath: $0)) }
@@ -162,6 +167,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         } else {
             resample(full, srcW, srcH, into: bgra, width, height)
         }
+        if pictures.isEmpty, opts.has("ref-from-half") { firstBGRA = Array(UnsafeRawBufferPointer(bgra)) }
         pictures.append(try YUV420(bgra: bgra, width: width, height: height))
     }
     guard !pictures.isEmpty else { throw BenchError("no frames after --skip \(skip)") }
@@ -201,6 +207,31 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     if let dir = opts.string("dump-partition") {
         try dumpPartitions(pictures, width: width, height: height, qindex: qindex, preset: preset, device: device, to: dir)
         return
+    }
+    let upscalers = try (opts.string("upscale")?.split(separator: ",").map { try Upscaler(String($0)) }) ?? []
+    let upscaler = upscalers.first
+    if let spec = opts.string("ref-from-half") {
+        // the reference a reduced transient leaves: picture 0 coded small, decoded, scaled up
+        let parts = spec.split(separator: ":").compactMap { Int($0) }
+        guard inter, crop == nil, (1...2).contains(parts.count), parts[0] >= 64, parts[0] < width,
+              parts.count < 2 || (0...63).contains(parts[1]), !firstBGRA.isEmpty
+        else { throw BenchError("--ref-from-half: <width>[:<q>], with --inter, less than --width, not with --crop") }
+        let hw = parts[0] & ~1, hh = (srcH * hw / srcW) & ~1, hq = parts.count > 1 ? parts[1] : q
+        let small = UnsafeMutableRawBufferPointer.allocate(byteCount: hw * hh * 4, alignment: 64)
+        defer { small.deallocate() }
+        firstBGRA.withUnsafeMutableBytes { resample($0, width, height, into: small, hw, hh) }
+        let half = try YUV420(bgra: small, width: hw, height: hh)
+        let e = try AV1HybridEncoder(device: device)
+        e.preset = preset
+        e.tiling = (tileParts[0], tileParts[1])
+        let f = try e.encode(AV1HybridEncoder.Picture(y: half.planes[0], u: half.planes[1], v: half.planes[2], width: hw, height: hh),
+                             qindex: hq == 63 ? 255 : 4 * hq)
+        try YUV420.decode(f.obu, width: hw, height: hh).bgra(into: small)
+        if let upscaler { try upscaler.scale(small, hw, hh, into: bgra, width, height) } else { resample(small, hw, hh, into: bgra, width, height) }
+        pictures[0] = try YUV420(bgra: bgra, width: width, height: height)
+        print(String(format: "  ref-from-half: picture 0 coded alone at %d×%d q%d: %@, decoded and scaled up to %d×%d (%@); PSNR-Y %.2f against the source's",
+                     hw, hh, hq, formatBytes(f.obu.count), width, height, upscaler?.kind.rawValue ?? "vImage high quality",
+                     pictures[0].psnrY(try firstBGRA.withUnsafeMutableBytes { try YUV420(bgra: $0, width: width, height: height) })))
     }
     let encoder = try AV1HybridEncoder(device: device)
     encoder.preset = preset
@@ -363,6 +394,15 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                       ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil)
     }
     let rgb = scoreRGB ? try scorer() : nil
+    if let rgb {
+        rgb.upscalers = upscalers
+        if let spec = opts.string("save-png") {
+            let parts = spec.split(separator: ":", maxSplits: 2).map(String.init)
+            guard (2...3).contains(parts.count) else { throw BenchError("--save-png: <dir>:<tag>[:<i>,...]") }
+            try FileManager.default.createDirectory(atPath: parts[0], withIntermediateDirectories: true)
+            rgb.savePNG = (parts[0], parts[1], parts.count > 2 ? Set(parts[2].split(separator: ",").compactMap { Int($0) }) : nil)
+        }
+    }
     // (--two-steps: the second step's, reading the trace again in step)
     let rgbAgain = scoreRGB && steps == 2 ? try scorer() : nil
     var psnrAgain = 0.0
@@ -445,6 +485,24 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
     if let rgb { print(rgb.summary(stream.map { "hybrid at \(width)×\(height) shown at \($0.width)×\($0.height)" } ?? "hybrid")) }
     if let rgb, opts.has("per-frame") { rgb.printFrames("hybrid", bytes: frames.map(\.obu.count)) }
+    if let rgb, opts.has("frame-scores") {
+        let scores = (try? rgb.ssimulacra2Scores()) ?? []
+        for (i, f) in frames.enumerated() where i < rgb.psnrs.count {
+            let k = rgb.ssimu2Every > 0 && i % rgb.ssimu2Every == 0 ? i / rgb.ssimu2Every : -1
+            print(String(format: "fscore %d %d %d %d %.4f %.5f %@ %.2f %.2f %.2f", i, f.obu.count, f.timing.qindex, f.timing.fast ? 1 : 0, rgb.psnrs[i],
+                         rgb.ssims[i], k >= 0 && k < scores.count ? String(format: "%.3f", scores[k]) : "-",
+                         f.timing.closedLoop * 1000, f.timing.filtersGPU * 1000, f.timing.analysis * 1000))
+        }
+        for (u, x) in zip(upscalers.dropFirst(), rgb.extra) {
+            for i in x.psnrs.indices { print(String(format: "fscore-up %@ %d %.4f %.5f", u.kind.rawValue, i, x.psnrs[i], x.ssims[i])) }
+        }
+    }
+    if let rgb {
+        for (u, x) in zip(upscalers.dropFirst(), rgb.extra) where !x.psnrs.isEmpty {
+            print(String(format: "             upscaled %@: SSIM mean %.4f · PSNR mean %.2f dB", u.kind.rawValue,
+                         x.ssims.reduce(0, +) / Double(x.ssims.count), x.psnrs.filter(\.isFinite).reduce(0, +) / Double(x.psnrs.count)))
+        }
+    }
     if encoder.keyFrameQindex(qindex) != qindex {
         print("             key frame at qindex \(encoder.keyFrameQindex(qindex)), inter frames at \(qindex)")
     }
@@ -726,6 +784,21 @@ final class RGBScorer {
     /// Each frame's PSNR (`--per-frame`), and the SSIMULACRA2 scores (scored once: the scorer's
     /// files go when it has)
     var psnrs: [Double] = []
+    /// `--frame-scores`: each frame's SSIM
+    var ssims: [Double] = []
+    /// `--upscale`: the scalers of reduced frames (none: `resample`); the first's picture is the
+    /// one scored as usual, each other's scored by PSNR and SSIM into `extra`
+    var upscalers: [Upscaler] = [] {
+        didSet {
+            extra = upscalers.dropFirst().map { _ in (psnrs: [], ssims: []) }
+            if upscalers.count > 1, other == nil { other = .allocate(byteCount: width * height * 4, alignment: 64) }
+        }
+    }
+    var extra: [(psnrs: [Double], ssims: [Double])] = []
+    private var other: UnsafeMutableRawBufferPointer?
+    /// `--save-png`: where each frame's reference and shown picture go, the shown's name, and
+    /// which frames (nil: all)
+    var savePNG: (dir: String, tag: String, frames: Set<Int>?)?
     private var ssimu2Scores: [Double]?
     /// `--step`: the trace's frames apart (its pictures read so far)
     let step: Int
@@ -766,6 +839,7 @@ final class RGBScorer {
         reference.deallocate()
         shown.deallocate()
         small.deallocate()
+        other?.deallocate()
     }
 
     func add(_ decoded: YUV420) throws {
@@ -790,7 +864,11 @@ final class RGBScorer {
         resample(f, r.header.width, r.header.height, into: reference, width, height)
         if let coded {
             try decoded.bgra(into: small)
-            resample(small, coded.width, coded.height, into: shown, width, height)
+            if let upscaler = upscalers.first {
+                try upscaler.scale(small, coded.width, coded.height, into: shown, width, height)
+            } else {
+                resample(small, coded.width, coded.height, into: shown, width, height)
+            }
         } else {
             try decoded.bgra(into: shown)
         }
@@ -802,6 +880,24 @@ final class RGBScorer {
         ssim += s
         if p.isFinite { psnr += p }
         psnrs.append(p)
+        ssims.append(s)
+        let saves = savePNG.map { $0.frames?.contains(frames) ?? true } ?? false
+        if let savePNG, saves {
+            try writePNG(reference, width, height, to: URL(fileURLWithPath: "\(savePNG.dir)/ref\(frames).png"))
+            let name = upscalers.count > 1 ? "\(savePNG.tag)-\(upscalers[0].kind.rawValue)" : savePNG.tag
+            try writePNG(shown, width, height, to: URL(fileURLWithPath: "\(savePNG.dir)/\(name)\(frames).png"))
+        }
+        if let coded, let other {
+            for (k, u) in upscalers.dropFirst().enumerated() {
+                try u.scale(small, coded.width, coded.height, into: other, width, height)
+                let (s2, p2) = lumaQuality(UnsafeRawBufferPointer(reference), UnsafeRawBufferPointer(other), width, height)
+                extra[k].psnrs.append(p2)
+                extra[k].ssims.append(s2)
+                if let savePNG, saves {
+                    try writePNG(other, width, height, to: URL(fileURLWithPath: "\(savePNG.dir)/\(savePNG.tag)-\(u.kind.rawValue)\(frames).png"))
+                }
+            }
+        }
         frames += 1
     }
 

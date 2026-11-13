@@ -115,7 +115,7 @@ final class SSIMULACRA2Scorer {
 }
 
 /// An opaque BGRA buffer as an sRGB PNG.
-private func writePNG(_ pixels: UnsafeMutableRawBufferPointer, _ width: Int, _ height: Int, to url: URL) throws {
+func writePNG(_ pixels: UnsafeMutableRawBufferPointer, _ width: Int, _ height: Int, to url: URL) throws {
     guard let ctx = CGContext(data: pixels.baseAddress, width: width, height: height,
                               bitsPerComponent: 8, bytesPerRow: width * 4,
                               space: CGColorSpace(name: CGColorSpace.sRGB)!,
