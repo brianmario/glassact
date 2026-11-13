@@ -564,10 +564,35 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             }
         }
         build_edges_par(I.src[0], sp, x, y, T::lw, T::lh, haveLeft, haveAbove, haveAR, haveBL, maxX, maxY, A, L, tsc, NTS);  // (integers: any threads)
-        ga_sync<NT>();
-        if (lane == 0) S.dcv = av1g_dc_value(A, L, haveLeft, haveAbove, T::lw, T::lh);
-        ga_sync<NT>();
-        const int dcv = S.dcv;
+        device const GpExtCand *ext = ga_fixed ? nullptr : (device const GpExtCand *)B.extCand[BS];
+        // Glass Act: the screening's SATDs zeroed and its candidates listed (the modes learned mode
+        // pruning leaves, in order) behind the edges' barrier: they read nothing the edges make, and
+        // each entry is written by one thread (a mode's slot by its mode's, the rest by their own)
+        const uint mm = ml_mode_mask(I, x, y, W, H);
+        if (!ext && tsc < 32) {
+            S.satd[tsc] = 0.f;
+            if (tsc < 13 && (mm >> tsc & 1)) S.cand[popcount(mm & ((1u << tsc) - 1u))] = cand_pack(tsc, 0);
+            if (tsc >= (int)popcount(mm)) S.cand[tsc] = 0;
+        }
+        ga_sync<NTS>();
+        // Glass Act: the DC value's edge sums on the first SIMD-group (whole numbers, any order: the
+        // same sum as av1g_dc_value's), each of its lanes then forming the value as av1g_dc_value
+        // does; with more than a SIMD-group it reaches the others through S.dcv behind the flat
+        // check's barriers
+        int dcv = 0;
+        if (tsc < 32) {
+            int sum = 0;
+            if (haveAbove)
+                for (int k = tsc; k < W; k += 32) sum += A[k];
+            if (haveLeft)
+                for (int k = tsc; k < H; k += 32) sum += L[k];
+            sum = simd_sum(sum);
+            dcv = haveLeft && haveAbove ? (sum + ((W + H) >> 1)) / (W + H)
+                : haveLeft              ? av1g_clip1((sum + (H >> 1)) >> T::lh)
+                : haveAbove             ? av1g_clip1((sum + (W >> 1)) >> T::lw)
+                                        : 1 << 7;
+            if (NTS > 32 && tsc == 0) S.dcv = dcv;
+        }
         // Glass Act: a flat block whose prediction edges are flat too (common on screens) is
         // predicted exactly by every mode, so every candidate screens at 0 and its RD is an
         // all-zero block's: the same results, without the predictions and transforms
@@ -578,9 +603,18 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             for (int p = tsc; p < W * H; p += NTS) bad |= src[(p / W) * sp + p % W] != v;
             for (int i = tsc - 1; i < W + H; i += NTS) bad |= A[i] != v;
             for (int i = tsc; i < W + H; i += NTS) bad |= L[i] != v;
-            flat = ga_max<NTS>(bad, tsc, S.redi) == 0;
+            if (NTS == 32) flat = ga_max<NTS>(bad, tsc, S.redi) == 0;
+            else {  // (ga_max's two barriers, S.dcv written before them)
+                bad = warp_max(bad);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if ((tsc & 31) == 0) S.redi[tsc >> 5] = bad;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                int t = S.redi[0];
+                for (int w = 1; w < NTS / 32; w++) t = max(t, S.redi[w]);
+                flat = t == 0;
+                dcv = S.dcv;
+            }
         }
-        device const GpExtCand *ext = ga_fixed ? nullptr : (device const GpExtCand *)B.extCand[BS];
         int K = ga_fixed ? 1 : min((W * H >= 1024 && P.kLarge > 0) ? P.kLarge : P.K, GP_MAXK);
         int top[GP_MAXK];
         auto mbits = [&](int c) -> float {
@@ -604,12 +638,6 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
             K = min(K, n);
             ga_sync<NT>();
         } else {
-        if (lane < 32) { S.satd[lane] = 0.f; S.cand[lane] = 0; }
-        ga_sync<NT>();
-        // Glass Act: the modes learned mode pruning leaves (all 13 without it), packed in order
-        const uint mm = ml_mode_mask(I, x, y, W, H);
-        if (lane < 13 && (mm >> lane & 1)) S.cand[popcount(mm & ((1u << lane) - 1u))] = cand_pack(lane, 0);
-        ga_sync<NT>();
         // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
         int ncand = (int)popcount(mm);
