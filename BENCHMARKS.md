@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The picture pipeline's waits: the partition read out to alternating buffers so the next analysis doesn't wait for the CPU, the motion search ahead of the filters' gate, the kept analysis without array copies, a spare set of deblocking buffers (`metal-av1`) | kept; the reference by a GPU blit not (the closed loop reads GPU-written memory slower); no gate not (44.6 fps) | the same streams; the period 21.5 → 19.0 ms; all-new 5K 51.7 → 54.3 inter frames a second, 5K video 56 → 61; the closed loop bounds the period now | [entry](#metal-av1-where-the-gpu-waits-in-the-picture-pipeline-the-readout-the-motion-search-ahead-of-the-gate-2026-11-12) |
 | A mostly-new picture coded at half resolution and upscaled at the Viewer (`metal-av1`; measured with `av1seq --stream-width --upscale`) | measured, not built; the form to build if 60 fps isn't reached at 5K or a link forces under ≈ 200 KB a picture is in the entry | bytes −59 % at the same q, closed loop −65 % (105 → 37 core-ms), GPU −41 %; but 30 dB against 44 at 5K, and at the same bytes full resolution coded coarser is as good or better down to ≈ 200 KB a picture; scaled references save nothing on the way back | [entry](#metal-av1-a-mostly-new-picture-at-half-resolution-upscaled-measured-not-built-2026-11-12) |
 | The analysis's screening with each mode compiled for itself and DC, V and H from the source's Hadamard; its set-up in three barriers; the residual's mode compiled in (`metal-av1`) | kept; lists for the SIMD-group shapes and a 16-bit-pair column pass not (no gain) | the same streams; a new 5K picture's analysis 7.3 → 6.8 ms (9.7 → 9.2 with `--fast off`); the GPU stages ≈ 13.2 ms | [entry](#metal-av1-the-analysiss-screening-by-mode-dc-v-and-h-in-the-transform-domain-2026-11-12) |
 | `k_inter`'s 16x16, 32x32 and 64x64 DCTs on the matrix units; the RD's end of block from the quantization loop; the thread kernels' rate from padded levels (`metal-av1`) | kept; the matrix tile loaded once a SIMD-group not (no gain) | the same streams; inter candidates 1.32 → 1.17 ms on a new 5K picture and 3.71 → 2.93 on video; 4x4 1.00 → 0.93, 8x8 1.54 → 1.48; the GPU stages ≈ 13.7 ms | [entry](#metal-av1-the-inter-candidates-dcts-on-the-matrix-units-the-rds-end-of-block-and-rate-2026-11-12) |
@@ -328,6 +329,67 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: where the GPU waits in the picture pipeline; the readout, the motion search ahead of the gate (2026-11-12)
+
+The all-new stream (the rotation at 5K q20, `--no-golden`), one process at a time, the Mac at
+load 4–10. The same streams: the ten digests and a 60-frame stream twice each on the merged
+head (three times on every kept state by their builder), video, scrolling images, app switching,
+dragging and two screens without CDEF against the previous build's, and the no-CDEF stream
+decoded exactly with the same bytes as without its pictures.
+
+**The GPU's account a picture** (`GA_TIMELINE`, 57 pictures, means): busy 14.9 ms, idle 6.3, of
+which 5.2 waiting for the closed loop to hand it the filters, 0.9 for the CPU's read of the last
+analysis (`readEvent`), 0.3 for the gate. So the chain was not GPU-bound, as the frame's line
+had suggested: the analyses take about 19, 13, 10 and 10 ms in the rotation's four-picture
+cycle; on the long ones the chain is closed loop → filters → the gated analysis → read → closed
+loop, on the others the closed loop bounds it. The analysis is one command buffer already (the
+stage sum is profiling's), and the filters' wall, unqueued, is 1.5 ms (0.23 set-up, 0.5 from
+commit to the GPU's start, 0.6 GPU). Without the gate: 44.6 inter frames a second.
+
+**Kept:**
+- **The next analysis no longer waits for the CPU's read** (`8b6fe74`): `k_leaf_out` writes the
+  partition into one of two alternating readout sets as the analysis ends, and `leafBlocks`
+  writes in place in two passes. From the analysis's end to its read 3.4 → 1.7 ms; the wait for
+  the read gone. A test reads partitions after later analyses have overwritten the buffers.
+- **The filters' last command buffer raises the gate on the GPU** (`8ea569f`): idle before an
+  analysis 0.32 → 0.23 ms.
+- **The kept analysis's blocks as ranges of the partition's own arrays**, not 10,800 array
+  copies a picture (`1ff7c76`): the read 1.5 → 0.8 ms.
+- **An inter frame's motion search ahead of the gate** (`61b9c9b`): the motion search,
+  projections, candidate SADs and inter candidates (4–5 ms) in a command buffer of their own,
+  behind only the earlier analyses; the rest waits for the filters as before. The period 21.1 →
+  18.6 ms. A test checks the stream is the same both ways.
+- **A spare set of deblocking buffers** (`99f54bb`): without CDEF the closed loop reconstructs
+  into the spare set and predicts from the filters' output where it is, so the copy of the
+  reference that the fix of this morning took (22 MB a picture) is gone: the encoder's thread
+  before the closed loop 1.06 → 0.03 ms.
+
+| the account, before → after | ms a picture |
+|---|---|
+| period (an analysis's start to the next's), median | 21.5 → 19.0 |
+| GPU idle, mean | 6.33 → 4.92 |
+| … waiting for the closed loop | 5.15 → 4.66 |
+| … waiting for the CPU's read | 0.90 → 0 |
+| the analysis's end to its read | 3.41 → 1.12 |
+| the encoder's thread, partition to closed loop | 1.12 → 0.16 |
+| filters' wall, mean | 3.4 → 2.4 |
+
+Inter frames a second on the all-new stream: their builder's 10 alternated pairs 51.4 → 53.45
+(medians; ahead in 8); on the merged head, 6 pairs at load 6–10: 50.3–54.1 → 51.9–57.1 (medians
+51.7 → 54.3; ahead in all 6); filters 3.1 → 2.4 ms. **Video at 5K, 24 frames: 55.0 / 56.5 →
+60.7 / 60.9 inter frames a second**, the first 5K stream of new content over 60. Scrolling
+images 114 / 131 → 136 / 137.
+
+**Measured, not kept:** the aliased reference copied by a GPU blit (`2605dc1`, reverted by
+`133c3d7`: 1 ms off the encoder's thread, but the closed loop's chroma 0.4–0.9 ms slower reading
+memory the GPU wrote, in every pairing: 54.75 against 55.0); the analysis split after learned
+pruning instead (18.61 against 18.55); the chroma reference read ahead of the closed loop.
+
+**What bounds the period now:** the closed loop (12–15 ms) + the filters' wall (1.5 median) +
+0.3 of hand-off; the GPU waits ≈ 4.7 ms a picture for it. The closed loop's chroma is 0.5–0.9 ms
+slower when its reference is memory the GPU wrote. The analysis's set-up (`begin` to commit,
+≈ 3.3 ms on its own thread) allocates and clears several MB a picture, off the chain.
 
 ### Metal AV1: a mostly-new picture at half resolution, upscaled, measured, not built (2026-11-12)
 
