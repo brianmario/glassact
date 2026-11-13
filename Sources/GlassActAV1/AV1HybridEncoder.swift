@@ -381,6 +381,18 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// settle; video or scrolling new images make every picture mostly new, and their softness
         /// would last as long as the motion does.
         public var runLimit: Int?
+        /// Only in pictures of at least this many 64×64s (0: any size). The mode buys speed with
+        /// quality, and a small picture has the speed already: at 2900 wide (1,196 64×64s) video
+        /// runs at twice 60 a second without it, and with it needs 15–25 % more bytes for its
+        /// quality (BENCHMARKS "real streams at 2900").
+        public var minSuperblocks = 0
+        /// The encoder's default: level 1 in pictures larger than 4K (2,400 64×64s and up; 5K is
+        /// 3,600, 4K UHD 2,040), where a mostly-new picture is what keeps a stream under 60 a second.
+        public static var standard: NewPictureEffort {
+            var e = level(1)!
+            e.minSuperblocks = 2400
+            return e
+        }
         /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
         /// that holds the default's bytes (BENCHMARKS "a mostly-new picture coded fast"):
         /// 1. the levers whose bytes don't depend on the content: learned pruning looser (levels
@@ -416,10 +428,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             (self.usesRDOQ, self.rdoqMinCoefficients, self.analysis) = (usesRDOQ, rdoqMinCoefficients, analysis)
         }
     }
-    /// See `NewPictureEffort` (nil: off). Level 1 by default, on every mostly-new picture: the
-    /// owner's order is speed and bytes first, quality where it can give (the tiles settle a still
-    /// screen to lossless; a video's softness lasts while it plays: `runLimit` would spare it).
-    public var newPictureEffort: NewPictureEffort? = .level(1)
+    /// See `NewPictureEffort` (nil: off). By default level 1 on every mostly-new picture of a
+    /// stream larger than 4K (`NewPictureEffort.standard`): the owner's order is speed and bytes
+    /// first, quality where it can give (the tiles settle a still screen to lossless; a video's
+    /// softness lasts while it plays: `runLimit` would spare it), and only where the speed is
+    /// needed.
+    public var newPictureEffort: NewPictureEffort? = .standard
 
     /// Whether an inter frame with these copies takes `newPictureEffort`, given `run`: the
     /// mostly-new pictures in a row before it (counted here, in the stream's order).
@@ -428,7 +442,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             run = 0
             return false
         }
-        guard Double(skip.count(where: { $0 == 0 })) > metal.interGateOverShare * Double(max(1, skip.count)) else {
+        guard skip.count >= effort.minSuperblocks,
+              Double(skip.count(where: { $0 == 0 })) > metal.interGateOverShare * Double(max(1, skip.count)) else {
             run = 0
             return false
         }
