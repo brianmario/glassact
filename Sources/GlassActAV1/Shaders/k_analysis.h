@@ -60,7 +60,8 @@ static inline threadgroup uint8_t *plOf(threadgroup ASmem<W, H> &S) {
     return ASmem<W, H>::edgesInTmp ? (threadgroup uint8_t *)S.tmp + ASmem<W, H>::EL : S.pl;
 }
 
-__device__ __forceinline__ float hadamard4_abs(int *d) {
+// Glass Act: the sum of absolute coefficients, a whole number (hadamard4_abs: a quarter of it)
+__device__ __forceinline__ int hadamard4_sum(int *d) {
     // rows
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -74,8 +75,9 @@ __device__ __forceinline__ float hadamard4_abs(int *d) {
         int s0 = d[j] + d[4 + j], s1 = d[j] - d[4 + j], s2 = d[8 + j] + d[12 + j], s3 = d[8 + j] - d[12 + j];
         sum += abs(s0 + s2) + abs(s1 + s3) + abs(s0 - s2) + abs(s1 - s3);
     }
-    return (float)sum * 0.25f;
+    return sum;
 }
+__device__ __forceinline__ float hadamard4_abs(int *d) { return (float)hadamard4_sum(d) * 0.25f; }
 
 __device__ __forceinline__ int pangle_of(int mode, int delta) {
     return av1g_is_directional(mode) ? AV1G_T(Mode_To_Angle)[mode] + delta * AV1G_ANGLE_STEP : 0;
@@ -144,6 +146,29 @@ __device__ __forceinline__ int pred_fast(thread const PredCand &p, int i, int j,
     const int base = A[j] + L[i] - A[-1];  // PAETH
     const int pL = abs(base - L[i]), pT = abs(base - A[j]), pTL = abs(base - A[-1]);
     return (pL <= pT && pL <= pTL) ? L[i] : pT <= pTL ? A[j] : A[-1];
+}
+
+// pred_cand of mode m at delta 0, from literals (Mode_To_Angle, Dr_Intra_Derivative), so that a
+// constant m leaves a constant
+__device__ __forceinline__ PredCand pred_cand0(int m, int lw, int lh) {
+    PredCand p;
+    p.mode = m;
+    p.w = 1 << lw; p.h = 1 << lh;
+    p.dx = 0; p.dy = 0;
+    p.wx = av1g_sm_weights(lw); p.wy = av1g_sm_weights(lh);
+    switch (m) {
+    case AV1G_DC_PRED: p.zone = 0; break;
+    case AV1G_V_PRED: p.zone = 4; break;
+    case AV1G_H_PRED: p.zone = 5; break;
+    case AV1G_D45_PRED: p.zone = 1; p.dx = 64; break;
+    case AV1G_D67_PRED: p.zone = 1; p.dx = 27; break;
+    case AV1G_D113_PRED: p.zone = 2; p.dx = 27; p.dy = 151; break;
+    case AV1G_D135_PRED: p.zone = 2; p.dx = 64; p.dy = 64; break;
+    case AV1G_D157_PRED: p.zone = 2; p.dx = 151; p.dy = 27; break;
+    case AV1G_D203_PRED: p.zone = 3; p.dy = 27; break;
+    default: p.zone = 6; break;
+    }
+    return p;
 }
 
 // SATD of candidates cands[c0..c1) (all 4x4 sub-blocks), accumulated into satd[]
@@ -224,6 +249,162 @@ __device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const in
         for (int off = g >> 1; off > 0; off >>= 1) v += simd_shuffle_down(v, (ushort)off);
         if (it < items && (sl & (g - 1)) == 0)
             atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[ci], v, memory_order_relaxed);
+    }
+    ga_sync<NT>();
+}
+
+// Glass Act: the 4-point Walsh-Hadamard of hadamard4_abs's passes (rows, then columns): outputs
+// (s0 + s2, s1 + s3, s0 - s2, s1 - s3) of s0 = x0 + x1, s1 = x0 - x1, s2 = x2 + x3, s3 = x2 - x3
+static inline int4 ga_wh4(int x0, int x1, int x2, int x3) {
+    const int s0 = x0 + x1, s1 = x0 - x1, s2 = x2 + x3, s3 = x2 - x3;
+    return int4(s0 + s2, s1 + s3, s0 - s2, s1 - s3);
+}
+// Glass Act: a lane's row of a 4x4 (four lanes, rows 0..3, aligned), its row pass `r` done: the
+// column pass across the four by shuffles, as warp_screen's, returning row i of the 4x4's
+// coefficients (column j in component j), signs and all
+static inline int4 ga_col4(int4 r, int i) {
+    int4 o;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int v = r[j], b = simd_shuffle_xor(v, (ushort)1);
+        const int plus = v + b, minus = (i & 1) ? b - v : v - b;
+        const int pp = simd_shuffle_xor(plus, (ushort)2), pm = simd_shuffle_xor(minus, (ushort)2);
+        o[j] = i == 0 ? plus + pp : i == 1 ? minus + pm : i == 2 ? pp - plus : pm - minus;
+    }
+    return o;
+}
+static inline int ga_abs4(int4 v) { return abs(v.x) + abs(v.y) + abs(v.z) + abs(v.w); }
+
+// Glass Act: warp_screen of the modes at delta 0 that the mask `mm` leaves (packed in mode order in
+// satd, as k_analysis lists them), each mode compiled for itself (pred_cand0 of a constant), and DC,
+// V and H in the transform domain. The Hadamard is linear and in integers, so H(src - pred) =
+// H(src) - H(pred) exactly, and those three predictors' transforms are a few coefficients: DC's
+// 16 dcv at (0, 0); V's rows all A[sx..sx+3], so 4 wh4(A) in row 0; H's columns all L[sy..sy+3],
+// so 4 wh4(L) in column 0. One pass over the source's transforms makes all three SATDs, the same
+// integers. Each SATD is a multiple of 0.25 below 2^22 and its quarter-integers sum exactly in any
+// order (warp_screen), so a lane's whole-number partials, summed over a SIMD-group and added once
+// a SIMD-group, give the same totals. Shapes with fewer than 32 items a mode keep warp_screen.
+template <int W, int H, int NT>
+__device__ __forceinline__ void warp_screen_modes(const uint8_t *src, int sp, uint mm, threadgroup float *satd, const uint8_t *A,
+                                                  const uint8_t *L, int dcv, int tsc, int sub, const int *cands) {
+    typedef TxD<W, H> T;
+    constexpr int nsx = W / 4, nsub0 = (W / 4) * (H / 4);
+    const int nsub = sub == 2 ? nsub0 / 2 : nsub0;
+    const bool rows4 = nsub >= 8 && nsub != 32;  // four lanes a 4x4 (warp_screen's choice)
+    const int per = rows4 ? nsub * 4 : nsub;     // items a mode: a power of two
+    if (per < 32) {
+        warp_screen<W, H, NT>(src, sp, cands, 0, (int)popcount(mm), satd, A, L, dcv, tsc, sub);
+        return;
+    }
+    // a mode's items on all NT threads (per >= NT), or on aligned groups of per threads, the modes
+    // dealt out to them in turn (per < NT: whole SIMD-groups, as per >= 32)
+    const int lp = (int)ctz((uint)per);
+    const int G = per >= NT ? 1 : NT >> lp, grp = G == 1 ? 0 : tsc >> lp;
+    const int k0 = G == 1 ? tsc : tsc & (per - 1), nit = G == 1 ? per / NT : 1;
+    // this thread's items: their 4x4s and, a lane a row, its row; the source read once for all modes
+    // (at most MIT items a thread: the rows of 64x64 on 256, 32x32 on 128, 16x16 on 32 are 4, 2, 2;
+    // the shapes with more, 16x64 to 64x32 on a SIMD-group, keep warp_screen)
+    constexpr int MIT = (W * H) / (4 * NT) < 1 ? 1 : (W * H) / (4 * NT);
+    if (MIT > 4) {
+        warp_screen<W, H, NT>(src, sp, cands, 0, (int)popcount(mm), satd, A, L, dcv, tsc, sub);
+        return;
+    }
+    int sxs[MIT], sys[MIT];
+    uint sv[MIT][4];
+    const int i = k0 & 3;
+#pragma unroll
+    for (int it = 0; it < MIT; it++) {
+        sxs[it] = 0; sys[it] = 0;
+        sv[it][0] = sv[it][1] = sv[it][2] = sv[it][3] = 0;
+        if (it >= nit) continue;
+        const int k = k0 + it * NT;
+        int sb = rows4 ? k >> 2 : k;
+        if (sub == 2) { const int r = (2 * sb) / nsx; sb = 2 * sb + (r & 1); }
+        sxs[it] = (sb % nsx) * 4; sys[it] = (sb / nsx) * 4;
+        const uint8_t *s = src + sys[it] * sp + sxs[it];
+        if (rows4) {
+            s += i * sp;
+            sv[it][0] = (uint)s[0] | (uint)s[1] << 8 | (uint)s[2] << 16 | (uint)s[3] << 24;
+        } else {
+#pragma unroll
+            for (int r = 0; r < 4; r++) sv[it][r] = (uint)s[r * sp] | (uint)s[r * sp + 1] << 8 | (uint)s[r * sp + 2] << 16 | (uint)s[r * sp + 3] << 24;
+        }
+    }
+    auto px = [&](uint v, int j) -> int { return (int)((v >> (8 * j)) & 0xFFu); };
+    // a SIMD-group's whole-number partial into a candidate's SATD
+    auto add = [&](int slot, int a) {
+        const int v = simd_sum(a);
+        if ((tsc & 31) == 0) atomic_fetch_add_explicit((threadgroup atomic_float *)&satd[slot], (float)v * 0.25f, memory_order_relaxed);
+    };
+    int job = 0;
+    // DC, V and H from the source's transforms
+    if (mm & 7u) {
+        if (job % G == grp) {
+            int aDC = 0, aV = 0, aH = 0;
+#pragma unroll
+            for (int it = 0; it < MIT; it++) {
+                if (it >= nit) continue;
+                const int sx = sxs[it], sy = sys[it];
+                const int4 ra = ga_wh4(A[sx], A[sx + 1], A[sx + 2], A[sx + 3]) * 4;
+                const int4 rl = ga_wh4(L[sy], L[sy + 1], L[sy + 2], L[sy + 3]) * 4;
+                if (rows4) {
+                    const uint v = sv[it][0];
+                    const int4 c = ga_col4(ga_wh4(px(v, 0), px(v, 1), px(v, 2), px(v, 3)), i);
+                    const int tot = ga_abs4(c);
+                    aDC += i == 0 ? tot - abs(c.x) + abs(c.x - 16 * dcv) : tot;
+                    aV += i == 0 ? ga_abs4(c - ra) : tot;
+                    aH += tot - abs(c.x) + abs(c.x - rl[i]);
+                } else {
+                    int4 rr[4];
+#pragma unroll
+                    for (int r = 0; r < 4; r++) { const uint v = sv[it][r]; rr[r] = ga_wh4(px(v, 0), px(v, 1), px(v, 2), px(v, 3)); }
+                    int4 c[4];  // c[i][j]: row i, column j
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const int4 o = ga_wh4(rr[0][j], rr[1][j], rr[2][j], rr[3][j]);
+                        c[0][j] = o.x; c[1][j] = o.y; c[2][j] = o.z; c[3][j] = o.w;
+                    }
+                    const int t0 = ga_abs4(c[0]), t1 = ga_abs4(c[1]), t2 = ga_abs4(c[2]), t3 = ga_abs4(c[3]);
+                    const int tot = t0 + t1 + t2 + t3;
+                    aDC += tot - abs(c[0].x) + abs(c[0].x - 16 * dcv);
+                    aV += tot - t0 + ga_abs4(c[0] - ra);
+                    aH += tot - abs(c[0].x) - abs(c[1].x) - abs(c[2].x) - abs(c[3].x) + abs(c[0].x - rl.x) + abs(c[1].x - rl.y) +
+                          abs(c[2].x - rl.z) + abs(c[3].x - rl.w);
+                }
+            }
+            int slot = 0;
+            if (mm & 1u) add(slot++, aDC);
+            if (mm & 2u) add(slot++, aV);
+            if (mm & 4u) add(slot, aH);
+        }
+        job++;
+    }
+#pragma unroll
+    for (int m = AV1G_D45_PRED; m <= AV1G_PAETH_PRED; m++) {
+        if (!(mm >> m & 1)) continue;
+        if (job++ % G != grp) continue;
+        const PredCand pc = pred_cand0(m, T::lw, T::lh);
+        int a = 0;
+#pragma unroll
+        for (int it = 0; it < MIT; it++) {
+            if (it >= nit) continue;
+            const int sx = sxs[it], sy = sys[it];
+            if (rows4) {
+                const uint v = sv[it][0];
+                const int y = sy + i;
+                const int4 r = ga_wh4(px(v, 0) - pred_fast(pc, y, sx, A, L, dcv), px(v, 1) - pred_fast(pc, y, sx + 1, A, L, dcv),
+                                      px(v, 2) - pred_fast(pc, y, sx + 2, A, L, dcv), px(v, 3) - pred_fast(pc, y, sx + 3, A, L, dcv));
+                a += ga_abs4(ga_col4(r, i));
+            } else {
+                int d[16];
+#pragma unroll
+                for (int r = 0; r < 4; r++)
+#pragma unroll
+                    for (int j = 0; j < 4; j++) d[r * 4 + j] = px(sv[it][r], j) - pred_fast(pc, sy + r, sx + j, A, L, dcv);
+                a += hadamard4_sum(d);
+            }
+        }
+        add((int)popcount(mm & ((1u << m) - 1u)), a);
     }
     ga_sync<NT>();
 }
@@ -432,7 +613,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         // ---- screening: the modes at delta 0 ----
         const int ssub = (P.screenSub == 2 && W * H >= 256) ? 2 : 1;
         int ncand = (int)popcount(mm);
-        if (!flat) warp_screen<W, H, NTS>(src, sp, S.cand, 0, ncand, S.satd, A, L, dcv, tsc, ssub);
+        if (!flat) warp_screen_modes<W, H, NTS>(src, sp, mm, S.satd, A, L, dcv, tsc, ssub, S.cand);
         // (angle deltas read S.satd by mode: only with every mode screened)
         const bool allowDelta = P.deltas && mm == 0x1FFFu && BS >= AV1G_BLOCK_8X8 && (P.deltasMaxArea <= 0 || W * H <= P.deltasMaxArea);
         if (allowDelta) {

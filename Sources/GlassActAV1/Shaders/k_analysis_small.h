@@ -162,29 +162,6 @@ __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const 
     return o;
 }
 
-// pred_cand of mode m at delta 0, from literals (Mode_To_Angle, Dr_Intra_Derivative), so that a
-// constant m leaves a constant
-__device__ __forceinline__ PredCand pred_cand0(int m, int lw, int lh) {
-    PredCand p;
-    p.mode = m;
-    p.w = 1 << lw; p.h = 1 << lh;
-    p.dx = 0; p.dy = 0;
-    p.wx = av1g_sm_weights(lw); p.wy = av1g_sm_weights(lh);
-    switch (m) {
-    case AV1G_DC_PRED: p.zone = 0; break;
-    case AV1G_V_PRED: p.zone = 4; break;
-    case AV1G_H_PRED: p.zone = 5; break;
-    case AV1G_D45_PRED: p.zone = 1; p.dx = 64; break;
-    case AV1G_D67_PRED: p.zone = 1; p.dx = 27; break;
-    case AV1G_D113_PRED: p.zone = 2; p.dx = 27; p.dy = 151; break;
-    case AV1G_D135_PRED: p.zone = 2; p.dx = 64; p.dy = 64; break;
-    case AV1G_D157_PRED: p.zone = 2; p.dx = 151; p.dy = 27; break;
-    case AV1G_D203_PRED: p.zone = 3; p.dy = 27; break;
-    default: p.zone = 6; break;
-    }
-    return p;
-}
-
 template <int W, int H, int BS>
 kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                              constant uint32_t &nTotal [[buffer(2)]], uint gb [[thread_position_in_grid]]) {
@@ -299,11 +276,40 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
             }
         };
         const uint mm = ml_mode_mask(I, x, y, W, H);  // Glass Act: learned mode pruning's modes
+        // Glass Act: DC, V and H in the transform domain, from each 4x4's source transform once
+        // (warp_screen_modes: H(src - pred) = H(src) - H(pred) in integers, and those predictors'
+        // transforms are 16 dcv at (0, 0), 4 wh4(A) in row 0, 4 wh4(L) in column 0): the same
+        // whole-number SATDs, a quarter of each the same float as satd_pc's sum of quarters
+        int aDVH[3] = {0, 0, 0};
+        if (!flat && (mm & 7u)) {
+            for (int sy = 0; sy < H; sy += 4)
+                for (int sx = 0; sx < W; sx += 4) {
+                    int4 rr[4];
+#pragma unroll
+                    for (int r = 0; r < 4; r++) {
+                        const int o = (sy + r) * W + sx;
+                        rr[r] = ga_wh4(s[o], s[o + 1], s[o + 2], s[o + 3]);
+                    }
+                    int4 c[4];  // c[i][j]: row i, column j
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const int4 o = ga_wh4(rr[0][j], rr[1][j], rr[2][j], rr[3][j]);
+                        c[0][j] = o.x; c[1][j] = o.y; c[2][j] = o.z; c[3][j] = o.w;
+                    }
+                    const int4 ra = ga_wh4(A[sx], A[sx + 1], A[sx + 2], A[sx + 3]) * 4;
+                    const int4 rl = ga_wh4(L[sy], L[sy + 1], L[sy + 2], L[sy + 3]) * 4;
+                    const int t0 = ga_abs4(c[0]), tot = t0 + ga_abs4(c[1]) + ga_abs4(c[2]) + ga_abs4(c[3]);
+                    aDVH[0] += tot - abs(c[0].x) + abs(c[0].x - 16 * dcv);
+                    aDVH[1] += tot - t0 + ga_abs4(c[0] - ra);
+                    aDVH[2] += tot - abs(c[0].x) - abs(c[1].x) - abs(c[2].x) - abs(c[3].x) + abs(c[0].x - rl.x) +
+                               abs(c[1].x - rl.y) + abs(c[2].x - rl.z) + abs(c[3].x - rl.w);
+                }
+        }
 #pragma unroll
         for (int m = 0; m < 13; m++) {
             if (!(mm >> m & 1)) continue;
             const int c = cand_pack(m, 0);
-            const float j = satd_pc(pred_cand0(m, T::lw, T::lh)) + lamS * mbits(c);
+            const float j = (m < 3 ? (float)aDVH[m] * 0.25f : satd_pc(pred_cand0(m, T::lw, T::lh))) + lamS * mbits(c);
             if (m >= AV1G_V_PRED && m <= AV1G_D67_PRED) dirJ[m - AV1G_V_PRED] = j;
             insert(c, j);
         }
