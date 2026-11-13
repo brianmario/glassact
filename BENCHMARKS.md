@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| A mostly-new picture coded at half resolution and upscaled at the Viewer (`metal-av1`; measured with `av1seq --stream-width --upscale`) | measured, not built; the form to build if 60 fps isn't reached at 5K or a link forces under ≈ 200 KB a picture is in the entry | bytes −59 % at the same q, closed loop −65 % (105 → 37 core-ms), GPU −41 %; but 30 dB against 44 at 5K, and at the same bytes full resolution coded coarser is as good or better down to ≈ 200 KB a picture; scaled references save nothing on the way back | [entry](#metal-av1-a-mostly-new-picture-at-half-resolution-upscaled-measured-not-built-2026-11-12) |
 | The analysis's screening with each mode compiled for itself and DC, V and H from the source's Hadamard; its set-up in three barriers; the residual's mode compiled in (`metal-av1`) | kept; lists for the SIMD-group shapes and a 16-bit-pair column pass not (no gain) | the same streams; a new 5K picture's analysis 7.3 → 6.8 ms (9.7 → 9.2 with `--fast off`); the GPU stages ≈ 13.2 ms | [entry](#metal-av1-the-analysiss-screening-by-mode-dc-v-and-h-in-the-transform-domain-2026-11-12) |
 | `k_inter`'s 16x16, 32x32 and 64x64 DCTs on the matrix units; the RD's end of block from the quantization loop; the thread kernels' rate from padded levels (`metal-av1`) | kept; the matrix tile loaded once a SIMD-group not (no gain) | the same streams; inter candidates 1.32 → 1.17 ms on a new 5K picture and 3.71 → 2.93 on video; 4x4 1.00 → 0.93, 8x8 1.54 → 1.48; the GPU stages ≈ 13.7 ms | [entry](#metal-av1-the-inter-candidates-dcts-on-the-matrix-units-the-rds-end-of-block-and-rate-2026-11-12) |
 | `k_me`'s window search dropping vectors that can't make the best two and starting where the gate found best; its sub-sample steps sharing horizontal sums; `k_inter_sad` a loop a sub-sample case; `k_proj`'s minimum by `simd_min` (`metal-av1`) | kept; a dozen variants not (no gain or slower); half-sample steps only not taken (+92 % on scrolling images scaled) | the same streams; the motion search at 5K: video 5.81 → 3.87 ms, scrolling images 9.13 → 5.67, a screen switch 2.16 → 1.75; video ≈ 46 → 53 inter frames a second | [entry](#metal-av1-the-motion-search-on-moving-content-the-same-bytes-in-two-thirds-of-the-time-again-2026-11-12) |
@@ -327,6 +328,64 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a mostly-new picture at half resolution, upscaled, measured, not built (2026-11-12)
+
+Under the owner's order (speed and bytes first, quality where the settle repairs it) the
+half-resolution idea rejected for the HEVC layer on 2026-09-29 as a steady state was measured as
+a transient. The bench codes a real reduced AV1 frame (2560 wide in a 5120 stream, render size)
+and scores it at 5K against the source after the scalers a Viewer could run (`av1seq
+--stream-width`, and new: `--upscale`, `--frame-scores`, `--save-png`, `--ref-from-half`;
+`4ebe778`). The rotation at 5K with `--no-golden` (every picture new), means over the inter
+frames; "alt" alternates an IDE and browser tabs. GPU stage times and thread CPU; one process
+at a time.
+
+**Bytes, KB an inter frame at q 14 / 20 / 26 / 32:** 5K as coded today 670 / 558 / 443 / 341,
+3/4 477 / 397 / 315 / 242, 2/3 410 / 341 / 271 / 209, 1/2 275 / 230 / 183 / 141 (−59 % at the
+same q; photos −66 %, text ≈ −50 %); alt 412 / 358 / 300 / 244 against 202 / 173 / 143 / 115.
+
+**Time at q20:**
+
+| | GPU stages (ms) | filters' GPU (ms) | closed loop (core-ms) |
+|---|---|---|---|
+| 5K today | 14.0 | 0.6 | 103–107 |
+| 5K `--fast off` | 15.6 | 4.6 | 128 |
+| 5K level 3 / and no 4x4s | 10.2 / 8.9 | 0.6 / 0.75 | 94 / 87 |
+| 3/4 | 9.2 | 0.6 | 68 |
+| 2/3 | 7.2 | 0.3 | 57 |
+| 1/2 | 8.1–8.4 | 0.3–0.4 | 36–38 |
+
+The GPU falls 41 %, not 75 %: the analysis 7.4 → 4.9 ms, since the downscaled picture is busier
+and less of it is pruned. The closed loop falls 65 %, which nothing at 5K reaches.
+
+**Quality at 5K** (1/2 at q20; PSNR / SSIM / SSIMULACRA2): vImage Lanczos5 30.02 / 0.9495 /
+43.7, Lanczos3 29.85 / 0.9510, Core Image Lanczos 29.28 / 0.9456, MetalFX spatial 29.32 /
+0.9441 / 41.5, bilinear 28.22 / 0.9435 / 34.2; 5K as coded today 44.16 / 0.9895 / 75.5. The
+resampling caps it: half resolution at q2 reaches 30.3 dB, and SSIMULACRA2 tops out at 50–62
+whatever the bytes.
+
+**At the same bytes** (1/2 against the 5K curve; SSIM and SSIMULACRA2 as half / 5K): at 352 KB
+−9.5 dB, 0.959 / 0.976, 49.8 / 61.5; at 230 KB −5.9 dB, 0.950 / 0.955, 43.7 / 42.0; at 141 KB
+−2.8 dB, 0.927 / 0.918, 26.0 / 14.2. 3/4 and 2/3 are −6 dB at q20. Half resolution wins only
+below ≈ 150–200 KB a 5K picture, where 5K must be at q 40–44. To the eye, at matched bytes (1/2
+q20 against 5K q40): small text is readable in both, half evenly soft with faint ringing, 5K
+sharper with smudges and colour fringes on dark backgrounds; thin lines in a photo survive at
+half and vanish at 5K q40. Against today's 5K q20 half is plainly soft.
+
+**The way back.** A 5K picture after its own half-size transient, bounded with the upscaled
+half picture as its reference, costs −6 to +10 % of a key frame at the same q (terminal 444
+against 429 KB, an IDE 229 / 208, tabs 430 / 457): scaled references save nothing, as the two
+steps of 2026-11-10 found. So a transient followed by motion costs the transient plus a whole
+new picture; followed by stillness, the tiles replace it and the 5K picture is never sent.
+
+**Not built.** At the same bytes full resolution coded coarser is as good or better down to
+≈ 200 KB a picture, and the fast pictures already pay in quality without a resampler's ceiling.
+Its one unique gain is the closed loop's time. If 60 fps is not reached at 5K, or for a link
+that forces under ≈ 200 KB a picture, the form to build is: every mostly-new picture of a run at
+1/2 each way (not a run's first alone, nor 2/3 or 3/4), Lanczos on the Viewer (not bilinear or
+MetalFX), back to 5K by an intra-only frame at full size (it keeps the long-term pictures; a key
+frame drops them), and no scaled references. Unmeasured: video, the Host's downscale and the
+Viewer's upscale costs, VideoToolbox decoding reduced frames or a size change, AV1 superres.
 
 ### Metal AV1: the analysis's screening by mode, DC, V and H in the transform domain (2026-11-12)
 
