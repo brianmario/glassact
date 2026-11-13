@@ -539,6 +539,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var analysisUsesMatrixUnits: Bool { metal.analysisUsesMatrixUnits }
     /// The last picture's GPU stages (with `profilesStages`).
     public var lastStages: AV1MetalEncoder.StageTimes { metal.lastStages }
+    /// An inter frame's motion search runs ahead of the filters it'd otherwise wait for
+    /// (`AV1MetalEncoder.splitsMotion`; on). The same bytes either way.
+    public var splitsMotion: Bool {
+        get { metal.splitsMotion }
+        set { metal.splitsMotion = newValue }
+    }
 
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
@@ -649,9 +655,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var writing: Writing?
         var starting: Later<Pending>?, following: Later<Pending>?
         // Picture k's analysis waits on the GPU for picture k - 2's filters (`gate(k)`), besides
-        // picture k - 1's analysis being read: the filters, which picture k - 1's closed loop
-        // waits for, then have the GPU as soon as their own closed loop ends, and picture k's
-        // analysis runs beside picture k - 1's closed loop.
+        // the reads of the pictures whose buffers it reuses: the filters, which picture k - 1's
+        // closed loop waits for, then have the GPU as soon as their own closed loop ends, and
+        // picture k's analysis runs beside picture k - 1's closed loop. Its motion search doesn't
+        // wait for the filters (`AV1MetalEncoder.splitsMotion`): it fills the GPU's wait for them.
         let gateBase = filtersDone
         func gate(_ k: Int) -> UInt64 { k >= 2 ? gateBase + UInt64(k - 1) : 0 }
         // picture i's partition, read on a thread of its own as soon as its analysis ends

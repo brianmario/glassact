@@ -552,6 +552,44 @@ extension HybridEncoderTests {
 }
 
 extension HybridEncoderTests {
+    /// A stream whose motion searches run ahead of the filters in front of them, in a command
+    /// buffer of their own (`splitsMotion`), has the bytes of one whose analyses run whole behind
+    /// them: moving and new content, with kept analysis between them.
+    @available(macOS 27, *)
+    @Test func motionSearchAheadOfTheFiltersKeepsTheBytes() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 384)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x5b1_17)
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<10 {
+            var y = base.y
+            if i == 5 {
+                for k in y.indices { y[k] = UInt8(rng.int(0..<256)) }  // all new
+            } else {
+                for r in 100..<300 {  // a texture moving (3, 1) a picture
+                    for c in 64..<448 {
+                        let (u0, v0) = (c + 3 * i, r + i)
+                        y[r * width + c] = UInt8(clamping: 60 + (u0 * 7 + v0 * 3) % 50 + ((u0 / 9 + v0 / 7) % 3) * 20)
+                    }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        func stream(splits: Bool) throws -> [[UInt8]] {
+            let encoder = try AV1HybridEncoder(device: device)
+            encoder.tiling = (1, 1)
+            encoder.interFrames = true
+            encoder.splitsMotion = splits
+            var frames: [[UInt8]] = []
+            try encoder.encode(count: pictures.count, qindex: 100, picture: { pictures[$0] }, output: { _, f in frames.append(f.obu) })
+            return frames
+        }
+        let whole = try stream(splits: false), split = try stream(splits: true)
+        #expect(whole.count == pictures.count)
+        for i in whole.indices { #expect(whole[i] == split[i], "frame \(i) differs") }
+    }
+
     /// `motionSkip`: a stream of a scene whose photo drifts, then of stripes (each picture new),
     /// then of the scene again, searches the scene's frames (quarter samples, blocks predicted at
     /// them), skips the search once two frames that searched found almost nothing (whole samples,

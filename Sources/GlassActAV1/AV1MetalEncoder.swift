@@ -355,6 +355,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         readouts[parity] = r
         return r
     }
+    /// An inter frame's analysis ordered behind `gate` (`beginPartition(after:)`) runs its motion
+    /// search and inter candidates (4-5 ms of a mostly-new 5K picture's) ahead of it, in a command
+    /// buffer of their own: in the time the GPU would otherwise wait for the filters in front,
+    /// which wait for their closed loop on the CPU. Only the rest waits for the gate. (On: the
+    /// 5K all-new stream's period 21.1 -> 18.6 ms.)
+    public var splitsMotion = true
     /// The last analysis set up reads the analysis's own buffers on the CPU (it has no GPU work,
     /// and so no `Readout`): the next one's GPU work waits for that read.
     var lastReadsLive = false
@@ -964,6 +970,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if let error = commands.error { throw Failure.metal("\(error)") }
                 var stages = StageTimes()
                 stages.analysis = commands.gpuEndTime - commands.gpuStartTime
+                if let early = run.motionCommands {  // (done before the rest: the queue's order)
+                    early.waitUntilCompleted()
+                    if let error = early.error { throw Failure.metal("\(error)") }
+                    stages.analysis += early.gpuEndTime - early.gpuStartTime
+                    AV1HybridEncoder.trace("motion gpu \(String(format: "%.3f %.3f", early.gpuStartTime * 1000, early.gpuEndTime * 1000)) seq \(run.seq)")
+                }
                 AV1HybridEncoder.trace("analysis gpu \(String(format: "%.3f %.3f", commands.gpuStartTime * 1000, commands.gpuEndTime * 1000)) seq \(run.seq)")
                 run.encoder.lastStages = stages
                 run.encoder.lastGPUSeconds = stages.analysis
@@ -1064,6 +1076,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var gateValue: UInt64 = 0
         /// Where its partition is read from (k_leaf_out's), or nil: the analysis's buffers.
         let readout: Readout?
+        /// With `splitsMotion`: the motion search's command buffer, ahead of the rest's.
+        var motionCommands: (any MTLCommandBuffer)?
         /// `readEvent`'s value its GPU work waits for: the reads of the analyses whose buffers it
         /// overwrites (its readout's last user, two before; the one before if that one reads the
         /// analysis's own).
@@ -1400,13 +1414,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             params.leafChromaAngled = encoder.leafChromaAngledModes ? 1 : 0
             params.meSubpel = newPictureAnalysis?.subpel ?? encoder.searchesSubpelMotion ? 1 : 0
             params.interSkipsIntra = encoder.interSkipsIntra ? 1 : 0
+            // An inter frame's motion search and inter candidates in a command buffer of their own,
+            // ahead of the gate (`splitsMotion`): the rest, behind it, in a second.
+            let splits = encoder.splitsMotion && isInter && !profiling && !closedLoop && gateValue > 0
+                && (staleSuperblocks ?? (sbCols * sbRows)) > 0
+            var gated = !splits
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
                 guard let c = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
                 // the earlier pictures' results this one's overwrite are read (`waitsForRead`)
                 if waitsForRead > 0 { c.encodeWaitForEvent(encoder.readEvent, value: waitsForRead) }
                 // and whatever the caller orders it behind (`beginPartition(after:)`)
-                if gateValue > 0 { c.encodeWaitForEvent(encoder.gate, value: gateValue) }
+                if gateValue > 0, gated { c.encodeWaitForEvent(encoder.gate, value: gateValue) }
                 guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
@@ -1500,6 +1519,17 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     stages.interSearch = try close()
                     e = try open()
                 }
+            }
+            if splits, let c = commands {  // the motion search's command buffer, committed; the rest behind the gate
+                e.endEncoding()
+                c.label = "AV1 analysis (motion)"
+                c.commit()
+                AV1HybridEncoder.trace("analysis motion commit seq \(seq)")
+                motionCommands = c
+                commands = nil
+                compute = nil
+                gated = true
+                e = try open()
             }
             if isInter, analyzed > 0 { e.memoryBarrier(scope: .buffers) }
             if let mask = mlMask, let weights = encoder.mlWeights, let lp = encoder.learnedPrune,
