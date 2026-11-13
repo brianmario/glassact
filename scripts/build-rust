@@ -1,0 +1,29 @@
+#!/bin/sh
+# Builds the Rust AV1 library (rust/av1) that the package's AV1 targets link:
+# .build/rust/libglassact_av1.a, always optimized (debug Swift builds link it too).
+#   scripts/build-rust              this Mac's architecture
+#   scripts/build-rust --universal  arm64 + x86_64 (CI, the Intel build)
+# `just` runs it before every build and test; run it yourself before a bare `swift build`.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+manifest="$root/rust/av1/Cargo.toml"
+out="$root/.build/rust"
+mkdir -p "$out"
+command -v cargo >/dev/null || { echo "build-rust: no cargo; install Rust with rustup (https://rustup.rs)" >&2; exit 1; }
+if [ "${1:-}" = "--universal" ]; then
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        rustup target list --installed 2>/dev/null | grep -qx "$t" || rustup target add "$t"
+        cargo build --quiet --release --manifest-path "$manifest" --target "$t"
+    done
+    lib="$out/libglassact_av1.a.new"
+    xcrun lipo -create -output "$lib" \
+        "$root/rust/av1/target/aarch64-apple-darwin/release/libglassact_av1.a" \
+        "$root/rust/av1/target/x86_64-apple-darwin/release/libglassact_av1.a"
+else
+    cargo build --quiet --release --manifest-path "$manifest"
+    lib="$root/rust/av1/target/release/libglassact_av1.a"
+fi
+# replace only when changed, so SwiftPM doesn't relink for nothing
+if ! cmp -s "$lib" "$out/libglassact_av1.a"; then cp "$lib" "$out/libglassact_av1.a"; fi
+[ "$lib" = "$out/libglassact_av1.a.new" ] && rm -f "$lib"
+exit 0

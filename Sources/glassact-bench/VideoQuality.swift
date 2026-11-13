@@ -29,12 +29,16 @@ let videoQualityCommand = Command(
         .int("scale", "<pct>", 10...100, "encode resolution as % of the canvas (default 100); scored after scaling back up"),
         .int("frames", "<n>", 1...100_000, "frames to encode (default 300)"),
         .int("skip", "<n>", 0...100_000, "trace frames to skip first (default 0)"),
+        .string("mix", "<trace.scap>[,<trace.scap>...]", "interleave the frames with these traces' in turn (each from the same --skip, 60 fps apart), as av1seq --mix does: every block changes from frame to frame"),
         .bool("low-latency", "request VideoToolbox's low-latency rate control"),
         .int("cqf", "<0-100>", 0...100, "experiment: constant-quality factor ×100 (kVTCompressionPropertyKey_ConstantQualityFactor, macOS 27)"),
         .bool("no-realtime", "experiment: kVTCompressionPropertyKey_RealTime = false"),
         .bool("chroma444", "experiment: HEVC Main 4:4:4 (full-resolution chroma) instead of Main 4:2:0"),
         .bool("cqf-vbv", "experiment: with --cqf, cap the rate as a VBV peak (1 s) instead of an average"),
         .int("max-qp", "<n>", 1...51, "quality floor: cap frame QP (kVTCompressionPropertyKey_MaxAllowedFrameQP; default \(VTHEVCRegionEncoder.defaultMaxFrameQP), as in the product; 51 = none)"),
+        .int("qp", "<n>", 1...51, "every frame at this QP under a rate that never binds, so bytes measure content (constant-quality curves)"),
+        .int("throughput", "<n>", 2...600, "instead of scoring: read n pictures first, then hand them to the encoder with up to --in-flight outstanding, and report frames a second (throughput, where the default reports one picture's latency)"),
+        .int("in-flight", "<n>", 1...16, "with --throughput: pictures handed to the encoder and not yet delivered (default 3)"),
         .string("ssimulacra2", "<path|off>", "also score SSIMULACRA2 with this binary (default: `ssimulacra2` on PATH, if any; off = SSIM/PSNR only)"),
         .int("ssimulacra2-every", "<n>", 1...100_000, "SSIMULACRA2 on every nth scored frame (default 5), plus the SSIM-worst frame and every settle step"),
     ],
@@ -89,6 +93,7 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
     }()
     if let hevc {
         if opts.has("max-qp") { hevc.maxFrameQP = opts.int("max-qp", 30) }
+        if opts.has("qp") { hevc.pinnedFrameQP = opts.int("qp", 30) }
         if opts.has("cqf") { hevc.constantQualityFactor = Float(opts.int("cqf", 50)) / 100 }
         hevc.capWithVBV = opts.has("cqf-vbv")
         hevc.realTime = !opts.has("no-realtime")
@@ -99,7 +104,10 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
     nonisolated(unsafe) var lastData: [UInt8] = []
     nonisolated(unsafe) var lastSync = false
     nonisolated(unsafe) var config: [UInt8]?
+    nonisolated(unsafe) var deliveredCount = 0, deliveredBytes = 0
     guard encoder.start(width: submitW, height: submitH, onFrame: { data, sync, cfg in
+        deliveredCount += data.isEmpty ? 0 : 1
+        deliveredBytes += data.count
         lastData = data
         lastSync = sync
         if let cfg { config = cfg }
@@ -128,6 +136,44 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
     var rects: [DirtyRect] = []
     for _ in 0..<skip {
         guard try reader.readFrame(rects: &rects, into: src) != nil else { throw BenchError("trace too short for --skip") }
+    }
+    if opts.has("throughput") {
+        // Throughput, not latency: the pictures are read first, then handed to the encoder with up
+        // to `--in-flight` of them outstanding, as a Host hands on the next picture without
+        // waiting for the last one's bytes.
+        let n = opts.int("throughput", 24), depth = opts.int("in-flight", 3)
+        var pics: [UnsafeMutableRawBufferPointer] = [], times: [UInt64] = []
+        defer { pics.forEach { $0.deallocate() } }
+        var first: UInt64?
+        while pics.count < n, let meta = try reader.readFrame(rects: &rects, into: src) {
+            let f0 = first ?? meta.timestampUS
+            first = f0
+            resample(src, srcW, srcH, into: canvas, canvasW, canvasH)
+            let p = UnsafeMutableRawBufferPointer.allocate(byteCount: encW * encH * 4, alignment: 64)
+            resample(UnsafeMutableRawBufferPointer(canvas), canvasW, canvasH, into: p, encW, encH)
+            pics.append(p)
+            times.append(meta.timestampUS &- f0)
+        }
+        guard pics.count > 1 else { throw BenchError("--throughput: the trace is too short") }
+        var outstanding = 0, late = 0
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        for (i, p) in pics.enumerated() {
+            if outstanding == depth {
+                if delivered.wait(timeout: .now() + 2) != .success { late += 1 }
+                outstanding -= 1
+            }
+            encoder.encode(bgra: UnsafeRawBufferPointer(p), forceSync: i == 0, timeUS: times[i])
+            outstanding += 1
+        }
+        while outstanding > 0 {
+            if delivered.wait(timeout: .now() + 2) != .success { late += 1 }
+            outstanding -= 1
+        }
+        let seconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+        let (count, bytes) = queue.sync { (deliveredCount, deliveredBytes) }
+        print(String(format: "  throughput: %d pictures handed in, %d delivered (%d not within 2 s), up to %d in flight: %.3f s · %.1f frames a second · %.1f KB a frame",
+                     pics.count, count, late, depth, seconds, Double(count) / seconds, Double(bytes) / Double(max(1, count)) / 1024))
+        return
     }
     var ssims: [Double] = [], psnrs: [Double] = [], sizes: [Int] = [], latenciesUS: [UInt64] = []
     var decodeFailures = 0
@@ -168,15 +214,33 @@ func cmdVideoQuality(_ reader: ScapReader, traceName: String, opts: Options) thr
         _ = try encodeAndScore(timeUS: 0, forceSync: true)
         submitted = 1
     }
-    for _ in 0..<frames {
-        guard let meta = try reader.readFrame(rects: &rects, into: src) else { break }
-        let first = firstTraceUS ?? meta.timestampUS
-        firstTraceUS = first
-        traceUS = (meta.timestampUS &- first) + (fromBlack ? 16_667 : 0)
+    // --mix: frames from these traces in turn after each of the trace's, the pictures av1seq --mix codes
+    let mix = try mixTraces(opts).map { try ScapReader(url: URL(fileURLWithPath: $0)) }
+    let mixSrc = mix.map { UnsafeMutableRawBufferPointer.allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
+    defer { mixSrc.forEach { $0.deallocate() } }
+    for (m, s) in zip(mix, mixSrc) {
+        for _ in 0..<skip {
+            guard try m.readFrame(rects: &rects, into: s) != nil else { throw BenchError("mix trace too short for --skip") }
+        }
+    }
+    for k in 0..<frames {
+        if !mix.isEmpty {
+            let j = k % (mix.count + 1)
+            let (r, s, w, h) = j == 0 ? (reader, src, srcW, srcH)
+                : (mix[j - 1], mixSrc[j - 1], mix[j - 1].header.width, mix[j - 1].header.height)
+            guard try r.readFrame(rects: &rects, into: s) != nil else { break }
+            traceUS = UInt64(k) * 16_667 + (fromBlack ? 16_667 : 0)
+            resample(s, w, h, into: canvas, canvasW, canvasH)
+        } else {
+            guard let meta = try reader.readFrame(rects: &rects, into: src) else { break }
+            let first = firstTraceUS ?? meta.timestampUS
+            firstTraceUS = first
+            traceUS = (meta.timestampUS &- first) + (fromBlack ? 16_667 : 0)
+            resample(src, srcW, srcH, into: canvas, canvasW, canvasH)
+        }
         // Newest-wins pacing: the first capture at or after the deadline goes.
         if submitIntervalUS != nil, submitted > 0, traceUS < nextSubmitUS { continue }
         nextSubmitUS = traceUS + (submitIntervalUS ?? 0)
-        resample(src, srcW, srcH, into: canvas, canvasW, canvasH)
         resample(UnsafeMutableRawBufferPointer(canvas), canvasW, canvasH, into: enc, encW, encH)
         guard let scored = try encodeAndScore(timeUS: traceUS, forceSync: submitted == 0) else { submitted += 1; continue }
         submitted += 1
