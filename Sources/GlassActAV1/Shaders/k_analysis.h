@@ -409,6 +409,43 @@ __device__ __forceinline__ void warp_screen_modes(const uint8_t *src, int sp, ui
     ga_sync<NT>();
 }
 
+// Glass Act: warp_residual's loop for a mode at delta 0 without the edge filter, the mode a
+// constant (pred_cand0), so its predictor is compiled for itself: the same samples p0, p0 + step,
+// ..., the same residuals, and (sq) the same float sum of their squares in the same order
+template <int W, int H, int M>
+__device__ __forceinline__ float ga_res_mode(const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L, int dcv,
+                                             int p0, int step, bool sq) {
+    typedef TxD<W, H> T;
+    const PredCand pc = pred_cand0(M, T::lw, T::lh);
+    float e = 0.f;
+    for (int p = p0; p < W * H; p += step) {
+        const int i = p / W, j = p % W;
+        const int r = (int)src[i * sp + j] - pred_fast(pc, i, j, A, L, dcv);
+        res[p] = (int16_t)r;
+        if (sq) e += (float)(r * r);
+    }
+    return e;
+}
+template <int W, int H>
+__device__ __forceinline__ float ga_res_modes(int m, const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L,
+                                              int dcv, int p0, int step, bool sq) {
+    switch (m) {
+    case 0: return ga_res_mode<W, H, 0>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 1: return ga_res_mode<W, H, 1>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 2: return ga_res_mode<W, H, 2>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 3: return ga_res_mode<W, H, 3>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 4: return ga_res_mode<W, H, 4>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 5: return ga_res_mode<W, H, 5>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 6: return ga_res_mode<W, H, 6>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 7: return ga_res_mode<W, H, 7>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 8: return ga_res_mode<W, H, 8>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 9: return ga_res_mode<W, H, 9>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 10: return ga_res_mode<W, H, 10>(src, sp, res, A, L, dcv, p0, step, sq);
+    case 11: return ga_res_mode<W, H, 11>(src, sp, res, A, L, dcv, p0, step, sq);
+    default: return ga_res_mode<W, H, 12>(src, sp, res, A, L, dcv, p0, step, sq);
+    }
+}
+
 // residual of candidate c into res (W x H), returns sum r^2 (all lanes).  With the intra edge filter,
 // directional candidates use edges prepared by lane 0 into pa/pl (filter type 0: neighbour modes unknown).
 // Glass Act: NTS > NT (k_analysis's screening threads, tsc each): the residual on all NTS, then
@@ -432,7 +469,10 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
     }
     const PredCand pc = pred_cand(c, T::lw, T::lh);
     float e = 0.f;
+    const bool byMode = !ef && cand_delta(c) == 0;
     if (NTS != NT) {
+        if (byMode) ga_res_modes<W, H>(m, src, sp, res, A, L, dcv, tsc, NTS, false);
+        else
         for (int p = tsc; p < W * H; p += NTS) {
             const int i = p / W, j = p % W;
             const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
@@ -447,6 +487,8 @@ __device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c
         }
         return ga_sum<NT>(e, lane, red);
     }
+    if (byMode) e = ga_res_modes<W, H>(m, src, sp, res, A, L, dcv, lane, NT, true);
+    else
     for (int p = lane; p < W * H; p += NT) {
         const int i = p / W, j = p % W;
         const int pr = ef ? av1g_pred_pixel_up(m, pangle_of(m, cand_delta(c)), i, j, T::lw, T::lh, pa + AV1G_EDGE_OFF,
