@@ -1335,15 +1335,24 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // inter frame's straight there, a key frame's copied)
         var geometry = av1g_frame_params()
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
-        let store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
-        let into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
+        var store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
+        var into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
         // The previous picture where the filters left it is the closed loop's reference. Without
-        // CDEF (qindex 32 and under) that is the buffers they deblocked in place, the ones this
-        // picture is reconstructed into: the closed loop would predict from samples it has
-        // overwritten, and a decoder wouldn't. It then reads a copy taken first.
-        let aliased = reference != nil && previousOnGPU && postfilter.outputPlanes.contains { out in
-            into.contains { $0.map { UnsafePointer($0) == out } == true }
+        // CDEF (qindex 32 and under, or `newPictureEffort`'s) that is the buffers they deblocked in
+        // place, the ones this picture would be reconstructed into: the closed loop would predict
+        // from samples it has overwritten, and a decoder wouldn't. It's reconstructed into the
+        // filters' spare buffers instead, which they then deblock in place (they trade places).
+        func aliases() -> Bool {
+            reference != nil && previousOnGPU && postfilter.outputPlanes.contains { out in
+                into.contains { $0.map { UnsafePointer($0) == out } == true }
+            }
         }
+        if !store.isEmpty, aliases() {
+            store = try postfilter.spareReconstructionBuffers(params: geometry)
+            into = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
+        }
+        // (or, should the spare buffers be the reference too, it reads a copy taken first)
+        let aliased = aliases()
         let ownReference = aliased ? previousDecoded(width: p.width, height: p.height) : []
         let refPlanes = ownReference.count == 3 ? ownReference : reference?.planes ?? []
         let gpuRef = reference != nil && previousOnGPU && ownReference.count != 3

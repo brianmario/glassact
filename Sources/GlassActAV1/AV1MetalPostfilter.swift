@@ -506,6 +506,16 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         return Array(job.source.prefix(job.nPlanes))
     }
 
+    /// As `reconstructionBuffers`, but a second set, apart from them: for a closed loop whose
+    /// reference is the last search's output where that is `reconstructionBuffers` (no CDEF), so
+    /// that it needn't copy its reference first. The next `search` given them takes them as its
+    /// deblocking buffers (they and `reconstructionBuffers` trade places), without a copy.
+    public func spareReconstructionBuffers(params fp: av1g_frame_params) throws -> [any MTLBuffer] {
+        let job = try job(geometry: fp)
+        if job.spare.isEmpty { job.spare = try (0..<3).map { try job.make(job.pw[$0] * job.ph[$0]) } }
+        return Array(job.spare.prefix(job.nPlanes))
+    }
+
     /// Encodes `body`'s work and runs it.
     private func run(_ body: (any MTLComputeCommandEncoder) -> Void) throws {
         try wait(commit(body))
@@ -559,6 +569,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         let pw: [Int], ph: [Int]
         var made: [any MTLBuffer] = []
         var source: [any MTLBuffer] = [], output: [any MTLBuffer] = []
+        /// `spareReconstructionBuffers`: deblocking buffers that `load` trades `source` for when it
+        /// is given their contents (empty until asked for).
+        var spare: [any MTLBuffer] = []
         var cdefIdx: (any MTLBuffer)!, blockBuffer: (any MTLBuffer)!, lfZeroBuffer: (any MTLBuffer)!
         var addrs = GaPfAddrs()
         /// The frame (av1g_pf_frame) every kernel reads, which l_select writes the presets into.
@@ -606,6 +619,12 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         func load(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>, planes: [UnsafePointer<UInt8>],
                   lfZero: [UInt8]?) throws {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
+            // the spare buffers' contents: they become the deblocking buffers, the others the spare
+            if spare.count == 3,
+               (0..<nPlanes).allSatisfy({ planes[$0] == UnsafePointer(spare[$0].contents().assumingMemoryBound(to: UInt8.self)) }) {
+                swap(&source, &spare)
+                addrs.plane = (source[0].gpuAddress, source[1].gpuAddress, source[2].gpuAddress)
+            }
             for p in 0..<nPlanes where planes[p] != UnsafePointer(source[p].contents().assumingMemoryBound(to: UInt8.self)) {
                 source[p].contents().copyMemory(from: planes[p], byteCount: pw[p] * ph[p])
             }
