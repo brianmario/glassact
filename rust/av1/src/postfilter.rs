@@ -366,7 +366,20 @@ pub fn lf_line(
 /// when no tx edge is there.
 #[inline(always)]
 pub(crate) fn lf_filter_size(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col: i32) -> Option<i32> {
-    let sub = f.sub(plane);
+    lf_filter_size_sub(f, m, plane, f.sub(plane), pass, row, col)
+}
+
+/// [`lf_filter_size`] with the plane's subsampling `sub` given (a constant in the NEON plane loops).
+#[inline(always)]
+pub(crate) fn lf_filter_size_sub(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    sub: i32,
+    pass: usize,
+    row: i32,
+    col: i32,
+) -> Option<i32> {
     let (x_p, y_p) = ((col * 4) >> sub, (row * 4) >> sub);
     let (row, col) = (row | sub, col | sub);
     let prev_row = row - (((pass == 1) as i32) << sub);

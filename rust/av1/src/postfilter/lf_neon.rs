@@ -178,12 +178,12 @@ fn filter8(s: &mut [int16x8_t; 16], fs: int16x8_t, chroma: bool, any16: bool, l:
 
 /// The filter size of one segment (0 = none): lf_edge's checks.
 #[inline(always)]
-fn seg_fs(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col: i32) -> i32 {
+fn seg_fs(f: &PfFrame, m: &PfMaps, plane: usize, sub: i32, pass: usize, row: i32, col: i32) -> i32 {
     let (x, y) = (col * 4, row * 4);
     if row >= f.mi_rows || col >= f.mi_cols || x >= f.w || y >= f.h || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
         return 0;
     }
-    lf_filter_size(f, m, plane, pass, row, col).unwrap_or(0)
+    lf_filter_size_sub(f, m, plane, sub, pass, row, col).unwrap_or(0)
 }
 
 #[inline(always)]
@@ -203,7 +203,16 @@ fn lanes(fs0: i32, fs1: i32) -> int16x8_t {
 }
 
 fn deblock_plane(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: usize) {
-    let sub = f.sub(plane);
+    // the subsampling a constant: luma and 4:4:4 chroma, 4:2:0 chroma
+    if f.sub(plane) != 0 {
+        deblock_plane_sub::<1>(f, m, plane, pl, stride);
+    } else {
+        deblock_plane_sub::<0>(f, m, plane, pl, stride);
+    }
+}
+
+fn deblock_plane_sub<const SUB: i32>(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: usize) {
+    let sub = SUB;
     let chroma = plane != 0;
     // 7.14.1: chroma edges every 1 << subsampling 4x4s (4:2:0: 2; 4:4:4: luma's grid)
     let step = 1 << sub;
@@ -232,8 +241,8 @@ fn deblock_plane(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: u
                 }
                 for col in (step as i32..f.mi_cols).step_by(step) {
                     let (fs0, fs1) = (
-                        seg_fs(f, m, plane, 0, row, col),
-                        seg_fs(f, m, plane, 0, row + step as i32, col),
+                        seg_fs(f, m, plane, sub, 0, row, col),
+                        seg_fs(f, m, plane, sub, 0, row + step as i32, col),
                     );
                     if fs0 == 0 && fs1 == 0 {
                         continue;
@@ -283,8 +292,8 @@ fn deblock_plane(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: u
                         continue;
                     }
                     let (fs0, fs1) = (
-                        seg_fs(f, m, plane, 1, row, col),
-                        seg_fs(f, m, plane, 1, row, col + step as i32),
+                        seg_fs(f, m, plane, sub, 1, row, col),
+                        seg_fs(f, m, plane, sub, 1, row, col + step as i32),
                     );
                     if fs0 == 0 && fs1 == 0 {
                         continue;
