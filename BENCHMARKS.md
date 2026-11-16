@@ -139,6 +139,7 @@ the numbers and the reasoning.
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
+| The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.5 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
@@ -334,6 +335,50 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### The hybrid's 4:4:4 key frames, as tiles (2026-11-16)
+
+The owner asked for 4:4:4 chroma (AV1's High profile) after the entry below found the hybrid's
+4:2:0 tiles capped by their chroma. Built in two stages on `metal-av1`: the Rust crate (`3699695`…
+`3de3792`: the subsampling a parameter of the frame, as a constant in the hot loops; key frames
+only, inter frames refused) and the Swift encoder (`da0f4aa`, `033373d`: `Picture.chroma444`; the
+GPU analysis on a 4:2:0 copy of the chroma, 2×2 means, its chroma decisions ignored; the closed
+loop decides chroma on the CPU by the reference engine's rule; no post-filters, the GPU's being
+4:2:0's). The 4:2:0 output is unchanged: the five reference digests, `just test-rust` (70 + 139
+against the C++), `av1tiles`'s sizes. 4:4:4 decodes exactly: 384 random legal key frames (every
+intra mode, CfL, palettes, intra block copy, every transform size, odd sizes, filters on and off)
+in dav1d and aomdec, 2,400 at larger sizes; the closed loop's pictures in both; every tile below in
+the vendored libaom.
+
+`av1tiles --chroma 444` (new): BT.601's matrix, full range, as the still's header signals and as
+avifenc converts (the 4:2:0 path converts BT.709 video range, which its header doesn't say: its
+own conversion's inverse scores it, so its rows are consistent, but an outside decoder would show
+its colours off). No tile used intra block copy. Bytes a tile (the stream), SSIMULACRA2 mean / p10:
+
+| Tiles | VP8L z4 (ships) | AVIF 4:4:4 q90 (AV1 data) | hybrid 4:4:4 q2 | q4 | q8 | q14 | q20 | conversion alone |
+|---|---|---|---|---|---|---|---|---|
+| typing-cc | 417 | 379 · 94.1 / 91.6 | 574 · 94.6 / 93.6 | 517 · 93.1 | 436 · 91.3 / 90.3 | 369 · 89.2 | 327 · 88.0 | 96.3 / 95.8 |
+| scroll-win | 381 | 270 · 95.6 / 91.7 | 423 · 96.6 / 94.4 | 356 · 96.1 / 93.3 | 291 · 94.9 / 91.1 | 244 · 93.6 | 219 · 92.5 | 97.8 / 96.7 |
+| photos | 3332 | 1026 · 91.0 / 84.9 | 1838 · 94.3 / 92.6 | 1419 · 93.3 / 91.1 | 1018 · 91.6 / 87.9 | 737 · 89.2 | 580 · 87.1 | 96.3 / 95.5 |
+| cursor-drag | 2381 | 526 · 91.5 / 87.9 | 903 · 93.7 / 92.7 | 675 · 93.0 / 91.6 | 500 · 91.5 / 89.0 | 387 · 89.2 | 327 · 87.0 | 95.4 / 94.8 |
+| tabs | 404 | 260 · 96.0 / 92.2 | 387 · 97.1 / 94.4 | 330 · 96.7 / 93.2 | 273 · 95.8 / 91.0 | 229 · 94.8 | 204 · 94.0 | 97.9 / 96.8 |
+| ide | 501 | 298 · 93.5 / 88.9 | 489 · 95.2 / 93.3 | 414 · 94.5 / 91.9 | 341 · 93.4 / 89.7 | 286 · 91.7 | 251 · 90.6 | 96.3 / 95.2 |
+
+- **Against 4:2:0, at the same bytes, 4:4:4 wins everywhere:** e.g. photos 737 B at 89.2 against
+  4:2:0 q8's 819 B at 84.7, cursor-drag 387 B at 89.2 against 397 B at 83.8, ide 251 B at 90.6 against
+  292 B at 86.5 (the 2026-11-16 table below). The conversion alone now scores 95–98, not 86–94.
+- **Against libaom's AVIF 4:4:4 q90 (speed 6),** at its score: photos and graphics about even
+  (photos ~950 B against 1026, cursor-drag ~500 against 526, with better p10s); UI 10–22 % more
+  bytes (tabs ~285 against 260, ide ~340 against 298, scroll ~330 against 270); text ~45 % more
+  (typing ~550 against 379). The text gap is the next thing to look at; suspects: no post-filters,
+  chroma decided on a block's first 32×32 only, the analysis seeing 2×2-mean chroma, and no intra
+  block copy at tile size.
+- **Against what ships,** a near-lossless 4:4:4 tile (q4, 93–97) is 57–72 % smaller than VP8L
+  on photos and graphics, 7–18 % smaller on UI, and 24 % larger on text. It still owes the
+  lossless settle, so the product case is unchanged from the entry below: a lossy tier only pays
+  where the settle can wait.
+- **Encode time** 3.6–13 ms a tile one at a time (GPU round trips; load average 20–55, so
+  provisional). Decoding needs libaom or our own decoder: VideoToolbox decodes no 4:4:4.
 
 ### Our own AV1 decoder: a first measurement (2026-11-16)
 

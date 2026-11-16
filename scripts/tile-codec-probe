@@ -96,7 +96,9 @@ def main():
                 sc = sorted(r[2] for r in res)
                 line += f" · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}"
             print(line, flush=True)
-        for q in ("conv", 8, 20, 32, 44):
+        qs = sorted(int(f[len(name) + 2:-4]) for f in os.listdir(D)
+                    if f.startswith(f"{name}-q") and f.endswith(".raw") and f[len(name) + 2:-4].isdigit())
+        for q in ["conv"] + qs:
             path = f"{D}/{name}-q{q}.raw" if q != "conv" else f"{D}/{name}-conv.raw"
             if not os.path.exists(path): continue
             dec = open(path, "rb").read()
@@ -105,7 +107,7 @@ def main():
                 png(p, dec[i * TB:(i + 1) * TB])
                 return score(refs[i], p)
             sc = sorted(pool.map(one, range(n)))
-            label = "4:2:0 conversion only" if q == "conv" else f"Metal AV1 420 q{q:<2d}   "
+            label = "conversion only      " if q == "conv" else f"hybrid AV1 q{q:<2d}       "
             print(f"  {label} (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}", flush=True)
 
 main()
