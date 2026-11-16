@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The hybrid as a live video encoder: a push API, a `VideoRegionEncoder` adapter (`GlassActHybridVideo`) and bitrate targeting, in the product's replay against libaom and HEVC (`metal-av1`) | built; not in the Host (libaom stays its AV1; switching is the owner's call) | a third to a half of libaom's bytes at about its PSNR; more frames than libaom on 6 Mbit/s (photos 146 / 120, video 149 / 115, scrolling images 270 / 185); a lone new 5K picture's encode 35–45 ms p50 against libaom's 15–30 | [entry](#metal-av1-the-hybrid-as-a-live-video-encoder-with-bitrate-targeting-in-the-products-replay-2026-11-16) |
 | The hybrid's streams on VideoToolbox's hardware AV1 decoder, the Viewer's (`metal-av1`, `av1seq --vt-decode`) | measured: they decode, exactly | 13 configurations (5K, 2900, 1280; intra block copy, long-term references, fast pictures, no CDEF, tilings, 128x128 superblocks): every frame identical to the encoder's picture; a test guards it on M3 and later | [entry](#metal-av1-the-hybrids-streams-on-videotoolboxs-av1-decoder-2026-11-16) |
 | Real streams at 2900 wide against libaom and HEVC (`metal-av1`) | measured; the fast pictures limited to streams larger than 4K on it | the hybrid leads both on typing, an IDE, scrolling, dragging and app switching (13–51 % against libaom, 26–36 % against HEVC), is level with HEVC on photos; on video +20 % / +5 % against HEVC with the fast pictures and −5 % / −10 % without; on scrolling images (resampled: sub-sample motion) HEVC needs 25–37 % fewer bytes either way | [entry](#metal-av1-real-streams-at-2900-against-libaom-and-hevc-the-fast-pictures-only-above-4k-2026-11-12) |
 | The hybrid against libaom realtime and hardware HEVC with the defaults of 2026-11-12 (`metal-av1`) | measured | real 5K streams: 16–58 % fewer bytes than libaom and 17–77 % fewer than HEVC at equal quality on all eight, at 54–337 frames a second against libaom's 35–217 and HEVC's 31–56; at 2900 (resampled) HEVC needs 4–10 % fewer bytes on video and 24–31 % fewer on scrolling images | [entry](#metal-av1-against-libaom-and-hardware-hevc-with-the-days-defaults-real-streams-at-5k-mixes-at-session-size-2026-11-12) |
@@ -332,6 +333,95 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the hybrid as a live video encoder, with bitrate targeting, in the product's replay (2026-11-16)
+
+The hybrid behind the product's `VideoRegionEncoder` (new target `GlassActHybridVideo`, in no
+product yet; libaom stays the Host's AV1), measured in `glassact-bench replay --video hybrid`
+against `--video av1` (libaom realtime, as the Host runs it) and `--video vt` (hardware HEVC).
+Commits `4e6a4c9`…`3792e74`. The fixed-quantizer streams are unchanged (the five reference
+digests); AV1 tests 37, `HybridVideoTests` 10, `GLASSACT_FAST=1 swift test` green; the apps
+and the iPadOS viewer build.
+
+**A push encoder.** `startStream`, `submit(picture, qindex, forceKey, chooser)`, `endStream`:
+a picture's copies are decided on a queue of their own as it arrives, its analysis begins once
+picture k − 2's partition is read, and each frame goes out from the writer as soon as it exists,
+so a picture with nothing after it isn't held back. `encode(count:)` is now a wrapper over it
+(six pictures ahead: with three, the copy finder sat on the critical path, 80.7 against 98.2
+inter frames a second; with six 101.4). A lone 5K picture of new content, submitted alone:
+analysis committed at 3.2 ms, read at 20.5, closed loop to 36.4, filters to 38.0, written at
+50.1 ms, with no wait on any other picture.
+
+**The adapter.** BGRA → I420 on the engine's queue, `forceSync` a key frame, the `av1C` with the
+first frame, one delivery per `encode`, a restart with a key frame after a failure.
+**Colour:** the hybrid's sequence header says BT.601 full range, but VideoToolbox's decoder (the
+Viewer's) shows its streams with a full-range BT.709 matrix, so the adapter converts with that:
+at qindex 8, luma 50.8 / 55.8 dB on text / photos as shown, against 38.6 / 44.6 converting as
+the header says. The header should say what is meant (a writer change; the digests would move);
+until then a decoder that honours it would show these streams' colours off.
+
+**Bitrate targeting** (`HybridRateController`, a value type, 10 tests). It aims where libaom
+aims (40 % of the Host's target under the link cap, 60 % with smooth motion; the frame-QP
+ceiling 34 → qindex 168). Bits ≈ header + coded 64x64s × exp(a − slope·(q − 80)): the coded
+64x64s come from the copy finder before `begin`, `a` is learned online for inter and key frames
+apart, the slope measured at 0.006–0.012 a qindex step on four streams (0.010 used; the whole
+range moves bytes only 2–3×). A picture's predicted bits are charged when its qindex is chosen
+and corrected when it's written (one or two pictures in flight); the share follows the mean
+capture interval (film in a 60 Hz capture swung the qindex by 45 a frame otherwise). The encoder
+still applies its own offsets (key −16, fast +7) under the ceiling. A key frame gets 2.5 s of the
+aim, at most 1 s of the link, and the bucket is charged only its time share: the send gate pays
+for the burst with skipped frames. On 5K video at 20 Mbit/s, decided with a frame's size
+unknown: 19.98–20.45 Mbit/s achieved.
+
+**The replay** (`--mode loop`, 5K, the first 300 trace frames; all 63 runs ended byte-exact and
+settled, no undecodable frame, every AV1 run decoded by VideoToolbox in hardware). Frames
+delivered · Mbit/s · luma PSNR of what the Viewer decoded (every 4th frame):
+
+| trace · link | hybrid | libaom | HEVC |
+|---|---|---|---|
+| typing · none | 17 · 1.58 · 46.97 | 17 · 3.52 · 45.40 | 17 · 2.82 · 42.55 |
+| typing · 2 Mbit/s | 16 · 1.58 · 46.97 | 13 · 2.96 · 44.80 | 13 · 1.94 · 39.95 |
+| scrolling · none | 265 · 1.21 · 50.13 | 265 · 2.70 · 52.00 | 265 · 3.96 · 47.23 |
+| scrolling · 2 | 209 · 0.73 · 48.19 | 180 · 1.24 · 49.51 | 94 · 1.26 · 43.78 |
+| photos · none | 282 · 6.35 · 41.26 | 282 · 8.95 · 42.23 | 282 · 18.41 · 41.24 |
+| photos · 6 | 146 · 2.86 · 38.97 | 120 · 4.84 · 39.81 | 21 · 5.26 · 39.92 |
+| photos · 2 | 7 · 1.78 · 42.98 | 7 · 2.25 · 40.98 | 11 · 2.40 · 36.91 |
+| dragging · none | 178 · 0.58 · 48.06 | 178 · 2.50 · 48.72 | 178 · 1.14 · 46.41 |
+| dragging · 2 | 155 · 0.43 · 42.13 | 123 · 1.09 · 47.27 | 95 · 0.91 · 44.52 |
+| video · none | 300 · 9.69 · 44.98 | 300 · 13.00 · 44.70 | 300 · 17.69 · 46.25 |
+| video · 6 | 149 · 4.62 · 45.46 | 115 · 4.92 · 45.15 | 171 · 5.77 · 44.40 |
+| video · 2 | 56 · 1.86 · 45.50 | 36 · 1.92 · 45.32 | 59 · 2.07 · 44.43 |
+| scrolling images · none | 300 · 3.55 · 40.88 | 300 · 6.88 · 42.83 | 300 · 8.63 · 43.13 |
+| scrolling images · 6 | 270 · 3.05 · 40.45 | 185 · 4.96 · 41.66 | 285 · 4.99 · 40.13 |
+| scrolling images · 2 | 7 · 2.44 · 43.82 | 4 · 3.14 · 41.64 | 65 · 2.64 · 38.88 |
+| app switching · none | 186 · 1.10 · 51.10 | 186 · 3.76 · 53.37 | 186 · 2.65 · 47.61 |
+
+Frames at no cap are equal by construction (the replay waits for every encode). libaom doesn't
+hold its 40 % aim (up to 147 % of the full target); the hybrid's rows at qindex 168 on links
+(video, photos, scrolling images) are the ceiling's rate. So: a third to a half of libaom's
+bytes, more frames delivered on 6 Mbit/s (photos 146 against 120, video 149 / 115, scrolling
+images 270 / 185), PSNR within about 1–2 dB of libaom's either way.
+
+**Encode latency per frame** (no cap, real time, load 10–34): hybrid 35.4 / 59.6 ms (photos,
+p50 / p95) and 44.8 / 53.4 ms (video) against libaom's 15.4 / 25.4 and 30.3 / 36.6 and HEVC's
+36.2 / 36.4 and 24.3 / 26.3; level with libaom (8–9 ms) on copy-heavy content. The replay has
+one picture in flight, so this is a lone picture's latency, the critical path above.
+
+**The key frame's budget is a trade.** The hybrid's inter frames copy the key frame's 64x64s
+and never code them again, so a coarse key frame is the stream's quality wherever the screen is
+still. Bound to 0.5 s of the link, 5K key frames stay at qindex 168 under a session's startup
+cap: copy-heavy streams 4–9 dB under libaom, but a 2 Mbit/s link keeps moving (photos 91,
+scrolling images 210 frames). Bound to 1 s (the default): key frames at qindex 76–99, copy-heavy
+streams within about 1 dB of libaom at a quarter to half its bytes, and on 2 Mbit/s photos and
+scrolling images stall behind the first key frame (7 frames, as libaom's 7 and 4). AV1 runs
+where the link has room, which favours 1 s. **Smooth motion at 2 Mbit/s** (`--prefer-smoothness`):
+photos 149 frames at 31.2 dB against libaom's 126 at 32.4; scrolling images 91 at 30.6 against
+206 at 34.3.
+
+Left: a key frame's cost from the picture's content (it is the model's one blind spot: a photo
+key frame costs 2.6× the seed); coarse copied 64x64s re-coded when budget is spare; the colour
+signalling; a lone picture's latency (the writer and the copy finder off its critical path);
+acknowledged long-term references.
 
 ### Metal AV1: the hybrid's streams on VideoToolbox's AV1 decoder (2026-11-16)
 
