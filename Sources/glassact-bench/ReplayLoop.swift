@@ -53,6 +53,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     videoFaults.dissolveAt = counts("fault-dissolve").sorted()
     videoFaults.armed()
     videoFaults.checksPictures = videoMode == "hybrid" && (videoFaults.active || opts.has("check-pictures"))
+        && !opts.has("no-check-pictures")
+    let resetUntold = opts.has("fault-reset-untold")
     videoFaults.armed()
     videoFaults.now = { link.nowUS }
     var viewerCodecs: [UInt8] = []
@@ -228,7 +230,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             // (its encode queue) later; what it sends meanwhile goes on the replacement stream
             videoFaults.noteReset(lost: link.dropVideoInFlight())
             viewer.resetVideoStream()
-            hostResetDueUS = link.nowUS + 20_000
+            // (--fault-reset-untold: never; the region recovers in place from a sync request)
+            hostResetDueUS = resetUntold ? nil : link.nowUS + 20_000
         }
         if let due = hostResetDueUS, link.nowUS >= due {
             hostResetDueUS = nil

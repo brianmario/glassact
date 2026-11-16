@@ -181,23 +181,32 @@ struct HybridStreamTests {
         let streams = [Self.screensInTurn(16, width: width, height: height, salt: 0, seed: 0x51c0),
                        Self.screensInTurn(12, width: width, height: height, salt: 3, seed: 0x51c1)]
         let keyAt = 9
-        var coded: [[AV1HybridEncoder.Frame]] = []
-        for (s, pictures) in streams.enumerated() {
-            let got = Collected()
-            encoder.startStream { i, r in
-                got.lock.withLock { got.frames.append((i, try? r.get())) }
-                got.ready.signal()
+        func encodeStreams() throws -> [[AV1HybridEncoder.Frame]] {
+            var coded: [[AV1HybridEncoder.Frame]] = []
+            for (s, pictures) in streams.enumerated() {
+                let got = Collected()
+                encoder.startStream { i, r in
+                    got.lock.withLock { got.frames.append((i, try? r.get())) }
+                    got.ready.signal()
+                }
+                for (i, p) in pictures.enumerated() { encoder.submit(p, qindex: 96, forceKey: s == 0 && i == keyAt) }
+                for _ in pictures { #expect(got.ready.wait(timeout: .now() + 20) == .success) }
+                encoder.endStream()
+                let frames = got.frames.compactMap(\.frame)
+                try #require(frames.count == pictures.count)
+                coded.append(frames)
             }
-            for (i, p) in pictures.enumerated() { encoder.submit(p, qindex: 96, forceKey: s == 0 && i == keyAt) }
-            for _ in pictures { #expect(got.ready.wait(timeout: .now() + 20) == .success) }
-            encoder.endStream()
-            let frames = got.frames.compactMap(\.frame)
-            try #require(frames.count == pictures.count)
-            coded.append(frames)
+            return coded
         }
+        let coded = try encodeStreams()
+        // the encoder as the Host's adapter runs it, without its reconstruction (the closed loop's
+        // references then stay in the filters' buffers): the same bytes
+        encoder.returnsPlanes = false
+        let live = try encodeStreams()
+        #expect(live.map { $0.map(\.obu) } == coded.map { $0.map(\.obu) }, "the bytes depend on returnsPlanes")
         let (first, second) = (coded[0], coded[1])
-        let golden = { (f: AV1HybridEncoder.Frame) in f.timing.goldenSlot >= 0 }
-        // (or the test proves nothing: long-term pictures in use before the key frame, and after it)
+        let golden = { (f: AV1HybridEncoder.Frame) in f.timing.goldenSlot >= 0 && f.timing.copiedGolden > 0 }
+        // (or the test proves nothing: copies from long-term pictures before the key frame, and after it)
         #expect(first[..<keyAt].contains(where: golden), "no GOLDEN_FRAME before the key frame: \(first.map(\.timing.goldenSlot))")
         #expect(first[(keyAt + 1)...].contains(where: golden), "no GOLDEN_FRAME after the key frame: \(first.map(\.timing.goldenSlot))")
         #expect(second.contains(where: golden), "no GOLDEN_FRAME in the second stream: \(second.map(\.timing.goldenSlot))")

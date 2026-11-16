@@ -7,7 +7,8 @@ import GlassActCodec
 /// Flags that only mean something in `--mode loop`.
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
                              "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "frames", "score-every",
-                             "fault-decode", "fault-reset", "fault-dissolve", "check-pictures"]
+                             "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
+                             "no-check-pictures", "fault-reset-untold"]
 
 let replayCommand = Command(
     name: "replay",
@@ -32,6 +33,8 @@ let replayCommand = Command(
         .string("fault-decode", "<n,…>", "loop, real codecs: the Viewer's nth frames (from 1, over the session) reach its decoder corrupted, which fails and is rebuilt (deterministic)"),
         .string("fault-reset", "<n,…>", "loop, real codecs: the video stream fails once the Host has sent n frames (what's in flight is lost; the Viewer hears at once, the Host 20 ms later)"),
         .string("fault-dissolve", "<n,…>", "loop, real codecs: the Host's region dissolves once it has sent n frames (it re-forms as the screen changes)"),
+        .bool("no-check-pictures", "loop, --video hybrid: no picture check with --fault-* (the encoder as the product runs it, without its reconstruction)"),
+        .bool("fault-reset-untold", "loop: with --fault-reset, the Host is never told (the Viewer's sync requests recover the region in place)"),
         .bool("check-pictures", "loop, --video hybrid: check every frame the Viewer shows against the encoder's reconstruction (on with any --fault-*)"),
         .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),

@@ -36,6 +36,9 @@ final class ReplayVideoFaults: @unchecked Sendable {
     private var reconstruction: [UInt64: UInt64] = [:]
     private var goldenFrames = 0
     private var goldenSlots: Set<Int> = []
+    /// FNV-1a 64 of every frame's bytes in the order written: the same stream, run to run and
+    /// with or without the reconstruction (`checksPictures`).
+    private var writtenDigest: UInt64 = 0xcbf2_9ce4_8422_2325
     private var keySeconds: [Double] = []
 
     @available(macOS 27, *)
@@ -43,6 +46,7 @@ final class ReplayVideoFaults: @unchecked Sendable {
         let picture = frame.planes.count == 3 ? Self.hash(frame.planes) : nil
         let bytes = XXH64.hash(frame.obu)
         lock.withLock {
+            for b in frame.obu { writtenDigest = (writtenDigest ^ UInt64(b)) &* 0x100_0000_01b3 }
             if let picture { reconstruction[bytes] = picture }
             if frame.timing.goldenSlot >= 0 && frame.timing.copiedGolden > 0 {
                 goldenFrames += 1
@@ -119,7 +123,8 @@ final class ReplayVideoFaults: @unchecked Sendable {
             + "recovered \(recoveries.count)/\(injected + resets - overlapping): \(recov) (virtual), frames not shown \(recoveries.map(\.dropped))"
             + (faultSinceUS != nil ? " · STILL UNRECOVERED" : "") + (overlapping > 0 ? " · \(overlapping) during another" : "")
             + "\n  shown frames: \(shown), the encoder's picture exactly \(exact), not \(mismatched), unchecked \(unchecked) · "
-            + "key frames' encode latency \(keys) (real)"
+            + "key frames' encode latency \(keys) (real) · written frames' digest "
+            + String(format: "%016llx", lock.withLock { writtenDigest })
     }
 }
 
