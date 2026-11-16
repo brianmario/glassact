@@ -408,6 +408,29 @@ public final class AOMRegionDecoder: VideoRegionDecoder {
 /// for AV1, and what VideoToolbox's AV1 decoder takes as its sample
 /// description extension. Built from the encoder's sequence header OBU.
 public enum AV1Config {
+    /// The first sequence header OBU in a temporal unit (OBUs with size fields, as libaom and
+    /// the hybrid encoder write them), nil if it has none.
+    public static func sequenceHeaderOBU(inTemporalUnit tu: [UInt8]) -> [UInt8]? {
+        var i = 0
+        while i < tu.count {
+            let header = tu[i]
+            guard header & 0x02 != 0 else { return nil } // no size field: can't walk on
+            var j = i + 1 + (header & 0x04 != 0 ? 1 : 0)
+            var size = 0, shift = 0
+            while j < tu.count, shift < 56 {
+                let b = tu[j]
+                size |= Int(b & 0x7F) << shift
+                j += 1
+                if b & 0x80 == 0 { break }
+                shift += 7
+            }
+            guard size <= tu.count - j else { return nil }
+            if (header >> 3) & 0x0F == 1 { return Array(tu[i..<(j + size)]) }
+            i = j + size
+        }
+        return nil
+    }
+
     public static func build(sequenceHeaderOBU obu: [UInt8]) -> [UInt8]? {
         guard let (profile, level, tier) = parse(obu) else { return nil }
         return [

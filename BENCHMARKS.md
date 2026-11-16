@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| The hybrid's streams on VideoToolbox's hardware AV1 decoder, the Viewer's (`metal-av1`, `av1seq --vt-decode`) | measured: they decode, exactly | 13 configurations (5K, 2900, 1280; intra block copy, long-term references, fast pictures, no CDEF, tilings, 128x128 superblocks): every frame identical to the encoder's picture; a test guards it on M3 and later | [entry](#metal-av1-the-hybrids-streams-on-videotoolboxs-av1-decoder-2026-11-16) |
 | Real streams at 2900 wide against libaom and HEVC (`metal-av1`) | measured; the fast pictures limited to streams larger than 4K on it | the hybrid leads both on typing, an IDE, scrolling, dragging and app switching (13–51 % against libaom, 26–36 % against HEVC), is level with HEVC on photos; on video +20 % / +5 % against HEVC with the fast pictures and −5 % / −10 % without; on scrolling images (resampled: sub-sample motion) HEVC needs 25–37 % fewer bytes either way | [entry](#metal-av1-real-streams-at-2900-against-libaom-and-hevc-the-fast-pictures-only-above-4k-2026-11-12) |
 | The hybrid against libaom realtime and hardware HEVC with the defaults of 2026-11-12 (`metal-av1`) | measured | real 5K streams: 16–58 % fewer bytes than libaom and 17–77 % fewer than HEVC at equal quality on all eight, at 54–337 frames a second against libaom's 35–217 and HEVC's 31–56; at 2900 (resampled) HEVC needs 4–10 % fewer bytes on video and 24–31 % fewer on scrolling images | [entry](#metal-av1-against-libaom-and-hardware-hevc-with-the-days-defaults-real-streams-at-5k-mixes-at-session-size-2026-11-12) |
 | The picture pipeline's waits: the partition read out to alternating buffers so the next analysis doesn't wait for the CPU, the motion search ahead of the filters' gate, the kept analysis without array copies, a spare set of deblocking buffers (`metal-av1`) | kept; the reference by a GPU blit not (the closed loop reads GPU-written memory slower); no gate not (44.6 fps) | the same streams; the period 21.5 → 19.0 ms; all-new 5K 51.7 → 54.3 inter frames a second, 5K video 56 → 61; the closed loop bounds the period now | [entry](#metal-av1-where-the-gpu-waits-in-the-picture-pipeline-the-readout-the-motion-search-ahead-of-the-gate-2026-11-12) |
@@ -331,6 +332,45 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the hybrid's streams on VideoToolbox's AV1 decoder (2026-11-16)
+
+Before the hybrid could stand in for libaom in a session: does the Viewer's decoder take its
+streams? `av1seq --vt-decode` (new) decodes the stream twice with VideoToolbox's hardware AV1
+decoder, the Viewer's on M3 and later (here an M4 Pro): as the Viewer does, the `av1C` built from
+the key frame's sequence header by `AV1Config.build` (as VIDEO_START does) and every frame into
+`VTRegionDecoder`; and with no output format asked for, the decoder's own 4:2:0 (`420f`)
+compared sample for sample with the encoder's picture (which libaom already matches).
+
+**Every stream decoded, every frame identical**, on all 13 configurations:
+
+| stream | frames | `seq_level_idx` |
+|---|---|---|
+| text key frames, 5K q14 (intra block copy) | 6 | 16 (6.0) |
+| the rotation, 5K q20 (long-term references, GOLDEN in slots 1–4) | 24 | 16 |
+| the rotation, `--no-golden` (fast pictures: their own qindex, no CDEF) | 16 | 16 |
+| the rotation, 5K q8 (no CDEF anywhere) | 12 | 16 |
+| the rotation, `--fast off` | 12 | 16 |
+| the rotation, `--tiles 2x2` | 12 | 16 |
+| app switching, 5K | 30 | 16 |
+| video, 5K (motion search, quarter-sample vectors) | 24 | 16 |
+| an IDE, 5K q28 | 40 | 16 |
+| two screens in turn, 2900 | 12 | 12 (5.0) |
+| scrolling images, 2900 | 24 | 12 |
+| scrolling, 2900 q36 (copies at a shift, 128x128 superblocks) | 30 | 12 |
+| the rotation, 2900 q32, `--tiles 1x1` | 12 | 12 |
+| two screens in turn, 1280 q26 | 16 | 5 (3.1) |
+
+So no tool the hybrid uses (intra block copy, 128x128 superblocks, GOLDEN remapped to any of
+the eight slots, per-frame qindex, CDEF on and off, tiles) is a problem for the Viewer's decoder,
+and `AV1Config.build` takes the hybrid's sequence header as it is. `VideoToolboxDecodeTests`
+keeps it so where the Mac decodes AV1 in hardware (1280×720, 5K and 333×201 streams of two
+screens in turn; skipped elsewhere, the CI runner included). `AV1Config.sequenceHeaderOBU(inTemporalUnit:)`
+(GlassActCore) finds the header in a frame.
+
+What a live AV1 path from the hybrid still needs: bitrate targeting (it codes at a fixed
+quantizer), and acknowledged long-term references (a lost frame stays wrong in a slot until it
+is replaced).
 
 ### Metal AV1: real streams at 2900 against libaom and HEVC; the fast pictures only above 4K (2026-11-12)
 

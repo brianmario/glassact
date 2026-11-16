@@ -4,6 +4,7 @@
 // frames per second, size, luma PSNR, where the time goes, and optionally
 // libaom's realtime key frames on the same pictures. Every frame is decoded by
 // libaom afterwards and must equal the encoder's picture exactly.
+import AV1Core
 import Foundation
 import GlassActAV1
 import GlassActCore
@@ -44,6 +45,7 @@ let av1SeqCommand = Command(
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
+        .bool("vt-decode", "also decode the stream with VideoToolbox's hardware AV1 decoder, as the Viewer does (M3 and later), and compare its output with the encoder's picture"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
@@ -478,6 +480,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             encoder.profilesStages = false
         }
         return
+    }
+    if opts.has("vt-decode") {
+        let vt = frames.map { f in
+            VTDecodeCheck.Frame(obu: f.obu, key: f.params.frame_type != UInt8(AV1G_FRAME_INTER), planes: f.planes)
+        }
+        for line in VTDecodeCheck.run(vt, width: stream?.width ?? width, height: stream?.height ?? height) { print(line) }
     }
     let n = Double(frames.count)
     func mean(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { frames.map { f($0.timing) }.reduce(0, +) / n * 1000 }
