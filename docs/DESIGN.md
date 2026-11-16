@@ -603,7 +603,9 @@ first negotiated codec whose encoder starts; START carries its id.
     120 ticks of the last dissolve (paging workloads). The wall-time limit
     scales the same way (2.1 s, 6.3 s). A frame touching fewer than 32 tiles
     counts as quiet, so typing returns to tiles;
-  - after 30 empty encodes;
+  - after 30 empty encodes, frames before START without the config START
+    needs (the first frame, which carries it, failed) counting as empty: each
+    predicts from a frame the viewer never gets;
   - when a frame is too large for the wire;
   - when the video stream resets.
 - While the viewer has paused content (§4.10) the region idles: nothing is
@@ -959,6 +961,12 @@ the bitmap ACK. That covers records that were:
   SYNC_REQUEST at once, and the viewer asks again at most every 500 ms
   while the region stays undecodable. The region recovers in place: no new
   START, and the session carries on.
+- **After a video stream reset** (§3.7) every live region takes only a sync
+  frame: frames the Host sent before it heard of the loss go out on the new
+  stream under the same generation, after the ones lost with the old stream,
+  and may predict from them (HEVC's DPB, AV1's reference slots), which no
+  decoder can tell. The rest are undecodable, which asks for a sync frame; a
+  Host that saw the loss dissolves the region anyway.
 - **Last resort:** a region still undecodable 2 s after its first failed
   frame fails the session, and the app reconnects. That leaves room for the
   first answer (a round trip plus a sync frame, which on a thin link can

@@ -244,6 +244,7 @@ the numbers and the reasoning.
 | Learned pruning's 32x32s and 64x64s decided per node (cells' mean or quantile, per-level thresholds, a small node network trained on the tree's cost) instead of any cell (`metal-av1`, offline) | measured, not adopted | held out on the training dumps, within ±0.02 ms of today’s GPU of the any-cell rule at eps 0.02 and ≈ 0.1 ms better at eps 0.05; the network loses; an oracle that knows the nodes' costs would skip ≈ 1.6 ms more, which the cells' statistics can't find | [entry](#metal-av1-reviewers-ideas-measured-inter-candidates-side-by-side-kept-2026-11-11) |
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
+| Acknowledged long-term references for the hybrid's live stream (`metal-av1`) | not needed: video is a reliable stream; every way a Viewer loses video state checked instead, and two engine gaps fixed (a stream reset's stale frames; a frame before START without its config) | replay with decode faults, stream resets and dissolves: every frame shown exact, recovery 33 ms unconstrained, 0.6–0.9 s on thin links | [entry](#video-recovery-with-the-hybrid-live-encoder-a-streams-colour-signalling-2026-11-16) |
 | The hybrid as a live video encoder: a push API, a `VideoRegionEncoder` adapter (`GlassActHybridVideo`) and bitrate targeting, in the product's replay against libaom and HEVC (`metal-av1`) | built; not in the Host (libaom stays its AV1; switching is the owner's call) | a third to a half of libaom's bytes at about its PSNR; more frames than libaom on 6 Mbit/s (photos 146 / 120, video 149 / 115, scrolling images 270 / 185); a lone new 5K picture's encode 35–45 ms p50 against libaom's 15–30 | [entry](#metal-av1-the-hybrid-as-a-live-video-encoder-with-bitrate-targeting-in-the-products-replay-2026-11-16) |
 | The hybrid's streams on VideoToolbox's hardware AV1 decoder, the Viewer's (`metal-av1`, `av1seq --vt-decode`) | measured: they decode, exactly | 13 configurations (5K, 2900, 1280; intra block copy, long-term references, fast pictures, no CDEF, tilings, 128x128 superblocks): every frame identical to the encoder's picture; a test guards it on M3 and later | [entry](#metal-av1-the-hybrids-streams-on-videotoolboxs-av1-decoder-2026-11-16) |
 | Real streams at 2900 wide against libaom and HEVC (`metal-av1`) | measured; the fast pictures limited to streams larger than 4K on it | the hybrid leads both on typing, an IDE, scrolling, dragging and app switching (13–51 % against libaom, 26–36 % against HEVC), is level with HEVC on photos; on video +20 % / +5 % against HEVC with the fast pictures and −5 % / −10 % without; on scrolling images (resampled: sub-sample motion) HEVC needs 25–37 % fewer bytes either way | [entry](#metal-av1-real-streams-at-2900-against-libaom-and-hevc-the-fast-pictures-only-above-4k-2026-11-12) |
@@ -333,6 +334,71 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video recovery with the hybrid live encoder; a stream's colour signalling (2026-11-16)
+
+The owner had asked for acknowledged long-term references, so that a lost frame can't stay
+wrong in one of the hybrid's eight reference slots. Video travels on a reliable, ordered QUIC
+stream (DESIGN §3.7), so frames aren't lost in transit; instead every way a Viewer loses video
+state was checked with the hybrid, which nobody had exercised (the replay matrix above saw no
+sync request). Commits `5316fda`…`68895fe`.
+
+**Frames encoded but never sent** (`HostEngine+Video.swift`): a stale generation's straggler, a
+STOP racing a delivery, a frame too large for the wire and a failed encode all end the stream or
+restart it with a key frame; the rate gate and the encoder-full skip act before the encoder.
+Two gaps, fixed, in the shared engine (HEVC and libaom too):
+- **A video stream reset**: frames the Host sent before it heard of the loss went out on the
+  new stream under the same generation, after the lost ones, and could predict from them. 3 of
+  549 frames shown were not the encoder's pictures. The Viewer's live regions now take only a
+  sync frame after a reset (`VideoRegionTable.awaitSyncAll`): 0 of 549.
+  `videoStreamResetWaitsForASyncFrame`.
+- **A frame before START without its config** (the first frame, which carries it, failed) was
+  dropped silently with its claims, and so was every frame after it. It now counts as a failed
+  delivery, so 30 of them dissolve the region. `framesThatCantStartTheRegionDissolveIt`.
+
+**One region, one encoder.** An engine has at most one video region, and every START begins a
+fresh hybrid stream (a key frame, the eight slots cleared, the copy finder's long-term pictures
+forgotten), as does a key frame mid-stream. `nothingAfterAKeyFrameReachesBackPastIt` decodes
+from a key frame on demand, with frames copying from GOLDEN before and after it, exactly.
+
+**The push stream's failure path**, run for the first time (`failingPicture`): a picture that
+fails fails every later one of its stream, in order, and the gate opens past them; the adapter
+restarts once with a key frame (a per-stream epoch: a second, needless restart before).
+
+**Recovery in the replay** (`--fault-decode`, `--fault-reset`, `--fault-reset-untold`,
+`--fault-dissolve`, new; every frame the Viewer shows checked against the encoder's
+reconstruction by a libaom mirror of the Viewer's decoder). Whole traces, every run settled and
+byte-exact, every frame shown exact:
+
+| run | hybrid | libaom |
+|---|---|---|
+| tabs, 4 decode faults (GOLDEN in use, slots 0–2) | 4 sync requests answered, 33 ms, 2 frames lost each; 1691/1691 exact | 33 ms, 2 lost |
+| tabs, 4 stream resets | the next region after 526 ms (the repaint covers it); 1597/1597 exact | the same |
+| tabs, 4 dissolves (6 regions) | 1604/1604 exact | |
+| app switching, 4 decode faults / 4 resets / 4 dissolves | 33 ms / 109 ms median / —; all exact | 33 ms / the same |
+| app switching, resets the Host never hears of | recovered in place: 4 sync requests, 59 ms; 579/579 exact | |
+| tabs at 6 Mbit/s, decode faults | 629 ms median, 695 max | 613 / 766 ms |
+| tabs at 2 Mbit/s, decode faults | 883 ms median, 988 max | 1323 median, **2089 max** |
+
+(Virtual time; a recovery key frame's real encode is 73–110 ms median, 210 ms worst.) So nothing
+lets a hybrid reference reach a picture the Viewer doesn't hold, and acknowledged references
+aren't needed. Note libaom at 2 Mbit/s: one recovery took past the Viewer's 2 s limit for an
+undecodable region without failing the session, close to the edge.
+
+**Colour.** A stream's sequence header now says BT.709's matrix (`matrix_coefficients` 1;
+full range, BT.709 primaries, sRGB transfer, as before), which is how the adapter converts and
+how VideoToolbox shows the stream; still pictures stay BT.601 (sYCC). VideoToolbox shows the same
+either way (luma 50.81 / 55.78 dB on text / photos at qindex 8 before and after), libaom decodes
+them exactly. Only the sequence header's bytes changed ("frames digest", new in `av1seq
+--digest`, unchanged); the reference digests, old → new:
+
+| stream (the rotation, `--tiles 3x0 --inter --no-planes`) | old | new | frames digest |
+|---|---|---|---|
+| 5K q20, 8 frames | `39d5541a9eae08a5` | `b2c0cf4a45158b3a` | `191fce78d22cdb78` |
+| 5K q20, 24 frames, `--no-golden` | `cf4d6ebc3490e6b3` | `1082c1633f48dc22` | `a62723f000e81e54` |
+| 2900 q32, 8 frames | `33c3d884c3d0ca8c` | `4fd6684b7d92c680` | `aeba358023201e7b` |
+| 5K q8, 8 frames | `1fd80abca3e35c82` | `61775b236211418f` | `a758ec70c05e4475` |
+| 1280 q20, 8 frames | `862da50b8c92dbed` | `ebdc001957933f8d` | `316f844512c24ec7` |
 
 ### Metal AV1: the hybrid as a live video encoder, with bitrate targeting, in the product's replay (2026-11-16)
 
