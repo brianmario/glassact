@@ -707,11 +707,23 @@ extension HostEngine {
             }
             return
         }
-        regionEmptyDeliveries = 0
         // A generation's first frame claims every tile; later ones, what changed.
         let claimAll = !regionStartSent
         if !regionStartSent {
-            guard let config, let encoder = regionEncoder else { return }
+            guard let config, let encoder = regionEncoder else {
+                // A frame before START without the config START needs: the
+                // first frame, which carries it, failed. This one predicts
+                // from a frame the viewer never gets, and so does every one
+                // after it: a failed delivery, so a region that can't start
+                // dissolves instead of streaming nothing while motion lasts.
+                if let claimed { returnClaims(claimed) }
+                regionEmptyDeliveries += 1
+                if regionEmptyDeliveries >= Self.videoMaxEmptyDeliveries {
+                    stats.videoEncoderFailures += 1
+                    dissolveRegion()
+                }
+                return
+            }
             let r = regionPixelRect
             guard sendVideoMessage(.start(region: 0, generation: regionGeneration,
                                           x: UInt16(r.x), y: UInt16(r.y),
@@ -722,6 +734,7 @@ extension HostEngine {
             }
             regionStartSent = true
         }
+        regionEmptyDeliveries = 0
         // The LWW stamp: any record sent from now on carries a seq ≥ this, so
         // a dissolve repaint (strictly later tick → strictly newer seq) beats
         // this frame at the viewer even if the channels cross in flight.
