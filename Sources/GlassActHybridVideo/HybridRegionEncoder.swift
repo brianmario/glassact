@@ -16,8 +16,8 @@ import QuartzCore
 ///   ceiling mapped to libaom's quantizer scale and on to qindex (34 → 42 → 168), the smooth
 ///   ceiling quantizer 60 (qindex 240). `HybridRateController` turns that into each picture's
 ///   qindex, budgeting by the pictures' capture times.
-/// - **Pipeline**: BGRA → I420 on the caller's queue (`I420Converter`, BT.601 full range, as the
-///   encoder's sequence header says), then
+/// - **Pipeline**: BGRA → I420 on the caller's queue (`I420Converter`, full range BT.709: what the
+///   Viewer's decoder makes of the encoder's sequence header), then
 ///   the picture is pushed into the encoder's stream (`AV1HybridEncoder.submit`), which returns at
 ///   once: its copies, analysis, closed loop, filters and write run on the encoder's own queues and
 ///   threads, and the frame comes back on `callbackQueue` as soon as its bitstream exists. A
@@ -63,9 +63,12 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     public var onWritten: (@Sendable (_ bytes: Int, _ qindex: Int, _ key: Bool, _ seconds: Double) -> Void)?
 
     private let callbackQueue: DispatchQueue
-    /// In the colour the encoder's sequence header signals (BT.601, full range), which the
-    /// Viewer's decoder honours: libaom's conversion (BT.709 video range) would shift every colour.
-    private let converter = I420Converter(.bt601Full)
+    /// Full range, BT.709 matrix: how VideoToolbox's AV1 decoder (the Viewer's) shows the encoder's
+    /// streams. Their sequence header says BT.601, full range, sRGB transfer, BT.709 primaries; the
+    /// decoder takes the range and, measured, a BT.709 matrix: text at qindex 8 comes back at
+    /// 50.8 dB luma PSNR against the capture this way, 38.6 converted BT.601 full, 31.4 as libaom
+    /// converts (BT.709 video range); photos 55.8 against 44.6 (replay, `--hybrid-colour`).
+    private let converter: I420Converter?
     // the caller's queue
     private var width = 0
     private var height = 0
@@ -87,8 +90,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
 
     /// `callbackQueue` must be the host engine's confining queue (the VideoRegionEncoder threading
     /// contract).
-    public init(callbackQueue: DispatchQueue) {
+    public init(callbackQueue: DispatchQueue, colour: I420Converter.Colour = .bt709Full) {
         self.callbackQueue = callbackQueue
+        converter = I420Converter(colour)
     }
 
     public func start(width: Int, height: Int,

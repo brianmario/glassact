@@ -324,30 +324,34 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 }
 
 /// BGRA → I420 (vImage) for another AV1 encoder of the same regions: as `AOMRegionEncoder`
-/// converts its pictures (BT.709 video range), or in the colour an encoder's sequence header
-/// signals (`.bt601Full`: matrix BT.601, full range, as av1gpu's writer, the hybrid's, says), so
-/// that a decoder that honours the header (VideoToolbox) shows the colours captured. Confined to
-/// its caller's queue.
+/// converts its pictures (BT.709 video range), or in another matrix and range, to match what the
+/// Viewer's decoder makes of that encoder's sequence header (the hybrid's: `.bt709Full`).
+/// Confined to its caller's queue.
 public final class I420Converter {
-    public enum Colour: Sendable { case bt709Video, bt601Full }
+    public enum Colour: String, Sendable, CaseIterable { case bt709Video, bt709Full, bt601Video, bt601Full }
     private var conversion = vImage_ARGBToYpCbCr()
     private var permuteMap: [UInt8] = [3, 2, 1, 0] // BGRA in memory → ARGB
 
     public init?(_ colour: Colour = .bt709Video) {
-        switch colour {
-        case .bt709Video:
+        if colour == .bt709Video {
             guard AOMRegionEncoder.makeConversion(&conversion) else { return nil }
-        case .bt601Full:
-            var range = vImage_YpCbCrPixelRange(Yp_bias: 0, CbCr_bias: 128, YpRangeMax: 255, CbCrRangeMax: 255,
-                                                YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
-            var matrix = vImage_ARGBToYpCbCrMatrix(
-                R_Yp: 0.299, G_Yp: 0.587, B_Yp: 0.114,
-                R_Cb: -0.299 / 1.772, G_Cb: -0.587 / 1.772,
-                B_Cb_R_Cr: 0.5, G_Cr: -0.587 / 1.402, B_Cr: -0.114 / 1.402)
-            guard vImageConvert_ARGBToYpCbCr_GenerateConversion(
-                &matrix, &range, &conversion, kvImageARGB8888, kvImage420Yp8_Cb8_Cr8,
-                vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+            return
         }
+        let full = colour == .bt709Full || colour == .bt601Full
+        var range = full
+            ? vImage_YpCbCrPixelRange(Yp_bias: 0, CbCr_bias: 128, YpRangeMax: 255, CbCrRangeMax: 255,
+                                      YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
+            : vImage_YpCbCrPixelRange(Yp_bias: 16, CbCr_bias: 128, YpRangeMax: 235, CbCrRangeMax: 240,
+                                      YpMax: 235, YpMin: 16, CbCrMax: 240, CbCrMin: 16)
+        let (kr, kb) = colour == .bt709Full ? (0.2126, 0.0722) : (0.299, 0.114)
+        let kg = 1 - kr - kb
+        var matrix = vImage_ARGBToYpCbCrMatrix(
+            R_Yp: Float(kr), G_Yp: Float(kg), B_Yp: Float(kb),
+            R_Cb: Float(-kr / (2 * (1 - kb))), G_Cb: Float(-kg / (2 * (1 - kb))),
+            B_Cb_R_Cr: 0.5, G_Cr: Float(-kg / (2 * (1 - kr))), B_Cr: Float(-kb / (2 * (1 - kr))))
+        guard vImageConvert_ARGBToYpCbCr_GenerateConversion(
+            &matrix, &range, &conversion, kvImageARGB8888, kvImage420Yp8_Cb8_Cr8,
+            vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
     }
 
     /// A tightly packed BGRA picture (stride width × 4; even width and height) into tight

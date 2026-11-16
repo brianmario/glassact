@@ -35,6 +35,12 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var encoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
     var decoderFactory: (() -> any VideoRegionDecoder)?
     var hostCodecs: [UInt8] = []
+    // --video hybrid: each frame's qindex and whether it's a key frame (the encoder's threads)
+    final class HybridLog: @unchecked Sendable {
+        let lock = NSLock()
+        var qindex: [Int] = [], keys = 0
+    }
+    let hybridLog = HybridLog()
     var viewerCodecs: [UInt8] = []
     let vtPipeline = BenchVTPipeline()
     let score = ReplayVideoScore()
@@ -81,14 +87,23 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             throw BenchError("--video hybrid needs macOS 27 and an Apple-silicon GPU")
         }
         let fixed = opts.has("hybrid-q") ? opts.int("hybrid-q", 20) : nil
+        guard let colour = I420Converter.Colour(rawValue: opts.string("hybrid-colour") ?? "bt709Full") else {
+            throw BenchError("--hybrid-colour: \(I420Converter.Colour.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
         let targetPct = opts.int("av1-target-pct", 40)
         let qmax = opts.has("av1-qmax") ? opts.int("av1-qmax", 42) : nil
         encoderFactory = {
             guard $0 == VideoCodec.av1 else { return nil }
-            let h = HybridRegionEncoder(callbackQueue: .main)
+            let h = HybridRegionEncoder(callbackQueue: .main, colour: colour)
             h.fixedQindex = fixed.map { $0 == 63 ? 255 : 4 * $0 }
             h.targetPercent = targetPct
             h.quantizerCeiling = qmax
+            h.onWritten = { _, q, key, _ in
+                hybridLog.lock.withLock {
+                    hybridLog.qindex.append(q)
+                    if key { hybridLog.keys += 1 }
+                }
+            }
             return BenchPipelinedEncoder(h, vtPipeline)
         }
         decoderFactory = { scored(VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder()) }
@@ -431,6 +446,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     """)
     if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
+        if videoMode == "hybrid" {
+            let (qs, keys) = hybridLog.lock.withLock { (hybridLog.qindex.sorted(), hybridLog.keys) }
+            func at(_ p: Double) -> Int { qs.isEmpty ? -1 : qs[min(qs.count - 1, Int(Double(qs.count) * p))] }
+            print("  hybrid: \(qs.count) frames, \(keys) key frames · qindex p10 \(at(0.1)) p50 \(at(0.5)) p90 \(at(0.9)) max \(qs.last ?? -1)")
+        }
         print("  \(videoMode!): \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
               + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "
               + "stalls \(vtPipeline.stalls)")
