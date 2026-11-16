@@ -668,8 +668,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             box.put(result)
         }
         defer { endStream() }
-        // (submitted three ahead, as the stream reads them: the analysis of a picture waits for the
-        // read of the one two before it anyway)
+        // (submitted six ahead: a picture's copies are decided on the copy queue as soon as it's
+        // submitted, ahead of its analysis, which waits for the read of the picture two before it
+        // anyway; three ahead left the copy finder, with long-term pictures, on the critical path)
         var submitted = 0
         func top(_ n: Int) throws {
             while submitted < min(count, n) {
@@ -677,10 +678,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 submitted += 1
             }
         }
-        try top(3)
+        try top(6)
         for i in 0..<count {
             let result = box.take()
-            try top(i + 4)
+            try top(i + 7)
             try output(i, try result.get())
         }
     }
