@@ -593,9 +593,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// `motionSkip`'s state in a stream: what the searched frames found, newest last, and the
-    /// frames skipped in a row.
+    /// frames skipped in a row. Pictures are decided in order on the stream's begin queue and
+    /// recorded in order by their partitions' readers; picture i decides from the frames up to
+    /// i - 2 (the last one whose read its analysis waits for), whenever the others are recorded.
     private struct MotionRule {
-        var found: [Double] = []
+        var found: [(index: Int, share: Double)] = []
         var skipped = 0
         /// The last key frame decided (frames before it don't count).
         var key = 0
@@ -608,7 +610,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 return
             }
             guard let rule, copies.candidates != nil else { return }
-            let quiet = lookback > 0 && found.count >= lookback && found.suffix(lookback).allSatisfy { $0 < rule.threshold }
+            let seen = found.filter { $0.index <= index - 2 }.suffix(8)
+            let quiet = lookback > 0 && seen.count >= lookback && seen.suffix(lookback).allSatisfy { $0.share < rule.threshold }
             if quiet && skipped + 1 < rule.recheckEvery {
                 copies.candidates = nil
                 skipped += 1
@@ -620,10 +623,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// What picture `index`, searched, found (`Timing.motionFound`; < 0: nothing coded).
         mutating func record(_ index: Int, _ share: Double) {
             guard index > key, share >= 0 else { return }
-            found.append(share)
-            if found.count > 8 { found.removeFirst() }
+            found.append((index, share))
+            if found.count > 16 { found.removeFirst() }
         }
     }
+    /// `motionSkip`'s state (`MotionRule`), shared by the begin queue and the partitions' readers.
+    private var motionRule = MotionRule()
+    private let motionRuleLock = NSLock()
 
     /// A searched inter frame's `Timing.motionFound`: the area in blocks the analysis predicts by
     /// motion, of the coded 64×64s' (-1: not searched, or nothing coded).
@@ -648,15 +654,122 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         return frame
     }
 
-    /// Pictures 0..<count: picture i + 1's analysis runs on the GPU while
-    /// picture i is finished on the CPU. `output` gets them in order. With
-    /// `interFrames`, they're one stream: the first a key frame and the rest
-    /// inter frames. Picture i's bitstream is written, and picture i + 1's
-    /// analysis set up and committed (while picture i - 1 is finished), on other
-    /// threads; `output` gets picture i before picture i + 1's closed loop.
+    /// Pictures 0..<count, as one stream (`startStream`, `submit`, `endStream`): picture i + 1's
+    /// analysis runs on the GPU while picture i is finished on the CPU. `output` gets them in
+    /// order, on the caller's thread. With `interFrames`, they're one stream: the first a key frame
+    /// and the rest inter frames. `written` gets each frame on the encoder's threads as soon as
+    /// its bitstream exists.
     public func encode(count: Int, qindex: Int, picture: (Int) throws -> Picture,
                        written: (@Sendable (Int, Frame) -> Void)? = nil, output: (Int, Frame) throws -> Void) throws {
         guard count > 0 else { return }
+        let box = Outbox()
+        startStream { index, result in
+            if case let .success(frame) = result { written?(index, frame) }
+            box.put(result)
+        }
+        defer { endStream() }
+        // (submitted three ahead, as the stream reads them: the analysis of a picture waits for the
+        // read of the one two before it anyway)
+        var submitted = 0
+        func top(_ n: Int) throws {
+            while submitted < min(count, n) {
+                submit(try picture(submitted), qindex: qindex)
+                submitted += 1
+            }
+        }
+        try top(3)
+        for i in 0..<count {
+            let result = box.take()
+            try top(i + 4)
+            try output(i, try result.get())
+        }
+    }
+
+    /// Frames from the stream's threads to `encode(count:)`'s caller, in order.
+    private final class Outbox: @unchecked Sendable {
+        private var results: [Result<Frame, any Error>] = []
+        private let lock = NSLock()
+        private let ready = DispatchSemaphore(value: 0)
+        func put(_ r: Result<Frame, any Error>) {
+            lock.withLock { results.append(r) }
+            ready.signal()
+        }
+        func take() -> Result<Frame, any Error> {
+            ready.wait()
+            return lock.withLock { results.removeFirst() }
+        }
+    }
+
+    // MARK: - A stream, picture by picture
+
+    /// What `submit`'s `chooser` knows of a picture before its analysis begins.
+    public struct PictureInfo: Sendable, Equatable {
+        /// The picture's place in the stream (0: its first).
+        public var index: Int
+        /// A key frame: the stream's first picture, one submitted with `forceKey`, one of another
+        /// size than the picture before, or every picture without `interFrames`.
+        public var key: Bool
+        /// The 64×64s it codes: all of a key frame's; an inter frame's that don't copy.
+        public var coded: Int
+        /// Its 64×64s.
+        public var superblocks: Int
+        /// It takes `newPictureEffort` (its qindex then gets the effort's `qindexDelta`).
+        public var fast: Bool
+
+        public init(index: Int, key: Bool, coded: Int, superblocks: Int, fast: Bool) {
+            (self.index, self.key, self.coded, self.superblocks, self.fast) = (index, key, coded, superblocks, fast)
+        }
+    }
+
+    /// A stream's state. The copy queue decides each picture's copies as soon as it's submitted
+    /// (and the picture before's are decided); the begin queue its qindex, and starts its
+    /// analysis, in order; the finish queue finishes each one (closed loop, filters) and starts its
+    /// write, in order. Picture k's analysis begins once picture k - 2's partition is read (two at
+    /// most are set up and not yet read: their buffers alternate), and its GPU work waits for
+    /// picture k - 2's filters (`gate`): the batch loop's order, without a picture after it to wait for.
+    private final class Stream: @unchecked Sendable {
+        let output: @Sendable (Int, Result<Frame, any Error>) -> Void
+        let copying = DispatchQueue(label: "glassact.av1.hybrid.copies", qos: .userInteractive)
+        let begins = DispatchQueue(label: "glassact.av1.hybrid.begin", qos: .userInteractive)
+        let finishes = DispatchQueue(label: "glassact.av1.hybrid.finish", qos: .userInteractive)
+        /// `filtersDone` when the stream started: picture k's filters bring it to gateBase + k + 1.
+        let gateBase: UInt64
+        /// Pictures submitted (the caller's).
+        var submitted = 0
+        /// The copy queue's: the last picture whose copies were decided.
+        var lastCopied: Picture?
+        /// The begin queue's: the reads of the last two pictures begun (by index parity), and
+        /// `newPictureEffort`'s run.
+        var reads: [Later<Read>?] = [nil, nil]
+        var newRun = 0
+        /// The finish queue's: the last picture's write.
+        var writing: Writing?
+        /// The first picture that failed, and why: it and every one after it fail.
+        private var brokenAt: (index: Int, error: any Error)?
+        private let lock = NSLock()
+
+        init(gateBase: UInt64, output: @escaping @Sendable (Int, Result<Frame, any Error>) -> Void) {
+            self.gateBase = gateBase
+            self.output = output
+        }
+
+        func broken(at index: Int) -> (any Error)? {
+            lock.withLock { brokenAt.flatMap { index >= $0.index ? $0.error : nil } }
+        }
+        var isBroken: Bool { lock.withLock { brokenAt != nil } }
+        /// Marks the stream broken from `index` (the first failure wins).
+        func breakAt(_ index: Int, _ error: any Error) {
+            lock.withLock { if brokenAt == nil || index < brokenAt!.index { brokenAt = (index, error) } }
+        }
+    }
+    private var stream: Stream?
+
+    /// Starts a stream; none may be under way. `output` gets each submitted picture's frame, or why
+    /// it has none, once each and in the order they were submitted, on one of the encoder's threads
+    /// as soon as its bitstream exists. After a failure every later picture fails too: end the
+    /// stream and start another, whose first picture is a key frame.
+    public func startStream(output: @escaping @Sendable (Int, Result<Frame, any Error>) -> Void) {
+        precondition(stream == nil, "a stream is under way")
         previous = nil
         slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = interFrames && goldenFrames
@@ -664,144 +777,169 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         copyFinder.reset()
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
-        if interFrames { metal.forgetAnalysis() }  // the cache may hold an earlier stream's inter frames
-        // picture i - 1's bitstream, being written while picture i + 1's analysis starts, which
-        // is also on a thread of its own (`starting`), as is picture i + 2's after it (`following`)
-        var writing: Writing?
-        var starting: Later<Pending>?, following: Later<Pending>?
-        // Picture k's analysis waits on the GPU for picture k - 2's filters (`gate(k)`), besides
-        // the reads of the pictures whose buffers it reuses: the filters, which picture k - 1's
-        // closed loop waits for, then have the GPU as soon as their own closed loop ends, and
-        // picture k's analysis runs beside picture k - 1's closed loop. Its motion search doesn't
-        // wait for the filters (`AV1MetalEncoder.splitsMotion`): it fills the GPU's wait for them.
-        let gateBase = filtersDone
-        func gate(_ k: Int) -> UInt64 { k >= 2 ? gateBase + UInt64(k - 1) : 0 }
-        // picture i's partition, read on a thread of its own as soon as its analysis ends
-        var reading: Later<Read>?
-        defer {
-            // (no analysis waits for filters that won't come)
-            filtersDone = max(filtersDone, gateBase + UInt64(count) + 1)
-            metal.openGate(filtersDone)
-            copyFinder.drain()
-            _ = try? writing?.end()
-            _ = try? reading?.wait()
-            for later in [starting, following] {
-                if let p = try? later?.wait() { _ = try? p.read?.wait() }
+        motionRuleLock.withLock { motionRule = MotionRule() }
+        stream = Stream(gateBase: filtersDone, output: output)
+    }
+
+    /// The stream's next picture. Returns at once: its copies are decided and its analysis begins
+    /// on the encoder's threads as soon as the analysis two pictures before it is read, and it is
+    /// finished as soon as its own is and the picture before it is. So a picture with nothing after
+    /// it comes out without waiting for one, and one submitted while the picture before is being
+    /// finished is analyzed beside it.
+    ///
+    /// Its qindex: `chooser`'s, asked on the encoder's thread once its copies are known and before
+    /// its analysis begins, else `qindex`. A key frame's then follows `keyFrameQindexDelta`, a fast
+    /// picture's `newPictureEffort`'s offset. `forceKey`: a key frame (with `interFrames`; without,
+    /// every picture is one).
+    public func submit(_ picture: Picture, qindex: Int, forceKey: Bool = false,
+                       chooser: (@Sendable (PictureInfo) -> Int)? = nil) {
+        guard let s = stream else { preconditionFailure("no stream") }
+        let index = s.submitted
+        s.submitted += 1
+        let copies = Handoff<(copies: Copies, key: Bool)>()
+        s.copying.async { self.copyStep(s, index, picture, forceKey: forceKey, into: copies) }
+        s.begins.async { self.beginStep(s, index, picture, copies, qindex: qindex, chooser: chooser) }
+    }
+
+    /// A value from one queue to another.
+    private final class Handoff<T>: @unchecked Sendable {
+        private var value: T?
+        private let ready = DispatchSemaphore(value: 0)
+        func put(_ v: T) {
+            value = v
+            ready.signal()
+        }
+        func take() -> T {
+            ready.wait()
+            return value!
+        }
+    }
+
+    /// Whether picture `index` is a key frame, and an inter frame's copies (the copy queue).
+    private func copyStep(_ s: Stream, _ index: Int, _ p: Picture, forceKey: Bool,
+                          into out: Handoff<(copies: Copies, key: Bool)>) {
+        let sameSize = s.lastCopied.map { $0.width == p.width && $0.height == p.height } ?? false
+        let key = !interFrames || index == 0 || forceKey || !sameSize
+        var copies = Copies()
+        if interFrames {
+            if key {
+                if index > 0 { copyFinder.reset() }  // (every slot then holds the key frame)
+            } else if let last = s.lastCopied {
+                copyFinder.start(p, after: last, searchesMotion: searchesMotion)
+                copies = copyFinder.wait()
             }
         }
-        // `motionSkip`: picture i + 2's search is decided once picture i's analysis is read
-        var rule = MotionRule()
-        // `newPictureEffort`: the mostly-new inter frames in a row so far
-        var newRun = 0
-        // picture i's qindex: a key frame's for the first, or every one without inter frames
-        let keyQindex = keyFrameQindex(qindex)
-        func qindexOf(_ i: Int, fast: Bool = false) -> Int {
-            guard interFrames && i > 0 else { return keyQindex }
-            guard fast, let d = newPictureEffort?.qindexDelta, d != 0, qindex > 0 else { return qindex }
-            return min(255, max(1, qindex + d))
+        s.lastCopied = p
+        out.put((copies, key))
+    }
+
+    /// Waits for every submitted picture to come out, and ends the stream. Every picture's analysis
+    /// is done and its source back in the pool.
+    public func endStream() {
+        guard let s = stream else { return }
+        s.copying.sync {}
+        s.begins.sync {}
+        s.finishes.sync {
+            _ = try? s.writing?.end()
+            s.writing = nil
         }
-        var current = try picture(0)
-        var pending = try begin(current, Copies(), qindex: keyQindex)
-        read(&pending, of: current, after: nil)
-        reading = pending.read
-        // picture i + 1's analysis is set up while picture i - 1 is finished, and committed: its
-        // command buffer waits on the GPU until picture i's results are read
-        // (AV1MetalEncoder.readEvent; on the reader's thread, as soon as its analysis ends) and
-        // picture i - 1's filters are done (`gate`), so its GPU work starts as soon as both are.
-        // Its copies are decided (on the CPU, from the two sources alone) before that.
-        var next = count > 1 ? try picture(1) : nil
-        if let next {
-            if interFrames { copyFinder.start(next, after: current, searchesMotion: searchesMotion) }
-            var copies = interFrames ? copyFinder.wait() : Copies()
-            if interFrames { rule.decide(1, &copies, rule: motionSkip, lookback: motionSkipLookback) }
-            let fast = takesEffort(&copies, run: &newRun)
-            let q = qindexOf(1, fast: fast)
-            let first = pending.read
-            starting = Later { [copies] in
-                var p = try self.begin(next, copies, qindex: q, fast: fast)
-                self.read(&p, of: next, after: first)
-                return p
+        copyFinder.drain()
+        // (no analysis waits for filters that won't come)
+        filtersDone = max(filtersDone, s.gateBase + UInt64(s.submitted) + 1)
+        metal.openGate(filtersDone)
+        stream = nil
+    }
+
+    /// A fast picture's qindex, for frames at `qindex` (`newPictureEffort`'s offset).
+    private func fastQindex(_ qindex: Int) -> Int {
+        guard let d = newPictureEffort?.qindexDelta, d != 0, qindex > 0 else { return qindex }
+        return min(255, max(1, qindex + d))
+    }
+
+    /// Picture `index`'s copies, qindex and analysis (the begin queue).
+    private func beginStep(_ s: Stream, _ index: Int, _ p: Picture, _ decided: Handoff<(copies: Copies, key: Bool)>,
+                           qindex: Int, chooser: (@Sendable (PictureInfo) -> Int)?) {
+        if index >= 2 { _ = try? s.reads[index % 2]?.wait() }
+        var (copies, key) = decided.take()
+        Self.trace("begin step \(index)")
+        if s.isBroken {
+            s.finishes.async { self.failStep(s, index, nil) }
+            return
+        }
+        do {
+            if interFrames && key { metal.forgetAnalysis() }  // (the cache may hold inter frames' analysis)
+            if interFrames {
+                motionRuleLock.withLock { motionRule.decide(index, &copies, rule: motionSkip, lookback: motionSkipLookback) }
             }
+            let fast = takesEffort(&copies, run: &s.newRun)
+            let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
+            let coded = copies.skip.map { $0.count(where: { $0 == 0 }) } ?? sbs
+            let base = chooser?(PictureInfo(index: index, key: key, coded: coded, superblocks: sbs, fast: fast)) ?? qindex
+            let q = key ? keyFrameQindex(base) : fast ? fastQindex(base) : base
+            let gate: UInt64 = index >= 2 ? s.gateBase + UInt64(index - 1) : 0
+            var pending = try begin(p, copies, qindex: q, after: gate, fast: fast)
+            read(&pending, of: p, index: index, after: s.reads[(index + 1) % 2])
+            s.reads[index % 2] = pending.read
+            let started = pending
+            s.finishes.async { self.finishStep(s, index, p, started) }
+        } catch {
+            s.breakAt(index, error)
+            s.finishes.async { self.failStep(s, index, error) }
         }
-        var upcoming = count > 2 ? try picture(2) : nil
-        if interFrames, let upcoming, let next { copyFinder.start(upcoming, after: next, searchesMotion: searchesMotion) }
-        for i in 0..<count {
-            // (each picture's autoreleased objects, its Metal command buffers and what they hold,
-            // go with it, not when the stream ends: a caller's thread may never drain them)
+    }
+
+    /// Picture `index`'s closed loop and filters, and its write begun (the finish queue).
+    private func finishStep(_ s: Stream, _ index: Int, _ p: Picture, _ pending: Pending) {
+        if s.broken(at: index) != nil {
+            // (its analysis runs on: wait for it, so that nothing after it waits on what it holds)
+            if let got = try? pending.read?.wait() { metal.keepSource(got.partition.source) }
+            failStep(s, index, nil)
+            return
+        }
+        do {
             try autoreleasepool {
                 let got = try pending.read?.wait() ?? Read(partition: pending.partition.wait())
                 let partition = got.partition
                 // the picture before's source back to the pool: its closed loop and filters, and
                 // this picture's analysis (whose motion search read it), are done
                 if pending.read != nil { metal.keepSource(partition.source) }
-                Self.trace("partition \(i)")
-                let found = Self.motionFound(partition, motion: pending.motion)
-                rule.record(i, found)
-                // picture i + 2's analysis, set up after picture i + 1's (two at most are set up and not
-                // yet read: their kept-analysis buffers alternate)
-                let afterNext = upcoming
-                if let up = upcoming {
-                    var copies = interFrames ? copyFinder.wait() : Copies()
-                    if interFrames { rule.decide(i + 2, &copies, rule: motionSkip, lookback: motionSkipLookback) }
-                    let before = starting
-                    let fast = takesEffort(&copies, run: &newRun)
-                    let q = qindexOf(i + 2, fast: fast), g = gate(i + 2)
-                    following = Later { [copies] in
-                        let previous = try before?.wait()
-                        var p = try self.begin(up, copies, qindex: q, after: g, fast: fast)
-                        self.read(&p, of: up, after: previous?.read)
-                        return p
-                    }
-                    Self.trace("following")
-                    upcoming = i + 3 < count ? try picture(i + 3) : nil
-                    Self.trace("fetched")
-                    if interFrames, let upcoming { copyFinder.start(upcoming, after: up, searchesMotion: searchesMotion) }
-                }
-                Self.trace("set up")
+                Self.trace("partition \(index)")
                 let t0 = CACurrentMediaTime()
                 var timing = Timing()
                 timing.analysis = partition.gpuSeconds
-                let sbs = ((2 * ((current.width + 7) >> 3) + 15) >> 4) * ((2 * ((current.height + 7) >> 3) + 15) >> 4)
+                let sbs = ((2 * ((p.width + 7) >> 3) + 15) >> 4) * ((2 * ((p.height + 7) >> 3) + 15) >> 4)
                 timing.kept = Double(pending.partition.keptSuperblocks) / Double(max(1, sbs))
                 timing.motion = pending.motionSeconds
-                timing.motionFound = found
+                timing.motionFound = got.found
                 timing.fast = pending.fast
                 timing.qindex = pending.qindex
                 timing.shiftCandidates = pending.shiftCandidates
-                let motion = pending.motion
-                // picture i - 1's write runs beside this closed loop; finish takes it back before
-                // picture i's write begins (until then `writing` holds it, for the defer)
-                var onWritten: (@Sendable (Frame) -> Void)?
-                if let written {
-                    let index = i
-                    onWritten = { frame in written(index, frame) }
-                }
-                let (w, ended) = try finish(current, partition: partition, applied: got.applied, motion: motion,
-                                            searchesMotion: pending.searchesMotion,
-                                            refs: pending.refs, qindex: pending.qindex, fast: pending.fast,
-                                            qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0, writingBefore: writing,
-                                            written: onWritten)
-                writing = w
-                if let ended {
-                    try output(i - 1, ended)
-                    Self.trace("written \(i - 1)")
-                }
-                if let s = starting {
-                    starting = following
-                    following = nil
-                    pending = try s.wait()
-                    reading = pending.read
-                }
-                if let n = next {
-                    current = n
-                    next = afterNext
-                }
+                // the picture before's write runs beside this closed loop; finish takes it back
+                // before this picture's write begins
+                let output = s.output
+                let (w, _) = try finish(p, partition: partition, applied: got.applied, motion: pending.motion,
+                                        searchesMotion: pending.searchesMotion,
+                                        refs: pending.refs, qindex: pending.qindex, fast: pending.fast,
+                                        qmap: pending.qmap, hashes: pending.hashes, timing: timing, started: t0,
+                                        writingBefore: s.writing, written: { output(index, $0) })
+                s.writing = w
             }
+        } catch {
+            s.breakAt(index, error)
+            failStep(s, index, error)
         }
-        if let w = writing {
-            writing = nil
-            try output(count - 1, try w.end())
-        }
+    }
+
+    /// Picture `index` fails (the finish queue): after the picture before it came out, and with the
+    /// gate open past every analysis that may be under way, which won't have its filters.
+    private func failStep(_ s: Stream, _ index: Int, _ error: (any Error)?) {
+        _ = try? s.writing?.end()  // (the picture before is out: its frame, or its failure)
+        s.writing = nil
+        // pictures up to index + 3 may have begun; their analyses wait for gates up to
+        // gateBase + index + 2
+        filtersDone = max(filtersDone, s.gateBase + UInt64(index) + 3)
+        metal.openGate(filtersDone)
+        s.output(index, .failure(error ?? s.broken(at: index) ?? Failure.encode("stream broken")))
     }
 
     /// A measurement (BENCHMARKS "a picture in two steps"), not a mode anything ships: one stream
@@ -896,7 +1034,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
         /// Starts writing the last closed loop's picture with the filters' choices.
         init(cpu: OpaquePointer, search: AV1MetalPostfilter.Search, sbCols: Int, flags: UInt32, timing: Timing,
-             t0: Double, t2: Double, written: (@Sendable (Frame) -> Void)?) throws {
+             t0: Double, t2: Double, written: (@Sendable (Result<Frame, any Error>) -> Void)?) throws {
             self.cpu = cpu
             frameParams = search.params
             planes = search.planes
@@ -913,7 +1051,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             self.job = job
             DispatchQueue.global(qos: .userInitiated).async {
                 self.result = Result { try self.write() }
-                if let written, case let .success(frame) = self.result { written(frame) }
+                if let written, let result = self.result { written(result) }
                 self.done.signal()
             }
         }
@@ -1183,6 +1321,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     private struct Read {
         var partition: AV1MetalEncoder.Partition
         var applied: Applied? = nil
+        /// `Timing.motionFound`.
+        var found = -1.0
     }
 
     /// An inter frame's blocks with its motion applied (`av1enc_motion_apply_ex`), and the area of
@@ -1223,8 +1363,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// share `readerMotion`), and applies an inter frame's motion to it. Its source isn't handed
     /// back: the caller does that (`AV1MetalEncoder.keepSource`) when the picture before's closed
     /// loop and filters are done with theirs.
-    private func read(_ p: inout Pending, of picture: Picture, after previous: Later<Read>?) {
-        let partition = p.partition, motion = interFrames ? p.motion : nil
+    private func read(_ p: inout Pending, of picture: Picture, index: Int, after previous: Later<Read>?) {
+        let partition = p.partition, motion = interFrames ? p.motion : nil, sbMotion = p.motion
         let (width, height) = (picture.width, picture.height)
         // (above the closed loop's threads, which take every core: it's short, and the next
         // analysis and closed loop wait for it)
@@ -1233,6 +1373,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             AV1HybridEncoder.trace("read wait")
             var read = Read(partition: try partition.wait(keepsSource: false))
             AV1HybridEncoder.trace("read")
+            // what it found, for `motionSkip`'s decisions of the pictures from index + 2 on
+            read.found = Self.motionFound(read.partition, motion: sbMotion)
+            self.motionRuleLock.withLock { self.motionRule.record(index, read.found) }
             if let motion {
                 read.applied = try self.apply(self.readerMotion, motion, to: read.partition, width: width, height: height)
                 AV1HybridEncoder.trace("applied")
@@ -1273,7 +1416,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                         searchesMotion: Bool,
                         refs: Refs?, qindex: Int, fast: Bool = false,
                         qmap: [UInt8]?, hashes: IbcHashes?, timing: Timing, started t0: Double, writingBefore: Writing?,
-                        written: (@Sendable (Frame) -> Void)?) throws -> (Writing, Frame?) {
+                        written: (@Sendable (Result<Frame, any Error>) -> Void)?) throws -> (Writing, Frame?) {
         var timing = timing
         if let hashes {  // (its closed loop's search takes them)
             av1enc_hybrid_use_ibc_hashes(cpu, hashes.handle)
@@ -1462,7 +1605,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                   t0: t0, t1: t1)
             filteredLast = false
             remember(p, frame.planes, sbMotion)
-            written?(frame)
+            written?(.success(frame))
             return (Writing(frame), ended)
         }
         var changed = [UInt8](repeating: 1, count: sbCols0 * sbRows0)

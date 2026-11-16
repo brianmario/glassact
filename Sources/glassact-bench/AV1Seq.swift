@@ -45,6 +45,7 @@ let av1SeqCommand = Command(
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
+        .string("push", "<mode>", "drive the encoder's stream API (startStream/submit) as a session does, and print each picture's submit-to-frame latency: lone (each picture submitted once the one before came out), burst (all at once), every=<ms> (one every ms, at most two waiting, as the Host's engine allows)"),
         .bool("vt-decode", "also decode the stream with VideoToolbox's hardware AV1 decoder, as the Viewer does (M3 and later), and compare its output with the encoder's picture"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
@@ -370,6 +371,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     frames.reserveCapacity(pictures.count * steps)
     let repeats = opts.int("repeat", 1)
     var outputAt: [Double] = []  // when each frame came out (overlapped runs)
+    var pushLatencies: [Double] = []  // --push: each picture's submit to its frame, seconds
     var seconds = 0.0
     for r in 0..<repeats {
         if r > 0 { frames.removeAll(keepingCapacity: true) }
@@ -379,6 +381,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                                        output: { _, _, f in frames.append(f) })
         } else if serial {
             for i in 0..<pictures.count { frames.append(try encoder.encode(picture(i), qindex: qindex)) }
+        } else if let push = opts.string("push") {
+            // the stream API as a session drives it: each picture submitted on its own
+            outputAt.removeAll(keepingCapacity: true)
+            let (got, latencies) = try pushStream(encoder, count: pictures.count, qindex: qindex, mode: push, picture: picture)
+            frames = got
+            pushLatencies = latencies
         } else {
             outputAt.removeAll(keepingCapacity: true)
             try encoder.encode(count: pictures.count, qindex: qindex, picture: { picture($0) }, output: { _, f in
@@ -492,6 +500,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
+    if !pushLatencies.isEmpty {
+        let s = pushLatencies.sorted()
+        func at(_ q: Double) -> Double { s[min(s.count - 1, Int(Double(s.count) * q))] * 1000 }
+        print(String(format: "             --push %@: submit to frame p50 %.1f ms · p95 %.1f ms · max %.1f ms · first %.1f ms",
+                     opts.string("push") ?? "", at(0.5), at(0.95), s.last! * 1000, pushLatencies[0] * 1000))
+    }
     if let rgb { print(rgb.summary(stream.map { "hybrid at \(width)×\(height) shown at \($0.width)×\($0.height)" } ?? "hybrid")) }
     if let rgb, opts.has("per-frame") { rgb.printFrames("hybrid", bytes: frames.map(\.obu.count)) }
     if let rgb, opts.has("frame-scores") {
@@ -1034,4 +1048,58 @@ func deltaQMap(kind: String, amount: Int) -> @Sendable (AV1HybridEncoder.Picture
         }
         return map
     }
+}
+
+/// `--push`: the pictures through the hybrid's stream API, as `mode` submits them; the frames in
+/// order and each picture's submit-to-frame time.
+@available(macOS 27, *)
+func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: String,
+                picture: (Int) -> AV1HybridEncoder.Picture) throws -> ([AV1HybridEncoder.Frame], [Double]) {
+    final class Box: @unchecked Sendable {
+        let lock = NSLock()
+        let ready = DispatchSemaphore(value: 0)
+        var frames: [AV1HybridEncoder.Frame] = []
+        var at: [Double] = []
+        var error: (any Error)?
+    }
+    let box = Box()
+    var every: Double?
+    switch mode {
+    case "lone", "burst": break
+    default:
+        guard mode.hasPrefix("every="), let ms = Double(mode.dropFirst(6)), ms > 0 else {
+            throw BenchError("--push: lone, burst or every=<ms>")
+        }
+        every = ms / 1000
+    }
+    encoder.startStream { _, result in
+        let t = CACurrentMediaTime()
+        box.lock.withLock {
+            switch result {
+            case let .success(f): box.frames.append(f)
+            case let .failure(e): box.error = box.error ?? e
+            }
+            box.at.append(t)
+        }
+        box.ready.signal()
+    }
+    var submittedAt: [Double] = []
+    var outstanding = 0
+    let t0 = CACurrentMediaTime()
+    for i in 0..<count {
+        if let every {
+            let due = t0 + Double(i) * every
+            let wait = due - CACurrentMediaTime()
+            if wait > 0 { Thread.sleep(forTimeInterval: wait) }
+            while outstanding >= 2 { box.ready.wait(); outstanding -= 1 }
+        }
+        submittedAt.append(CACurrentMediaTime())
+        encoder.submit(picture(i), qindex: qindex)
+        outstanding += 1
+        if mode == "lone" { box.ready.wait(); outstanding -= 1 }
+    }
+    while outstanding > 0 { box.ready.wait(); outstanding -= 1 }
+    encoder.endStream()
+    if let e = box.error { throw e }
+    return (box.frames, zip(box.at, submittedAt).map { $0 - $1 })
 }
