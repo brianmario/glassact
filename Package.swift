@@ -100,6 +100,13 @@ let package = Package(
             exclude: ["Shaders"],
             swiftSettings: strictLibrary
         ),
+        // The hybrid as a video region encoder (VideoRegionEncoder) with bitrate targeting, for a
+        // Host to use in libaom's place: macOS only, and in no product the iPad Viewer links.
+        .target(
+            name: "GlassActHybridVideo",
+            dependencies: ["GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire"],
+            swiftSettings: strictLibrary
+        ),
         // av1gpu's random legal records and CPU reference engine, for tests (Rust too).
         .target(
             name: "AV1CoreTestSupport",
@@ -137,7 +144,7 @@ let package = Package(
         .executableTarget(
             name: "glassact-bench",
             dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActShare",
-                           "GlassActAV1", "AV1Core", "libaom"],
+                           "GlassActAV1", "AV1Core", "libaom", "GlassActHybridVideo"],
             swiftSettings: strict
         ),
         // A Host with a synthetic screen, for developing a viewer (the iPad
@@ -163,6 +170,8 @@ let package = Package(
         .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActCore", "GlassActWire", "GlassActTestSupport", "libaom"],
                     exclude: ["Shaders"], swiftSettings: strict),
+        .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire"],
+                    swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
     ]
 )

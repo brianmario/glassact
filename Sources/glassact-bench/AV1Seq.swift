@@ -42,6 +42,7 @@ let av1SeqCommand = Command(
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
         .bool("motion-shares", "with --inter: print which inter frames searched for motion and what each found (as --motion-skip does)"),
+        .bool("frame-bytes", "also a line a frame, \"fbytes <i> <bytes> <qindex> <key 0/1> <fast 0/1> <coded 64x64s> <64x64s>\""),
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
@@ -500,6 +501,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
+    if opts.has("frame-bytes") {
+        // each frame's size against what it coded (the rate controller's model)
+        let nsb = ((width + 63) / 64) * ((height + 63) / 64)
+        for (i, f) in frames.enumerated() {
+            let key = f.params.frame_type != UInt8(AV1G_FRAME_INTER)
+            print("fbytes \(i) \(f.obu.count) \(f.timing.qindex) \(key ? 1 : 0) \(f.timing.fast ? 1 : 0) \(key ? nsb : Int((1 - f.timing.copied) * Double(nsb) + 0.5)) \(nsb)")
+        }
+    }
     if !pushLatencies.isEmpty {
         let s = pushLatencies.sorted()
         func at(_ q: Double) -> Double { s[min(s.count - 1, Int(Double(s.count) * q))] * 1000 }

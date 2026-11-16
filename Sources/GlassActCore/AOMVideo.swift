@@ -91,7 +91,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         self.onFrame = onFrame
         // The same budget as HEVC: at equal bytes AV1's screen tools buy
         // sharper text, not more bandwidth.
-        baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
+        baseBitrate = Self.baseBitrate(width: width, height: height)
         appliedBitrate = aimedBitrate
         var options = glassact_aom_enc_options(speed: Int32(speed), vbr: vbr ? 1 : 0)
         guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
@@ -184,9 +184,14 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     // MARK: - Rate control
 
+    /// The base bitrate for a region of this size: the same budget as HEVC's.
+    public static func baseBitrate(width: Int, height: Int) -> Int {
+        min(20_000_000, max(2_000_000, width * height * 12))
+    }
+
     /// The quality level's share of the base, under the link cap: the HEVC
     /// encoder's ladder (~0.66× per step).
-    static func target(base: Int, level: Int, cap: Int?) -> Int {
+    public static func target(base: Int, level: Int, cap: Int?) -> Int {
         let factor = [1.0, 0.66, 0.45, 0.33][min(max(level, 0), 3)]
         var target = Int(Double(base) * factor)
         if let cap { target = max(300_000, min(target, cap)) }
@@ -195,7 +200,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     /// HEVC frame QP (0–51) → libaom's quantizer (0–63): the same fraction
     /// of each scale. HEVC's 34 floor is 42, its sharp 28 is 35.
-    static func quantizer(forFrameQP qp: Int) -> Int {
+    public static func quantizer(forFrameQP qp: Int) -> Int {
         min(63, max(0, Int((Double(qp) * 63 / 51).rounded())))
     }
 
@@ -315,6 +320,50 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         return vImageConvert_ARGBToYpCbCr_GenerateConversion(
             &matrix, &pixelRange, &conversion, kvImageARGB8888, kvImage420Yp8_Cb8_Cr8,
             vImage_Flags(kvImageNoFlags)) == kvImageNoError
+    }
+}
+
+/// BGRA → I420 (vImage) for another AV1 encoder of the same regions: as `AOMRegionEncoder`
+/// converts its pictures (BT.709 video range), or in the colour an encoder's sequence header
+/// signals (`.bt601Full`: matrix BT.601, full range, as av1gpu's writer, the hybrid's, says), so
+/// that a decoder that honours the header (VideoToolbox) shows the colours captured. Confined to
+/// its caller's queue.
+public final class I420Converter {
+    public enum Colour: Sendable { case bt709Video, bt601Full }
+    private var conversion = vImage_ARGBToYpCbCr()
+    private var permuteMap: [UInt8] = [3, 2, 1, 0] // BGRA in memory → ARGB
+
+    public init?(_ colour: Colour = .bt709Video) {
+        switch colour {
+        case .bt709Video:
+            guard AOMRegionEncoder.makeConversion(&conversion) else { return nil }
+        case .bt601Full:
+            var range = vImage_YpCbCrPixelRange(Yp_bias: 0, CbCr_bias: 128, YpRangeMax: 255, CbCrRangeMax: 255,
+                                                YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
+            var matrix = vImage_ARGBToYpCbCrMatrix(
+                R_Yp: 0.299, G_Yp: 0.587, B_Yp: 0.114,
+                R_Cb: -0.299 / 1.772, G_Cb: -0.587 / 1.772,
+                B_Cb_R_Cr: 0.5, G_Cr: -0.587 / 1.402, B_Cr: -0.114 / 1.402)
+            guard vImageConvert_ARGBToYpCbCr_GenerateConversion(
+                &matrix, &range, &conversion, kvImageARGB8888, kvImage420Yp8_Cb8_Cr8,
+                vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+        }
+    }
+
+    /// A tightly packed BGRA picture (stride width × 4; even width and height) into tight
+    /// planes: Y width × height, U and V half that each way.
+    public func convert(bgra: UnsafeRawBufferPointer, width: Int, height: Int, y: UnsafeMutableRawPointer,
+                        u: UnsafeMutableRawPointer, v: UnsafeMutableRawPointer) -> Bool {
+        guard width > 0, height > 0, width & 1 == 0, height & 1 == 0, bgra.count >= width * height * 4 else { return false }
+        var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: bgra.baseAddress),
+                                height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
+        var yp = vImage_Buffer(data: y, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
+        var cb = vImage_Buffer(data: u, height: vImagePixelCount(height / 2), width: vImagePixelCount(width / 2),
+                               rowBytes: width / 2)
+        var cr = vImage_Buffer(data: v, height: vImagePixelCount(height / 2), width: vImagePixelCount(width / 2),
+                               rowBytes: width / 2)
+        return vImageConvert_ARGB8888To420Yp8_Cb8_Cr8(&src, &yp, &cb, &cr, &conversion, &permuteMap,
+                                                      vImage_Flags(kvImageNoFlags)) == kvImageNoError
     }
 }
 

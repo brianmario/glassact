@@ -6,7 +6,7 @@ import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
-                             "link-mbit", "link-buffer-ms"]
+                             "link-mbit", "link-buffer-ms", "hybrid-q", "frames", "score-every"]
 
 let replayCommand = Command(
     name: "replay",
@@ -21,7 +21,10 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
-        .choice("video", ["mock", "vt", "av1", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
+        .choice("video", ["mock", "vt", "av1", "hybrid", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none; hybrid: the Metal/CPU hybrid AV1 encoder in libaom's place, research)"),
+        .int("hybrid-q", "<0-63>", 0...63, "loop experiment, --video hybrid: every frame at this quantizer (libaom's scale; qindex 4q), no rate control"),
+        .int("frames", "<n>", 1...1_000_000, "loop: feed only the trace's first n frames"),
+        .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
         .bool("no-fresh-queue", "loop: before 'Link estimate from the viewer': the video gate cuts on the smoothed RTT's queue alone"),
