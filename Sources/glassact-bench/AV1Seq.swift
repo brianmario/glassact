@@ -551,6 +551,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         var h: UInt64 = 0xcbf2_9ce4_8422_2325
         for f in frames { for b in f.obu { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 } }
         print(String(format: "             stream digest %016llx (%d frames)", h, frames.count))
+        // the same without the sequence header OBUs: a change to the header alone keeps this one
+        var g: UInt64 = 0xcbf2_9ce4_8422_2325
+        for f in frames { for b in withoutSequenceHeaders(f.obu) { g = (g ^ UInt64(b)) &* 0x100_0000_01b3 } }
+        print(String(format: "             frames digest %016llx (without sequence headers)", g))
     }
     // the trace's own timing: frames arrive when the screen changes, at most ~60 a second
     if thens.isEmpty, let first = stamps.first, let last = stamps.last, last > first, stamps.count > 1 {
@@ -1145,4 +1149,28 @@ func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: Stri
                      box.frames.map { String($0.timing.qindex) }.joined(separator: " ")))
     }
     return (box.frames, zip(box.at, submittedAt).map { $0 - $1 })
+}
+
+/// A temporal unit's OBUs less its sequence headers (type 1): `--digest`'s frames digest.
+func withoutSequenceHeaders(_ tu: [UInt8]) -> [UInt8] {
+    var out: [UInt8] = []
+    var i = 0
+    while i < tu.count {
+        let header = tu[i]
+        // (every OBU the writer makes has obu_has_size_field)
+        guard header & 0x02 != 0 else { return out + tu[i...] }
+        var j = i + 1 + (header & 0x04 != 0 ? 1 : 0)
+        var size = 0, shift = 0
+        while j < tu.count {
+            let b = tu[j]
+            size |= Int(b & 0x7F) << shift
+            j += 1
+            if b & 0x80 == 0 { break }
+            shift += 7
+        }
+        let end = min(tu.count, j + size)
+        if (header >> 3) & 0x0F != 1 { out += tu[i..<end] }
+        i = end
+    }
+    return out
 }
