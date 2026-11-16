@@ -57,7 +57,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// Main thread: when the current viewer's transport came up.
     private(set) var viewerConnectedAt: Date?
     private(set) var fingerprint = ""
+    /// Main thread: capture is running. It runs only while something needs frames — a
+    /// viewer's session, or a trace being recorded — not merely because the Host is.
     private(set) var isRunning = false
+    /// Main thread: viewers can connect. The listener runs from launch (once the identity
+    /// and Screen Recording are there) until the Host quits; quitting is how the person
+    /// at the Mac stops sharing.
+    private(set) var isListening = false
     private(set) var isRecording = false
 
     private let encodeQueue = DispatchQueue(label: "glassact.host.encode", qos: .userInteractive)
@@ -89,8 +95,25 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// encodeQueue-confined mirror of the transport the engine talks to (for
     /// in-session engine rebuilds, which run on encodeQueue).
     private var sessionTransport: QUICTransport?
-    /// encodeQueue: a server bootstrap hop is outstanding / done.
-    private var serverRequested = false
+    /// encodeQueue: a session whose engine waits for capture's first frame (capture starts
+    /// when the viewer connects, and the engine is made at the size it delivers), whether
+    /// that session's transport is up already (its HELLO goes as the engine is made), and
+    /// since when it waits.
+    private var engineAwaitsFrame: QUICTransport?
+    private var engineStartPending = false
+    private var engineAwaitedSinceUS: UInt64 = 0
+    /// encodeQueue: capture has started and not been stopped since. A stopped stream can
+    /// still deliver a frame or two; without this they'd set `frameWidth`, and the next
+    /// session's engine could be made at a size its own capture doesn't deliver.
+    private var acceptsFrames = false
+    /// Main thread: stopping capture after a session ended (`scheduleCaptureStop`).
+    private var pendingCaptureStop: DispatchWorkItem?
+    /// Main thread: the display the person chose to share (Choose Display…), used when the
+    /// next session starts capture; nil: the main display.
+    private var preferredFilter: SCContentFilter?
+    /// Main thread: the session now ending was ended here (Disconnect Viewer, or the
+    /// system's own screen-sharing control): someone is at the Mac, so no lock after it.
+    private var endedHere = false
     private var pixelScale: CGFloat = 1
     private var contentOrigin: CGPoint = .zero
     /// main-thread: the physical display a full-display capture shows, set
@@ -339,7 +362,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// Main thread.
     private func requestApproval(_ peer: QUICTransport.PeerCertificate) {
         let fingerprint = peer.fingerprint
-        guard isRunning, !approvalsPending.contains(fingerprint),
+        guard isListening, !approvalsPending.contains(fingerprint),
               !deniedThisRun.contains(fingerprint), !authorizedViewers.contains(fingerprint) else { return }
         // A prompt is up, or one was just denied: this key is refused like
         // any other for now, and its dialer's next retry asks again.
@@ -393,8 +416,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         let what = entry?.kind == .agent ? "agent" : "viewer"
         if entry?.kind == .agent { agentAudit.log("forgot agent key \(QUICIdentity.abbreviatedKeyString(fingerprint))") }
         if connectedViewerFingerprint == fingerprint, transport != nil {
-            endSession()
-            server?.resetSession()
+            disconnectViewer(status: "forgetting the connected \(what)")
             onStatus("\(what) \(QUICIdentity.abbreviatedKeyString(fingerprint)) forgotten and disconnected")
         } else {
             onStatus("\(what) \(QUICIdentity.abbreviatedKeyString(fingerprint)) forgotten")
@@ -435,10 +457,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             return
         }
         deniedThisRun.removeAll()
-        if transport != nil {
-            endSession()
-            server?.resetSession()
-        }
+        if transport != nil { disconnectViewer(status: "forgetting the connected viewer") }
         onStatus("approved viewers forgotten")
         approvalsChanged()
     }
@@ -623,15 +642,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
     }
 
-    /// Auto-start capture on the main display — no picker step. Single-window
-    /// mode already requires Screen Recording, so enumerating the display here
-    /// via SCShareableContent is free, and it lets the host "just work" on
-    /// launch. There is no multi-monitor selection yet; the picker menu item
-    /// is the manual override for another display. Single-window mode ignores
-    /// this entirely (the viewer's pick swaps the filter to a single window).
-    func startDefaultDisplay() {
+    /// Main thread. Let viewers connect, from now until the Host quits: the listener
+    /// runs, and the screen isn't captured until a viewer connects (`beginCapture`).
+    /// Needs the identity, and Screen Recording: a viewer let into a Host that can't
+    /// capture would see nothing.
+    func startListening() {
         watchDisplayReconfiguration()
-        guard !isRunning, identity != nil else { return }
+        guard !isListening, identity != nil else { return }
         // Preflight, not request: asking is the setup window's job (one
         // place, with context), not a bare system alert at launch.
         guard CGPreflightScreenCaptureAccess() else {
@@ -640,23 +657,49 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             onPermissionProblem()
             return
         }
+        isListening = true
+        phase = .starting
+        ensureServer()
+    }
+
+    /// Main thread: something needs frames — a viewer's session (from the moment its
+    /// transport is adopted), or a trace being recorded.
+    private var captureWanted: Bool { transport != nil || isRecording }
+
+    /// Main thread. Capture the display to share: the one chosen with Choose Display…,
+    /// else the main display, with no picker step. Single-window mode ignores this (the
+    /// viewer's pick swaps the filter to a single window).
+    private func beginCapture() {
+        pendingCaptureStop?.cancel()
+        pendingCaptureStop = nil
+        guard !isRunning, identity != nil else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            onStatus("can't capture: Screen Recording is off")
+            phase = .needsScreenRecording
+            onPermissionProblem()
+            return
+        }
+        if let preferredFilter {
+            start(filter: preferredFilter)
+            return
+        }
         Task {
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: false)
                 guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
                         ?? content.displays.first else {
-                    // Asleep (or locked): nothing to capture yet. Launch has
-                    // no viewer to wake it and the listener only starts on
-                    // the first frame — so without a retry a host launched
-                    // while the display sleeps would stay unreachable.
-                    // Wake it and try again.
+                    // Asleep (or locked): nothing to capture yet. Wake it and
+                    // try again while the viewer (or the recording) waits.
                     self.retryDefaultDisplay(after: 2, reason: "no display available to capture")
                     return
                 }
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let displayID = display.displayID
-                DispatchQueue.main.async { self.start(filter: filter, displayID: displayID) }
+                DispatchQueue.main.async {
+                    guard self.captureWanted else { return } // the viewer left meanwhile
+                    self.start(filter: filter, displayID: displayID)
+                }
             } catch {
                 self.retryDefaultDisplay(after: 5, reason: "display enumeration failed: \(error.localizedDescription)")
             }
@@ -666,10 +709,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private var defaultDisplayRetries = 0
 
     /// Any thread. Declare user activity (wakes a sleeping display — the
-    /// same as a key press) and retry `startDefaultDisplay` until it runs.
+    /// same as a key press) and retry `beginCapture` until it runs, while
+    /// something still wants frames.
     private func retryDefaultDisplay(after seconds: Double, reason: String) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, !self.isRunning else { return }
+            guard let self, !self.isRunning, self.captureWanted else { return }
             self.defaultDisplayRetries += 1
             if self.defaultDisplayRetries == 1 || self.defaultDisplayRetries % 30 == 0 {
                 self.onStatus("\(reason) — waking the display, retrying (attempt \(self.defaultDisplayRetries))")
@@ -677,12 +721,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             var activity: IOPMAssertionID = 0
             IOPMAssertionDeclareUserActivity("Glass Act host starting" as CFString, kIOPMUserActiveLocal, &activity)
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
-                guard let self, !self.isRunning else { return }
-                self.startDefaultDisplay()
+                guard let self, !self.isRunning, self.captureWanted else { return }
+                self.beginCapture()
             }
         }
     }
 
+    /// Choose the display the next session shares (not while one runs).
     func presentPicker() {
         guard !isRunning, identity != nil else { return }
         // Accessory (menu-bar) apps are never active; without this the system
@@ -695,7 +740,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         picker.add(self)
         picker.isActive = true
         picker.present(using: .display)
-        onStatus("choose a display in the picker…")
+        onStatus("choose the display to share in the picker…")
     }
 
     // SCContentSharingPickerObserver (callbacks arrive off-main)
@@ -704,8 +749,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         guard stream == nil else { return } // no live re-picking of a running stream
         let boxed = UnsafeSendableBox(filter)
         DispatchQueue.main.async { [self] in
-            guard !isRunning else { return }
-            start(filter: boxed.value)
+            let picker = SCContentSharingPicker.shared
+            picker.isActive = false
+            picker.remove(self)
+            preferredFilter = boxed.value
+            onStatus("display chosen — shared when a viewer connects")
+            if captureWanted && !isRunning { start(filter: boxed.value) }
         }
     }
 
@@ -731,11 +780,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private func start(filter: SCContentFilter, displayID: CGDirectDisplayID? = nil) {
         guard !isRunning, identity != nil else { return }
         isRunning = true
-        phase = .starting
         let scale = CGFloat(filter.pointPixelScale)
         let size = CaptureGeometry.clamp(Int(filter.contentRect.width * scale),
                                          Int(filter.contentRect.height * scale))
         pixelScale = scale * size.factor
+        captureWidth = size.w
+        captureHeight = size.h
+        encodeQueue.async { [weak self] in self?.acceptsFrames = true } // ahead of its frames' drains
         let shared = displayID ?? Self.display(containing: filter.contentRect)
         sharedDisplayID = shared
         contentOrigin = shared != 0 ? CGDisplayBounds(shared).origin : filter.contentRect.origin
@@ -750,10 +801,15 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             break
         case let .startFailed(reason):
             isRunning = false
-            phase = CGPreflightScreenCaptureAccess() ? .stopped : .needsScreenRecording
+            if !CGPreflightScreenCaptureAccess() { phase = .needsScreenRecording }
             onStatus("capture failed: \(reason)")
+            // A session can't go on without frames.
+            if transport != nil { disconnectViewer(status: "capture failed — ending the session") }
         case .stoppedFromMenuBar:
-            stop()
+            // The system's own control: the person at the Mac stopped the share.
+            disconnectViewer(status: "sharing stopped from the menu bar — viewer disconnected")
+            if isRecording { toggleRecording() }
+            stopCaptureIfIdle(force: true)
         case .screenRecordingRevoked:
             phase = .needsScreenRecording
             onPermissionProblem()
@@ -841,8 +897,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
     }
 
+    /// Main thread. Everything off — capture, any session, the listener: the Host is
+    /// quitting.
     func stop() {
         isRunning = false
+        isListening = false
+        pendingCaptureStop?.cancel()
+        pendingCaptureStop = nil
         phase = .stopped
         viewerConnectedAt = nil
         pendingLock?.cancel() // stopped locally: someone is at the Mac
@@ -879,7 +940,9 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         encodeQueue.async { [self] in
             engine = nil
             sessionTransport = nil
-            serverRequested = false
+            engineAwaitsFrame = nil
+            engineStartPending = false
+            acceptsFrames = false
             lastFrame = nil
             frameWidth = 0
             frameHeight = 0
@@ -892,6 +955,79 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             }
         }
     }
+
+    /// Main thread. Stop capturing once nothing needs frames — no session, no trace being
+    /// recorded (`force`: the system stopped the stream itself) — and put back what a
+    /// session changed: the display's mode, a shared window's frame. The listener stays.
+    private func stopCaptureIfIdle(force: Bool = false) {
+        pendingCaptureStop?.cancel()
+        pendingCaptureStop = nil
+        guard isRunning, force || !captureWanted else { return }
+        isRunning = false
+        pendingDisplayRestore?.cancel()
+        pendingDisplayRestore = nil
+        lastFilter = nil
+        captureModified = false
+        lastScaleRequest = nil
+        autoScaledDown = false
+        autoScaleFull = nil
+        autoScaleRecoverHoldS = 60
+        autoScaleRecovered = false
+        captureWidth = 0
+        captureHeight = 0
+        clipboardTimer?.invalidate(); clipboardTimer = nil
+        cursorImageTimer?.invalidate(); cursorImageTimer = nil
+        restoreSharedWindowFrame()
+        singleWindowID = 0
+        savedDisplayFilter = nil
+        sharedAXWindow = nil
+        originalWindowFrame = nil
+        restoreDisplayMode()
+        capture.stop()
+        encodeQueue.async { [weak self] in
+            guard let self else { return }
+            self.acceptsFrames = false
+            self.autoScaleRecovery = nil
+            self.lastFrame = nil
+            self.frameWidth = 0
+            self.frameHeight = 0
+        }
+        onStatus("capture stopped — nobody watching; still listening")
+    }
+
+    /// Main thread. A session ended: stop capturing once the viewer isn't coming straight
+    /// back — a moment after one that left on purpose (its display restore runs first),
+    /// `lockGraceSeconds` after a dropped connection, whose reconnect then resumes without
+    /// restarting capture. A new session cancels it (`beginCapture`, `adopt`).
+    private func scheduleCaptureStop(clean: Bool) {
+        pendingCaptureStop?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.stopCaptureIfIdle() }
+        pendingCaptureStop = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (clean ? 1 : Double(Self.lockGraceSeconds)), execute: work)
+    }
+
+    /// Main thread. The person at the Mac ends the session (the menu, or the system's own
+    /// screen-sharing control): no lock after it — someone is here. Capture stops a moment
+    /// later, as after a viewer that left on purpose.
+    func disconnectViewer(status: String = "viewer disconnected from this Mac") {
+        // Someone is at the Mac: no lock, also not one pending from a viewer that dropped.
+        pendingLock?.cancel()
+        pendingLock = nil
+        guard let transport else { return }
+        endedHere = true
+        onStatus(status)
+        // Over, not interrupted: the viewer doesn't redial (WindowAction.endSession, the
+        // message a closed shared window sends). Then close, once it has had time to land;
+        // its .cancelled runs the usual teardown (transportStateChanged).
+        encodeQueue.async { self.engine?.sendSharedWindowClosed() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak transport] in
+            guard let self, let transport, self.transport === transport else { return }
+            transport.cancel()
+        }
+    }
+
+    /// Main thread: a session is up (Disconnect Viewer is offered).
+    var hasViewer: Bool { viewerSessionLive }
 
     // MARK: - Clipboard sync (main thread)
 
@@ -1671,7 +1807,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 self.restoreToNative(status: "viewer gone — display/capture restored to native")
                 return
             }
-            self.onStatus("viewer gone — restoring in \(grace)s (or on Stop Sharing)")
+            self.onStatus("viewer gone — restoring in \(grace)s")
             let work = DispatchWorkItem { [weak self] in
                 self?.restoreToNative(status: "display/capture restored to native")
             }
@@ -1865,12 +2001,18 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         encodeQueue.asyncAfter(deadline: .now() + delaySeconds) { [weak self] in
             guard let self else { return }
             self.recordingArmed = true
-            DispatchQueue.main.async { self.isRecording = true }
+            DispatchQueue.main.async {
+                self.isRecording = true
+                if self.isListening && !self.isRunning { self.beginCapture() }
+            }
             self.onStatus("⏺ timed recording started")
             self.encodeQueue.asyncAfter(deadline: .now() + durationSeconds) { [weak self] in
                 guard let self, self.recordingArmed || self.recorder != nil else { return }
                 self.recordingArmed = false
-                DispatchQueue.main.async { self.isRecording = false }
+                DispatchQueue.main.async {
+                    self.isRecording = false
+                    self.stopCaptureIfIdle()
+                }
                 self.closeRecorder(status: self.recorder != nil
                     ? "⏹ timed recording done — trace saved: \(self.recordName)"
                     : "⏹ timed recording done (no frames)")
@@ -1881,17 +2023,16 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     func toggleRecording() {
         let arming = !isRecording
         isRecording = arming
-        let capturing = isRunning
+        if arming && isListening && !isRunning { beginCapture() } // a trace needs frames, viewer or not
         encodeQueue.async { [self] in
             recordingArmed = arming
             if arming {
-                onStatus(capturing
-                    ? "recording armed — waiting for frames (move the cursor)"
-                    : "recording armed — share a display first, then move the cursor")
+                onStatus("recording armed — waiting for frames (move the cursor)")
             } else {
                 closeRecorder(status: recorder != nil ? "trace saved: \(recordName)" : "recording cancelled")
             }
         }
+        if !arming && transport == nil { stopCaptureIfIdle() }
     }
 
     /// encodeQueue only. `status` once the capture is compressed into its trace.
@@ -1934,6 +2075,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
     private func drain() {
         guard let taken = slot.take() else { return }
+        guard acceptsFrames else { return } // a stopped stream's last frames
         let sampleBuffer = taken.buffer
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -1974,7 +2116,17 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
         frameWidth = width
         frameHeight = height
-        bootstrapServerIfNeeded(width: width, height: height)
+        if let waiting = engineAwaitsFrame, engine == nil {
+            // The session's first frame (capture started as its viewer connected): the
+            // engine at the size capture delivers, its HELLO now if the transport is up.
+            engineAwaitsFrame = nil
+            let made = makeEngine(on: waiting, width: width, height: height, startFrameSeq: 1)
+            engine = made
+            if engineStartPending {
+                engineStartPending = false
+                made.start(nowUS: MonotonicClock.nowUS)
+            }
+        }
         record(frame: frame, bytesPerRow: bytesPerRow, width: width, height: height,
                rects: rects ?? [], nowUS: captureUS)
         guard let engine, engine.grid.width == width, engine.grid.height == height else { return }
@@ -2257,26 +2409,10 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
     // MARK: - Transport wiring
 
-    /// encodeQueue (first captured frame). The server itself is main-thread
-    /// state — creating it right here would race stop() (a queued drain
-    /// after Stop Sharing would re-create the listener).
-    private func bootstrapServerIfNeeded(width: Int, height: Int) {
-        guard !serverRequested else { return }
-        serverRequested = true
-        DispatchQueue.main.async { [weak self] in self?.ensureServer(width: width, height: height) }
-    }
-
-    /// Main thread. Creates the listener if sharing and none exists; a
+    /// Main thread. Creates the listener if listening and none exists; a
     /// listener failure (port in use, interface loss) retries every 2 s.
-    private func ensureServer(width: Int, height: Int) {
-        guard isRunning else {
-            // A frame drained just after stop(): un-latch so the next share
-            // bootstraps a listener again.
-            encodeQueue.async { [weak self] in self?.serverRequested = false }
-            return
-        }
-        if captureWidth == 0 { captureWidth = width; captureHeight = height }
-        guard server == nil, let identity else { return }
+    private func ensureServer() {
+        guard isListening, server == nil, let identity else { return }
         do {
             let gate = signInGate
             let srv = try QUICServer(port: Self.controlPort, identity: identity,
@@ -2290,9 +2426,9 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 DispatchQueue.main.async { self?.adopt(transport) }
             }
             srv.onReady = { [weak self] in
-                self?.onStatus("listening on \(Self.controlPort) (\(width)×\(height))")
+                self?.onStatus("listening on \(Self.controlPort) — capturing only while a viewer is connected")
                 DispatchQueue.main.async {
-                    guard let self, self.isRunning, !self.viewerSessionLive else { return }
+                    guard let self, self.isListening, !self.viewerSessionLive else { return }
                     self.phase = .listening
                 }
             }
@@ -2314,8 +2450,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
     private func retryServer() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            guard let self, self.isRunning, self.server == nil else { return }
-            self.ensureServer(width: self.captureWidth, height: self.captureHeight)
+            guard let self, self.isListening, self.server == nil else { return }
+            self.ensureServer()
         }
     }
 
@@ -2355,7 +2491,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         onStatus(clean ? "viewer left — locking the screen"
                        : "viewer gone — locking the screen in \(delay)s unless it reconnects")
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isRunning, self.lockOnDisconnect, !self.viewerSessionLive else { return }
+            guard let self, self.isListening, self.lockOnDisconnect, !self.viewerSessionLive else { return }
             self.pendingLock = nil
             MainActor.assumeIsolated { self.lockScreen { locked in
                 if locked {
@@ -2736,20 +2872,31 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// this also cancels its tick timer, which would otherwise pile up (one
     /// more 10 ms timer per reconnect, all ticking the engine).
     private func adopt(_ transport: QUICTransport) {
-        guard isRunning else {
+        guard isListening else {
             transport.cancel()
             return
         }
         endSession()
         self.transport = transport
-        let fallback = (captureWidth, captureHeight)
+        endedHere = false
+        // Capture starts with the session (it's idle while nobody watches); a viewer back
+        // within the grace finds it still running.
+        pendingCaptureStop?.cancel()
+        pendingCaptureStop = nil
+        if !isRunning { beginCapture() }
         encodeQueue.async { [weak self] in
             guard let self else { return }
-            // The engine must match the frames actually arriving.
-            let width = self.frameWidth > 0 ? self.frameWidth : fallback.0
-            let height = self.frameHeight > 0 ? self.frameHeight : fallback.1
-            self.engine = self.makeEngine(on: transport, width: width, height: height, startFrameSeq: 1)
             self.sessionTransport = transport
+            if self.frameWidth > 0 {
+                // The engine must match the frames actually arriving.
+                self.engine = self.makeEngine(on: transport, width: self.frameWidth, height: self.frameHeight,
+                                              startFrameSeq: 1)
+            } else {
+                // Capture is starting: the engine is made at its first frame (drain).
+                self.engineAwaitsFrame = transport
+                self.engineStartPending = false
+                self.engineAwaitedSinceUS = MonotonicClock.nowUS
+            }
         }
         // Clipboard sync is session-scoped (one timer), not per engine rebuild.
         startClipboardSync { [weak self] fmt, data in
@@ -2795,7 +2942,18 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         // timer handler only, i.e. encodeQueue.
         var watchdog = HostSessionWatchdog()
         timer.setEventHandler { [weak self] in
-            guard let self, let engine = self.engine else { return }
+            guard let self else { return }
+            guard let engine = self.engine else {
+                // Capture hasn't delivered a frame for this session (the display won't
+                // wake, capture failed): end it under the viewer's own handshake deadline.
+                if self.engineAwaitsFrame != nil,
+                   MonotonicClock.nowUS &- self.engineAwaitedSinceUS > Self.firstFrameDeadlineUS {
+                    self.engineAwaitsFrame = nil
+                    self.engineStartPending = false
+                    self.resetSessionFromTimer("no frame from capture in \(Self.firstFrameDeadlineUS / 1_000_000) s — session reset")
+                }
+                return
+            }
             let now = MonotonicClock.nowUS
             engine.tick(nowUS: now)
             self.drainPendingWhileStatic(nowUS: now)
@@ -2807,6 +2965,10 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         timer.resume()
         tickTimer = timer
     }
+
+    /// How long a new session waits for capture's first frame (under the viewer's 15 s
+    /// handshake deadline, `Session.handshakeTimeoutUS`).
+    static let firstFrameDeadlineUS: UInt64 = 10_000_000
 
     /// encodeQueue (tick timer). The transport's resulting terminal state
     /// runs the normal teardown on main.
@@ -2842,8 +3004,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             agentAccess.beginSession(peer: peer, viewOnly: peer.map { authorizedViewers.isViewOnly($0.fingerprint) } ?? false)
             let connectedUS = MonotonicClock.nowUS
             encodeQueue.async { [weak self] in
-                self?.viewerConnectedUS = connectedUS
-                self?.engine?.start(nowUS: MonotonicClock.nowUS)
+                guard let self else { return }
+                self.viewerConnectedUS = connectedUS
+                if let engine = self.engine {
+                    engine.start(nowUS: MonotonicClock.nowUS)
+                } else if self.engineAwaitsFrame != nil {
+                    self.engineStartPending = true // HELLO as the first frame makes the engine
+                }
             }
             viewerConnectedAt = Date()
             phase = .viewerConnected
@@ -2858,13 +3025,15 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             let reason = transport?.lastFailReason ?? ""
             let closedCleanly = transport?.peerClosedCleanly ?? false
             let hadSession = viewerSessionLive
+            let here = endedHere
+            endedHere = false
             viewerSessionLive = false
             viewerConnectedAt = nil
             if agentAccess.snapshot.agentActive { agentAudit.log("\(agentTag) disconnected") }
             // A headless agent leaving isn't the person walking away: no lock.
             let agentLeft = agentAccess.sessionIsAgent
             agentAccess.endSession()
-            if isRunning { phase = .listening }
+            if isListening { phase = .listening }
             holdDisplayAwake(false)
             endSession()
             server?.resetSession()
@@ -2878,9 +3047,13 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                     guard let self, !self.viewerSessionLive else { return }
                     let bye = self.viewerBye
                     self.viewerBye = nil
-                    let onPurpose = ViewerBye.leftOnPurpose(bye: bye, closedCleanly: closedCleanly)
+                    let onPurpose = here || ViewerBye.leftOnPurpose(bye: bye, closedCleanly: closedCleanly)
                     if self.isRunning { self.scheduleDisplayRestore(clean: onPurpose) }
-                    if self.isRunning && hadSession && !agentLeft { self.scheduleLockAfterDisconnect(clean: onPurpose) }
+                    if self.isListening && hadSession && !agentLeft && !here {
+                        self.scheduleLockAfterDisconnect(clean: onPurpose)
+                    }
+                    // Nobody watching: capture stops (unless a trace is being recorded).
+                    if self.isRunning { self.scheduleCaptureStop(clean: onPurpose) }
                 }
             }
         case .connecting:
@@ -2900,6 +3073,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             self?.releaseHeldInput()
             self?.engine = nil
             self?.sessionTransport = nil
+            self?.engineAwaitsFrame = nil
+            self?.engineStartPending = false
         }
     }
 
@@ -2949,7 +3124,10 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     /// encodeQueue only.
     private func disarmRecording(reason: String) {
         recordingArmed = false
-        DispatchQueue.main.async { self.isRecording = false }
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.stopCaptureIfIdle() // the recording may have been all that wanted frames
+        }
         closeRecorder(status: reason)
     }
 }

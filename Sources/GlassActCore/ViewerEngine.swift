@@ -110,8 +110,9 @@ public final class ViewerEngine: @unchecked Sendable {
     /// Single-window mode: host → viewer, the pickable-window snapshot.
     /// The app shows the picker; the choice comes back via sendWindowSelect.
     public var onWindowList: ((_ windows: [WireWindow]) -> Void)?
-    /// The host ended the session on purpose (single-window mode: the shared
-    /// window closed). The app shows why and does NOT redial.
+    /// The host ended the session on purpose (someone at the Mac disconnected
+    /// this viewer, or in single-window mode the shared window closed). The
+    /// app shows why and does NOT redial.
     public var onHostEndedSession: ((_ reason: String) -> Void)?
     /// The engine entered `.failed` (terminal: incompatible or malformed
     /// peer, undecodable video). It sends nothing more; the app must tear
@@ -456,10 +457,12 @@ public final class ViewerEngine: @unchecked Sendable {
             case let .windowList(windows):
                 onWindowList?(windows)
             case let .windowControl(action, _, _):
-                // Host → viewer endSession: the shared window is gone (closed,
-                // or its app quit) — the session is over, not interrupted.
+                // Host → viewer endSession: the session is over, not interrupted —
+                // someone at the Mac disconnected this viewer, or the shared window
+                // is gone (closed, or its app quit). Older hosts send it only for
+                // the window.
                 if action == WindowAction.endSession {
-                    onHostEndedSession?("the shared window was closed on the host")
+                    onHostEndedSession?("it was disconnected at the Mac, or the shared window closed")
                 }
             case let .agentScope(control, reason):
                 onAgentScope?(control, reason)
