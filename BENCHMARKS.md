@@ -335,6 +335,32 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Our own AV1 decoder: a first measurement (2026-11-16)
+
+VideoToolbox decodes no AV1 4:4:4 (entry below), and no AV1 at all before M3, so the owner
+suggested our own decoder. The crate has most of one already: the parser (`writer::parse_with`,
+the spec's symbol decoder, for the toolset the writer produces, key and inter frames) and the
+writer's decoder-exact reconstruction with post-filters. `rust/av1/examples/own_decode.rs` (new)
+chains them: each frame parsed into its record, then reconstructed by `Writer::encode_ex` from the
+reference slots its earlier frames refreshed. It re-codes the symbols too, so its times are an
+upper bound for a reconstruction-only path.
+
+5K hybrid streams (`av1seq --inter --q 20 --width 5120 --frames 60 --ivf`), M4 Pro, load average
+30–54, so provisional:
+
+| Stream | identical to libaom's | parse: key, inter median | reconstruct: key, inter median / max | aomdec, 8 threads / 1 |
+|---|---|---|---|---|
+| typing-cc | 60 / 60 | 64 ms, 2.9 | 14 ms, 9.8 / 12 | 3.0 / 6.8 ms a frame |
+| tabs | 60 / 60 | 65 ms, 3.0 | 13 ms, 9.8 / 12 | 3.0 / 7.0 |
+| app switching | 60 / 60 | 34 ms, 2.9 | 10 ms, 9.8 / 16 | 2.8 / 6.5 |
+| photos | 60 / 60 | 154 ms, 6.2 (max 139) | 70 ms, 13.4 / 60 | 5.7 / 21.5 |
+
+So the crate already decodes its own streams exactly. It's 3–4× libaom's 8-thread time on a frame
+that's mostly copied, and far slower on big changes. What's known to be slack: it re-codes every
+symbol; it reconstructs and filters the whole frame where most of it is copied; the parse is
+single-threaded (154 ms for a 153 KB key frame). Not yet a product decoder: hostile input (INV-6)
+needs fuzzing, and it decodes only the writer's toolset, so a new encoder tool would need a caps bit.
+
 ### Tiles as AVIF from the hybrid, re-measured (2026-11-16)
 
 The owner asked whether the hybrid could make AVIF tiles, lossy or lossless, and how they'd
