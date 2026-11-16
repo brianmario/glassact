@@ -650,7 +650,9 @@ fn intrabc_key_frames() {
         let mut given = Hybrid::new();
         given.set_intrabc(true);
         given.use_ibc_hashes(&mut pre, w as u32, h as u32);
-        given.closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl).unwrap();
+        given
+            .closed_loop(&pic.y, &pic.u, &pic.v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+            .unwrap();
         assert!(given.record() == &rec, "seed {seed}: a search given its hashes");
         if repeats == 0 {
             let mut plain = Hybrid::new();
@@ -724,6 +726,311 @@ fn intrabc_key_frames() {
             assert!(d == want, "seed {seed}: dav1d decodes another picture");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+/// A 4:4:4 picture of `p`: its chroma at full size (nearest), with per-sample colour on its dark
+/// samples (text's subpixel fringes, which 4:2:0 can't carry).
+fn to_444(p: &Pic) -> (Vec<u8>, Vec<u8>) {
+    let (w, h, cw) = (p.w, p.h, p.cw());
+    let (mut u, mut v) = (vec![0u8; w * h], vec![0u8; w * h]);
+    for y in 0..h {
+        for x in 0..w {
+            let k = (y / 2) * cw + x / 2;
+            let f = if p.y[y * w + x] < 100 {
+                [24i32, 0, -24][x % 3]
+            } else {
+                0
+            };
+            u[y * w + x] = (p.u[k] as i32 + f).clamp(0, 255) as u8;
+            v[y * w + x] = (p.v[k] as i32 - f).clamp(0, 255) as u8;
+        }
+    }
+    (u, v)
+}
+
+/// An IVF file of one frame's OBUs.
+fn ivf1(obu: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut v = b"DKIF".to_vec();
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.extend_from_slice(&32u16.to_le_bytes());
+    v.extend_from_slice(b"AV01");
+    v.extend_from_slice(&(w as u16).to_le_bytes());
+    v.extend_from_slice(&(h as u16).to_le_bytes());
+    for x in [30u32, 1, 1, 0] {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend_from_slice(&(obu.len() as u32).to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes());
+    v.extend_from_slice(obu);
+    v
+}
+
+/// 4:4:4 key frames from the closed loop (Hybrid::set_chroma_444): screen pictures (text with
+/// colour fringes, gradients, UI, a photo region), tiny and odd sizes, one tile and several,
+/// random and variance partitions, with intra block copies or with deblocking and CDEF. The
+/// closed loop decides chroma itself (given chroma ignored), codes the same on one thread as on
+/// all, its record is 4:4:4 and the write keeps it so; the bitstream parses back to the record,
+/// whose writer reconstruction is the closed loop's post-filtered, and (where installed) dav1d
+/// and aomdec decode exactly that. Inter frames are refused.
+#[test]
+fn chroma444_key_frames() {
+    use crate::writer::parse_with;
+    let tools: Vec<(&str, Vec<&str>)> = vec![
+        ("dav1d", vec!["-q", "-i", "IN", "-o", "OUT"]),
+        ("aomdec", vec!["--rawvideo", "-o", "OUT", "IN"]),
+    ];
+    let mut decoded = 0;
+    for (seed, (w, h), (cl, rl), style, abc) in [
+        (1u64, (600usize, 400usize), (0, 0), Style::Variance, false),
+        (2, (600, 400), (1, 0), Style::Random, false),
+        (3, (333, 517), (0, 1), Style::Variance, false),
+        (4, (77, 45), (0, 0), Style::Random, false),
+        (5, (13, 7), (0, 0), Style::Variance, false),
+        (6, (600, 400), (0, 0), Style::Variance, true),
+        (7, (333, 517), (1, 1), Style::Random, true),
+    ] {
+        let what = format!("seed {seed} {w}x{h}");
+        let pic = screen_pic(w, h, seed, seed == 3);
+        let (mut u, mut v) = to_444(&pic);
+        let mut y = pic.y.clone();
+        let mut rng = Rng(seed * 13 + 5);
+        if abc && w > 200 {
+            // a source rectangle repeated (every plane) at even and odd positions below it
+            let (sx, sy, rw, rh) = (w * 2 / 5 + 8, 8usize, 96usize, 80usize);
+            for _ in 0..10 {
+                let dx = rng.below((w - rw) as u32) as usize;
+                let dy = (80 + rng.below((h - rh - 80) as u32)) as usize;
+                for p in [&mut y, &mut u, &mut v] {
+                    for yy in 0..rh {
+                        p.copy_within((sy + yy) * w + sx..(sy + yy) * w + sx + rw, (dy + yy) * w + dx);
+                    }
+                }
+            }
+        }
+        let tiles = tile_layout(w as u32, h as u32, cl, rl).unwrap();
+        let blocks = partition(&pic, &tiles, &mut rng, style, true);
+        let run = |threads: usize, flags: i32| {
+            let mut hy = Hybrid::new();
+            hy.threads = threads;
+            hy.set_chroma_444(true);
+            hy.set_intrabc(abc);
+            hy.closed_loop(&y, &u, &v, w as u32, h as u32, &blocks, None, flags, 90, cl, rl)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            hy
+        };
+        let mut hy = run(Hybrid::new().threads, 0);
+        let rec = hy.record().clone();
+        assert_eq!(rec.fp.chroma_format, CHROMA_444, "{what}");
+        // (seed 7's repeats straddle its tiles, which copies can't: it searches and doesn't copy)
+        assert_eq!(seed == 6, rec.fp.allow_intrabc == 1, "{what}: copies");
+        let (mc4, mr4) = (mi_cols(w as i32) as usize * 4, mi_rows(h as i32) as usize * 4);
+        for k in 0..3 {
+            assert_eq!(hy.recon(k).unwrap().len(), mc4 * mr4, "{what}: plane {k}");
+        }
+        let one = run(1, 0);
+        assert!(
+            one.record() == &rec && one.output().recon == hy.output().recon,
+            "{what}: threads"
+        );
+        // the analysis's chroma, given: the closed loop decides its own anyway
+        let given = run(Hybrid::new().threads, GIVEN_CHROMA);
+        assert!(given.record() == &rec, "{what}: given chroma");
+        assert!(
+            w < 200 || rec.blocks.iter().any(|b| b.uv_mode as i32 == UV_CFL_PRED),
+            "{what}: no CfL"
+        );
+        // the write: post-filters chosen (none where it copies), and a caller's fp saying 4:2:0
+        let mut wfp = rec.fp;
+        (wfp.loop_filter_level, wfp.loop_filter_sharpness) = ([12, 9, 7, 6], 2);
+        (wfp.enable_cdef, wfp.cdef_bits, wfp.cdef_damping_minus_3) = (1, 1, 2);
+        wfp.cdef_y_pri[..2].copy_from_slice(&[3, 6]);
+        wfp.cdef_y_sec[..2].copy_from_slice(&[1, 2]);
+        wfp.cdef_uv_pri[..2].copy_from_slice(&[2, 5]);
+        wfp.cdef_uv_sec[..2].copy_from_slice(&[0, 4]);
+        wfp.chroma_format = CHROMA_420;
+        let sbc = w.div_ceil(64);
+        let sb_cdef: Vec<i8> = (0..sbc * h.div_ceil(64)).map(|_| rng.below(2) as i8).collect();
+        let obu = hy.write(&wfp, Some(&sb_cdef), sbc).unwrap().to_vec();
+        let fin = hy.record().clone();
+        assert_eq!(fin.fp.chroma_format, CHROMA_444, "{what}: the write keeps 4:4:4");
+        // the closed loop's reconstruction, post-filtered as the record says, cropped
+        let rw = hy.output().recon_w;
+        let mut planes: Vec<Vec<u8>> = (0..3).map(|k| hy.recon(k).unwrap().to_vec()).collect();
+        // (a frame with intra block copies has none: postfilter_ex doesn't know that, and would
+        // CDEF it with the enable_cdef the write leaves)
+        if fin.fp.allow_intrabc == 0 {
+            let [a, b, c] = &mut planes[..] else { unreachable!() };
+            let mut pl: [&mut [u8]; 3] = [a, b, c];
+            crate::postfilter::postfilter_ex(&fin.fp, &fin.blocks, &fin.inter, &mut pl, &rw.map(|x| x as usize));
+        }
+        let mut want = Vec::new();
+        for (k, p) in planes.iter().enumerate() {
+            for yy in 0..h {
+                want.extend_from_slice(&p[yy * rw[k] as usize..][..w]);
+            }
+        }
+        // it parses back to the record, whose writer reconstruction is that
+        let p = parse_with(&obu, None).unwrap_or_else(|e| panic!("{what}: parse: {e}"));
+        assert_eq!(p.rec.fp.chroma_format, CHROMA_444);
+        assert_eq!(p.rec.blocks.len(), fin.blocks.len(), "{what}");
+        let mut again = p.rec.clone();
+        let mut o = Output::default();
+        Writer::new()
+            .encode(
+                again.as_mut(),
+                &EncodeOpts {
+                    flags: 0,
+                    seq_level_idx: -1,
+                },
+                &mut o,
+            )
+            .unwrap();
+        let no_td = |b: &[u8]| {
+            if b.starts_with(&[0x12, 0]) {
+                b[2..].to_vec()
+            } else {
+                b.to_vec()
+            }
+        };
+        assert!(
+            no_td(&o.obu) == no_td(&obu),
+            "{what}: the parsed record codes another stream"
+        );
+        let wr: Vec<u8> = o.recon.concat();
+        assert!(
+            wr == want,
+            "{what}: the writer's reconstruction isn't the closed loop's post-filtered"
+        );
+        eprintln!(
+            "{what}: {} blocks, {} copy, {} CfL, {} bytes",
+            fin.blocks.len(),
+            fin.inter.iter().filter(|i| i.is_inter != 0).count(),
+            fin.blocks.iter().filter(|b| b.uv_mode as i32 == UV_CFL_PRED).count(),
+            obu.len()
+        );
+        let dir = std::env::temp_dir().join(format!("glassact-444-{}-{seed}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("f.ivf");
+        std::fs::write(&inp, ivf1(&obu, w, h)).unwrap();
+        for (tool, args) in &tools {
+            let path = format!("/opt/homebrew/bin/{tool}");
+            if !std::path::Path::new(&path).exists() {
+                continue;
+            }
+            let out = dir.join(format!("{tool}.yuv"));
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| match *a {
+                    "IN" => inp.display().to_string(),
+                    "OUT" => out.display().to_string(),
+                    a => a.to_string(),
+                })
+                .collect();
+            let st = std::process::Command::new(&path).args(&args).output().unwrap();
+            assert!(
+                st.status.success(),
+                "{what}: {tool}: {}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+            let d = std::fs::read(&out).unwrap();
+            assert_eq!(d.len(), want.len(), "{what}: {tool} output size");
+            if d != want {
+                let i = (0..d.len()).find(|&i| d[i] != want[i]).unwrap();
+                panic!(
+                    "{what}: {tool} differs first at plane {} ({}, {})",
+                    i / (w * h),
+                    i % w,
+                    (i % (w * h)) / w
+                );
+            }
+            decoded += 1;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // the same picture again: every tile kept, the same record and bytes
+        hy.closed_loop(&y, &u, &v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+            .unwrap();
+        assert_eq!(hy.reused_tiles(), tiles.rows * tiles.cols, "{what}: tiles kept");
+        let again = hy.write(&wfp, Some(&sb_cdef), sbc).unwrap().to_vec();
+        assert!(
+            again == obu && hy.record() == &fin,
+            "{what}: kept tiles code another picture"
+        );
+    }
+    eprintln!("{decoded} decodes exact");
+    // inter frames are 4:2:0 only
+    let pic = screen_pic(64, 64, 9, false);
+    let (u, v) = to_444(&pic);
+    let tiles = tile_layout(64, 64, 0, 0).unwrap();
+    let blocks = partition(&pic, &tiles, &mut Rng(3), Style::Variance, false);
+    let mut hy = Hybrid::new();
+    hy.set_chroma_444(true);
+    let vfp = FrameParams {
+        video: 1,
+        frame_type: FRAME_INTER,
+        allow_screen_content_tools: 1,
+        ..FrameParams::default()
+    };
+    let vid = Video {
+        fp: vfp,
+        inter: &[],
+        reference: None,
+        golden: None,
+        padded: None,
+    };
+    let r = hy.closed_loop_ex(&pic.y, &u, &v, 64, 64, &blocks, None, 0, 90, 0, 0, Some(&vid), None);
+    assert!(r.is_err_and(|e| e.msg.contains("4:4:4")));
+}
+
+/// The C API's 4:4:4 (av1enc_hybrid_set_chroma_444): full-size chroma planes read, the record
+/// the Rust closed loop's.
+#[cfg(feature = "capi")]
+#[test]
+fn chroma444_capi() {
+    use crate::capi::*;
+    let (w, h) = (150usize, 90usize);
+    let pic = screen_pic(w, h, 21, false);
+    let (u, v) = to_444(&pic);
+    let tiles = tile_layout(w as u32, h as u32, 0, 0).unwrap();
+    let blocks = partition(&pic, &tiles, &mut Rng(8), Style::Variance, false);
+    let mut direct = Hybrid::new();
+    direct.set_chroma_444(true);
+    direct
+        .closed_loop(&pic.y, &u, &v, w as u32, h as u32, &blocks, None, 0, 100, 0, 0)
+        .unwrap();
+    let mut err = [0 as core::ffi::c_char; 256];
+    // SAFETY: a handle of av1enc_hybrid_create; full-size planes and the blocks; the record view
+    // read before the handle is destroyed.
+    unsafe {
+        let hh = av1enc_hybrid_create();
+        av1enc_hybrid_set_chroma_444(hh, 1);
+        let rc = av1enc_hybrid_closed_loop(
+            hh,
+            pic.y.as_ptr(),
+            u.as_ptr(),
+            v.as_ptr(),
+            w as u32,
+            h as u32,
+            blocks.as_ptr(),
+            blocks.len() as u32,
+            core::ptr::null(),
+            0,
+            100,
+            0,
+            0,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(rc, OK);
+        let r = &*av1enc_hybrid_record(hh);
+        assert_eq!(r.fp.chroma_format, CHROMA_444);
+        let want = direct.record();
+        assert_eq!(r.n_txb as usize, want.txb.len());
+        assert!(core::slice::from_raw_parts(r.coeffs, r.n_coeffs as usize) == &want.coeffs[..]);
+        let pl = av1enc_hybrid_recon(hh, 2);
+        let n = mi_cols(w as i32) as usize * 4 * mi_rows(h as i32) as usize * 4;
+        assert!(core::slice::from_raw_parts(pl, n) == direct.recon(2).unwrap());
+        av1enc_hybrid_destroy(hh);
     }
 }
 

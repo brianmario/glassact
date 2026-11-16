@@ -315,21 +315,26 @@ pub(crate) fn hash_picture(y: &[u8], width: u32, height: u32, out: &mut Vec<u32>
     let (hw, hh) = ((w - 8) / 2 + 1, (h - 8) / 2 + 1);
     out.resize(hw * hh, FLAT);
     let mut rows: Vec<(usize, &mut [u32])> = out.chunks_mut(hw).enumerate().collect();
-    super::par_for(threads, &mut rows, || (), |_, (j, o)| {
-        let y0 = *j * 2;
-        for (i, v) in o.iter_mut().enumerate() {
-            let x0 = i * 2;
-            *v = if x0 + 8 <= pw && y0 + 8 <= ph {
-                hash_rows(|k| u64::from_le_bytes(y[(y0 + k) * pw + x0..][..8].try_into().unwrap()))
-            } else {
-                // past the picture's edge: its last column and row repeated, as the padding does
-                hash_rows(|k| {
-                    let r = &y[(y0 + k).min(ph - 1) * pw..][..pw];
-                    u64::from_le_bytes(core::array::from_fn(|c| r[(x0 + c).min(pw - 1)]))
-                })
-            };
-        }
-    });
+    super::par_for(
+        threads,
+        &mut rows,
+        || (),
+        |_, (j, o)| {
+            let y0 = *j * 2;
+            for (i, v) in o.iter_mut().enumerate() {
+                let x0 = i * 2;
+                *v = if x0 + 8 <= pw && y0 + 8 <= ph {
+                    hash_rows(|k| u64::from_le_bytes(y[(y0 + k) * pw + x0..][..8].try_into().unwrap()))
+                } else {
+                    // past the picture's edge: its last column and row repeated, as the padding does
+                    hash_rows(|k| {
+                        let r = &y[(y0 + k).min(ph - 1) * pw..][..pw];
+                        u64::from_le_bytes(core::array::from_fn(|c| r[(x0 + c).min(pw - 1)]))
+                    })
+                };
+            }
+        },
+    );
 }
 
 impl TileSearch {
@@ -682,7 +687,14 @@ impl IntraBc {
         luma_tx: Option<&[u8]>,
         qindex: i32,
     ) -> Option<bool> {
-        let key = [width, height, sb128 as u32 | (ss as u32) << 1, tiles.cols, tiles.rows, qindex as u32];
+        let key = [
+            width,
+            height,
+            sb128 as u32 | (ss as u32) << 1,
+            tiles.cols,
+            tiles.rows,
+            qindex as u32,
+        ];
         (key == self.given_key && blocks == self.given && luma_tx.unwrap_or(&[]) == self.given_tx)
             .then_some(self.copied)
     }
@@ -814,7 +826,14 @@ impl IntraBc {
         }
         self.tx.extend((k..blocks.len()).map(|o| luma_tx.map_or(0, |l| l[o])));
         self.copied = self.copies > 0 && self.busy_exact * 100 >= self.busy * MIN_BUSY_SHARE;
-        self.given_key = [width, height, sb128 as u32 | (ss as u32) << 1, tiles.cols, tiles.rows, qindex as u32];
+        self.given_key = [
+            width,
+            height,
+            sb128 as u32 | (ss as u32) << 1,
+            tiles.cols,
+            tiles.rows,
+            qindex as u32,
+        ];
         self.given.clear();
         self.given.extend_from_slice(blocks);
         self.given_tx.clear();

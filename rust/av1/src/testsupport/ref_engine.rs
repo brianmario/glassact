@@ -359,7 +359,8 @@ pub fn ref_engine_encode(
             nskip += 1;
         }
         let k = &rec.blocks[b];
-        if k.uv_mode as i32 == UV_CFL_PRED && has_chroma(k.bsize as i32, k.mi_row as i32, k.mi_col as i32, img.mono, 1) {
+        if k.uv_mode as i32 == UV_CFL_PRED && has_chroma(k.bsize as i32, k.mi_row as i32, k.mi_col as i32, img.mono, 1)
+        {
             ncfl += 1;
         }
     }

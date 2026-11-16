@@ -35,10 +35,10 @@ mod quant;
 mod rdoq;
 
 pub(crate) use intrabc::hash_picture as hash_ibc_picture;
-mod tx_model;
-mod tx_weights;
 #[cfg(test)]
 pub(crate) mod tests;
+mod tx_model;
+mod tx_weights;
 
 pub(crate) use decide::{DecOpts, Decider, Src, SrcView, pad_source};
 pub(crate) use quant::{HookOpts, QuantHook};
@@ -341,7 +341,9 @@ impl Hybrid {
             rdoq_range: 0,
             rdoq_min_coeffs: 0,
             rdoq_costs: None,
-            tx_samples: std::env::var("GA_TX_SAMPLES").ok().map(|p| (std::sync::Mutex::new(Vec::new()), p)),
+            tx_samples: std::env::var("GA_TX_SAMPLES")
+                .ok()
+                .map(|p| (std::sync::Mutex::new(Vec::new()), p)),
             ibc: intrabc::IntraBc::default(),
             src: Src::default(),
             mem: Vec::new(),
@@ -442,7 +444,10 @@ impl Hybrid {
         let n = blocks.len();
         let (rw, rh) = (mi_cols(width as i32) as usize * 4, mi_rows(height as i32) as usize * 4);
         if self.chroma444 && video.is_some_and(|v| v.fp.frame_type == FRAME_INTER) {
-            return Err(error(ERR_INVALID, "4:4:4 is for key frames: inter frames are 4:2:0 only"));
+            return Err(error(
+                ERR_INVALID,
+                "4:4:4 is for key frames: inter frames are 4:2:0 only",
+            ));
         }
         if n == 0
             || w < 1
@@ -578,7 +583,11 @@ impl Hybrid {
             (f.lf_inter_off, f.allow_screen_content_tools) = (v.fp.lf_inter_off, v.fp.allow_screen_content_tools);
             (f.mv_precision, f.sb128) = (v.fp.mv_precision, v.fp.sb128);
             (f.stream_width, f.stream_height) = (v.fp.stream_width, v.fp.stream_height);
-            f.golden_slot = if v.fp.frame_type == FRAME_INTER { v.fp.golden_slot } else { 0 };
+            f.golden_slot = if v.fp.frame_type == FRAME_INTER {
+                v.fp.golden_slot
+            } else {
+                0
+            };
             // from the reference's saved CDFs, where the slot has them
             f.cdf_from_ref = (v.fp.cdf_from_ref != 0 && *slot_known >> (v.fp.ref_slot & 7) & 1 != 0) as u8;
         }
@@ -715,14 +724,19 @@ impl Hybrid {
         // each block's qindex: its 64x64's from the map, if there is one (delta-q), else the frame's
         let qi = qindex as u8;
         let sb_cols64 = (mi_cols(width as i32) as usize).div_ceil(16);
-        let qmap: &[u8] = if rec.fp.sb128 == 0 && sb_qindex.len() == sb_cols64 * (mi_rows(height as i32) as usize).div_ceil(16) {
-            (rec.fp.delta_q_present, rec.fp.delta_q_res) = (1, 0);
-            &sb_qindex[..]
-        } else {
-            &[]
-        };
+        let qmap: &[u8] =
+            if rec.fp.sb128 == 0 && sb_qindex.len() == sb_cols64 * (mi_rows(height as i32) as usize).div_ceil(16) {
+                (rec.fp.delta_q_present, rec.fp.delta_q_res) = (1, 0);
+                &sb_qindex[..]
+            } else {
+                &[]
+            };
         let q_of = |b: &Block| -> u8 {
-            if qmap.is_empty() { qi } else { qmap[(b.mi_row as usize >> 4) * sb_cols64 + (b.mi_col as usize >> 4)].max(1) }
+            if qmap.is_empty() {
+                qi
+            } else {
+                qmap[(b.mi_row as usize >> 4) * sb_cols64 + (b.mi_col as usize >> 4)].max(1)
+            }
         };
         if given_chroma {
             // the GPU decided chroma: only the fields the closed loop sets
@@ -1121,7 +1135,11 @@ impl Hybrid {
         // tile is coded, the context tile too.
         if fp.frame_type == FRAME_INTER || !mem.iter().any(|m| m.valid) {
             if fp.video != 0 {
-                *slot_known |= if fp.frame_type == FRAME_INTER { fp.refresh_frame_flags } else { 0xFF };
+                *slot_known |= if fp.frame_type == FRAME_INTER {
+                    fp.refresh_frame_flags
+                } else {
+                    0xFF
+                };
             }
             return Ok(Box::new(WriteJob {
                 side,

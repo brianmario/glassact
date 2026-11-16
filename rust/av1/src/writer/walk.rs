@@ -8,9 +8,7 @@
 
 mod palette;
 
-use super::mvstack::{
-    MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack_ref, mv_class,
-};
+use super::mvstack::{MvMaps, MvStack, REF_INTRABC, REF_UNSET, derive_mode, find_mv_stack_ref, mv_class};
 use super::recon::PlanCtx;
 use super::sink::Sink;
 use super::{Res, TileInfo, TxbCtx, TxbHook, fail};
@@ -501,7 +499,11 @@ pub(super) fn predict_inter_block(
                 let (px, py) = (base_x + x, base_y + y);
                 let k = mi(cand_r + ri as i32, cand_c + ci as i32);
                 let m = maps.mvs[k];
-                let refs = if maps.ref0[k] == GOLDEN { &f.refs_golden } else { &f.refs };
+                let refs = if maps.ref0[k] == GOLDEN {
+                    &f.refs_golden
+                } else {
+                    &f.refs
+                };
                 let Some(refs) = refs.as_ref() else { return };
                 #[cfg(test)]
                 {
@@ -1388,13 +1390,18 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             let (bufs, st) = (&*self.bufs, &*self.st);
             let count = |rf: u8| {
                 let at = |k: usize| (bufs.ref0[k] == rf) as i32;
-                (if st.avail_u { at(bufs.mi(r - 1, c)) } else { 0 }) + if st.avail_l { at(bufs.mi(r, c - 1)) } else { 0 }
+                (if st.avail_u { at(bufs.mi(r - 1, c)) } else { 0 })
+                    + if st.avail_l { at(bufs.mi(r, c - 1)) } else { 0 }
             };
             (count(LAST_FRAME as u8), count(GOLDEN))
         };
         let ref_count_ctx = |c0: i32, c1: i32| (c0 >= c1) as usize + (c0 > c1) as usize;
         let golden_w = S::WRITE && bi.is_inter == GOLDEN;
-        if self.sk.sym(&mut self.st.icdf.single_ref[ref_count_ctx(last + golden, 0)][0], 0) != 0 {
+        if self
+            .sk
+            .sym(&mut self.st.icdf.single_ref[ref_count_ctx(last + golden, 0)][0], 0)
+            != 0
+        {
             fail!(ERR_INVALID, "block {b_idx}: backward references are not supported");
         }
         // p3: LAST_FRAME / LAST2_FRAME against LAST3_FRAME / GOLDEN_FRAME
@@ -2423,7 +2430,18 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 let [a, b, c_] = &mut bufs.plane;
                 let mut planes: [&mut [u8]; 3] = [a, b, c_];
                 let dv = [bi.mv_row as i32, bi.mv_col as i32];
-                predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma_, f.ss, dv);
+                predict_intrabc_block(
+                    &mut planes,
+                    bufs.stride,
+                    bufs.r0,
+                    bufs.c0,
+                    r,
+                    c,
+                    bsize,
+                    has_chroma_,
+                    f.ss,
+                    dv,
+                );
             } else {
                 self.predict_inter_block(bsize, has_chroma_);
             }
@@ -2445,7 +2463,11 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     for ux in 0..units_w {
                         for $plane in 0..planes {
                             let sub = f.sub($plane);
-                            let $tx_sz = if $plane != 0 { uv_tx_size(bsize, f.ss) } else { tx_size };
+                            let $tx_sz = if $plane != 0 {
+                                uv_tx_size(bsize, f.ss)
+                            } else {
+                                tx_size
+                            };
                             let step_x = t8(&Tx_Width, $tx_sz) >> 2;
                             let step_y = t8(&Tx_Height, $tx_sz) >> 2;
                             let plane_sz = if $plane != 0 { uv_bsize(bsize, f.ss) } else { bsize };
@@ -2863,7 +2885,11 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let ctx = {
             let al = &st.above_level[plane];
             let ll = &st.left_level[plane];
-            let bsz = if plane != 0 { uv_bsize(st.mi_size, f.ss) } else { st.mi_size };
+            let bsz = if plane != 0 {
+                uv_bsize(st.mi_size, f.ss)
+            } else {
+                st.mi_size
+            };
             let (bw, bh) = (4 * bw4(bsz), 4 * bh4(bsz));
             let wn = w4.min(max_x4 - x4).max(0) as usize;
             let hn = h4.min(max_y4 - y4).max(0) as usize;

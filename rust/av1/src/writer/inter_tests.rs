@@ -139,7 +139,10 @@ fn reduced_frames_round_trip() {
 /// frames, the same for the whole stream.
 fn reduce(seq: &mut InterSeq, seed: u64) {
     let fp = seq.frames[0].fp;
-    let (sw, sh) = (fp.width + 1 + (seed % 97) as u32 * 13, fp.height + (seed % 3) as u32 * 41);
+    let (sw, sh) = (
+        fp.width + 1 + (seed % 97) as u32 * 13,
+        fp.height + (seed % 3) as u32 * 41,
+    );
     for rec in &mut seq.frames {
         (rec.fp.stream_width, rec.fp.stream_height) = (sw as u16, sh as u16);
     }
@@ -198,7 +201,12 @@ fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) 
         if reduced {
             reduce(&mut seq, seed);
         }
-        let golden = seq.frames.iter().flat_map(|r| &r.inter).filter(|i| i.is_inter == crate::types::GOLDEN).count();
+        let golden = seq
+            .frames
+            .iter()
+            .flat_map(|r| &r.inter)
+            .filter(|i| i.is_inter == crate::types::GOLDEN)
+            .count();
         GOLDEN_BLOCKS.fetch_add(golden as u64, std::sync::atomic::Ordering::Relaxed);
         let outs = match encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD) {
             Ok(o) => o,
@@ -435,7 +443,11 @@ fn video_key_frames_are_still_pictures() {
         assert_eq!((p.rec.fp.video, p.rec.fp.frame_type), (1, FRAME_KEY));
         let full = (rec.fp.monochrome == 0) as u32;
         assert_eq!(p.colour, [1, 13, 1, full], "seed {seed}: a stream's colour description");
-        assert_eq!(parse(&still.obu).unwrap().colour, [1, 13, 6, full], "seed {seed}: a still picture's");
+        assert_eq!(
+            parse(&still.obu).unwrap().colour,
+            [1, 13, 6, full],
+            "seed {seed}: a still picture's"
+        );
     });
 }
 
@@ -465,7 +477,11 @@ impl TxbHook for McCheck<'_> {
         }
         let bi = self.inter[ctx.block_idx as usize];
         let sub = (p != 0) as u32;
-        let pic = if bi.is_inter == crate::types::GOLDEN { &self.golden } else { &self.reference };
+        let pic = if bi.is_inter == crate::types::GOLDEN {
+            &self.golden
+        } else {
+            &self.reference
+        };
         let r = RefPlane {
             data: pic.plane[p],
             stride: pic.stride[p],
@@ -511,7 +527,11 @@ fn hook_sees_the_inter_prediction() {
                 let rec = &mut seq.frames[k];
                 let refs: RefSlots = core::array::from_fn(|s| Some(RefPicture::from_output(&plain[slot_of[s]])));
                 let reference = refs[fp.ref_slot as usize].unwrap();
-                let golden = if fp.golden_slot != 0 { refs[fp.golden_slot as usize - 1].unwrap() } else { reference };
+                let golden = if fp.golden_slot != 0 {
+                    refs[fp.golden_slot as usize - 1].unwrap()
+                } else {
+                    reference
+                };
                 let inter = rec.inter.clone();
                 let hook = McCheck {
                     inter: &inter,

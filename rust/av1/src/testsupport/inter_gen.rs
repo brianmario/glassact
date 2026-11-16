@@ -24,7 +24,9 @@ use crate::dsp::{
     get_scan, get_tx_set_inter, get_tx_set_intra, is_directional, tx_type_in_set_inter, tx_type_in_set_intra,
 };
 use crate::tables::*;
-use crate::types::{Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams, GOLDEN};
+use crate::types::{
+    Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams, GOLDEN,
+};
 use crate::writer::{Record, apply_sb_qindex, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
 /// splitmix64 (as fuzz_gen's, its own stream)
@@ -458,7 +460,11 @@ impl InterSeq {
                     fp.golden_slot = ((fp.ref_slot as i32 + grng.range(1, 7)) % 8 + 1) as u8;
                 }
             }
-            let golden_pct = if fp.golden_slot == 0 { 0 } else { [10, 30, 60][grng.range(0, 2) as usize] };
+            let golden_pct = if fp.golden_slot == 0 {
+                0
+            } else {
+                [10, 30, 60][grng.range(0, 2) as usize]
+            };
             let inter_pct = [0, 30, 60, 85, 100][rng.range(0, 4) as usize];
             let skip_pct = [5, 20, 50, 80][rng.range(0, 3) as usize];
             let mv_far = [24, 96, (w.max(h) + 80).min(1000)][rng.range(0, 2) as usize];
@@ -686,7 +692,13 @@ pub(crate) fn add_intrabc_seeded(
     blocks: &mut [Block],
     inter: &mut [BlockInter],
 ) {
-    add_intrabc(&mut Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1), fp, tiles, blocks, inter);
+    add_intrabc(
+        &mut Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+        fp,
+        tiles,
+        blocks,
+        inter,
+    );
 }
 
 /// av1t_inter_case_make: [`InterSeq::make`].

@@ -113,8 +113,16 @@ pub fn block_avail(
     let l = inside(mi_row, mi_col - 1);
     let (mut u_chroma, mut l_chroma) = (false, false);
     if has_chroma(bsize, mi_row, mi_col, mono, ss) {
-        u_chroma = if ss != 0 && bh4(bsize) == 1 { inside(mi_row - 2, mi_col) } else { u };
-        l_chroma = if ss != 0 && bw4(bsize) == 1 { inside(mi_row, mi_col - 2) } else { l };
+        u_chroma = if ss != 0 && bh4(bsize) == 1 {
+            inside(mi_row - 2, mi_col)
+        } else {
+            u
+        };
+        l_chroma = if ss != 0 && bw4(bsize) == 1 {
+            inside(mi_row, mi_col - 2)
+        } else {
+            l
+        };
     }
     Avail {
         u,
@@ -282,7 +290,11 @@ pub fn for_each_txb(
     mut f: impl FnMut(i32, i32, i32, i32, i32, i32),
 ) -> i32 {
     let mut n = 0;
-    let planes = if has_chroma(bsize, mi_row, mi_col, mono, ss) { 3 } else { 1 };
+    let planes = if has_chroma(bsize, mi_row, mi_col, mono, ss) {
+        3
+    } else {
+        1
+    };
     let (uw, uh) = res_units(bsize);
     for uy in 0..uh {
         for ux in 0..uw {
@@ -484,7 +496,10 @@ mod tests {
             for r in 0..4 {
                 for c in 0..4 {
                     for mono in 0..2 {
-                        assert_eq!(has_chroma(bs, r, c, mono != 0, 1) as i64, ci("has_chroma", bs, r, c, mono));
+                        assert_eq!(
+                            has_chroma(bs, r, c, mono != 0, 1) as i64,
+                            ci("has_chroma", bs, r, c, mono)
+                        );
                     }
                 }
             }

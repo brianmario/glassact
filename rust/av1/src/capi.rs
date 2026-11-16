@@ -288,7 +288,11 @@ pub unsafe extern "C" fn av1g_encode_ex(
             }
             let mut pic = writer::RefPicture::default();
             for p in 0..if fp.monochrome != 0 { 1 } else { 3 } {
-                let sub = if p != 0 { crate::blockinfo::chroma_ss(&fp) as u32 } else { 0 };
+                let sub = if p != 0 {
+                    crate::blockinfo::chroma_ss(&fp) as u32
+                } else {
+                    0
+                };
                 let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
                 let stride = r.stride[p].max(0) as usize;
                 if r.plane[p].is_null() || h == 0 || stride < w as usize {
@@ -997,9 +1001,22 @@ pub unsafe extern "C" fn av1enc_hybrid_write_end(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(h: *mut HybridHandle, on: c_int, trials: c_int, min_range: c_int, min_coeffs: c_int) {
+pub unsafe extern "C" fn av1enc_hybrid_set_rdoq(
+    h: *mut HybridHandle,
+    on: c_int,
+    trials: c_int,
+    min_range: c_int,
+    min_coeffs: c_int,
+) {
     // SAFETY: the handle
-    unsafe { (*h).h.set_rdoq(on != 0, trials != 0, min_range.clamp(0, 255) as u8, min_coeffs.clamp(0, 4096) as u16) }
+    unsafe {
+        (*h).h.set_rdoq(
+            on != 0,
+            trials != 0,
+            min_range.clamp(0, 255) as u8,
+            min_coeffs.clamp(0, 4096) as u16,
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1024,7 +1041,11 @@ pub unsafe extern "C" fn av1enc_hybrid_set_quick_tx_trials(h: *mut HybridHandle,
 pub unsafe extern "C" fn av1enc_hybrid_set_sb_qindex(h: *mut HybridHandle, map: *const u8, n: usize) {
     // SAFETY: the handle; `map` has `n` bytes (or is null with n 0)
     unsafe {
-        let m = if map.is_null() || n == 0 { &[][..] } else { std::slice::from_raw_parts(map, n) };
+        let m = if map.is_null() || n == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(map, n)
+        };
         (*h).h.set_sb_qindex(m)
     }
 }
@@ -1039,7 +1060,11 @@ pub struct IbcHashes {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn av1enc_ibc_hashes_create() -> *mut IbcHashes {
-    Box::into_raw(Box::new(IbcHashes { v: Vec::new(), width: 0, height: 0 }))
+    Box::into_raw(Box::new(IbcHashes {
+        v: Vec::new(),
+        width: 0,
+        height: 0,
+    }))
 }
 
 #[unsafe(no_mangle)]
@@ -1057,7 +1082,12 @@ pub unsafe extern "C" fn av1enc_ibc_hashes_compute(p: *mut IbcHashes, y: *const 
         return;
     }
     // SAFETY: the handle, and the caller's luma of width * height samples
-    let (p, y) = unsafe { (&mut *p, core::slice::from_raw_parts(y, width as usize * height as usize)) };
+    let (p, y) = unsafe {
+        (
+            &mut *p,
+            core::slice::from_raw_parts(y, width as usize * height as usize),
+        )
+    };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     crate::hybrid::hash_ibc_picture(y, width, height, &mut p.v, threads);
     (p.width, p.height) = (width, height);

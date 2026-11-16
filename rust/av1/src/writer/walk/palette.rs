@@ -31,15 +31,7 @@ pub(crate) struct MapDims {
 /// size >> subsampling_x / _y, `ss` both ways): a chroma map narrower or shorter than 4 (in 4:2:0,
 /// of a 4x16 or 16x4 block) is 2 more, the chroma of its 8x8, which starts at [`map_origin`]. A
 /// 4:4:4 chroma map is the luma map's size (palette blocks are 8x8 and up).
-pub(crate) fn map_dims(
-    bsize: i32,
-    mi_row: i32,
-    mi_col: i32,
-    mi_rows: i32,
-    mi_cols: i32,
-    uv: bool,
-    ss: i32,
-) -> MapDims {
+pub(crate) fn map_dims(bsize: i32, mi_row: i32, mi_col: i32, mi_rows: i32, mi_cols: i32, uv: bool, ss: i32) -> MapDims {
     let (w, h) = ((4 * bw4(bsize)) as usize, (4 * bh4(bsize)) as usize);
     let ow = w.min(((mi_cols - mi_col) * 4) as usize);
     let oh = h.min(((mi_rows - mi_row) * 4) as usize);

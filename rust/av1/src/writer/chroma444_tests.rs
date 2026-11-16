@@ -122,7 +122,10 @@ impl Cov {
         for t in 0..TX_SIZES_ALL {
             for ty in 0..TX_TYPES {
                 if tx_type_in_set_intra(get_tx_set_intra(t, false), ty) {
-                    assert!(n(&self.txb[0][t as usize][ty as usize]) > 0, "luma tx {t} type {ty}: {r}");
+                    assert!(
+                        n(&self.txb[0][t as usize][ty as usize]) > 0,
+                        "luma tx {t} type {ty}: {r}"
+                    );
                 }
             }
             let big = tx_w(t) == 64 || tx_h(t) == 64;
@@ -304,12 +307,21 @@ fn check_444(w: &mut Writer, rec: &Record, what: &str) -> (Output, Record) {
     let (mut oa, mut ob) = (Output::default(), Output::default());
     w.encode(a.as_mut(), &opts(flags), &mut oa)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
-    Writer::with_threads(1).encode(b.as_mut(), &opts(flags), &mut ob).unwrap();
+    Writer::with_threads(1)
+        .encode(b.as_mut(), &opts(flags), &mut ob)
+        .unwrap();
     assert!(oa == ob, "{what}: split vs one pass");
-    assert!(a.txb == b.txb && a.coeffs == b.coeffs, "{what}: split vs one pass, record");
+    assert!(
+        a.txb == b.txb && a.coeffs == b.coeffs,
+        "{what}: split vs one pass, record"
+    );
     // every plane is the picture's size
     for p in 0..3 {
-        assert_eq!((oa.recon_w[p], oa.recon_h[p]), (rec.fp.width, rec.fp.height), "{what}: plane {p}");
+        assert_eq!(
+            (oa.recon_w[p], oa.recon_h[p]),
+            (rec.fp.width, rec.fp.height),
+            "{what}: plane {p}"
+        );
     }
     let p = parse(&oa.obu).unwrap_or_else(|e| panic!("{what}: parse: {e}"));
     assert_eq!(p.rec.fp.chroma_format, CHROMA_444, "{what}");
@@ -321,12 +333,17 @@ fn check_444(w: &mut Writer, rec: &Record, what: &str) -> (Output, Record) {
         let n = [x.size_y, x.size_uv, x.size_uv];
         assert_eq!((x.size_y, x.size_uv), (y.size_y, y.size_uv), "{what}: palette {k}");
         for c in 0..3 {
-            assert_eq!(x.colors[c][..n[c] as usize], y.colors[c][..n[c] as usize], "{what}: palette {k}");
+            assert_eq!(
+                x.colors[c][..n[c] as usize],
+                y.colors[c][..n[c] as usize],
+                "{what}: palette {k}"
+            );
         }
     }
     let mut again = p.rec.clone();
     let mut o = Output::default();
-    w.encode(again.as_mut(), &opts(ENC_BITSTREAM_ONLY | ENC_TD), &mut o).unwrap();
+    w.encode(again.as_mut(), &opts(ENC_BITSTREAM_ONLY | ENC_TD), &mut o)
+        .unwrap();
     assert!(o.obu == oa.obu, "{what}: the parsed record codes another stream");
     (oa, a)
 }
@@ -338,7 +355,9 @@ fn chroma444_round_trip() {
     let cov = Cov::new();
     seeds(120, |w, seed| {
         for filters in [true, false] {
-            let Some(rec) = record_444(seed, 200, filters) else { continue };
+            let Some(rec) = record_444(seed, 200, filters) else {
+                continue;
+            };
             let (_, written) = check_444(w, &rec, &format!("seed {seed} filters {filters}"));
             cov.add(&written);
         }
@@ -370,7 +389,9 @@ fn decoders_444() {
     let pictures = AtomicU64::new(0);
     seeds(n, |w, seed| {
         for filters in [true, false] {
-            let Some(rec) = record_444(seed, maxdim, filters) else { continue };
+            let Some(rec) = record_444(seed, maxdim, filters) else {
+                continue;
+            };
             if rec.fp.allow_intrabc != 0 && filters {
                 continue; // (no post-filters with intra block copy: the unfiltered one is the same)
             }
@@ -428,14 +449,19 @@ fn chroma444_geometry() {
             v.push((t, x4, y4))
         }
     });
-    assert_eq!(v, [(TX_32X32, 0, 0), (TX_32X32, 8, 0), (TX_32X32, 0, 8), (TX_32X32, 8, 8)]);
+    assert_eq!(
+        v,
+        [(TX_32X32, 0, 0), (TX_32X32, 8, 0), (TX_32X32, 0, 8), (TX_32X32, 8, 8)]
+    );
 }
 
 /// The sequence header of a 4:4:4 picture is the High profile's (seq_profile 1, no mono_chrome, no
 /// chroma_sample_position), and its AVIF's av1C says so.
 #[test]
 fn chroma444_headers() {
-    let rec = (0..40).find_map(|s| record_444(s, 64, false).filter(|r| r.fp.video == 0)).unwrap();
+    let rec = (0..40)
+        .find_map(|s| record_444(s, 64, false).filter(|r| r.fp.video == 0))
+        .unwrap();
     let mut a = rec.clone();
     let out = encode(a.as_mut(), &opts(ENC_FIX_RANGE | ENC_AVIF)).unwrap();
     // OBU_SEQUENCE_HEADER (0x0A), its size, then seq_profile in the top 3 bits
@@ -454,12 +480,21 @@ fn chroma444_headers() {
 /// streams; and a version 1 record's chroma_format is not read (4:2:0).
 #[test]
 fn chroma444_refusals() {
-    let rec = (0..40).find_map(|s| record_444(s, 64, false).filter(|r| r.fp.allow_intrabc == 0)).unwrap();
+    let rec = (0..40)
+        .find_map(|s| record_444(s, 64, false).filter(|r| r.fp.allow_intrabc == 0))
+        .unwrap();
     // the error's message, or "" for success
     let refused = |r: &Record, extras: &Extras| {
         let mut r = r.clone();
         Writer::with_threads(1)
-            .encode_into::<NoHook>(r.as_mut(), &opts(ENC_FIX_RANGE), None, extras, None, &mut Output::default())
+            .encode_into::<NoHook>(
+                r.as_mut(),
+                &opts(ENC_FIX_RANGE),
+                None,
+                extras,
+                None,
+                &mut Output::default(),
+            )
             .map_or_else(|e| e.msg, |_| String::new())
     };
     let none = Extras::default();

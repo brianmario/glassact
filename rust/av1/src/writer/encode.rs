@@ -623,7 +623,16 @@ impl<H: TxbHook> Split<'_, H> {
         let (first, end) = (j.first as usize, j.end as usize);
         let (t0, t1) = (self.block_txb[first] as usize, self.block_txb[end] as usize);
         // SAFETY: as above; the &mut ends before the groups' shared reads start
-        plan.setup(unsafe { &mut *j.pout }, bufs, first, end, t0, t1, self.unit, self.plan_f.ss);
+        plan.setup(
+            unsafe { &mut *j.pout },
+            bufs,
+            first,
+            end,
+            t0,
+            t1,
+            self.unit,
+            self.plan_f.ss,
+        );
         // SAFETY: from here on, only shared: the plan's walk writes its atomics, and the groups it
         // publishes read them
         let out: &PlanOut = unsafe { &*j.pout };
@@ -1145,9 +1154,7 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
         fail!(ERR_INVALID, "inter frames need video mode");
     }
     if (fp.stream_width != 0 || fp.stream_height != 0)
-        && (fp.video == 0
-            || (fp.stream_width as u32) < fp.width
-            || (fp.stream_height as u32) < fp.height)
+        && (fp.video == 0 || (fp.stream_width as u32) < fp.width || (fp.stream_height as u32) < fp.height)
     {
         fail!(
             ERR_INVALID,
@@ -1967,7 +1974,8 @@ fn recon(
             let (cc, cw) = (mc >> ss, mw >> ss);
             for k in 0..2 {
                 for y in 0..mh >> ss {
-                    fb.lf_uv[k][((r0 >> ss) + y) * cc + (c0 >> ss)..][..cw].copy_from_slice(&t.lf_uv[k][y * cw..][..cw]);
+                    fb.lf_uv[k][((r0 >> ss) + y) * cc + (c0 >> ss)..][..cw]
+                        .copy_from_slice(&t.lf_uv[k][y * cw..][..cw]);
                 }
             }
             let (sc0, sr0, tsc) = (c0 >> 4, r0 >> 4, t.sb_cols as usize);
