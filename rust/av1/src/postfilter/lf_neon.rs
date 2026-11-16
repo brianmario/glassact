@@ -203,9 +203,10 @@ fn lanes(fs0: i32, fs1: i32) -> int16x8_t {
 }
 
 fn deblock_plane(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: usize) {
-    let sub = (plane != 0) as i32;
+    let sub = f.sub(plane);
     let chroma = plane != 0;
-    let step = if chroma { 2 } else { 1 };
+    // 7.14.1: chroma edges every 1 << subsampling 4x4s (4:2:0: 2; 4:4:4: luma's grid)
+    let step = 1 << sub;
     let (pw, ph) = (((f.mi_cols * 4) >> sub) as usize, ((f.mi_rows * 4) >> sub) as usize);
     for pass in 0..2 {
         let Some((limit, blimit, thresh)) = lf_limits(f, plane, pass) else {

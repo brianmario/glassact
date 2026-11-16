@@ -77,10 +77,11 @@ void av1enc_cdef_select_cpu(const uint32_t *my, const uint32_t *muv, int nc, int
 
 // The CPU half of the hybrid encoder (src/hybrid.cpp): the closed loop on blocks the Metal
 // analysis decided (av1g_block with mi_row, mi_col, bsize, y_mode and angle_delta_y set; the rest
-// is decided here), on 8-bit 4:2:0 planes (tight: Y w x h, U and V ((w+1)/2) x ((h+1)/2)), with
-// the given tiling. On success the handle holds the record (chroma modes, coefficients, skip
-// flags; no post-filter parameters yet) and the PADDED pre-filter reconstruction
-// (MiCols*4 x MiRows*4, chroma half), until the next call. Reuse one handle per picture stream.
+// is decided here), on 8-bit 4:2:0 planes (tight: Y w x h, U and V ((w+1)/2) x ((h+1)/2)), or
+// after av1enc_hybrid_set_chroma_444 4:4:4 planes (Y, U and V w x h), with the given tiling. On
+// success the handle holds the record (chroma modes, coefficients, skip flags; no post-filter
+// parameters yet) and the PADDED pre-filter reconstruction (MiCols*4 x MiRows*4, chroma half in
+// 4:2:0, the same in 4:4:4), until the next call. Reuse one handle per picture stream.
 typedef struct av1enc_hybrid av1enc_hybrid;
 av1enc_hybrid *av1enc_hybrid_create(void);
 void av1enc_hybrid_destroy(av1enc_hybrid *h);
@@ -170,6 +171,13 @@ void av1enc_hybrid_set_sb_qindex(av1enc_hybrid *h, const uint8_t *map, size_t n)
 // post-filters: the record's fp.allow_intrabc is 1, and av1enc_hybrid_write_ex keeps it so (no
 // deblocking, every cdef_idx 0) whatever fp it's given.
 void av1enc_hybrid_set_intrabc(av1enc_hybrid *h, int on);
+// The next pictures are 4:4:4 (on; the High profile, seq_profile 1) or 4:2:0 (off, the default).
+// In 4:4:4 every plane given, padded, reconstructed and referenced is w x h (MiCols*4 x MiRows*4
+// padded), the record has fp.chroma_format AV1G_CHROMA_444 (av1enc_hybrid_write_ex keeps it,
+// whatever fp it's given), the closed loop makes its own chroma decisions (it ignores
+// AV1ENC_HYBRID_GIVEN_CHROMA: the analysis's are 4:2:0's), and inter frames are refused (4:2:0
+// only). Tiles aren't kept across a change.
+void av1enc_hybrid_set_chroma_444(av1enc_hybrid *h, int on);
 // A picture's intra block copy hashes, taken ahead of its closed loop on any thread (each handle
 // on one at a time): av1enc_ibc_hashes_compute of its luma (rows width apart), then
 // av1enc_hybrid_use_ibc_hashes right before that picture's av1enc_hybrid_closed_loop_ex, which

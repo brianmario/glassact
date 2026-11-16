@@ -63,6 +63,7 @@ pub(super) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
     let mut r = Rnd(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     rec.fp.allow_screen_content_tools = 1;
     let mono = rec.fp.monochrome != 0;
+    let ss = crate::blockinfo::chroma_ss(&rec.fp);
     let pool: Vec<u8> = (0..6).map(|_| r.below(256) as u8).collect();
     rec.palette = vec![BlockPalette::default(); rec.blocks.len()];
     rec.palette_map.clear();
@@ -73,7 +74,7 @@ pub(super) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
         if !intra || bs < BLOCK_8X8 || bw4(bs) > 16 || bh4(bs) > 16 || r.below(100) >= pct {
             continue;
         }
-        let chroma = has_chroma(bs, b.mi_row as i32, b.mi_col as i32, mono);
+        let chroma = has_chroma(bs, b.mi_row as i32, b.mi_col as i32, mono, ss);
         let (luma, uv) = match r.below(4) {
             0 => (true, false),
             1 if chroma => (false, true),
@@ -105,7 +106,7 @@ pub(super) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
                 crate::blockinfo::mi_cols(rec.fp.width as i32),
                 crate::blockinfo::mi_rows(rec.fp.height as i32),
             );
-            let d = walk::map_dims(bs, b.mi_row as i32, b.mi_col as i32, mi_rows, mi_cols, true);
+            let d = walk::map_dims(bs, b.mi_row as i32, b.mi_col as i32, mi_rows, mi_cols, true, ss);
             map(&mut r, n, d.w, d.h, &mut rec.palette_map);
         }
         n_pal += 1;
@@ -156,7 +157,7 @@ fn expect_palettes(want: &Record, got: &Record, what: &str) {
             if n == 0 {
                 continue;
             }
-            let d = walk::map_dims(bs, r, c, mi_rows, mi_cols, uv);
+            let d = walk::map_dims(bs, r, c, mi_rows, mi_cols, uv, crate::blockinfo::chroma_ss(&want.fp));
             for y in 0..d.oh {
                 assert_eq!(
                     want.palette_map[oa + y * d.w..][..d.ow],

@@ -163,11 +163,13 @@ pub(crate) struct TilePlan {
     pub ok: bool,
     /// the group square's side in 4x4s (a power of two)
     pub unit: i32,
+    /// the frame's chroma subsampling (1: a sub-8x8 block's chroma is its 8x8's)
+    ss: i32,
 }
 
 impl TilePlan {
     /// Sizes the plan for a tile of `bufs`'s geometry, its blocks first..end and their tx blocks
-    /// txb0..txb1, in groups of `unit` x `unit` 4x4s.
+    /// txb0..txb1, in groups of `unit` x `unit` 4x4s, of a frame whose chroma subsampling is `ss`.
     #[allow(clippy::too_many_arguments)]
     pub fn setup(
         &mut self,
@@ -178,7 +180,9 @@ impl TilePlan {
         txb0: usize,
         txb1: usize,
         unit: i32,
+        ss: i32,
     ) {
+        self.ss = ss;
         (self.r0, self.c0, self.mw, self.mh) = (bufs.r0, bufs.c0, bufs.mw, bufs.mh);
         *out.view.get_mut().unwrap_or_else(|e| e.into_inner()) = TileView {
             planes: core::array::from_fn(|p| bufs.plane[p].as_mut_ptr() as usize),
@@ -264,8 +268,8 @@ impl TilePlan {
         if !is_inter {
             self.near.clear();
             self.ring(r, c, bh, bw);
-            if has_chroma && (bw == 1 || bh == 1) {
-                // the chroma of a sub-8x8 block covers its 8x8
+            if has_chroma && self.ss != 0 && (bw == 1 || bh == 1) {
+                // the chroma of a 4:2:0 sub-8x8 block covers its 8x8
                 self.ring(r & !1, c & !1, bh.max(2), bw.max(2));
             }
             self.add_deps(g);
@@ -273,10 +277,11 @@ impl TilePlan {
             // the source's 4x4s, which is_mv_valid keeps inside the tile and before the block, to
             // whole 8x8s: a sub-8x8 block's chroma is its 8x8's last block's
             let (y0, x0) = (r * 4 + (dv[0] >> 3), c * 4 + (dv[1] >> 3));
-            // (and 2 luma samples more along an odd component: the bilinear chroma reads them)
+            // (and in 4:2:0 2 luma samples more along an odd component: the bilinear chroma reads
+            // them)
             let (y1, x1) = (
-                y0 + 4 * bh + 2 * ((dv[0] >> 3) & 1),
-                x0 + 4 * bw + 2 * ((dv[1] >> 3) & 1),
+                y0 + 4 * bh + 2 * ((dv[0] >> 3) & self.ss),
+                x0 + 4 * bw + 2 * ((dv[1] >> 3) & self.ss),
             );
             let ((ry0, ry1), (rx0, rx1)) = (
                 ((y0 >> 3) << 1, (((y1 + 7) >> 3) << 1).min(self.r0 + self.mh)),
@@ -512,7 +517,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
     if is_inter && f.intrabc {
         let dv = mvs[((r - t.r0) * t.mw + c - t.c0) as usize];
         let dv = [dv[0] as i32, dv[1] as i32];
-        predict_intrabc_block(&mut planes, t.stride, t.r0, t.c0, r, c, bsize, has_chroma, dv);
+        predict_intrabc_block(&mut planes, t.stride, t.r0, t.c0, r, c, bsize, has_chroma, f.ss, dv);
     } else if is_inter && f.refs.is_some() {
         let maps = InterMaps {
             ref0,
@@ -530,7 +535,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let tx = unsafe { &mut *rec.txb.add(ti) };
         let plane = tx.plane as usize;
         let tx_sz = tx.tx_size as i32;
-        let sub = (plane != 0) as i32;
+        let sub = f.sub(plane);
         let (ox, oy) = ((t.c0 * 4) >> sub, (t.r0 * 4) >> sub);
         let (lx, ly) = (tx.x4 as i32 * 4 - ox, tx.y4 as i32 * 4 - oy);
         let stride = t.stride[plane];
@@ -539,10 +544,10 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let pal_n = [pal.size_y, pal.size_uv][(plane > 0) as usize];
         if !is_inter && pal_n != 0 {
             // the maps start at map_off: luma, then chroma (the plan's walk checked them)
-            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, plane > 0);
+            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, plane > 0, f.ss);
             let at = pal.map_off as usize
                 + if plane > 0 && pal.size_y != 0 {
-                    let l = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, false);
+                    let l = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, false, f.ss);
                     l.w * l.h
                 } else {
                     0
@@ -569,6 +574,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
             };
             predict_intra_txb(
                 fp,
+                f.ss,
                 b,
                 plane,
                 tx_sz,
@@ -593,7 +599,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
             tx.tx_type as i32
         } else {
             let tt = if is_inter {
-                let (y4, x4) = (((tx.y4 as i32) << 1).max(r) - r, ((tx.x4 as i32) << 1).max(c) - c);
+                let (y4, x4) = (((tx.y4 as i32) << sub).max(r) - r, ((tx.x4 as i32) << sub).max(c) - c);
                 chroma_tx_type_inter(
                     tx_sz,
                     ws.tx_types[y4 as usize][x4 as usize] as i32,

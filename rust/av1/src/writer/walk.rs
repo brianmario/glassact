@@ -32,6 +32,8 @@ pub(crate) struct Frame<'a> {
     pub mi_cols: i32,
     pub mi_rows: i32,
     pub mono: bool,
+    /// the chroma planes' subsampling, both ways: 1 (4:2:0) or 0 (4:4:4)
+    pub ss: i32,
     pub sb_cols: i32,
     pub sb_rows: i32,
     pub tiles: TileInfo,
@@ -72,6 +74,11 @@ impl Frame<'_> {
     fn planes(&self) -> usize {
         if self.mono { 1 } else { 3 }
     }
+    /// The subsampling of plane `p` (0 for luma).
+    #[inline(always)]
+    pub(super) fn sub(&self, p: usize) -> i32 {
+        if p != 0 { self.ss } else { 0 }
+    }
     /// the superblock's size in luma 4x4 units (sbSize4)
     #[inline(always)]
     pub(super) fn sb_size4(&self) -> i32 {
@@ -91,7 +98,7 @@ pub(crate) struct TileBufs {
     /// 128x128 superblock's blocks never reaching past the 64x64s that start inside the frame)
     pub sb_cols: i32,
     pub sb_rows: i32,
-    /// the tile's 64x64s' samples, stride sb_cols * 64 >> sub
+    /// the tile's 64x64s' samples, stride sb_cols * 64 >> sub (sub: the plane's subsampling)
     pub plane: [Vec<u8>; 3],
     pub stride: [usize; 3],
     pub height: [usize; 3],
@@ -102,7 +109,7 @@ pub(crate) struct TileBufs {
     pub skip: Vec<u8>,
     pub tx_size: Vec<u8>,
     pub uv_mode: Vec<u8>,
-    /// LoopfilterTxSizes for U, V: (mh / 2) x (mw / 2)
+    /// LoopfilterTxSizes for U, V: (mh >> ss) x (mw >> ss)
     pub lf_uv: [Vec<u8>; 2],
     /// cdef_idx per 64x64 (-1: no non-skip block)
     pub sb_cdef: Vec<i8>,
@@ -132,7 +139,7 @@ impl TileBufs {
         self.sb_rows = ((r1 + 15) >> 4) - (r0 >> 4);
         self.has_planes = planes;
         for p in 0..3 {
-            let sub = (p != 0) as usize;
+            let sub = f.sub(p) as usize;
             self.stride[p] = (self.sb_cols as usize * 64) >> sub;
             self.height[p] = (self.sb_rows as usize * 64) >> sub;
             if planes && p < f.planes() {
@@ -150,7 +157,7 @@ impl TileBufs {
             m.clear();
             m.resize(nmi, 0);
         }
-        let nuv = ((self.mw >> 1) * (self.mh >> 1)) as usize;
+        let nuv = ((self.mw >> f.ss) * (self.mh >> f.ss)) as usize;
         for m in &mut self.lf_uv {
             m.clear();
             m.resize(nuv, 0);
@@ -460,8 +467,8 @@ pub(super) fn predict_inter_block(
 ) {
     let mi = |y: i32, x: i32| ((y - maps.r0) * maps.mw + (x - maps.c0)) as usize;
     for plane in 0..1 + 2 * has_chroma as usize {
-        let sub = (plane != 0) as i32;
-        let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
+        let sub = f.sub(plane);
+        let plane_sz = if plane != 0 { uv_bsize(bsize, f.ss) } else { bsize };
         let (n4w, n4h) = (bw4(plane_sz), bh4(plane_sz));
         let (base_x, base_y) = ((c >> sub) * 4, (r >> sub) * 4);
         let (mut cand_r, mut cand_c) = ((r >> sub) << sub, (c >> sub) << sub);
@@ -531,11 +538,11 @@ pub(super) fn predict_inter_block(
 
 /// An intra block copy block's prediction (spec 7.11.3 with use_intrabc), the whole block: luma
 /// copies the tile's reconstruction at the displacement `dv` ([row, col], 1/8 luma sample, whole
-/// samples; the BILINEAR filter at position 0 is a copy), and 4:2:0 chroma does too where the
-/// displacement is even, or averages two samples along an odd component (the BILINEAR filter at
-/// the half position: Round2(a + b, 1)), four where both are (Round2(a + b + c + d, 2)). The source
-/// (spec is_mv_valid, and with an odd component that one more chroma sample) is inside the tile,
-/// decoded and apart from the block.
+/// samples; the BILINEAR filter at position 0 is a copy), and 4:4:4 chroma does too, and 4:2:0
+/// chroma where the displacement is even, or averages two samples along an odd component (the
+/// BILINEAR filter at the half position: Round2(a + b, 1)), four where both are (Round2(a + b + c +
+/// d, 2)). The source (spec is_mv_valid, and with an odd component that one more chroma sample) is
+/// inside the tile, decoded and apart from the block. `ss`: the chroma subsampling.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predict_intrabc_block(
     planes: &mut [&mut [u8]; 3],
@@ -546,10 +553,11 @@ pub(super) fn predict_intrabc_block(
     c: i32,
     bsize: i32,
     has_chroma: bool,
+    ss: i32,
     dv: [i32; 2],
 ) {
     for plane in 0..1 + 2 * has_chroma as usize {
-        let sub = (plane != 0) as i32;
+        let sub = if plane != 0 { ss } else { 0 };
         let (w, h) = (((4 * bw4(bsize)) >> sub) as usize, ((4 * bh4(bsize)) >> sub) as usize);
         let (x, y) = (((c - c0) * 4) >> sub, ((r - r0) * 4) >> sub);
         let (sx, sy) = (x + ((dv[1] >> 3) >> sub), y + ((dv[0] >> 3) >> sub));
@@ -621,11 +629,12 @@ impl TxbEdges {
 }
 
 /// An intra tx block's prediction (with CfL, from the block's luma reconstructed so far: the
-/// luma extent `max_luma`) into `cur`, its plane, at tile-local sample (lx, ly); `luma` is the
-/// luma plane for a chroma tx block.
+/// luma extent `max_luma`, averaged over 2x2 in 4:2:0, `ss` 1) into `cur`, its plane, at tile-local
+/// sample (lx, ly); `luma` is the luma plane for a chroma tx block.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn predict_intra_txb(
     fp: &FrameParams,
+    ss: i32,
     b: &Block,
     plane: usize,
     tx_sz: i32,
@@ -701,8 +710,8 @@ pub(super) fn predict_intra_txb(
             lx,
             ly,
             tx_sz,
-            1,
-            1,
+            ss,
+            ss,
             max_luma.0,
             max_luma.1,
             if plane == 1 { b.cfl_alpha_u } else { b.cfl_alpha_v } as i32,
@@ -991,7 +1000,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let sb4 = self.f.sb_size4();
         let st = &mut *self.st;
         for p in 0..self.f.planes() {
-            let sub = (p != 0) as i32;
+            let sub = self.f.sub(p);
             let sb_width4 = (st.mi_col_end - c) >> sub;
             let sb_height4 = (st.mi_row_end - r) >> sub;
             for y in -1..=(sb4 >> sub) {
@@ -1647,15 +1656,16 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
 
     /// is_mv_valid (spec 6.10.25) of an intra block copy block at (r, c) with displacement `dv`,
     /// within the writer's toolset: a whole-sample displacement and a block of at least 8x8 (so the
-    /// chroma special case never applies); with chroma and an odd component, the source one more
-    /// chroma sample that way (2 luma samples: what the BILINEAR filter's half position reads
-    /// beyond it) valid too, so that every sample the prediction reads is decoded, in the tile.
+    /// chroma special case never applies); with 4:2:0 chroma and an odd component, the source one
+    /// more chroma sample that way (2 luma samples: what the BILINEAR filter's half position reads
+    /// beyond it) valid too, so that every sample the prediction reads is decoded, in the tile
+    /// (4:4:4 chroma copies at the luma displacement, reading what luma does).
     fn dv_valid(&self, r: i32, c: i32, bsize: i32, dv: [i32; 2]) -> bool {
         let (bw, bh) = (4 * bw4(bsize), 4 * bh4(bsize));
         if dv[0].abs() >= 1 << 14 || dv[1].abs() >= 1 << 14 || (dv[0] | dv[1]) & 7 != 0 || bw < 8 || bh < 8 {
             return false;
         }
-        let chroma = !self.f.mono;
+        let chroma = !self.f.mono && self.f.ss != 0;
         let (ey, ex) = (
             2 * (chroma && (dv[0] >> 3) & 1 != 0) as i32,
             2 * (chroma && (dv[1] >> 3) & 1 != 0) as i32,
@@ -1884,7 +1894,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     "block {b_idx}: a luma palette needs y_mode DC_PRED, no filter intra and increasing colours"
                 );
             }
-            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, false);
+            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, false, f.ss);
             len += d.w * d.h;
         }
         if p.size_uv != 0 {
@@ -1895,7 +1905,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     "block {b_idx}: a chroma palette needs chroma, uv_mode DC_PRED and non-decreasing U colours"
                 );
             }
-            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, true);
+            let d = map_dims(bs, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, true, f.ss);
             len += d.w * d.h;
         }
         let Rec::Write { palette_map, .. } = rec else {
@@ -2073,16 +2083,16 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         st.mi_size = bsize;
         st.bw4 = bw4(bsize);
         st.bh4 = bh4(bsize);
-        st.has_chroma = has_chroma(bsize, r, c, f.mono);
+        st.has_chroma = has_chroma(bsize, r, c, f.mono, f.ss);
         st.avail_u = st.is_inside(r - 1, c);
         st.avail_l = st.is_inside(r, c - 1);
         st.avail_uc = st.avail_u;
         st.avail_lc = st.avail_l;
         if st.has_chroma {
-            if st.bh4 == 1 {
+            if f.ss != 0 && st.bh4 == 1 {
                 st.avail_uc = st.is_inside(r - 2, c);
             }
-            if st.bw4 == 1 {
+            if f.ss != 0 && st.bw4 == 1 {
                 st.avail_lc = st.is_inside(r, c - 2);
             }
         } else {
@@ -2249,7 +2259,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     let maps = self.st.maps.as_ref().unwrap();
                     for (uv, n) in [(false, pal.size_y), (true, pal.size_uv)] {
                         if n != 0 {
-                            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, uv);
+                            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, uv, f.ss);
                             p.palette_map.extend_from_slice(&maps.map[uv as usize][..d.w * d.h]);
                         }
                     }
@@ -2358,7 +2368,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             // reset_block_context
             let st = &mut *self.st;
             for p in 0..planes {
-                let sub = (p != 0) as i32;
+                let sub = f.sub(p);
                 for i in (c >> sub)..((c + bw) >> sub) {
                     st.above_level[p][i as usize] = 0;
                     st.above_dc[p][i as usize] = 0;
@@ -2413,7 +2423,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 let [a, b, c_] = &mut bufs.plane;
                 let mut planes: [&mut [u8]; 3] = [a, b, c_];
                 let dv = [bi.mv_row as i32, bi.mv_col as i32];
-                predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma_, dv);
+                predict_intrabc_block(&mut planes, bufs.stride, bufs.r0, bufs.c0, r, c, bsize, has_chroma_, f.ss, dv);
             } else {
                 self.predict_inter_block(bsize, has_chroma_);
             }
@@ -2434,11 +2444,11 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 for uy in 0..units_h {
                     for ux in 0..units_w {
                         for $plane in 0..planes {
-                            let sub = ($plane != 0) as i32;
-                            let $tx_sz = if $plane != 0 { uv_tx_size(bsize) } else { tx_size };
+                            let sub = f.sub($plane);
+                            let $tx_sz = if $plane != 0 { uv_tx_size(bsize, f.ss) } else { tx_size };
                             let step_x = t8(&Tx_Width, $tx_sz) >> 2;
                             let step_y = t8(&Tx_Height, $tx_sz) >> 2;
-                            let plane_sz = if $plane != 0 { uv_bsize(bsize) } else { bsize };
+                            let plane_sz = if $plane != 0 { uv_bsize(bsize, f.ss) } else { bsize };
                             let (num4x4_w, num4x4_h) = (bw4(plane_sz).min(16 >> sub), bh4(plane_sz).min(16 >> sub));
                             let (ox, oy) = ((ux << 4) >> sub, (uy << 4) >> sub);
                             let (base_x4, base_y4) = (c >> sub, r >> sub);
@@ -2558,7 +2568,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
     fn intra_edges(&self, b: &Block, t: &Txb, xi: i32, yi: i32, sbr: i32, sbc: i32, step: (i32, i32)) -> Res<TxbEdges> {
         let (f, st, bufs) = (self.f, &*self.st, &*self.bufs);
         let plane = t.plane as usize;
-        let sub = (plane != 0) as i32;
+        let sub = f.sub(plane);
         let (step_x, step_y) = step;
         let (bl, bu) = if plane == 0 {
             (st.avail_l, st.avail_u)
@@ -2589,6 +2599,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                         &bufs.y_mode,
                         &bufs.uv_mode,
                         bufs.mw,
+                        f.ss,
                     )
                 } else {
                     0
@@ -2610,6 +2621,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 st.mi_col_end,
                 &f.ordmap[plane],
                 ((f.sb_cols * 16) >> sub) as usize,
+                f.ss,
             );
             if c.have_left != e.left
                 || c.have_above != e.above
@@ -2643,7 +2655,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let fp = &f.fp;
         let plane = t.plane as usize;
         let tx_sz = t.tx_size as i32;
-        let sub = (plane != 0) as i32;
+        let sub = f.sub(plane);
         let (start_x, start_y) = (t.x4 as i32 * 4, t.y4 as i32 * 4);
         let row = (start_y << sub) >> 2;
         let col = (start_x << sub) >> 2;
@@ -2679,7 +2691,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             } else if [self.st.pal.size_y, self.st.pal.size_uv][(plane > 0) as usize] != 0 {
                 // predict_palette (palette_tokens filled the maps)
                 let st = &*self.st;
-                let d = map_dims(st.mi_size, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, plane > 0);
+                let d = map_dims(st.mi_size, st.mi_row, st.mi_col, f.mi_rows, f.mi_cols, plane > 0, f.ss);
                 let (bx, by) = map_origin(st.mi_row, st.mi_col, sub);
                 predict_palette(
                     &mut self.bufs.plane[plane],
@@ -2703,6 +2715,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                 let luma_stride = self.bufs.stride[0];
                 predict_intra_txb(
                     fp,
+                    f.ss,
                     b,
                     plane,
                     tx_sz,
@@ -2734,8 +2747,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
                     // compute_tx_type: the luma type at Max(MiRow / MiCol, the chroma position << 1)
                     let st = &*self.st;
                     let (y4, x4) = (
-                        ((t.y4 as i32) << 1).max(st.mi_row) - st.mi_row,
-                        ((t.x4 as i32) << 1).max(st.mi_col) - st.mi_col,
+                        ((t.y4 as i32) << sub).max(st.mi_row) - st.mi_row,
+                        ((t.x4 as i32) << sub).max(st.mi_col) - st.mi_col,
                     );
                     chroma_tx_type_inter(
                         tx_sz,
@@ -2801,8 +2814,8 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         if plane > 0 {
             // LoopfilterTxSizes for the chroma planes (luma uses the tx_size map)
             let bufs = &mut *self.bufs;
-            let (cs, cr) = (f.mi_cols >> 1, f.mi_rows >> 1);
-            let (cx0, cy0, cw) = (bufs.c0 >> 1, bufs.r0 >> 1, bufs.mw >> 1);
+            let (cs, cr) = (f.mi_cols >> f.ss, f.mi_rows >> f.ss);
+            let (cx0, cy0, cw) = (bufs.c0 >> f.ss, bufs.r0 >> f.ss, bufs.mw >> f.ss);
             let m = &mut bufs.lf_uv[plane - 1];
             let (x4, y4) = (t.x4 as i32, t.y4 as i32);
             for i in 0..step_y {
@@ -2838,7 +2851,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let st = &mut *self.st;
         let cdf = &mut st.cdf;
         let ptype = (plane > 0) as usize;
-        let sub = (plane != 0) as i32;
+        let sub = f.sub(plane);
         let tsz = tx_sz as usize;
         let tx_sz_ctx = (Tx_Size_Sqr[tsz] as usize + Tx_Size_Sqr_Up[tsz] as usize + 1) >> 1;
         let (w, h) = (Tx_Width[tsz] as i32, Tx_Height[tsz] as i32);
@@ -2850,7 +2863,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
         let ctx = {
             let al = &st.above_level[plane];
             let ll = &st.left_level[plane];
-            let bsz = if plane != 0 { uv_bsize(st.mi_size) } else { st.mi_size };
+            let bsz = if plane != 0 { uv_bsize(st.mi_size, f.ss) } else { st.mi_size };
             let (bw, bh) = (4 * bw4(bsz), 4 * bh4(bsz));
             let wn = w4.min(max_x4 - x4).max(0) as usize;
             let hn = h4.min(max_y4 - y4).max(0) as usize;

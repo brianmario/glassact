@@ -948,11 +948,12 @@ fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
         Ok(r)
             if (r.rec.fp.frame_type == FRAME_INTER
                 || r.rec.fp.sb128 != 0
+                || r.rec.fp.chroma_format != 0
                 || r.rec.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0))
                 && crc != OK =>
         {
-            // an inter frame, 128x128 superblocks or palette blocks (a damaged frame_type,
-            // use_128x128_superblock or has_palette_y/uv): the C++ has none of them
+            // an inter frame, 128x128 superblocks, 4:4:4 or palette blocks (a damaged frame_type,
+            // use_128x128_superblock, seq_profile or has_palette_y/uv): the C++ has none of them
             Some(r)
         }
         Ok(r) => {
@@ -1031,6 +1032,7 @@ fn parse_matches_c() {
                 a.mi_row as i32,
                 a.mi_col as i32,
                 want.fp.monochrome != 0,
+                crate::blockinfo::chroma_ss(&want.fp),
             ) {
                 a.uv_mode = b.uv_mode;
                 a.angle_delta_uv = b.angle_delta_uv;
@@ -1706,7 +1708,7 @@ pub(crate) fn big_record(seed: u64, w: u32, h: u32, cols_log2: i8, rows_log2: i8
                         if bs >= BLOCK_8X8 && crate::dsp::is_directional(b.y_mode as i32) && r.below(2) == 0 {
                             b.angle_delta_y = r.below(7) as i8 - 3;
                         }
-                        if has_chroma(bs, rr, cc, false) {
+                        if has_chroma(bs, rr, cc, false, 1) {
                             b.uv_mode = r.below(if cfl_allowed(bs) { 14 } else { 13 }) as u8;
                             if b.uv_mode as i32 == UV_CFL_PRED {
                                 b.cfl_alpha_u = r.below(33) as i8 - 16;

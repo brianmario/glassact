@@ -5,8 +5,8 @@
 use super::*;
 
 /// The current block's colour index maps, as the decoder has them: luma `w x h` (row-major), chroma
-/// half each way. Only the on-screen part is coded; the prediction repeats its last column and
-/// row past it.
+/// half each way (4:2:0) or the same (4:4:4). Only the on-screen part is coded; the prediction
+/// repeats its last column and row past it.
 pub(crate) struct PaletteMaps {
     pub map: [[u8; 64 * 64]; 2],
 }
@@ -27,10 +27,19 @@ pub(crate) struct MapDims {
     pub oh: usize,
 }
 
-/// The block's map geometry for plane type `uv` (spec palette_tokens; 4:2:0 or monochrome): a
-/// chroma map narrower or shorter than 4 (of a 4x16 or 16x4 block) is 2 more, the chroma of its
-/// 8x8, which starts at [`map_origin`].
-pub(crate) fn map_dims(bsize: i32, mi_row: i32, mi_col: i32, mi_rows: i32, mi_cols: i32, uv: bool) -> MapDims {
+/// The block's map geometry for plane type `uv` (spec palette_tokens: the block's and its on-screen
+/// size >> subsampling_x / _y, `ss` both ways): a chroma map narrower or shorter than 4 (in 4:2:0,
+/// of a 4x16 or 16x4 block) is 2 more, the chroma of its 8x8, which starts at [`map_origin`]. A
+/// 4:4:4 chroma map is the luma map's size (palette blocks are 8x8 and up).
+pub(crate) fn map_dims(
+    bsize: i32,
+    mi_row: i32,
+    mi_col: i32,
+    mi_rows: i32,
+    mi_cols: i32,
+    uv: bool,
+    ss: i32,
+) -> MapDims {
     let (w, h) = ((4 * bw4(bsize)) as usize, (4 * bh4(bsize)) as usize);
     let ow = w.min(((mi_cols - mi_col) * 4) as usize);
     let oh = h.min(((mi_rows - mi_row) * 4) as usize);
@@ -39,13 +48,13 @@ pub(crate) fn map_dims(bsize: i32, mi_row: i32, mi_col: i32, mi_rows: i32, mi_co
     }
     let (mut d, wide, tall) = (
         MapDims {
-            w: w >> 1,
-            h: h >> 1,
-            ow: ow >> 1,
-            oh: oh >> 1,
+            w: w >> ss,
+            h: h >> ss,
+            ow: ow >> ss,
+            oh: oh >> ss,
         },
-        w >> 1 >= 4,
-        h >> 1 >= 4,
+        w >> ss >= 4,
+        h >> ss >= 4,
     );
     if !wide {
         (d.w, d.ow) = (d.w + 2, d.ow + 2);
@@ -56,7 +65,8 @@ pub(crate) fn map_dims(bsize: i32, mi_row: i32, mi_col: i32, mi_rows: i32, mi_co
     d
 }
 
-/// Where a block's map of plane `sub` (0 luma, 1 chroma) starts, in that plane's samples.
+/// Where a block's map of a plane subsampled `sub` (0: luma, 4:4:4 chroma; 1: 4:2:0 chroma) starts,
+/// in that plane's samples.
 pub(crate) fn map_origin(mi_row: i32, mi_col: i32, sub: i32) -> (i32, i32) {
     ((mi_col >> sub) * 4, (mi_row >> sub) * 4)
 }
@@ -389,7 +399,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             if n == 0 {
                 continue;
             }
-            let d = map_dims(bsize, self.st.mi_row, self.st.mi_col, f.mi_rows, f.mi_cols, uv);
+            let d = map_dims(bsize, self.st.mi_row, self.st.mi_col, f.mi_rows, f.mi_cols, uv, f.ss);
             let mut maps = self.st.maps.take().unwrap_or_default();
             let map = &mut maps.map[uv as usize];
             if S::WRITE {

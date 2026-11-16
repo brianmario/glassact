@@ -88,6 +88,8 @@ struct Seq {
     cdef: bool,
     restoration: bool,
     mono: bool,
+    /// seq_profile 1 (High): 4:4:4
+    chroma444: bool,
     separate_uv: bool,
     force_sct: u32,
     force_int_mv: u32,
@@ -122,7 +124,8 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     let profile = br.f(3)?;
     sq.still = br.b()?;
     sq.reduced = br.b()?;
-    need!(profile == 0, "only Main profile (got {profile})");
+    need!(profile <= 1, "only the Main and High profiles (got {profile})");
+    sq.chroma444 = profile == 1;
     if sq.reduced {
         sq.level = br.f(5)? as i32;
     } else {
@@ -194,7 +197,8 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     sq.cdef = br.b()?;
     sq.restoration = br.b()?;
     need!(br.f(1)? == 0, "only 8-bit supported");
-    sq.mono = br.b()?;
+    // color_config: the High profile has no mono_chrome (0), and its subsampling is 0, 0
+    sq.mono = !sq.chroma444 && br.b()?;
     let (mut cp, mut tc, mut mc) = (2, 2, 2);
     if br.b()? {
         cp = br.f(8)?;
@@ -207,7 +211,9 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
     } else {
         need!(!(cp == 1 && tc == 13 && mc == 0), "4:4:4 identity matrix not supported");
         sq.colour[3] = br.f(1)?; // color_range
-        br.f(2)?; // chroma_sample_position
+        if !sq.chroma444 {
+            br.f(2)?; // chroma_sample_position (subsampling_x && subsampling_y)
+        }
         sq.separate_uv = br.b()?;
     }
     sq.film_grain = br.b()?;
@@ -408,6 +414,7 @@ fn parse_frame(
     fp.width = fw;
     fp.height = fh;
     fp.monochrome = sq.mono as u8;
+    fp.chroma_format = if sq.chroma444 { CHROMA_444 } else { CHROMA_420 };
     let mut tile_size_bytes = 4;
     let mut context_tile = 0usize;
     // tile_info
@@ -602,6 +609,7 @@ fn parse_frame(
         mi_cols,
         mi_rows,
         mono,
+        ss: crate::blockinfo::chroma_ss(fp),
         sb_cols: (mi_cols + 15) >> 4,
         sb_rows: (mi_rows + 15) >> 4,
         tiles,

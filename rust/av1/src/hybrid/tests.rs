@@ -382,7 +382,7 @@ impl Partition<'_> {
             b.tx_depth = rng.below(3) as u8;
             b.sb_qindex = rng.below(256) as u8;
         }
-        if self.chroma && has_chroma(bs, r, c, false) {
+        if self.chroma && has_chroma(bs, r, c, false, 1) {
             if self.style == Style::Variance {
                 b.uv_mode = if cfl_allowed(bs) && rng.below(4) == 0 {
                     UV_CFL_PRED

@@ -1,5 +1,5 @@
 /* av1g/decisions.h - the DecisionRecord: every coding decision + quantized
- * coefficients for ONE AV1 picture (8-bit, 4:2:0 or monochrome, 64x64 or 128x128
+ * coefficients for ONE AV1 picture (8-bit, 4:2:0, 4:4:4 or monochrome, 64x64 or 128x128
  * superblocks): an intra-only still picture (reduced_still_picture_header), or a
  * key frame or inter frame of a video stream (fp.video, see "Video mode" below).
  * Interface version 2 (version 1 records are still accepted: they are still
@@ -243,6 +243,18 @@
  *   size is the stream's, so a decoder shows it scaled up to the stream's size.  Every frame of
  *   a stream must give the same stream size.  An inter frame's reference must be the frame's
  *   own size: this writer doesn't code scaled prediction, which a decoder would apply.
+ *
+ * 4:4:4 (fp.chroma_format = AV1G_CHROMA_444, version 2).  The High profile (seq_profile 1):
+ *   the chroma planes are the luma plane's size (subsampling_x = subsampling_y = 0), not half
+ *   each way, so "chroma half" below reads "chroma the same" and ssx = ssy = 0.  Every block has
+ *   chroma (no sub-8x8 pairing), coded with its own position and size: the chroma block is the
+ *   block, its tx size Max_Tx_Size_Rect of the block with 64-sample sides capped at 32 (a 64x64
+ *   block's chroma is four 32x32s), CfL reads the co-located luma unaveraged (<< 3), palette
+ *   colour index maps are the block's size for chroma too, intra block copy copies chroma at the
+ *   luma displacement, and the post-filters work on chroma 4x4 edges and 8x8 CDEF blocks as on
+ *   luma (chroma filter lengths and CDEF damping as for 4:2:0 chroma).  Key frames and still
+ *   pictures only (inter frames are refused), not monochrome; the reconstruction and reference
+ *   planes are width x height for every plane.  Version 1 records are 4:2:0.
  * ==============================================================================
  */
 #ifndef AV1G_DECISIONS_H
@@ -256,6 +268,10 @@ extern "C" {
 #endif
 
 #define AV1G_DECISIONS_VERSION 2
+
+/* av1g_frame_params.chroma_format (version 2; ignored, as 4:2:0, in version 1 records) */
+#define AV1G_CHROMA_420 0
+#define AV1G_CHROMA_444 1
 
 /* av1g_frame_params.frame_type (video mode) */
 #define AV1G_FRAME_KEY   0
@@ -338,6 +354,8 @@ typedef struct av1g_frame_params {
     uint16_t stream_width;         /* video: the stream's size when this frame is coded smaller */
     uint16_t stream_height;        /*   (see "Reduced frames"); 0 or width/height: full size */
     uint8_t  golden_slot;          /* inter: GOLDEN_FRAME's slot + 1; 0 = fp.ref_slot's (see "Video mode") */
+    /* ---- v2, 4:4:4 (in what was trailing padding: the structure's size is unchanged) ---- */
+    uint8_t  chroma_format;        /* AV1G_CHROMA_420 (0) / AV1G_CHROMA_444 (see "4:4:4") */
 } av1g_frame_params;
 
 typedef struct av1g_block_inter {

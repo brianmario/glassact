@@ -12,8 +12,11 @@
 //! Order (spec 7.14 / 7.15): deblock every plane - pass 0 (vertical edges) of a plane completes
 //! before its pass 1 (horizontal edges); within a pass all edges are independent - then CDEF reads
 //! the deblocked frame and writes a separate output frame; all 8x8 blocks are independent. 8-bit,
-//! 4:2:0 or monochrome, no segmentation / delta-lf / lossless; `lf_level` are the effective levels
-//! (Y vertical, Y horizontal, U, V).
+//! 4:2:0, 4:4:4 or monochrome, no segmentation / delta-lf / lossless; `lf_level` are the effective
+//! levels (Y vertical, Y horizontal, U, V). In 4:4:4 the chroma planes are filtered on luma's grid:
+//! every 4x4 edge (7.14: colStep / rowStep 1 << subsampling), and 8x8 CDEF blocks (7.15.3: 8 >>
+//! subsampling) whose direction is luma's (Cdef_Uv_Dir[0][0] is the identity), with chroma's filter
+//! lengths (at most 6 taps: 7.14.6.2) and damping (CdefDamping - 1) as in 4:2:0.
 //!
 //! On aarch64 the frame-level functions run NEON filters (postfilter/neon.rs) for whole edge rows
 //! and interior 8x8 blocks; the scalar functions stay the reference.
@@ -39,6 +42,8 @@ pub struct PfFrame {
     pub mi_rows: i32,
     pub mi_cols: i32,
     pub mono: bool,
+    /// the chroma planes' subsampling, both ways: 1 (4:2:0) or 0 (4:4:4)
+    pub ss: i32,
     pub sb_cols: i32,
     pub sb_rows: i32,
     /// effective loop filter levels Y vertical, Y horizontal, U, V (0..63); 0 = off
@@ -71,6 +76,7 @@ impl PfFrame {
             mi_rows,
             mi_cols,
             mono: fp.monochrome != 0,
+            ss: chroma_ss(fp),
             sb_cols: (mi_cols + 15) >> 4,
             sb_rows: (mi_rows + 15) >> 4,
             lf_level,
@@ -86,10 +92,15 @@ impl PfFrame {
     fn planes(&self) -> usize {
         if self.mono { 1 } else { 3 }
     }
+    /// The subsampling of plane `p` (0 for luma).
+    #[inline(always)]
+    pub(crate) fn sub(&self, p: usize) -> i32 {
+        if p != 0 { self.ss } else { 0 }
+    }
 }
 
 /// The maps the filters read: `skip` (Skips) and `lf_tx[0]` (luma LoopfilterTxSizes) are MiRows x
-/// MiCols, stride MiCols; `lf_tx[1..3]` are (MiRows / 2) x (MiCols / 2), stride MiCols / 2;
+/// MiCols, stride MiCols; `lf_tx[1..3]` are (MiRows >> ss) x (MiCols >> ss), stride MiCols >> ss;
 /// `cdef_idx` is per 64x64, raster, stride sbCols, -1 = no CDEF (no non-skip block in it).
 /// [`PfMaps::skip`]'s bit for a block whose loop filter level is 0 (fp.lf_inter_off's inter
 /// blocks); bit 0 is the block's skip.
@@ -147,7 +158,7 @@ impl PfMapsBuf {
     /// Zeroed maps with cdef_idx = -1 everywhere.
     pub fn new(f: &PfFrame) -> PfMapsBuf {
         let nmi = (f.mi_rows * f.mi_cols) as usize;
-        let nuv = ((f.mi_rows >> 1) * (f.mi_cols >> 1)) as usize;
+        let nuv = ((f.mi_rows >> f.ss) * (f.mi_cols >> f.ss)) as usize;
         PfMapsBuf {
             skip: vec![0; nmi],
             lf_tx: [vec![0; nmi], vec![0; nuv], vec![0; nuv]],
@@ -178,9 +189,10 @@ impl PfMapsBuf {
                 self.lf_tx[0][k] = tx_y;
             }
         }
-        if has_chroma(bs, r0, c0, f.mono) {
-            let (uv_sz, tx_uv) = (uv_bsize(bs), uv_tx_size(bs) as u8);
-            let (cr, cc, y0, x0) = (f.mi_rows >> 1, f.mi_cols >> 1, r0 >> 1, c0 >> 1);
+        if has_chroma(bs, r0, c0, f.mono, f.ss) {
+            let (uv_sz, tx_uv) = (uv_bsize(bs, f.ss), uv_tx_size(bs, f.ss) as u8);
+            let ss = f.ss;
+            let (cr, cc, y0, x0) = (f.mi_rows >> ss, f.mi_cols >> ss, r0 >> ss, c0 >> ss);
             let (w, h) = (bw4(uv_sz), bh4(uv_sz));
             for y in y0..(y0 + h).min(cr) {
                 for x in x0..(x0 + w).min(cc) {
@@ -354,7 +366,7 @@ pub fn lf_line(
 /// when no tx edge is there.
 #[inline(always)]
 pub(crate) fn lf_filter_size(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col: i32) -> Option<i32> {
-    let sub = (plane != 0) as i32;
+    let sub = f.sub(plane);
     let (x_p, y_p) = ((col * 4) >> sub, (row * 4) >> sub);
     let (row, col) = (row | sub, col | sub);
     let prev_row = row - (((pass == 1) as i32) << sub);
@@ -389,9 +401,10 @@ pub(crate) fn lf_filter_size(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize,
 }
 
 /// The edge loop filter process (7.14.2): plane, pass, luma 4x4 position (row, col) - the 4 lines
-/// of one edge segment. Callers visit row / col in steps of 2 for chroma. `pl` is the plane.
+/// of one edge segment. Callers visit row / col in steps of 2 for 4:2:0 chroma (1 << ss). `pl` is
+/// the plane.
 pub fn lf_edge(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col: i32, pl: &mut [u8], stride: usize) {
-    let sub = (plane != 0) as i32;
+    let sub = f.sub(plane);
     let (x, y) = (col * 4, row * 4);
     if x >= f.w || y >= f.h || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
         return;
@@ -423,7 +436,7 @@ pub fn deblock_frame_scalar(f: &PfFrame, m: &PfMaps, planes: &mut [&mut [u8]; 3]
         if p > 0 && f.lf_level[1 + p] == 0 {
             continue;
         }
-        let step = if p != 0 { 2 } else { 1 };
+        let step = 1 << f.sub(p);
         for pass in 0..2 {
             for row in (0..f.mi_rows).step_by(step) {
                 for col in (0..f.mi_cols).step_by(step) {
@@ -579,7 +592,8 @@ pub fn cdef_params(f: &PfFrame, idx: i32, y_dir: i32, var: i32) -> CdefBlk {
         y_sec: f.cdef_y_sec[idx],
         uv_pri,
         uv_sec: f.cdef_uv_sec[idx],
-        uv_dir: if uv_pri == 0 { 0 } else { y_dir }, // Cdef_Uv_Dir[1][1] is the identity (4:2:0)
+        // Cdef_Uv_Dir[1][1] (4:2:0) and [0][0] (4:4:4) are the identity
+        uv_dir: if uv_pri == 0 { 0 } else { y_dir },
     }
 }
 
@@ -621,7 +635,7 @@ pub fn cdef_pixel(
 ) -> i32 {
     const PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]]; // Cdef_Pri_Taps
     const SEC_TAPS: [i32; 2] = [2, 1]; // Cdef_Sec_Taps
-    let sub = (plane != 0) as i32;
+    let sub = f.sub(plane);
     let x0v = src[y as usize * sstride + x as usize] as i32;
     let (pri_adj, sec_adj) = (cdef_damping_adj(pri_str, damping), cdef_damping_adj(sec_str, damping));
     let (mut sum, mut mx, mut mn) = (0, x0v, x0v);
@@ -674,7 +688,7 @@ pub fn cdef_block(
         stat(6);
     }
     for p in 0..f.planes() {
-        let sub = (p != 0) as i32;
+        let sub = f.sub(p);
         let (x0, y0, w) = ((c * 4) >> sub, (r * 4) >> sub, 8 >> sub);
         let (s, ss, ds) = (src[p], sstride[p], dstride[p]);
         for i in 0..w {
@@ -711,7 +725,7 @@ pub fn cdef_frame_scalar(
 }
 
 /// Whole-frame CDEF: `src` = the deblocked frame, `dst` = the output frame (MiCols * 4 x MiRows * 4
-/// luma samples are written, the chroma planes at half that).
+/// luma samples are written, the chroma planes at that >> ss).
 pub fn cdef_frame(
     f: &PfFrame,
     m: &PfMaps,
@@ -731,7 +745,8 @@ pub fn cdef_frame(
 }
 
 /// av1g_postfilter: deblocking then CDEF of a record's reconstruction, in place. The planes cover
-/// the coded area (MiCols * 4 x MiRows * 4 luma samples, the chroma planes at half that), with
+/// the coded area (MiCols * 4 x MiRows * 4 luma samples, the chroma planes at half that in 4:2:0,
+/// the same in 4:4:4), with
 /// strides `stride`; the chroma planes are unused (and may be empty) for monochrome.
 pub fn postfilter(fp: &FrameParams, blocks: &[Block], planes: &mut [&mut [u8]; 3], stride: &[usize; 3]) {
     postfilter_ex(fp, blocks, &[], planes, stride)
@@ -767,7 +782,7 @@ pub fn postfilter_ex(
     }
     let mut out: Vec<Vec<u8>> = (0..f.planes())
         .map(|p| {
-            let h = ((f.mi_rows * 4) >> (p != 0) as i32) as usize;
+            let h = ((f.mi_rows * 4) >> f.sub(p)) as usize;
             vec![0u8; h * stride[p]]
         })
         .collect();
@@ -779,7 +794,7 @@ pub fn postfilter_ex(
         cdef_frame(&f, &m, &src, stride, &mut dst, stride);
     }
     for p in 0..f.planes() {
-        let sub = (p != 0) as i32;
+        let sub = f.sub(p);
         let (h, w) = (((f.mi_rows * 4) >> sub) as usize, ((f.mi_cols * 4) >> sub) as usize);
         for y in 0..h {
             let o = y * stride[p];

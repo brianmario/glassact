@@ -229,7 +229,7 @@ pub fn ref_engine_encode(
     let (mc, mr) = (mi_cols(img.w as i32), mi_rows(img.h as i32));
     let (sb_cols, sb_rows) = (((mc + 15) >> 4) as usize, ((mr + 15) >> 4) as usize);
     let mut src = Src::default();
-    pad_source(img.planes, wu, hu, sb_cols, sb_rows, nplanes, &mut src, 1, None);
+    pad_source(img.planes, wu, hu, 1, sb_cols, sb_rows, nplanes, &mut src, 1, None);
     let tiles = tile_layout(img.w, img.h, -1, -1).map_err(|c| error(c, "tiling"))?;
     // pixel-domain quantizer steps (Ac_Qlookup is 8x the orthonormal step)
     let (step_y, step_c) = (ac_q(o.qindex) as f64 / 8.0, ac_q(o.qindex) as f64 / 8.0);
@@ -359,7 +359,7 @@ pub fn ref_engine_encode(
             nskip += 1;
         }
         let k = &rec.blocks[b];
-        if k.uv_mode as i32 == UV_CFL_PRED && has_chroma(k.bsize as i32, k.mi_row as i32, k.mi_col as i32, img.mono) {
+        if k.uv_mode as i32 == UV_CFL_PRED && has_chroma(k.bsize as i32, k.mi_row as i32, k.mi_col as i32, img.mono, 1) {
             ncfl += 1;
         }
     }

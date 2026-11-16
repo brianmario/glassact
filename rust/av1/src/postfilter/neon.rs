@@ -235,7 +235,7 @@ pub(super) fn cdef_frame(
                 stat(6);
             }
             for p in 0..f.planes() {
-                let sub = (p != 0) as i32;
+                let sub = f.sub(p);
                 let (x0, y0, w) = ((c * 4) >> sub, (r * 4) >> sub, 8 >> sub);
                 let (s, ss, ds) = (src[p], sstride[p], dstride[p]);
                 let d = &mut *dst[p];

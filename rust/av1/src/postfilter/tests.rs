@@ -787,6 +787,7 @@ mod oracle {
             let f = PfFrame {
                 mi_rows: mr,
                 mi_cols: mc,
+                ss: 1,
                 ..Default::default()
             };
             let v = cdef_pixel(&f, &src, 64, plane, px, py, pri, sec, dmp, dir);

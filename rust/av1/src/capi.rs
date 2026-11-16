@@ -158,16 +158,18 @@ pub unsafe extern "C" fn av1g_postfilter(
     if rec.is_null() || planes.is_null() || stride.is_null() {
         return ERR_INVALID;
     }
-    // SAFETY: the record, and planes of at least MiCols*4 x MiRows*4 (chroma half) at their strides.
+    // SAFETY: the record, and planes of at least MiCols*4 x MiRows*4 (chroma half in 4:2:0, the
+    // same in 4:4:4) at their strides.
     let rec = unsafe { &*rec };
     let blocks = unsafe { opt_slice(rec.blocks, rec.n_blocks as usize) };
     let nplanes = if rec.fp.monochrome != 0 { 1 } else { 3 };
     let mi_rows = crate::blockinfo::mi_rows(rec.fp.height as i32) as usize;
+    let ss = crate::blockinfo::chroma_ss(&rec.fp) as usize;
     let mut views: [&mut [u8]; 3] = [&mut [], &mut [], &mut []];
     let mut strides = [0usize; 3];
     for p in 0..nplanes {
         let s = unsafe { *stride.add(p) } as usize;
-        let h = (mi_rows * 4) >> (p > 0) as usize;
+        let h = (mi_rows * 4) >> if p > 0 { ss } else { 0 };
         strides[p] = s;
         views[p] = unsafe { slice::from_raw_parts_mut(*planes.add(p), s * h) };
     }
@@ -286,7 +288,7 @@ pub unsafe extern "C" fn av1g_encode_ex(
             }
             let mut pic = writer::RefPicture::default();
             for p in 0..if fp.monochrome != 0 { 1 } else { 3 } {
-                let sub = (p != 0) as u32;
+                let sub = if p != 0 { crate::blockinfo::chroma_ss(&fp) as u32 } else { 0 };
                 let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
                 let stride = r.stride[p].max(0) as usize;
                 if r.plane[p].is_null() || h == 0 || stride < w as usize {
@@ -663,9 +665,11 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop(
         unsafe { set_error_raw(err, errlen, "bad arguments") };
         return ERR_INVALID;
     }
-    // SAFETY: tight 4:2:0 planes, n blocks, and n luma tx types when given (av1enc.h).
+    // SAFETY: tight 4:2:0 (or, set so, 4:4:4) planes, n blocks, and n luma tx types when given
+    // (av1enc.h).
     let hh = unsafe { &mut *h };
-    let (cw, ch) = (w.div_ceil(2) as usize, hgt.div_ceil(2) as usize);
+    let ss = hh.h.chroma_ss();
+    let (cw, ch) = (((w + ss) >> ss) as usize, ((hgt + ss) >> ss) as usize);
     let (y, u, v, blocks) = unsafe {
         (
             slice::from_raw_parts(y, w as usize * hgt as usize),
@@ -725,10 +729,12 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         unsafe { set_error_raw(err, errlen, "bad arguments") };
         return ERR_INVALID;
     }
-    // SAFETY: tight 4:2:0 planes, n blocks, n luma tx types and n inter entries when given, and
-    // the reference's planes of the picture's size at their strides (av1enc.h).
+    // SAFETY: tight 4:2:0 (or, set so, 4:4:4) planes, n blocks, n luma tx types and n inter
+    // entries when given, and the reference's planes of the picture's size at their strides
+    // (av1enc.h).
     let hh = unsafe { &mut *h };
-    let (cw, ch) = (w.div_ceil(2) as usize, hgt.div_ceil(2) as usize);
+    let ss = hh.h.chroma_ss();
+    let (cw, ch) = (((w + ss) >> ss) as usize, ((hgt + ss) >> ss) as usize);
     let (y, u, v, blocks) = unsafe {
         (
             slice::from_raw_parts(y, w as usize * hgt as usize),
@@ -753,7 +759,7 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
         let r = unsafe { &*reference.add(i) };
         let mut p = writer::RefPicture::default();
         for k in 0..3 {
-            let sub = (k != 0) as u32;
+            let sub = if k != 0 { ss } else { 0 };
             let (pw, ph) = ((w + sub) >> sub, (hgt + sub) >> sub);
             let stride = r.stride[k].max(0) as usize;
             if r.plane[k].is_null() || stride < pw as usize {
@@ -778,7 +784,8 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
             (2 * w.div_ceil(8) as usize).div_ceil(16),
             (2 * hgt.div_ceil(8) as usize).div_ceil(16),
         );
-        let len = |pl: usize| ((sb_cols * 64) >> (pl > 0) as usize) * ((sb_rows * 64) >> (pl > 0) as usize);
+        let sub = |pl: usize| if pl > 0 { ss as usize } else { 0 };
+        let len = |pl: usize| ((sb_cols * 64) >> sub(pl)) * ((sb_rows * 64) >> sub(pl));
         given = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts(p[pl], len(pl))) });
     }
     let mut recon_into = None;
@@ -791,7 +798,8 @@ pub unsafe extern "C" fn av1enc_hybrid_closed_loop_ex(
             return ERR_INVALID;
         }
         let (rw, rh) = (2 * w.div_ceil(8) as usize * 4, 2 * hgt.div_ceil(8) as usize * 4);
-        let len = |pl: usize| (rw >> (pl > 0) as usize) * (rh >> (pl > 0) as usize);
+        let sub = |pl: usize| if pl > 0 { ss as usize } else { 0 };
+        let len = |pl: usize| (rw >> sub(pl)) * (rh >> sub(pl));
         recon_into = Some(unsafe { [0, 1, 2].map(|pl| slice::from_raw_parts_mut(p[pl], len(pl))) });
     }
     let vid = (!video.is_null()).then(|| crate::hybrid::Video {
@@ -1071,6 +1079,12 @@ pub unsafe extern "C" fn av1enc_hybrid_use_ibc_hashes(h: *mut HybridHandle, p: *
 pub unsafe extern "C" fn av1enc_hybrid_set_intrabc(h: *mut HybridHandle, on: c_int) {
     // SAFETY: the handle
     unsafe { (*h).h.set_intrabc(on != 0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_chroma_444(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_chroma_444(on != 0) }
 }
 
 #[unsafe(no_mangle)]

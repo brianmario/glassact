@@ -5,7 +5,7 @@ use super::recon::{PlanCtx, PlanOut, Ready, ReconBufs, ReconRec, ReconTile, Tile
 use super::sink::{EcSink, NullSink, TeeSink};
 use super::walk::{Frame, Rec, TileBufs, TileState, Walk};
 use super::*;
-use crate::blockinfo::{mi_cols, mi_rows};
+use crate::blockinfo::{chroma_ss, mi_cols, mi_rows};
 use crate::dsp::{
     RefPlane, get_tx_set_inter, get_tx_set_intra, tx_coeffs, tx_h, tx_type_in_set_inter, tx_type_in_set_intra, tx_w,
 };
@@ -623,7 +623,7 @@ impl<H: TxbHook> Split<'_, H> {
         let (first, end) = (j.first as usize, j.end as usize);
         let (t0, t1) = (self.block_txb[first] as usize, self.block_txb[end] as usize);
         // SAFETY: as above; the &mut ends before the groups' shared reads start
-        plan.setup(unsafe { &mut *j.pout }, bufs, first, end, t0, t1, self.unit);
+        plan.setup(unsafe { &mut *j.pout }, bufs, first, end, t0, t1, self.unit, self.plan_f.ss);
         // SAFETY: from here on, only shared: the plan's walk writes its atomics, and the groups it
         // publishes read them
         let out: &PlanOut = unsafe { &*j.pout };
@@ -1099,6 +1099,16 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     if fp.allow_screen_content_tools > 1 {
         fail!(ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
+    // 4:4:4 (version 2): key frames and still pictures, with chroma
+    if fp.version >= 2 && fp.chroma_format > CHROMA_444 {
+        fail!(ERR_INVALID, "chroma_format must be 0 (4:2:0) or 1 (4:4:4)");
+    }
+    if chroma_ss(fp) == 0 && (fp.monochrome != 0 || fp.frame_type != FRAME_KEY) {
+        fail!(
+            ERR_INVALID,
+            "4:4:4 (chroma_format 1) is for key frames and still pictures with chroma: not monochrome, not inter frames"
+        );
+    }
     if fp.allow_intrabc > 1
         || (fp.allow_intrabc != 0
             && (fp.frame_type != FRAME_KEY || fp.allow_screen_content_tools != 1 || fp.loop_filter_level != [0; 4]))
@@ -1199,7 +1209,7 @@ fn ref_planes<'a>(fp: &FrameParams, refs: Option<&RefSlots<'a>>, slot: u8) -> Re
         h: 0,
     }; 3];
     for p in 0..if fp.monochrome != 0 { 1 } else { 3 } {
-        let sub = (p != 0) as u32;
+        let sub = if p != 0 { chroma_ss(fp) as u32 } else { 0 };
         let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
         let (data, stride) = (r.plane[p], r.stride[p]);
         if stride < w as usize || data.len() < (h as usize - 1) * stride + w as usize {
@@ -1450,6 +1460,13 @@ impl Writer {
         };
         let (w, h) = (fp.width, fp.height);
         let mono = fp.monochrome != 0;
+        let ss = chroma_ss(&fp);
+        if ss == 0 && extras.record_syms {
+            fail!(
+                ERR_INVALID,
+                "symbol streams are for 4:2:0 only (the GPU entropy coder's)"
+            );
+        }
         let (mi_cols, mi_rows) = (mi_cols(w as i32), mi_rows(h as i32));
         let (sb_cols, sb_rows) = ((mi_cols + 15) >> 4, (mi_rows + 15) >> 4);
         let mut tiles = TileInfo::default();
@@ -1473,7 +1490,7 @@ impl Writer {
         let check_edges = opts.flags & ENC_CHECK_EDGES != 0 && !sb128;
         if check_edges {
             for p in 0..nplanes {
-                let sub = (p != 0) as i32;
+                let sub = if p != 0 { ss } else { 0 };
                 let (stride, rows) = (((sb_cols * 16) >> sub) as usize, ((sb_rows * 16) >> sub) as usize);
                 self.ordmap[p].clear();
                 self.ordmap[p].resize(stride * rows, u32::MAX);
@@ -1482,7 +1499,7 @@ impl Writer {
                 if x.plane as usize >= nplanes || x.tx_size as i32 >= TX_SIZES_ALL {
                     continue;
                 }
-                let sub = (x.plane != 0) as i32;
+                let sub = if x.plane != 0 { ss } else { 0 };
                 let (stride, rows) = (((sb_cols * 16) >> sub) as usize, ((sb_rows * 16) >> sub) as usize);
                 let (w4, h4) = (
                     tx_w(x.tx_size as i32) as usize >> 2,
@@ -1578,6 +1595,7 @@ impl Writer {
             mi_cols,
             mi_rows,
             mono,
+            ss,
             sb_cols,
             sb_rows,
             tiles,
@@ -1858,7 +1876,7 @@ fn recon(
         let mut bands: Vec<(usize, usize, &mut [u8])> = Vec::new();
         let mut into = recon_into.map(|p| p.into_iter());
         for (p, o) in out.recon.iter_mut().enumerate().take(nplanes) {
-            let sub = (p != 0) as usize;
+            let sub = f.sub(p) as usize;
             let (w, h) = ((f.mi_cols as usize * 4) >> sub, (f.mi_rows as usize * 4) >> sub);
             out.recon_w[p] = w as u32;
             out.recon_h[p] = h as u32;
@@ -1875,7 +1893,7 @@ fn recon(
             }
         }
         let copy = |(p, y0, band): &mut (usize, usize, &mut [u8])| {
-            let sub = (*p != 0) as usize;
+            let sub = f.sub(*p) as usize;
             let w = (f.mi_cols as usize * 4) >> sub;
             let (b0, b1) = (*y0, *y0 + band.len() / w);
             for t in tiles {
@@ -1894,8 +1912,9 @@ fn recon(
         }
         return;
     }
-    let pstride: [usize; 3] = core::array::from_fn(|p| ((f.sb_cols as usize) * 64) >> (p != 0) as usize);
-    let pheight: [usize; 3] = core::array::from_fn(|p| ((f.sb_rows as usize) * 64) >> (p != 0) as usize);
+    let pstride: [usize; 3] = core::array::from_fn(|p| ((f.sb_cols as usize) * 64) >> f.sub(p));
+    let pheight: [usize; 3] = core::array::from_fn(|p| ((f.sb_rows as usize) * 64) >> f.sub(p));
+    let ss = f.ss as usize;
     let (mc, mr) = (f.mi_cols as usize, f.mi_rows as usize);
     // the post-filters' skip map: with lf_inter_off, inter blocks' level is 0; with 128x128
     // superblocks, skipped inter blocks larger than 64x64 have unfiltered tx edges inside
@@ -1933,7 +1952,7 @@ fn recon(
         fb.skip.resize(mr * mc, 0);
         fb.tx.resize(mr * mc, 0);
         for m in &mut fb.lf_uv {
-            m.resize((mr >> 1) * (mc >> 1), 0);
+            m.resize((mr >> ss) * (mc >> ss), 0);
         }
         fb.sb_cdef.resize((f.sb_cols * f.sb_rows) as usize, -1);
         for p in 0..nplanes {
@@ -1945,10 +1964,10 @@ fn recon(
                 fb.skip[(r0 + y) * mc + c0..][..mw].copy_from_slice(&t.skip[y * mw..][..mw]);
                 fb.tx[(r0 + y) * mc + c0..][..mw].copy_from_slice(&t.tx_size[y * mw..][..mw]);
             }
-            let (cc, cw) = (mc >> 1, mw >> 1);
+            let (cc, cw) = (mc >> ss, mw >> ss);
             for k in 0..2 {
-                for y in 0..mh >> 1 {
-                    fb.lf_uv[k][((r0 >> 1) + y) * cc + (c0 >> 1)..][..cw].copy_from_slice(&t.lf_uv[k][y * cw..][..cw]);
+                for y in 0..mh >> ss {
+                    fb.lf_uv[k][((r0 >> ss) + y) * cc + (c0 >> ss)..][..cw].copy_from_slice(&t.lf_uv[k][y * cw..][..cw]);
                 }
             }
             let (sc0, sr0, tsc) = (c0 >> 4, r0 >> 4, t.sb_cols as usize);
@@ -1956,7 +1975,7 @@ fn recon(
                 fb.sb_cdef[(sr0 + y) * f.sb_cols as usize + sc0..][..tsc].copy_from_slice(&t.sb_cdef[y * tsc..][..tsc]);
             }
             for p in 0..nplanes {
-                let sub = (p != 0) as usize;
+                let sub = f.sub(p) as usize;
                 let (x0, y0) = ((c0 * 4) >> sub, (r0 * 4) >> sub);
                 let (tw, th) = ((mw * 4) >> sub, (mh * 4) >> sub);
                 let s = t.stride[p];
@@ -1994,7 +2013,7 @@ fn recon(
         planes
     };
     for p in 0..nplanes {
-        let sub = (p != 0) as u32;
+        let sub = f.sub(p) as u32;
         let (w, h) = ((fp.width + sub) >> sub, (fp.height + sub) >> sub);
         let o = &mut out.recon[p];
         o.resize((w * h) as usize, 0);

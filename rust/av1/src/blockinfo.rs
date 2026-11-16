@@ -1,7 +1,8 @@
 //! Block / transform geometry rules of the AV1 syntax that every engine needs
-//! (Sources/AV1Core/include/av1g/blockinfo.h). 4:2:0 or monochrome. Blocks wider or taller than
+//! (Sources/AV1Core/include/av1g/blockinfo.h). 4:2:0, 4:4:4 or monochrome: `ss` is the chroma
+//! planes' subsampling, both ways (1: 4:2:0, 0: 4:4:4; [`chroma_ss`]). Blocks wider or taller than
 //! 64 (128x128 superblocks) code their residual per 64x64 unit ([`res_units`]); the C header's
-//! copies have no such blocks.
+//! copies have no such blocks, and are 4:2:0 only.
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 use crate::tables::*;
 
@@ -27,9 +28,18 @@ pub fn mi_rows(height: i32) -> i32 {
     2 * ((height + 7) >> 3)
 }
 
-/// HasChroma (spec decode_block), 4:2:0.
-pub fn has_chroma(bsize: i32, mi_row: i32, mi_col: i32, mono: bool) -> bool {
-    !(mono || (bh4(bsize) == 1 && (mi_row & 1) == 0) || (bw4(bsize) == 1 && (mi_col & 1) == 0))
+/// The chroma planes' subsampling of a frame (subsampling_x = subsampling_y): 1 for 4:2:0 (and
+/// monochrome), 0 for 4:4:4 (fp.chroma_format [`crate::types::CHROMA_444`], read from version 2
+/// records on).
+#[inline]
+pub fn chroma_ss(fp: &crate::types::FrameParams) -> i32 {
+    (fp.version < 2 || fp.chroma_format != crate::types::CHROMA_444) as i32
+}
+
+/// HasChroma (spec decode_block; libaom is_chroma_reference): 4:2:0's sub-8x8 blocks at an even
+/// row (a 4-high one) or column (a 4-wide one) carry none; in 4:4:4 every block has chroma.
+pub fn has_chroma(bsize: i32, mi_row: i32, mi_col: i32, mono: bool, ss: i32) -> bool {
+    !(mono || (ss != 0 && ((bh4(bsize) == 1 && (mi_row & 1) == 0) || (bw4(bsize) == 1 && (mi_col & 1) == 0))))
 }
 
 /// The luma TxSize of an intra block for a given tx_depth (read_tx_size).
@@ -45,15 +55,17 @@ pub fn max_tx_depth(bsize: i32) -> i32 {
     (Max_Tx_Depth[bsize as usize] as i32).min(2)
 }
 
-/// The chroma block size (get_plane_residual_size, plane > 0, 4:2:0).
+/// The chroma block size (get_plane_residual_size, plane > 0): the block's own in 4:4:4.
 #[inline]
-pub fn uv_bsize(bsize: i32) -> i32 {
-    Subsampled_Size[bsize as usize][1][1] as i32
+pub fn uv_bsize(bsize: i32, ss: i32) -> i32 {
+    Subsampled_Size[bsize as usize][ss as usize][ss as usize] as i32
 }
 
-/// The chroma TxSize (get_tx_size for plane > 0).
-pub fn uv_tx_size(bsize: i32) -> i32 {
-    let uv_tx = Max_Tx_Size_Rect[uv_bsize(bsize) as usize] as i32;
+/// The chroma TxSize (get_tx_size for plane > 0; libaom av1_get_max_uv_txsize): the largest of the
+/// chroma block, 64-sample sides capped at 32 (in 4:4:4 a 64x64 block's chroma is coded as four
+/// 32x32s).
+pub fn uv_tx_size(bsize: i32, ss: i32) -> i32 {
+    let uv_tx = Max_Tx_Size_Rect[uv_bsize(bsize, ss) as usize] as i32;
     let (w, h) = (Tx_Width[uv_tx as usize], Tx_Height[uv_tx as usize]);
     if w == 64 || h == 64 {
         if w == 16 {
@@ -67,7 +79,8 @@ pub fn uv_tx_size(bsize: i32) -> i32 {
     uv_tx
 }
 
-/// CflAllowed for a non-lossless block.
+/// CflAllowed for a non-lossless block: the luma block at most 32x32, whatever the subsampling
+/// (spec intra_frame_mode_info; libaom is_cfl_allowed).
 pub fn cfl_allowed(bsize: i32) -> bool {
     bw4(bsize) <= 8 && bh4(bsize) <= 8
 }
@@ -89,6 +102,7 @@ pub fn block_avail(
     mi_row: i32,
     mi_col: i32,
     mono: bool,
+    ss: i32,
     tile_r0: i32,
     tile_r1: i32,
     tile_c0: i32,
@@ -98,9 +112,9 @@ pub fn block_avail(
     let u = inside(mi_row - 1, mi_col);
     let l = inside(mi_row, mi_col - 1);
     let (mut u_chroma, mut l_chroma) = (false, false);
-    if has_chroma(bsize, mi_row, mi_col, mono) {
-        u_chroma = if bh4(bsize) == 1 { inside(mi_row - 2, mi_col) } else { u };
-        l_chroma = if bw4(bsize) == 1 { inside(mi_row, mi_col - 2) } else { l };
+    if has_chroma(bsize, mi_row, mi_col, mono, ss) {
+        u_chroma = if ss != 0 && bh4(bsize) == 1 { inside(mi_row - 2, mi_col) } else { u };
+        l_chroma = if ss != 0 && bw4(bsize) == 1 { inside(mi_row, mi_col - 2) } else { l };
     }
     Avail {
         u,
@@ -129,7 +143,8 @@ pub struct TxbEdges {
 /// t, or it is in the row above / column left of the SB inside the tile (spec
 /// clear_block_decoded_flags). For GPU closed-loop engines.
 ///   plane/x4/y4/tx_sz/t: the tx block; xi/yi: its 4x4 offset inside the block;
-///   block_avail_l/u: AvailL/AvailU (plane 0) or AvailLChroma/AvailUChroma.
+///   block_avail_l/u: AvailL/AvailU (plane 0) or AvailLChroma/AvailUChroma; ss: the chroma
+///   subsampling.
 pub fn txb_edges(
     plane: i32,
     x4: i32,
@@ -144,8 +159,9 @@ pub fn txb_edges(
     tile_c1: i32,
     ordmap: &[u32],
     stride: usize,
+    ss: i32,
 ) -> TxbEdges {
-    let sub = (plane != 0) as i32;
+    let sub = if plane != 0 { ss } else { 0 };
     let (row, col) = (y4 << sub, x4 << sub); // luma mi
     let (sb_r, sb_c) = (row & !15, col & !15); // SB origin, luma mi
     let (by, bx) = ((row & 15) >> sub, (col & 15) >> sub);
@@ -182,7 +198,8 @@ fn is_smooth(m: u8) -> bool {
 /// get_filter_type (spec 7.11.2.8) for the intra edge filter: 1 if the above or left block (chroma:
 /// the chroma-carrying block of that 8x8 unit) uses SMOOTH / SMOOTH_V / SMOOTH_H. `y_modes` /
 /// `uv_modes`: 4x4 maps (stride = MiCols) of YMode and UVMode (UVMode written by blocks that carry
-/// chroma); avail_u / avail_l: AvailU / AvailL (plane 0) or AvailUChroma / AvailLChroma.
+/// chroma); avail_u / avail_l: AvailU / AvailL (plane 0) or AvailUChroma / AvailLChroma; ss: the
+/// chroma subsampling (4:4:4 chroma reads the neighbours as luma does).
 pub fn get_filter_type(
     plane: i32,
     mi_row: i32,
@@ -192,13 +209,14 @@ pub fn get_filter_type(
     y_modes: &[u8],
     uv_modes: &[u8],
     mi_cols: i32,
+    ss: i32,
 ) -> i32 {
     let m = if plane != 0 { uv_modes } else { y_modes };
     let mut above_smooth = false;
     let mut left_smooth = false;
     if avail_u {
         let (mut r, mut c) = (mi_row - 1, mi_col);
-        if plane > 0 {
+        if plane > 0 && ss != 0 {
             if mi_col & 1 == 0 {
                 c += 1;
             }
@@ -210,7 +228,7 @@ pub fn get_filter_type(
     }
     if avail_l {
         let (mut r, mut c) = (mi_row, mi_col - 1);
-        if plane > 0 {
+        if plane > 0 && ss != 0 {
             if mi_col & 1 != 0 {
                 c -= 1;
             }
@@ -234,11 +252,11 @@ pub fn res_units(bsize: i32) -> (i32, i32) {
 /// The intra-style tx blocks of one plane of residual unit (ux, uy) ([`res_units`]): `f(x, y)` with
 /// (x, y) the spec's transform_block x / y (4x4 units of the plane within the block).
 #[inline(always)]
-fn unit_plane_txbs(bsize: i32, plane: i32, tx_sz: i32, ux: i32, uy: i32, mut f: impl FnMut(i32, i32)) {
-    let sub = (plane != 0) as i32;
+fn unit_plane_txbs(bsize: i32, plane: i32, tx_sz: i32, ux: i32, uy: i32, ss: i32, mut f: impl FnMut(i32, i32)) {
+    let sub = if plane != 0 { ss } else { 0 };
     let step_x = Tx_Width[tx_sz as usize] as usize >> 2;
     let step_y = Tx_Height[tx_sz as usize] as usize >> 2;
-    let plane_sz = if plane != 0 { uv_bsize(bsize) } else { bsize };
+    let plane_sz = if plane != 0 { uv_bsize(bsize, ss) } else { bsize };
     let (w, h) = (bw4(plane_sz).min(16 >> sub), bh4(plane_sz).min(16 >> sub));
     let (ox, oy) = ((ux << 4) >> sub, (uy << 4) >> sub);
     for y in (0..h).step_by(step_y) {
@@ -251,32 +269,33 @@ fn unit_plane_txbs(bsize: i32, plane: i32, tx_sz: i32, ux: i32, uy: i32, mut f: 
 /// Iterates the coded tx blocks of one block in bitstream order: calls `f(plane, tx_sz, x4, y4, xi,
 /// yi)` where (x4, y4) is the tx block's position in its plane (4-sample units) and (xi, yi) its
 /// index within the block (4x4 units of the plane, the spec's x / y in transform_block). Returns
-/// the count.
+/// the count. `ss`: the chroma subsampling.
 pub fn for_each_txb(
     bsize: i32,
     mi_row: i32,
     mi_col: i32,
     tx_depth: i32,
     mono: bool,
+    ss: i32,
     mi_rows: i32,
     mi_cols: i32,
     mut f: impl FnMut(i32, i32, i32, i32, i32, i32),
 ) -> i32 {
     let mut n = 0;
-    let planes = if has_chroma(bsize, mi_row, mi_col, mono) { 3 } else { 1 };
+    let planes = if has_chroma(bsize, mi_row, mi_col, mono, ss) { 3 } else { 1 };
     let (uw, uh) = res_units(bsize);
     for uy in 0..uh {
         for ux in 0..uw {
             for plane in 0..planes {
-                let sub = (plane != 0) as i32;
+                let sub = if plane != 0 { ss } else { 0 };
                 let tx_sz = if plane != 0 {
-                    uv_tx_size(bsize)
+                    uv_tx_size(bsize, ss)
                 } else {
                     luma_tx_size(bsize, tx_depth)
                 };
                 let (base_x4, base_y4) = (mi_col >> sub, mi_row >> sub);
                 let (max_x4, max_y4) = (mi_cols >> sub, mi_rows >> sub); // (MiCols * MI_SIZE) >> sub in 4-units
-                unit_plane_txbs(bsize, plane, tx_sz, ux, uy, |x, y| {
+                unit_plane_txbs(bsize, plane, tx_sz, ux, uy, ss, |x, y| {
                     let (x4, y4) = (base_x4 + x, base_y4 + y);
                     if x4 < max_x4 && y4 < max_y4 {
                         f(plane, tx_sz, x4, y4, x, y);
@@ -342,18 +361,19 @@ pub fn for_each_txb_ex(
     tx_depth: i32,
     inter: bool,
     mono: bool,
+    ss: i32,
     mi_rows: i32,
     mi_cols: i32,
     mut f: impl FnMut(i32, i32, i32, i32, i32, i32),
 ) -> i32 {
     if !inter {
-        return for_each_txb(bsize, mi_row, mi_col, tx_depth, mono, mi_rows, mi_cols, f);
+        return for_each_txb(bsize, mi_row, mi_col, tx_depth, mono, ss, mi_rows, mi_cols, f);
     }
     let tx_sz = luma_tx_size(bsize, tx_depth);
     let mut order = [(0, 0); 16];
     let mut n = 0;
     let leaves = tx_tree_order(res_unit_bsize(bsize), tx_sz, &mut order);
-    let chroma = has_chroma(bsize, mi_row, mi_col, mono);
+    let chroma = has_chroma(bsize, mi_row, mi_col, mono, ss);
     let (uw, uh) = res_units(bsize);
     for uy in 0..uh {
         for ux in 0..uw {
@@ -365,12 +385,12 @@ pub fn for_each_txb_ex(
                 }
             }
             if chroma {
-                let tx_sz = uv_tx_size(bsize);
-                let (base_x4, base_y4) = (mi_col >> 1, mi_row >> 1);
+                let tx_sz = uv_tx_size(bsize, ss);
+                let (base_x4, base_y4) = (mi_col >> ss, mi_row >> ss);
                 for plane in 1..3 {
-                    unit_plane_txbs(bsize, plane, tx_sz, ux, uy, |x, y| {
+                    unit_plane_txbs(bsize, plane, tx_sz, ux, uy, ss, |x, y| {
                         let (x4, y4) = (base_x4 + x, base_y4 + y);
-                        if x4 < mi_cols >> 1 && y4 < mi_rows >> 1 {
+                        if x4 < mi_cols >> ss && y4 < mi_rows >> ss {
                             f(plane, tx_sz, x4, y4, x, y);
                             n += 1;
                         }
@@ -455,8 +475,8 @@ mod tests {
             assert_eq!(max_tx_depth(bs) as i64, ci("max_tx_depth", bs, 0, 0, 0));
             assert_eq!(cfl_allowed(bs) as i64, ci("cfl_allowed", bs, 0, 0, 0));
             if bs != BLOCK_128X128 && bs != BLOCK_128X64 && bs != BLOCK_64X128 {
-                assert_eq!(uv_bsize(bs) as i64, ci("uv_bsize", bs, 0, 0, 0));
-                assert_eq!(uv_tx_size(bs) as i64, ci("uv_tx_size", bs, 0, 0, 0));
+                assert_eq!(uv_bsize(bs, 1) as i64, ci("uv_bsize", bs, 0, 0, 0));
+                assert_eq!(uv_tx_size(bs, 1) as i64, ci("uv_tx_size", bs, 0, 0, 0));
             }
             for d in 0..=max_tx_depth(bs) {
                 assert_eq!(luma_tx_size(bs, d) as i64, ci("luma_tx_size", bs, d, 0, 0));
@@ -464,7 +484,7 @@ mod tests {
             for r in 0..4 {
                 for c in 0..4 {
                     for mono in 0..2 {
-                        assert_eq!(has_chroma(bs, r, c, mono != 0) as i64, ci("has_chroma", bs, r, c, mono));
+                        assert_eq!(has_chroma(bs, r, c, mono != 0, 1) as i64, ci("has_chroma", bs, r, c, mono));
                     }
                 }
             }
@@ -492,14 +512,14 @@ mod tests {
             let mono = r.below(5) == 0;
             let (r0, c0) = (row - r.range(0, 8), col - r.range(0, 8));
             let (r1, c1) = (row + r.range(1, 20), col + r.range(1, 20));
-            let a = block_avail(bs, row, col, mono, r0, r1, c0, c1);
+            let a = block_avail(bs, row, col, mono, 1, r0, r1, c0, c1);
             let mut o = [0i32; 4];
             // SAFETY: 4 ints out.
             unsafe { oracle_bi_block_avail(bs, row, col, mono as i32, r0, r1, c0, c1, o.as_mut_ptr()) };
             assert_eq!([a.u, a.l, a.u_chroma, a.l_chroma].map(|v| v as i32), o);
             let d = r.range(0, max_tx_depth(bs));
             let mut mine = Vec::new();
-            let n = for_each_txb(bs, row, col, d, mono, mr, mc, |p, t, x4, y4, xi, yi| {
+            let n = for_each_txb(bs, row, col, d, mono, 1, mr, mc, |p, t, x4, y4, xi, yi| {
                 mine.extend([p, t, x4, y4, xi, yi])
             });
             // SAFETY: room for 512 tx blocks.
@@ -534,7 +554,7 @@ mod tests {
                 let t = r.below(1000);
                 let (al, au) = (r.below(2) == 0, r.below(2) == 0);
                 let s = stride >> sub;
-                let e = txb_edges(plane, x4, y4, t_sz, t, xi, yi, al, au, tr1, tc1, &ordmap, s);
+                let e = txb_edges(plane, x4, y4, t_sz, t, xi, yi, al, au, tr1, tc1, &ordmap, s, 1);
                 let mut o = [0i32; 4];
                 // SAFETY: the map covers the SB grid at this stride; 4 ints out.
                 unsafe {
@@ -568,7 +588,7 @@ mod tests {
             let plane = r.range(0, 2);
             let (row, col) = (r.range(2, mc - 3), r.range(2, mc - 3));
             let (au, al) = (r.below(2) == 0, r.below(2) == 0);
-            let v = get_filter_type(plane, row, col, au, al, &y, &uv, mc);
+            let v = get_filter_type(plane, row, col, au, al, &y, &uv, mc, 1);
             // SAFETY: maps of mc x mc; the neighbours read stay inside.
             let c = unsafe {
                 oracle_bi_get_filter_type(plane, row, col, au as i32, al as i32, y.as_ptr(), uv.as_ptr(), mc)

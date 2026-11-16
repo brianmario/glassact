@@ -141,7 +141,7 @@ impl Gen<'_> {
             if self.tx_select && bs > BLOCK_4X4 {
                 b.tx_depth = rng.range(0, max_tx_depth(bs)) as u8;
             }
-            if has_chroma(bs, r, c, self.mono) {
+            if has_chroma(bs, r, c, self.mono, 1) {
                 b.uv_mode = rng.range(0, if cfl_allowed(bs) { 13 } else { 12 }) as u8;
                 if b.uv_mode as i32 == UV_CFL_PRED {
                     loop {

@@ -106,11 +106,19 @@ pub struct FrameParams {
     /// inter: GOLDEN_FRAME's reference slot + 1 (blocks with is_inter [`GOLDEN`] predict from
     /// it); 0: GOLDEN_FRAME uses `ref_slot`, as every other reference does
     pub golden_slot: u8,
+    /// [`CHROMA_420`] (0) or [`CHROMA_444`] (1: seq_profile 1, the chroma planes full size; key
+    /// frames and still pictures only, not monochrome). Read from version 2 records on; it takes
+    /// what was the structure's trailing padding byte, so its size is unchanged.
+    pub chroma_format: u8,
 }
 
 /// AV1G_DECISIONS_VERSION: 2 adds video mode and inter blocks; version 1 records (still pictures)
 /// are still accepted.
 pub const DECISIONS_VERSION: u32 = 2;
+/// av1g_frame_params.chroma_format: 4:2:0 (seq_profile 0)
+pub const CHROMA_420: u8 = 0;
+/// av1g_frame_params.chroma_format: 4:4:4 (seq_profile 1)
+pub const CHROMA_444: u8 = 1;
 /// av1g_frame_params.frame_type
 pub const FRAME_KEY: u8 = 0;
 pub const FRAME_INTER: u8 = 1;
@@ -346,6 +354,8 @@ pub struct GaEntTile {
 }
 
 const _: () = {
+    assert!(size_of::<FrameParams>() == 88);
+    assert!(core::mem::offset_of!(FrameParams, chroma_format) == 87);
     assert!(size_of::<Block>() == 16);
     assert!(size_of::<Txb>() == 16);
     assert!(size_of::<BlockInter>() == 8);
@@ -384,6 +394,7 @@ mod tests {
                refresh_frame_flags: "refresh_frame_flags", error_resilient_mode: "error_resilient_mode", golden_slot: "golden_slot");
         check!(FrameParams, "FrameParams", lf_inter_off: "lf_inter_off", cdf_from_ref: "cdf_from_ref",
                mv_precision: "mv_precision", sb128: "sb128", allow_intrabc: "allow_intrabc");
+        check!(FrameParams, "FrameParams", stream_width: "stream_width", chroma_format: "chroma_format");
         check!(BlockInter, "BlockInter", mv_row: "mv_row", mv_col: "mv_col", is_inter: "is_inter", reserved: "reserved");
         check!(DecisionRecord, "DecisionRecord", n_blocks: "n_blocks", n_coeffs: "n_coeffs", blocks: "blocks", coeffs: "coeffs",
                inter: "inter");

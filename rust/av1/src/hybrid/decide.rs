@@ -58,13 +58,15 @@ pub(crate) struct Compare<'a> {
     pub changed: &'a mut [bool],
 }
 
-/// The source planes (tight: Y w x h, U / V ((w + 1) / 2) x ((h + 1) / 2)), padded to sb_cols x
-/// sb_rows superblocks into `s` (which keeps its capacity) on `threads` threads. With `cmp`, `s`
-/// must hold a picture of the same geometry, and each tile's coded area is compared with it.
+/// The source planes (tight: Y w x h, U / V ((w + ss) >> ss) x ((h + ss) >> ss): half in 4:2:0,
+/// `ss` 1, the same in 4:4:4), padded to sb_cols x sb_rows superblocks into `s` (which keeps its
+/// capacity) on `threads` threads. With `cmp`, `s` must hold a picture of the same geometry, and
+/// each tile's coded area is compared with it.
 pub(crate) fn pad_source(
     planes: [&[u8]; 3],
     w: usize,
     h: usize,
+    ss: usize,
     sb_cols: usize,
     sb_rows: usize,
     nplanes: usize,
@@ -73,7 +75,7 @@ pub(crate) fn pad_source(
     mut cmp: Option<Compare>,
 ) {
     for pl in 0..nplanes {
-        let sub = (pl > 0) as usize;
+        let sub = if pl > 0 { ss } else { 0 };
         let (stride, height) = ((sb_cols * 64) >> sub, (sb_rows * 64) >> sub);
         debug_assert!(cmp.is_none() || (s.stride[pl] == stride && s.p[pl].len() == stride * height));
         s.stride[pl] = stride;
@@ -96,8 +98,8 @@ pub(crate) fn pad_source(
     let run = |jobs: &mut [(usize, usize, &mut [u8])], changed: &mut [bool]| {
         for (pl, y0, buf) in jobs.iter_mut() {
             let pl = *pl;
-            let sub = (pl > 0) as usize;
-            let (pw, ph) = if pl > 0 { ((w + 1) >> 1, (h + 1) >> 1) } else { (w, h) };
+            let sub = if pl > 0 { ss } else { 0 };
+            let (pw, ph) = ((w + sub) >> sub, (h + sub) >> sub);
             let st = stride[pl];
             for (r, d) in buf.chunks_mut(st).enumerate() {
                 let y = *y0 + r;
@@ -222,6 +224,8 @@ pub(crate) struct Decider<'a> {
     pub mi_cols: i32,
     pub mi_rows: i32,
     pub mono: bool,
+    /// the chroma subsampling, both ways: 1 (4:2:0, [`Decider::new`]'s) or 0 (4:4:4)
+    pub ss: i32,
     pub luma: Proxy,
     pub chroma: Proxy,
     /// the tile's origin (luma samples)
@@ -241,6 +245,7 @@ impl<'a> Decider<'a> {
             mi_cols,
             mi_rows,
             mono,
+            ss: 1,
             luma: Proxy {
                 step: step_y,
                 lambda: 0.12 * step_y * step_y,
@@ -259,7 +264,7 @@ impl<'a> Decider<'a> {
 
     /// Open-loop prediction of a (1 << lw) x (1 << lh) region at (x, y) of plane pl.
     fn predict(&self, pl: usize, x: i32, y: i32, lw: i32, lh: i32, mode: i32, delta: i32, dst: &mut [u8]) {
-        let sub = (pl > 0) as i32;
+        let sub = if pl > 0 { self.ss } else { 0 };
         let (mut ea, mut el): (Edge, Edge) = ([0; EDGE_LEN], [0; EDGE_LEN]);
         let have_left = x > (self.tx0 >> sub);
         let have_above = y > (self.ty0 >> sub);
@@ -338,15 +343,18 @@ impl<'a> Decider<'a> {
         best
     }
 
-    /// The best chroma mode (and CfL alphas) for a block at luma sample (x, y).
+    /// The best chroma mode (and CfL alphas) for a block at luma sample (x, y), judged on its
+    /// first chroma tx block (the whole chroma block up to 32x32).
     pub fn best_chroma(&mut self, x: i32, y: i32, bs: i32, b: &mut Block) {
-        let tx_sz = uv_tx_size(bs);
+        let ss = self.ss;
+        let tx_sz = uv_tx_size(bs, ss);
         let (lw, lh) = (
             Tx_Width_Log2[tx_sz as usize] as i32,
             Tx_Height_Log2[tx_sz as usize] as i32,
         );
-        // chroma block origin: (MiCol >> 1) * 4 (sub-8x8 blocks carry the chroma of the 8x8 area)
-        let (cx, cy) = (((x >> 2) >> 1) << 2, ((y >> 2) >> 1) << 2);
+        // chroma block origin: (MiCol >> ss) * 4 (4:2:0's sub-8x8 blocks carry the chroma of the
+        // 8x8 area)
+        let (cx, cy) = (((x >> 2) >> ss) << 2, ((y >> 2) >> ss) << 2);
         let mut pred = [[0u8; 32 * 32]; 2];
         let mut best = 1e300;
         let mut best_mode = DC_PRED;
@@ -375,8 +383,13 @@ impl<'a> Decider<'a> {
             let s0 = self.src.stride[0];
             for i in 0..h {
                 for j in 0..w {
-                    let s = self.src.at(0, (cx as usize + j) * 2, (cy as usize + i) * 2);
-                    let v = (s[0] as i32 + s[1] as i32 + s[s0] as i32 + s[s0 + 1] as i32) << 1;
+                    // the spec's CfL luma (7.11.5): 2x2 averages << 1 in 4:2:0, samples << 3 in 4:4:4
+                    let v = if ss != 0 {
+                        let s = self.src.at(0, (cx as usize + j) * 2, (cy as usize + i) * 2);
+                        (s[0] as i32 + s[1] as i32 + s[s0] as i32 + s[s0 + 1] as i32) << 1
+                    } else {
+                        (self.src.at(0, cx as usize + j, cy as usize + i)[0] as i32) << 3
+                    };
                     l[i * w + j] = v;
                     sum += v as i64;
                 }
@@ -432,7 +445,7 @@ impl<'a> Decider<'a> {
             b.sb_qindex = q[(r as usize >> 4) * self.sb_cols + (c as usize >> 4)];
         }
         self.best_luma(c * 4, r * 4, bs, &mut b);
-        if has_chroma(bs, r, c, self.mono) {
+        if has_chroma(bs, r, c, self.mono, self.ss) {
             self.best_chroma(c * 4, r * 4, bs, &mut b);
         }
         out.push(b);

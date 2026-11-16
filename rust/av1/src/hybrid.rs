@@ -6,7 +6,10 @@
 //! parallel threads; then skip flags for all-zero blocks. The caller filters the reconstruction and
 //! writes the bitstream ([`Hybrid::write`]). With [`Hybrid::set_intrabc`], a key frame's blocks go
 //! through the intra block copy search first ([`intrabc`]), and a frame that copies is written
-//! without post-filters.
+//! without post-filters. With [`Hybrid::set_chroma_444`], key frames are 4:4:4 (fp.chroma_format):
+//! the planes are full size, and the chroma decisions are the closed loop's own (the reference
+//! engine's rule, [`decide::Decider::best_chroma`], whatever the flags say: the Metal analysis's
+//! chroma decision is 4:2:0's); inter frames are refused.
 //!
 //! From av1gpu's CPU reference engine (BSD-2): its forward transform (here also in float), padded
 //! source, Hadamard cost proxy, chroma decisions and quantization hook, which the reference engine
@@ -156,6 +159,8 @@ pub struct Hybrid {
     search_inter_tx: bool,
     /// key frames search for intra block copies ([`intrabc`]; off by default)
     intrabc: bool,
+    /// the pictures are 4:4:4 ([`Hybrid::set_chroma_444`]; off by default: 4:2:0)
+    chroma444: bool,
     /// the next pictures' qindex per 64x64 superblock (raster; empty: `qindex` everywhere), coded
     /// with delta_q_present; not with 128x128 superblocks ([`Hybrid::set_sb_qindex`])
     sb_qindex: Vec<u8>,
@@ -326,6 +331,7 @@ impl Hybrid {
             search_luma_tx: true,
             search_inter_tx: true,
             intrabc: false,
+            chroma444: false,
             sb_qindex: Vec::new(),
             tx_model_eps: None,
             quick_tx_trials: false,
@@ -369,7 +375,8 @@ impl Hybrid {
 
     /// av1enc_hybrid_closed_loop: the closed loop on blocks the Metal analysis decided (mi_row,
     /// mi_col, bsize, y_mode and angle_delta_y set; the rest is decided here), on 8-bit 4:2:0
-    /// planes (tight: Y w x h, U and V ((w + 1) / 2) x ((h + 1) / 2)), with the given tiling.
+    /// planes (tight: Y w x h, U and V ((w + 1) / 2) x ((h + 1) / 2)), or with
+    /// [`Hybrid::set_chroma_444`] 4:4:4 planes (Y, U and V w x h), with the given tiling.
     /// `luma_tx`: every block's luma tx type from the analysis (the closed loop searches its own; it
     /// keeps these only as the C++ hybrid did, in the tests). `flags`: [`GIVEN_CHROMA`].
     /// On success [`Hybrid::record`] has the record (chroma modes, coefficients, skip flags) and
@@ -430,9 +437,13 @@ impl Hybrid {
         recon_into: Option<[&mut [u8]; 3]>,
     ) -> Result<(), Error> {
         let (w, h) = (width as usize, height as usize);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let ss = (!self.chroma444) as usize;
+        let (cw, ch) = ((w + ss) >> ss, (h + ss) >> ss);
         let n = blocks.len();
         let (rw, rh) = (mi_cols(width as i32) as usize * 4, mi_rows(height as i32) as usize * 4);
+        if self.chroma444 && video.is_some_and(|v| v.fp.frame_type == FRAME_INTER) {
+            return Err(error(ERR_INVALID, "4:4:4 is for key frames: inter frames are 4:2:0 only"));
+        }
         if n == 0
             || w < 1
             || h < 1
@@ -446,7 +457,7 @@ impl Hybrid {
             || recon_into.as_ref().is_some_and(|r| {
                 r.iter()
                     .enumerate()
-                    .any(|(p, r)| r.len() < (rw >> (p > 0) as usize) * (rh >> (p > 0) as usize))
+                    .any(|(p, r)| r.len() < (rw >> if p > 0 { ss } else { 0 }) * (rh >> if p > 0 { ss } else { 0 }))
             })
         {
             return Err(error(ERR_INVALID, "bad arguments"));
@@ -489,7 +500,9 @@ impl Hybrid {
         recon_into: Option<[&mut [u8]; 3]>,
     ) -> Result<(), Error> {
         let t0 = Instant::now();
-        let given_chroma = flags & GIVEN_CHROMA != 0;
+        // (4:4:4: the analysis's chroma decisions are 4:2:0's; the closed loop decides its own)
+        let given_chroma = flags & GIVEN_CHROMA != 0 && !self.chroma444;
+        let ss = (!self.chroma444) as i32;
         let inter_frame = video.is_some_and(|v| v.fp.frame_type == FRAME_INTER);
         if inter_frame || self.last_inter {
             // tiles are kept by their decisions and source, which an inter block's reference
@@ -555,6 +568,7 @@ impl Hybrid {
             base_q_idx: qindex as u8,
             tile_cols_log2: tile_cols_log2 as i8,
             tile_rows_log2: tile_rows_log2 as i8,
+            chroma_format: if ss == 0 { CHROMA_444 } else { CHROMA_420 },
             ..FrameParams::default()
         };
         if let Some(v) = video {
@@ -577,12 +591,12 @@ impl Hybrid {
         let pad_threads = ((sb_cols * sb_rows * 6144) >> 20).clamp(1, 8).min(*threads);
         let sb128 = rec.fp.sb128 != 0;
         let Ok(tiles) = tile_layout_ex(width, height, tile_cols_log2, tile_rows_log2, sb128) else {
-            pad_source(planes, w, h, sb_cols, sb_rows, 3, src, pad_threads, None);
+            pad_source(planes, w, h, ss as usize, sb_cols, sb_rows, 3, src, pad_threads, None);
             return Err(error(ERR_INVALID, "tiling"));
         };
         let ntiles = (tiles.rows * tiles.cols) as usize;
         let key = [
-            width as u64 | (sb128 as u64) << 32,
+            width as u64 | (sb128 as u64) << 32 | (ss as u64) << 33,
             height as u64,
             ((tile_cols_log2 as u32 as u64) << 32) | tile_rows_log2 as u32 as u64,
             qindex as i64 as u64,
@@ -605,18 +619,18 @@ impl Hybrid {
             inter_frame
                 && !compare
                 && (0..3).all(|pl| {
-                    let sub = (pl > 0) as usize;
+                    let sub = if pl > 0 { ss as usize } else { 0 };
                     p[pl].len() >= ((sb_cols * 64) >> sub) * ((sb_rows * 64) >> sub)
                 })
         });
         *src_given = theirs.is_some();
         let src: SrcView = match theirs {
             Some(p) => SrcView {
-                stride: [sb_cols * 64, (sb_cols * 64) >> 1, (sb_cols * 64) >> 1],
+                stride: [sb_cols * 64, (sb_cols * 64) >> ss, (sb_cols * 64) >> ss],
                 p,
             },
             None => {
-                pad_source(planes, w, h, sb_cols, sb_rows, 3, src, pad_threads, cmp);
+                pad_source(planes, w, h, ss as usize, sb_cols, sb_rows, 3, src, pad_threads, cmp);
                 src.view()
             }
         };
@@ -629,10 +643,10 @@ impl Hybrid {
             ibc.forget();
         }
         let abc = searches
-            && match ibc.again(width, height, sb128, &tiles, given, luma_tx, qindex) {
+            && match ibc.again(width, height, sb128, ss, &tiles, given, luma_tx, qindex) {
                 Some(copied) if compare && !src_changed.iter().any(|&c| c) => copied,
                 _ => ibc.search(
-                    src, width, height, sb128, false, &tiles, given, luma_tx, qindex, *threads,
+                    src, width, height, sb128, false, ss, &tiles, given, luma_tx, qindex, *threads,
                 ),
             };
         ibc.clear_hashes();
@@ -756,7 +770,8 @@ impl Hybrid {
             }
             chunks.extend(take_range(&mut rest, &mut at, tile_first[ntiles] as usize, n).chunks_mut(64));
             let step = crate::dsp::ac_q(qindex) as f64 / 8.0;
-            let dec = Decider::new(src, hybrid_dec_opts(), mc, mr, false, step, step);
+            let mut dec = Decider::new(src, hybrid_dec_opts(), mc, mr, false, step, step);
+            dec.ss = ss;
             par_for(
                 *threads,
                 &mut chunks,
@@ -776,7 +791,7 @@ impl Hybrid {
                         (b.tx_depth, b.sb_qindex) = (0, q_of(b));
                         (b.uv_mode, b.angle_delta_uv, b.cfl_alpha_u, b.cfl_alpha_v) = (DC_PRED as u8, 0, 0, 0);
                         let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
-                        if !inter_block && has_chroma(bs, r, c, false) {
+                        if !inter_block && has_chroma(bs, r, c, false, ss) {
                             d.best_chroma(c * 4, r * 4, bs, b);
                         }
                     }
@@ -938,7 +953,7 @@ impl Hybrid {
             let recon_w = out.recon_w;
             let mut rows: Vec<(usize, usize, &mut [u8])> = Vec::new();
             for (p, plane) in out.recon.iter_mut().enumerate() {
-                let sub = (p > 0) as usize;
+                let sub = if p > 0 { ss as usize } else { 0 };
                 let stride = recon_w[p] as usize;
                 let mut rest: &mut [u8] = plane;
                 for tr in 0..tiles.rows as usize {
@@ -956,7 +971,7 @@ impl Hybrid {
                 || (),
                 |_, (p, tr, part)| {
                     let (p, tr) = (*p, *tr);
-                    let sub = (p > 0) as usize;
+                    let sub = if p > 0 { ss as usize } else { 0 };
                     let stride = recon_w[p] as usize;
                     let y0 = (tiles.mi_row_starts[tr] as usize * 4) >> sub;
                     for tc in 0..tiles.cols as usize {
@@ -1073,9 +1088,15 @@ impl Hybrid {
             ..
         } = self;
         let rec = &mut recs[*cur];
-        // a frame with intra block copies stays one: no post-filters, every cdef_idx 0
+        // a frame with intra block copies stays one: no post-filters, every cdef_idx 0; and the
+        // closed loop's chroma format stays (the caller's fp.chroma_format isn't read)
         let abc = rec.fp.allow_intrabc != 0;
+        let chroma_format = rec.fp.chroma_format;
         rec.fp = *fp;
+        rec.fp.chroma_format = chroma_format;
+        if chroma_format != CHROMA_420 {
+            rec.fp.version = DECISIONS_VERSION; // (chroma_format is a version 2 field)
+        }
         if abc {
             (rec.fp.allow_intrabc, rec.fp.allow_screen_content_tools) = (1, 1);
             rec.fp.loop_filter_level = [0; 4];
@@ -1209,6 +1230,21 @@ impl Hybrid {
         self.intrabc = on;
     }
 
+    /// av1enc_hybrid_set_chroma_444: the next pictures are 4:4:4 (the High profile; off by
+    /// default: 4:2:0). Their planes are all width x height, as are the reconstruction's
+    /// ([`Hybrid::recon`]: MiCols * 4 x MiRows * 4) and the padded source's; the record says
+    /// fp.chroma_format 1, which the write keeps whatever its `fp` says. The closed loop decides
+    /// chroma itself (GIVEN_CHROMA is ignored), and refuses inter frames (4:2:0 only). Tiles aren't
+    /// kept across a change.
+    pub fn set_chroma_444(&mut self, on: bool) {
+        self.chroma444 = on;
+    }
+
+    /// The chroma planes' subsampling the next pictures have: 1 (4:2:0) or 0 (4:4:4).
+    pub fn chroma_ss(&self) -> u32 {
+        (!self.chroma444) as u32
+    }
+
     /// av1enc_hybrid_set_tx_search: the closed loop searches intra blocks' luma tx types (else keeps
     /// the analysis's, DCT_DCT without them) and inter blocks' (else DCT_DCT); both on by default.
     pub fn set_tx_search(&mut self, luma: bool, inter: bool) {
@@ -1308,7 +1344,8 @@ impl Hybrid {
     }
 
     /// av1enc_hybrid_recon: plane `plane`'s pre-filter reconstruction of the last closed loop,
-    /// `MiCols * 4 >> sub` wide and `MiRows * 4 >> sub` high (sub = 1 for chroma); empty after a
+    /// `MiCols * 4 >> sub` wide and `MiRows * 4 >> sub` high (sub = 1 for 4:2:0 chroma, else 0);
+    /// empty after a
     /// failure, `None` for a plane > 2 or when the call wrote it into its caller's planes.
     pub fn recon(&self, plane: usize) -> Option<&[u8]> {
         (!self.recon_given)
@@ -1480,6 +1517,7 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
         })
         .collect();
     let (mi_c, mi_r, mono) = (mi_cols(fp.width as i32), mi_rows(fp.height as i32), fp.monochrome != 0);
+    let ss = crate::blockinfo::chroma_ss(&fp);
     par_for(
         threads,
         &mut fills,
@@ -1497,6 +1535,7 @@ fn layout_tiles(rec: &mut Record, tile_first: &[u32], threads: usize) -> Result<
                     depth,
                     f.inter.get(j).is_some_and(|i| i.is_inter != 0),
                     mono,
+                    ss,
                     mi_r,
                     mi_c,
                     |plane, tx_sz, x4, y4, _, _| {

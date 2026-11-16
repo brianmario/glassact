@@ -9,11 +9,13 @@
 //! is never used by av1t_case_make and isn't ported either.
 //!
 //! [`FuzzCase::make_ex`] adds 128x128 superblocks (fp.sb128, which the C++ doesn't have): the
-//! partition starts at 128x128 there, with every type the 128x128 node allows.
+//! partition starts at 128x128 there, with every type the 128x128 node allows. [`FuzzCase::make_444`]
+//! makes 4:4:4 records (fp.chroma_format, which the C++ doesn't have either): every block has
+//! chroma.
 use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma, max_tx_depth, mi_cols, mi_rows, tx_coeffs};
 use crate::dsp::{chroma_tx_type, get_scan, get_tx_set_intra, is_directional, tx_type_in_set_intra};
 use crate::tables::*;
-use crate::types::{Block, DECISIONS_VERSION, DecisionRecord, FrameParams, Tiles, Txb};
+use crate::types::{Block, CHROMA_444, DECISIONS_VERSION, DecisionRecord, FrameParams, Tiles, Txb};
 use crate::writer::{apply_sb_qindex, layout, layout_counts, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
 /// splitmix64, with the seed hashed so that streams of consecutive seeds are not shifted copies.
@@ -52,6 +54,8 @@ struct Gen<'a> {
     mi_cols: i32,
     mi_rows: i32,
     mono: bool,
+    /// the chroma subsampling: 1 (4:2:0) or 0 (4:4:4)
+    ss: i32,
     tx_select: bool,
     blocks: Vec<Block>,
     max_depth_bias: i32,
@@ -87,7 +91,7 @@ impl Gen<'_> {
         if self.tx_select && bs > BLOCK_4X4 {
             b.tx_depth = rng.range(0, max_tx_depth(bs)) as u8;
         }
-        if has_chroma(bs, r, c, self.mono) {
+        if has_chroma(bs, r, c, self.mono, self.ss) {
             let maxuv = if cfl_allowed(bs) { 13 } else { 12 };
             b.uv_mode = rng.range(0, maxuv) as u8;
             if cfl_allowed(bs) && rng.chance(20) {
@@ -313,6 +317,17 @@ impl FuzzCase {
     /// same draws, the partition (and the per-SB qindex map) of 128x128 superblocks. Without
     /// `sb128` exactly [`FuzzCase::make`].
     pub fn make_ex(seed: u64, maxdim: i32, big_pct: i32, sb128: bool) -> Option<FuzzCase> {
+        Self::make_fmt(seed, maxdim, big_pct, sb128, false)
+    }
+
+    /// [`FuzzCase::make_ex`] in 4:4:4 (fp.chroma_format [`CHROMA_444`], never monochrome): the
+    /// same draws, every block with chroma (so more chroma draws than 4:2:0's sub-8x8 blocks
+    /// make), the chroma tx blocks of a 4:4:4 layout.
+    pub fn make_444(seed: u64, maxdim: i32, big_pct: i32, sb128: bool) -> Option<FuzzCase> {
+        Self::make_fmt(seed, maxdim, big_pct, sb128, true)
+    }
+
+    fn make_fmt(seed: u64, maxdim: i32, big_pct: i32, sb128: bool, c444: bool) -> Option<FuzzCase> {
         let mut rng = Rng::new(seed);
         // ---- frame parameters ----
         const SPECIAL: [(i32, i32); 10] = [
@@ -351,6 +366,9 @@ impl FuzzCase {
             ..FrameParams::default()
         };
         fp.monochrome = rng.chance(15) as u8;
+        if c444 {
+            (fp.monochrome, fp.chroma_format) = (0, CHROMA_444);
+        }
         fp.base_q_idx = rng.range(1, 255) as u8;
         fp.tx_mode_select = rng.chance(60) as u8;
         fp.reduced_tx_set = rng.chance(30) as u8;
@@ -451,6 +469,7 @@ impl FuzzCase {
             mi_cols: mi_c,
             mi_rows: mi_r,
             mono: fp.monochrome != 0,
+            ss: crate::blockinfo::chroma_ss(&fp),
             tx_select: fp.tx_mode_select != 0,
             blocks: Vec::new(),
             max_depth_bias,

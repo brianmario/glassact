@@ -29,7 +29,7 @@ pub fn layout_counts(fp: &FrameParams, blocks: &[Block]) -> Result<LayoutCounts,
 /// [`layout_counts`] of a record with inter blocks (`inter`: one entry per block, or empty).
 pub fn layout_counts_ex(fp: &FrameParams, blocks: &[Block], inter: &[BlockInter]) -> Result<LayoutCounts, i32> {
     let (mi_cols, mi_rows) = (mi_cols(fp.width as i32), mi_rows(fp.height as i32));
-    let mono = fp.monochrome != 0;
+    let (mono, ss) = (fp.monochrome != 0, chroma_ss(fp));
     let (mut n, mut nc) = (0u32, 0u64);
     for (b, k) in blocks.iter().enumerate() {
         if k.bsize as i32 >= BLOCK_SIZES || k.mi_row as i32 >= mi_rows || k.mi_col as i32 >= mi_cols {
@@ -42,6 +42,7 @@ pub fn layout_counts_ex(fp: &FrameParams, blocks: &[Block], inter: &[BlockInter]
             depth(k),
             is_inter(inter, b),
             mono,
+            ss,
             mi_rows,
             mi_cols,
             |_, tx_sz, _, _, _, _| {
@@ -74,7 +75,7 @@ pub fn layout_ex(
         return Err(ERR_CAPACITY);
     }
     let (mi_cols, mi_rows) = (mi_cols(fp.width as i32), mi_rows(fp.height as i32));
-    let mono = fp.monochrome != 0;
+    let (mono, ss) = (fp.monochrome != 0, chroma_ss(fp));
     let (mut n, mut nc) = (0usize, 0u64);
     for (b, k) in blocks.iter().enumerate() {
         block_txb[b] = n as u32;
@@ -85,6 +86,7 @@ pub fn layout_ex(
             depth(k),
             is_inter(inter, b),
             mono,
+            ss,
             mi_rows,
             mi_cols,
             |plane, tx_sz, x4, y4, _, _| {

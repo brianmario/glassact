@@ -5,7 +5,8 @@
 //! The analysis's blocks are kept but where a block, or a square node it split into several (its
 //! partition then becomes NONE: the copies of whole nodes are most of the gain), has an exact
 //! copy, luma and chroma, at a whole displacement (4:2:0 chroma is then the decoder's: at an odd
-//! component, the average of two samples, which must equal the block's too). A tile's sources are
+//! component, the average of two samples, which must equal the block's too; 4:4:4 chroma copies
+//! at the luma displacement). A tile's sources are
 //! its own (is_mv_valid), so tiles are searched apart, on every thread. A tile's candidates come
 //! from a hash of every 8x8 at even positions the search has passed (added row by row, so its
 //! chains start at the nearest rows: valid, and the cheapest to code),
@@ -36,7 +37,9 @@ const MAX_DV: i32 = 1023;
 /// Hash chain entries looked at per block.
 const MAX_CHAIN: usize = 512;
 /// A lossy copy's largest residual: its SSE (luma and chroma) per luma sample, in units of the
-/// quantizer step squared times 1.5 (the chroma samples). On the reference traces' key frames
+/// quantizer step squared times 1.5 in 4:2:0, 3 in 4:4:4 (the samples, luma and chroma, per luma
+/// sample). On the
+/// reference traces' key frames
 /// (BD-rate against exact copies only): 0.005 and 0.01 within 0.3 % of each other, 0.02 0.5 %
 /// worse at 5K; at 0.25 and above, 5K loses.
 const NEAR_SHARE: f64 = 0.005;
@@ -129,6 +132,8 @@ struct Frame<'a> {
     h: i32,
     sb128: bool,
     mono: bool,
+    /// the chroma subsampling, both ways: 1 (4:2:0) or 0 (4:4:4)
+    ss: i32,
     /// [`IntraBc::h8`], and its width
     h8: &'a [u32],
     hw: usize,
@@ -157,13 +162,13 @@ impl Frame<'_> {
     }
 
     /// spec is_mv_valid of a block (x, y, bw, bh in luma samples) of tile `t` copying at `dv`
-    /// (samples, nonzero), within [`MAX_DV`], and the writer's rule for an odd component: the
-    /// source 2 samples larger that way valid too (the bilinear chroma reads them).
+    /// (samples, nonzero), within [`MAX_DV`], and the writer's rule for an odd component of a
+    /// 4:2:0 frame: the source 2 samples larger that way valid too (the bilinear chroma reads them).
     fn valid(&self, t: TileArea, x: i32, y: i32, bw: i32, bh: i32, dv: [i32; 2]) -> bool {
         if dv[0].abs() > MAX_DV || dv[1].abs() > MAX_DV {
             return false;
         }
-        let (ey, ex) = if self.mono {
+        let (ey, ex) = if self.mono || self.ss == 0 {
             (0, 0)
         } else {
             (2 * (dv[0] & 1), 2 * (dv[1] & 1))
@@ -196,7 +201,7 @@ impl Frame<'_> {
     fn sse(&self, x: i32, y: i32, bw: i32, bh: i32, dv: [i32; 2], cap: u64) -> Option<u64> {
         let mut e = 0u64;
         for p in 0..if self.mono { 1 } else { 3 } {
-            let sub = (p > 0) as i32;
+            let sub = if p > 0 { self.ss } else { 0 };
             let (x, y, w, h) = (x >> sub, y >> sub, (bw >> sub) as usize, bh >> sub);
             let (sx, sy) = (x + (dv[1] >> sub), y + (dv[0] >> sub));
             let (hx, hy) = (sub != 0 && dv[1] & 1 != 0, sub != 0 && dv[0] & 1 != 0);
@@ -232,7 +237,7 @@ impl Frame<'_> {
     /// chroma (the decoder's: walk::predict_intrabc_block).
     fn same(&self, x: i32, y: i32, bw: i32, bh: i32, dv: [i32; 2]) -> bool {
         for p in 0..if self.mono { 1 } else { 3 } {
-            let sub = (p > 0) as i32;
+            let sub = if p > 0 { self.ss } else { 0 };
             let (x, y, w, h) = (x >> sub, y >> sub, (bw >> sub) as usize, bh >> sub);
             let (sx, sy) = (x + (dv[1] >> sub), y + (dv[0] >> sub));
             let (hx, hy) = (sub != 0 && dv[1] & 1 != 0, sub != 0 && dv[0] & 1 != 0);
@@ -671,12 +676,13 @@ impl IntraBc {
         width: u32,
         height: u32,
         sb128: bool,
+        ss: i32,
         tiles: &Tiles,
         blocks: &[Block],
         luma_tx: Option<&[u8]>,
         qindex: i32,
     ) -> Option<bool> {
-        let key = [width, height, sb128 as u32, tiles.cols, tiles.rows, qindex as u32];
+        let key = [width, height, sb128 as u32 | (ss as u32) << 1, tiles.cols, tiles.rows, qindex as u32];
         (key == self.given_key && blocks == self.given && luma_tx.unwrap_or(&[]) == self.given_tx)
             .then_some(self.copied)
     }
@@ -699,7 +705,8 @@ impl IntraBc {
     }
 
     /// The search over a key frame's blocks (tile order, the analysis's: intra, given chroma or
-    /// not) on the padded source `src`, `width` x `height`, tiled `tiles`, coded at `qindex`, on
+    /// not) on the padded source `src` (chroma subsampled `ss` both ways), `width` x `height`,
+    /// tiled `tiles`, coded at `qindex`, on
     /// `threads` threads. Sets [`IntraBc::blocks`], [`IntraBc::inter`] and [`IntraBc::tx`] (from
     /// `luma_tx`, a copy's DCT_DCT), and returns whether the frame should copy: its exact copies
     /// cover at least [`MIN_BUSY_SHARE`] of its non-flat 8x8s.
@@ -711,6 +718,7 @@ impl IntraBc {
         height: u32,
         sb128: bool,
         mono: bool,
+        ss: i32,
         tiles: &Tiles,
         blocks: &[Block],
         luma_tx: Option<&[u8]>,
@@ -758,9 +766,10 @@ impl IntraBc {
             h,
             sb128,
             mono,
+            ss,
             h8: &self.h8,
             hw,
-            near: NEAR_SHARE * 1.5 * step * step,
+            near: NEAR_SHARE * if ss != 0 { 1.5 } else { 3.0 } * step * step,
             lambda: 0.12 * step * step,
         };
         self.busy = f.busy_in(0, 0, w & !7, h & !7);
@@ -805,7 +814,7 @@ impl IntraBc {
         }
         self.tx.extend((k..blocks.len()).map(|o| luma_tx.map_or(0, |l| l[o])));
         self.copied = self.copies > 0 && self.busy_exact * 100 >= self.busy * MIN_BUSY_SHARE;
-        self.given_key = [width, height, sb128 as u32, tiles.cols, tiles.rows, qindex as u32];
+        self.given_key = [width, height, sb128 as u32 | (ss as u32) << 1, tiles.cols, tiles.rows, qindex as u32];
         self.given.clear();
         self.given.extend_from_slice(blocks);
         self.given_tx.clear();

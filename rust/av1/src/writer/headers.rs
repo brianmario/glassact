@@ -81,11 +81,13 @@ pub(crate) fn write_headers(
     };
     let reduced = (w, h) != (sw, sh);
     let mono = fp.monochrome as u32;
+    // 4:4:4: the High profile, whose color_config has no mono_chrome and implies subsampling 0, 0
+    let high = crate::blockinfo::chroma_ss(fp) == 0;
     let video = fp.video != 0;
     let inter = video && fp.frame_type == crate::types::FRAME_INTER;
     let diff_uv = (fp.delta_q_v_dc != fp.delta_q_u_dc || fp.delta_q_v_ac != fp.delta_q_u_ac) as u32;
     let separate_uv = (mono == 0 && (diff_uv != 0 || (fp.using_qmatrix != 0 && fp.qm_v != fp.qm_u))) as u32;
-    seq.put(0, 3); // seq_profile = Main
+    seq.put(high as u32, 3); // seq_profile = Main (4:2:0, monochrome) / High (4:4:4)
     if video {
         seq.put(0, 1); // still_picture
         seq.put(0, 1); // reduced_still_picture_header
@@ -135,7 +137,9 @@ pub(crate) fn write_headers(
     seq.put(0, 1); // enable_restoration
     // color_config
     seq.put(0, 1); // high_bitdepth
-    seq.put(mono, 1); // mono_chrome
+    if !high {
+        seq.put(mono, 1); // mono_chrome
+    }
     seq.put(1, 1); // color_description_present_flag
     seq.put(1, 8); // color_primaries = CP_BT_709
     seq.put(13, 8); // transfer_characteristics = TC_SRGB
@@ -145,7 +149,9 @@ pub(crate) fn write_headers(
     seq.put(if video { 1 } else { 6 }, 8); // matrix_coefficients = MC_BT_709 / MC_BT_601
     seq.put(1, 1); // color_range = full
     if mono == 0 {
-        seq.put(0, 2); // chroma_sample_position = CSP_UNKNOWN
+        if !high {
+            seq.put(0, 2); // chroma_sample_position = CSP_UNKNOWN (subsampling_x && subsampling_y)
+        }
         seq.put(separate_uv, 1); // separate_uv_delta_q
     }
     seq.put(0, 1); // film_grain_params_present
