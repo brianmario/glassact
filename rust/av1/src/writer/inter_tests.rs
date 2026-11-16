@@ -396,6 +396,9 @@ fn split_schedules_are_the_walks_under_stress() {
 }
 
 /// A key frame in video mode codes a still picture's tile data and reconstructs exactly as it.
+/// Their colour descriptions differ only in the matrix: sRGB primaries and transfer, full range,
+/// and BT.601's matrix for a still picture (sYCC), BT.709's for a stream (what Glass Act converts
+/// with, and VideoToolbox shows it with).
 #[test]
 fn video_key_frames_are_still_pictures() {
     seeds(120, |w, seed| {
@@ -430,6 +433,9 @@ fn video_key_frames_are_still_pictures() {
         assert_ne!(still.obu, video.obu);
         let p = parse(&video.obu).unwrap();
         assert_eq!((p.rec.fp.video, p.rec.fp.frame_type), (1, FRAME_KEY));
+        let full = (rec.fp.monochrome == 0) as u32;
+        assert_eq!(p.colour, [1, 13, 1, full], "seed {seed}: a stream's colour description");
+        assert_eq!(parse(&still.obu).unwrap().colour, [1, 13, 6, full], "seed {seed}: a still picture's");
     });
 }
 

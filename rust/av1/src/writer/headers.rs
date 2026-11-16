@@ -139,7 +139,10 @@ pub(crate) fn write_headers(
     seq.put(1, 1); // color_description_present_flag
     seq.put(1, 8); // color_primaries = CP_BT_709
     seq.put(13, 8); // transfer_characteristics = TC_SRGB
-    seq.put(6, 8); // matrix_coefficients = MC_BT_601
+    // A still picture's samples are sYCC (BT.601's matrix, as the C++ writes it); a stream's are
+    // converted from the screen's BGRA with BT.709's (Glass Act's adapter), which is also what
+    // VideoToolbox's decoder shows a stream with, whatever its header says.
+    seq.put(if video { 1 } else { 6 }, 8); // matrix_coefficients = MC_BT_709 / MC_BT_601
     seq.put(1, 1); // color_range = full
     if mono == 0 {
         seq.put(0, 2); // chroma_sample_position = CSP_UNKNOWN

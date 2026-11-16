@@ -18,6 +18,9 @@ use crate::tables::{
 pub struct Parsed {
     pub rec: Record,
     pub seq_level_idx: u32,
+    /// The sequence header's colour description: color_primaries, transfer_characteristics,
+    /// matrix_coefficients (2, 2, 2 without one: unspecified) and color_range (0 for monochrome).
+    pub colour: [u32; 4],
     /// per tile: payload size in the parsed stream
     pub tile_bytes: Vec<u32>,
     /// per tile: payload offset in the parsed buffer
@@ -65,6 +68,8 @@ impl BitReader<'_> {
 #[derive(Clone, Debug, Default)]
 struct Seq {
     seen: bool,
+    /// `Parsed::colour`
+    colour: [u32; 4],
     /// use_128x128_superblock
     sb128: bool,
     still: bool,
@@ -196,11 +201,12 @@ fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
         tc = br.f(8)?;
         mc = br.f(8)?;
     }
+    sq.colour = [cp, tc, mc, 0];
     if sq.mono {
         br.f(1)?;
     } else {
         need!(!(cp == 1 && tc == 13 && mc == 0), "4:4:4 identity matrix not supported");
-        br.f(1)?; // color_range
+        sq.colour[3] = br.f(1)?; // color_range
         br.f(2)?; // chroma_sample_position
         sq.separate_uv = br.b()?;
     }
@@ -274,6 +280,7 @@ fn parse_into(obus: &[u8], out: &mut Parsed, mut state: Option<&mut ParseState>)
     }
     need!(done, "no frame found");
     out.seq_level_idx = sq.level as u32;
+    out.colour = sq.colour;
     Ok(())
 }
 
