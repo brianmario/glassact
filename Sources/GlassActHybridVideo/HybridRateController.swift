@@ -35,10 +35,15 @@ import Foundation
 /// the aim bought a 5K text key frame only qindex 168, and the replay's typing and dragging came
 /// out 5–8 dB under libaom at a fraction of its bytes; at 2.5 s, qindex 76–99 and within 1 dB of
 /// it at a quarter of the bytes; the burst moves a 2 Mbit/s link's glass-to-glass p50 from 88 to
-/// 626 ms on typing's first frames). With a link cap the key frame also spends no more than
-/// `keyLinkUS` (0.5 s) of the link: without that bound a 5K photo's key frame (2.6× the seed's
-/// bits) filled a 2 Mbit/s link's buffer and the stream delivered 7 frames of 300, as libaom's
-/// does; with it, 110.
+/// 626 ms on typing's first frames). With a link cap (a session always has one: the startup cap
+/// at first) the key frame also spends no more than `keyLinkUS` (1 s) of the link. The key model
+/// can't tell a photo's key frame (2.6× the seed's bits) from text's, so the bound trades: at
+/// 0.5 s, 5K key frames came out at the ceiling under the startup cap and copy-heavy streams 4–9 dB
+/// under libaom, but a 2 Mbit/s link kept moving (photos 91–110 frames of 300, scrolling images
+/// 210); at 1 s, key frames at qindex 76–99 and those streams within 1 dB of libaom at a quarter of
+/// its bytes, and on 2 Mbit/s photos and scrolling images stall behind the first key frame (7
+/// frames, as libaom's 7 and 4). AV1 runs on a link with room (`LinkRoomPolicy`, 6 Mbit/s), where
+/// 1 s is the better side (photos at 6 Mbit/s: 146 frames, libaom 120, HEVC 21).
 ///
 /// A deterministic value type; `HybridRegionEncoder` holds it under a lock (decisions on the
 /// encoder's begin queue, sizes from its writer).
@@ -109,7 +114,7 @@ public struct HybridRateController: Sendable {
     /// The link's measured rate (the encoder's bitrate cap), when there is one: a key frame spends
     /// no more than `keyLinkUS` of it, so that its burst doesn't fill a thin link's buffer.
     public var linkBitsPerSecond: Int?
-    public var keyLinkUS: UInt64 = 500_000
+    public var keyLinkUS: UInt64 = 1_000_000
 
     public private(set) var inter: Model
     public private(set) var key: Model
