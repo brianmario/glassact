@@ -459,6 +459,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false
 
+    /// Tests: in a stream, the picture with this index fails once its analysis is read, as one
+    /// whose closed loop threw would (the stream's failure path: it and every picture after it
+    /// fail, in order). Read as the stream starts.
+    public var failingPicture: Int?
+
     /// Inter frames also copy from an older picture, GOLDEN_FRAME's: one of the long-term
     /// pictures (`longTermReferences`), each the last picture of a scene that a mostly new picture
     /// (most of whose 64×64s didn't copy the picture before it) left. Switching back to what was
@@ -748,9 +753,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// The first picture that failed, and why: it and every one after it fail.
         private var brokenAt: (index: Int, error: any Error)?
         private let lock = NSLock()
+        /// `failingPicture`, as the stream started.
+        let failing: Int?
 
-        init(gateBase: UInt64, output: @escaping @Sendable (Int, Result<Frame, any Error>) -> Void) {
+        init(gateBase: UInt64, failing: Int?, output: @escaping @Sendable (Int, Result<Frame, any Error>) -> Void) {
             self.gateBase = gateBase
+            self.failing = failing
             self.output = output
         }
 
@@ -779,7 +787,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         streamSB128 = interFrames && largeSuperblocks
         metal.largeSuperblocks = streamSB128
         motionRuleLock.withLock { motionRule = MotionRule() }
-        stream = Stream(gateBase: filtersDone, output: output)
+        stream = Stream(gateBase: filtersDone, failing: failingPicture, output: output)
     }
 
     /// The stream's next picture. Returns at once: its copies are decided and its analysis begins
@@ -904,6 +912,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 // the picture before's source back to the pool: its closed loop and filters, and
                 // this picture's analysis (whose motion search read it), are done
                 if pending.read != nil { metal.keepSource(partition.source) }
+                if index == s.failing { throw Failure.encode("picture \(index) fails (failingPicture)") }
                 Self.trace("partition \(index)")
                 let t0 = CACurrentMediaTime()
                 var timing = Timing()

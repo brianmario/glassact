@@ -80,6 +80,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     private var shared: Shared?
     /// This region's stream on the shared encoder (`Shared.owner`).
     private var token = 0
+    /// This region's streams, counted: a failure restarts the stream only if it came from the
+    /// current one (a picture submitted before the restart fails in the old one too).
+    private var epoch = 0
     private var restartNext = false
     private var baseBitrate = 20_000_000
     private var qualityLevel = 0
@@ -240,7 +243,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// A new stream on the shared encoder for this region (after its last one, if any, ends).
     private func startStream() {
         guard let shared else { return }
-        let token = token, configure = configure
+        epoch += 1
+        let token = token, epoch = epoch, configure = configure
         let w = width
         shared.control.async { [weak self] in
             guard shared.owner == token else { return }
@@ -252,14 +256,14 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             let sb128 = (w + 127) / 128
             e.tiling = (min(3, sb128 <= 1 ? 0 : Int(ceil(log2(Double(sb128))))), 0)
             configure?(e)
-            e.startStream { [weak self] _, result in self?.written(result, token: token) }
+            e.startStream { [weak self] _, result in self?.written(result, token: token, epoch: epoch) }
             shared.streaming = true
         }
     }
 
     /// A frame (or a failure) from the encoder's thread: the controller learns its size, and it
     /// goes to the caller's queue.
-    private func written(_ result: Result<AV1HybridEncoder.Frame, any Error>, token: Int) {
+    private func written(_ result: Result<AV1HybridEncoder.Frame, any Error>, token: Int, epoch: Int) {
         let now = CACurrentMediaTime()
         switch result {
         case let .success(frame):
@@ -282,8 +286,10 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 if !submitted.isEmpty { submitted.removeFirst() }
             }
             callbackQueue.async { [weak self] in
-                guard let self, token == self.token else { return }
-                self.restartNext = true
+                guard let self else { return }
+                // (the stream is broken from this picture on: every later one in it fails too, and
+                // the next picture submitted starts a new one, with a key frame)
+                if token == self.token && epoch == self.epoch { self.restartNext = true }
                 self.deliver([], sync: false, config: nil, token: token)
             }
         }

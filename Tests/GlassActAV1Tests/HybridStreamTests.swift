@@ -208,6 +208,51 @@ struct HybridStreamTests {
         try Self.expectDecodesExactly(second[...], width: width, height: height, "the next stream")
     }
 
+    /// A picture that fails inside the stream, with the pictures after it already submitted (their
+    /// analyses begun, waiting on gates its filters would have opened): every picture gets one
+    /// output, in order — those before it their frames, it and every one after it a failure —
+    /// the stream ends without waiting on a gate that won't open, and the next stream starts with
+    /// a key frame that a new decoder decodes exactly from.
+    @available(macOS 27, *)
+    @Test func aPictureThatFailsFailsTheRestOfItsStreamInOrder() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (1, 0)
+        encoder.interFrames = true
+        let (width, height) = (640, 360)
+        let pictures = Self.screensInTurn(10, width: width, height: height, salt: 1, seed: 0xfa11)
+        let failing = 4
+        for (n, fails) in [(8, true), (5, false)] {
+            encoder.failingPicture = fails ? failing : nil
+            let got = Collected()
+            encoder.startStream { i, r in
+                got.lock.withLock { got.frames.append((i, try? r.get())) }
+                got.ready.signal()
+            }
+            for p in pictures.prefix(n) { encoder.submit(p, qindex: 96) }  // (all at once)
+            for i in 0..<n {
+                try #require(got.ready.wait(timeout: .now() + 20) == .success, "picture \(i) has no output")
+            }
+            // (on a thread of its own: an end that waits on a gate nothing will open would hang)
+            let ended = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                encoder.endStream()
+                ended.signal()
+            }
+            try #require(ended.wait(timeout: .now() + 20) == .success, "the stream didn't end")
+            let outputs = got.lock.withLock { got.frames }
+            #expect(outputs.map(\.index) == Array(0..<n), "outputs out of order")
+            if fails {
+                #expect(outputs.map { $0.frame != nil } == (0..<n).map { $0 < failing }, "\(outputs.map { $0.frame != nil })")
+            } else {
+                let frames = outputs.compactMap(\.frame)
+                try #require(frames.count == n, "the stream after the failure failed")
+                #expect(frames[0].params.frame_type != UInt8(AV1G_FRAME_INTER))
+                try Self.expectDecodesExactly(frames[...], width: width, height: height, "the stream after the failure")
+            }
+        }
+    }
+
     /// The first sequence header OBU in a temporal unit.
     static func sequenceHeader(_ tu: [UInt8]) -> [UInt8]? {
         var i = 0
