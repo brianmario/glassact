@@ -122,6 +122,92 @@ struct HybridStreamTests {
         }
     }
 
+    /// Two screens in turn (A A B B A A …), each picture with edits of its own: from the first
+    /// return, inter frames copy the other screen's last state through GOLDEN_FRAME. `salt` makes
+    /// another pair of screens.
+    @available(macOS 27, *)
+    static func screensInTurn(_ n: Int, width: Int, height: Int, salt: Int, seed: UInt64) -> [AV1HybridEncoder.Picture] {
+        var rng = SplitMix64(seed: seed)
+        var screens = [PartitionTests.Picture(width: width, height: height), PartitionTests.Picture(width: width, height: height)]
+        for s in 0..<2 {
+            for k in screens[s].y.indices {
+                let (x, y) = (k % width, k / width)
+                screens[s].y[k] = s == 0 ? UInt8(truncatingIfNeeded: y * (3 + salt) + (x % (29 + salt) < 14 ? 30 : 210))
+                    : UInt8(truncatingIfNeeded: (x / (5 + salt)) * 11 + (y % 23 < 9 ? 180 : 60))
+            }
+            for k in screens[s].u.indices { screens[s].u[k] = UInt8(truncatingIfNeeded: 128 + (s == 0 ? 20 : -30) + salt) }
+        }
+        return (0..<n).map { i in
+            var p = screens[(i / 2) % 2]
+            for _ in 0..<120 { p.y[rng.int(0..<p.y.count)] = UInt8(rng.int(0..<256)) }
+            return AV1HybridEncoder.Picture(y: p.y, u: p.u, v: p.v, width: width, height: height)
+        }
+    }
+
+    /// Frames `frames` decoded in order by a decoder that starts at the first of them: each must
+    /// be the encoder's own reconstruction, sample for sample in all three planes. A frame that
+    /// predicted from a picture before the first (a reference slot the decoder never filled)
+    /// wouldn't be.
+    @available(macOS 27, *)
+    static func expectDecodesExactly(_ frames: ArraySlice<AV1HybridEncoder.Frame>, width: Int, height: Int,
+                                     _ what: String) throws {
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        for (i, f) in zip(frames.indices, frames) {
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "\(what): frame \(i): libaom")
+            for plane in 0..<3 {
+                let w = plane == 0 ? width : (width + 1) / 2, h = plane == 0 ? height : (height + 1) / 2
+                let theirs = try #require(frame.planesTuple(plane))
+                let stride = Int(frame.stridesTuple(plane))
+                let rows = (0..<h).filter { r in (0..<w).contains { f.planes[plane][r * w + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(what): frame \(i) plane \(plane) differs from the decoder's on \(rows.count) rows")
+            }
+        }
+    }
+
+    /// What a Viewer's decoder loses and gets back: after GOLDEN_FRAME is in use (long-term
+    /// pictures in slots of their own), a key frame on demand (a SYNC_REQUEST's answer) is the
+    /// start of everything after it — a decoder rebuilt there decodes every later frame exactly —
+    /// and so is a new stream's first frame (a region's START) on the encoder the last region
+    /// used: no picture of the earlier stream, in any slot, is reachable from it.
+    @available(macOS 27, *)
+    @Test func nothingAfterAKeyFrameReachesBackPastIt() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let encoder = try AV1HybridEncoder(device: device)
+        encoder.tiling = (1, 0)
+        encoder.interFrames = true
+        let (width, height) = (640, 360)
+        let streams = [Self.screensInTurn(16, width: width, height: height, salt: 0, seed: 0x51c0),
+                       Self.screensInTurn(12, width: width, height: height, salt: 3, seed: 0x51c1)]
+        let keyAt = 9
+        var coded: [[AV1HybridEncoder.Frame]] = []
+        for (s, pictures) in streams.enumerated() {
+            let got = Collected()
+            encoder.startStream { i, r in
+                got.lock.withLock { got.frames.append((i, try? r.get())) }
+                got.ready.signal()
+            }
+            for (i, p) in pictures.enumerated() { encoder.submit(p, qindex: 96, forceKey: s == 0 && i == keyAt) }
+            for _ in pictures { #expect(got.ready.wait(timeout: .now() + 20) == .success) }
+            encoder.endStream()
+            let frames = got.frames.compactMap(\.frame)
+            try #require(frames.count == pictures.count)
+            coded.append(frames)
+        }
+        let (first, second) = (coded[0], coded[1])
+        let golden = { (f: AV1HybridEncoder.Frame) in f.timing.goldenSlot >= 0 }
+        // (or the test proves nothing: long-term pictures in use before the key frame, and after it)
+        #expect(first[..<keyAt].contains(where: golden), "no GOLDEN_FRAME before the key frame: \(first.map(\.timing.goldenSlot))")
+        #expect(first[(keyAt + 1)...].contains(where: golden), "no GOLDEN_FRAME after the key frame: \(first.map(\.timing.goldenSlot))")
+        #expect(second.contains(where: golden), "no GOLDEN_FRAME in the second stream: \(second.map(\.timing.goldenSlot))")
+        #expect(first[keyAt].params.frame_type != UInt8(AV1G_FRAME_INTER))
+        #expect(second[0].params.frame_type != UInt8(AV1G_FRAME_INTER))
+        try Self.expectDecodesExactly(first[...], width: width, height: height, "the first stream, whole")
+        try Self.expectDecodesExactly(first[keyAt...], width: width, height: height, "from the key frame on demand")
+        try Self.expectDecodesExactly(second[...], width: width, height: height, "the next stream")
+    }
+
     /// The first sequence header OBU in a temporal unit.
     static func sequenceHeader(_ tu: [UInt8]) -> [UInt8]? {
         var i = 0
