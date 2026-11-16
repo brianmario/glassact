@@ -385,8 +385,15 @@ then and now, and 10-31's typing-cc fell 0.1, so that cell is likely 10-31's err
   each (provisional); tiles in one frame are the workable form (+4–11 % bytes, 10-31). The
   Viewer's AV1 decode is VideoToolbox (M3 and later) or the vendored libaom (arm64).
 - **What would change the answer:** 4:4:4 (High profile) in the hybrid, for near-lossless lossy
-  tiles. Not built: a lossy tier still pays the settle, and VideoToolbox's hardware decoder may not
-  take High profile, which wasn't checked.
+  tiles; the owner asked for it the same day. What decodes it on a Mac (M4 Pro, macOS 27.2):
+  - *VideoToolbox: nothing.* A High-profile stream (aomenc `--profile=1`) is refused at session
+    creation, `kVTVideoDecoderUnsupportedDataFormatErr` (−12910), with or without hardware
+    required and with the supplemental AV1 decoder registered; Main profile decodes in hardware.
+    The Viewer decodes AV1 only through VideoToolbox (it offers AV1 only when that works).
+  - *ImageIO* decodes 4:4:4 and lossless AVIF stills exactly, ~3 ms a 64×64 image, in software.
+  - *libaom*, which the package vendors for arm64 only (no Intel): 5K 4:4:4 at 8 Mbit/s took
+    15 ms a frame on 8 threads, 36 on one (4:2:0: 12 / 21), with Homebrew's aomdec on a synthetic
+    clip on a loaded Mac, so provisional. A 4:4:4 Viewer would need a libaom decode path.
 
 ### Video recovery with the hybrid live encoder; a stream's colour signalling (2026-11-16)
 
