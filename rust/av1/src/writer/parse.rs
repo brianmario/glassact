@@ -3,7 +3,7 @@
 //! spec's symbol decoder. Inter frames parse without their reference pictures; a later frame of a
 //! stream without its own sequence header parses with the stream's ([`ParseState`]).
 use super::sink::DecSink;
-use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, Walk};
+use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, walk_tile};
 use super::*;
 use crate::blockinfo::{mi_cols, mi_rows};
 use crate::dsp::clip3;
@@ -665,16 +665,19 @@ fn parse_frame(
         let (tr, tc) = (tn / tiles.cols as usize, tn % tiles.cols as usize);
         bufs.setup(&f, tr, tc, false);
         let mut hs = ();
-        let mut walk = Walk::<DecSink, NoHook> {
-            st: &mut st,
-            sk: DecSink::new(&p[tpos..tpos + tsz]),
-            f: &f,
-            bufs: &mut bufs,
-            hook: None,
-            hs: &mut hs,
-            plan: None,
-        };
-        walk.tile(&mut Rec::Parse(&mut pr), tr, tc)?;
+        let sk = DecSink::new(&p[tpos..tpos + tsz]);
+        walk_tile::<DecSink, NoHook>(
+            &mut st,
+            sk,
+            &f,
+            &mut bufs,
+            None,
+            &mut hs,
+            None,
+            &mut Rec::Parse(&mut pr),
+            tr,
+            tc,
+        )?;
         out.tile_bytes.push(tsz as u32);
         out.tile_offsets.push(p_off + tpos as u64);
         tpos += tsz;

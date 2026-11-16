@@ -381,17 +381,24 @@ impl<'a> Decider<'a> {
             let mut l = [0i32; 32 * 32];
             let mut sum = 0i64;
             let s0 = self.src.stride[0];
-            for i in 0..h {
-                for j in 0..w {
-                    // the spec's CfL luma (7.11.5): 2x2 averages << 1 in 4:2:0, samples << 3 in 4:4:4
-                    let v = if ss != 0 {
+            // the spec's CfL luma (7.11.5): 2x2 averages << 1 in 4:2:0, samples << 3 in 4:4:4
+            if ss != 0 {
+                for i in 0..h {
+                    for j in 0..w {
                         let s = self.src.at(0, (cx as usize + j) * 2, (cy as usize + i) * 2);
-                        (s[0] as i32 + s[1] as i32 + s[s0] as i32 + s[s0 + 1] as i32) << 1
-                    } else {
-                        (self.src.at(0, cx as usize + j, cy as usize + i)[0] as i32) << 3
-                    };
-                    l[i * w + j] = v;
-                    sum += v as i64;
+                        let v = (s[0] as i32 + s[1] as i32 + s[s0] as i32 + s[s0 + 1] as i32) << 1;
+                        l[i * w + j] = v;
+                        sum += v as i64;
+                    }
+                }
+            } else {
+                for i in 0..h {
+                    let s = self.src.at(0, cx as usize, cy as usize + i);
+                    for j in 0..w {
+                        let v = (s[j] as i32) << 3;
+                        l[i * w + j] = v;
+                        sum += v as i64;
+                    }
                 }
             }
             let n = (w * h) as i64;

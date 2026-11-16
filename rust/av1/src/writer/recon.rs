@@ -34,7 +34,7 @@
 //! record as it does).
 use super::walk::{
     Frame, InterMaps, TileBufs, TxbEdges, levels, map_dims, map_origin, predict_inter_block, predict_intra_txb,
-    predict_intrabc_block, predict_palette,
+    predict_intrabc_block, predict_palette, sub_of,
 };
 use super::{Res, TxbCtx, TxbHook};
 use crate::blockinfo::{bh4, bw4};
@@ -463,7 +463,8 @@ pub(super) struct ReconRec<'a> {
 }
 
 /// Block `k`'s reconstruction: its prediction, and with a residual the hook, the inverse transform,
-/// its tx blocks' final levels, tx types and eobs. As the walk's (`walk::txb`).
+/// its tx blocks' final levels, tx types and eobs. As the walk's (`walk::txb`). `SS`: the frame's
+/// chroma subsampling ([`Frame::ss`], a constant as in the walk).
 ///
 /// # Safety
 ///
@@ -472,7 +473,7 @@ pub(super) struct ReconRec<'a> {
 /// must be reconstructed, their writes ordered before this call. The planes, tx blocks and
 /// coefficients must be the ones the plan's walk checked.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn recon_block<H: TxbHook>(
+pub(super) unsafe fn recon_block<H: TxbHook, const SS: i32>(
     f: &Frame,
     hook: Option<&H>,
     rec: ReconRec,
@@ -517,7 +518,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
     if is_inter && f.intrabc {
         let dv = mvs[((r - t.r0) * t.mw + c - t.c0) as usize];
         let dv = [dv[0] as i32, dv[1] as i32];
-        predict_intrabc_block(&mut planes, t.stride, t.r0, t.c0, r, c, bsize, has_chroma, f.ss, dv);
+        predict_intrabc_block(&mut planes, t.stride, t.r0, t.c0, r, c, bsize, has_chroma, SS, dv);
     } else if is_inter && f.refs.is_some() {
         let maps = InterMaps {
             ref0,
@@ -535,7 +536,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let tx = unsafe { &mut *rec.txb.add(ti) };
         let plane = tx.plane as usize;
         let tx_sz = tx.tx_size as i32;
-        let sub = f.sub(plane);
+        let sub = sub_of::<SS>(plane);
         let (ox, oy) = ((t.c0 * 4) >> sub, (t.r0 * 4) >> sub);
         let (lx, ly) = (tx.x4 as i32 * 4 - ox, tx.y4 as i32 * 4 - oy);
         let stride = t.stride[plane];
@@ -544,10 +545,10 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
         let pal_n = [pal.size_y, pal.size_uv][(plane > 0) as usize];
         if !is_inter && pal_n != 0 {
             // the maps start at map_off: luma, then chroma (the plan's walk checked them)
-            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, plane > 0, f.ss);
+            let d = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, plane > 0, SS);
             let at = pal.map_off as usize
                 + if plane > 0 && pal.size_y != 0 {
-                    let l = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, false, f.ss);
+                    let l = map_dims(bsize, r, c, f.mi_rows, f.mi_cols, false, SS);
                     l.w * l.h
                 } else {
                     0
@@ -574,7 +575,7 @@ pub(super) unsafe fn recon_block<H: TxbHook>(
             };
             predict_intra_txb(
                 fp,
-                f.ss,
+                SS,
                 b,
                 plane,
                 tx_sz,

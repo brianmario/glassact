@@ -136,7 +136,7 @@ fn ceil_log2(x: i32) -> i32 {
     }
 }
 
-impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
+impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
     /// NS(n): a value below n with the fewest bits.
     fn ns(&mut self, v_w: i32, n: i32) -> i32 {
         let w = 32 - (n as u32).leading_zeros() as i32;
@@ -391,7 +391,7 @@ impl<S: Sink, H: TxbHook> Walk<'_, S, H> {
             if n == 0 {
                 continue;
             }
-            let d = map_dims(bsize, self.st.mi_row, self.st.mi_col, f.mi_rows, f.mi_cols, uv, f.ss);
+            let d = map_dims(bsize, self.st.mi_row, self.st.mi_col, f.mi_rows, f.mi_cols, uv, SS);
             let mut maps = self.st.maps.take().unwrap_or_default();
             let map = &mut maps.map[uv as usize];
             if S::WRITE {

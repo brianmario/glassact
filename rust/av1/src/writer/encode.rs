@@ -3,7 +3,7 @@
 use super::headers::{BitWriter, frame_obus};
 use super::recon::{PlanCtx, PlanOut, Ready, ReconBufs, ReconRec, ReconTile, TilePlan, recon_block};
 use super::sink::{EcSink, NullSink, TeeSink};
-use super::walk::{Frame, Rec, TileBufs, TileState, Walk};
+use super::walk::{Frame, Rec, TileBufs, TileState, walk_tile};
 use super::*;
 use crate::blockinfo::{chroma_ss, mi_cols, mi_rows};
 use crate::dsp::{
@@ -143,16 +143,7 @@ fn code_tile<H: TxbHook>(
     w.ec.reset();
     let nsym = match (plan, syms) {
         (Some(p), _) => {
-            let mut walk = Walk {
-                st: &mut w.st,
-                sk: NullSink,
-                f,
-                bufs,
-                hook,
-                hs,
-                plan: Some(p),
-            };
-            walk.tile(rec, tr, tc)?;
+            walk_tile(&mut w.st, NullSink, f, bufs, hook, hs, Some(p), rec, tr, tc)?;
             0
         }
         (None, Some(out)) => {
@@ -163,31 +154,11 @@ fn code_tile<H: TxbHook>(
                 base,
                 out,
             };
-            let mut walk = Walk {
-                st: &mut w.st,
-                sk,
-                f,
-                bufs,
-                hook,
-                hs,
-                plan: None,
-            };
-            walk.tile(rec, tr, tc)?;
-            walk.sk.ec.nsym
+            walk_tile(&mut w.st, sk, f, bufs, hook, hs, None, rec, tr, tc)?.ec.nsym
         }
         (None, None) => {
             let sk = EcSink { ec: &mut w.ec, nsym: 0 };
-            let mut walk = Walk {
-                st: &mut w.st,
-                sk,
-                f,
-                bufs,
-                hook,
-                hs,
-                plan: None,
-            };
-            walk.tile(rec, tr, tc)?;
-            walk.sk.nsym
+            walk_tile(&mut w.st, sk, f, bufs, hook, hs, None, rec, tr, tc)?.nsym
         }
     };
     payload.clear();
@@ -801,7 +772,14 @@ impl<H: TxbHook> Split<'_, H> {
             // lock and the queue order their writes before this), and its blocks run in walk
             // order here; their tx blocks, coefficients and samples are their own; the plan's
             // walk checked them
-            let r = unsafe { recon_block(&self.f, self.hook, rec, t, j.first as usize + b, &mut w.rb, hs, n_fixed) };
+            let k = j.first as usize + b;
+            let r = unsafe {
+                if self.f.ss != 0 {
+                    recon_block::<H, 1>(&self.f, self.hook, rec, t, k, &mut w.rb, hs, n_fixed)
+                } else {
+                    recon_block::<H, 0>(&self.f, self.hook, rec, t, k, &mut w.rb, hs, n_fixed)
+                }
+            };
             if let Err(e) = r {
                 // (not reached: a split tile's reconstruction can't fail)
                 let mut o = j.out.lock().unwrap_or_else(|e| e.into_inner());
