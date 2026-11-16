@@ -62,9 +62,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     public var fixedQindex: Int?
     /// Bench: the encoder's settings for each stream, before it starts (on the encoder's queue).
     public var configure: (@Sendable (AV1HybridEncoder) -> Void)?
-    /// Bench: each frame as it's written (the encoder's thread): its size, qindex, whether it's a
-    /// key frame, and its submit-to-frame time in seconds.
-    public var onWritten: (@Sendable (_ bytes: Int, _ qindex: Int, _ key: Bool, _ seconds: Double) -> Void)?
+    /// Bench: each frame as it's written (the encoder's thread), whether it's a key frame, and its
+    /// submit-to-frame time in seconds.
+    public var onWritten: (@Sendable (_ frame: AV1HybridEncoder.Frame, _ key: Bool, _ seconds: Double) -> Void)?
 
     private let callbackQueue: DispatchQueue
     /// Full range, BT.709 matrix: how VideoToolbox's AV1 decoder (the Viewer's) shows the encoder's
@@ -277,7 +277,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 configSent = config != nil
                 return (config, now - t0)
             }
-            onWritten?(frame.obu.count, frame.timing.qindex, key, seconds)
+            onWritten?(frame, key, seconds)
             let obu = frame.obu
             callbackQueue.async { [weak self] in self?.deliver(obu, sync: key, config: config, token: token) }
         case .failure:

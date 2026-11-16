@@ -6,7 +6,8 @@ import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
-                             "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "frames", "score-every"]
+                             "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "frames", "score-every",
+                             "fault-decode", "fault-reset", "fault-dissolve", "check-pictures"]
 
 let replayCommand = Command(
     name: "replay",
@@ -28,6 +29,10 @@ let replayCommand = Command(
         .int("hybrid-key-link-ms", "<ms>", 1...60_000, "loop experiment, --video hybrid: what a key frame may spend as time at the link's cap (default the controller's)"),
         .int("hybrid-min-qindex", "<n>", 1...255, "loop experiment, --video hybrid: the rate controller's qindex floor (default the controller's)"),
         .int("frames", "<n>", 1...1_000_000, "loop: feed only the trace's first n frames"),
+        .string("fault-decode", "<n,…>", "loop, real codecs: the Viewer's nth frames (from 1, over the session) reach its decoder corrupted, which fails and is rebuilt (deterministic)"),
+        .string("fault-reset", "<n,…>", "loop, real codecs: the video stream fails once the Host has sent n frames (what's in flight is lost; the Viewer hears at once, the Host 20 ms later)"),
+        .string("fault-dissolve", "<n,…>", "loop, real codecs: the Host's region dissolves once it has sent n frames (it re-forms as the screen changes)"),
+        .bool("check-pictures", "loop, --video hybrid: check every frame the Viewer shows against the encoder's reconstruction (on with any --fault-*)"),
         .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),

@@ -1,6 +1,7 @@
 // replay --mode loop: host engine -> seeded faults -> viewer engine over
 // virtual time, then the §7 settle and the golden canvas check.
 import Foundation
+import GlassActAV1
 import GlassActCodec
 import GlassActCore
 import GlassActHybridVideo
@@ -41,6 +42,19 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         var qindex: [Int] = [], keys = 0, keyQindex: [Int] = []
     }
     let hybridLog = HybridLog()
+    // --fault-decode / --fault-reset / --fault-dissolve (ReplayVideoFaults), and with the hybrid
+    // the check that every frame shown is the encoder's picture (also --check-pictures)
+    let videoFaults = ReplayVideoFaults()
+    func counts(_ name: String) -> [Int] {
+        (opts.string(name) ?? "").split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+    videoFaults.decodeAt = Set(counts("fault-decode"))
+    videoFaults.resetAt = counts("fault-reset").sorted()
+    videoFaults.dissolveAt = counts("fault-dissolve").sorted()
+    videoFaults.armed()
+    videoFaults.checksPictures = videoMode == "hybrid" && (videoFaults.active || opts.has("check-pictures"))
+    videoFaults.armed()
+    videoFaults.now = { link.nowUS }
     var viewerCodecs: [UInt8] = []
     let vtPipeline = BenchVTPipeline()
     let score = ReplayVideoScore()
@@ -103,7 +117,10 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             if keyBudgetMS > 0 { h.keyBudgetUS = UInt64(keyBudgetMS) * 1000 }
             if minQ >= 0 { h.minQindex = minQ }
             if keyLinkMS > 0 { h.keyLinkUS = UInt64(keyLinkMS) * 1000 }
-            h.onWritten = { _, q, key, _ in
+            if videoFaults.checksPictures { h.configure = { $0.returnsPlanes = true } }  // (the reconstruction too)
+            h.onWritten = { frame, key, seconds in
+                videoFaults.written(frame, key: key, seconds: seconds)
+                let q = frame.timing.qindex
                 hybridLog.lock.withLock {
                     hybridLog.qindex.append(q)
                     if key {
@@ -141,6 +158,9 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         viewerCodecs = [VideoCodec.av1, VideoCodec.hevc]
     default:
         throw BenchError("--video expects mock, vt, av1, hybrid or av1-hevc")
+    }
+    if videoFaults.active, let real = decoderFactory {
+        decoderFactory = { FaultingDecoder(real(), videoFaults) }
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -198,12 +218,39 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var nextBacklogSampleUS: UInt64 = 0
     let timeline = opts.has("timeline")
     var nextTimelineUS: UInt64 = 0
+    // the video faults that come by the Host's frame count
+    var hostResetDueUS: UInt64?
+    func videoFaultsTick() {
+        let sent = host.stats.videoFramesSent
+        if let n = videoFaults.resetAt.first, sent >= n {
+            videoFaults.resetAt.removeFirst()
+            // the stream fails: what's in flight is lost, the Viewer hears of it now, the Host
+            // (its encode queue) later; what it sends meanwhile goes on the replacement stream
+            videoFaults.noteReset(lost: link.dropVideoInFlight())
+            viewer.resetVideoStream()
+            hostResetDueUS = link.nowUS + 20_000
+        }
+        if let due = hostResetDueUS, link.nowUS >= due {
+            hostResetDueUS = nil
+            host.videoChannelReset()
+        }
+        if let n = videoFaults.dissolveAt.first, sent >= n {
+            videoFaults.dissolveAt.removeFirst()
+            if host.activeVideoRegionCount > 0 {
+                videoFaults.noteDissolve()
+                // (the Host's dissolve on a lost stream, with the stream kept: a full repaint, and
+                // the region re-forms on the next churn)
+                host.videoChannelReset()
+            }
+        }
+    }
     func drive(untilUS: UInt64) {
         var t = link.nowUS
         while t < untilUS {
             t = min(t + 1_000, untilUS)
             link.advance(toUS: t)
             drainVTOutput()
+            if videoFaults.active { videoFaultsTick() }
             timed(&timings.viewerTick) { viewer.tick(nowUS: link.nowUS) }
             timed(&timings.hostTick) { host.tick(nowUS: link.nowUS) }
             if timeline && t >= nextTimelineUS {
@@ -454,6 +501,10 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     """)
     if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
+        if videoFaults.active {
+            print(videoFaults.summary + " · sync requests ignored by the Host \(host.stats.videoSyncRequestsIgnored)"
+                  + " · stream resets the Host saw \(host.stats.videoChannelResets)")
+        }
         if videoMode == "hybrid" {
             let (qs, keys, keyQ) = hybridLog.lock.withLock { (hybridLog.qindex.sorted(), hybridLog.keys, hybridLog.keyQindex) }
             func at(_ p: Double) -> Int { qs.isEmpty ? -1 : qs[min(qs.count - 1, Int(Double(qs.count) * p))] }
