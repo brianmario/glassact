@@ -269,8 +269,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 let t0 = submitted.isEmpty ? now : submitted.removeFirst()
                 // the av1C record with the region's first frame (a key frame: its sequence header)
                 guard !configSent, key else { return (nil, now - t0) }
-                configSent = true
-                return (AV1Config.sequenceHeaderOBU(inTemporalUnit: frame.obu).flatMap { AV1Config.build(sequenceHeaderOBU: $0) }, now - t0)
+                let config = AV1Config.sequenceHeaderOBU(inTemporalUnit: frame.obu).flatMap { AV1Config.build(sequenceHeaderOBU: $0) }
+                configSent = config != nil
+                return (config, now - t0)
             }
             onWritten?(frame.obu.count, frame.timing.qindex, key, seconds)
             let obu = frame.obu

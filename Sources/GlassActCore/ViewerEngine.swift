@@ -536,9 +536,12 @@ public final class ViewerEngine: @unchecked Sendable {
 
     /// The transport replaced or lost the video stream (see QUICTransport
     /// `onVideoReset`): discard any partial TLV so the new stream's bytes
-    /// frame from scratch. Regions resynchronize from the host's next START.
+    /// frame from scratch. Regions resynchronize from the host's next START,
+    /// or in place from a sync frame: frames of a live region that predict
+    /// from ones lost with the old stream aren't shown (`awaitSyncAll`).
     public func resetVideoStream() {
         videoDeframer = VideoDeframer()
+        video.awaitSyncAll()
     }
 
     /// Lossless keyframe apply (§4.7, see KeyframeApplier); the ACK goes out only on
