@@ -36,17 +36,52 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// One 8-bit 4:2:0 picture, tightly packed: Y width × height, U and V
-    /// half that each way, rounded up.
+    /// half that each way, rounded up. Or, with `chroma444`, a 4:4:4 one: U and
+    /// V width × height too.
     public struct Picture: Sendable {
         public var y: [UInt8], u: [UInt8], v: [UInt8]
         public var width: Int, height: Int
+        /// The chroma planes are full size: the picture is coded as a 4:4:4 key frame (AV1's High
+        /// profile), whose decoded planes (`Frame.planes`) are full size too. Key frames only: a
+        /// stream with `interFrames` refuses it. The GPU's analysis decides the partition and luma
+        /// modes from a 4:2:0 copy of the chroma (2×2 means); the closed loop decides chroma from
+        /// the real planes. No post-filters (the GPU's are 4:2:0's), with intra block copy or not.
+        public var chroma444: Bool
 
-        public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int) {
+        public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {
             self.y = y
             self.u = u
             self.v = v
             self.width = width
             self.height = height
+            self.chroma444 = chroma444
+        }
+
+        /// The chroma planes' width and height.
+        var chromaSize: (width: Int, height: Int) {
+            chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+        }
+
+        /// A 4:4:4 picture's chroma as 4:2:0's: each 2×2's mean, rounded (edge samples repeated
+        /// past an odd width or height).
+        func chroma420() -> (u: [UInt8], v: [UInt8]) {
+            let (cw, ch) = ((width + 1) / 2, (height + 1) / 2)
+            func half(_ plane: [UInt8]) -> [UInt8] {
+                [UInt8](unsafeUninitializedCapacity: cw * ch) { out, count in
+                    plane.withUnsafeBufferPointer { s in
+                        for r in 0..<ch {
+                            let r0 = 2 * r * width, r1 = min(2 * r + 1, height - 1) * width
+                            for c in 0..<cw {
+                                let c0 = 2 * c, c1 = min(2 * c + 1, width - 1)
+                                let sum = Int(s[r0 + c0]) + Int(s[r0 + c1]) + Int(s[r1 + c0]) + Int(s[r1 + c1])
+                                out[r * cw + c] = UInt8((sum + 2) >> 2)
+                            }
+                        }
+                    }
+                    count = cw * ch
+                }
+            }
+            return (half(u), half(v))
         }
     }
 
@@ -830,7 +865,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let sameSize = s.lastCopied.map { $0.width == p.width && $0.height == p.height } ?? false
         let key = !interFrames || index == 0 || forceKey || !sameSize
         var copies = Copies()
-        if interFrames {
+        if interFrames && !p.chroma444 {  // (a 4:4:4 picture fails in `begin`)
             if key {
                 if index > 0 { copyFinder.reset() }  // (every slot then holds the key frame)
             } else if let last = s.lastCopied {
@@ -1398,12 +1433,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
     private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
         Self.trace("begin")
+        // a 4:4:4 picture: a key frame alone, its analysis on a 4:2:0 copy of its chroma
+        var analysisChroma: (u: [UInt8], v: [UInt8])?
+        if p.chroma444 {
+            guard !interFrames else {
+                throw Failure.encode("4:4:4 pictures are coded as key frames alone: a stream with interFrames is 4:2:0")
+            }
+            guard p.y.count == p.width * p.height, p.u.count == p.y.count, p.v.count == p.y.count else {
+                throw Failure.encode("4:4:4 picture \(p.width)×\(p.height): planes of \(p.y.count), \(p.u.count), \(p.v.count) samples")
+            }
+            analysisChroma = p.chroma420()
+        }
         let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         let partition = try p.y.withUnsafeBufferPointer { y in
-            try p.u.withUnsafeBufferPointer { u in
-                try p.v.withUnsafeBufferPointer { v in
+            try (analysisChroma?.u ?? p.u).withUnsafeBufferPointer { u in
+                try (analysisChroma?.v ?? p.v).withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
                                              motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort)
@@ -1539,6 +1585,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                    Int32(effort.rdoqMinCoefficients ?? rdoqMinCoefficients))
         }
         Self.trace("closed loop start")
+        av1enc_hybrid_set_chroma_444(cpu, p.chroma444 ? 1 : 0)
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in
@@ -1607,7 +1654,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(analysisSource.isEmpty ? Int(stride) : partition.sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
-        guard postfilters, !copies else {
+        // (a 4:4:4 picture has none either: the GPU's filters and their search are 4:2:0's)
+        guard postfilters, !copies, !p.chroma444 else {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
             filtered()  // (none)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
@@ -1787,8 +1835,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
         let paddedWidth = 2 * ((p.width + 7) >> 3) * 4
         let planes = (0..<3).map { plane -> [UInt8] in
-            let w = plane == 0 ? p.width : (p.width + 1) / 2, h = plane == 0 ? p.height : (p.height + 1) / 2
-            let stride = plane == 0 ? paddedWidth : paddedWidth / 2
+            let w = plane == 0 ? p.width : p.chromaSize.width, h = plane == 0 ? p.height : p.chromaSize.height
+            let stride = plane == 0 || p.chroma444 ? paddedWidth : paddedWidth / 2
             return [UInt8](unsafeUninitializedCapacity: w * h) { d, count in
                 for row in 0..<h { (d.baseAddress! + row * w).update(from: recon[plane] + row * stride, count: w) }
                 count = w * h

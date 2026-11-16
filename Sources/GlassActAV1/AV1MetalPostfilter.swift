@@ -73,8 +73,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     public private(set) var lastFilteredShare = 1.0
 
     /// av1g_frame_params up to its last field (the rest is padding).
-    private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.golden_slot)!
-        + MemoryLayout.size(ofValue: av1g_frame_params().golden_slot)
+    private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.chroma_format)!
+        + MemoryLayout.size(ofValue: av1g_frame_params().chroma_format)
     /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, chroma half;
     /// the picture's samples at the top left), valid until the next call: what a caller that
     /// doesn't take `Search.planes` reads instead.
@@ -483,6 +483,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private var lastJob: Job?
     private func job(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                      planes: [UnsafePointer<UInt8>], lfZero: [UInt8]?) throws -> Job {
+        // (the kernels, the strength search and blockinfo.h are 4:2:0's)
+        guard fp.chroma_format == UInt8(AV1G_CHROMA_420) else { throw Failure.metal("the post-filters are 4:2:0 only") }
         let job = try job(geometry: fp)
         try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         return job
