@@ -46,6 +46,8 @@ mod tiles;
 mod walk;
 
 #[cfg(test)]
+mod chroma444_tests;
+#[cfg(test)]
 mod inter_tests;
 #[cfg(test)]
 mod palette_tests;

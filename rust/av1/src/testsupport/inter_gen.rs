@@ -570,14 +570,24 @@ impl InterSeq {
 
 /// spec is_mv_valid for an intra block copy block of `bsize` at mi (r, c) of tile `t`: a whole
 /// displacement `dv` (1/8 sample) to an area inside the tile, decoded and INTRABC_DELAY behind; with
-/// chroma and an odd component, also with the area 2 samples larger that way (the writer's rule:
-/// the bilinear chroma reads them).
-fn dv_valid(t: (i32, i32, i32, i32), sb128: bool, mono: bool, r: i32, c: i32, bsize: i32, dv: [i32; 2]) -> bool {
+/// 4:2:0 chroma (`ss` 1) and an odd component, also with the area 2 samples larger that way (the
+/// writer's rule: the bilinear chroma reads them).
+#[allow(clippy::too_many_arguments)]
+fn dv_valid(
+    t: (i32, i32, i32, i32),
+    sb128: bool,
+    mono: bool,
+    ss: i32,
+    r: i32,
+    c: i32,
+    bsize: i32,
+    dv: [i32; 2],
+) -> bool {
     if dv[0] & 7 != 0 || dv[1] & 7 != 0 || dv[0].abs() >= 1 << 13 || dv[1].abs() >= 1 << 13 {
         return false;
     }
     let (bw, bh) = (4 * bw4(bsize), 4 * bh4(bsize));
-    let (ey, ex) = if mono {
+    let (ey, ex) = if mono || ss == 0 {
         (0, 0)
     } else {
         (2 * ((dv[0] / 8) & 1), 2 * ((dv[1] / 8) & 1))
@@ -606,7 +616,7 @@ fn area_valid(t: (i32, i32, i32, i32), sb128: bool, r: i32, c: i32, bw: i32, bh:
 
 /// Turns some blocks of 8x8 and up of a key frame with intra block copy into intra block copy
 /// blocks (mode fields 0) at valid displacements: the tile's last one again now and then (the
-/// candidate stack's), else random ones, near and far.
+/// candidate stack's), else random ones, near and far. (4:4:4 frames: fp.chroma_format.)
 fn add_intrabc(
     rng: &mut Rng,
     fp: &FrameParams,
@@ -615,6 +625,7 @@ fn add_intrabc(
     inter: &mut [BlockInter],
 ) {
     let pct = [20, 50, 90][rng.range(0, 2) as usize];
+    let ss = crate::blockinfo::chroma_ss(fp);
     let mut last: Option<(usize, [i32; 2])> = None;
     for (b, bi) in blocks.iter_mut().zip(inter.iter_mut()) {
         let bs = b.bsize as i32;
@@ -639,7 +650,7 @@ fn add_intrabc(
         if let Some((lt, dv)) = last
             && lt == ti
             && rng.chance(50)
-            && dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, r, c, bs, dv)
+            && dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, ss, r, c, bs, dv)
         {
             found = Some(dv);
         }
@@ -648,7 +659,7 @@ fn add_intrabc(
             let y = rng.range(t.0 * 4, (r * 4).max(t.0 * 4));
             let x = rng.range(t.2 * 4, (t.3 * 4 - 8).max(t.2 * 4));
             let dv = [(y - r * 4) * 8, (x - c * 4) * 8];
-            if dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, r, c, bs, dv) {
+            if dv_valid(t, fp.sb128 != 0, fp.monochrome != 0, ss, r, c, bs, dv) {
                 found = Some(dv);
                 break;
             }
@@ -664,6 +675,18 @@ fn add_intrabc(
         }
         b.tx_depth = b.tx_depth.min(2);
     }
+}
+
+/// [`add_intrabc`] with its own random stream of `seed` (the 4:4:4 tests' key frames).
+#[cfg(test)]
+pub(crate) fn add_intrabc_seeded(
+    seed: u64,
+    fp: &FrameParams,
+    tiles: &crate::types::Tiles,
+    blocks: &mut [Block],
+    inter: &mut [BlockInter],
+) {
+    add_intrabc(&mut Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1), fp, tiles, blocks, inter);
 }
 
 /// av1t_inter_case_make: [`InterSeq::make`].

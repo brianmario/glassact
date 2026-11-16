@@ -116,12 +116,21 @@ pub(crate) fn random_case(r: &mut Rng, max_dim: i32) -> Case {
 /// [`random_case`], or (`sb128`) with partitions of 128x128s (blocks up to 128x128) and random
 /// inter flags.
 pub(crate) fn random_case_ex(r: &mut Rng, max_dim: i32, sb128: bool) -> Case {
+    random_case_fmt(r, max_dim, sb128, false)
+}
+
+/// [`random_case_ex`], or (`c444`) a 4:4:4 frame (fp.chroma_format, never monochrome) with the
+/// same draws: full-size chroma planes.
+pub(crate) fn random_case_fmt(r: &mut Rng, max_dim: i32, sb128: bool, c444: bool) -> Case {
     let mut fp = FrameParams {
         width: r.range(1, max_dim) as u32,
         height: r.range(1, max_dim) as u32,
         ..Default::default()
     };
     fp.monochrome = (r.below(6) == 0) as u8;
+    if c444 {
+        (fp.version, fp.chroma_format, fp.monochrome) = (crate::types::DECISIONS_VERSION, crate::types::CHROMA_444, 0);
+    }
     let lv = |r: &mut Rng| if r.below(6) == 0 { 0 } else if r.below(2) == 0 { r.range(0, 63) } else { r.range(20, 63) } as u8;
     fp.loop_filter_level = [lv(r), lv(r), lv(r), lv(r)];
     fp.loop_filter_sharpness = if r.below(2) == 0 { 0 } else { r.range(0, 7) as u8 };
@@ -161,8 +170,9 @@ pub(crate) fn random_case_ex(r: &mut Rng, max_dim: i32, sb128: bool) -> Case {
     };
     let mut planes: [Vec<u8>; 3] = Default::default();
     let mut stride = [0usize; 3];
+    let ss = chroma_ss(&fp);
     for p in 0..3 {
-        let sub = (p != 0) as i32;
+        let sub = if p != 0 { ss } else { 0 };
         let (w, h) = (((mc * 4) >> sub) as usize, ((mr * 4) >> sub) as usize);
         stride[p] = w + r.below(3) as usize * 8;
         let mut v = vec![0u8; stride[p] * h];
@@ -271,6 +281,55 @@ fn skipped_inter_128_blocks_keep_their_inner_edges() {
         .map(|&(r, c)| blk(BLOCK_64X64, r, c, 1))
         .collect();
     assert!(run(&quads, PF_BLK_INTER), "four 64x64s");
+}
+
+/// [`deblock_simd_matches_scalar`] of 4:4:4 frames: chroma edges on luma's grid.
+#[test]
+fn deblock_simd_matches_scalar_444() {
+    let mut r = Rng(33);
+    let mut changed = 0;
+    for k in 0..200 {
+        let c = random_case_fmt(&mut r, 200, k >= 150, true);
+        let f = PfFrame::new(&c.fp);
+        assert_eq!(f.ss, 0);
+        let mb = c.maps(&f);
+        let m = mb.maps();
+        let (mut a, mut b) = (c.planes.clone(), c.planes.clone());
+        deblock_frame(&f, &m, &mut split(&mut a), &c.stride);
+        deblock_frame_scalar(&f, &m, &mut split(&mut b), &c.stride);
+        assert!(a == b, "{:?}", c.fp);
+        changed += (a[1] != c.planes[1] || a[2] != c.planes[2]) as u32;
+    }
+    assert!(changed > 100);
+}
+
+/// [`cdef_simd_matches_scalar`] of 4:4:4 frames: 8x8 chroma blocks.
+#[test]
+fn cdef_simd_matches_scalar_444() {
+    let mut r = Rng(34);
+    let mut changed = 0;
+    for k in 0..60 {
+        let c = random_case_fmt(&mut r, 200, k % 4 == 3, true);
+        let mut fp = c.fp;
+        fp.enable_cdef = 1;
+        let f = PfFrame::new(&fp);
+        let mut mb = PfMapsBuf::new(&f);
+        for b in &c.blocks {
+            mb.mark_block(&f, b);
+        }
+        let m = mb.maps();
+        let src: [&[u8]; 3] = [&c.planes[0], &c.planes[1], &c.planes[2]];
+        let (mut a, mut b) = (c.planes.clone(), c.planes.clone());
+        for p in 0..3 {
+            a[p].fill(0);
+            b[p].fill(0);
+        }
+        cdef_frame(&f, &m, &src, &c.stride, &mut split(&mut a), &c.stride);
+        cdef_frame_scalar(&f, &m, &src, &c.stride, &mut split(&mut b), &c.stride);
+        assert!(a == b, "{fp:?}");
+        changed += (a[1] != c.planes[1] || a[2] != c.planes[2]) as u32;
+    }
+    assert!(changed > 40, "{changed}");
 }
 
 #[test]

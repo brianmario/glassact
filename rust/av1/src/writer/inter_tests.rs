@@ -44,7 +44,7 @@ pub(super) fn encode_seq(w: &mut Writer, seq: &mut InterSeq, flags: u32) -> Resu
 /// What the parser gives back for a written record: the decisions the bitstream carries (a skip
 /// block's cdef_idx and a skipped SB-sized block's qindex are not coded) and the written-back tx
 /// blocks.
-fn expect_parsed(want: &Record, got: &Record, what: &str) {
+pub(super) fn expect_parsed(want: &Record, got: &Record, what: &str) {
     let mut fp = want.fp;
     (fp.tile_cols_log2, fp.tile_rows_log2) = (got.fp.tile_cols_log2, got.fp.tile_rows_log2);
     assert_eq!(fp, got.fp, "{what}: frame params");
@@ -995,7 +995,8 @@ pub(super) fn decode_check(
         );
         let data = std::fs::read(&yuv).unwrap();
         let (pw, ph) = (fp.width as usize, fp.height as usize);
-        let (cw, ch) = (pw.div_ceil(2), ph.div_ceil(2));
+        let ss = crate::blockinfo::chroma_ss(fp) as usize;
+        let (cw, ch) = ((pw + ss) >> ss, (ph + ss) >> ss);
         let mono = fp.monochrome != 0;
         let per = if mono { pw * ph } else { pw * ph + 2 * cw * ch };
         assert_eq!(data.len(), per * outs.len(), "{name}: {tool} output size");
