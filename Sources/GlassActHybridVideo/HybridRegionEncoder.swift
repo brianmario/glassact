@@ -53,6 +53,10 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     public var smoothQuantizerCeiling = 60
     /// Experiment: libaom's quantizer ceiling (0–63) instead of the frame-QP mapping; nil = the mapping.
     public var quantizerCeiling: Int?
+    /// Experiments: the controller's key frame budget and qindex floor (nil: its defaults).
+    public var keyBudgetUS: UInt64?
+    public var keyLinkUS: UInt64?
+    public var minQindex: Int?
     /// Bench: every picture at this qindex (key frames `keyFrameQindexDelta` finer, fast ones
     /// coarser, as `av1seq` codes them), no rate control.
     public var fixedQindex: Int?
@@ -104,9 +108,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         self.onFrame = onFrame
         self.shared = shared
         baseBitrate = AOMRegionEncoder.baseBitrate(width: width, height: height)
+        applyRate()
         rateLock.withLock {
-            rate.bitsPerSecond = aimedBitrate
-            rate.maxQindex = maxQindex
             rate.restart()
             submitted = []
             configSent = false
@@ -207,10 +210,15 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     private func applyRate() {
-        let (bits, ceiling) = (aimedBitrate, maxQindex)
+        let (bits, ceiling, key, floor, cap) = (aimedBitrate, maxQindex, keyBudgetUS, minQindex, bitrateCap)
+        let keyLink = keyLinkUS
         rateLock.withLock {
             rate.bitsPerSecond = bits
+            rate.linkBitsPerSecond = cap
+            if let keyLink { rate.keyLinkUS = keyLink }
             rate.maxQindex = ceiling
+            if let key { rate.keyBudgetUS = key }
+            if let floor { rate.minQindex = floor }
         }
     }
 

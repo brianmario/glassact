@@ -29,7 +29,16 @@ import Foundation
 ///
 /// **Key frames.** A key frame may spend `keyBudgetUS` of the rate, and the bucket is charged no
 /// more than its time's share: its burst is paid back by the frames the send gate skips
-/// (`VideoRateController`), not by the next pictures' quality.
+/// (`VideoRateController`), not by the next pictures' quality. The budget is large (2.5 s of the
+/// aim) because the inter frames copy the key frame's 64×64s and never re-code them: a key frame
+/// at the ceiling stays the stream's quality wherever the screen is still (a quarter second of
+/// the aim bought a 5K text key frame only qindex 168, and the replay's typing and dragging came
+/// out 5–8 dB under libaom at a fraction of its bytes; at 2.5 s, qindex 76–99 and within 1 dB of
+/// it at a quarter of the bytes; the burst moves a 2 Mbit/s link's glass-to-glass p50 from 88 to
+/// 626 ms on typing's first frames). With a link cap the key frame also spends no more than
+/// `keyLinkUS` (0.5 s) of the link: without that bound a 5K photo's key frame (2.6× the seed's
+/// bits) filled a 2 Mbit/s link's buffer and the stream delivered 7 frames of 300, as libaom's
+/// does; with it, 110.
 ///
 /// A deterministic value type; `HybridRegionEncoder` holds it under a lock (decisions on the
 /// encoder's begin queue, sizes from its writer).
@@ -93,10 +102,14 @@ public struct HybridRateController: Sendable {
     public var targetDebtUS: UInt64 = 50_000
     public var recoveryUS: UInt64 = 500_000
     /// What a key frame may spend.
-    public var keyBudgetUS: UInt64 = 250_000
+    public var keyBudgetUS: UInt64 = 2_500_000
     /// An inter frame keeps the last one's qindex when the new one is this close (the analysis
     /// keeps its buffers only for one qindex at a time).
     public var hysteresis = 4
+    /// The link's measured rate (the encoder's bitrate cap), when there is one: a key frame spends
+    /// no more than `keyLinkUS` of it, so that its burst doesn't fill a thin link's buffer.
+    public var linkBitsPerSecond: Int?
+    public var keyLinkUS: UInt64 = 500_000
 
     public private(set) var inter: Model
     public private(set) var key: Model
@@ -135,7 +148,9 @@ public struct HybridRateController: Sendable {
         let share = rate * Double(dtUS) / 1e6
         let decision: Decision
         if isKey {
-            let target = max(share, rate * Double(keyBudgetUS) / 1e6 - max(0, debtBits - rate * Double(targetDebtUS) / 1e6))
+            var budget = rate * Double(keyBudgetUS) / 1e6
+            if let link = linkBitsPerSecond { budget = min(budget, Double(link) * Double(keyLinkUS) / 1e6) }
+            let target = max(share, budget - max(0, debtBits - rate * Double(targetDebtUS) / 1e6))
             let q = clamp(key.qindex(forBits: target, coded: coded), minQindex, maxQindex)
             let predicted = key.bits(coded: coded, qindex: q)
             decision = Decision(key: true, fast: false, coded: coded, qindex: min(255, q - keyQindexDelta), finalQindex: q,

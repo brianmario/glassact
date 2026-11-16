@@ -38,7 +38,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // --video hybrid: each frame's qindex and whether it's a key frame (the encoder's threads)
     final class HybridLog: @unchecked Sendable {
         let lock = NSLock()
-        var qindex: [Int] = [], keys = 0
+        var qindex: [Int] = [], keys = 0, keyQindex: [Int] = []
     }
     let hybridLog = HybridLog()
     var viewerCodecs: [UInt8] = []
@@ -92,16 +92,24 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         }
         let targetPct = opts.int("av1-target-pct", 40)
         let qmax = opts.has("av1-qmax") ? opts.int("av1-qmax", 42) : nil
+        let keyBudgetMS = opts.int("hybrid-key-ms", 0), minQ = opts.int("hybrid-min-qindex", -1)
+        let keyLinkMS = opts.int("hybrid-key-link-ms", 0)
         encoderFactory = {
             guard $0 == VideoCodec.av1 else { return nil }
             let h = HybridRegionEncoder(callbackQueue: .main, colour: colour)
             h.fixedQindex = fixed.map { $0 == 63 ? 255 : 4 * $0 }
             h.targetPercent = targetPct
             h.quantizerCeiling = qmax
+            if keyBudgetMS > 0 { h.keyBudgetUS = UInt64(keyBudgetMS) * 1000 }
+            if minQ >= 0 { h.minQindex = minQ }
+            if keyLinkMS > 0 { h.keyLinkUS = UInt64(keyLinkMS) * 1000 }
             h.onWritten = { _, q, key, _ in
                 hybridLog.lock.withLock {
                     hybridLog.qindex.append(q)
-                    if key { hybridLog.keys += 1 }
+                    if key {
+                        hybridLog.keys += 1
+                        hybridLog.keyQindex.append(q)
+                    }
                 }
             }
             return BenchPipelinedEncoder(h, vtPipeline)
@@ -447,9 +455,9 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
         if videoMode == "hybrid" {
-            let (qs, keys) = hybridLog.lock.withLock { (hybridLog.qindex.sorted(), hybridLog.keys) }
+            let (qs, keys, keyQ) = hybridLog.lock.withLock { (hybridLog.qindex.sorted(), hybridLog.keys, hybridLog.keyQindex) }
             func at(_ p: Double) -> Int { qs.isEmpty ? -1 : qs[min(qs.count - 1, Int(Double(qs.count) * p))] }
-            print("  hybrid: \(qs.count) frames, \(keys) key frames · qindex p10 \(at(0.1)) p50 \(at(0.5)) p90 \(at(0.9)) max \(qs.last ?? -1)")
+            print("  hybrid: \(qs.count) frames, \(keys) key frames at qindex \(keyQ) · qindex p10 \(at(0.1)) p50 \(at(0.5)) p90 \(at(0.9)) max \(qs.last ?? -1)")
         }
         print("  \(videoMode!): \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
               + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "

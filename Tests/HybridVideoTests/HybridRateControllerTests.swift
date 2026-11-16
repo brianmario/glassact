@@ -123,7 +123,7 @@ struct HybridRateControllerTests {
         for f in Self.run(&d, e, Self.stream(60, coded: 4, key: false), lag: 0) { #expect(f.finalQindex >= 40) }
     }
 
-    /// A key frame at 2 Mbit/s spends at most its budget (a quarter second of the rate) and isn't
+    /// A key frame at 2 Mbit/s spends at most its budget and isn't
     /// charged past its time's share: the send gate pays for its burst, and the inter frames after
     /// it are back at their steady qindex within a few pictures.
     @Test(arguments: [0, 2])
@@ -137,9 +137,26 @@ struct HybridRateControllerTests {
         pictures[100].coded = 3600
         let frames = Self.run(&c, e, pictures, lag: lag)
         let steady = frames[90].qindex
-        #expect(frames[100].bits <= 2e6 * 0.25 * 1.5, "the key frame: \(frames[100].bits) bits")
+        #expect(frames[100].bits <= 2e6 * Double(c.keyBudgetUS) / 1e6 * 1.5, "the key frame: \(frames[100].bits) bits")
         let back = (101..<200).first { abs(frames[$0].qindex - steady) <= 4 } ?? 200
         #expect(back - 100 <= 3, "the inter frames took \(back - 100) pictures to come back to qindex \(steady)")
+    }
+
+    /// With a link cap, a key frame spends no more than `keyLinkUS` of the link, however large its
+    /// budget at the aim: its burst mustn't fill a thin link's buffer.
+    @Test func aKeyFrameFitsTheLink() {
+        let e = Encoder(a: log(1000), keyFactor: 1)  // (as the key model's seed predicts)
+        var c = HybridRateController(bitsPerSecond: 3_000_000)
+        c.minQindex = 1
+        c.maxQindex = 255
+        let free = Self.run(&c, e, [Picture(key: true, coded: 3600, timeUS: 0)], lag: 0)[0]
+        var d = HybridRateController(bitsPerSecond: 3_000_000)
+        d.minQindex = 1
+        d.maxQindex = 255
+        d.linkBitsPerSecond = 2_000_000
+        let linked = Self.run(&d, e, [Picture(key: true, coded: 3600, timeUS: 0)], lag: 0)[0]
+        #expect(free.bits > 2e6 * Double(d.keyLinkUS) / 1e6 * 2, "the free key frame: \(free.bits) bits")
+        #expect(linked.bits <= 2e6 * Double(d.keyLinkUS) / 1e6 * 1.1, "the key frame on the link: \(linked.bits) bits")
     }
 
     /// A failed picture's charge comes back; a restart leaves nothing in flight.
