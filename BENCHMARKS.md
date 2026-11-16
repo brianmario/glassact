@@ -139,8 +139,8 @@ the numbers and the reasoning.
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
-| AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31) | AV1 data alone 1.26–2.6× VP8L z4's bytes | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31) |
-| Lossy WebP / AVIF tiles | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
+| AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
+| Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
 | VP8L positional routing memory | kept | 96 % of probes avoided on churn, 0 % on text (zero regret) | [entry](#vp8l-routing-memory-positional-outcome-memory-2026-08-05) |
 | VP8L effort policy (4 on small ticks, 1 on bursts; keyframes 0/1) | kept | typing-cc encode CPU 5.74 → 2.62 s, cold tick 707 → 191 ms, ≤ +1.6 % steady bytes | [entry](#vp8l-effort-sweep--tick-size--rate-policy-2026-09-27) |
@@ -334,6 +334,59 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Tiles as AVIF from the hybrid, re-measured (2026-11-16)
+
+The owner asked whether the hybrid could make AVIF tiles, lossy or lossless, and how they'd
+compare with what ships (VP8L lossless, sent once and exact). `av1tiles` and
+`scripts/tile-codec-probe` as on [2026-10-31](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31),
+on its four corpora plus two new ones (`dumptiles`, every 7th changed tile, 400 each: tabs, ide).
+The probe now caps its workers (`PROBE_JOBS`, 4) and gained libaom runs with its screen tools
+forced (`tune-content=screen`, palette, IntraBC). AVIF sizes are the AV1 data in the mdat box
+(the container adds ~275 B a tile, so tiles would travel as bare OBUs). Times are provisional
+(load average 20–55).
+
+**Could it?**
+- *Lossless: no.* The writer is Main profile (4:2:0 or monochrome); lossless needs qindex 0, the
+  Walsh–Hadamard transform and 4:4:4 (High profile), none of which the encoder has.
+- *Lossy: yes,* as it is: each tile a 4:2:0 key frame, which the AVIF writer (`rust/av1/src/avif.rs`)
+  can wrap. Its colour would have to be signalled as converted (BT.709 video range for
+  these; a still's header says sYCC).
+
+**Calibration.** Against 10-31, the hybrid's sizes are 0.3–2 % larger and its scores the same
+(±0.1) on every corpus and quantizer but one: typing-cc at q20 scores 85.6 where 10-31 has
+87.8, at the same bytes (288 vs 287). The other three corpora fall 1.8–3.5 points from q8 to q20
+then and now, and 10-31's typing-cc fell 0.1, so that cell is likely 10-31's error.
+
+**Bytes a tile, then SSIMULACRA2 mean / p10:**
+
+| Tiles | VP8L z4 (ships) | AV1 lossless, libaom best (s0, screen) | AVIF 4:4:4 q90 | hybrid q8 (stream) | hybrid q20 | 4:2:0 conversion alone |
+|---|---|---|---|---|---|---|
+| typing-cc | 417 | 1036 | 379 · 94.1 / 91.6 | 369 · 87.8 / 86.6 | 288 · 85.6 / 82.7 | 91.2 / 90.6 |
+| scroll-win | 381 | 817 | 270 · 95.6 / 91.7 | 250 · 90.6 / 82.2 | 194 · 88.7 / 78.0 | 92.3 / 86.0 |
+| photos | 3332 | 3985 | 1026 · 91.0 / 84.9 | 819 · 84.7 / 71.1 | 472 · 81.2 / 66.1 | 87.6 / 73.0 |
+| cursor-drag | 2381 | 2862 | 526 · 91.5 / 87.9 | 397 · 83.8 / 68.5 | 268 · 81.3 / 66.3 | 86.5 / 70.2 |
+| tabs | 404 | 802 | 260 · 96.0 / 92.2 | 239 · 92.8 / 83.7 | 183 · 91.4 / 80.9 | 94.1 / 85.4 |
+| ide | 501 | 998 | 298 · 93.5 / 88.9 | 292 · 86.5 / 60.6 | 225 · 84.1 / 58.9 | 88.8 / 61.1 |
+
+- **Lossless stays rejected.** Forcing libaom's screen tools changes nothing at speed 6 (it
+  detects screen content already); speed 0 saves 3–6 % more. Still 2.0–2.5× VP8L on text and UI,
+  1.2× on photos and graphics.
+- **Lossy hybrid tiles are smaller than VP8L** (q8: −11 % on text to −83 % on graphics), but
+  capped in quality by their 4:2:0 conversion: the conversion alone scores 86.5–94.1, and on
+  the IDE's coloured text its p10 is 61. AVIF 4:4:4 q90 is near-lossless (91–96) at 2–32 % more
+  bytes than the hybrid's q8, so the gap is the chroma format, as on 10-31.
+- **Against what ships, a lossy tile adds bytes.** It still owes the lossless settle (the canvas
+  converges exactly), so a tile costs lossy + VP8L instead of VP8L: +58–89 % on text and UI, +17–25 %
+  on photos and graphics at q8. It pays only where the settle can wait: the first paint of a
+  photo or graphic on a thin link, which is what the video region does already
+  (the settle after video, measured on the `doublepay2` branch, is 24–54 % of a stream's bytes).
+- **Standalone tiles are slow and need a decoder.** 2.3–3.9 ms a tile on the GPU, one round trip
+  each (provisional); tiles in one frame are the workable form (+4–11 % bytes, 10-31). The
+  Viewer's AV1 decode is VideoToolbox (M3 and later) or the vendored libaom (arm64).
+- **What would change the answer:** 4:4:4 (High profile) in the hybrid, for near-lossless lossy
+  tiles. Not built: a lossy tier still pays the settle, and VideoToolbox's hardware decoder may not
+  take High profile, which wasn't checked.
 
 ### Video recovery with the hybrid live encoder; a stream's colour signalling (2026-11-16)
 
