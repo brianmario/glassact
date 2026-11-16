@@ -220,7 +220,8 @@ pub(super) fn record_444(seed: u64, maxdim: i32, filters: bool) -> Option<Record
         for i in 0..1usize << fp.cdef_bits {
             fp.cdef_y_pri[i] = r.below(16) as u8;
             fp.cdef_y_sec[i] = SEC[r.below(4) as usize];
-            fp.cdef_uv_pri[i] = r.range(1, 15) as u8;
+            // (a zero primary strength now and then: chroma direction 0, 7.15.1)
+            fp.cdef_uv_pri[i] = if r.below(4) == 0 { 0 } else { r.range(1, 15) as u8 };
             fp.cdef_uv_sec[i] = SEC[r.below(4) as usize];
         }
     } else {

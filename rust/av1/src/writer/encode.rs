@@ -1354,8 +1354,8 @@ impl Writer {
     }
 
     /// [`Writer::encode_with_hook`] with [`ENC_PREFILTER_RECON`]'s reconstruction written into
-    /// the caller's planes (`recon_into`: each at least MiCols * 4 x MiRows * 4 samples, chroma half
-    /// each way, rows that wide), not `out.recon`, which stays empty (`recon_w` and `recon_h` are
+    /// the caller's planes (`recon_into`: each at least MiCols * 4 x MiRows * 4 samples, 4:2:0 chroma
+    /// half each way, rows that wide), not `out.recon`, which stays empty (`recon_w` and `recon_h` are
     /// set). The samples outside the decoded area are left as they were.
     pub fn encode_into<H: TxbHook>(
         &mut self,

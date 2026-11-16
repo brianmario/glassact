@@ -30,7 +30,7 @@ extern "C" {
 #define AV1G_ENC_TD          4u  /* prefix the OBU stream with a temporal delimiter */
 #define AV1G_ENC_AVIF        8u  /* also produce AVIF file bytes */
 #define AV1G_ENC_PREFILTER_RECON 0x20u /* recon = before deblocking / CDEF, NOT cropped: planes are
-                                         MiCols*4 x MiRows*4 (>> 1 for chroma) because the filters
+                                         MiCols*4 x MiRows*4 (>> 1 for 4:2:0 chroma) because the filters
                                          read the decoded area beyond the picture.  Strength
                                          searches start here; av1g_postfilter finishes it. */
 #define AV1G_ENC_NO_SEQ_HEADER 0x40u /* video mode: no OBU_SEQUENCE_HEADER ([TD] + OBU_FRAME): a later
@@ -52,7 +52,7 @@ typedef struct av1g_output {
     size_t   obu_size;
     uint8_t *avif;           /* AVIF file (AV1G_ENC_AVIF) */
     size_t   avif_size;
-    uint8_t *recon[3];       /* cropped planes: Y w x h, U/V ((w+1)/2) x ((h+1)/2) */
+    uint8_t *recon[3];       /* cropped planes: Y w x h, U/V ((w+1)/2) x ((h+1)/2) (4:4:4: w x h) */
     uint32_t recon_w[3], recon_h[3];
     /* stats */
     uint32_t seq_level_idx;

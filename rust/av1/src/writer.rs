@@ -245,9 +245,9 @@ pub struct Output {
     /// the AVIF file ([`ENC_AVIF`]), else empty
     pub avif: Vec<u8>,
     /// the reconstruction, `recon_w[p] x recon_h[p]` row-major: cropped (Y w x h, U / V ((w + 1) / 2)
-    /// x ((h + 1) / 2)) or, with [`ENC_PREFILTER_RECON`], the padded pre-filter frame (MiCols * 4 x
-    /// MiRows * 4, chroma half). Empty with [`ENC_NO_RECON`] / [`ENC_BITSTREAM_ONLY`] and for the
-    /// chroma planes of monochrome pictures.
+    /// x ((h + 1) / 2); in 4:4:4 w x h too) or, with [`ENC_PREFILTER_RECON`], the padded pre-filter
+    /// frame (MiCols * 4 x MiRows * 4, chroma half in 4:2:0). Empty with [`ENC_NO_RECON`] /
+    /// [`ENC_BITSTREAM_ONLY`] and for the chroma planes of monochrome pictures.
     pub recon: [Vec<u8>; 3],
     pub recon_w: [u32; 3],
     pub recon_h: [u32; 3],

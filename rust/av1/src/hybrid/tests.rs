@@ -780,7 +780,7 @@ fn chroma444_key_frames() {
         ("dav1d", vec!["-q", "-i", "IN", "-o", "OUT"]),
         ("aomdec", vec!["--rawvideo", "-o", "OUT", "IN"]),
     ];
-    let mut decoded = 0;
+    let (mut decoded, mut stale_checks) = (0, 0);
     for (seed, (w, h), (cl, rl), style, abc) in [
         (1u64, (600usize, 400usize), (0, 0), Style::Variance, false),
         (2, (600, 400), (1, 0), Style::Random, false),
@@ -956,8 +956,33 @@ fn chroma444_key_frames() {
             again == obu && hy.record() == &fin,
             "{what}: kept tiles code another picture"
         );
+        let ntiles = tiles.rows * tiles.cols;
+        if ntiles > 1 {
+            // one chroma sample at an odd position of the last tile changed: that tile alone is
+            // coded again, and the picture is what a fresh closed loop makes of it
+            let (px, py) = ((w - 2) | 1, (h - 2) | 1);
+            let mut u2 = u.clone();
+            u2[py * w + px] ^= 0x40;
+            hy.closed_loop(&y, &u2, &v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+                .unwrap();
+            assert_eq!(hy.reused_tiles(), ntiles - 1, "{what}: tiles kept after a chroma change");
+            let kept = hy.write(&wfp, Some(&sb_cdef), sbc).unwrap().to_vec();
+            let mut fresh = Hybrid::new();
+            fresh.set_chroma_444(true);
+            fresh.set_intrabc(abc);
+            fresh
+                .closed_loop(&y, &u2, &v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
+                .unwrap();
+            let want = fresh.write(&wfp, Some(&sb_cdef), sbc).unwrap().to_vec();
+            assert!(
+                kept == want && hy.record() == fresh.record(),
+                "{what}: a kept tile went stale"
+            );
+            stale_checks += 1;
+        }
     }
-    eprintln!("{decoded} decodes exact");
+    eprintln!("{decoded} decodes exact, {stale_checks} pictures partly kept");
+    assert!(stale_checks >= 2);
     // inter frames are 4:2:0 only
     let pic = screen_pic(64, 64, 9, false);
     let (u, v) = to_444(&pic);

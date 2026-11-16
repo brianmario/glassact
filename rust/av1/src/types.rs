@@ -136,8 +136,9 @@ pub struct BlockPalette {
     pub size_uv: u8,
     pub reserved: [u8; 2],
     /// where the block's colour index maps start in the record's palette map: luma (the block's
-    /// width x height, row-major) if size_y, then chroma (half each way; 2 more where that is
-    /// below 4, for 4x16 and 16x4 blocks: the chroma of their 8x8) if size_uv
+    /// width x height, row-major) if size_y, then chroma (4:2:0: half each way, 2 more where that is
+    /// below 4, for 4x16 and 16x4 blocks: the chroma of their 8x8; 4:4:4: the luma map's size) if
+    /// size_uv
     pub map_off: u32,
     /// palette_colors_y (strictly increasing), palette_colors_u (non-decreasing), palette_colors_v
     pub colors: [[u8; 8]; 3],
