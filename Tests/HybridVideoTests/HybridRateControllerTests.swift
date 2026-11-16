@@ -110,6 +110,26 @@ struct HybridRateControllerTests {
         #expect(abs(achieved / 6e6 - 1) < 0.10, "\(achieved)")
     }
 
+    /// Film in a 60 Hz capture: pictures 33 and 50 ms apart in turn. The rate holds and the qindex
+    /// doesn't swing from one picture to the next with the interval.
+    @Test func filmCadenceDoesNotSwingTheQindex() {
+        let e = Encoder(a: log(300))
+        var c = HybridRateController(bitsPerSecond: 20_000_000)
+        c.minQindex = 1
+        c.maxQindex = 255
+        var t: UInt64 = 1_000_000
+        let pictures = (0..<240).map { i -> Picture in
+            t += i % 2 == 0 ? 33_333 : 50_000
+            return Picture(coded: 3600, timeUS: t)
+        }
+        let frames = Self.run(&c, e, pictures, lag: 1)
+        let tail = frames.suffix(100)
+        let qs = tail.map(\.qindex)
+        #expect(qs.max()! - qs.min()! <= 12, "qindex \(qs.min()!)…\(qs.max()!)")
+        let achieved = tail.map(\.bits).reduce(0, +) / (Double(pictures.last!.timeUS - pictures[139].timeUS) / 1e6)
+        #expect(abs(achieved / 20e6 - 1) < 0.10, "\(achieved)")
+    }
+
     /// The ceiling bounds the final qindex, a fast picture's (+7) included; the floor holds.
     @Test func theCeilingBoundsTheFinalQindex() {
         let e = Encoder(a: log(5000))

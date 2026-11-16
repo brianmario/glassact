@@ -130,6 +130,7 @@ public struct HybridRateController: Sendable {
     }
     public private(set) var inFlight: [Decision] = []
     private var lastTimeUS: UInt64?
+    private var intervalUS: Double?
     private var lastInterQindex: Int?
 
     public init(bitsPerSecond: Int, inter: Model = defaultInter, key: Model = defaultKey) {
@@ -145,7 +146,11 @@ public struct HybridRateController: Sendable {
         let dtUS = lastTimeUS.map { timeUS > $0 ? min(1_000_000, max(1_000, timeUS - $0)) : 1_000 } ?? 16_667
         lastTimeUS = max(lastTimeUS ?? 0, timeUS)
         debtBits = max(0, debtBits - rate * Double(dtUS) / 1e6)
-        let share = rate * Double(dtUS) / 1e6
+        // the bucket drains by each picture's own interval; its share of the rate follows their
+        // mean (an EMA): 24 frames a second in a 60 Hz capture alternate 33 and 50 ms, and on the
+        // flat rate curve that 1.5x would swing an inter frame's qindex by 40 from one to the next
+        intervalUS = intervalUS.map { $0 + 0.3 * (Double(dtUS) - $0) } ?? Double(dtUS)
+        let share = rate * (intervalUS ?? Double(dtUS)) / 1e6
         let decision: Decision
         if isKey {
             var budget = rate * Double(keyBudgetUS) / 1e6

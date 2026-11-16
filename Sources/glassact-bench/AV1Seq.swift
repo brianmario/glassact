@@ -8,6 +8,7 @@ import AV1Core
 import Foundation
 import GlassActAV1
 import GlassActCore
+import GlassActHybridVideo
 import libaom
 import Metal
 import QuartzCore
@@ -46,6 +47,7 @@ let av1SeqCommand = Command(
         .bool("digest", "also print a hash (FNV-1a 64) of every frame's bytes, to check that a change keeps the stream the same"),
         .string("gpu-capture", "<path.gputrace>", "afterwards, write a Metal GPU capture of the last picture (with --inter, as an inter frame after the one before) for Xcode; run with MTL_CAPTURE_ENABLED=1"),
         .bool("no-planes", "with --inter: frames without their decoded pictures (the speed without copying them out; not decode-checked)"),
+        .int("push-kbit", "<kbit/s>", 10...1_000_000, "with --push: each picture's qindex from GlassActHybridVideo's rate controller aiming at this rate (by the trace's capture times), not --q; prints what it achieved"),
         .string("push", "<mode>", "drive the encoder's stream API (startStream/submit) as a session does, and print each picture's submit-to-frame latency: lone (each picture submitted once the one before came out), burst (all at once), every=<ms> (one every ms, at most two waiting, as the Host's engine allows)"),
         .bool("vt-decode", "also decode the stream with VideoToolbox's hardware AV1 decoder, as the Viewer does (M3 and later), and compare its output with the encoder's picture"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
@@ -385,7 +387,10 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         } else if let push = opts.string("push") {
             // the stream API as a session drives it: each picture submitted on its own
             outputAt.removeAll(keepingCapacity: true)
-            let (got, latencies) = try pushStream(encoder, count: pictures.count, qindex: qindex, mode: push, picture: picture)
+            let rate = opts.has("push-kbit") ? opts.int("push-kbit", 2000) * 1000 : nil
+            let (got, latencies) = try pushStream(encoder, count: pictures.count, qindex: qindex, mode: push, rate: rate,
+                                                  timeUS: { i in stamps.indices.contains(i) ? stamps[i] : UInt64(i) * 16_667 },
+                                                  picture: picture)
             frames = got
             pushLatencies = latencies
         } else {
@@ -1062,8 +1067,17 @@ func deltaQMap(kind: String, amount: Int) -> @Sendable (AV1HybridEncoder.Picture
 /// `--push`: the pictures through the hybrid's stream API, as `mode` submits them; the frames in
 /// order and each picture's submit-to-frame time.
 @available(macOS 27, *)
-func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: String,
+func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: String, rate: Int? = nil,
+                timeUS: (Int) -> UInt64 = { UInt64($0) * 16_667 },
                 picture: (Int) -> AV1HybridEncoder.Picture) throws -> ([AV1HybridEncoder.Frame], [Double]) {
+    // --push-kbit: the live encoder's rate controller, decisions on the begin queue, sizes from the writer
+    final class Rate: @unchecked Sendable {
+        let lock = NSLock()
+        var c: HybridRateController
+        var inFlightMax = 0
+        init(_ bits: Int) { c = HybridRateController(bitsPerSecond: bits) }
+    }
+    let rc = rate.map(Rate.init)
     final class Box: @unchecked Sendable {
         let lock = NSLock()
         let ready = DispatchSemaphore(value: 0)
@@ -1085,7 +1099,9 @@ func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: Stri
         let t = CACurrentMediaTime()
         box.lock.withLock {
             switch result {
-            case let .success(f): box.frames.append(f)
+            case let .success(f):
+                box.frames.append(f)
+                if let rc { rc.lock.withLock { rc.c.wrote(bytes: f.obu.count) } }
             case let .failure(e): box.error = box.error ?? e
             }
             box.at.append(t)
@@ -1103,12 +1119,30 @@ func pushStream(_ encoder: AV1HybridEncoder, count: Int, qindex: Int, mode: Stri
             while outstanding >= 2 { box.ready.wait(); outstanding -= 1 }
         }
         submittedAt.append(CACurrentMediaTime())
-        encoder.submit(picture(i), qindex: qindex)
+        if let rc {
+            let t = timeUS(i)
+            encoder.submit(picture(i), qindex: qindex) { info in
+                rc.lock.withLock {
+                    rc.inFlightMax = max(rc.inFlightMax, rc.c.inFlight.count)
+                    return rc.c.decide(key: info.key, coded: info.coded, fast: info.fast, timeUS: t)
+                }
+            }
+        } else {
+            encoder.submit(picture(i), qindex: qindex)
+        }
         outstanding += 1
         if mode == "lone" { box.ready.wait(); outstanding -= 1 }
     }
     while outstanding > 0 { box.ready.wait(); outstanding -= 1 }
     encoder.endStream()
     if let e = box.error { throw e }
+    if let rc, let rate, count > 1 {
+        let span = Double(timeUS(count - 1) &- timeUS(0)) / 1e6 * Double(count) / Double(count - 1)
+        let bits = Double(box.frames.map(\.obu.count).reduce(0, +)) * 8
+        let inter = box.frames.dropFirst().map(\.obu.count).reduce(0, +) * 8
+        print(String(format: "             --push-kbit %d: %.2f Mbit/s over the trace's %.2f s (inter frames %.2f) against %.2f; decided with up to %d frames' sizes unknown; qindex %@",
+                     rate / 1000, bits / span / 1e6, span, Double(inter) / span / 1e6, Double(rate) / 1e6, rc.inFlightMax,
+                     box.frames.map { String($0.timing.qindex) }.joined(separator: " ")))
+    }
     return (box.frames, zip(box.at, submittedAt).map { $0 - $1 })
 }
