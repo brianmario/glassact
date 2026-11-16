@@ -965,7 +965,11 @@ fn chroma444_key_frames() {
             u2[py * w + px] ^= 0x40;
             hy.closed_loop(&y, &u2, &v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
                 .unwrap();
-            assert_eq!(hy.reused_tiles(), ntiles - 1, "{what}: tiles kept after a chroma change");
+            assert_eq!(
+                hy.reused_tiles(),
+                ntiles - 1,
+                "{what}: tiles kept after a chroma change"
+            );
             let kept = hy.write(&wfp, Some(&sb_cdef), sbc).unwrap().to_vec();
             let mut fresh = Hybrid::new();
             fresh.set_chroma_444(true);
