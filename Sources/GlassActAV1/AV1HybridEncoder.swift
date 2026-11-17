@@ -258,17 +258,18 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         didSet { av1enc_hybrid_set_quick_tx_trials(cpu, quickTxTrials ? 1 : 0) }
     }
 
-    /// Intra blocks may be luma palette blocks (AV1 screen content tools: a few colours as the
+    /// Intra blocks may be palette blocks (AV1 screen content tools: a few colours as the
     /// prediction, the residual coded on top), decided by cost before the closed loop (rust/av1
-    /// hybrid::palette). Off by default; off, the stream is as without it.
+    /// hybrid::palette): luma, and in 4:4:4 pictures chroma too. Off by default; off, the stream is
+    /// as without it (a 4:4:4 picture's are `chroma444Palettes`').
     public var palette = false {
         didSet { av1enc_hybrid_set_palette(cpu, palette ? 1 : 0) }
     }
 
     /// The palette decisions' totals since the encoder was made (`av1enc_hybrid_palette_stats`):
     /// pictures, eligible intra blocks, tried, palette blocks, eligible area, palette area,
-    /// seconds, with GA_PALETTE_BITS set the written bits of all, intra and palette blocks, and
-    /// palette blocks past the picture's right or bottom edge.
+    /// seconds, with GA_PALETTE_BITS set the written bits of all, intra and palette blocks,
+    /// palette blocks past the picture's right or bottom edge, and chroma palettes (4:4:4).
     public var paletteStats: [Double] {
         var v = [Double](repeating: 0, count: 16)
         let n = Int(av1enc_hybrid_palette_stats(cpu, &v, Int32(v.count)))

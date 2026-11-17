@@ -10,7 +10,8 @@
 //!   its colour context), from the default CDFs.
 //!
 //! The lower J (SSE + λ bits, the hook's λ) wins; a palette block gets y_mode DC_PRED, its colours
-//! and its map. Luma only (size_uv 0).
+//! and its map. In 4:4:4 its chroma is decided the same way after it ([`decide_uv`]: the chroma as
+//! decided, or a palette of (U, V) pairs); 4:2:0 blocks get no chroma palette (size_uv 0).
 //!
 //! Work is per tile and superblock row (blocks in decode order inside it), on the closed loop's
 //! threads: the contexts a block reads from its neighbours (the colour cache, has_palette_y's
@@ -36,12 +37,13 @@ const GATE_COVER: u32 = 50;
 
 /// 4:4:4 screen content: a block at least `SCREEN_COVER` % of whose samples (or (U, V) pairs) are
 /// exactly its gate's 8 values keeps its decided luma (chroma) only where that costs under
-/// 1 / `SCREEN_BIAS_Y` (`_UV`) of the best palette's J. The decided side is priced open loop, its
-/// prediction from the source's edges and its residual by the trials' rate proxy, both optimistic
-/// against a palette, which needs no edges and whose side bits are exact. Measured on the 4:4:4
-/// tile corpora (BENCHMARKS "the hybrid's 4:4:4 tiles against libaom's"): at equal SSIMULACRA2,
-/// 1.4 / 1.6 take typing from +11 % to −1 % of libaom's bytes and UI 3–4 points lower; applied
-/// to every block they cost photos 3.5 points (palettes on smooth content), which the gate avoids.
+/// 1 / `SCREEN_BIAS_Y` (`_UV`) of the best palette's J. The presumed reason (not measured): the
+/// decided side is priced open loop, its prediction from the source's edges and its residual by
+/// the trials' rate proxy, which flatters it against a palette, which needs no edges and whose
+/// side bits are exact. Fitted on the six 4:4:4 tile corpora (BENCHMARKS "the hybrid's 4:4:4 tiles
+/// against libaom's"), not checked on other content: at equal SSIMULACRA2, 1.4 / 1.6 take typing
+/// from +11 % of libaom's bytes to even and UI 3–4 points lower; applied to every block they cost
+/// photos 3.5 points (palettes on smooth content), which the gate avoids.
 const SCREEN_COVER: f64 = 80.0;
 const SCREEN_BIAS_Y: f64 = 1.4;
 const SCREEN_BIAS_UV: f64 = 1.6;

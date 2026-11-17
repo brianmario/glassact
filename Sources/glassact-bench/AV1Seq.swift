@@ -53,7 +53,7 @@ let av1SeqCommand = Command(
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
         .bool("no-intrabc", "key frames don't copy what repeats inside them (AV1 intra block copy, on by default)"),
-        .bool("palette", "intra blocks may be luma palette blocks, decided by cost before the closed loop (AV1HybridEncoder.palette; off by default); prints how many are (with GA_PALETTE_BITS=1 in the environment, their bits too)"),
+        .bool("palette", "intra blocks may be palette blocks (luma; 4:4:4: chroma too), decided by cost before the closed loop (AV1HybridEncoder.palette; off by default); prints how many are (with GA_PALETTE_BITS=1 in the environment, their bits too)"),
         .bool("no-golden", "with --inter: inter frames copy only the picture before them, not GOLDEN_FRAME (a long-term picture: the end of a scene left)"),
         .int("key-delta", "<n>", -255...255, "the key frame's qindex this much from the inter frames' (AV1HybridEncoder.keyFrameQindexDelta; default the encoder's, -16; negative: finer)"),
         .bool("per-frame", "with --score-rgb: also each frame's bytes, RGB PSNR and SSIMULACRA2 (where scored), the hybrid's and libaom's, as lines \"frame <who> <i> <bytes> <psnr> <ssimulacra2 or ->\""),

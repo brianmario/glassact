@@ -1470,8 +1470,9 @@ impl Hybrid {
         (!self.chroma444) as u32
     }
 
-    /// av1enc_hybrid_set_palette: intra blocks may be palette blocks (luma), decided by cost before
-    /// the closed loop ([`palette`]; off by default: the output is as without it).
+    /// av1enc_hybrid_set_palette: intra blocks may be palette blocks (luma, and in 4:4:4 chroma),
+    /// decided by cost before the closed loop ([`palette`]; off by default: the output is as
+    /// without it).
     pub fn set_palette(&mut self, on: bool) {
         self.palette = on;
     }
@@ -1480,7 +1481,8 @@ impl Hybrid {
     /// pictures decided, intra blocks that may be palettes, of them tried (past the gate), palette
     /// blocks, the eligible blocks' area and the palette blocks' (samples), the decisions' seconds;
     /// then from writes, with GA_PALETTE_BITS set: all blocks' bits, intra blocks', palette
-    /// blocks'; then the palette blocks past the picture's right or bottom edge.
+    /// blocks'; then the palette blocks past the picture's right or bottom edge; then the chroma
+    /// palettes (4:4:4).
     pub fn palette_stats(&self) -> [f64; 12] {
         let s = &self.pal_stats;
         let b = self.side.as_ref().map_or([0.0; 3], |w| w.bits);

@@ -50,6 +50,10 @@ frame. The decoder's tests hold it to the writer's reconstructions, to dav1d and
 `hostile_input_long` at length), and with `OWNDEC_DIR` to a directory of streams and libaom's I420
 decodes (`streams_match_libaom`).
 
+`examples/tile_stats.rs` counts the blocks of AV1 stills (one per tile, as `glassact-bench
+av1tiles --obus` writes them; libaom's AVIF data too, where it's in the writer's toolset) by size
+and tool, each block's bits as the writer codes it (`ENC_BLOCK_BITS`).
+
 `src/tables` is generated from the C table headers (`scripts/gen-av1-rust-tables`) so that the CPU
 and the GPU use the same values. Never edit it by hand. The inter frames' tables
 (`av1g/inter_tables.h`) come from the AV1 spec's markdown (`scripts/gen-av1-inter-tables`).

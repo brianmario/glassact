@@ -22,9 +22,8 @@ let av1TilesCommand = Command(
         .string("obus", "<prefix>", "with --chroma 444: write each quantizer's streams to <prefix>-q<q>.obus (per tile a little-endian u32 length and its OBUs; rust/av1 examples/tile_stats reads them)"),
         .string("preset", "<name>", "with --chroma 444: the analysis's preset (AV1MetalEncoder.Preset; default the encoder's)"),
         .string("shapes", "<hex>", "with --chroma 444: the analysis's shapes (GpParams.shapeMask bits, hex), in place of the preset's"),
-        .string("tx-types", "<hex>", "with --chroma 444: the closed loop's luma tx types (AV1HybridEncoder.txTypes bits, hex)"),
         .bool("no-444-palettes", "with --chroma 444: no palettes and every shape, as 4:2:0 pictures are analyzed (AV1HybridEncoder.chroma444Palettes off: the encoder before 2026-11-16's palettes)"),
-        .bool("palette", "with --chroma 444: intra blocks may be luma palette blocks, decided by cost (AV1HybridEncoder.palette); prints how many are"),
+        .bool("palette", "with --chroma 444: palettes whatever --no-444-palettes says (AV1HybridEncoder.palette); prints how many there are (4:4:4 tiles print them anyway)"),
         .string("chroma", "<420|444>", "AV1 key frames' chroma: 420 (default; BT.709 video range) or 444 (High profile; BT.601 full range, as the sequence header signals; every tile checked against libaom's decode)"),
     ],
     run: { opts in try cmdAV1Tiles(opts: opts) }
@@ -77,7 +76,6 @@ func cmdAV1Tiles(opts: Options) throws {
                             guard let p = AV1MetalEncoder.Preset(rawValue: $0) else { throw BenchError("--preset \($0)") }
                             return p
                         }, shapes: opts.string("shapes").flatMap { Int32($0, radix: 16) },
-                        txTypes: opts.string("tx-types").flatMap { UInt32($0, radix: 16) },
                         palettes444: !opts.has("no-444-palettes"))
         return
     }
@@ -143,7 +141,7 @@ func cmdAV1Tiles(opts: Options) throws {
 /// `out`, the decoded tiles (and the conversion alone) back to BGRA by the same matrix.
 @available(macOS 27, *)
 private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?, palette: Bool,
-                         obus: String? = nil, preset: AV1MetalEncoder.Preset? = nil, shapes: Int32? = nil, txTypes: UInt32? = nil, palettes444: Bool = true) throws {
+                         obus: String? = nil, preset: AV1MetalEncoder.Preset? = nil, shapes: Int32? = nil, palettes444: Bool = true) throws {
     let side = 64, tileBytes = side * side * 4
     func tile(_ i: Int) -> YUV444 {
         corpus.withUnsafeBytes { YUV444(bgra: UnsafeRawBufferPointer(rebasing: $0[i * tileBytes..<(i + 1) * tileBytes]), width: side, height: side) }
@@ -168,7 +166,6 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
     encoder.chroma444Palettes = palettes444
     if let preset { encoder.preset = preset }
     if let shapes { encoder.shapeMask = shapes }
-    if let txTypes { encoder.txTypes = txTypes }
     for q in qs {
         let qindex = q == 63 ? 255 : max(1, 4 * q)
         let before = encoder.paletteStats
