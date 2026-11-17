@@ -158,9 +158,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
     /// A 4:4:4 picture's chroma modes decided by the closed loop on the CPU, on the real planes
     /// (the reference engine's rule), not by the GPU's leaf kernel on the analysis's 4:2:0 copy
-    /// (off). Against the GPU's: +2.1 % BD-rate on new screen pictures (the 5K rotation), −4.9 % on
-    /// video, 0.0 to −0.5 % on the other screens, at 1.7–35 ms of CPU a 5K picture (BENCHMARKS "the
-    /// hybrid's 4:4:4 work on the GPU").
+    /// (off). Against the GPU's decisions the CPU rule takes 2.1 % fewer bytes at equal quality on
+    /// new screen pictures (the 5K rotation), 4.9 % more on video and 0.0–0.5 % more on the other
+    /// screens, for 1.7–35 ms of CPU a 5K picture (BENCHMARKS "the hybrid's 4:4:4 work on the GPU").
     public var chroma444CPUChroma = false
 
     /// The shapes a 4:4:4 picture's analysis leaves out with `chroma444Palettes`: 4×4, 4×8 and 8×4
@@ -623,8 +623,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// as in its frame (the filters cross tile edges).
     public var postfilters = true
 
-    /// CDEF where the filters run (on): off, every picture is deblocked alone (CDEF signalled
-    /// but inactive, as libaom does at qindex 32 and under), as `newPictureEffort`'s are.
+    /// CDEF where the GPU's filters run (on): off, every picture is deblocked alone (CDEF signalled
+    /// but inactive, as libaom does at qindex 32 and under), as `newPictureEffort`'s are. (Not with
+    /// `chroma444CPUFilters`, which refuses it.)
     public var usesCDEF = true
 
     /// Time the GPU's stages one by one (`AV1MetalEncoder.profilesStages`):
@@ -1050,6 +1051,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         streamSB128 = largeSuperblocks
         metal.largeSuperblocks = streamSB128
         func code(_ p: Picture, _ copies: Copies, _ q: Int) throws -> Frame {
+            // (the second step's motion search predicts from a decoded luma plane set as a 4:2:0
+            // source, `AV1MetalEncoder.setReference`, which a 4:4:4 picture's source doesn't match)
+            guard !p.chroma444 else { throw Failure.encode("encodeTwoSteps takes 4:2:0 pictures") }
             metal.forgetAnalysis()  // (the same source at another q, or against another reference)
             let pending = try begin(p, copies, qindex: q)
             let partition = try pending.partition.wait()
@@ -1719,6 +1723,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
             filtered()  // (none on the GPU)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
+            // (the CPU's filters, research, always search CDEF: `usesCDEF` is the GPU's)
+            guard !cpuFilters || usesCDEF else { throw Failure.encode("chroma444CPUFilters with usesCDEF off") }
             let filtered = cpuFilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
             // (a 4:4:4 stream's reference without its planes copied out: the closed loop's own)
             let inPlace = p.chroma444 && interFrames && !returnsPlanes && filtered == nil && !copies && store.isEmpty
@@ -1739,8 +1745,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let known: Bool
         if reference != nil {
             var d = [UInt8](repeating: 0, count: sbCols0 * sbRows0)
-            known = reusesAnalysis && Self.filterRegions(now: sbMotion, before: previous?.motion ?? [], sbCols: sbCols0,
-                                                         sbRows: sbRows0, changed: &changed, direct: &d)
+            // (only on the previous picture's GPU filtering: one filtered otherwise, or not at all, left
+            // an older picture's output in the filters' buffers)
+            known = reusesAnalysis && filteredLast
+                && Self.filterRegions(now: sbMotion, before: previous?.motion ?? [], sbCols: sbCols0,
+                                      sbRows: sbRows0, changed: &changed, direct: &d)
             direct = d
         } else {
             known = reusesAnalysis && filteredLast

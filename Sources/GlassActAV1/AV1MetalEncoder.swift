@@ -383,7 +383,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     func keepSource(_ planes: [any MTLBuffer]) {
         poolLock.lock()
         defer { poolLock.unlock() }
-        if let old = lastSource, sourcePool.count < 2 { sourcePool.append(old) }
+        if let old = lastSource {
+            // (sets of another geometry or chroma format, from before a change, give way: they'd
+            // otherwise hold the pool's places and every later picture make its own)
+            let lengths = old.map(\.length)
+            sourcePool.removeAll { $0.map(\.length) != lengths }
+            if sourcePool.count < 2 { sourcePool.append(old) }
+        }
         lastSource = planes
     }
 

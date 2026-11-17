@@ -108,9 +108,13 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// filters: `planes` are MiCols·4 × MiRows·4 (4:2:0 chroma half that each
     /// way), tightly packed, because the filters read past the picture's edge.
     /// The result is cropped: Y width × height, 4:2:0's U and V half that,
-    /// rounded up (Y only for a monochrome picture). `lfZero` (per block, nonzero where its
-    /// loop filter level is 0: an inter block of a frame with lf_inter_off)
-    /// defaults to none.
+    /// rounded up (Y only for a monochrome picture). `lfZero`: per block,
+    /// av1g_pf_mark_block_flags' flags: AV1G_PF_BLK_INTER (2) for an inter
+    /// block, which every inter block of an inter frame must have (or a
+    /// skipped one's tx edges inside it, 64 wide or high in 4:4:4 chroma and
+    /// 128 in any plane, are filtered as an intra block's), with
+    /// AV1G_PF_BLK_LF_ZERO (1) where its loop filter level is 0 (lf_inter_off).
+    /// Nil: every block intra, as in a key frame.
     public func filter(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                        planes: [UnsafePointer<UInt8>], lfZero: [UInt8]? = nil) throws -> [[UInt8]] {
         let job = try self.job(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
@@ -146,6 +150,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// inter frame's copies: every block skipped and at level 0, and no intra
     /// block in the 64×64s around them). They're copied, not filtered.
     ///
+    /// Every block larger than 64×64 (128×128 superblocks) must be skipped: CDEF's preset is
+    /// chosen per 64×64, and a coded one would signal one for all of its 64×64s.
+    ///
     /// `planes` may be `reconstructionBuffers`' contents: then they're deblocked in place (and
     /// hold the reconstruction no more), and with `direct` (whose 64×64s and the unchanged ones
     /// come out of the filters as they went in) nothing of the previous picture's deblocking is
@@ -155,6 +162,12 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                        sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
                        direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true,
                        cdef: Bool = true) throws -> Search {
+        // (the search chooses a CDEF preset per 64×64, but a coded block larger than 64×64 codes one
+        // for all of its 64×64s: refused. The hybrid's are skipped copies.)
+        let large = Int32(AV1G_BLOCK_64X128)...Int32(AV1G_BLOCK_128X128)
+        if params.sb128 != 0, blocks.contains(where: { $0.skip == 0 && large.contains(Int32($0.bsize)) }) {
+            throw Failure.metal("search: a coded block larger than 64×64")
+        }
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
@@ -305,7 +318,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                 (luv + sb * nc).update(repeating: 0, count: nc)
             }
             if inPlace {
-                farDirect = (0..<nsb).filter { direct[$0] != 0 }.map(UInt32.init)
+                // (not those beside a changed one, `inner`: the GPU's deblocking, which runs as these
+                // are copied, reaches into them, and CDEF writes their output after it anyway)
+                farDirect = (0..<nsb).filter { direct[$0] != 0 && inner[$0] == 0 }.map(UInt32.init)
             } else {
                 copyDirect((0..<nsb).filter { direct[$0] != 0 && around[$0] != 0 }.map(UInt32.init))
                 farDirect = (0..<nsb).filter { direct[$0] != 0 && around[$0] == 0 }.map(UInt32.init)

@@ -783,9 +783,10 @@ impl Hybrid {
         for (i, b) in rec.blocks.iter_mut().enumerate() {
             b.skip = if is_inter(i) { b.skip.min(1) } else { 0 };
         }
-        if !given_chroma {
+        if !given_chroma || ss == 0 {
             // the chroma decisions read the blocks' areas: no block outside the padded source (an
-            // inter block, which has none, may be larger than 64x64 with 128x128 superblocks)
+            // inter block, which has none, may be larger than 64x64 with 128x128 superblocks). A
+            // 4:4:4 picture's are checked with given chroma too, as before the GPU decided them.
             for (i, b) in rec.blocks.iter().enumerate() {
                 let bs = b.bsize as i32;
                 if bs >= BLOCK_SIZES
