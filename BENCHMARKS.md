@@ -146,9 +146,9 @@ the numbers and the reasoning.
 | 4:4:4 chroma AC delta-q as libaom's tune=iq sets it | rejected | 4–8 % more bytes at equal SSIMULACRA2 | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
 | The palette bias on every 4:4:4 block | rejected (gated instead) | photos −10.5 → −7.0 % against libaom | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
 | 4:4:4 post-filters on the CPU; a merge pass of sub-8×8 blocks into palettes | not built | libaom's CDEF and deblocking are worth −1 to +3 % on these tiles; it keeps sub-8×8 blocks on 1.4–3.5 % of the area | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
-| 4:4:4 inter frames (High profile) in the writer, our decoder, the hybrid, its live encoder and the replay (`av1-444-video`; `HybridRegionEncoder(chroma444:)`, `replay --chroma 444`) | built, research; not offered (stage 2: av1C, caps bit, the Viewer's decoder by profile) | at equal bytes on screens +1.0–3.3 dB RGB PSNR, +0.3–1.9 SSIMULACRA2; video 26 % more bytes a frame at the ceiling (−29 % frames at 6 Mbit/s); at 5K half 4:2:0's frame rate (screens 80–97 against 165–177, new video 19 against 54); recommended only ≥ 20 Mbit/s and for screen content | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
-| 4:4:4 post-filters on the CPU (`hybrid::pf444`, `chroma444CPUFilters`) | built, off | BD-rate −16.8 % on video, −3.4 % scrolling images, −0.3 to 0 % on screens; 66 ms a 5K video frame on all cores (475 on one) | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
-| 4:4:4 palettes and 8×8-and-up shapes in video | kept, but not in fast (mostly-new) pictures; the shape rule now removes the small shapes from an inter frame's own | without them +4.8–14.2 % bytes on screens, 0 on video, where they cost a quarter of the frame rate (19 against 26) | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
+| 4:4:4 inter frames (High profile) in the writer, our decoder, the hybrid, its live encoder and the replay (`av1-444-video`; `HybridRegionEncoder(chroma444:)`, `replay --chroma 444`) | built, research; not offered (stage 2: av1C, caps bit, the Viewer's decoder by profile) | at equal bytes on screens +1.0–3.3 dB RGB PSNR at 2, 6 and 20 Mbit/s alike; video 26 % more bytes a frame at the ceiling (−29 % frames at 6 Mbit/s, none fewer at 20); at 5K half 4:2:0's throughput (screens 120–148 against 240–275 frames a second, new video 28 against 55), +1.3–1.6 ms latency a screen frame, +19 ms a video frame; not by default; if offered, only where the link carries video without losing frames and not for mostly-new pictures | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
+| 4:4:4 post-filters on the CPU (`hybrid::pf444`, `chroma444CPUFilters`) | built, off | deblocking + CDEF: BD-rate −17.3 % on video, −3.4 % scrolling images, −0.3 to 0 % on screens, 60 ms a new 5K picture on all cores; deblocking alone −5.4 % on video for 6.2 ms (stage 2: deblock 4:4:4's fast pictures if video ships) | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
+| 4:4:4 palettes and 8×8-and-up shapes in video | kept, but not in fast (mostly-new) pictures; the shape rule now removes the small shapes from an inter frame's own | without them +4.8–14.2 % bytes on screens, 0 on video, where they cost a quarter of the frame rate | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
 | 4:4:4 rate models (`HybridRateController.defaultInter444` / `defaultKey444`) | kept | a coded 64×64 1.24× (inter) and 1.22× (key) 4:2:0's, on its slope | [entry](#the-hybrids-444-inter-frames-encoder-our-decoder-the-replay-444-against-420-2026-11-17) |
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
@@ -362,7 +362,7 @@ which.
 The owner asked for 4:4:4 video on 2026-11-17: 4:4:4 (High profile) inter frames end to end,
 measured in the product's replay. This is stage 1 (encoder, decoder, replay); the wire and the
 apps are stage 2. Branch `av1-444-video` (off `metal-av1` at `6050750`), commits `32cd5f1`…
-`fbd3d98` and this entry's. 4:2:0 output is unchanged throughout (gates below).
+`fbd3d98`, `0e5c174` and this entry's. 4:2:0 output is unchanged throughout (gates below).
 
 **What was built.**
 - **The writer and our decoder** take 4:4:4 inter frames. Chroma motion compensation, copies,
@@ -433,35 +433,37 @@ apps are stage 2. Branch `av1-444-video` (off `metal-av1` at `6050750`), commits
   `HybridRegionEncoderTests.a444RegionIsHighProfileAndKeepsItsChroma`,
   `HybridRateControllerTests.the444ModelsPriceTheFullChroma`).
 
-**Speed** (`av1seq --inter`, 5K, 30 frames from frame 150 (scrolling 240), q20, overlapped
-pictures; load average 4–7, so provisional): frames a second, and the stages in ms a frame
-(GPU analysis · CPU chroma · closed loop · filters · writer, the writer's 4:4:4 figure including
-cropping the planes av1seq returns):
+**Speed** (`av1seq --inter --no-planes`, the final encoder, 5K, 30 frames from frame 150
+(scrolling 240), q20, overlapped pictures; each run started at a load average under 3): frames a
+second, and the stages in ms a frame (GPU analysis · CPU chroma · closed loop · filters · writer):
 
 | trace | 4:2:0 fps | stages | 4:4:4 fps | stages |
 |---|---|---|---|---|
-| scrolling | 177 | 1.4 · 0.2 · 1.6 · 2.7 · 0.5 | 79 | 1.7 · 2.6 · 4.8 · 0.0 · 4.1 |
-| dragging | 174 | 1.6 · 0.2 · 1.6 · 2.7 · 0.5 | 88 | 1.6 · 2.2 · 4.2 · 0.0 · 3.8 |
-| video | 54 | 17.7 · 0.2 · 8.9 · 8.1 · 2.4 | 19 | 18.8 · 16.9 · 27.0 · 0.0 · 6.7 |
-| scrolling images | 128 | 3.5 · 0.3 · 2.4 · 3.3 · 1.0 | 56 | 5.8 · 3.7 · 8.0 · 0.0 · 4.2 |
-| tabs | 177 | 1.2 · 0.2 · 1.6 · 2.7 · 0.4 | 84 | 1.5 · 2.5 · 4.4 · 0.0 · 3.9 |
-| IDE | 173 | 1.5 · 0.2 · 1.8 · 2.8 · 0.6 | 96 | 1.6 · 1.8 · 3.9 · 0.0 · 3.9 |
-| app switching | 165 | 1.0 · 0.2 · 1.8 · 2.8 · 0.4 | 97 | 1.0 · 1.7 · 3.9 · 0.0 · 3.5 |
+| scrolling | 240 | 1.5 · 0.2 · 1.8 · 1.1 · 0.6 | 121 | 2.1 · 2.2 · 3.7 · 0 · 0.7 |
+| dragging | 240 | 1.6 · 0.2 · 1.8 · 0.9 · 0.5 | 120 | 2.0 · 2.4 · 3.7 · 0 · 0.7 |
+| video (all pictures new) | 54.8 | 17.7 · 0.2 · 8.6 · 6.9 · 2.3 | 28.4 | 18.4 · 15.6 · 15.2 · 0 · 3.2 |
+| scrolling images | 137 | 3.6 · 0.3 · 2.3 · 2.1 · 0.8 | 69 | 5.2 · 3.5 · 7.2 · 0 · 1.0 |
+| tabs | 257 | 1.2 · 0.2 · 1.7 · 0.8 · 0.4 | 126 | 1.9 · 2.4 · 3.3 · 0 · 0.6 |
+| IDE | 258 | 1.3 · 0.2 · 1.8 · 1.1 · 0.5 | 142 | 1.6 · 2.1 · 3.3 · 0 · 0.8 |
+| app switching | 275 | 0.7 · 0.2 · 1.6 · 1.0 · 0.4 | 148 | 1.2 · 1.7 · 3.1 · 0 · 0.5 |
 
-4:4:4 is half 4:2:0's rate on copy-heavy screens (80–97 against 165–177 frames a second) and a
-third on all-new video (19 against 54). Where it goes: the chroma decision moves from the GPU to
-the CPU (0.2 → 2–17 ms: the analysis's is 4:2:0's), the closed loop codes three times the chroma
-samples (1.6 → 4–27 ms), and 4:4:4 has no filters to skip (4:2:0's GPU filters 3–8 ms). Byte-
+4:4:4 runs at half 4:2:0's rate on screens (120–148 against 240–275 frames a second) and on new
+video (28.4 against 54.8). Where it goes: the chroma decision moves from the GPU to the CPU (0.2 →
+1.7–15.6 ms: the analysis's is 4:2:0's), and the closed loop codes three times the chroma samples
+and prices palettes (1.6–8.6 → 3.1–15.2 ms); 4:4:4 skips the filters (4:2:0's 0.8–6.9 ms). Byte-
 identical speedups made here: the analysis's 4:2:0 chroma copy on every core (it was a scalar loop
-over both full planes on the analysis's critical path); the reference in place (no 44 MB crop a
-5K frame in the live encoder); the analysis's shape rule (below).
+over both full planes on the analysis's critical path), and the reference in place (no 44 MB crop
+a 5K frame in the live encoder; the same stream digests with and without planes on app switching,
+200 frames, and the four-trace mix, 24 frames with GOLDEN_FRAME swapping among four long-term
+pictures). An earlier sweep with the planes cropped out (the first encoder of this entry) had
+4:4:4 at 79–97 frames a second on screens: the crop was a third of a screen frame.
 
 **Palettes and shapes in 4:4:4 video.** The key frames' rule (palettes, and analysis shapes of
 8×8 and up) at first replaced an inter frame's shapes with the preset's, undoing the fewer shapes
 a mostly-new picture analyzes: a new 5K picture's GPU analysis 17.6 → 30.6 ms. It now removes
 4×4, 4×8 and 8×4 from whichever shapes the picture would try (`beginPartition(removesShapes:)`;
 key frames get the same mask as before): 18.8 ms. Palettes' worth (BD-rate on PSNR (6Y + U +
-V) / 8, q14–36), and their cost:
+V) / 8, q14–36) and their cost, from that sweep (planes cropped, load average 4–7):
 
 | trace | without palettes: bytes at equal PSNR | fps with / without (q20) |
 |---|---|---|
@@ -474,34 +476,39 @@ V) / 8, q14–36), and their cost:
 | app switching | +9.1 % | 97 / 103 |
 
 They pay on screens (4.8–14.2 %, mostly in the key frame of these copy-heavy windows) and buy
-nothing on video, where they cost a quarter of the frame rate (25.6 → 19.3). So 4:4:4 pictures
-keep them, but not a stream's fast (mostly-new) pictures, which already trade bytes for speed.
+nothing on video, where they cost a quarter of the frame rate. So 4:4:4 pictures keep them, but
+not a stream's fast (mostly-new) pictures, which already trade bytes for speed: the final
+encoder's video is 28.4 frames a second (above).
 
 **Post-filters.** 4:2:0's GPU filters and their search are 4:2:0's; 4:4:4 started with none.
 Measured as the brief asked: `hybrid::pf444` (`av1enc_hybrid_postfilter_cpu`, research, off)
 deblocks at tune=iq's level and runs CDEF by the GPU search's rule (four candidates' SSE per
 64×64, `cdef_select_cpu`, `cdef_bits`, each 64×64 its cheapest preset) on the crate's exact
-filters, in bands of 64×64 rows on the pool; the frames decode exactly in libaom (every `av1seq
---cpu-filters` frame) and in ours (`chroma444_cpu_filters_decode_exactly`). BD-rate against none:
+filters, in bands of 64×64 rows on the pool; `GA_PF444_DEBLOCK_ONLY` deblocks alone. The frames
+decode exactly in libaom (every `av1seq --cpu-filters` frame) and in ours
+(`chroma444_cpu_filters_decode_exactly`). BD-rate against none (first encoder, all seven traces;
+video and scrolling images again on the final one, with deblocking apart), and the filters' time a
+5K frame (final encoder, `--no-planes`, load under 3):
 
-| trace | 4:4:4 CPU filters, PSNR (6Y+U+V)/8 | PSNR-Y | 4:2:0's GPU filters, PSNR-Y |
-|---|---|---|---|
-| scrolling | -0.1 % | -0.1 % | -0.1 % |
-| dragging | -0.2 % | -0.2 % | -0.1 % |
-| video | -16.8 % | -15.2 % | -5.6 % |
-| scrolling images | -3.4 % | -1.9 % | -1.9 % |
-| tabs | -0.0 % | -0.1 % | -0.0 % |
-| IDE | -0.3 % | -0.3 % | -0.3 % |
-| app switching | +0.0 % | +0.0 % | -0.0 % |
+| trace | deblocking + CDEF, PSNR (6Y+U+V)/8 · PSNR-Y | deblocking alone | 4:2:0's GPU filters, PSNR-Y | ms a frame: deblocking alone · both (4:4:4 fps then) |
+|---|---|---|---|---|
+| scrolling | −0.1 · −0.1 % | | −0.1 % | |
+| dragging | −0.2 · −0.2 % | | −0.1 % | |
+| video | −16.8 · −15.2 % (final: −17.3 · −15.6 %) | −5.4 · −5.2 % | −5.6 % (deblocking: its fast pictures run no CDEF) | 6.2 · 59.9 (24.7, 10.4 against 28.4) |
+| scrolling images | −3.4 · −1.9 % (final: the same) | −0.7 · −0.4 % | −1.9 % | 7.4 · 27.7 (47.1, 24.0 against 69.4) |
+| tabs | −0.0 · −0.1 % | | −0.0 % | |
+| IDE | −0.3 · −0.3 % | | −0.3 % | |
+| app switching | +0.0 · +0.0 % | | −0.0 % | |
 
-On screens they're worth nothing at these quantizers (as 4:2:0's: tabs, ide, app switching −0.3
-to 0 %), on photos 3.4 %, on video 16.8 % (4:2:0's fast pictures run no CDEF, so its video gain
-is 5.6 %). Over 2 % on video, so built on the CPU as asked, and timed: a 5K video frame 475 ms on
-one thread, 66 ms on all of them in bands (scrolling images 168 → 27 ms) — four times a 60 Hz
-frame, on top of a 4:4:4 frame that is already 52 ms. **Not enabled.** What would make them
-affordable: the GPU's filters and search made subsampling-generic (4:2:0's cost 3–8 ms), or
-filtering only the coded 64×64s as the GPU path does (copy-heavy pictures then cost nearly
-nothing).
+On screens the filters are worth nothing at these quantizers (as 4:2:0's), on scrolling images
+3.4 % (deblocking 0.7 %), on video 17.3 % (deblocking alone 5.4 %, CDEF the rest). Both clear 2 %
+on video, so both were built on the CPU and timed: CDEF's five passes cost 54 ms a new 5K picture
+on every core (475 ms for both on one), which no 60 Hz stream can carry. Deblocking alone costs
+6.2 ms, 13 % of the video frame rate, for 5.4 % of its bytes, and nothing on screens, where it
+also buys nothing. **Not enabled** (4:4:4 isn't offered yet): the decision for stage 2 is to
+deblock 4:4:4's fast (mostly-new) pictures alone, as 4:2:0's fast pictures are, if it ships 4:4:4
+for video; CDEF waits for the GPU's filters and search made subsampling-generic (4:2:0's cost
+0.8–6.9 ms), or for filtering only the coded 64×64s as the GPU path does.
 
 **The rate model** (`HybridRateController.defaultInter444` / `defaultKey444`), fitted as 4:2:0's
 was: bits per coded 64×64 at qindex 80 and the slope, per trace, from `av1seq --frame-bytes`
@@ -549,8 +556,9 @@ luma PSNR is the replay's usual (BT.601 luma at half size, every 4th frame):
   (inter frames at its floor, qindex 40, on all three screens at every link), and the bytes are
   the key frames'. A 4:4:4 key frame is priced 1.22× and so coded about 20 qindex steps coarser
   (119 against 99 under the startup cap). For the same bytes 4:4:4 shows **+1.0–3.3 dB RGB PSNR**
-  and **+0.3–1.9 SSIMULACRA2** (p10 too, but tabs at 2 and the IDE at 6), at 0.8–1.4 dB less luma
-  PSNR (the coarser key frame). Frames shown are the same (app switching and tabs at 2 Mbit/s a
+  in all nine screen runs, the consistent signal; SSIMULACRA2 is higher in all nine too, by
+  0.3–1.9, but those deltas (and p10, lower on tabs at 2 and the IDE at 6) are within one run's
+  noise at n 12–29. Luma PSNR is 0.8–1.4 dB lower (the coarser key frame). Frames shown are the same (app switching and tabs at 2 Mbit/s a
   few more).
 - **On video 4:4:4 costs frames.** The movie sits at the ceiling (qindex 168) in both formats on
   every link; there a 4:4:4 frame costs 26 % more (20 Mbit/s: 35.0 against 27.7 MB for the same
@@ -564,21 +572,46 @@ luma PSNR is the replay's usual (BT.601 luma at half size, every 4th frame):
   1,776 max, none unshown — 4:2:0's figures (BENCHMARKS "Our own AV1 decoder in the Viewer's place,
   stage 2").
 
-**Timing** (pending: the runs wait for a load average under 3).
+**Timing** (the same replays at 20 Mbit/s without the picture check or scoring,
+`--no-check-pictures --score-every 0`, so the live encoder's path (no planes returned); each run
+started at a load average under 3; one link a trace, since a frame's latency and decode don't
+depend on it). Encode latency is submit to frame with one picture in flight (the replay waits
+for each); decode is our decoder's own time on the engine's queue, then its BGRA conversion:
 
-**Recommendation.** **Not by default; at most, on links of 20 Mbit/s and up, for screen content.**
-4:4:4 buys colour fidelity in moving text and UI for no bandwidth on screens (+1.0–3.3 dB RGB
-PSNR, +0.3–1.9 SSIMULACRA2 at the same bytes and frames, at 2, 6 and 20 Mbit/s alike). It pays in
-speed, which comes first: half the encoder's frame rate at 5K (80–97 against 165–177 frames a second on
-screens, 19 against 54 on new video), 1–2 ms more encode latency a screen frame and about 25 more a video
-frame, twice the Viewer's conversion; and on video 26 % more bytes a frame at the same qindex,
-so 29 % fewer frames through 6 Mbit/s. What it buys is transient: the tiles settle the screen to
-lossless either way. So 4:2:0 stays the default. If stage 2 offers 4:4:4, the rule that fits these
-numbers is a link of 20 Mbit/s or more *and* a region that isn't coding mostly-new pictures
-(the encoder's fast pictures are the signal), with hysteresis, since every switch of format is a
-key frame. Never below 6 Mbit/s, where video loses frames and screens gain only the colour scores.
-Making 4:4:4 cheaper first would change this: the chroma decision back on the GPU (it is 2–17 ms on the
-CPU), and 4:4:4 GPU filters (16.8 % on video).
+| trace · link | frames shown 4:2:0 / 4:4:4 | encode latency p50 · p95 (ms) | key frame decode + conversion (ms) | inter frame decode + conversion (ms) |
+|---|---|---|---|---|
+| tabs · 20 | 573 / 573 | 8.5 · 11.0 / 9.8 · 12.6 | 20.3 + 2.5 / 24.5 + 2.9 | 1.03 + 0.58 / 0.99 + 1.09 |
+| app switching · 20 | 232 / 232 | 7.5 · 19.4 / 9.1 · 23.1 | 23.4 + 2.4 / 24.5 + 3.3 | 1.14 + 0.56 / 1.12 + 1.07 |
+| IDE · 20 | 547 / 547 | 7.2 · 9.1 / 8.6 · 10.9 | 12.8 + 2.4 / 16.0 + 3.1 | 1.02 + 0.56 / 0.97 + 1.06 |
+| video (movie) · 20 | 600 / 600 | 33.4 · 37.8 / 52.6 · 68.3 | 13.4 + 4.5 / 11.8 + 4.8 | 11.38 + 0.53 / 9.76 + 1.07 |
+
+Frames per second shown are equal by construction (the replay waits for every encode) and are the
+traces' own rates while the region is up: tabs 55 (573 frames over 10.4 s), the IDE 27 (547 over
+20.4), app switching 22 (232 over 10.4), the movie 24 (600 over 25.0). What 4:4:4 adds is latency: 1.3–1.6 ms
+a frame on screens (+15–21 %), 19 ms on video (52.6 against 33.4 p50, 68.3 against 37.8 p95), so a
+lone video picture comes 19 times a second instead of 30; the encoder's throughput with pictures
+overlapped is the speed table's. The Viewer: inter frames decode in the same time (0.97–1.12
+against 1.02–1.14 ms on screens; 9.8 against 11.4 on video), but the 4:4:4 conversion (interleave
+to AYpCbCr, then vImage) takes twice 4:2:0's (1.06–1.09 against 0.53–0.58 ms); key frames 1–3 ms
+more to decode, 0.4–0.9 ms more to convert.
+
+
+**Recommendation.** **Not by default.** On screens 4:4:4 buys colour fidelity in moving text
+and UI for no bandwidth: at the same bytes and frames, RGB PSNR +1.0–3.3 dB in all nine screen
+runs (SSIMULACRA2 mostly up by 0.3–1.9, within one run's noise at n 12–29), luma PSNR 0.8–1.4 dB
+down (its key frames coarser for the same budget), and that held alike at 2, 6 and 20 Mbit/s: on
+screens there is no link-rate dependence to place a threshold on (6 and 20 are one operating
+point, inter frames at the controller's floor; nothing was run between them). It pays in speed,
+which comes first: half the encoder's throughput at 5K, 1.3–1.6 ms more latency a screen frame and
+19 ms more a video frame, twice the Viewer's conversion. On video it also pays in bandwidth: 26 %
+more bytes a frame at the ceiling, so 29 % fewer frames through 6 Mbit/s and 11 % fewer through 2
+(none fewer at 20). And what it buys is transient: the tiles settle the screen to lossless either
+way. So 4:2:0 stays the default. If stage 2 offers 4:4:4, the measurements support it only where
+the link carries video's extra bytes without losing frames (20 Mbit/s did; 6 didn't; the owner
+places the threshold in between) and only while the region isn't coding mostly-new pictures (the
+encoder's fast pictures are the signal), with hysteresis, since every switch of format is a key
+frame. What would change this: the chroma decision back on the GPU (1.7–15.6 ms on the CPU) and
+4:4:4 GPU filters (CDEF is worth 12 % more on video).
 
 **Stage 2 needs:**
 - *The av1C:* `AV1Config.build444` makes the 4:4:4 record (seq_profile 1, no subsampling);

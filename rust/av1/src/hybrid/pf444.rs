@@ -75,7 +75,10 @@ impl Hybrid {
         if (0..3).any(|p| out_stride[p] < cw[p] || out[p].len() < out_stride[p] * (ch[p] - 1) + cw[p]) {
             return Err(error(ERR_INVALID, "postfilter_cpu: output planes too small"));
         }
-        let t = tuneiq_frame_init(rec.fp.base_q_idx as i32, ss, ss, false);
+        let mut t = tuneiq_frame_init(rec.fp.base_q_idx as i32, ss, ss, false);
+        if deblock_only() {
+            t.cdef_mode = 0; // (research: GA_PF444_DEBLOCK_ONLY, deblocking's worth alone)
+        }
         let mut fp = rec.fp;
         let lvl = t.lf_level as u8;
         fp.loop_filter_level = [lvl; 4];
@@ -299,4 +302,11 @@ fn split<'a>(
         out.push((uy, e));
     }
     out
+}
+
+/// Research: GA_PF444_DEBLOCK_ONLY in the environment makes [`Hybrid::postfilter_cpu`] deblock
+/// alone (CDEF signalled inactive, as at qindex 32 and under), to measure deblocking's worth apart.
+fn deblock_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GA_PF444_DEBLOCK_ONLY").is_some())
 }
