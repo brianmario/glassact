@@ -158,8 +158,9 @@ fn copy_variant(seq: &mut InterSeq, seed: u64) {
 
 /// Random sequence `seed` as the tests vary it: sometimes copy-heavy, reduced, with palettes.
 fn test_seq(seed: u64, maxdim: i32, nframes: usize) -> Option<InterSeq> {
-    let mut seq = InterSeq::make(seed, if seed % 2 == 0 { 2 * maxdim } else { maxdim }, nframes)?;
-    if seed % 2 == 0 {
+    let copies = seed.is_multiple_of(2);
+    let mut seq = InterSeq::make(seed, if copies { 2 * maxdim } else { maxdim }, nframes)?;
+    if copies {
         copy_variant(&mut seq, seed);
     }
     if seed % 3 == 1 {
@@ -528,13 +529,13 @@ fn corpus(n: u64) -> Vec<Stream> {
     let mut v = Vec::new();
     let mut w = Writer::with_threads(1);
     for seed in 0..n {
-        if let Some(mut seq) = test_seq(seed, 96, 6) {
-            if let Ok(outs) = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD) {
-                v.push(Stream {
-                    tus: outs.iter().map(|o| o.obu.clone()).collect(),
-                    outs,
-                });
-            }
+        if let Some(mut seq) = test_seq(seed, 96, 6)
+            && let Ok(outs) = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD)
+        {
+            v.push(Stream {
+                tus: outs.iter().map(|o| o.obu.clone()).collect(),
+                outs,
+            });
         }
         let mut stills = Vec::new();
         if let Some(r) = record_444(seed, 64, seed % 2 == 0) {

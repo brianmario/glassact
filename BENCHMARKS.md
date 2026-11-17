@@ -140,6 +140,7 @@ the numbers and the reasoning.
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
 | The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
+| Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 2.6, dav1d 1.1), photos 3.3 (5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
@@ -335,6 +336,54 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Our own AV1 decoder, stage 1 (2026-11-16)
+
+The decoder the first measurement below pointed at, built on branch `av1-decoder` (off `metal-av1`):
+`decoder::Decoder` in `rust/av1` and a C API (`av1g/decoder.h`, in AV1Core's module map; no Swift
+yet). A temporal unit in, the shown frame's planes out (cropped, at a stride). Its first users would be
+a Viewer with no other decoder for these streams: 4:4:4, M1 / M2, Intel.
+
+**How.** Each tile is parsed and reconstructed in one walk (the parser's walk with the inverse
+transform in parse mode, no record kept: `writer::decode`), tiles in parallel on the pool. Then, per
+64x64 and in bands of 64x64 rows on the pool: a 64x64 whose blocks all copy one reference with no
+motion or residual, and which neither filter touches, is that reference's; one no filter touches is
+the tile's samples; the rest are deblocked and CDEF-filtered from a frame-level copy
+(`postfilter::deblock_rect` / `cdef_rect`, of which the frame functions are now the full-frame case).
+Every 64x64 of every picture (and of the tile planes, which persist) carries a content id, so a copy
+happens only where the destination holds something else, and a no-motion inter block isn't predicted
+where the tile planes already hold its reference's samples.
+
+**Exact.** The four 5K streams of the first measurement: 240 of 240 frames identical to libaom's
+(arm64, and x86_64 under Rosetta). Random 4:2:0 key and inter sequences (copy-heavy, reduced frames,
+palettes, intra block copy, 128x128 superblocks, GOLDEN slots) and 4:4:4 key frames: 1,200 frames,
+240 of them 4:4:4, identical in this decoder, dav1d and aomdec (`decoders_agree`); the writer's
+`decoders` tests now hold it to their frames too (480 + 60 stills, 384 4:4:4 pictures). The encoder
+is unchanged: the five reference digests; `cargo test --release` 77 and the oracle build 145 (70 and 139 before, the rest the decoder's).
+
+**Hostile input** (INV-6). Truncated, bit-flipped, overwritten and random temporal units of real
+streams, random OBU structures, reordering and resets, with every decoded frame checked against the
+parser and the writer's reconstruction, and key frames after the damage against the stream:
+7,200 cases in 3 s in `cargo test --release`; 270,000 cases (719,912 decodes, 440,580 reaching the
+tile walk) in `hostile_input_long`. Frames are at most 8192 a side. Anything outside the writer's
+toolset is refused.
+
+**Speed** (`examples/own_decode.rs`; aomdec and dav1d per frame as whole-stream runs less a
+first-frame-only run; M4 Pro, 8 threads, load average 8–13, so provisional):
+
+| Stream | ours: key; inter median / max | parse + writer (the first measurement's) | aomdec, 8 threads / 1 | dav1d, 8 threads (frame delay 1) |
+|---|---|---|---|---|
+| typing-cc | 15.7 ms; 0.83 / 3.7 | 77; 15.9 | 2.61 / 5.73 ms a frame | 1.10 (0.86) |
+| tabs | 16.6; 0.82 / 3.7 | 76; 16.1 | 2.63 / 5.81 | 1.06 (0.86) |
+| app switching | 11.1; 0.81 / 4.3 | 43; 16.0 | 2.69 / 5.84 | 1.16 (0.94) |
+| photos | 42.5; 3.26 / 33.6 | 221; 22.6 | 5.09 / 18.5 | 2.13 (2.32) |
+
+On one thread: typing 85 ms key, 4.3 ms inter; photos 228 / 17.4. So copy-heavy inter frames are a
+third of libaom's 8-thread time and level with dav1d's; photos are two thirds of libaom's and 1.5×
+dav1d's. Where a copy-heavy inter frame's 0.8 ms goes: the tile walks 0.48 (parsing 3,600 64x64s and
+clearing the tiles' maps), the frame's maps and each 64x64's kind 0.44, filters and copies 0.16.
+A warm decoder allocates ~17 times (1.3 KB) a frame: the pool's job per stage and each stage's
+queue lock (`tests/decoder_alloc.rs`).
 
 ### The hybrid's 4:4:4 key frames, as tiles (2026-11-16)
 
