@@ -6,7 +6,10 @@ In this crate, the libaom-derived parts below are:
 - the quantization-matrix tables in `src/tables/spec.rs`;
 - `src/entropy/ec.rs`: the range encoder.
 
-The C++ reference in `oracle/cpp` keeps the original paths named here.
+The paths named below are av1gpu's. Its C++, which this crate was ported from, was kept in
+`oracle/cpp` as a frozen test reference until 2026-11-17, when snapshot tests replaced it; the
+port stays derived from it, under the licenses below. libaom's quantizer tables are in
+`tables/av1f/aom_tables_gen.h`, the input of `scripts/gen-av1-rust-tables`.
 
 ## libaom (Alliance for Open Media)
 

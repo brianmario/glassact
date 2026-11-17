@@ -318,6 +318,7 @@ the numbers and the reasoning.
 | Carry skipped captures' damage forward | kept | fixes tiles left stale until touched; bytes unchanged | [entry](#stale-tiles-damage-from-skipped-captures-is-carried-forward-2026-09-30) |
 | Hot-map churn keyed on hash changes, not "un-ACKed" | kept | 1 s RTT sessions converge; photos loop 14 → 9 regions | [entry](#high-rtt-convergence-hot-map-read-un-acked-as-churn-2026-08-10) |
 | Allocation-free scroll path (preallocated signatures, votes, probe buffers; pooled marks) | kept | `maybeEmitScroll` 779–2,097 → 2 allocations per tick (the SCROLL `Data`); timing unchanged | [entry](#allocation-free-scroll-ticks-2026-10-18) |
+| av1gpu's C++ as the Rust AV1 crate's test reference (`oracle` feature, differential tests) | retired 2026-11-17: snapshot tests | 64 tests, 184 hash families on the same seeds and cases; 5,947 lines of C++ and build script gone; `just test-rust` 140 → 65 s (one build, not two) | [entry](#the-rust-av1-crates-c-reference-retired-snapshot-tests-2026-11-17) |
 
 ## Removed bench commands
 
@@ -345,6 +346,71 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### The Rust AV1 crate's C++ reference retired: snapshot tests (2026-11-17)
+
+The owner's decision (2026-11-17). Branch `av1-no-oracle` (off `metal-av1`). `rust/av1/oracle` was
+av1gpu's C++, which the crate was ported from, frozen with shims; the `oracle` feature compiled it
+and the differential tests held the Rust to it output for output. Correctness is held by real
+decoders (libaom, dav1d, our decoder) and the encoder by the five reference digests; what the
+oracle still caught was a change that is valid AV1 but different. A snapshot catches that.
+
+**What replaced it.** Every oracle test keeps its seeds, inputs and case counts and hashes the
+Rust's outputs (FNV-1a 64, `testsupport::snapshot`) per family: the writer's bytes, AVIF,
+reconstruction, stats, tile payloads, symbol streams and write-back; the parser's records; the
+closed loops' records, reconstructions and writes; the DSP's, entropy coder's, post-filters' and
+tune=iq's results; the fuzzer's records and the GPU's DSP sets. 64 tests, 184 families. The C
+layouts are held to `tests/layouts.cpp`, compiled at test time against `Sources/*/include`.
+
+**Proof.** One commit carried both (`d510ae4`): each test's C half under `cfg(feature = "oracle")`,
+its Rust half and hashes in every build. On that commit, checked out clean, the oracle build passes
+(150 tests: every C comparison and every recorded hash), and so do the default (152) and
+`--no-default-features` (150) builds. The fuzzer's records were
+checked equal to the C++'s whole for every seed used, and the DSP sets for seed 0xfeed too. The
+hybrid's and tune=iq's float code contracts on arm64 and not on x86_64 (`enc::fmac`), so five
+tests keep constants per architecture, the x86_64 ones recorded from an x86_64 oracle build
+(Rosetta): its C comparisons all passed, and its only failures were those five tests' arm64
+constants, which it printed as the x86_64 ones. Repeated runs and `--test-threads=1` give the same hashes.
+
+Perturbations, one at a time and reverted (the default build's failing tests were the same set as
+the oracle build's for the first four):
+
+| perturbed | tests failing | families that moved (examples) |
+|---|---|---|
+| DC dequant step + 1 (`dsp::dequant`) | 17 | dsp `dequant`, `itx_residual`; writer `recon`, `obu`; hybrid `record`; dav1d checks |
+| CDF adaptation rate + 1 (`entropy::ec::rate`) | 22 | entropy `update_cdf`, `bytes`, `cdfs`; writer `obu`, `payloads`; ref engine `obu` |
+| tile_size_bytes 2 for small tiles (writer headers, still valid AV1) | 6 | writer `obu`, `stats`, `parse`; hybrid `write` |
+| CDEF primary tap [4, 2] -> [5, 1] (scalar) | 15 | postfilter `pixel`, `cdef`, `postfilter`; writer `recon` |
+| deblock filter4 rounding + 1 | 14 | postfilter `lf_line`, `deblock`; writer and ref engine `recon` |
+| tune=iq rdmult weight + 1 | 2 | enc `rdmult_q`, `cdef_bits` |
+| AVIF `ispe` flags 1 | 6 | avif `mux`; writer and ref engine `avif` |
+| fuzzer's monochrome odds | 16 | testsupport's fuzz families; writer, parse, layout |
+| intra edge filter type (`get_filter_type`) | 9 | blockinfo `filter_type`; writer `recon`, `obu` |
+| hybrid rounding offset + 0.01 | 3 | hybrid `record`, `recon`, `write` |
+| entropy plan's `mono` + 1 | 1 | writer `ent_plan` |
+| inverse transform butterfly rounding + 1 (scalar) | 6 | dsp `inv_1d`, `residual`, `itx_residual`; testsupport `itx`, `residual` |
+| inverse transform's final rounding + 1 (NEON) | 18 | dsp `residual`; hybrid `record`; writer `recon`, `obu`; ref engine |
+| intra DC rounding + 1 | 17 | dsp `dc`, `predict_intra`, `pred`; hybrid; writer `recon`, `obu` |
+
+101 of the 184 families moved under at least one of these 14. The rest pin outputs none of them
+reaches (each helper's own table, the CDEF and loop-filter searches, tile layouts, error codes,
+the padded source) or that stay empty for their test (the AVIF of a test without `ENC_AVIF`).
+
+**Also.** `Sources/GlassActAV1/Shaders/cuda_compat.h` (CUDA spellings for the kernels ported from
+av1gpu) is gone: the kernels say `fma`, `threadgroup_barrier`, `atomic_fetch_add_explicit` and so
+on themselves. Preprocessed, the three kernel sources differ only in dropped `(float)` casts of
+float arguments, `*(&a[i])` read as `a[i]`, and the atomics written out; the digests and the Swift
+GPU/CPU equality tests are unchanged.
+
+**Numbers.** The five reference digests are unchanged (after the shader change: `b2c0cf4a45158b3a`,
+`1082c1633f48dc22`, `4fd6684b7d92c680`, `61775b236211418f`, `ebdc001957933f8d`, frames digests
+too). `cargo test --release` 152 tests (81 before: the snapshots now run in the default build,
+so CI has them), the ignored `decoders`, `decoders_444`, `decoders_agree` and `palette_decoders`
+pass; the Swift AV1, AV1Core, AV1Decode, HybridVideo and ShaderBundle tests pass. `just
+test-rust` from clean: 140 s before (the default build 59 s, then the oracle build's C++ and Rust
+55 s and its tests 27 s), 65 s now (52 s build, 11 s tests). Removed: 5,869 lines
+of C++ and shims (`rust/av1/oracle`), `build.rs` (78), the tests' C halves (net 1,014 lines of Rust
+test code), `cuda_compat.h` (52).
 
 ### Glass Act's AV1 in the apps: the hybrid on the Host, VideoToolbox or our decoder on the Viewer (2026-11-17)
 

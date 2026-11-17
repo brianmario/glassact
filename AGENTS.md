@@ -21,9 +21,10 @@ retransmission.
   release workflow's one-time setup.
 - **GitHub issues** hold the open work.
 - **[rust/av1](rust/av1)** is the AV1 encoder's CPU code in Rust (the bitstream
-  writer, post-filters, the hybrid encoder's closed loop). Swift reaches it
-  through the C API in `Sources/AV1Core`, `AV1Encoder` and
-  `AV1CoreTestSupport`; the Metal kernels are in `Sources/GlassActAV1`.
+  writer, post-filters, the hybrid encoder's closed loop) and the AV1 decoder;
+  the apps link it. Swift reaches it through the C API in `Sources/AV1Core`,
+  `AV1Encoder` and `AV1CoreTestSupport`; the Metal kernels are in
+  `Sources/GlassActAV1`.
 - `## Deviations` notes at the top of a file (e.g. `QUICTransport.swift`)
   explain where the code departs from the SDK docs or the design.
 
@@ -84,7 +85,7 @@ retransmission.
 
 ```sh
 just test-fast        # skips real-QUIC and slow tests (~40 s); run this while iterating
-just test-rust        # the Rust AV1 crate's tests, including the ones against the C++ it was ported from
+just test-rust        # the Rust AV1 crate's tests, including the snapshots that pin its outputs
 just test             # everything; must be green before landing
 just test-asan        # AddressSanitizer
 just bench <args>     # release glassact-bench (replay, synth, goldens)

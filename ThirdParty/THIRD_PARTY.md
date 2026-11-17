@@ -132,6 +132,11 @@ the exception to the default no-dependencies posture.
   `encoder/src/entropy_gpu.cpp`) to Metal and C++ hosts.
 - **Changes:** `internal.h` moved into `include/av1g`; module maps expose
   only the C API to Swift; the tests' tool paths, file I/O and JPEG input
-  dropped. Files changed beyond include paths say so at the top.
+  dropped. Files changed beyond include paths say so at the top. The CPU
+  C++ is ported to Rust (`rust/av1`, behind the same C API); the C++ itself
+  was kept frozen in `rust/av1/oracle/cpp` as the port's test reference
+  until 2026-11-17, when snapshot tests replaced it (BENCHMARKS). The C
+  headers in `Sources/*/include`, the Metal kernels and the Rust port stay
+  derived from av1gpu, under its license.
 - **Update procedure:** none while it's a fork in progress. Record here
   which upstream commit a change was taken from.
