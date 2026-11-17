@@ -451,6 +451,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var stale: any MTLBuffer { stales[flip] }
         var staleCount = 0
         var previous: [[UInt8]]? = nil
+        /// Per SB, whether an analysis of it is kept: false for one the cache's first picture
+        /// skipped (`markUnchanged`), until a picture analyzes it.
+        var analyzed: [Bool] = []
+        /// The last picture was the cache's first, an inter frame's (with `skip`), which analyzed
+        /// only the SBs it codes: its analysis chooses its kernels as for every SB, as it did when
+        /// it analyzed them all (`Run.choiceSuperblocks`).
+        var firstWithSkip = false
         /// The last picture's qindex per 64x64 (delta-q), or nil.
         var previousQ: [UInt8]? = nil
         var keptCount = 0
@@ -529,19 +536,39 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
             let k = keep.contents().assumingMemoryBound(to: UInt8.self)
             let list = stale.contents().assumingMemoryBound(to: UInt32.self)
+            let nSb = sbCols * sbRows
             guard let prev = previous else {
-                memset(k, 0, sbCols * sbRows)
-                for i in 0..<(sbCols * sbRows) { list[i] = UInt32(i) }
-                staleCount = sbCols * sbRows
-                keptCount = 0
+                // The cache's first picture. With `skip` (an inter frame) only the SBs it codes are
+                // analyzed, as in every later inter frame: a skipped SB's analysis is never read (the
+                // partition stands one block for it), and the choices made by how much is analyzed
+                // are made as for every SB (`Run.choiceSuperblocks`), so the coded SBs' results are
+                // those of analyzing them all. Those it skips are marked unanalyzed, so that a
+                // picture without `skip` analyzes them.
+                staleCount = 0
+                analyzed = [Bool](repeating: true, count: nSb)
+                for i in 0..<nSb {
+                    let isStale = skip.map { $0[i] == 0 } ?? true
+                    k[i] = isStale ? 0 : 1
+                    analyzed[i] = isStale
+                    if isStale {
+                        list[staleCount] = UInt32(i)
+                        staleCount += 1
+                    }
+                }
+                keptCount = nSb - staleCount
+                firstWithSkip = skip != nil
                 previous = planes.map { Array(UnsafeBufferPointer(start: $0.0, count: $0.1 * $0.2)) }
                 return
             }
-            var changed = [Bool](repeating: false, count: sbCols * sbRows)
+            firstWithSkip = false
+            var changed = [Bool](repeating: false, count: nSb)
             if let skip {
                 // the mask decides: every SB not skipped is analyzed (and its source remembered, which
                 // for an unchanged one changes nothing), with no comparison
                 for i in changed.indices { changed[i] = skip[i] == 0 }
+            } else {
+                // an SB a first picture skipped has no analysis to keep
+                for i in changed.indices where !analyzed[i] { changed[i] = true }
             }
             for (p, (pixels, w, h)) in planes.enumerated() where skip == nil {
                 let side = p == 0 ? 64 : 32
@@ -572,6 +599,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                             || changedAt(r - 1, c + 1) || changedAt(r + 1, c - 1))
                     k[r * sbCols + c] = isStale ? 0 : 1
                     if isStale {
+                        analyzed[r * sbCols + c] = true
                         list[staleCount] = UInt32(r * sbCols + c)
                         staleCount += 1
                     } else {
@@ -1106,6 +1134,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let keptSuperblocks: Int
         /// With `reusesAnalysis`, the superblocks to analyze (the rest are kept).
         let staleSuperblocks: Int?
+        /// The superblocks the analysis's choices by size (the kernel a shape takes, the motion
+        /// projections' table) count: `staleSuperblocks`, or every SB on a cache's first inter
+        /// frame (`AnalysisCache.firstWithSkip`), which used to analyze them all.
+        let choiceSuperblocks: Int?
         /// The list of every SB's leaves and the leaf kernels' indirect dispatches (k_leaf_small's,
         /// then k_leaf's), and the leaves k_leaf_small leaves to k_leaf.
         let leafOffsets: any MTLBuffer, leafDispatch: any MTLBuffer, leafRest: any MTLBuffer
@@ -1373,6 +1405,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 sbList = keep(cache.stale)
             }
             staleSuperblocks = cache?.staleCount
+            choiceSuperblocks = cache?.firstWithSkip == true ? sbCols * sbRows : cache?.staleCount
             // a partition with GPU work (`execute`'s) is read from its readout; one without, from the
             // analysis's buffers, which the next analysis then mustn't overwrite before it's read
             let readsLive = !closedLoop && !encoder.profilesStages && staleSuperblocks == 0
@@ -1545,13 +1578,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 guard shTotal[s] > 0, params.smallKernel != 0, kernels.small[s] != nil else { return false }
                 let size = AV1MetalEncoder.blockSizes[s]
                 let n = staleSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
-                return n > 0 && !takesSIMDGroup(size, n)
+                let chosen = choiceSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(shTotal[s])
+                return n > 0 && !takesSIMDGroup(size, chosen)
             }
             let analyzed = staleSuperblocks ?? (sbCols * sbRows)
             if isInter, analyzed > 0 {  // long-range motion per SB, then per 16x16, alongside the analysis
                 // the previous picture's strips summed once, where enough SBs search that neighbours'
                 // ranges overlap (a search reads ~20 SBs' strips; the same sums either way)
-                let table = analyzed * AV1MetalEncoder.projectionTableShare >= sbCols * sbRows
+                let table = (choiceSuperblocks ?? analyzed) * AV1MetalEncoder.projectionTableShare >= sbCols * sbRows
                     ? try encoder.projectionTable(superblocks: sbCols * sbRows) : nil
                 if let table {
                     e.setComputePipelineState(encoder.projectionSums)
@@ -1685,7 +1719,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // skips the intra search, and a thread-per-block SIMD-group then waits on its
                 // slowest block (8x8 to 16x8 3-6x slower there; BENCHMARKS)
                 let size = AV1MetalEncoder.blockSizes[s]
-                let fewBlocks = takesSIMDGroup(size, Int(n))
+                let fewBlocks = takesSIMDGroup(size, choiceSuperblocks.map { $0 * (64 / size.w) * (64 / size.h) } ?? Int(n))
                 if params.smallKernel != 0, !fewBlocks, let pipeline = kernels.small[s] {
                     if mlListBuffer != nil { n = shTotal[s] }  // the list's count bounds it
                     e.setComputePipelineState(pipeline)
