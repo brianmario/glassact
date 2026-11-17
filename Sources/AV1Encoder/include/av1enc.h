@@ -86,7 +86,8 @@ typedef struct av1enc_hybrid av1enc_hybrid;
 av1enc_hybrid *av1enc_hybrid_create(void);
 void av1enc_hybrid_destroy(av1enc_hybrid *h);
 // luma_tx (optional): every block's luma tx type from the analysis (the closed loop searches its own). flags:
-// AV1ENC_HYBRID_GIVEN_CHROMA: the blocks' uv_mode / angle_delta_uv / cfl_alpha_* are decided already.
+// AV1ENC_HYBRID_GIVEN_CHROMA: the blocks' uv_mode / angle_delta_uv / cfl_alpha_* are decided already
+// (in 4:4:4 too).
 #define AV1ENC_HYBRID_GIVEN_CHROMA 1
 int av1enc_hybrid_closed_loop(av1enc_hybrid *h, const uint8_t *y, const uint8_t *u, const uint8_t *v, uint32_t w,
                               uint32_t hgt, const av1g_block *blocks, uint32_t n, const uint8_t *luma_tx, int flags,
@@ -185,8 +186,8 @@ void av1enc_hybrid_set_intrabc(av1enc_hybrid *h, int on);
 // The next pictures are 4:4:4 (on; the High profile, seq_profile 1) or 4:2:0 (off, the default).
 // In 4:4:4 every plane given, padded, reconstructed and referenced is w x h (MiCols*4 x MiRows*4
 // padded), the record has fp.chroma_format AV1G_CHROMA_444 (av1enc_hybrid_write_ex keeps it,
-// whatever fp it's given), and the closed loop makes its own chroma decisions (it ignores
-// AV1ENC_HYBRID_GIVEN_CHROMA: the analysis's are 4:2:0's). Inter frames too: their references
+// whatever fp it's given), and AV1ENC_HYBRID_GIVEN_CHROMA keeps the blocks' chroma decisions as in
+// 4:2:0 (the Metal analysis makes them on a 4:2:0 copy of the chroma). Inter frames too: their references
 // (av1g_ref_planes) are w x h in every plane, and their inter blocks' chroma predicts at the luma
 // motion vector. Tiles aren't kept across a change.
 void av1enc_hybrid_set_chroma_444(av1enc_hybrid *h, int on);

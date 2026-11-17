@@ -769,8 +769,8 @@ fn ivf1(obu: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// 4:4:4 key frames from the closed loop (Hybrid::set_chroma_444): screen pictures (text with
 /// colour fringes, gradients, UI, a photo region), tiny and odd sizes, one tile and several,
 /// random and variance partitions, with intra block copies or with deblocking and CDEF. The
-/// closed loop decides chroma itself (given chroma ignored), codes the same on one thread as on
-/// all, its record is 4:4:4 and the write keeps it so; the bitstream parses back to the record,
+/// closed loop decides chroma itself (or keeps the given decisions), codes the same on one thread
+/// as on all, its record is 4:4:4 and the write keeps it so; the bitstream parses back to the record,
 /// whose writer reconstruction is the closed loop's post-filtered, and (where installed) dav1d
 /// and aomdec decode exactly that. (Inter frames: [`chroma444_inter_frames`].)
 #[test]
@@ -846,9 +846,21 @@ fn chroma444_key_frames() {
             one.record() == &rec && one.output().recon == hy.output().recon,
             "{what}: threads"
         );
-        // the analysis's chroma, given: the closed loop decides its own anyway
+        // the analysis's chroma, given: kept, as in 4:2:0 (but where a chroma palette replaces it;
+        // a picture with intra block copies has blocks of its own)
         let given = run(Hybrid::new().threads, GIVEN_CHROMA);
-        assert!(given.record() == &rec, "{what}: given chroma");
+        let g = given.record();
+        if g.fp.allow_intrabc == 0 {
+            assert_eq!(g.blocks.len(), blocks.len(), "{what}: given chroma");
+            for (i, (b, gb)) in blocks.iter().zip(&g.blocks).enumerate() {
+                assert!(
+                    g.palette.get(i).is_some_and(|p| p.size_uv != 0)
+                        || (gb.uv_mode, gb.angle_delta_uv, gb.cfl_alpha_u, gb.cfl_alpha_v)
+                            == (b.uv_mode, b.angle_delta_uv, b.cfl_alpha_u, b.cfl_alpha_v),
+                    "{what}: block {i}'s given chroma"
+                );
+            }
+        }
         assert!(
             w < 200 || rec.blocks.iter().any(|b| b.uv_mode as i32 == UV_CFL_PRED),
             "{what}: no CfL"

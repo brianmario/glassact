@@ -45,10 +45,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// decoded planes (`Frame.planes`) are full size too. In a stream with `interFrames` every
         /// picture after the first of a chroma format is an inter frame as 4:2:0's are, and a change
         /// of format, as of size, is a key frame. The GPU's analysis decides the partition, luma
-        /// modes and motion from a 4:2:0 copy of the chroma (2×2 means; inter frames' against the
-        /// picture before's copy); the closed loop decides chroma and codes every plane from the
-        /// real ones, its inter blocks predicting from full-size references. The GPU's post-filters
-        /// and their search filter it as 4:2:0's, on its full-size planes.
+        /// and chroma modes and motion from a 4:2:0 copy of the chroma (2×2 means; inter frames'
+        /// against the picture before's copy); the closed loop codes every plane from the real
+        /// ones, its inter blocks predicting from full-size references (with `gpuDecides` off it
+        /// decides chroma itself, on the real planes). The GPU's post-filters and their search
+        /// filter it as 4:2:0's, on its full-size planes.
         public var chroma444: Bool
 
         public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {

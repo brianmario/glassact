@@ -77,7 +77,8 @@ pub(crate) fn fmacf(a: f32, b: f32, c: f32) -> f32 {
 }
 
 /// [`Hybrid::closed_loop`] flags (AV1ENC_HYBRID_GIVEN_CHROMA): the blocks' uv_mode /
-/// angle_delta_uv / cfl_alpha_* are decided already.
+/// angle_delta_uv / cfl_alpha_* are decided already (in 4:4:4 too: the Metal analysis decides them
+/// on a 4:2:0 copy of the chroma, and a block a 4:2:0 picture gives no chroma has its defaults).
 pub const GIVEN_CHROMA: i32 = 1;
 
 /// A frame of a stream for [`Hybrid::closed_loop_ex`] (av1enc_hybrid_closed_loop_ex).
@@ -603,8 +604,7 @@ impl Hybrid {
         recon_into: Option<[&mut [u8]; 3]>,
     ) -> Result<(), Error> {
         let t0 = Instant::now();
-        // (4:4:4: the analysis's chroma decisions are 4:2:0's; the closed loop decides its own)
-        let given_chroma = flags & GIVEN_CHROMA != 0 && !self.chroma444;
+        let given_chroma = flags & GIVEN_CHROMA != 0;
         let ss = (!self.chroma444) as i32;
         let inter_frame = video.is_some_and(|v| v.fp.frame_type == FRAME_INTER);
         if inter_frame || self.last_inter {
@@ -1455,8 +1455,8 @@ impl Hybrid {
     /// av1enc_hybrid_set_chroma_444: the next pictures are 4:4:4 (the High profile; off by
     /// default: 4:2:0). Their planes are all width x height, as are the reconstruction's
     /// ([`Hybrid::recon`]: MiCols * 4 x MiRows * 4) and the padded source's; the record says
-    /// fp.chroma_format 1, which the write keeps whatever its `fp` says. The closed loop decides
-    /// chroma itself (GIVEN_CHROMA is ignored). Inter frames' references ([`Video::reference`],
+    /// fp.chroma_format 1, which the write keeps whatever its `fp` says. With GIVEN_CHROMA the
+    /// blocks' chroma decisions are kept, as in 4:2:0. Inter frames' references ([`Video::reference`],
     /// [`Video::golden`]) are full size in every plane too. Tiles aren't kept across a change.
     pub fn set_chroma_444(&mut self, on: bool) {
         self.chroma444 = on;
