@@ -10,7 +10,9 @@ pub mod dsp_cases;
 pub mod fuzz_gen;
 pub mod inter_gen;
 pub mod ref_engine;
-#[cfg(all(test, feature = "oracle"))]
+#[cfg(test)]
+pub(crate) mod snapshot;
+#[cfg(test)]
 mod tests;
 
 pub use dsp_cases::{

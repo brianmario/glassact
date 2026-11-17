@@ -1,20 +1,23 @@
 //! The writer against the C++ (Sources/AV1Core/src/encoder.cpp): random legal records of av1gpu's
 //! fuzzer (av1t_case_make) with every flag, invalid records, the hook path, tile skips and symbol
 //! streams, the parser; and the enc module's entropy plan, OBU assembly and post-filter frame.
-#![cfg(feature = "oracle")]
 
 use super::*;
 use crate::blockinfo::*;
 use crate::dsp::{get_tx_set_intra, tx_coeffs, tx_h, tx_type_in_set_intra, tx_w};
 use crate::tables::*;
+use crate::testsupport::snapshot::{Cases, OUTPUT, Snapshot, put_output, same};
+#[cfg(feature = "oracle")]
 use core::ffi::{c_char, c_int};
 
 // ---------------------------------------------------------------------------------------------
 // the oracle
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(feature = "oracle")]
 type CCase = core::ffi::c_void;
 
+#[cfg(feature = "oracle")]
 unsafe extern "C" {
     fn av1t_case_make(seed: u64, maxdim: c_int, big_pct: c_int) -> *mut CCase;
     fn av1t_case_record(c: *mut CCase) -> *mut DecisionRecord;
@@ -56,8 +59,24 @@ unsafe extern "C" {
     fn free(p: *mut core::ffi::c_void);
 }
 
-/// av1t_case_make's record, copied.
+/// av1gpu's fuzzer's record (testsupport's FuzzCase); with the oracle, checked equal to the C++'s
+/// (av1t_case_make) whole.
 fn case(seed: u64, maxdim: i32, big_pct: i32) -> Option<Record> {
+    let r = crate::testsupport::snapshot::fuzz_record(seed, maxdim, big_pct);
+    #[cfg(feature = "oracle")]
+    {
+        let c = c_case(seed, maxdim, big_pct);
+        assert!(
+            r == c,
+            "seed {seed} ({maxdim}, {big_pct}): the Rust record isn't the C++'s"
+        );
+    }
+    r
+}
+
+/// av1t_case_make's record, copied.
+#[cfg(feature = "oracle")]
+fn c_case(seed: u64, maxdim: i32, big_pct: i32) -> Option<Record> {
     // SAFETY: the C test support's case and its record's arrays (counts from av1g_layout).
     unsafe {
         let c = av1t_case_make(seed, maxdim, big_pct);
@@ -96,6 +115,7 @@ struct Enc {
     syms: Vec<Vec<u32>>,
 }
 
+#[cfg(feature = "oracle")]
 fn c_output(o: &crate::types::Output) -> Output {
     // SAFETY: av1g_output's buffers, sized by its fields.
     let v = |p: *mut u8, n: usize| {
@@ -123,6 +143,7 @@ fn c_output(o: &crate::types::Output) -> Output {
 }
 
 /// The C++ encode_with_hook on `rec` (changed in place, as the C++ changes it).
+#[cfg(feature = "oracle")]
 fn c_encode(
     rec: &mut Record,
     flags: u32,
@@ -291,6 +312,7 @@ fn r_encode(
     }
 }
 
+#[cfg(feature = "oracle")]
 fn first_diff<T: PartialEq>(a: &[T], b: &[T]) -> Option<usize> {
     if a.len() != b.len() {
         return Some(a.len().min(b.len()));
@@ -298,6 +320,7 @@ fn first_diff<T: PartialEq>(a: &[T], b: &[T]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
+#[cfg(feature = "oracle")]
 fn check_same(what: &str, c: &Enc, r: &Enc, crec: &Record, rrec: &Record) {
     assert_eq!(c.rc, r.rc, "{what}: return code");
     let (co, ro) = (&c.out, &r.out);
@@ -348,30 +371,81 @@ fn check_same(what: &str, c: &Enc, r: &Enc, crec: &Record, rrec: &Record) {
     }
 }
 
-/// Encodes `rec` with both, compares everything, returns the C++ results.
-fn both(w: &mut Writer, what: &str, rec: &Record, flags: u32, level: i32, hook: i32, syms: bool) -> (Enc, Record) {
-    let (mut cr, mut rr) = (rec.clone(), rec.clone());
+/// The families of an encode: its return code, output, tile payloads and symbol streams, and the
+/// record's written-back tx blocks and coefficients.
+const ENC: [&str; 8] = [
+    "rc",
+    OUTPUT[0],
+    OUTPUT[1],
+    OUTPUT[2],
+    OUTPUT[3],
+    "payloads",
+    "syms",
+    "writeback",
+];
+
+/// Feeds an encode's results to the [`ENC`] families of `s`; `rrec` is the record after it.
+/// After an error in a picture of several tiles, the other tiles' threads have written back
+/// whatever they reached: the write-back isn't fed then.
+fn snap_enc(s: &mut Snapshot, r: &Enc, rrec: &Record) {
+    s.put("rc", &r.rc);
+    put_output(s, &r.out);
+    s.put("payloads", &r.payloads);
+    s.put("syms", &r.syms);
+    let tiles = tile_layout(
+        rrec.fp.width,
+        rrec.fp.height,
+        rrec.fp.tile_cols_log2 as i32,
+        rrec.fp.tile_rows_log2 as i32,
+    );
+    if r.rc != OK && tiles.is_ok_and(|t| t.cols * t.rows > 1) {
+        return;
+    }
+    s.put("writeback", &(&rrec.txb, &rrec.coeffs));
+}
+
+/// Encodes `rec`, fed to `s`; with the oracle, also with the C++, comparing everything. Returns
+/// the results (the C++'s are equal).
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn both(
+    w: &mut Writer,
+    what: &str,
+    rec: &Record,
+    flags: u32,
+    level: i32,
+    hook: i32,
+    syms: bool,
+    s: &mut Snapshot,
+) -> (Enc, Record) {
+    let mut rr = rec.clone();
+    #[cfg(feature = "oracle")]
+    let mut cr = rec.clone();
+    #[cfg(feature = "oracle")]
     let mut c = c_encode(&mut cr, flags, level, hook, syms, None);
     let r = r_encode(w, &mut rr, flags, level, hook, syms, None);
-    // Errors in several tiles: the C++ reports the error of whichever tile thread comes first
-    // (Rust: the first tile's, as sequential coding does). It must be one the C++ can report.
-    let tiles = tile_layout(
-        rec.fp.width,
-        rec.fp.height,
-        rec.fp.tile_cols_log2 as i32,
-        rec.fp.tile_rows_log2 as i32,
-    );
-    if c.rc != r.rc && c.rc != OK && r.rc != OK && tiles.is_ok_and(|t| t.cols * t.rows > 1) {
-        for _ in 0..200 {
-            cr = rec.clone();
-            c = c_encode(&mut cr, flags, level, hook, syms, None);
-            if c.rc == r.rc {
-                break;
+    #[cfg(feature = "oracle")]
+    {
+        // Errors in several tiles: the C++ reports the error of whichever tile thread comes first
+        // (Rust: the first tile's, as sequential coding does). It must be one the C++ can report.
+        let tiles = tile_layout(
+            rec.fp.width,
+            rec.fp.height,
+            rec.fp.tile_cols_log2 as i32,
+            rec.fp.tile_rows_log2 as i32,
+        );
+        if c.rc != r.rc && c.rc != OK && r.rc != OK && tiles.is_ok_and(|t| t.cols * t.rows > 1) {
+            for _ in 0..200 {
+                cr = rec.clone();
+                c = c_encode(&mut cr, flags, level, hook, syms, None);
+                if c.rc == r.rc {
+                    break;
+                }
             }
         }
+        check_same(what, &c, &r, &cr, &rr);
     }
-    check_same(what, &c, &r, &cr, &rr);
-    (c, cr)
+    snap_enc(s, &r, &rr);
+    (r, rr)
 }
 
 const FLAG_SETS: [u32; 9] = [
@@ -386,9 +460,16 @@ const FLAG_SETS: [u32; 9] = [
     ENC_BITSTREAM_ONLY | ENC_TD | ENC_NO_RECON,
 ];
 
-/// Runs `f` over seeds on several threads (each with its own writer).
-fn par_seeds(seeds: core::ops::Range<u64>, threads: usize, f: impl Fn(&mut Writer, u64) + Sync) {
+/// Runs `f` over seeds on several threads (each with its own writer), each seed with its own
+/// snapshot of the families `names`; returns them folded in seed order.
+fn par_seeds(
+    seeds: core::ops::Range<u64>,
+    threads: usize,
+    names: &'static [&'static str],
+    f: impl Fn(&mut Writer, u64, &mut Snapshot) + Sync,
+) -> Snapshot {
     let next = std::sync::atomic::AtomicU64::new(seeds.start);
+    let cases = Cases::new(names);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -398,11 +479,14 @@ fn par_seeds(seeds: core::ops::Range<u64>, threads: usize, f: impl Fn(&mut Write
                     if seed >= seeds.end {
                         break;
                     }
-                    f(&mut w, seed);
+                    let mut snap = cases.case();
+                    f(&mut w, seed, &mut snap);
+                    cases.add(seed, snap);
                 }
             });
         }
     });
+    cases.fold()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -418,11 +502,20 @@ fn encode_matches_c_random_records() {
     // edge filter, deblocking, CDEF, monochrome, odd sizes, screen content, filter-intra blocks,
     // CfL blocks, skip blocks
     let stats = std::sync::Mutex::new([0u64; 16]);
-    par_seeds(0..1500, 8, |w, seed| {
+    let snap = par_seeds(0..1500, 8, &ENC, |w, seed, s| {
         let Some(rec) = case(seed, 300, 4) else { return };
         let mut ntiles = 0;
         for &flags in &FLAG_SETS {
-            let (c, _) = both(w, &format!("seed {seed} flags {flags:#x}"), &rec, flags, -1, 0, false);
+            let (c, _) = both(
+                w,
+                &format!("seed {seed} flags {flags:#x}"),
+                &rec,
+                flags,
+                -1,
+                0,
+                false,
+                s,
+            );
             if flags == ENC_FIX_RANGE {
                 ntiles = c.out.tile_cols * c.out.tile_rows;
                 let fp = &rec.fp;
@@ -452,10 +545,10 @@ fn encode_matches_c_random_records() {
             }
         }
         // a forced level, and one tile thread
-        both(w, &format!("seed {seed} level 13"), &rec, ENC_TD, 13, 0, false);
+        both(w, &format!("seed {seed} level 13"), &rec, ENC_TD, 13, 0, false, s);
         if ntiles > 1 {
             let mut w1 = Writer::with_threads(1);
-            both(&mut w1, &format!("seed {seed} one thread"), &rec, 0, -1, 0, false);
+            both(&mut w1, &format!("seed {seed} one thread"), &rec, 0, -1, 0, false, s);
         }
     });
     let s = stats.lock().unwrap();
@@ -466,6 +559,16 @@ fn encode_matches_c_random_records() {
     );
     assert!(s[1] > 1400 && s[2] > 30 && s[3] > 0);
     assert!(s[4..16].iter().all(|&n| n > 50), "{:?}", &s[4..16]);
+    snap.check(&[
+        ("rc", 0x26f5c149c9c61259),
+        ("obu", 0xd621a21e61132751),
+        ("avif", 0x9f62199a6ce13aad),
+        ("recon", 0x98b265c712797c3a),
+        ("stats", 0xcdfc2bf4b8b4681b),
+        ("payloads", 0x1788ac39c13b0699),
+        ("syms", 0x7cd37ef1565a4fa3),
+        ("writeback", 0x23f40f717d32bc2a),
+    ]);
 }
 
 /// All 128 combinations of the flags.
@@ -480,7 +583,7 @@ fn encode_matches_c_every_flag_combination() {
         ENC_BITSTREAM_ONLY,
         ENC_CHECK_EDGES,
     ];
-    par_seeds(5000..5040, 8, |w, seed| {
+    let snap = par_seeds(5000..5040, 8, &ENC, |w, seed, s| {
         let Some(rec) = case(seed, 160, 3) else { return };
         for m in 0..1u32 << bits.len() {
             let flags = (0..bits.len()).filter(|&i| m >> i & 1 != 0).fold(0, |f, i| f | bits[i]);
@@ -492,31 +595,61 @@ fn encode_matches_c_every_flag_combination() {
                 -1,
                 (m % 3) as i32,
                 m % 5 == 0,
+                s,
             );
         }
     });
+    snap.check(&[
+        ("rc", 0x3835fec3e09c4f81),
+        ("obu", 0x295248481cc2622d),
+        ("avif", 0x9b170c3ad24e0e3d),
+        ("recon", 0x2a90e85846b31ab0),
+        ("stats", 0xe08819000a7e5e1c),
+        ("payloads", 0x91524c203d8e3eca),
+        ("syms", 0x865b5963452d05a7),
+        ("writeback", 0xefe70dafdca2dd27),
+    ]);
 }
 
 /// Big pictures: several tiles on parallel threads, with every output.
 #[test]
 fn encode_matches_c_multi_tile() {
-    par_seeds(1000..1024, 3, |w, seed| {
+    let snap = par_seeds(1000..1024, 3, &ENC, |w, seed, s| {
         let Some(rec) = case(seed, 300, 100) else { return };
         for flags in [
             0,
             ENC_FIX_RANGE | ENC_PREFILTER_RECON | ENC_AVIF | ENC_TD,
             ENC_BITSTREAM_ONLY,
         ] {
-            both(w, &format!("seed {seed} flags {flags:#x}"), &rec, flags, -1, 0, false);
+            both(
+                w,
+                &format!("seed {seed} flags {flags:#x}"),
+                &rec,
+                flags,
+                -1,
+                0,
+                false,
+                s,
+            );
         }
     });
+    snap.check(&[
+        ("rc", 0xfe7ff6036ce2425d),
+        ("obu", 0x98e44c0aa8c44c1b),
+        ("avif", 0x719d3d153a48ff15),
+        ("recon", 0xed10af2460812209),
+        ("stats", 0x065d8fd58f7a4885),
+        ("payloads", 0x972543fe36123364),
+        ("syms", 0x4e41240738bc6d25),
+        ("writeback", 0x6d30ec324966027b),
+    ]);
 }
 
 /// The closed-loop hook: rewrites every tx block's coefficients and luma tx type from its exact
 /// prediction (with large levels the range repair runs too).
 #[test]
 fn hook_matches_c() {
-    par_seeds(0..200, 6, |w, seed| {
+    let snap = par_seeds(0..200, 6, &ENC, |w, seed, s| {
         let Some(rec) = case(seed, 200, 5) else { return };
         for (mode, flags) in [
             (1, ENC_FIX_RANGE | ENC_PREFILTER_RECON),
@@ -533,17 +666,28 @@ fn hook_matches_c() {
                 -1,
                 mode,
                 false,
+                s,
             );
         }
     });
+    snap.check(&[
+        ("rc", 0x2a64390269de777a),
+        ("obu", 0xf63d247d18a75167),
+        ("avif", 0x4b94ce34a6427985),
+        ("recon", 0x2e14b873b89061e3),
+        ("stats", 0x813c1a108e7e49c2),
+        ("payloads", 0xf6e537eb71f436c2),
+        ("syms", 0x4b94ce34a6427985),
+        ("writeback", 0xb12a1fc857624a25),
+    ]);
 }
 
 /// Per-tile symbol streams (TeeSink), payloads and tile skips with given or missing payloads.
 #[test]
 fn tile_skips_and_symbols_match_c() {
-    par_seeds(2000..2030, 3, |w, seed| {
+    let snap = par_seeds(2000..2030, 3, &ENC, |w, seed, s| {
         let Some(rec) = case(seed, 300, 70) else { return };
-        let (c, _) = both(w, &format!("seed {seed} symbols"), &rec, ENC_FIX_RANGE, -1, 0, true);
+        let (c, _) = both(w, &format!("seed {seed} symbols"), &rec, ENC_FIX_RANGE, -1, 0, true, s);
         if c.rc != OK {
             return;
         }
@@ -567,20 +711,41 @@ fn tile_skips_and_symbols_match_c() {
                 (ENC_TD | ENC_BITSTREAM_ONLY, 0),
                 (0, 0),
             ] {
-                let (mut cr, mut rr) = (rec.clone(), rec.clone());
-                let what = format!("seed {seed} skip round {round} flags {flags:#x}");
-                let cres = c_encode(&mut cr, flags, -1, hook, round == 1, Some((&skip, &given)));
+                let mut rr = rec.clone();
                 let rres = r_encode(w, &mut rr, flags, -1, hook, round == 1, Some((&skip, &given)));
-                check_same(&what, &cres, &rres, &cr, &rr);
+                #[cfg(feature = "oracle")]
+                {
+                    let mut cr = rec.clone();
+                    let what = format!("seed {seed} skip round {round} flags {flags:#x}");
+                    let cres = c_encode(&mut cr, flags, -1, hook, round == 1, Some((&skip, &given)));
+                    check_same(&what, &cres, &rres, &cr, &rr);
+                }
+                snap_enc(s, &rres, &rr);
             }
         }
         // a wrong-sized skip list
-        let (mut cr, mut rr) = (rec.clone(), rec.clone());
-        let (s, g) = (vec![false; n + 1], vec![Vec::new(); n + 1]);
-        let cres = c_encode(&mut cr, 0, -1, 0, false, Some((&s, &g)));
-        let rres = r_encode(w, &mut rr, 0, -1, 0, false, Some((&s, &g)));
-        assert_eq!((cres.rc, rres.rc), (ERR_INVALID, ERR_INVALID));
+        let mut rr = rec.clone();
+        let (sk, g) = (vec![false; n + 1], vec![Vec::new(); n + 1]);
+        let rres = r_encode(w, &mut rr, 0, -1, 0, false, Some((&sk, &g)));
+        #[cfg(feature = "oracle")]
+        {
+            let mut cr = rec.clone();
+            let cres = c_encode(&mut cr, 0, -1, 0, false, Some((&sk, &g)));
+            assert_eq!(cres.rc, ERR_INVALID);
+        }
+        assert_eq!(rres.rc, ERR_INVALID);
+        s.put("rc", &rres.rc);
     });
+    snap.check(&[
+        ("rc", 0x9b03b5fef55d33c0),
+        ("obu", 0x5751aef4a9bc422a),
+        ("avif", 0xbee578544a59c645),
+        ("recon", 0x7272fe5e9be1d955),
+        ("stats", 0x1e31adab76efa9f1),
+        ("payloads", 0x98c5821747249984),
+        ("syms", 0x1e1e4fafcbb01a1f),
+        ("writeback", 0x162125e68034f81f),
+    ]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -705,7 +870,10 @@ fn corrupt(rec: &mut Record, r: &mut Rnd) -> &'static str {
 #[test]
 fn invalid_records_match_c() {
     let codes = std::sync::Mutex::new([0u64; 5]);
-    par_seeds(0..1500, 6, |w, seed| {
+    const FAMS: [&str; 9] = [
+        ENC[0], ENC[1], ENC[2], ENC[3], ENC[4], ENC[5], ENC[6], ENC[7], "validate",
+    ];
+    let snap = par_seeds(0..1500, 6, &FAMS, |w, seed, s| {
         let Some(mut rec) = case(seed, 150, 0) else { return };
         let mut r = Rnd(seed * 7919 + 1);
         let n = 1 + r.below(3);
@@ -725,17 +893,13 @@ fn invalid_records_match_c() {
                 -1,
                 0,
                 false,
+                s,
             );
             if flags == 0 {
                 codes.lock().unwrap()[(-c.rc) as usize] += 1;
             }
         }
         // validate
-        let mut cr = rec.clone();
-        let mut crec = cr.as_c();
-        // SAFETY: crec points into cr.
-        let mut crc = unsafe { av1g_validate(&crec, core::ptr::null_mut(), 0) };
-        let _ = &mut crec;
         let mut rr = rec.clone();
         let rrc = validate(rr.as_mut()).map_or_else(|e| e.code, |_| OK);
         let tiles = tile_layout(
@@ -745,22 +909,46 @@ fn invalid_records_match_c() {
             rec.fp.tile_rows_log2 as i32,
         );
         let multi = tiles.is_ok_and(|t| t.cols * t.rows > 1);
-        for _ in 0..200 {
-            if crc == rrc || crc == OK || rrc == OK || !multi {
-                break;
+        #[cfg(feature = "oracle")]
+        {
+            let mut cr = rec.clone();
+            let mut crec = cr.as_c();
+            // SAFETY: crec points into cr.
+            let mut crc = unsafe { av1g_validate(&crec, core::ptr::null_mut(), 0) };
+            let _ = &mut crec;
+            for _ in 0..200 {
+                if crc == rrc || crc == OK || rrc == OK || !multi {
+                    break;
+                }
+                let mut c2 = rec.clone();
+                // SAFETY: as above.
+                crc = unsafe { av1g_validate(&c2.as_c(), core::ptr::null_mut(), 0) };
             }
-            let mut c2 = rec.clone();
-            // SAFETY: as above.
-            crc = unsafe { av1g_validate(&c2.as_c(), core::ptr::null_mut(), 0) };
+            assert_eq!(crc, rrc, "seed {seed} ({what}): validate");
+            if crc == OK || !multi {
+                assert_eq!(cr.txb, rr.txb, "seed {seed}: validate's write-back");
+            }
         }
-        assert_eq!(crc, rrc, "seed {seed} ({what}): validate");
-        if crc == OK || !multi {
-            assert_eq!(cr.txb, rr.txb, "seed {seed}: validate's write-back");
+        let _ = &what;
+        s.put("validate", &rrc);
+        if rrc == OK || !multi {
+            s.put("validate", &rr.txb);
         }
     });
     let c = codes.lock().unwrap();
     eprintln!("ok {} invalid {} range {}", c[0], c[1], c[3]);
     assert!(c[1] > 500 && c[3] > 10);
+    snap.check(&[
+        ("rc", 0x363be43469030b8c),
+        ("obu", 0xe8a123b1b43772f6),
+        ("avif", 0xeea4e77ab04547d5),
+        ("recon", 0x7bdf36d8bfb614b4),
+        ("stats", 0x0c488762ad70f89e),
+        ("payloads", 0x3afc2a96af84ec2a),
+        ("syms", 0xeea4e77ab04547d5),
+        ("writeback", 0xe805d9a2be3b39fc),
+        ("validate", 0x69721601f31d0d6a),
+    ]);
 }
 
 /// The C view of a record whose arrays are missing.
@@ -783,6 +971,7 @@ fn missing_arrays_are_invalid() {
 
 #[test]
 fn tile_layout_matches_c() {
+    let mut s = Snapshot::new(&["tile_layout"]);
     let mut r = Rnd(77);
     for i in 0..20000 {
         let (w, h) = match i % 4 {
@@ -792,26 +981,43 @@ fn tile_layout_matches_c() {
             _ => (4000 + r.below(5000), 2000 + r.below(3000)),
         };
         let (cl, rl) = (r.below(9) as i32 - 1, r.below(9) as i32 - 1);
-        // SAFETY: plain data.
-        let mut c: Tiles = unsafe { core::mem::zeroed() };
-        let crc = unsafe { av1g_tile_layout(w, h, cl, rl, &mut c) };
-        match tile_layout(w, h, cl, rl) {
-            Ok(t) => {
-                assert_eq!(crc, OK, "{w}x{h} {cl}/{rl}");
-                assert_eq!(
-                    (t.cols_log2, t.rows_log2, t.cols, t.rows),
-                    (c.cols_log2, c.rows_log2, c.cols, c.rows)
-                );
-                assert_eq!(t.mi_col_starts[..=t.cols as usize], c.mi_col_starts[..=t.cols as usize]);
-                assert_eq!(t.mi_row_starts[..=t.rows as usize], c.mi_row_starts[..=t.rows as usize]);
+        let rt = tile_layout(w, h, cl, rl);
+        #[cfg(feature = "oracle")]
+        {
+            // SAFETY: plain data.
+            let mut c: Tiles = unsafe { core::mem::zeroed() };
+            let crc = unsafe { av1g_tile_layout(w, h, cl, rl, &mut c) };
+            match &rt {
+                Ok(t) => {
+                    assert_eq!(crc, OK, "{w}x{h} {cl}/{rl}");
+                    assert_eq!(
+                        (t.cols_log2, t.rows_log2, t.cols, t.rows),
+                        (c.cols_log2, c.rows_log2, c.cols, c.rows)
+                    );
+                    assert_eq!(t.mi_col_starts[..=t.cols as usize], c.mi_col_starts[..=t.cols as usize]);
+                    assert_eq!(t.mi_row_starts[..=t.rows as usize], c.mi_row_starts[..=t.rows as usize]);
+                }
+                Err(e) => assert_eq!(crc, *e, "{w}x{h} {cl}/{rl}"),
             }
-            Err(e) => assert_eq!(crc, e, "{w}x{h} {cl}/{rl}"),
+        }
+        match rt {
+            Ok(t) => s.put(
+                "tile_layout",
+                &(
+                    (t.cols_log2, t.rows_log2, t.cols, t.rows),
+                    &t.mi_col_starts[..=t.cols as usize],
+                    &t.mi_row_starts[..=t.rows as usize],
+                ),
+            ),
+            Err(e) => s.put("tile_layout", &e),
         }
     }
+    s.check(&[("tile_layout", 0xf0c31ee9a0c51d11)]);
 }
 
 #[test]
 fn layout_matches_c() {
+    let mut s = Snapshot::new(&["counts", "layout"]);
     let mut r = Rnd(5);
     for seed in 0..300 {
         let Some(mut rec) = case(seed, 200, 2) else { continue };
@@ -826,38 +1032,57 @@ fn layout_matches_c() {
         }
         let fp = rec.fp;
         let rust = layout_counts(&fp, &rec.blocks);
+        s.put("counts", &rust);
+        #[cfg(feature = "oracle")]
         let mut cr = rec.clone();
+        #[cfg(feature = "oracle")]
         for t in &mut cr.txb {
             t.eob = 9;
             t.tx_type = 5;
         }
+        #[cfg(feature = "oracle")]
         let mut c = cr.as_c();
-        // capacity: counts only
-        let mut c0 = c;
-        c0.txb = core::ptr::null_mut();
-        // SAFETY: c / c0 point into cr (txb and coeffs as long as the layout's counts, as the case
-        // built them).
-        let crc0 = unsafe { av1g_layout(&mut c0, 0, 0) };
+        #[cfg(feature = "oracle")]
+        let crc0 = {
+            // capacity: counts only
+            let mut c0 = c;
+            c0.txb = core::ptr::null_mut();
+            // SAFETY: c / c0 point into cr (txb and coeffs as long as the layout's counts, as the
+            // case built them).
+            let crc0 = unsafe { av1g_layout(&mut c0, 0, 0) };
+            (crc0, c0.n_txb, c0.n_coeffs)
+        };
         match rust {
-            Err(e) => {
-                assert_eq!(crc0, e, "seed {seed}");
+            Err(_e) => {
+                #[cfg(feature = "oracle")]
+                assert_eq!(crc0.0, _e, "seed {seed}");
                 continue;
             }
             Ok(n) => {
-                assert_eq!(crc0, ERR_CAPACITY);
-                assert_eq!((c0.n_txb, c0.n_coeffs), (n.n_txb, n.n_coeffs), "seed {seed}");
-                if (n.n_txb as usize) != cr.txb.len() {
+                #[cfg(feature = "oracle")]
+                {
+                    assert_eq!(crc0.0, ERR_CAPACITY);
+                    assert_eq!((crc0.1, crc0.2), (n.n_txb, n.n_coeffs), "seed {seed}");
+                }
+                if (n.n_txb as usize) != rec.txb.len() {
                     continue; // tx_depth clamps changed the counts: arrays too small for the C++
                 }
             }
         }
-        let crc = unsafe { av1g_layout(&mut c, c.n_txb, c.n_coeffs) };
-        assert_eq!(crc, OK);
+        #[cfg(feature = "oracle")]
+        {
+            let crc = unsafe { av1g_layout(&mut c, c.n_txb, c.n_coeffs) };
+            assert_eq!(crc, OK);
+        }
         let mut rr = rec.clone();
         let n = rr.layout().unwrap();
         assert_eq!((n.n_txb as usize, n.n_coeffs as usize), (rr.txb.len(), rr.coeffs.len()));
-        assert_eq!(cr.block_txb, rr.block_txb, "seed {seed}");
-        assert_eq!(cr.txb, rr.txb, "seed {seed}");
+        #[cfg(feature = "oracle")]
+        {
+            assert_eq!(cr.block_txb, rr.block_txb, "seed {seed}");
+            assert_eq!(cr.txb, rr.txb, "seed {seed}");
+        }
+        s.put("layout", &(&rr.block_txb, &rr.txb));
         // too small
         let mut small = vec![Txb::default(); n.n_txb as usize - 1];
         assert_eq!(
@@ -865,36 +1090,49 @@ fn layout_matches_c() {
             Err(ERR_CAPACITY)
         );
     }
+    s.check(&[("counts", 0x9f6784ee3f37c9d0), ("layout", 0x9b267efbf8f0e3bc)]);
 }
 
 #[test]
 fn delta_q_helpers_match_c() {
+    let mut s = Snapshot::new(&["legalize", "apply"]);
     let mut r = Rnd(11);
     for _ in 0..2000 {
         let (base, res) = (1 + r.below(255) as i32, r.below(8) as i32);
         let target: Vec<u8> = (0..64).map(|_| r.below(256) as u8).collect();
-        let (mut a, mut b) = (vec![0u8; 64], vec![0u8; 64]);
-        // SAFETY: 64-entry arrays.
-        unsafe { av1g_legalize_sb_qindex(base, res, target.as_ptr(), 64, a.as_mut_ptr()) };
+        let mut b = vec![0u8; 64];
         legalize_sb_qindex(base, res, &target, &mut b);
-        assert_eq!(a, b, "base {base} res {res}");
+        #[cfg(feature = "oracle")]
+        {
+            let mut a = vec![0u8; 64];
+            // SAFETY: 64-entry arrays.
+            unsafe { av1g_legalize_sb_qindex(base, res, target.as_ptr(), 64, a.as_mut_ptr()) };
+            assert_eq!(a, b, "base {base} res {res}");
+        }
+        s.put("legalize", &b);
     }
     for seed in 0..50 {
         let Some(rec) = case(seed, 300, 0) else { continue };
         let sbc = ((mi_cols(rec.fp.width as i32) + 15) >> 4) as usize;
         let sbr = ((mi_rows(rec.fp.height as i32) + 15) >> 4) as usize;
         let map: Vec<u8> = (0..sbc * sbr).map(|_| r.below(256) as u8).collect();
-        let (mut cr, mut rr) = (rec.clone(), rec.clone());
-        let mut c = cr.as_c();
-        // SAFETY: c points into cr; the map covers the SB grid.
-        unsafe { av1g_apply_sb_qindex(&mut c, map.as_ptr()) };
+        let mut rr = rec.clone();
         apply_sb_qindex(&rr.fp, &mut rr.blocks, &map).unwrap();
-        assert_eq!(cr.blocks, rr.blocks);
+        #[cfg(feature = "oracle")]
+        {
+            let mut cr = rec.clone();
+            let mut c = cr.as_c();
+            // SAFETY: c points into cr; the map covers the SB grid.
+            unsafe { av1g_apply_sb_qindex(&mut c, map.as_ptr()) };
+            assert_eq!(cr.blocks, rr.blocks);
+        }
+        s.put("apply", &rr.blocks);
         assert_eq!(
             apply_sb_qindex(&rr.fp, &mut rr.blocks, &map[..map.len() - 1]),
             Err(ERR_INVALID)
         );
     }
+    s.check(&[("legalize", 0x3bb5f540056eff17), ("apply", 0x57b9082de72070a5)]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -902,6 +1140,7 @@ fn delta_q_helpers_match_c() {
 // ---------------------------------------------------------------------------------------------
 
 /// av1g_parse, copied (rc, record, level, tile sizes and offsets).
+#[cfg(feature = "oracle")]
 fn c_parse(obus: &[u8]) -> (i32, Parsed) {
     // SAFETY: av1g_parse's result and the arrays it owns, freed after copying.
     unsafe {
@@ -942,9 +1181,25 @@ fn c_parse(obus: &[u8]) -> (i32, Parsed) {
     }
 }
 
-fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
+/// Parses `obus`, fed to the family "parse" of `s` (the error code, or the record, the level and
+/// the tile sizes and offsets); with the oracle, compared with the C++ parser.
+fn check_parse(what: &str, obus: &[u8], s: &mut Snapshot) -> Option<Parsed> {
+    let rp = parse(obus);
+    match &rp {
+        Ok(r) => s.put("parse", &(&r.rec, r.seq_level_idx, &r.tile_bytes, &r.tile_offsets)),
+        Err(e) => s.put("parse", &e.code),
+    }
+    #[cfg(feature = "oracle")]
+    c_check_parse(what, obus, &rp);
+    let _ = what;
+    rp.ok()
+}
+
+/// The C++ parser on `obus` against the Rust's result `rp`.
+#[cfg(feature = "oracle")]
+fn c_check_parse(what: &str, obus: &[u8], rp: &Result<Parsed, Error>) {
     let (crc, c) = c_parse(obus);
-    match parse(obus) {
+    match rp {
         Ok(r)
             if (r.rec.fp.frame_type == FRAME_INTER
                 || r.rec.fp.sb128 != 0
@@ -954,7 +1209,6 @@ fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
         {
             // an inter frame, 128x128 superblocks, 4:4:4 or palette blocks (a damaged frame_type,
             // use_128x128_superblock, seq_profile or has_palette_y/uv): the C++ has none of them
-            Some(r)
         }
         Ok(r) => {
             assert_eq!(crc, OK, "{what}: rust parsed what the C++ rejects");
@@ -979,11 +1233,9 @@ fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
                 (c.seq_level_idx, &c.tile_bytes, &c.tile_offsets),
                 (r.seq_level_idx, &r.tile_bytes, &r.tile_offsets)
             );
-            Some(r)
         }
         Err(e) => {
             assert_eq!(crc, e.code, "{what}: parse error code ({})", e.msg);
-            None
         }
     }
 }
@@ -992,7 +1244,7 @@ fn check_parse(what: &str, obus: &[u8]) -> Option<Parsed> {
 /// written (decisions, coefficients and the written-back eob / tx types).
 #[test]
 fn parse_matches_c() {
-    par_seeds(0..300, 6, |w, seed| {
+    let snap = par_seeds(0..300, 6, &["parse"], |w, seed, s| {
         let Some(rec) = case(seed, 260, 4) else { return };
         let mut rr = rec.clone();
         let flags = if seed % 2 == 0 {
@@ -1008,7 +1260,7 @@ fn parse_matches_c() {
         if w.encode(rr.as_mut(), &opts, &mut out).is_err() {
             return;
         }
-        let p = check_parse(&format!("seed {seed}"), &out.obu).expect("parse");
+        let p = check_parse(&format!("seed {seed}"), &out.obu, s).expect("parse");
         let mut want = rr.clone();
         want.fp.tile_cols_log2 = p.rec.fp.tile_cols_log2;
         want.fp.tile_rows_log2 = p.rec.fp.tile_rows_log2;
@@ -1059,6 +1311,7 @@ fn parse_matches_c() {
             }
         }
     });
+    snap.check(&[("parse", 0xf41d48d6a8e982fd)]);
 }
 
 /// The picture of `fp` with its tile payloads as a libaom-style stream: full (not reduced)
@@ -1365,7 +1618,7 @@ fn parse_full_headers_matches_c() {
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
     ];
-    par_seeds(0..400, 6, |w, seed| {
+    let snap = par_seeds(0..400, 6, &["parse"], |w, seed, s| {
         let Some(mut rec) = case(seed, 200, 3) else { return };
         let opts = EncodeOpts {
             flags: ENC_BITSTREAM_ONLY,
@@ -1380,12 +1633,12 @@ fn parse_full_headers_matches_c() {
         (fp.tile_cols_log2, fp.tile_rows_log2) = (t.cols_log2 as i8, t.rows_log2 as i8);
         let mut r = Rnd(seed * 31 + 7);
         for k in 0..8 {
-            let s = full_header_stream(&fp, &payloads, &mut r, k >= 4);
-            let ok = check_parse(&format!("seed {seed} stream {k}"), &s).is_some();
+            let st = full_header_stream(&fp, &payloads, &mut r, k >= 4);
+            let ok = check_parse(&format!("seed {seed} stream {k}"), &st, s).is_some();
             n[ok as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if ok && k < 4 {
                 // same decisions as the reduced stream's
-                let p = parse(&s).unwrap();
+                let p = parse(&st).unwrap();
                 assert_eq!(p.rec.blocks.len(), rec.blocks.len(), "seed {seed}");
                 assert_eq!(p.rec.txb.len(), rec.txb.len(), "seed {seed}");
             }
@@ -1394,13 +1647,14 @@ fn parse_full_headers_matches_c() {
     let n = n.map(|a| a.into_inner());
     eprintln!("full-header streams: {} parsed, {} rejected", n[1], n[0]);
     assert!(n[1] > 1000 && n[0] > 50);
+    snap.check(&[("parse", 0xf213cf8d90c12027)]);
 }
 
 /// Damaged tile payloads: the same errors or the same records.
 #[test]
 fn parse_damaged_matches_c() {
     let n_ok = std::sync::atomic::AtomicU64::new(0);
-    par_seeds(0..400, 6, |w, seed| {
+    let snap = par_seeds(0..400, 6, &["parse"], |w, seed, s| {
         let Some(mut rec) = case(seed, 120, 0) else { return };
         let mut out = Output::default();
         let opts = EncodeOpts {
@@ -1419,16 +1673,17 @@ fn parse_damaged_matches_c() {
                 let i = n - 1 - r.below(tail as u32) as usize;
                 o[i] ^= 1 << r.below(8);
             }
-            if check_parse(&format!("seed {seed} damage {k}"), &o).is_some() {
+            if check_parse(&format!("seed {seed} damage {k}"), &o, s).is_some() {
                 n_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         // truncated streams and junk
         for cut in [1, 2, 5, out.obu.len() / 2, out.obu.len() - 1] {
-            check_parse(&format!("seed {seed} cut {cut}"), &out.obu[..out.obu.len().min(cut)]);
+            check_parse(&format!("seed {seed} cut {cut}"), &out.obu[..out.obu.len().min(cut)], s);
         }
     });
     eprintln!("damaged streams that parsed: {}", n_ok.into_inner());
+    snap.check(&[("parse", 0x7b14b58ea414cc44)]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1437,6 +1692,7 @@ fn parse_damaged_matches_c() {
 
 #[test]
 fn ent_plan_matches_c() {
+    let mut s = Snapshot::new(&["ent_plan"]);
     let mut r = Rnd(3);
     for seed in 0..300 {
         let Some(rec) = case(seed, 64, 0) else { continue };
@@ -1449,24 +1705,30 @@ fn ent_plan_matches_c() {
             fp.tile_rows_log2 = r.below(8) as i8 - 1;
         }
         let (nb, nt) = (r.below(3) * 1000, r.below(3) * 7);
-        let mut cf = GaEntFrame {
+        let cf = GaEntFrame {
             w: 77,
             ..Default::default()
         };
-        let mut ct = vec![GaEntTile::default(); GA_ENT_MAX_TILES];
+        let ct = vec![GaEntTile::default(); GA_ENT_MAX_TILES];
         let (mut rf, mut rt) = (cf, ct.clone());
-        // SAFETY: GA_ENT_MAX_TILES entries.
-        let cn = unsafe { av1enc_ent_plan(&fp, nb, nt, &mut cf, ct.as_mut_ptr()) };
         let rn = crate::enc::ent_plan(&fp, nb, nt, &mut rf, &mut rt);
-        assert_eq!(cn, rn, "seed {seed}");
-        assert_eq!(cf, rf, "seed {seed}");
-        assert_eq!(ct, rt, "seed {seed}");
+        #[cfg(feature = "oracle")]
+        {
+            let (mut cf, mut ct) = (cf, ct);
+            // SAFETY: GA_ENT_MAX_TILES entries.
+            let cn = unsafe { av1enc_ent_plan(&fp, nb, nt, &mut cf, ct.as_mut_ptr()) };
+            assert_eq!(cn, rn, "seed {seed}");
+            assert_eq!(cf, rf, "seed {seed}");
+            assert_eq!(ct, rt, "seed {seed}");
+        }
+        s.put("ent_plan", &(rn, rf, &rt));
     }
+    s.check(&[("ent_plan", 0x6058bec9ff509918)]);
 }
 
 #[test]
 fn assemble_obus_matches_c_and_the_writer() {
-    par_seeds(0..120, 4, |w, seed| {
+    let snap = par_seeds(0..120, 4, &["assemble"], |w, seed, s| {
         let Some(mut rec) = case(seed, 300, 30) else { return };
         let mut out = Output::default();
         let opts = EncodeOpts {
@@ -1488,41 +1750,50 @@ fn assemble_obus_matches_c_and_the_writer() {
         }
         for (k, v) in variants.iter().enumerate() {
             let td = opts.flags & ENC_TD != 0;
-            let ptrs: Vec<*const u8> = v.iter().map(|p| p.as_ptr()).collect();
-            let sizes: Vec<usize> = v.iter().map(|p| p.len()).collect();
-            let (mut cp, mut cn) = (core::ptr::null_mut(), 0usize);
-            // SAFETY: n payload pointers and sizes; the result is malloc'd.
-            let crc = unsafe {
-                av1enc_assemble_obus(
-                    &rec.fp,
-                    ptrs.as_ptr(),
-                    sizes.as_ptr(),
-                    v.len() as u32,
-                    td as c_int,
-                    &mut cp,
-                    &mut cn,
-                )
-            };
-            let c = if crc == 0 {
-                let c = unsafe { core::slice::from_raw_parts(cp, cn) }.to_vec();
-                unsafe { free(cp as *mut _) };
-                Ok(c)
-            } else {
-                Err(crc)
-            };
-            let r = crate::enc::assemble_obus(&rec.fp, v, td);
-            assert_eq!(c, r, "seed {seed} variant {k}");
+            let r = same!(
+                s,
+                "assemble",
+                crate::enc::assemble_obus(&rec.fp, v, td),
+                {
+                    let ptrs: Vec<*const u8> = v.iter().map(|p| p.as_ptr()).collect();
+                    let sizes: Vec<usize> = v.iter().map(|p| p.len()).collect();
+                    let (mut cp, mut cn) = (core::ptr::null_mut(), 0usize);
+                    // SAFETY: n payload pointers and sizes; the result is malloc'd.
+                    let crc = unsafe {
+                        av1enc_assemble_obus(
+                            &rec.fp,
+                            ptrs.as_ptr(),
+                            sizes.as_ptr(),
+                            v.len() as u32,
+                            td as c_int,
+                            &mut cp,
+                            &mut cn,
+                        )
+                    };
+                    if crc == 0 {
+                        let c = unsafe { core::slice::from_raw_parts(cp, cn) }.to_vec();
+                        unsafe { free(cp as *mut _) };
+                        Ok(c)
+                    } else {
+                        Err(crc)
+                    }
+                },
+                "seed {seed} variant {k}"
+            );
             if k == 0 && ok {
                 assert_eq!(r.unwrap(), out.obu, "seed {seed}: assembled = written");
             }
         }
     });
+    snap.check(&[("assemble", 0x689b74a42f6c3830)]);
 }
 
 #[test]
 fn pf_frame_matches_c() {
+    let mut s = Snapshot::new(&["pf_frame"]);
     let mut r = Rnd(9);
     // SAFETY: a size query.
+    #[cfg(feature = "oracle")]
     assert_eq!(
         unsafe { av1enc_pf_frame(core::ptr::null(), core::ptr::null(), core::ptr::null_mut(), 0) },
         280
@@ -1548,13 +1819,19 @@ fn pf_frame_matches_c() {
             cdef_idx: r.next() as u64,
             cdef_dir_var: r.next() as u64 | 1 << 40,
         };
-        let mut c = vec![0xAAu8; 280];
-        // SAFETY: 280 bytes.
-        let n = unsafe { av1enc_pf_frame(&fp, &a, c.as_mut_ptr(), c.len()) };
-        assert_eq!(n, 280);
         let f = crate::enc::pf_frame(&fp, &a);
-        assert_eq!(f.as_bytes(), &c[..], "seed {seed}");
+        assert_eq!(f.as_bytes().len(), 280);
+        #[cfg(feature = "oracle")]
+        {
+            let mut c = vec![0xAAu8; 280];
+            // SAFETY: 280 bytes.
+            let n = unsafe { av1enc_pf_frame(&fp, &a, c.as_mut_ptr(), c.len()) };
+            assert_eq!(n, 280);
+            assert_eq!(f.as_bytes(), &c[..], "seed {seed}");
+        }
+        s.put("pf_frame", f.as_bytes());
     }
+    s.check(&[("pf_frame", 0x224c499b102e6573)]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1789,6 +2066,7 @@ pub(crate) fn big_record(seed: u64, w: u32, h: u32, cols_log2: i8, rows_log2: i8
     rec
 }
 
+#[cfg(feature = "oracle")]
 fn time<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
     let mut best = f64::MAX;
     let mut last = None;
@@ -1803,6 +2081,7 @@ fn time<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
 
 /// The writer vs the C++ on a 5K picture (cargo test --release --no-default-features --features
 /// oracle bench_writer -- --ignored --nocapture).
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore]
 fn bench_writer_5k() {
@@ -1896,6 +2175,7 @@ fn profile_writer() {
 }
 
 /// One record, both encoders' messages (SEED=n FLAGS=f ... debug_seed -- --ignored --nocapture).
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore]
 fn debug_seed() {

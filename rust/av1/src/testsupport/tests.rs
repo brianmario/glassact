@@ -2,14 +2,19 @@
 //! equal the C++'s for fixed seeds.
 // src/dsp/tests.rs and src/entropy/tests.rs declare av1t_dsp_set_make with their own set types
 #![allow(clashing_extern_declarations)]
+use super::snapshot::{Fnv, Snapshot, same};
 use super::*;
 use crate::tables::*;
-use crate::types::{DecisionRecord, OK};
+#[cfg(feature = "oracle")]
+use crate::types::DecisionRecord;
+use crate::types::OK;
+#[cfg(feature = "oracle")]
 use core::ffi::{c_char, c_void};
 use core::mem::{offset_of, size_of};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "oracle")]
 unsafe extern "C" {
     // oracle/testsupport.cpp: sizeof / offsetof of the case structs and av1t_dsp_set, by name
     fn oracle_testsupport_layout(what: *const c_char) -> i64;
@@ -25,11 +30,17 @@ unsafe extern "C" {
     fn av1g_validate(rec: *const DecisionRecord, err: *mut c_char, errlen: usize) -> i32;
 }
 
+/// The layout of `what` from tests/layouts.cpp; with the oracle, checked equal to the shim's.
 fn c_layout(what: &str) -> i64 {
-    let s = std::ffi::CString::new(what).unwrap();
-    // SAFETY: a NUL-terminated name; the shim only compares it.
-    let v = unsafe { oracle_testsupport_layout(s.as_ptr()) };
-    assert!(v >= 0, "oracle_testsupport_layout doesn't know {what}");
+    let v = crate::types::tests::c_layout(what);
+    #[cfg(feature = "oracle")]
+    {
+        let s = std::ffi::CString::new(what).unwrap();
+        // SAFETY: a NUL-terminated name; the shim only compares it.
+        let o = unsafe { oracle_testsupport_layout(s.as_ptr()) };
+        assert!(o >= 0, "oracle_testsupport_layout doesn't know {what}");
+        assert_eq!(v, o, "{what}: tests/layouts.cpp and oracle_testsupport_layout");
+    }
     v
 }
 
@@ -62,6 +73,7 @@ fn layouts_match_c() {
 
 // ---- dsp_cases ----
 
+#[cfg(feature = "oracle")]
 /// `n` elements at `p` as bytes.
 ///
 /// SAFETY: `p` points to `n` initialized `T`s that outlive the slice.
@@ -69,6 +81,7 @@ unsafe fn bytes_of<'a, T>(p: *const T, n: usize) -> &'a [u8] {
     // SAFETY: as the caller promises; any initialized memory reads as bytes.
     unsafe { core::slice::from_raw_parts(p as *const u8, n * size_of::<T>()) }
 }
+#[cfg(feature = "oracle")]
 fn as_bytes<T>(v: &[T]) -> &[u8] {
     // SAFETY: a live slice; the element types here are padding-free repr(C) structs and integers.
     unsafe { bytes_of(v.as_ptr(), v.len()) }
@@ -76,6 +89,7 @@ fn as_bytes<T>(v: &[T]) -> &[u8] {
 
 #[test]
 fn dsp_sets_match_c() {
+    let snaps = Mutex::new(Vec::new());
     let seeds = [
         0u64,
         1,
@@ -89,12 +103,32 @@ fn dsp_sets_match_c() {
         42,
         1000,
         77777,
+        0xfeed,
     ];
     std::thread::scope(|sc| {
-        for &seed in &seeds {
+        for (k, &seed) in seeds.iter().enumerate() {
+            let snaps = &snaps;
             sc.spawn(move || {
                 let r = DspSet::make(seed);
                 let v = r.c_view();
+                let mut s = Snapshot::new(&["counts", "itx", "pred", "ec"]);
+                s.put(
+                    "counts",
+                    &(
+                        (v.itx_count, v.itx_flagged_count, v.itx_case_size, v.itx_coeffs_per_case),
+                        (v.itx_residual_per_case, v.pred_count, v.pred_cfl_count, v.pred_side),
+                        (v.pred_case_size, v.pred_luma_size, v.ec_count, v.ec_qindex),
+                        (v.ec_symbol_count, v.ec_capacity, v.ec_cdfs_size, v.ec_symbol_size),
+                    ),
+                );
+                s.put("itx", &(&r.itx, &r.itx_coeffs, &r.itx_residual, &r.itx_flags));
+                s.put("pred", &(&r.pred, &r.pred_planes, &r.pred_luma, &r.pred_out));
+                s.put(
+                    "ec",
+                    &(&r.ec_symbols, &r.ec_offsets, &r.ec_counts, &r.ec_sizes, &r.ec_bytes),
+                );
+                snaps.lock().unwrap().push((k, s));
+                #[cfg(feature = "oracle")]
                 // SAFETY: the C set lives until av1t_dsp_set_free; the array lengths are its own counts.
                 unsafe {
                     let c = &*av1t_dsp_set_make(seed);
@@ -180,6 +214,16 @@ fn dsp_sets_match_c() {
             });
         }
     });
+    let mut v = snaps.into_inner().unwrap();
+    v.sort_by_key(|c| c.0);
+    let mut s = Snapshot::new(&["counts", "itx", "pred", "ec"]);
+    v.iter().for_each(|c| s.absorb(&c.1));
+    s.check(&[
+        ("counts", 0x8c7d540fa24319b8),
+        ("itx", 0x50eb661b23df36de),
+        ("pred", 0x79ece522ae47915f),
+        ("ec", 0x17240dc07e2bc11d),
+    ]);
 }
 
 /// xorshift64 for the tests' own inputs.
@@ -198,17 +242,25 @@ impl XRng {
 
 #[test]
 fn tx_type_allowed_matches_c() {
+    let mut s = Snapshot::new(&["allowed"]);
     for tx_sz in 0..TX_SIZES_ALL {
         for tx_type in 0..TX_TYPES {
             // SAFETY: plain ints.
-            let c = unsafe { av1t_tx_type_allowed(tx_sz, tx_type) };
-            assert_eq!(tx_type_allowed(tx_sz, tx_type), c != 0, "{tx_sz} {tx_type}");
+            same!(
+                s,
+                "allowed",
+                tx_type_allowed(tx_sz, tx_type),
+                unsafe { av1t_tx_type_allowed(tx_sz, tx_type) } != 0,
+                "{tx_sz} {tx_type}"
+            );
         }
     }
+    s.check(&[("allowed", 0x55ffa6fa39ffa72e)]);
 }
 
 #[test]
 fn inverse_transform_matches_c() {
+    let mut s = Snapshot::new(&["flags", "residual"]);
     let mut r = XRng(0x17a_5eed);
     let mut flagged = 0;
     for tx_sz in 0..TX_SIZES_ALL {
@@ -236,17 +288,24 @@ fn inverse_transform_matches_c() {
                         }
                     }
                 }
-                let (mut a, mut b) = (vec![0i32; 4096], vec![0i32; 4096]);
+                let mut a = vec![0i32; 4096];
                 let fr = inverse_transform(tx_sz, tx_type, &dq, &mut a);
-                // SAFETY: dq holds the th x tw coefficients, b the h x w residual.
-                let fc = unsafe { av1t_inverse_transform(tx_sz, tx_type, dq.as_ptr(), b.as_mut_ptr()) };
-                assert_eq!(fr, fc, "flags {tx_sz} {tx_type} {k}");
-                assert!(a == b, "residual {tx_sz} {tx_type} {k}");
+                #[cfg(feature = "oracle")]
+                {
+                    let mut b = vec![0i32; 4096];
+                    // SAFETY: dq holds the th x tw coefficients, b the h x w residual.
+                    let fc = unsafe { av1t_inverse_transform(tx_sz, tx_type, dq.as_ptr(), b.as_mut_ptr()) };
+                    assert_eq!(fr, fc, "flags {tx_sz} {tx_type} {k}");
+                    assert!(a == b, "residual {tx_sz} {tx_type} {k}");
+                }
+                s.put("flags", &fr);
+                s.put("residual", &a);
                 flagged += (fr != 0) as u32;
             }
         }
     }
     assert!(flagged > 0);
+    s.check(&[("flags", 0xca1a78ab56ae9816), ("residual", 0x1d87a8d133f66351)]);
 }
 
 #[test]
@@ -272,6 +331,7 @@ fn ec_stream_overflows_as_c() {
 
 // ---- fuzz_gen ----
 
+#[cfg(feature = "oracle")]
 /// SAFETY: `p` points to `n` initialized `T`s that outlive the slice.
 unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
     // SAFETY: as the caller promises.
@@ -280,7 +340,8 @@ unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
 
 /// Compares the Rust record of (seed, maxdim, big_pct) with the C++'s; Err describes the first
 /// difference.
-fn compare_case(seed: u64, maxdim: i32, big_pct: i32) -> Result<(), String> {
+#[cfg(feature = "oracle")]
+pub(crate) fn compare_case(seed: u64, maxdim: i32, big_pct: i32) -> Result<(), String> {
     let r = FuzzCase::make(seed, maxdim, big_pct);
     // SAFETY: the C case and its record live until av1t_case_free; the lengths are the record's own
     // (coeffs has n_coeffs + 1 entries, block_txb n_blocks + 1).
@@ -327,11 +388,13 @@ fn compare_case(seed: u64, maxdim: i32, big_pct: i32) -> Result<(), String> {
     }
 }
 
-/// Runs compare_case on `count` seeds from `first` (wrapping) across threads; panics with every
-/// failing seed.
-fn compare_cases(first: u64, count: u64, maxdim: i32, big_pct: i32) {
+/// The Rust records of `count` seeds from `first` (wrapping), made across threads, hashed in seed
+/// order into the family `fam` of `snap`; with the oracle, compare_case on each (panics with every
+/// failing seed).
+fn compare_cases(snap: &mut Snapshot, fam: &str, first: u64, count: u64, maxdim: i32, big_pct: i32) {
     let next = AtomicU64::new(0);
     let fails = Mutex::new(Vec::new());
+    let hashes = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     std::thread::scope(|sc| {
         for _ in 0..threads {
@@ -342,6 +405,10 @@ fn compare_cases(first: u64, count: u64, maxdim: i32, big_pct: i32) {
                         break;
                     }
                     let seed = first.wrapping_add(i);
+                    let mut h = Fnv::default();
+                    h.put(&FuzzCase::make(seed, maxdim, big_pct));
+                    hashes.lock().unwrap().push((i, h.0));
+                    #[cfg(feature = "oracle")]
                     if let Err(e) = compare_case(seed, maxdim, big_pct) {
                         fails
                             .lock()
@@ -352,7 +419,7 @@ fn compare_cases(first: u64, count: u64, maxdim: i32, big_pct: i32) {
             });
         }
     });
-    let mut fails = fails.into_inner().unwrap();
+    let mut fails: Vec<String> = fails.into_inner().unwrap();
     fails.sort();
     assert!(
         fails.is_empty(),
@@ -361,33 +428,60 @@ fn compare_cases(first: u64, count: u64, maxdim: i32, big_pct: i32) {
         count,
         fails.join("\n")
     );
+    let mut hashes = hashes.into_inner().unwrap();
+    hashes.sort();
+    assert_eq!(hashes.len() as u64, count);
+    for (_, h) in hashes {
+        snap.put(fam, &h);
+    }
 }
 
 /// The parameters the Swift tests use (DecoderGateTests, EntropyTests, PostfilterTests).
 #[test]
 fn fuzz_cases_match_c_swift_params() {
-    compare_cases(0, 2000, 300, 2);
+    let mut s = Snapshot::new(&["0+2000 300/2"]);
+    compare_cases(&mut s, "0+2000 300/2", 0, 2000, 300, 2);
+    s.check(&[("0+2000 300/2", 0x2c8387278dbecd5d)]);
 }
 
 #[test]
 fn fuzz_cases_match_c_small() {
-    compare_cases(0, 2000, 1, 0);
-    compare_cases(0, 2000, 64, 0);
+    let mut s = Snapshot::new(&["0+2000 1/0", "0+2000 64/0"]);
+    compare_cases(&mut s, "0+2000 1/0", 0, 2000, 1, 0);
+    compare_cases(&mut s, "0+2000 64/0", 0, 2000, 64, 0);
+    s.check(&[("0+2000 1/0", 0x9b3dee59c8dcd794), ("0+2000 64/0", 0x0249e7e234b62469)]);
 }
 
 #[test]
 fn fuzz_cases_match_c_wide() {
-    compare_cases(2000, 1000, 300, 2);
-    compare_cases(0, 500, 1000, 10);
-    compare_cases(1 << 40, 500, 2000, 0);
-    compare_cases(u64::MAX - 200, 400, 300, 2);
+    let mut s = Snapshot::new(&[
+        "2000+1000 300/2",
+        "0+500 1000/10",
+        "2^40+500 2000/0",
+        "max-200+400 300/2",
+    ]);
+    compare_cases(&mut s, "2000+1000 300/2", 2000, 1000, 300, 2);
+    compare_cases(&mut s, "0+500 1000/10", 0, 500, 1000, 10);
+    compare_cases(&mut s, "2^40+500 2000/0", 1 << 40, 500, 2000, 0);
+    compare_cases(&mut s, "max-200+400 300/2", u64::MAX - 200, 400, 300, 2);
+    s.check(&[
+        ("2000+1000 300/2", 0x6f96db648409ddaf),
+        ("0+500 1000/10", 0x4a635d7bfd6b5f07),
+        ("2^40+500 2000/0", 0x44bfb1ba45f44d1e),
+        ("max-200+400 300/2", 0xed5495a07540e8a4),
+    ]);
 }
 
 #[test]
 fn fuzz_cases_match_c_big() {
     // mostly forced-tile pictures (several tiles, up to 9000 wide or 4096 x 2600)
-    compare_cases(0, 60, 300, 100);
-    compare_cases(5000, 60, 300, 50);
+    let mut s = Snapshot::new(&["0+60 300/100", "5000+60 300/50"]);
+    compare_cases(&mut s, "0+60 300/100", 0, 60, 300, 100);
+    compare_cases(&mut s, "5000+60 300/50", 5000, 60, 300, 50);
+    s.check(&[
+        ("0+60 300/100", 0xe5a08adae86a659b),
+        ("5000+60 300/50", 0x05ea7afa9c534350),
+    ]);
 }
 
 /// The Rust record is laid out, valid and points into its vectors.
@@ -400,12 +494,20 @@ fn fuzz_records_validate() {
         assert_eq!(rec.n_blocks as usize, c.blocks.len());
         assert_eq!(rec.blocks, c.blocks.as_mut_ptr());
         assert_eq!(c.block_txb[c.blocks.len()] as usize, c.txb.len());
-        let mut err = [0 as c_char; 256];
-        // SAFETY: rec points into c, which outlives the call; err is 256 bytes.
-        let rc = unsafe { av1g_validate(&rec, err.as_mut_ptr(), err.len()) };
-        // SAFETY: av1g_validate NUL-terminates err.
-        let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) };
-        assert_eq!(rc, OK, "seed {seed}: {msg:?}");
+        #[cfg(feature = "oracle")]
+        {
+            let mut err = [0 as c_char; 256];
+            // SAFETY: rec points into c, which outlives the call; err is 256 bytes.
+            let rc = unsafe { av1g_validate(&rec, err.as_mut_ptr(), err.len()) };
+            // SAFETY: av1g_validate NUL-terminates err.
+            let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) };
+            assert_eq!(rc, OK, "seed {seed}: {msg:?}");
+        }
+        let mut rec = rec;
+        // SAFETY: rec points into c, which outlives the view.
+        let r = unsafe { crate::writer::RecordMut::from_c(&mut rec) }.and_then(crate::writer::validate);
+        assert_eq!(r.map_err(|e| e.code), Ok(()), "seed {seed}");
+        let _ = OK;
         big += (c.fp.width > 4096) as u32;
     }
     assert!(big > 0);

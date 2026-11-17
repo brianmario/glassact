@@ -408,19 +408,65 @@ const _: () = {
     assert!(size_of::<BlockInter>() == 8);
 };
 
-#[cfg(all(test, feature = "oracle"))]
-mod tests {
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use core::mem::{offset_of, size_of};
 
+    /// sizeof / offsetof of the C structures, by name ("Block", "Block.skip", ...): tests/layouts.cpp
+    /// compiled with the system's compiler (`CXX`, else `c++`) against the C headers, once per test
+    /// process.
+    pub(crate) fn c_layout(what: &str) -> i64 {
+        use std::collections::HashMap;
+        use std::path::Path;
+        use std::process::Command;
+        static MAP: std::sync::OnceLock<HashMap<String, i64>> = std::sync::OnceLock::new();
+        let m = MAP.get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let dir = std::env::temp_dir().join(format!("glassact-av1-layouts-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("layouts");
+            let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+            let mut cmd = Command::new(&cxx);
+            cmd.args(["-std=c++17", "-w"]);
+            for inc in ["AV1Core", "AV1Encoder", "AV1CoreTestSupport"] {
+                cmd.arg("-I").arg(root.join("../../Sources").join(inc).join("include"));
+            }
+            let st = cmd.arg(root.join("tests/layouts.cpp")).arg("-o").arg(&exe).status();
+            assert!(
+                st.is_ok_and(|s| s.success()),
+                "compiling tests/layouts.cpp with {cxx} failed"
+            );
+            let out = Command::new(&exe).output().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    let (k, v) = l.split_once(' ').unwrap();
+                    (k.to_string(), v.parse().unwrap())
+                })
+                .collect()
+        });
+        *m.get(what)
+            .unwrap_or_else(|| panic!("tests/layouts.cpp doesn't know {what}"))
+    }
+
+    #[cfg(feature = "oracle")]
     unsafe extern "C" {
         // oracle/layout.cpp: sizeof / offsetof of the C structures, by name ("Block", "Block.skip", ...)
         fn oracle_layout(what: *const core::ffi::c_char) -> i64;
     }
     fn c(what: &str) -> i64 {
-        let s = std::ffi::CString::new(what).unwrap();
-        let v = unsafe { oracle_layout(s.as_ptr()) };
-        assert!(v >= 0, "oracle_layout doesn't know {what}");
+        let v = c_layout(what);
+        #[cfg(feature = "oracle")]
+        {
+            let s = std::ffi::CString::new(what).unwrap();
+            let o = unsafe { oracle_layout(s.as_ptr()) };
+            assert!(o >= 0, "oracle_layout doesn't know {what}");
+            assert_eq!(v, o, "{what}: tests/layouts.cpp and oracle_layout");
+        }
         v
     }
 

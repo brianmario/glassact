@@ -540,7 +540,6 @@ fn partition(pic: &Pic, tiles: &Tiles, r: &mut Rng, style: Style, chroma: bool) 
     p.blocks
 }
 
-#[cfg_attr(not(feature = "oracle"), allow(dead_code))]
 /// One luma tx type per block: valid for its size mostly, now and then not (the closed loop
 /// falls back to DCT_DCT).
 fn luma_types(blocks: &[Block], r: &mut Rng, wild: bool) -> Vec<u8> {
@@ -1401,11 +1400,13 @@ fn sb128_frames_from_motion() {
 // against the C++
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(feature = "oracle")]
 mod oracle {
     use super::*;
+    use crate::testsupport::snapshot::Snapshot;
+    #[cfg(feature = "oracle")]
     use core::ffi::{c_char, c_int, c_void};
 
+    #[cfg(feature = "oracle")]
     unsafe extern "C" {
         fn av1enc_hybrid_create() -> *mut c_void;
         fn av1enc_hybrid_destroy(h: *mut c_void);
@@ -1447,8 +1448,22 @@ mod oracle {
     }
 
     /// The C++ hybrid (av1enc_hybrid_*).
+    #[cfg(feature = "oracle")]
     pub(super) struct CHybrid(*mut c_void);
 
+    /// Without the oracle, nothing.
+    #[cfg(not(feature = "oracle"))]
+    pub(super) struct CHybrid;
+
+    #[cfg(not(feature = "oracle"))]
+    impl CHybrid {
+        pub fn new() -> CHybrid {
+            CHybrid
+        }
+        pub fn set_reuse(&mut self, _: bool) {}
+    }
+
+    #[cfg(feature = "oracle")]
     impl Drop for CHybrid {
         fn drop(&mut self) {
             // SAFETY: created by av1enc_hybrid_create, destroyed once.
@@ -1457,6 +1472,7 @@ mod oracle {
     }
 
     /// SAFETY: `p` points to `n` initialized `T`s (or n is 0).
+    #[cfg(feature = "oracle")]
     unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
         if n == 0 {
             return &[];
@@ -1473,6 +1489,7 @@ mod oracle {
         }
     }
 
+    #[cfg(feature = "oracle")]
     impl CHybrid {
         pub fn new() -> CHybrid {
             // SAFETY: plain constructor.
@@ -1590,9 +1607,13 @@ mod oracle {
         }
     }
 
+    /// The families [`closed_loop_both`] and [`write_both`] feed.
+    pub(super) const FAMS: [&str; 7] = ["rc", "record", "recon", "source", "reused", "changed_sb", "write"];
+
     /// One picture through both: the return codes, and on success the record, the reconstruction,
-    /// the padded source, the kept tiles and changed superblocks. Err describes the first
-    /// difference.
+    /// the padded source, the kept tiles and changed superblocks (the Rust's, fed to `s`). Err
+    /// describes the first difference.
+    #[allow(unused_variables)]
     pub(super) fn closed_loop_both(
         rs: &mut Hybrid,
         cs: &mut CHybrid,
@@ -1603,50 +1624,71 @@ mod oracle {
         q: i32,
         tc: i32,
         tr: i32,
+        s: &mut Snapshot,
     ) -> Result<bool, String> {
+        #[cfg(feature = "oracle")]
         let crc = cs.closed_loop(p, blocks, luma_tx, flags, q, tc, tr);
         let rrc = rs.closed_loop(
             &p.y, &p.u, &p.v, p.w as u32, p.h as u32, blocks, luma_tx, flags, q, tc, tr,
         );
+        s.put("rc", &rrc.as_ref().map_or_else(|e| e.code, |_| OK));
+        #[cfg(feature = "oracle")]
         match (&rrc, crc) {
             (Ok(()), OK) => {}
             (Err(e), c) if e.code == c => return Ok(false),
             _ => return Err(format!("return codes: rust {rrc:?}, c++ {crc}")),
         }
-        let (r, c) = (rs.record(), cs.record());
-        if r.fp != c.fp {
-            return Err(format!("fp\n rust {:?}\n c++  {:?}", r.fp, c.fp));
+        if rrc.is_err() {
+            return Ok(false);
         }
-        if r.blocks.len() != c.blocks.len() || r.txb.len() != c.txb.len() || r.coeffs.len() != c.coeffs.len() {
-            return Err("record counts".into());
+        #[cfg(feature = "oracle")]
+        {
+            let (r, c) = (rs.record(), cs.record());
+            if r.fp != c.fp {
+                return Err(format!("fp\n rust {:?}\n c++  {:?}", r.fp, c.fp));
+            }
+            if r.blocks.len() != c.blocks.len() || r.txb.len() != c.txb.len() || r.coeffs.len() != c.coeffs.len() {
+                return Err("record counts".into());
+            }
+            if let Some(i) = (0..r.blocks.len()).find(|&i| r.blocks[i] != c.blocks[i]) {
+                return Err(format!("block {i}: rust {:?}, c++ {:?}", r.blocks[i], c.blocks[i]));
+            }
+            if r.block_txb != c.block_txb {
+                return Err("block_txb".into());
+            }
+            if let Some(i) = (0..r.txb.len()).find(|&i| r.txb[i] != c.txb[i]) {
+                return Err(format!("txb {i}: rust {:?}, c++ {:?}", r.txb[i], c.txb[i]));
+            }
+            if let Some(i) = (0..r.coeffs.len()).find(|&i| r.coeffs[i] != c.coeffs[i]) {
+                let t = r.txb.iter().rposition(|t| t.coeff_off as usize <= i).unwrap();
+                return Err(format!(
+                    "coeff {i} (txb {t} {:?}): rust {}, c++ {}",
+                    r.txb[t], r.coeffs[i], c.coeffs[i]
+                ));
+            }
         }
-        if let Some(i) = (0..r.blocks.len()).find(|&i| r.blocks[i] != c.blocks[i]) {
-            return Err(format!("block {i}: rust {:?}, c++ {:?}", r.blocks[i], c.blocks[i]));
-        }
-        if r.block_txb != c.block_txb {
-            return Err("block_txb".into());
-        }
-        if let Some(i) = (0..r.txb.len()).find(|&i| r.txb[i] != c.txb[i]) {
-            return Err(format!("txb {i}: rust {:?}, c++ {:?}", r.txb[i], c.txb[i]));
-        }
-        if let Some(i) = (0..r.coeffs.len()).find(|&i| r.coeffs[i] != c.coeffs[i]) {
-            let t = r.txb.iter().rposition(|t| t.coeff_off as usize <= i).unwrap();
-            return Err(format!(
-                "coeff {i} (txb {t} {:?}): rust {}, c++ {}",
-                r.txb[t], r.coeffs[i], c.coeffs[i]
-            ));
-        }
+        // (fp, blocks, block_txb, txb, coeffs: what the C++'s record has)
+        let r = rs.record();
+        s.put("record", &(&r.fp, &r.blocks, &r.block_txb, &r.txb, &r.coeffs));
         for pl in 0..3 {
             let rr = rs.recon(pl).unwrap();
+            #[cfg(feature = "oracle")]
             if rr.is_empty() || rr != cs.recon(pl, rr.len()) {
                 return Err(format!("recon plane {pl}"));
             }
-            let (s, stride) = rs.source(pl).unwrap();
-            let (cs_, cstride) = cs.source(pl, s.len() / stride);
-            if stride != cstride || s != cs_ {
-                return Err(format!("source plane {pl}"));
+            assert!(!rr.is_empty());
+            s.put("recon", rr);
+            let (sp, stride) = rs.source(pl).unwrap();
+            #[cfg(feature = "oracle")]
+            {
+                let (cs_, cstride) = cs.source(pl, sp.len() / stride);
+                if stride != cstride || sp != cs_ {
+                    return Err(format!("source plane {pl}"));
+                }
             }
+            s.put("source", &(sp, stride));
         }
+        #[cfg(feature = "oracle")]
         if rs.reused_tiles() != cs.reused_tiles() {
             return Err(format!(
                 "reused tiles: rust {}, c++ {}",
@@ -1654,13 +1696,17 @@ mod oracle {
                 cs.reused_tiles()
             ));
         }
+        s.put("reused", &rs.reused_tiles());
         let (mc, mr) = (mi_cols(p.w as i32), mi_rows(p.h as i32));
         let (sc, sr) = (((mc + 15) >> 4) as usize, ((mr + 15) >> 4) as usize);
         let mut ch = vec![0u8; sc * sr];
         let known = rs.changed_superblocks(&mut ch, sc, sr);
-        if cs.changed_superblocks(sc, sr) != known.then_some(ch) {
+        #[cfg(feature = "oracle")]
+        if cs.changed_superblocks(sc, sr) != known.then_some(ch.clone()) {
             return Err("changed superblocks".into());
         }
+        s.put("changed_sb", &known.then_some(ch));
+        #[cfg(feature = "oracle")]
         if !(rs.seconds(0) >= 0.0 && rs.seconds(1) > 0.0 && cs.seconds(1) > 0.0) {
             return Err("seconds".into());
         }
@@ -1699,16 +1745,21 @@ mod oracle {
         (f, sb)
     }
 
+    #[allow(unused_variables)]
     pub(super) fn write_both(
         rs: &mut Hybrid,
         cs: &mut CHybrid,
         fp: &FrameParams,
         sb: Option<&[i8]>,
         sb_cols: usize,
+        s: &mut Snapshot,
     ) -> Result<(), String> {
+        #[cfg(feature = "oracle")]
         let c = cs.write(fp, sb, sb_cols);
         let r = rs.write(fp, sb, sb_cols).map(|o| o.to_vec());
-        match (&r, &c) {
+        s.put("write", &r.as_ref().map_err(|e| e.code));
+        #[cfg(feature = "oracle")]
+        return match (&r, &c) {
             (Ok(a), Ok(b)) if a == b => Ok(()),
             (Err(e), Err(code)) if e.code == *code => Ok(()),
             (Ok(a), Ok(b)) => Err(format!("OBUs differ ({} vs {} bytes)", a.len(), b.len())),
@@ -1717,7 +1768,9 @@ mod oracle {
                 r.as_ref().map(|v| v.len()),
                 c.as_ref().map(|v| v.len())
             )),
-        }
+        };
+        #[cfg(not(feature = "oracle"))]
+        Ok(())
     }
 
     /// A random size: small and odd ones, moderate ones, now and then a wide one.
@@ -1760,6 +1813,7 @@ mod oracle {
 
     #[test]
     fn closed_loop_and_write_match_cpp() {
+        let mut s = Snapshot::new(&FAMS);
         let mut r = Rng(0x00C0_FFEE_1234);
         let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
         let mut coded = 0;
@@ -1781,8 +1835,8 @@ mod oracle {
                 (rs, cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
             }
             let flags = if given_chroma { GIVEN_CHROMA } else { 0 };
-            let ok =
-                closed_loop_both(&mut rs, &mut cs, &p, &blocks, lt.as_deref(), flags, q, tc, tr).unwrap_or_else(|e| {
+            let ok = closed_loop_both(&mut rs, &mut cs, &p, &blocks, lt.as_deref(), flags, q, tc, tr, &mut s)
+                .unwrap_or_else(|e| {
                     panic!(
                         "case {case} ({w}x{h}, tiles {tc}/{tr}, q {q}, flags {flags}, luma_tx {}): {e}",
                         lt.is_some()
@@ -1795,14 +1849,36 @@ mod oracle {
             let sbs = sb_cols * ((mi_rows(h as i32) + 15) >> 4) as usize;
             for _ in 0..2 {
                 let (f, sb) = random_pf(&fp, sbs, &mut r);
-                write_both(&mut rs, &mut cs, &f, sb.as_deref(), sb_cols).unwrap_or_else(|e| panic!("case {case}: {e}"));
+                write_both(&mut rs, &mut cs, &f, sb.as_deref(), sb_cols, &mut s)
+                    .unwrap_or_else(|e| panic!("case {case}: {e}"));
             }
         }
         assert_eq!(coded, 240);
+        s.check_arch(
+            &[
+                ("rc", 0xc42a06f7e7a28e25),
+                ("record", 0x3abbcac7f7d06929),
+                ("recon", 0xb7b42c4a4d1fe235),
+                ("source", 0x1d1fe00d21cae48f),
+                ("reused", 0xc42a06f7e7a28e25),
+                ("changed_sb", 0x4675f9918e1cd831),
+                ("write", 0x9e245c33a6e64364),
+            ],
+            &[
+                ("rc", 0xc42a06f7e7a28e25),
+                ("record", 0x55b3adbe3eca70e3),
+                ("recon", 0x4326a91b190a7347),
+                ("source", 0x1d1fe00d21cae48f),
+                ("reused", 0xc42a06f7e7a28e25),
+                ("changed_sb", 0x4675f9918e1cd831),
+                ("write", 0xa92309d2b076a012),
+            ],
+        );
     }
 
     #[test]
     fn sequences_with_reuse_match_cpp() {
+        let mut s = Snapshot::new(&FAMS);
         let mut r = Rng(0x0BAD_C0DE_5678);
         let mut kept = 0;
         for seq in 0..40 {
@@ -1866,7 +1942,7 @@ mod oracle {
                     }
                 }
                 let flags = if given_chroma { GIVEN_CHROMA } else { 0 };
-                let ok = closed_loop_both(&mut rs, &mut cs, &p, &blocks, lt.as_deref(), flags, q, tc, tr)
+                let ok = closed_loop_both(&mut rs, &mut cs, &p, &blocks, lt.as_deref(), flags, q, tc, tr, &mut s)
                     .unwrap_or_else(|e| panic!("sequence {seq} picture {pic} ({w}x{h}, tiles {tc}/{tr}, q {q}): {e}"));
                 assert!(ok);
                 kept += rs.reused_tiles();
@@ -1884,11 +1960,31 @@ mod oracle {
                     (f.cdef_y_pri, f.cdef_y_sec, f.cdef_uv_pri, f.cdef_uv_sec) =
                         (cd.cdef_y_pri, cd.cdef_y_sec, cd.cdef_uv_pri, cd.cdef_uv_sec);
                 }
-                write_both(&mut rs, &mut cs, &f, sb.as_deref(), sb_cols)
+                write_both(&mut rs, &mut cs, &f, sb.as_deref(), sb_cols, &mut s)
                     .unwrap_or_else(|e| panic!("sequence {seq} picture {pic}: {e}"));
             }
         }
         assert!(kept > 100, "only {kept} tiles kept");
+        s.check_arch(
+            &[
+                ("rc", 0xc42a06f7e7a28e25),
+                ("record", 0xafc67a87b09a30bb),
+                ("recon", 0x5df8d9fbd8a3a179),
+                ("source", 0x95b85cb302ff99b1),
+                ("reused", 0x21163b1d503a0e43),
+                ("changed_sb", 0x3ccca7c1a94d857e),
+                ("write", 0x56b9bedabd1a5f43),
+            ],
+            &[
+                ("rc", 0xc42a06f7e7a28e25),
+                ("record", 0x923302eee34a75ec),
+                ("recon", 0x193cbb17b7aee04c),
+                ("source", 0x95b85cb302ff99b1),
+                ("reused", 0x21163b1d503a0e43),
+                ("changed_sb", 0x3ccca7c1a94d857e),
+                ("write", 0x3c0156cb356115a1),
+            ],
+        );
     }
 
     #[test]
@@ -1898,39 +1994,40 @@ mod oracle {
         let tiles = tile_layout(200, 120, -1, -1).unwrap();
         let blocks = partition(&p, &tiles, &mut r, Style::Random, false);
         let (mut rs, mut cs) = (Hybrid::new().with_cpp_quant(), CHybrid::new());
+        let mut s = Snapshot::new(&FAMS);
         // illegal tiling
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, 6, 0),
+            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, 6, 0, &mut s),
             Ok(false)
         );
         // blocks out of tile order (two swapped), with and without chroma decisions
         let mut bad = blocks.clone();
         bad.swap(0, 1);
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &bad, None, 0, 80, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &bad, None, 0, 80, -1, -1, &mut s),
             Ok(false)
         );
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &bad, None, GIVEN_CHROMA, 80, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &bad, None, GIVEN_CHROMA, 80, -1, -1, &mut s),
             Ok(false)
         );
         // a block missing
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &blocks[1..], None, 0, 80, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &blocks[1..], None, 0, 80, -1, -1, &mut s),
             Ok(false)
         );
         // qindex 0 (lossless)
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 0, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 0, -1, -1, &mut s),
             Ok(false)
         );
         // and fine after
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, -1, -1, &mut s),
             Ok(true)
         );
         assert_eq!(
-            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, -1, -1),
+            closed_loop_both(&mut rs, &mut cs, &p, &blocks, None, 0, 80, -1, -1, &mut s),
             Ok(true)
         );
         assert!(rs.reused_tiles() > 0);
@@ -1941,17 +2038,28 @@ mod oracle {
                 .code,
             ERR_INVALID
         );
+        s.check(&[
+            ("rc", 0xc24de25670e0c7a1),
+            ("record", 0xe7c4fdc9123ff551),
+            ("recon", 0xcec3be14652339d1),
+            ("source", 0xbf6b957b57b612c9),
+            ("reused", 0x08cd4c29d1e47d34),
+            ("changed_sb", 0x8a7091e5e39ec98f),
+            ("write", 0xcbf29ce484222325),
+        ]);
     }
 
     // ---- benchmarks ----
 
     /// The median of f(0..n).
+    #[cfg(feature = "oracle")]
     fn median(n: usize, f: impl Fn(usize) -> f64) -> f64 {
         let mut v: Vec<f64> = (0..n).map(f).collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[n / 2]
     }
 
+    #[cfg(feature = "oracle")]
     fn bench(w: usize, h: usize, tl: i32, gpu_decides: bool) {
         let mut r = Rng(4242);
         let a = screen_pic(w, h, 11, false);
@@ -1980,7 +2088,18 @@ mod oracle {
         // warm up, and check
         for p in [&a, &b] {
             assert_eq!(
-                closed_loop_both(&mut rs, &mut cs, p, &blocks, lt, flags, 80, tl, tl),
+                closed_loop_both(
+                    &mut rs,
+                    &mut cs,
+                    p,
+                    &blocks,
+                    lt,
+                    flags,
+                    80,
+                    tl,
+                    tl,
+                    &mut Snapshot::new(&FAMS)
+                ),
                 Ok(true)
             );
         }
@@ -2015,7 +2134,18 @@ mod oracle {
         let res = [[rust_first, rust_second], [cpp_first, cpp_second]];
         for p in [&a, &b] {
             assert_eq!(
-                closed_loop_both(&mut rs, &mut cs, p, &blocks, lt, flags, 80, tl, tl),
+                closed_loop_both(
+                    &mut rs,
+                    &mut cs,
+                    p,
+                    &blocks,
+                    lt,
+                    flags,
+                    80,
+                    tl,
+                    tl,
+                    &mut Snapshot::new(&FAMS)
+                ),
                 Ok(true)
             );
         }
@@ -2044,6 +2174,7 @@ mod oracle {
         );
     }
 
+    #[cfg(feature = "oracle")]
     #[test]
     #[ignore]
     fn bench_closed_loop_720p() {
@@ -2051,6 +2182,7 @@ mod oracle {
         bench(1280, 720, 3, false);
     }
 
+    #[cfg(feature = "oracle")]
     #[test]
     #[ignore]
     fn bench_closed_loop_5k() {

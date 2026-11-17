@@ -377,11 +377,13 @@ fn bench_nondirectional_scalar_vs_neon() {
 
 // ---- differential tests against the C++ (oracle/dsp.cpp, av1core_test.h) ----
 
-#[cfg(feature = "oracle")]
 mod oracle {
     use super::*;
+    use crate::testsupport::snapshot::{Snapshot, same};
+    #[cfg(feature = "oracle")]
     use core::ffi::{c_char, c_int};
 
+    #[cfg(feature = "oracle")]
     unsafe extern "C" {
         fn oracle_dsp_int(what: *const c_char, a: c_int, b: c_int, c: c_int, d: c_int) -> i64;
         fn oracle_dsp_get_scan(tx_sz: c_int, tx_type: c_int) -> *const u16;
@@ -506,6 +508,7 @@ mod oracle {
         fn av1t_dsp_set_free(set: *const DspSet);
     }
 
+    #[cfg(feature = "oracle")]
     fn ci(what: &str, a: i32, b: i32, c: i32, d: i32) -> i64 {
         let s = std::ffi::CString::new(what).unwrap();
         // SAFETY: plain ints; the shim knows `what` or returns a sentinel.
@@ -516,53 +519,70 @@ mod oracle {
 
     #[test]
     fn helpers_match() {
+        let mut s = Snapshot::new(&["tx_sets", "scan", "qm", "tx_class", "q", "dequant_coef", "edge"]);
         for t in ALL_TX {
             for red in 0..2 {
-                assert_eq!(
+                same!(
+                    s,
+                    "tx_sets",
                     get_tx_set_intra(t, red != 0) as i64,
                     ci("get_tx_set_intra", t, red, 0, 0)
                 );
                 for m in 0..UV_INTRA_MODES_CFL_ALLOWED {
-                    assert_eq!(
+                    same!(
+                        s,
+                        "tx_sets",
                         chroma_tx_type(t, m, red != 0) as i64,
                         ci("chroma_tx_type", t, m, red, 0)
                     );
                 }
             }
-            assert_eq!(dq_denom(t) as i64, ci("dq_denom", t, 0, 0, 0));
+            same!(s, "tx_sets", dq_denom(t) as i64, ci("dq_denom", t, 0, 0, 0));
             for ty in 0..TX_TYPES {
-                let s = get_scan(t, ty);
+                let sc = get_scan(t, ty);
                 // illegal combinations (a V_* type on 32x32) get a shorter table, as in the C++
-                let n = s.len().min(tx_coeffs(t));
-                // SAFETY: the C table is the same one, with at least n entries.
-                let c = unsafe { core::slice::from_raw_parts(oracle_dsp_get_scan(t, ty), n) };
-                assert_eq!(&s[..n], c, "scan {t} {ty}");
+                let n = sc.len().min(tx_coeffs(t));
+                same!(
+                    s,
+                    "scan",
+                    &sc[..n],
+                    {
+                        // SAFETY: the C table is the same one, with at least n entries.
+                        unsafe { core::slice::from_raw_parts(oracle_dsp_get_scan(t, ty), n) }
+                    },
+                    "scan {t} {ty}"
+                );
                 for level in 0..17 {
                     for plane in 0..3 {
                         for using in 0..2 {
-                            // SAFETY: plain ints; a null or a table pointer comes back.
-                            let p = unsafe { oracle_dsp_qm(using, level, plane, t, ty) };
-                            match qm(using != 0, level, plane, t, ty) {
-                                None => assert!(p.is_null()),
-                                // SAFETY: a non-null av1g_qm points at tx_coeffs weights.
-                                Some(m) => assert_eq!(m, unsafe { core::slice::from_raw_parts(p, tx_coeffs(t)) }),
+                            let m = qm(using != 0, level, plane, t, ty);
+                            #[cfg(feature = "oracle")]
+                            {
+                                // SAFETY: plain ints; a null or a table pointer comes back.
+                                let p = unsafe { oracle_dsp_qm(using, level, plane, t, ty) };
+                                match m {
+                                    None => assert!(p.is_null()),
+                                    // SAFETY: a non-null av1g_qm points at tx_coeffs weights.
+                                    Some(m) => assert_eq!(m, unsafe { core::slice::from_raw_parts(p, tx_coeffs(t)) }),
+                                }
                             }
+                            s.put("qm", &m);
                         }
                     }
                 }
             }
         }
         for ty in 0..TX_TYPES {
-            assert_eq!(tx_class(ty) as i64, ci("tx_class", ty, 0, 0, 0));
-            assert_eq!(row_kind(ty) as i64, ci("row_kind", ty, 0, 0, 0));
-            assert_eq!(col_kind(ty) as i64, ci("col_kind", ty, 0, 0, 0));
-            assert_eq!(flip_ud(ty) as i64, ci("flip_ud", ty, 0, 0, 0));
-            assert_eq!(flip_lr(ty) as i64, ci("flip_lr", ty, 0, 0, 0));
+            same!(s, "tx_class", tx_class(ty) as i64, ci("tx_class", ty, 0, 0, 0));
+            same!(s, "tx_class", row_kind(ty) as i64, ci("row_kind", ty, 0, 0, 0));
+            same!(s, "tx_class", col_kind(ty) as i64, ci("col_kind", ty, 0, 0, 0));
+            same!(s, "tx_class", flip_ud(ty) as i64, ci("flip_ud", ty, 0, 0, 0));
+            same!(s, "tx_class", flip_lr(ty) as i64, ci("flip_lr", ty, 0, 0, 0));
         }
         for q in -20..300 {
-            assert_eq!(dc_q(q) as i64, ci("dc_q", q, 0, 0, 0));
-            assert_eq!(ac_q(q) as i64, ci("ac_q", q, 0, 0, 0));
-            assert_eq!(qm_level_allintra(q) as i64, ci("qm_level_allintra", q, 0, 0, 0));
+            same!(s, "q", dc_q(q) as i64, ci("dc_q", q, 0, 0, 0));
+            same!(s, "q", ac_q(q) as i64, ci("ac_q", q, 0, 0, 0));
+            same!(s, "q", qm_level_allintra(q) as i64, ci("qm_level_allintra", q, 0, 0, 0));
         }
         let mut r = Rng(3);
         for _ in 0..20000 {
@@ -571,16 +591,33 @@ mod oracle {
                 r.range(4, 20000),
                 [1, 2, 4][r.below(3) as usize],
             );
-            assert_eq!(dequant_coef(qv, q, den) as i64, ci("dequant_coef", qv, q, den, 0));
+            same!(
+                s,
+                "dequant_coef",
+                dequant_coef(qv, q, den) as i64,
+                ci("dequant_coef", qv, q, den, 0)
+            );
             let (x, n) = (r.next() as i32 >> r.below(20), r.range(0, 12));
-            assert_eq!(round2signed(x, n) as i64, ci("round2signed", x, n, 0, 0));
+            same!(
+                s,
+                "dequant_coef",
+                round2signed(x, n) as i64,
+                ci("round2signed", x, n, 0, 0)
+            );
         }
         for w in [4, 8, 16, 32, 64] {
             for h in [4, 8, 16, 32, 64] {
                 for ft in 0..2 {
                     for d in -100..100 {
-                        assert_eq!(edge_strength(w, h, ft, d) as i64, ci("edge_strength", w, h, ft, d));
-                        assert_eq!(
+                        same!(
+                            s,
+                            "edge",
+                            edge_strength(w, h, ft, d) as i64,
+                            ci("edge_strength", w, h, ft, d)
+                        );
+                        same!(
+                            s,
+                            "edge",
                             edge_use_upsample(w, h, ft, d) as i64,
                             ci("edge_use_upsample", w, h, ft, d)
                         );
@@ -588,12 +625,24 @@ mod oracle {
                 }
             }
         }
+        s.check(&[
+            ("tx_sets", 0x2a8e0677ea05c622),
+            ("scan", 0x2349f9e32813ff55),
+            ("qm", 0x48b87e5734ba761f),
+            ("tx_class", 0x606ebd040d3611a6),
+            ("q", 0x817aa7d0b4b1d299),
+            ("dequant_coef", 0xd0bbfe3612966380),
+            ("edge", 0x1d56f6d95c554c27),
+        ]);
     }
 
     #[test]
     fn dequant_matches() {
+        let mut s = Snapshot::new(&["dequant"]);
         let mut r = Rng(11);
-        let (mut a, mut b) = (vec![0i32; 1024], vec![0i32; 1024]);
+        let mut a = vec![0i32; 1024];
+        #[cfg(feature = "oracle")]
+        let mut b = vec![0i32; 1024];
         for _ in 0..30 {
             for t in ALL_TX {
                 for ty in [DCT_DCT, ADST_ADST, FLIPADST_DCT, IDTX, V_DCT] {
@@ -609,16 +658,24 @@ mod oracle {
                     let (dcq, acq) = (dc_q(qi), ac_q(qi));
                     let (using, level, plane) = (r.below(2) as i32, r.range(0, 15), r.range(0, 2));
                     dequant(&quant, &mut a, t, dcq, acq, qm(using != 0, level, plane, t, ty));
-                    // SAFETY: n coefficients in and out.
-                    unsafe { oracle_dsp_dequant(quant.as_ptr(), b.as_mut_ptr(), t, dcq, acq, using, level, plane, ty) };
-                    assert_eq!(a[..n], b[..n], "tx {t} type {ty} qm {using} {level}");
+                    #[cfg(feature = "oracle")]
+                    {
+                        // SAFETY: n coefficients in and out.
+                        unsafe {
+                            oracle_dsp_dequant(quant.as_ptr(), b.as_mut_ptr(), t, dcq, acq, using, level, plane, ty)
+                        };
+                        assert_eq!(a[..n], b[..n], "tx {t} type {ty} qm {using} {level}");
+                    }
+                    s.put("dequant", &a[..n]);
                 }
             }
         }
+        s.check(&[("dequant", 0xb1d4829dd9f67210)]);
     }
 
     #[test]
     fn inv_1d_matches() {
+        let mut s = Snapshot::new(&["inv_1d", "range_errors"]);
         let mut r = Rng(12);
         for _ in 0..3000 {
             let kind = r.range(0, 2);
@@ -629,20 +686,31 @@ mod oracle {
             for v in t.iter_mut().take(1 << n) {
                 *v = (r.next() as i32) >> lim;
             }
+            #[cfg(feature = "oracle")]
             let mut c = t;
-            let (mut e1, mut e2) = (0u32, 0u32);
+            let mut e1 = 0u32;
             inv_1d(&mut t, kind, n, rr, &mut e1);
-            // SAFETY: 64 entries.
-            unsafe { oracle_dsp_inv_1d(c.as_mut_ptr(), kind, n, rr, &mut e2) };
-            assert_eq!(t, c, "kind {kind} n {n} r {rr}");
-            assert_eq!(e1, e2);
+            #[cfg(feature = "oracle")]
+            {
+                let mut e2 = 0u32;
+                // SAFETY: 64 entries.
+                unsafe { oracle_dsp_inv_1d(c.as_mut_ptr(), kind, n, rr, &mut e2) };
+                assert_eq!(t, c, "kind {kind} n {n} r {rr}");
+                assert_eq!(e1, e2);
+            }
+            s.put("inv_1d", &t);
+            s.put("range_errors", &e1);
         }
+        s.check(&[("inv_1d", 0xd403cd01e2509641), ("range_errors", 0x59bfc2689909dae5)]);
     }
 
     #[test]
     fn inv_txfm2d_matches() {
+        let mut s = Snapshot::new(&["flags", "residual"]);
         let mut r = Rng(13);
-        let (mut a, mut b) = (vec![0i32; 4096], vec![0i32; 4096]);
+        let mut a = vec![0i32; 4096];
+        #[cfg(feature = "oracle")]
+        let mut b = vec![0i32; 4096];
         let mut flagged = [0u32; 3];
         for _ in 0..60 {
             for t in ALL_TX {
@@ -650,33 +718,46 @@ mod oracle {
                     let dq = random_dq(&mut r, tx_coeffs(t), true);
                     let n = (tx_w(t) * tx_h(t)) as usize;
                     let fa = inv_txfm2d(&dq, t, ty, &mut a);
-                    // SAFETY: tx_coeffs in, w * h out.
-                    let fb = unsafe { av1t_inverse_transform(t, ty, dq.as_ptr(), b.as_mut_ptr()) };
-                    assert_eq!(fa, fb, "flags tx {t} type {ty}");
-                    assert_eq!(a[..n], b[..n], "tx {t} type {ty}");
-                    flagged[fb as usize & 1] += 1;
-                    flagged[2] += (fb & 2 != 0) as u32;
+                    #[cfg(feature = "oracle")]
+                    {
+                        // SAFETY: tx_coeffs in, w * h out.
+                        let fb = unsafe { av1t_inverse_transform(t, ty, dq.as_ptr(), b.as_mut_ptr()) };
+                        assert_eq!(fa, fb, "flags tx {t} type {ty}");
+                        assert_eq!(a[..n], b[..n], "tx {t} type {ty}");
+                    }
+                    s.put("flags", &fa);
+                    s.put("residual", &a[..n]);
+                    flagged[fa as usize & 1] += 1;
+                    flagged[2] += (fa & 2 != 0) as u32;
                 }
             }
         }
         assert!(flagged[1] > 100 && flagged[2] > 10, "flag coverage {flagged:?}");
+        s.check(&[("flags", 0xaaf3913971514126), ("residual", 0x49db114c4b327a5c)]);
     }
 
     #[test]
     fn add_residual_matches() {
+        let mut s = Snapshot::new(&["add_residual"]);
         let mut r = Rng(14);
         for t in ALL_TX {
             for ty in 0..TX_TYPES {
                 let (w, h) = (tx_w(t) as usize, tx_h(t) as usize);
                 let res: Vec<i32> = (0..w * h).map(|_| r.range(-300, 300)).collect();
                 let mut p: Vec<u8> = (0..72 * 70).map(|_| r.next() as u8).collect();
+                #[cfg(feature = "oracle")]
                 let mut q = p.clone();
                 add_residual(&mut p[72 + 3..], 72, &res, t, ty);
-                // SAFETY: the block fits the 72 x 70 buffer at (3, 1).
-                unsafe { oracle_dsp_add_residual(q.as_mut_ptr().add(72 + 3), 72, res.as_ptr(), t, ty) };
-                assert_eq!(p, q, "tx {t} type {ty}");
+                #[cfg(feature = "oracle")]
+                {
+                    // SAFETY: the block fits the 72 x 70 buffer at (3, 1).
+                    unsafe { oracle_dsp_add_residual(q.as_mut_ptr().add(72 + 3), 72, res.as_ptr(), t, ty) };
+                    assert_eq!(p, q, "tx {t} type {ty}");
+                }
+                s.put("add_residual", &p);
             }
         }
+        s.check(&[("add_residual", 0xb7b60436eac135fb)]);
     }
 
     const PW: usize = 160;
@@ -692,6 +773,7 @@ mod oracle {
 
     #[test]
     fn build_edges_and_dc_match() {
+        let mut s = Snapshot::new(&["edges", "dc"]);
         let mut r = Rng(15);
         let plane: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
         for _ in 0..20 {
@@ -702,54 +784,72 @@ mod oracle {
                     let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
                     let fill = r.next() as u8;
                     let (mut a1, mut l1) = ([fill; EDGE_LEN], [fill; EDGE_LEN]);
+                    #[cfg(feature = "oracle")]
                     let (mut a2, mut l2) = (a1, l1);
                     build_edges(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a1, &mut l1);
-                    // SAFETY: the plane and EDGE_LEN-byte arrays the C function indexes.
-                    unsafe {
-                        oracle_dsp_build_edges(
-                            plane.as_ptr(),
-                            PW as i32,
-                            x,
-                            y,
-                            lw,
-                            lh,
-                            hl as i32,
-                            ha as i32,
-                            har as i32,
-                            hbl as i32,
-                            mx,
-                            my,
-                            a2.as_mut_ptr(),
-                            l2.as_mut_ptr(),
-                        )
-                    };
-                    assert!(a1 == a2 && l1 == l2, "tx {t} flags {k}");
-                    // SAFETY: EDGE_LEN-byte arrays.
-                    let dc = unsafe { oracle_dsp_dc_value(a1.as_ptr(), l1.as_ptr(), hl as i32, ha as i32, lw, lh) };
-                    assert_eq!(dc_value(&a1, &l1, hl, ha, lw, lh), dc);
+                    #[cfg(feature = "oracle")]
+                    {
+                        // SAFETY: the plane and EDGE_LEN-byte arrays the C function indexes.
+                        unsafe {
+                            oracle_dsp_build_edges(
+                                plane.as_ptr(),
+                                PW as i32,
+                                x,
+                                y,
+                                lw,
+                                lh,
+                                hl as i32,
+                                ha as i32,
+                                har as i32,
+                                hbl as i32,
+                                mx,
+                                my,
+                                a2.as_mut_ptr(),
+                                l2.as_mut_ptr(),
+                            )
+                        };
+                        assert!(a1 == a2 && l1 == l2, "tx {t} flags {k}");
+                    }
+                    s.put("edges", &(a1, l1));
+                    same!(s, "dc", dc_value(&a1, &l1, hl, ha, lw, lh), {
+                        // SAFETY: EDGE_LEN-byte arrays.
+                        unsafe { oracle_dsp_dc_value(a1.as_ptr(), l1.as_ptr(), hl as i32, ha as i32, lw, lh) }
+                    });
                 }
             }
         }
+        s.check(&[("edges", 0x6332e604a05b79c3), ("dc", 0x3045cf75c5ac2474)]);
     }
 
     #[test]
     fn edge_filter_upsample_prepare_match() {
+        let mut s = Snapshot::new(&["edge_filter", "edge_upsample", "edge_prepare", "pred_pixel_up"]);
         let mut r = Rng(16);
         for _ in 0..3000 {
             let smooth = r.below(2) == 0;
             let e = random_edge(&mut r, smooth);
             let (sz, strength) = (r.range(1, 129), r.range(0, 3));
-            let (mut a, mut b) = (e, e);
+            let mut a = e;
             edge_filter(&mut a, sz, strength);
-            // SAFETY: an EDGE_LEN-byte array; sz <= 129.
-            unsafe { oracle_dsp_edge_filter(b.as_mut_ptr(), sz, strength) };
-            assert_eq!(a, b, "edge_filter {sz} {strength}");
+            #[cfg(feature = "oracle")]
+            {
+                let mut b = e;
+                // SAFETY: an EDGE_LEN-byte array; sz <= 129.
+                unsafe { oracle_dsp_edge_filter(b.as_mut_ptr(), sz, strength) };
+                assert_eq!(a, b, "edge_filter {sz} {strength}");
+            }
+            s.put("edge_filter", &a);
             let n = r.range(1, 24);
-            let (mut a, mut b) = (e, e);
+            let mut a = e;
             edge_upsample(&mut a, n);
-            // SAFETY: an EDGE_LEN-byte array; numPx <= 24.
-            unsafe { oracle_dsp_edge_upsample(b.as_mut_ptr(), n) };
-            assert_eq!(a, b, "edge_upsample {n}");
+            #[cfg(feature = "oracle")]
+            {
+                let mut b = e;
+                // SAFETY: an EDGE_LEN-byte array; numPx <= 24.
+                unsafe { oracle_dsp_edge_upsample(b.as_mut_ptr(), n) };
+                assert_eq!(a, b, "edge_upsample {n}");
+            }
+            s.put("edge_upsample", &a);
         }
         for _ in 0..20 {
             for t in ALL_TX {
@@ -760,62 +860,82 @@ mod oracle {
                         let (hl, ha, ft) = (r.below(2) == 0, r.below(2) == 0, r.below(2) as i32);
                         let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
                         let (mut a1, mut l1) = (random_edge(&mut r, true), random_edge(&mut r, true));
+                        #[cfg(feature = "oracle")]
                         let (mut a2, mut l2) = (a1, l1);
                         let up = edge_prepare(p_angle, lw, lh, ft, hl, ha, x, y, mx, my, &mut a1, &mut l1);
-                        let (mut ua, mut ul) = (0, 0);
-                        // SAFETY: EDGE_LEN-byte arrays.
-                        unsafe {
-                            oracle_dsp_edge_prepare(
-                                p_angle,
-                                lw,
-                                lh,
-                                ft,
-                                hl as i32,
-                                ha as i32,
-                                x,
-                                y,
-                                mx,
-                                my,
-                                a2.as_mut_ptr(),
-                                l2.as_mut_ptr(),
-                                &mut ua,
-                                &mut ul,
-                            )
-                        };
-                        assert_eq!(up, (ua, ul));
-                        assert!(a1 == a2 && l1 == l2, "edge_prepare tx {t} angle {p_angle}");
+                        #[cfg(feature = "oracle")]
+                        {
+                            let (mut ua, mut ul) = (0, 0);
+                            // SAFETY: EDGE_LEN-byte arrays.
+                            unsafe {
+                                oracle_dsp_edge_prepare(
+                                    p_angle,
+                                    lw,
+                                    lh,
+                                    ft,
+                                    hl as i32,
+                                    ha as i32,
+                                    x,
+                                    y,
+                                    mx,
+                                    my,
+                                    a2.as_mut_ptr(),
+                                    l2.as_mut_ptr(),
+                                    &mut ua,
+                                    &mut ul,
+                                )
+                            };
+                            assert_eq!(up, (ua, ul));
+                            assert!(a1 == a2 && l1 == l2, "edge_prepare tx {t} angle {p_angle}");
+                        }
+                        s.put("edge_prepare", &(up, a1, l1));
+                        let (ua, ul) = up;
                         // the per-pixel predictor on the (possibly upsampled) edges
                         for i in 0..1 << lh {
                             for j in 0..1 << lw {
-                                let v = pred_pixel_up(mode, p_angle, i, j, lw, lh, &a1, &l1, ua, ul);
-                                // SAFETY: EDGE_LEN-byte arrays.
-                                let c = unsafe {
-                                    oracle_dsp_pred_pixel_up(
-                                        mode,
-                                        p_angle,
-                                        i,
-                                        j,
-                                        lw,
-                                        lh,
-                                        a1.as_ptr(),
-                                        l1.as_ptr(),
-                                        ua,
-                                        ul,
-                                    )
-                                };
-                                assert_eq!(v, c);
+                                same!(
+                                    s,
+                                    "pred_pixel_up",
+                                    pred_pixel_up(mode, p_angle, i, j, lw, lh, &a1, &l1, ua, ul),
+                                    {
+                                        // SAFETY: EDGE_LEN-byte arrays.
+                                        unsafe {
+                                            oracle_dsp_pred_pixel_up(
+                                                mode,
+                                                p_angle,
+                                                i,
+                                                j,
+                                                lw,
+                                                lh,
+                                                a1.as_ptr(),
+                                                l1.as_ptr(),
+                                                ua,
+                                                ul,
+                                            )
+                                        }
+                                    }
+                                );
                             }
                         }
                     }
                 }
             }
         }
+        s.check(&[
+            ("edge_filter", 0x5bc23b9d51f144c9),
+            ("edge_upsample", 0xaa5b966ab41bd61d),
+            ("edge_prepare", 0x8715859b24779719),
+            ("pred_pixel_up", 0xd92e93b942e86ba5),
+        ]);
     }
 
     #[test]
     fn predict_intra_matches() {
+        let mut s = Snapshot::new(&["predict_intra", "predict_intra_ex", "filter_intra"]);
         let mut r = Rng(17);
-        let (mut d1, mut d2) = (vec![0u8; 80 * 70], vec![0u8; 80 * 70]);
+        let mut d1 = vec![0u8; 80 * 70];
+        #[cfg(feature = "oracle")]
+        let mut d2 = vec![0u8; 80 * 70];
         for rep in 0..4 {
             for t in ALL_TX {
                 let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
@@ -825,24 +945,28 @@ mod oracle {
                             let (hl, ha) = (k & 1 != 0, k & 2 != 0);
                             let (above, left) = (random_edge(&mut r, rep & 1 == 0), random_edge(&mut r, rep & 1 == 0));
                             d1.fill(7);
-                            d2.fill(7);
                             predict_intra(mode, delta, hl, ha, lw, lh, &above, &left, &mut d1[80 + 1..], 80);
-                            // SAFETY: EDGE_LEN-byte arrays; the block fits d2 at (1, 1).
-                            unsafe {
-                                oracle_dsp_predict_intra(
-                                    mode,
-                                    delta,
-                                    hl as i32,
-                                    ha as i32,
-                                    lw,
-                                    lh,
-                                    above.as_ptr(),
-                                    left.as_ptr(),
-                                    d2.as_mut_ptr().add(80 + 1),
-                                    80,
-                                )
-                            };
-                            assert_eq!(d1, d2, "tx {t} mode {mode} delta {delta} flags {k}");
+                            #[cfg(feature = "oracle")]
+                            {
+                                d2.fill(7);
+                                // SAFETY: EDGE_LEN-byte arrays; the block fits d2 at (1, 1).
+                                unsafe {
+                                    oracle_dsp_predict_intra(
+                                        mode,
+                                        delta,
+                                        hl as i32,
+                                        ha as i32,
+                                        lw,
+                                        lh,
+                                        above.as_ptr(),
+                                        left.as_ptr(),
+                                        d2.as_mut_ptr().add(80 + 1),
+                                        80,
+                                    )
+                                };
+                                assert_eq!(d1, d2, "tx {t} mode {mode} delta {delta} flags {k}");
+                            }
+                            s.put("predict_intra", &d1);
                             // with the edge filter / upsampling / filter intra
                             let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
                             let fi = if lw <= 5 && lh <= 5 && r.below(3) == 0 {
@@ -851,7 +975,9 @@ mod oracle {
                                 -1
                             };
                             let (ef, ft) = (r.below(4) != 0, r.below(2) as i32);
-                            let (mut a1, mut l1, mut a2, mut l2) = (above, left, above, left);
+                            let (mut a1, mut l1) = (above, left);
+                            #[cfg(feature = "oracle")]
+                            let (mut a2, mut l2) = (above, left);
                             predict_intra_ex(
                                 mode,
                                 delta,
@@ -871,30 +997,34 @@ mod oracle {
                                 &mut d1[80 + 1..],
                                 80,
                             );
-                            // SAFETY: as above.
-                            unsafe {
-                                oracle_dsp_predict_intra_ex(
-                                    mode,
-                                    delta,
-                                    fi,
-                                    ef as i32,
-                                    ft,
-                                    hl as i32,
-                                    ha as i32,
-                                    lw,
-                                    lh,
-                                    x,
-                                    y,
-                                    mx,
-                                    my,
-                                    a2.as_mut_ptr(),
-                                    l2.as_mut_ptr(),
-                                    d2.as_mut_ptr().add(80 + 1),
-                                    80,
-                                )
-                            };
-                            assert_eq!(d1, d2, "ex tx {t} mode {mode} delta {delta} fi {fi} ef {ef}");
-                            assert!(a1 == a2 && l1 == l2);
+                            #[cfg(feature = "oracle")]
+                            {
+                                // SAFETY: as above.
+                                unsafe {
+                                    oracle_dsp_predict_intra_ex(
+                                        mode,
+                                        delta,
+                                        fi,
+                                        ef as i32,
+                                        ft,
+                                        hl as i32,
+                                        ha as i32,
+                                        lw,
+                                        lh,
+                                        x,
+                                        y,
+                                        mx,
+                                        my,
+                                        a2.as_mut_ptr(),
+                                        l2.as_mut_ptr(),
+                                        d2.as_mut_ptr().add(80 + 1),
+                                        80,
+                                    )
+                                };
+                                assert_eq!(d1, d2, "ex tx {t} mode {mode} delta {delta} fi {fi} ef {ef}");
+                                assert!(a1 == a2 && l1 == l2);
+                            }
+                            s.put("predict_intra_ex", &(&d1, a1, l1));
                         }
                     }
                 }
@@ -902,27 +1032,37 @@ mod oracle {
                     for mode in 0..5 {
                         let (above, left) = (random_edge(&mut r, true), random_edge(&mut r, true));
                         predict_filter_intra(mode, lw, lh, &above, &left, &mut d1, 80);
-                        // SAFETY: as above.
-                        unsafe {
-                            oracle_dsp_predict_filter_intra(
-                                mode,
-                                lw,
-                                lh,
-                                above.as_ptr(),
-                                left.as_ptr(),
-                                d2.as_mut_ptr(),
-                                80,
-                            )
-                        };
-                        assert_eq!(d1, d2, "filter intra tx {t} mode {mode}");
+                        #[cfg(feature = "oracle")]
+                        {
+                            // SAFETY: as above.
+                            unsafe {
+                                oracle_dsp_predict_filter_intra(
+                                    mode,
+                                    lw,
+                                    lh,
+                                    above.as_ptr(),
+                                    left.as_ptr(),
+                                    d2.as_mut_ptr(),
+                                    80,
+                                )
+                            };
+                            assert_eq!(d1, d2, "filter intra tx {t} mode {mode}");
+                        }
+                        s.put("filter_intra", &d1);
                     }
                 }
             }
         }
+        s.check(&[
+            ("predict_intra", 0x133e8ae8216583d3),
+            ("predict_intra_ex", 0xbedea2d2d28f85bf),
+            ("filter_intra", 0x1e98a7b99a7e29c9),
+        ]);
     }
 
     #[test]
     fn cfl_predict_matches() {
+        let mut s = Snapshot::new(&["cfl"]);
         let mut r = Rng(18);
         let luma: Vec<u8> = (0..2 * PW * 2 * PW).map(|_| r.next() as u8).collect();
         for _ in 0..30 {
@@ -938,31 +1078,38 @@ mod oracle {
                 let (mlw, mlh) = (mlw.max(4), mlh.max(4));
                 let alpha = r.range(-16, 16);
                 let mut c1: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
+                #[cfg(feature = "oracle")]
                 let mut c2 = c1.clone();
                 cfl_predict(&mut c1, PW, &luma, 2 * PW, x, y, t, subx, suby, mlw, mlh, alpha);
-                // SAFETY: the planes cover every sample the C function reads or writes.
-                unsafe {
-                    oracle_dsp_cfl_predict(
-                        c2.as_mut_ptr(),
-                        PW as i32,
-                        luma.as_ptr(),
-                        2 * PW as i32,
-                        x,
-                        y,
-                        t,
-                        subx,
-                        suby,
-                        mlw,
-                        mlh,
-                        alpha,
-                    )
-                };
-                assert_eq!(c1, c2, "tx {t} sub {subx}{suby}");
+                #[cfg(feature = "oracle")]
+                {
+                    // SAFETY: the planes cover every sample the C function reads or writes.
+                    unsafe {
+                        oracle_dsp_cfl_predict(
+                            c2.as_mut_ptr(),
+                            PW as i32,
+                            luma.as_ptr(),
+                            2 * PW as i32,
+                            x,
+                            y,
+                            t,
+                            subx,
+                            suby,
+                            mlw,
+                            mlh,
+                            alpha,
+                        )
+                    };
+                    assert_eq!(c1, c2, "tx {t} sub {subx}{suby}");
+                }
+                s.put("cfl", &c1);
             }
         }
+        s.check(&[("cfl", 0x882cf7b61961c159)]);
     }
 
     // av1g_test/dsp_cases.h: the cases the GPU equivalence tests run, with the CPU's results
+    #[cfg(feature = "oracle")]
     #[repr(C)]
     struct DspSet {
         itx_count: i32,
@@ -984,6 +1131,7 @@ mod oracle {
         pred_luma: *const u8,
         pred_out: *const u8,
     }
+    #[cfg(feature = "oracle")]
     #[repr(C)]
     struct ItxCase {
         tx_sz: i32,
@@ -993,6 +1141,7 @@ mod oracle {
         qm_level: i32,
         plane: i32,
     }
+    #[cfg(feature = "oracle")]
     #[repr(C)]
     struct PredCase {
         mode: i32,
@@ -1014,9 +1163,14 @@ mod oracle {
         fi_mode: i32,
     }
 
+    /// The cases of the set of `seed` (the Rust's: testsupport's `dsp_sets_match_c` holds it to the
+    /// C++'s for these seeds) through the DSP: the inverse transforms' flags and residuals, the
+    /// predictions; each equal to the set's CPU results.
     #[test]
     fn dsp_cases_match() {
+        let mut s = Snapshot::new(&["itx_flags", "itx_residual", "pred"]);
         for seed in [1u64, 0xfeed] {
+            #[cfg(feature = "oracle")]
             // SAFETY: the set stays alive until av1t_dsp_set_free; the arrays have the sizes it reports.
             unsafe {
                 let s = &*av1t_dsp_set_make(seed);
@@ -1112,7 +1266,100 @@ mod oracle {
                 }
                 av1t_dsp_set_free(s);
             }
+            // the same cases from the Rust set, hashed
+            let set = crate::testsupport::DspSet::make(seed);
+            let mut dq = vec![0i32; 1024];
+            let mut res = vec![0i32; 4096];
+            for (i, c) in set.itx.iter().enumerate() {
+                let q = &set.itx_coeffs[i * crate::testsupport::ITX_COEFFS..][..1024];
+                let want = &set.itx_residual[i * crate::testsupport::ITX_RESIDUAL..][..4096];
+                dequant(
+                    q,
+                    &mut dq,
+                    c.tx_sz,
+                    c.dc_q,
+                    c.ac_q,
+                    qm(c.qm_level >= 0, c.qm_level, c.plane, c.tx_sz, c.tx_type),
+                );
+                let f = inv_txfm2d(&dq, c.tx_sz, c.tx_type, &mut res);
+                let n = (tx_w(c.tx_sz) * tx_h(c.tx_sz)) as usize;
+                assert_eq!(f, set.itx_flags[i], "itx case {i}");
+                assert_eq!(res[..n], want[..n], "itx case {i}");
+                s.put("itx_flags", &f);
+                s.put("itx_residual", &res[..n]);
+            }
+            let pw = PW;
+            let luma = &set.pred_luma[..];
+            for (i, c) in set.pred.iter().enumerate() {
+                let mut out = set.pred_planes[i * pw * pw..][..pw * pw].to_vec();
+                let want = &set.pred_out[i * pw * pw..][..pw * pw];
+                let (mut a, mut l) = ([0u8; EDGE_LEN], [0u8; EDGE_LEN]);
+                build_edges(
+                    &out,
+                    pw,
+                    c.x,
+                    c.y,
+                    c.log2w,
+                    c.log2h,
+                    c.have_left != 0,
+                    c.have_above != 0,
+                    c.have_ar != 0,
+                    c.have_bl != 0,
+                    c.max_x,
+                    c.max_y,
+                    &mut a,
+                    &mut l,
+                );
+                let o = c.y as usize * pw + c.x as usize;
+                predict_intra_ex(
+                    c.mode,
+                    c.delta,
+                    c.fi_mode,
+                    c.edge_filter != 0,
+                    c.filter_type,
+                    c.have_left != 0,
+                    c.have_above != 0,
+                    c.log2w,
+                    c.log2h,
+                    c.x,
+                    c.y,
+                    c.max_x,
+                    c.max_y,
+                    &mut a,
+                    &mut l,
+                    &mut out[o..],
+                    pw,
+                );
+                if c.cfl != 0 {
+                    let t = (0..TX_SIZES_ALL)
+                        .rfind(|&t| {
+                            Tx_Width_Log2[t as usize] as i32 == c.log2w && Tx_Height_Log2[t as usize] as i32 == c.log2h
+                        })
+                        .unwrap();
+                    cfl_predict(
+                        &mut out,
+                        pw,
+                        luma,
+                        2 * pw,
+                        c.x,
+                        c.y,
+                        t,
+                        1,
+                        1,
+                        2 * (c.x + (1 << c.log2w)),
+                        2 * (c.y + (1 << c.log2h)),
+                        c.alpha,
+                    );
+                }
+                assert_eq!(out, want, "pred case {i}");
+                s.put("pred", &out);
+            }
         }
+        s.check(&[
+            ("itx_flags", 0x0e129b7864b44267),
+            ("itx_residual", 0x025c7a2eaff56908),
+            ("pred", 0xd737715e4be1d3d4),
+        ]);
     }
 }
 

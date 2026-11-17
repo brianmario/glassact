@@ -3,9 +3,12 @@
 use super::*;
 use crate::dsp::Rng;
 use crate::hybrid::tests::{Pic, screen_pic};
+use crate::testsupport::snapshot::{OUTPUT, Snapshot, put_output};
+#[cfg(feature = "oracle")]
 use core::ffi::c_int;
 
 /// ref_engine_encode's options as the shim takes them (oracle/testsupport.cpp oracle_ref_opts).
+#[cfg(feature = "oracle")]
 #[repr(C)]
 struct OracleRefOpts {
     qindex: i32,
@@ -32,6 +35,7 @@ struct OracleRefOpts {
     cdef_damping: i32,
 }
 
+#[cfg(feature = "oracle")]
 unsafe extern "C" {
     fn av1t_ref_encode(
         y: *const u8,
@@ -56,6 +60,7 @@ unsafe extern "C" {
 }
 
 /// An av1g_output's contents, freed.
+#[cfg(feature = "oracle")]
 fn take(rc: c_int, o: &mut crate::types::Output) -> Result<Output, i32> {
     // SAFETY: av1g_output's buffers, sized by its fields; freed once.
     unsafe {
@@ -86,6 +91,7 @@ fn take(rc: c_int, o: &mut crate::types::Output) -> Result<Output, i32> {
     }
 }
 
+#[cfg(feature = "oracle")]
 fn c_ref_encode(p: &Pic, o: &RefOpts) -> Result<Output, i32> {
     // SAFETY: the planes are w x h and half chroma; av1g_output is plain data.
     unsafe {
@@ -103,6 +109,7 @@ fn c_ref_encode(p: &Pic, o: &RefOpts) -> Result<Output, i32> {
     }
 }
 
+#[cfg(feature = "oracle")]
 fn c_ref_engine(p: &Pic, mono: bool, o: &RefEngineOpts) -> Result<Output, i32> {
     let co = OracleRefOpts {
         qindex: o.qindex,
@@ -163,6 +170,7 @@ fn picture(r: &mut Rng, big: bool) -> Pic {
     p
 }
 
+#[cfg(feature = "oracle")]
 fn same(a: &Result<Output, Error>, b: &Result<Output, i32>) -> Result<(), String> {
     match (a, b) {
         (Ok(a), Ok(b)) => {
@@ -186,8 +194,22 @@ fn same(a: &Result<Output, Error>, b: &Result<Output, i32>) -> Result<(), String
     }
 }
 
+/// The families of an encode's result: the error code ("rc", 0 when it succeeds) and the output's.
+const FAMS: [&str; 5] = ["rc", OUTPUT[0], OUTPUT[1], OUTPUT[2], OUTPUT[3]];
+
+fn put_result(s: &mut Snapshot, a: &Result<Output, Error>) {
+    match a {
+        Ok(o) => {
+            s.put("rc", &OK);
+            put_output(s, o);
+        }
+        Err(e) => s.put("rc", &e.code),
+    }
+}
+
 #[test]
 fn ref_encode_matches_cpp() {
+    let mut s = Snapshot::new(&FAMS);
     let mut r = Rng(0xAB_CDEF_0123);
     for case in 0..400 {
         let p = picture(&mut r, case % 40 == 39);
@@ -204,14 +226,35 @@ fn ref_encode_matches_cpp() {
             edge_filter: r.below(2) as i32,
         };
         let a = ref_encode(&p.y, &p.u, &p.v, p.w as u32, p.h as u32, &o);
-        let b = c_ref_encode(&p, &o);
-        same(&a, &b).unwrap_or_else(|e| panic!("case {case} ({}x{}, {o:?}): {e}", p.w, p.h));
+        #[cfg(feature = "oracle")]
+        {
+            let b = c_ref_encode(&p, &o);
+            same(&a, &b).unwrap_or_else(|e| panic!("case {case} ({}x{}, {o:?}): {e}", p.w, p.h));
+        }
         assert!(a.is_ok(), "case {case}: failed");
+        put_result(&mut s, &a);
     }
+    s.check_arch(
+        &[
+            ("rc", 0xa947e50590de8025),
+            ("obu", 0x4f9b06a5285c3ed5),
+            ("avif", 0x121b7f07c69f787c),
+            ("recon", 0x955296a0b37bd35f),
+            ("stats", 0xa03edb6e7289c5b4),
+        ],
+        &[
+            ("rc", 0xa947e50590de8025),
+            ("obu", 0x461d54e22300a5e3),
+            ("avif", 0x0b92b139e73b479c),
+            ("recon", 0x0d2946f2ccb07502),
+            ("stats", 0x3fcdca7723aa381f),
+        ],
+    );
 }
 
 #[test]
 fn ref_engine_options_match_cpp() {
+    let mut s = Snapshot::new(&FAMS);
     let mut r = Rng(0x7777_1234_ABCD);
     for case in 0..240 {
         let p = picture(&mut r, false);
@@ -249,11 +292,31 @@ fn ref_engine_options_match_cpp() {
         let mut rec = Record::default();
         let mut stats = RefEngineStats::default();
         let a = ref_engine_encode(&img, &o, &mut rec, Some(&mut stats));
-        let b = c_ref_engine(&p, mono, &o);
-        same(&a, &b).unwrap_or_else(|e| panic!("case {case} ({}x{}, mono {mono}, {o:?}): {e}", p.w, p.h));
+        #[cfg(feature = "oracle")]
+        {
+            let b = c_ref_engine(&p, mono, &o);
+            same(&a, &b).unwrap_or_else(|e| panic!("case {case} ({}x{}, mono {mono}, {o:?}): {e}", p.w, p.h));
+        }
         assert!(a.is_ok(), "case {case}: failed");
         assert_eq!(stats.blocks as usize, rec.blocks.len());
+        put_result(&mut s, &a);
     }
+    s.check_arch(
+        &[
+            ("rc", 0xc42a06f7e7a28e25),
+            ("obu", 0x268d9959e5c79123),
+            ("avif", 0x632b6466cd94b68a),
+            ("recon", 0x5ad686ac51f175b7),
+            ("stats", 0xe084efabd8b0d734),
+        ],
+        &[
+            ("rc", 0xc42a06f7e7a28e25),
+            ("obu", 0xcf371ff80736629e),
+            ("avif", 0x361645bd2653449d),
+            ("recon", 0x937e6e0852154343),
+            ("stats", 0xa42b405f454c91d9),
+        ],
+    );
 }
 
 #[test]
@@ -268,6 +331,16 @@ fn ref_encode_errors_match_cpp() {
         edge_filter: 0,
     };
     let a = ref_encode(&p.y, &p.u, &p.v, 40, 30, &o);
+    #[cfg(feature = "oracle")]
     same(&a, &c_ref_encode(&p, &o)).unwrap();
     assert!(a.is_err());
+    let mut s = Snapshot::new(&FAMS);
+    put_result(&mut s, &a);
+    s.check(&[
+        ("rc", 0x994f76653e2a3951),
+        ("obu", 0xcbf29ce484222325),
+        ("avif", 0xcbf29ce484222325),
+        ("recon", 0xcbf29ce484222325),
+        ("stats", 0xcbf29ce484222325),
+    ]);
 }

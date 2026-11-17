@@ -199,11 +199,13 @@ fn boxes_are_consistent() {
     assert!(n_ok > 1000);
 }
 
-#[cfg(feature = "oracle")]
 mod oracle {
     use super::*;
+    use crate::testsupport::snapshot::{Snapshot, same};
+    #[cfg(feature = "oracle")]
     use crate::types::AvifMeta;
 
+    #[cfg(feature = "oracle")]
     unsafe extern "C" {
         fn av1g_mux_avif(obus: *const u8, n: usize, w: u32, h: u32, avif: *mut *mut u8, size: *mut usize) -> i32;
         fn av1g_mux_avif_ex(
@@ -248,6 +250,7 @@ mod oracle {
         false
     }
 
+    #[cfg(feature = "oracle")]
     fn c_mux(obus: &[u8], w: u32, h: u32, md: Option<&Meta>) -> Result<Vec<u8>, i32> {
         let mut p = core::ptr::null_mut();
         let mut size = 0usize;
@@ -278,16 +281,21 @@ mod oracle {
 
     #[test]
     fn exif_orientations_match_c() {
+        let mut s = Snapshot::new(&["irot_imir"]);
         for o in -3..12 {
-            let (mut r, mut m) = (0, 0);
-            unsafe { av1g_exif_orientation_to_irot_imir(o, &mut r, &mut m) };
-            assert_eq!(exif_orientation_to_irot_imir(o), (r, m));
+            same!(s, "irot_imir", exif_orientation_to_irot_imir(o), {
+                let (mut r, mut m) = (0, 0);
+                unsafe { av1g_exif_orientation_to_irot_imir(o, &mut r, &mut m) };
+                (r, m)
+            });
         }
+        s.check(&[("irot_imir", 0x4a96e5418a774022)]);
     }
 
     /// Random streams, with and without ICC, for every irot and imir (and out-of-range ones).
     #[test]
     fn mux_matches_c() {
+        let mut s = Snapshot::new(&["mux"]);
         let mut rnd = Rng(0x0a1f_0001);
         let (mut ok, mut compared) = (0, 0);
         for case in 0..3000 {
@@ -321,12 +329,18 @@ mod oracle {
                 } else {
                     mux_avif_ex(&obus, w, h, md.as_ref())
                 };
-                let want = c_mux(&obus, w, h, md.as_ref());
-                assert!(ours == want, "case {case} meta {md:?}");
-                ok += want.is_ok() as u32;
+                #[cfg(feature = "oracle")]
+                {
+                    let want = c_mux(&obus, w, h, md.as_ref());
+                    assert!(ours == want, "case {case} meta {md:?}");
+                }
+                let _ = case;
+                s.put("mux", &ours);
+                ok += ours.is_ok() as u32;
                 compared += 1;
             }
         }
         assert!(ok > compared / 2, "{ok} of {compared} valid");
+        s.check(&[("mux", 0x4ad16dd97a168a6c)]);
     }
 }

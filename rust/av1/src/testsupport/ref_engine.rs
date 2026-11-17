@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-#[cfg(all(test, feature = "oracle"))]
+#[cfg(test)]
 mod tests;
 
 /// av1t_ref_opts: the reference engine's options in the C API.
