@@ -3,6 +3,7 @@
 //!
 //! - the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's
 //!   exact reconstruction out;
+//! - the decoder for the writer's streams (`decoder`);
 //! - the post-filters (deblocking, CDEF) and their strength search's host half;
 //! - the hybrid encoder's CPU closed loop;
 //! - test support: random legal records, the reference engine, the GPU's DSP cases.
@@ -13,6 +14,7 @@ pub mod avif;
 pub mod blockinfo;
 #[cfg(feature = "capi")]
 pub mod capi;
+pub mod decoder;
 pub mod dsp;
 pub mod enc;
 pub mod entropy;

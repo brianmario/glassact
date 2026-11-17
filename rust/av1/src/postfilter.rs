@@ -417,6 +417,21 @@ pub(crate) fn lf_filter_size_sub(
 /// of one edge segment. Callers visit row / col in steps of 2 for 4:2:0 chroma (1 << ss). `pl` is
 /// the plane.
 pub fn lf_edge(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col: i32, pl: &mut [u8], stride: usize) {
+    lf_edge_at(f, m, plane, pass, row, col, pl, 0, stride);
+}
+
+/// [`lf_edge`] with `pl` holding the plane's rows from `y0` on.
+pub(crate) fn lf_edge_at(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    pass: usize,
+    row: i32,
+    col: i32,
+    pl: &mut [u8],
+    y0: usize,
+    stride: usize,
+) {
     let sub = f.sub(plane);
     let (x, y) = (col * 4, row * 4);
     if x >= f.w || y >= f.h || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
@@ -428,7 +443,7 @@ pub fn lf_edge(f: &PfFrame, m: &PfMaps, plane: usize, pass: usize, row: i32, col
     let Some((limit, blimit, thresh)) = lf_limits(f, plane, pass) else {
         return;
     };
-    let (x_p, y_p) = ((x >> sub) as usize, (y >> sub) as usize);
+    let (x_p, y_p) = ((x >> sub) as usize, (y >> sub) as usize - y0);
     let step = if pass == 0 { 1 } else { stride };
     for i in 0..4 {
         let q0 = if pass == 0 {
@@ -457,6 +472,59 @@ pub fn deblock_frame_scalar(f: &PfFrame, m: &PfMaps, planes: &mut [&mut [u8]; 3]
                 }
             }
         }
+    }
+}
+
+/// One pass of a plane's deblocking over the luma 4x4 rows `rows` and columns `cols` (64x64
+/// aligned, or the frame's edges), `pl` holding the plane's rows from `y0` on; the scalar
+/// reference.
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
+pub(crate) fn deblock_rect_scalar(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    pass: usize,
+    pl: &mut [u8],
+    y0: usize,
+    stride: usize,
+    (r0, r1): (i32, i32),
+    (c0, c1): (i32, i32),
+) {
+    let step = 1 << f.sub(plane);
+    for row in (r0..r1.min(f.mi_rows)).step_by(step) {
+        for col in (c0..c1.min(f.mi_cols)).step_by(step) {
+            lf_edge_at(f, m, plane, pass, row, col, pl, y0, stride);
+        }
+    }
+}
+
+/// One pass of deblocking (spec 7.14) of plane `plane` over the luma 4x4 rows `rows` and columns
+/// `cols` of the frame: 64x64 boundaries, or the frame's edges. `pl` holds the plane's rows from
+/// sample row `y0` on, at `stride`: every row the pass reads and writes (pass 0 its rows; pass 1
+/// up to 8 rows above them). Edges are independent within a pass, so rectangles that cover the
+/// frame once, in any order, filter it as [`deblock_frame`] does with pass 0 of a plane before its
+/// pass 1. Planes without loop filtering (their level 0) are left alone.
+pub fn deblock_rect(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    pass: usize,
+    pl: &mut [u8],
+    y0: usize,
+    stride: usize,
+    rows: (i32, i32),
+    cols: (i32, i32),
+) {
+    if (f.lf_level[0] == 0 && f.lf_level[1] == 0) || (plane > 0 && f.lf_level[1 + plane] == 0) {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        lf_neon::deblock_rect(f, m, plane, pass, pl, y0, stride, rows, cols);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        deblock_rect_scalar(f, m, plane, pass, pl, y0, stride, rows, cols);
     }
 }
 
@@ -696,6 +764,21 @@ pub fn cdef_block(
     r: i32,
     c: i32,
 ) {
+    cdef_block_at(f, m, src, sstride, dst, dstride, 0, r, c);
+}
+
+/// [`cdef_block`] with `dst` holding the planes' rows from luma 4x4 row `dst_row` on.
+fn cdef_block_at(
+    f: &PfFrame,
+    m: &PfMaps,
+    src: &[&[u8]; 3],
+    sstride: &[usize; 3],
+    dst: &mut [&mut [u8]; 3],
+    dstride: &[usize; 3],
+    dst_row: i32,
+    r: i32,
+    c: i32,
+) {
     let o = cdef_setup(f, m, src[0], sstride[0], r, c);
     if o.filtered {
         stat(6);
@@ -715,7 +798,7 @@ pub fn cdef_block(
                         cdef_pixel(f, s, ss, p, x, y, o.uv_pri, o.uv_sec, f.cdef_damping - 1, o.uv_dir)
                     };
                 }
-                dst[p][y as usize * ds + x as usize] = v as u8;
+                dst[p][(y - ((dst_row * 4) >> sub)) as usize * ds + x as usize] = v as u8;
             }
         }
     }
@@ -734,6 +817,53 @@ pub fn cdef_frame_scalar(
         for c in (0..f.mi_cols).step_by(2) {
             cdef_block(f, m, src, sstride, dst, dstride, r, c);
         }
+    }
+}
+
+/// CDEF of the 8x8 blocks of the luma 4x4 rows `rows` and columns `cols` (even): `src` = the
+/// deblocked frame, `dst` = the output planes' rows from luma 4x4 row `dst_row` on (the chroma
+/// planes' from that >> ss); the scalar reference.
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
+pub(crate) fn cdef_rect_scalar(
+    f: &PfFrame,
+    m: &PfMaps,
+    src: &[&[u8]; 3],
+    sstride: &[usize; 3],
+    dst: &mut [&mut [u8]; 3],
+    dstride: &[usize; 3],
+    dst_row: i32,
+    (r0, r1): (i32, i32),
+    (c0, c1): (i32, i32),
+) {
+    for r in (r0..r1.min(f.mi_rows)).step_by(2) {
+        for c in (c0..c1.min(f.mi_cols)).step_by(2) {
+            cdef_block_at(f, m, src, sstride, dst, dstride, dst_row, r, c);
+        }
+    }
+}
+
+/// CDEF (spec 7.15) of the 8x8 blocks of the luma 4x4 rows `rows` and columns `cols` (even) of
+/// the frame: `src` = the deblocked frame (every sample within 2 of the blocks, inside the
+/// frame), `dst` = the output planes' rows from luma 4x4 row `dst_row` on (the chroma planes'
+/// from that >> ss), at `dstride`.
+pub fn cdef_rect(
+    f: &PfFrame,
+    m: &PfMaps,
+    src: &[&[u8]; 3],
+    sstride: &[usize; 3],
+    dst: &mut [&mut [u8]; 3],
+    dstride: &[usize; 3],
+    dst_row: i32,
+    rows: (i32, i32),
+    cols: (i32, i32),
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::cdef_rect(f, m, src, sstride, dst, dstride, dst_row, rows, cols);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cdef_rect_scalar(f, m, src, sstride, dst, dstride, dst_row, rows, cols);
     }
 }
 

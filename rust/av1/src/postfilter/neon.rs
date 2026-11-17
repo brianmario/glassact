@@ -144,6 +144,7 @@ fn cdef_filter<const W: usize>(
     ss: usize,
     dst: &mut [u8],
     ds: usize,
+    dy: usize,
     x0: usize,
     y0: usize,
     pri: i32,
@@ -201,7 +202,7 @@ fn cdef_filter<const W: usize>(
             ));
             let v = vminq_s16(vmaxq_s16(vaddq_s16(x, r), mn), mx);
             let v = vmovn_u16(vreinterpretq_u16_s16(v));
-            let o = (y0 + if W == 8 { i } else { 2 * i }) * ds + x0;
+            let o = (y0 - dy + if W == 8 { i } else { 2 * i }) * ds + x0;
             if W == 8 {
                 st8(&mut dst[o..], v);
             } else {
@@ -220,8 +221,24 @@ pub(super) fn cdef_frame(
     dst: &mut [&mut [u8]; 3],
     dstride: &[usize; 3],
 ) {
-    for r in (0..f.mi_rows).step_by(2) {
-        for c in (0..f.mi_cols).step_by(2) {
+    cdef_rect(f, m, src, sstride, dst, dstride, 0, (0, f.mi_rows), (0, f.mi_cols));
+}
+
+/// [`super::cdef_rect`] in NEON.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cdef_rect(
+    f: &PfFrame,
+    m: &PfMaps,
+    src: &[&[u8]; 3],
+    sstride: &[usize; 3],
+    dst: &mut [&mut [u8]; 3],
+    dstride: &[usize; 3],
+    dst_row: i32,
+    (r0, r1): (i32, i32),
+    (c0, c1): (i32, i32),
+) {
+    for r in (r0..r1.min(f.mi_rows)).step_by(2) {
+        for c in (c0..c1.min(f.mi_cols)).step_by(2) {
             let idx = cdef_active_idx(f, m, r, c);
             let o = if idx < 0 {
                 CdefBlk::default()
@@ -237,13 +254,14 @@ pub(super) fn cdef_frame(
             for p in 0..f.planes() {
                 let sub = f.sub(p);
                 let (x0, y0, w) = ((c * 4) >> sub, (r * 4) >> sub, 8 >> sub);
+                let dy = ((dst_row * 4) >> sub) as usize;
                 let (s, ss, ds) = (src[p], sstride[p], dstride[p]);
                 let d = &mut *dst[p];
                 if !o.filtered {
                     for i in 0..w as usize {
                         let (a, b) = (
                             (y0 as usize + i) * ss + x0 as usize,
-                            (y0 as usize + i) * ds + x0 as usize,
+                            (y0 as usize - dy + i) * ds + x0 as usize,
                         );
                         d[b..b + w as usize].copy_from_slice(&s[a..a + w as usize]);
                     }
@@ -259,15 +277,16 @@ pub(super) fn cdef_frame(
                 if x0 >= 2 && y0 >= 2 && x0 + w + 2 <= pw && y0 + w + 2 <= ph {
                     let (x0, y0) = (x0 as usize, y0 as usize);
                     if w == 8 {
-                        cdef_filter::<8>(s, ss, d, ds, x0, y0, pri, sec, damp, dir);
+                        cdef_filter::<8>(s, ss, d, ds, dy, x0, y0, pri, sec, damp, dir);
                     } else {
-                        cdef_filter::<4>(s, ss, d, ds, x0, y0, pri, sec, damp, dir);
+                        cdef_filter::<4>(s, ss, d, ds, dy, x0, y0, pri, sec, damp, dir);
                     }
                 } else {
                     for i in 0..w {
                         for j in 0..w {
                             let (x, y) = (x0 + j, y0 + i);
-                            d[y as usize * ds + x as usize] = cdef_pixel(f, s, ss, p, x, y, pri, sec, damp, dir) as u8;
+                            d[(y as usize - dy) * ds + x as usize] =
+                                cdef_pixel(f, s, ss, p, x, y, pri, sec, damp, dir) as u8;
                         }
                     }
                 }

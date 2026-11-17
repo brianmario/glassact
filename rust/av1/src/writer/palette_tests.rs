@@ -59,7 +59,7 @@ fn map(r: &mut Rnd, n: usize, w: usize, h: usize, out: &mut Vec<u8>) {
 
 /// Turns about `pct` percent of the record's eligible intra blocks into palette blocks (luma,
 /// chroma or both), with allow_screen_content_tools.
-pub(super) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
+pub(crate) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
     let mut r = Rnd(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     rec.fp.allow_screen_content_tools = 1;
     let mono = rec.fp.monochrome != 0;
@@ -114,7 +114,7 @@ pub(super) fn add_palettes(rec: &mut Record, seed: u64, pct: u32) -> usize {
     n_pal
 }
 
-fn fuzz_record(seed: u64, maxdim: i32) -> Option<Record> {
+pub(crate) fn fuzz_record(seed: u64, maxdim: i32) -> Option<Record> {
     let mut case = FuzzCase::make(seed, maxdim, 20)?;
     let mut rec = Record {
         fp: case.fp,

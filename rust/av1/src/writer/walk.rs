@@ -65,6 +65,10 @@ pub(crate) struct Frame<'a> {
     /// [`super::ENC_BLOCK_BITS`]: each block's bits (f32, its partition symbols not included), by
     /// record index
     pub block_bits: Option<&'a [std::sync::atomic::AtomicU32]>,
+    /// decoding (crate::decoder): per 64x64 of the frame (raster, sbCols wide), whether the tile's
+    /// planes already hold LAST_FRAME's samples there (bit 0) or GOLDEN_FRAME's (bit 1), so that a
+    /// whole-sample copy from that reference with no motion needn't be predicted. Writing: None.
+    pub elide: Option<&'a [u8]>,
 }
 
 impl Frame<'_> {
@@ -216,6 +220,10 @@ pub(crate) static SB128_STAT: [std::sync::atomic::AtomicU64; 16] = [const { std:
 /// difference; skip ones; ones with a var-tx split.
 #[cfg(test)]
 pub(crate) static INTRABC_STAT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+/// Decoding: inter blocks not predicted, their tile's planes holding their reference's samples
+/// ([`Frame::elide`]), for the tests' coverage reports.
+#[cfg(test)]
+pub(crate) static ELIDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[inline(always)]
 fn intrabc_stat(_k: usize) {
     #[cfg(test)]
@@ -232,9 +240,15 @@ fn inter_stat(_k: usize) {
     INTER_STAT[_k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The parser's record being built.
+/// The parser's record being built, or (`decode`) only what a decoding walk needs of one.
 #[derive(Default)]
 pub(crate) struct ParseRec {
+    /// decoding: no record is kept (the blocks are reconstructed as they're parsed), each tx
+    /// block's levels go to `q`, and `n_blocks` counts the blocks
+    pub decode: bool,
+    pub n_blocks: u32,
+    /// decoding: the current tx block's levels (4096)
+    pub q: Vec<i16>,
     /// inter frames: one entry per block
     pub inter: Vec<BlockInter>,
     /// with allow_screen_content_tools: one entry per block, and the palette blocks' maps
@@ -1831,6 +1845,29 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
         Ok(())
     }
 
+    /// Decoding: whether inter block (r, c, bsize) with motion `bi` needn't be predicted, its
+    /// tile's planes holding its reference's samples already ([`Frame::elide`]): a block of 8x8 or
+    /// more (its chroma its own motion's) with no motion, every 64x64 it covers marked.
+    #[inline(never)]
+    fn elided(&self, r: i32, c: i32, bsize: i32, bi: &BlockInter) -> bool {
+        let f = self.f;
+        let Some(m) = f.elide else { return false };
+        let (bw, bh) = (bw4(bsize), bh4(bsize));
+        if bi.mv_row != 0 || bi.mv_col != 0 || bw < 2 || bh < 2 {
+            return false;
+        }
+        let bit = if bi.is_inter == GOLDEN { 2 } else { 1 };
+        let stride = ((f.mi_cols + 15) >> 4) as usize;
+        let ((y0, y1), (x0, x1)) = ((r >> 4, (r + bh - 1) >> 4), (c >> 4, (c + bw - 1) >> 4));
+        let e = (y0..=y1)
+            .all(|y| (x0..=x1).all(|x| m.get(y as usize * stride + x as usize).is_some_and(|&v| v & bit != 0)));
+        #[cfg(test)]
+        if e {
+            ELIDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        e
+    }
+
     /// compute_prediction of an inter block (spec 5.11.33 / 7.11.3): its planes from LAST_FRAME,
     /// the whole block (past the coded area too: the closed loop transforms whole tx blocks). The
     /// chroma of a block narrower or lower than 8 luma samples is predicted from the motion of each
@@ -2129,7 +2166,7 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     ..Default::default()
                 };
                 self.st.pal = BlockPalette::default();
-                self.st.b_idx = p.blocks.len() as u32;
+                self.st.b_idx = if p.decode { p.n_blocks } else { p.blocks.len() as u32 };
                 parse_txb0 = p.txb.len() as u32;
             }
         }
@@ -2231,7 +2268,16 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                 if a != 0 {
                     let sign = self.sk.bit((reduced_w < 0) as i32);
                     let reduced = if sign != 0 { -a } else { a };
-                    self.st.current_q_index = clip3(1, 255, self.st.current_q_index + reduced * step);
+                    let q = self.st.current_q_index + reduced * step;
+                    if !S::WRITE && f.do_recon && !(1..=255).contains(&q) {
+                        // (the spec clips it; the writer's qindexes are reachable without)
+                        fail!(
+                            ERR_INVALID,
+                            "block {}: delta_qindex beyond the qindex range (not supported)",
+                            self.st.b_idx
+                        );
+                    }
+                    self.st.current_q_index = clip3(1, 255, q);
                 }
             }
             if S::WRITE {
@@ -2308,6 +2354,7 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     let map = palette_map.get(pal.map_off as usize..).unwrap_or(&[]);
                     self.palette_tokens(bsize, map)?;
                 }
+                Rec::Parse(p) if p.decode => self.palette_tokens(bsize, &[])?,
                 Rec::Parse(p) => {
                     self.palette_tokens(bsize, &[])?;
                     // the maps as the record holds them: luma, then chroma
@@ -2491,7 +2538,7 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     SS,
                     dv,
                 );
-            } else {
+            } else if S::WRITE || !self.elided(r, c, bsize, &bi) {
                 self.predict_inter_block(bsize, has_chroma_);
             }
         }
@@ -2594,6 +2641,29 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                 if ti != t1 {
                     fail!(ERR_INVALID, "block {b_idx}: tx layout mismatch (count)");
                 }
+            }
+            Rec::Parse(p) if p.decode => {
+                // reconstructed as parsed: no record, each tx block's levels in `q` (zero on entry
+                // where they're coded)
+                if p.q.len() < 4096 {
+                    p.q.resize(4096, 0);
+                }
+                for_each_txb!(|plane, tx_sz, x, y, x4, y4| {
+                    let n = tx_coeffs(tx_sz);
+                    let mut t = Txb {
+                        x4: x4 as u16,
+                        y4: y4 as u16,
+                        plane: plane as u8,
+                        tx_size: tx_sz as u8,
+                        ..Default::default()
+                    };
+                    let q = &mut p.q[..n];
+                    if b.skip == 0 {
+                        q.fill(0);
+                    }
+                    self.txb(&b, &mut t, q, x, y)?;
+                });
+                p.n_blocks += 1;
             }
             Rec::Parse(p) => {
                 for_each_txb!(|plane, tx_sz, x, y, x4, y4| {
@@ -2865,6 +2935,23 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     t.tx_type = tx_type as u8;
                 }
                 t.eob = eob as u16;
+                if !S::WRITE && eob > 0 && f.do_recon {
+                    // decoding: the dequantized levels' inverse transform (the writer's levels()
+                    // without its hook and repair: a residual out of the transform's range is an
+                    // error, as the stream isn't conformant)
+                    let st = &mut *self.st;
+                    let m = qm(fp.using_qmatrix != 0, f.qm_level[plane], plane as i32, tx_sz, tx_type);
+                    dequant(q, &mut st.dq[..], tx_sz, st.dc_q[plane], st.ac_q[plane], m);
+                    if inv_txfm2d(&st.dq[..], tx_sz, tx_type, &mut st.res[..]) != 0 {
+                        fail!(
+                            ERR_RANGE,
+                            "block {} plane {plane} tx ({},{}): coefficients overflow the inverse transform's range",
+                            st.b_idx,
+                            t.x4,
+                            t.y4
+                        );
+                    }
+                }
                 if eob > 0 && f.do_recon {
                     add_residual(
                         &mut self.bufs.plane[plane][off..],

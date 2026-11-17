@@ -1604,6 +1604,7 @@ impl Writer {
                 }
                 &self.block_bits[..n_blocks]
             }),
+            elide: None,
         };
 
         if self.tiles.len() < ntiles {

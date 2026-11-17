@@ -35,6 +35,7 @@
 use crate::entropy::FrameCdfs;
 use crate::types::*;
 
+pub(crate) mod decode;
 mod encode;
 mod headers;
 mod layout;
@@ -46,11 +47,11 @@ mod tiles;
 mod walk;
 
 #[cfg(test)]
-mod chroma444_tests;
+pub(crate) mod chroma444_tests;
 #[cfg(test)]
-mod inter_tests;
+pub(crate) mod inter_tests;
 #[cfg(test)]
-mod palette_tests;
+pub(crate) mod palette_tests;
 #[cfg(test)]
 mod tests;
 
@@ -61,6 +62,7 @@ pub(crate) use headers::{BitWriter, frame_obus};
 pub use layout::{
     LayoutCounts, apply_sb_qindex, layout, layout_counts, layout_counts_ex, layout_ex, legalize_sb_qindex, sb_grid,
 };
+pub(crate) use parse::{FrameHdr, LfDeltas, Seq, parse_frame_header, parse_seq_obu, tile_spans};
 pub use parse::{ParseState, Parsed, parse, parse_with};
 pub(crate) use tiles::choose_level;
 pub use tiles::{TileInfo, compute_tiles, tile_layout, tile_layout_ex};

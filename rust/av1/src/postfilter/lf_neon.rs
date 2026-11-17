@@ -203,111 +203,141 @@ fn lanes(fs0: i32, fs1: i32) -> int16x8_t {
 }
 
 fn deblock_plane(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: usize) {
-    // the subsampling a constant: luma and 4:4:4 chroma, 4:2:0 chroma
-    if f.sub(plane) != 0 {
-        deblock_plane_sub::<1>(f, m, plane, pl, stride);
-    } else {
-        deblock_plane_sub::<0>(f, m, plane, pl, stride);
+    for pass in 0..2 {
+        deblock_rect(f, m, plane, pass, pl, 0, stride, (0, f.mi_rows), (0, f.mi_cols));
     }
 }
 
-fn deblock_plane_sub<const SUB: i32>(f: &PfFrame, m: &PfMaps, plane: usize, pl: &mut [u8], stride: usize) {
+/// One pass of a plane's deblocking over the luma 4x4 rows `rows` and columns `cols` of the frame
+/// (from a 64x64 boundary, or the frame's), `pl` holding the plane's rows from `y0` on.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn deblock_rect(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    pass: usize,
+    pl: &mut [u8],
+    y0: usize,
+    stride: usize,
+    rows: (i32, i32),
+    cols: (i32, i32),
+) {
+    // the subsampling a constant: luma and 4:4:4 chroma, 4:2:0 chroma
+    if f.sub(plane) != 0 {
+        deblock_rect_sub::<1>(f, m, plane, pass, pl, y0, stride, rows, cols);
+    } else {
+        deblock_rect_sub::<0>(f, m, plane, pass, pl, y0, stride, rows, cols);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deblock_rect_sub<const SUB: i32>(
+    f: &PfFrame,
+    m: &PfMaps,
+    plane: usize,
+    pass: usize,
+    pl: &mut [u8],
+    y0: usize,
+    stride: usize,
+    (r0, r1): (i32, i32),
+    (c0, c1): (i32, i32),
+) {
     let sub = SUB;
     let chroma = plane != 0;
     // 7.14.1: chroma edges every 1 << subsampling 4x4s (4:2:0: 2; 4:4:4: luma's grid)
     let step = 1 << sub;
     let (pw, ph) = (((f.mi_cols * 4) >> sub) as usize, ((f.mi_rows * 4) >> sub) as usize);
-    for pass in 0..2 {
-        let Some((limit, blimit, thresh)) = lf_limits(f, plane, pass) else {
-            continue;
-        };
-        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
-        let l = unsafe {
-            Lim {
-                limit: vdupq_n_s16(limit as i16),
-                blimit: vdupq_n_s16(blimit as i16),
-                thresh: vdupq_n_s16(thresh as i16),
+    let (r1, c1) = (r1.min(f.mi_rows), c1.min(f.mi_cols));
+    let Some((limit, blimit, thresh)) = lf_limits(f, plane, pass) else {
+        return;
+    };
+    // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+    let l = unsafe {
+        Lim {
+            limit: vdupq_n_s16(limit as i16),
+            blimit: vdupq_n_s16(blimit as i16),
+            thresh: vdupq_n_s16(thresh as i16),
+        }
+    };
+    if pass == 0 {
+        // vertical edges: segment rows (row, row + step) = 8 sample rows, transposed
+        for row in (r0..r1).step_by(2 * step) {
+            let y = ((row * 4) >> sub) as usize;
+            if y + 8 > ph {
+                for col in (c0..c1).step_by(step) {
+                    lf_edge_at(f, m, plane, 0, row, col, pl, y0, stride);
+                }
+                continue;
             }
-        };
-        if pass == 0 {
-            // vertical edges: segment rows (row, row + step) = 8 sample rows, transposed
-            for row in (0..f.mi_rows).step_by(2 * step) {
-                let y = ((row * 4) >> sub) as usize;
-                if y + 8 > ph {
-                    for col in (0..f.mi_cols).step_by(step) {
-                        lf_edge(f, m, plane, 0, row, col, pl, stride);
+            let y = y - y0;
+            for col in (c0.max(step as i32)..c1).step_by(step) {
+                let (fs0, fs1) = (
+                    seg_fs(f, m, plane, sub, 0, row, col),
+                    seg_fs(f, m, plane, sub, 0, row + step as i32, col),
+                );
+                if fs0 == 0 && fs1 == 0 {
+                    continue;
+                }
+                let x = ((col * 4) >> sub) as usize;
+                let any16 = fs0 == 16 || fs1 == 16;
+                let mut s = [unsafe_zero(); 16];
+                if any16 {
+                    let lt = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x - 8..])));
+                    let rt = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x..])));
+                    for k in 0..8 {
+                        s[k] = widen(lt[k]);
+                        s[8 + k] = widen(rt[k]);
+                    }
+                } else {
+                    let t = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x - 4..])));
+                    for k in 0..8 {
+                        s[4 + k] = widen(t[k]);
+                    }
+                }
+                filter8(&mut s, lanes(fs0, fs1), chroma, any16, &l);
+                if any16 {
+                    let lt = transpose8(core::array::from_fn(|k| narrow(s[k])));
+                    let rt = transpose8(core::array::from_fn(|k| narrow(s[8 + k])));
+                    for i in 0..8 {
+                        st8(&mut pl[(y + i) * stride + x - 8..], lt[i]);
+                        st8(&mut pl[(y + i) * stride + x..], rt[i]);
+                    }
+                } else {
+                    let t = transpose8(core::array::from_fn(|k| narrow(s[4 + k])));
+                    for i in 0..8 {
+                        st8(&mut pl[(y + i) * stride + x - 4..], t[i]);
+                    }
+                }
+            }
+        }
+    } else {
+        // horizontal edges: segment columns (col, col + step) = 8 samples, rows as vectors
+        for row in (r0.max(step as i32)..r1).step_by(step) {
+            let y = ((row * 4) >> sub) as usize - y0;
+            for col in (c0..c1).step_by(2 * step) {
+                let x = ((col * 4) >> sub) as usize;
+                if x + 8 > pw {
+                    for c in (col..c1).step_by(step) {
+                        lf_edge_at(f, m, plane, 1, row, c, pl, y0, stride);
                     }
                     continue;
                 }
-                for col in (step as i32..f.mi_cols).step_by(step) {
-                    let (fs0, fs1) = (
-                        seg_fs(f, m, plane, sub, 0, row, col),
-                        seg_fs(f, m, plane, sub, 0, row + step as i32, col),
-                    );
-                    if fs0 == 0 && fs1 == 0 {
-                        continue;
-                    }
-                    let x = ((col * 4) >> sub) as usize;
-                    let any16 = fs0 == 16 || fs1 == 16;
-                    let mut s = [unsafe_zero(); 16];
-                    if any16 {
-                        let lt = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x - 8..])));
-                        let rt = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x..])));
-                        for k in 0..8 {
-                            s[k] = widen(lt[k]);
-                            s[8 + k] = widen(rt[k]);
-                        }
-                    } else {
-                        let t = transpose8(core::array::from_fn(|i| ld8(&pl[(y + i) * stride + x - 4..])));
-                        for k in 0..8 {
-                            s[4 + k] = widen(t[k]);
-                        }
-                    }
-                    filter8(&mut s, lanes(fs0, fs1), chroma, any16, &l);
-                    if any16 {
-                        let lt = transpose8(core::array::from_fn(|k| narrow(s[k])));
-                        let rt = transpose8(core::array::from_fn(|k| narrow(s[8 + k])));
-                        for i in 0..8 {
-                            st8(&mut pl[(y + i) * stride + x - 8..], lt[i]);
-                            st8(&mut pl[(y + i) * stride + x..], rt[i]);
-                        }
-                    } else {
-                        let t = transpose8(core::array::from_fn(|k| narrow(s[4 + k])));
-                        for i in 0..8 {
-                            st8(&mut pl[(y + i) * stride + x - 4..], t[i]);
-                        }
-                    }
+                let (fs0, fs1) = (
+                    seg_fs(f, m, plane, sub, 1, row, col),
+                    seg_fs(f, m, plane, sub, 1, row, col + step as i32),
+                );
+                if fs0 == 0 && fs1 == 0 {
+                    continue;
                 }
-            }
-        } else {
-            // horizontal edges: segment columns (col, col + step) = 8 samples, rows as vectors
-            for row in (step as i32..f.mi_rows).step_by(step) {
-                let y = ((row * 4) >> sub) as usize;
-                for col in (0..f.mi_cols).step_by(2 * step) {
-                    let x = ((col * 4) >> sub) as usize;
-                    if x + 8 > pw {
-                        for c in (col..f.mi_cols).step_by(step) {
-                            lf_edge(f, m, plane, 1, row, c, pl, stride);
-                        }
-                        continue;
-                    }
-                    let (fs0, fs1) = (
-                        seg_fs(f, m, plane, sub, 1, row, col),
-                        seg_fs(f, m, plane, sub, 1, row, col + step as i32),
-                    );
-                    if fs0 == 0 && fs1 == 0 {
-                        continue;
-                    }
-                    let any16 = fs0 == 16 || fs1 == 16;
-                    let mut s = [unsafe_zero(); 16];
-                    let (k0, k1) = if any16 { (0, 16) } else { (4, 12) };
-                    for k in k0..k1 {
-                        s[k] = widen(ld8(&pl[(y + k - 8) * stride + x..]));
-                    }
-                    filter8(&mut s, lanes(fs0, fs1), chroma, any16, &l);
-                    for k in k0..k1 {
-                        st8(&mut pl[(y + k - 8) * stride + x..], narrow(s[k]));
-                    }
+                let any16 = fs0 == 16 || fs1 == 16;
+                let mut s = [unsafe_zero(); 16];
+                let (k0, k1) = if any16 { (0, 16) } else { (4, 12) };
+                for k in k0..k1 {
+                    s[k] = widen(ld8(&pl[(y + k - 8) * stride + x..]));
+                }
+                filter8(&mut s, lanes(fs0, fs1), chroma, any16, &l);
+                for k in k0..k1 {
+                    st8(&mut pl[(y + k - 8) * stride + x..], narrow(s[k]));
                 }
             }
         }

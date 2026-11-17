@@ -8,7 +8,7 @@ use crate::tables::*;
 use crate::testsupport::{FuzzCase, InterSeq};
 
 /// The outputs of a sequence's frames, encoded in order. The error names the frame.
-pub(super) fn encode_seq(w: &mut Writer, seq: &mut InterSeq, flags: u32) -> Result<Vec<Output>, (usize, Error)> {
+pub(crate) fn encode_seq(w: &mut Writer, seq: &mut InterSeq, flags: u32) -> Result<Vec<Output>, (usize, Error)> {
     let mut outs: Vec<Output> = Vec::with_capacity(seq.frames.len());
     let mut slot_of = [usize::MAX; 8];
     for (k, rec) in seq.frames.iter_mut().enumerate() {
@@ -137,7 +137,7 @@ fn reduced_frames_round_trip() {
 
 /// Makes every frame of `seq` a reduced frame: a stream wider (and some seeds taller) than the
 /// frames, the same for the whole stream.
-fn reduce(seq: &mut InterSeq, seed: u64) {
+pub(crate) fn reduce(seq: &mut InterSeq, seed: u64) {
     let fp = seq.frames[0].fp;
     let (sw, sh) = (
         fp.width + 1 + (seed % 97) as u32 * 13,
@@ -785,7 +785,7 @@ fn sb128_still_pictures_round_trip() {
 }
 
 /// A still picture with 128x128 superblocks of `seed` (FuzzCase::make_ex), as a record.
-pub(super) fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
+pub(crate) fn sb128_still(seed: u64, maxdim: i32) -> Option<Record> {
     let mut case = FuzzCase::make_ex(seed, maxdim, 4, true)?;
     let mut rec = Record {
         fp: case.fp,
@@ -886,7 +886,7 @@ fn sb128_and_headerless_refusals() {
 }
 
 /// IVF of a sequence's frames (each its TD + sequence header + frame).
-fn ivf(outs: &[Output], w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn ivf(outs: &[Output], w: u32, h: u32) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"DKIF");
     v.extend_from_slice(&0u16.to_le_bytes());

@@ -341,6 +341,15 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     .sym(&mut self.st.icdf.palette_y_size[bsize_ctx], p.size_y as i32 - 2)
                     + 2) as u8;
                 self.palette_colors(0, p.size_y as usize, &mut p.colors[0]);
+                if !S::WRITE && self.f.do_recon && p.colors[0][..p.size_y as usize].windows(2).any(|w| w[0] >= w[1]) {
+                    // decoding: a colour twice (legal, but not the writer's: its luma colours
+                    // increase)
+                    fail!(
+                        ERR_INVALID,
+                        "block {}: luma palette colours not increasing (not supported)",
+                        self.st.b_idx
+                    );
+                }
             }
         }
         if self.st.has_chroma && b.uv_mode as i32 == DC_PRED {

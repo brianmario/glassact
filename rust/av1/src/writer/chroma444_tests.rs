@@ -175,7 +175,7 @@ fn fill_levels(r: &mut Rng, q: &mut [i16], tx_sz: i32, tx_type: i32) {
 /// luma and chroma palettes and / or intra block copies, the post-filters on (`filters`: deblocking
 /// and CDEF with nonzero chroma strengths, unless the frame copies) or off, and fresh luma tx types
 /// (from each block's set) and levels.
-pub(super) fn record_444(seed: u64, maxdim: i32, filters: bool) -> Option<Record> {
+pub(crate) fn record_444(seed: u64, maxdim: i32, filters: bool) -> Option<Record> {
     let sb128 = seed % 4 == 3;
     let mut case = FuzzCase::make_444(seed, maxdim, 3, sb128)?;
     let mut rec = Record {
