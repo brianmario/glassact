@@ -133,6 +133,53 @@ in the decoder.
 - **The wire:** a new message type behind a caps bit (DESIGN §3.8, §12). The HEVC and tile paths
   stay for peers without it.
 
+## Still tiles (added 2026-11-17)
+
+The same codec could replace the lossless tile codec, and give lossy and refinement tiles. Measured
+on `metal-av1` (BENCHMARKS, 2026-11-17: "Room under VP8L for lossless tiles" and "Lossless 4:4:4
+AV1 tiles from the hybrid"), on six corpora of changed 64×64 tiles:
+
+- **Per tile, VP8L is near the frontier.** JPEG XL lossless at effort 10 is at best 8–12 % under
+  it on UI and graphics and 5–19 % over it on text; VP8L's own top effort gains 1–4 %.
+- **The room is across tiles.** 16 changed tiles coded together are 46 % smaller on typing, 12–20 %
+  on scroll, tabs and an IDE, 3–7 % on photos and graphics. A frame's spatial neighbours give only
+  3–9 % (2026-08-10), so it's redundancy over time: glyphs and lines repeat partly in later tiles,
+  where the tile cache (exact 64×64 repeats) and DELTA (the tile's own ACKed base) don't reach.
+- **AV1 can't take it, in lossless.** libaom at speed 0 with every screen tool is 2.0–2.5× VP8L's
+  bytes on text; the hybrid's 4:4:4 tiles at qindex 1, still lossy, are already 9–34 % over VP8L on
+  text and UI.
+
+Why VP8L wins in lossless, and what the codec should keep from each:
+
+| VP8L | AV1 |
+|---|---|
+| pixel-level LZ77 with short codes for nearby 2D offsets | intra block copy: whole blocks, key frames only, with a delay rule |
+| one palette of up to 256 colours for the image, indices bundled 2/4/8 to a pixel | up to 8 colours per block, paid for per block |
+| a colour cache for recently used colours | none |
+| exact RGB with reversible cross-channel transforms (subtract green, per-block colour transform) | lossless needs the identity matrix: separate planes |
+| 14 per-block pixel predictors | lossless is a 4×4 Walsh–Hadamard of the residual |
+| per-image Huffman tables, paid again on every tile | adaptive arithmetic coding (better) |
+
+Tiles the codec could make, in order of measured worth:
+
+1. **Lossless with references into what the Viewer holds.** LZ matches at any 2D offset into ACKed
+   canvas content, hash-pinned as DELTA's base is, so loss can't make them decode wrong. The cache
+   and DELTA become special cases.
+2. **No per-tile tables.** Adaptive arithmetic coding (the AV1 range coder is in `rust/av1`), with
+   priors trained on screen content that both sides ship.
+3. **Mixed tiles.** Palette and LZ coding for text, exact from the first paint, with a lossy
+   transform (the AV1 DSP) for the photographic parts.
+4. **The settle as a refinement.** The lossless settle codes only the difference from the lossy
+   tile already shown, instead of a full resend: lossy then lossless would cost about lossless
+   alone, which makes lossy first paints worth using on thin links.
+5. **Near-lossless with a hard per-pixel error bound**, text optionally exact.
+
+Before building, two measurements: each tile's cost in the replay with the Viewer's ACKed canvas
+as context (the realistic version of the 16-tile bound), and the refinement bound (a lossless
+settle given the lossy 4:4:4 tile). Constraints as for the rest of the codec: a new tile codec id
+behind a caps bit, hostile-input fuzzing (INV-6), std-only Rust, and the Host's per-tile budget
+(VP8L z4 takes 0.16–1.1 ms a tile).
+
 ## What it costs
 
 - **Power:** GPU decode on an iPad draws more than hardware AV1 or HEVC decode. It must be
