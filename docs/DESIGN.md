@@ -600,7 +600,8 @@ first negotiated codec whose encoder starts; START carries its id.
   - The Host's AV1 is Glass Act's own encoder (`HybridRegionEncoder`, the
     hybrid), on macOS 27 with an Apple-silicon GPU. Elsewhere (macOS
     15.5–26, Intel, a VM's GPU) the Host offers HEVC only. Its kernels
-    compile once a process (about 6 s), started at launch
+    compile once a process (6 s cold, well under 1 s once Metal has
+    cached them), started at launch
     (`HybridRegionEncoder.prepare`); until they have, the factory has no
     AV1 encoder and regions start on HEVC, not on a stalled queue.
   - libaom's encoder (`AOMRegionEncoder`, below) stays in the package,

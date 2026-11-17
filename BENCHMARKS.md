@@ -193,7 +193,7 @@ the numbers and the reasoning.
 | …but not for a region counting down to its dissolve | kept | 6 Mbit/s thin link: −4 to −7 % bytes on traces that re-sharpen, keyframe bytes halved, all byte-exact | [entry](#no-re-sharpen-for-a-dying-region-2026-10-22) |
 | Prefer sharpness: QP 28 ceiling when the link has headroom | kept (opt-in, 2026-10-19) | worst-frame SSIMULACRA2 50–60 → 69–75 on text at 6 Mbit/s, same average bytes; photos +26 % | [entry](#prefer-sharpness-a-qp-28-ceiling-on-a-link-with-headroom-2026-10-19) |
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
-| Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
+| Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in, until 2026-11-17: the opt-in's AV1 is now Glass Act's (below), libaom kept unused; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
 | Intra block copy in key frames (`metal-av1`, on by default) | kept | 5K BD-rate typing −18 %, cursor-drag −14 %, scroll −7 %; photos and 720p unchanged (a frame copies only when copies cover ≥ 6 % of its non-flat 8×8s: no filters then); ~10 ms of search per 5K key frame | [entry](#metal-av1-intra-block-copy-in-key-frames-2026-11-01) |
 | Lossy intra block copies; inter blocks' tx types searched (`metal-av1`) | kept | key frames also copy where a near copy's residual is ≤ 0.005 × 1.5 × step² per sample: 5K BD-rate typing −2.3 %, scroll −1.7 %, drag −3.2 % (1080p terminal crop's key frame −11 %); inter tx types: −0.1 to −2.4 % more (720p photos), 2–5 % slower on most points (one 5K point 25 %); split transforms in copies and 4×4 copies measured, not worth it | [entry](#metal-av1-lossy-intra-block-copies-and-inter-blocks-tx-types-2026-11-01) |
@@ -254,7 +254,8 @@ the numbers and the reasoning.
 | Byte-identical speedups from the reviewers' lists (`metal-av1`): the analysis kernels compiled for the hybrid's settings; the motion projections' strips summed once a picture; no transform for a residual that provably quantizes to nothing | kept | the same streams; analysis 11.3 → 10.3 ms, motion search 2.90 → 2.46; the closed loop's tx-block hook −12 % of its CPU (wall within noise); the GPU stages on a new 5K picture ≈ 21.8 → 20.4 ms. Not kept, no measurable time: CDEF's strength search from threadgroup memory, the writer's threads capped, k_leaf compiled for the hybrid | [entry](#metal-av1-byte-identical-speedups-analysis-kernels-for-the-hybrid-projections-once-a-picture-2026-11-11) |
 | The hybrid's partition read as its analysis ends, and the analysis gated behind the filters two pictures before (`metal-av1`) | kept; the next closed loop starting before the filters end not built (≤ 3.5 ms, then GPU-bound) | the same streams; from the filters' end to the next closed loop 3.0 → 0.25 ms; all-new 5K 33.1 → 35.0 inter frames a second (provisional, a loaded Mac). Found and fixed on the way: without CDEF (qindex ≤ 32) a stream coded without its pictures predicted from a reference its closed loop had overwritten | [entry](#metal-av1-the-partition-read-as-its-analysis-ends-the-analysis-behind-the-filters-a-reference-the-closed-loop-overwrote-2026-11-12) |
 | Acknowledged long-term references for the hybrid's live stream (`metal-av1`) | not needed: video is a reliable stream; every way a Viewer loses video state checked instead, and two engine gaps fixed (a stream reset's stale frames; a frame before START without its config) | replay with decode faults, stream resets and dissolves: every frame shown exact, recovery 33 ms unconstrained, 0.6–0.9 s on thin links | [entry](#video-recovery-with-the-hybrid-live-encoder-a-streams-colour-signalling-2026-11-16) |
-| The hybrid as a live video encoder: a push API, a `VideoRegionEncoder` adapter (`GlassActHybridVideo`) and bitrate targeting, in the product's replay against libaom and HEVC (`metal-av1`) | built; not in the Host (libaom stays its AV1; switching is the owner's call) | a third to a half of libaom's bytes at about its PSNR; more frames than libaom on 6 Mbit/s (photos 146 / 120, video 149 / 115, scrolling images 270 / 185); a lone new 5K picture's encode 35–45 ms p50 against libaom's 15–30 | [entry](#metal-av1-the-hybrid-as-a-live-video-encoder-with-bitrate-targeting-in-the-products-replay-2026-11-16) |
+| The hybrid as a live video encoder: a push API, a `VideoRegionEncoder` adapter (`GlassActHybridVideo`) and bitrate targeting, in the product's replay against libaom and HEVC (`metal-av1`) | built; the Host's AV1 since 2026-11-17 (the next row) | a third to a half of libaom's bytes at about its PSNR; more frames than libaom on 6 Mbit/s (photos 146 / 120, video 149 / 115, scrolling images 270 / 185); a lone new 5K picture's encode 35–45 ms p50 against libaom's 15–30 | [entry](#metal-av1-the-hybrid-as-a-live-video-encoder-with-bitrate-targeting-in-the-products-replay-2026-11-16) |
+| Glass Act's AV1 in the apps (owner's decision, 2026-11-17): the hybrid is the Host's AV1 (macOS 27, an Apple-silicon GPU), VideoToolbox or our own decoder the Viewer's, under a new Viewer caps bit (7, `videoAV1GlassAct`) since our decoder takes only the hybrid's toolset; AV1 stays codec 3; libaom kept unused behind `HostController.av1Encoder` | kept | no measurement of its own: the encoder's output is unchanged (the five reference digests), and the live numbers are the previous row's; over real QUIC, 41 of 41 frames our decoder showed were the encoder's pictures; every Host × Viewer pairing, old and new, with and without AV1 hardware, in `AV1PairingTests` | [entry](#glass-acts-av1-in-the-apps-the-hybrid-on-the-host-videotoolbox-or-our-decoder-on-the-viewer-2026-11-17) |
 | The hybrid's streams on VideoToolbox's hardware AV1 decoder, the Viewer's (`metal-av1`, `av1seq --vt-decode`) | measured: they decode, exactly | 13 configurations (5K, 2900, 1280; intra block copy, long-term references, fast pictures, no CDEF, tilings, 128x128 superblocks): every frame identical to the encoder's picture; a test guards it on M3 and later | [entry](#metal-av1-the-hybrids-streams-on-videotoolboxs-av1-decoder-2026-11-16) |
 | Real streams at 2900 wide against libaom and HEVC (`metal-av1`) | measured; the fast pictures limited to streams larger than 4K on it | the hybrid leads both on typing, an IDE, scrolling, dragging and app switching (13–51 % against libaom, 26–36 % against HEVC), is level with HEVC on photos; on video +20 % / +5 % against HEVC with the fast pictures and −5 % / −10 % without; on scrolling images (resampled: sub-sample motion) HEVC needs 25–37 % fewer bytes either way | [entry](#metal-av1-real-streams-at-2900-against-libaom-and-hevc-the-fast-pictures-only-above-4k-2026-11-12) |
 | The hybrid against libaom realtime and hardware HEVC with the defaults of 2026-11-12 (`metal-av1`) | measured | real 5K streams: 16–58 % fewer bytes than libaom and 17–77 % fewer than HEVC at equal quality on all eight, at 54–337 frames a second against libaom's 35–217 and HEVC's 31–56; at 2900 (resampled) HEVC needs 4–10 % fewer bytes on video and 24–31 % fewer on scrolling images | [entry](#metal-av1-against-libaom-and-hardware-hevc-with-the-days-defaults-real-streams-at-5k-mixes-at-session-size-2026-11-12) |
@@ -344,6 +345,57 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Glass Act's AV1 in the apps: the hybrid on the Host, VideoToolbox or our decoder on the Viewer (2026-11-17)
+
+The owner's decision: with "Use AV1 video" on, AV1 is Glass Act's own, on the Mac and the iPad.
+Branch `av1-ours-in-apps` (off `metal-av1`). No performance change of its own: the encoder's
+output is unchanged (below), and how the hybrid does live is the replay's entry under this one.
+
+**What ships.**
+- **Host:** `HostVideoEncoders` (GlassActHybridVideo) picks the AV1: the hybrid where it runs
+  (macOS 27, an Apple-silicon GPU), else HEVC alone. libaom's encoder stays in the package,
+  unused, behind one constant, `HostController.av1Encoder = .libaom`; it is no fallback for ours.
+  The kernels compile once a process, 6.2 s cold here (a fraction of a second once Metal has
+  cached them), so the Host starts them at launch (`HybridRegionEncoder.prepare`) and its
+  factory offers no AV1 encoder until they're done: the region starts on HEVC instead of the
+  engine's queue waiting on the compile.
+- **Viewer:** `ViewerVideoDecoders.glassAct` (GlassActAV1Decode), injected into the session so
+  GlassActCore and GlassActSession don't link Rust: VideoToolbox for HEVC, and for AV1 where the
+  Mac or iPad decodes it in hardware (M3 and later, any Host's AV1), else `OwnAV1RegionDecoder`.
+  The switch is enabled everywhere now.
+- **Wire** (additive): Viewer caps bit 7, `videoAV1GlassAct`, "decodes AV1 from Glass Act's
+  encoder" (bit 7 was `videoOverlay`, retired before wire version 4, so no peer this one can
+  talk to ever sent it). A Viewer sets it with any AV1 decoder and bit 1 only with VideoToolbox's;
+  a Host whose AV1 is ours answers either, a libaom Host only bit 1. AV1 stays codec 3: a new
+  id would cost released M3 Viewers their AV1 (their guard maps an unknown id to the HEVC bit and
+  VideoToolbox refuses it). DESIGN §4.6 has the pairing table; `AV1PairingTests` runs its 25
+  cells through the engines with mock codecs on the real ids, the released peers as the caps
+  they send (HELLO `0x0E71`, HELLO_OK `0x03` / `0x01`).
+- **Builds:** Xcode never ran `scripts/build-rust`. Now each app target's first build phase runs
+  `scripts/build-rust --xcode`, which maps Xcode's PLATFORM_NAME and ARCHS to Rust targets (adding
+  a missing one with rustup), builds in a clean environment (an Xcode script's SDKROOT and
+  deployment targets would otherwise reach build.rs and the cache), and lipos: the Mac apps
+  universal into `.build/rust` (AV1Core's `-L`, now macOS only); iPadOS and its Simulator (both
+  arm64, so not one universal file) into `.build/rust/iphoneos` and `iphonesimulator`, which the
+  iPad target's LIBRARY_SEARCH_PATHS picks by PLATFORM_NAME, since SwiftPM refuses build-setting
+  macros in unsafeFlags. An xcframework binary target was rejected: it must exist when the package
+  resolves, before any build phase could make it. The Host's phase also copies the kernels'
+  sources into Resources/AV1Shaders: an installed Host has no source tree, and `#filePath` alone
+  would have left every Host but a developer's without AV1, silently (`ShaderBundleTests`
+  checks the copy assembles as the tree does). Libraries at the apps' deployment targets
+  (15.5, 27.0); x86_64-apple-ios for a generic Simulator build. The apps' acknowledgements gain
+  av1gpu's BSD-2 notice.
+
+**Gates.** The five reference digests unchanged after the last change (`b2c0cf4a45158b3a` /
+`191fce78d22cdb78`, `1082c1633f48dc22` / `a62723f000e81e54`, `4fd6684b7d92c680` / `aeba358023201e7b`,
+`61775b236211418f` / `a758ec70c05e4475`, `ebdc001957933f8d` / `316f844512c24ec7`). `cargo test
+--release` 81 + 2; `GLASSACT_FAST=1 swift test` green; the real-QUIC suites green, the new
+`AV1SessionQUICTests` included: a new Host and Viewer over loopback negotiate our AV1 at 1280×768,
+the Viewer shows 40 frames, every one of the 41 our decoder showed was the encoder's picture (its
+reconstruction's hash), and the canvas is exact once the motion stops; the same with VideoToolbox.
+Builds: Host, Viewer (Debug, and Release universal), iPad (device, generic Simulator), the
+GlassActViewer package for iPadOS, `swift build --arch x86_64 --build-tests`.
 
 ### Video: frames that predict from lost ones after a stream reset (2026-11-16)
 
