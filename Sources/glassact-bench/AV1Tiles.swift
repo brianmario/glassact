@@ -19,6 +19,7 @@ let av1TilesCommand = Command(
         .string("corpus", "<file>", required: true, "tiles, raw BGRA 64×64, concatenated (glassact-bench dumptiles)"),
         .string("q", "<list>", "AV1 quantizers 0–63 (libaom's scale), comma-separated (default 8,20,32,44)"),
         .string("out", "<prefix>", "write each quantizer's decoded tiles to <prefix>-q<q>.raw (BGRA, the corpus's order)"),
+        .string("obus", "<prefix>", "with --chroma 444: write each quantizer's streams to <prefix>-q<q>.obus (per tile a little-endian u32 length and its OBUs; rust/av1 examples/tile_stats reads them)"),
         .bool("palette", "with --chroma 444: intra blocks may be luma palette blocks, decided by cost (AV1HybridEncoder.palette); prints how many are"),
         .string("chroma", "<420|444>", "AV1 key frames' chroma: 420 (default; BT.709 video range) or 444 (High profile; BT.601 full range, as the sequence header signals; every tile checked against libaom's decode)"),
     ],
@@ -67,7 +68,8 @@ func cmdAV1Tiles(opts: Options) throws {
     }
 
     if chroma == "444" {
-        try av1Tiles444(corpus: corpus, n: n, qs: qs, device: device, out: opts.string("out"), palette: opts.has("palette"))
+        try av1Tiles444(corpus: corpus, n: n, qs: qs, device: device, out: opts.string("out"), palette: opts.has("palette"),
+                        obus: opts.string("obus"))
         return
     }
 
@@ -131,7 +133,8 @@ func cmdAV1Tiles(opts: Options) throws {
 /// default too). Every tile is decoded by libaom and must equal the encoder's picture exactly; with
 /// `out`, the decoded tiles (and the conversion alone) back to BGRA by the same matrix.
 @available(macOS 27, *)
-private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?, palette: Bool) throws {
+private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?, palette: Bool,
+                         obus: String? = nil) throws {
     let side = 64, tileBytes = side * side * 4
     func tile(_ i: Int) -> YUV444 {
         corpus.withUnsafeBytes { YUV444(bgra: UnsafeRawBufferPointer(rebasing: $0[i * tileBytes..<(i + 1) * tileBytes]), width: side, height: side) }
@@ -157,6 +160,7 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
         let qindex = q == 63 ? 255 : max(1, 4 * q)
         let before = encoder.paletteStats
         var bytes = 0, payload = 0, copied = 0
+        var streams = [UInt8]()
         var decoded = [UInt8]()
         decoded.reserveCapacity(prefix == nil ? 0 : corpus.count)
         var seconds = 0.0
@@ -168,6 +172,10 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
             let frame = try encoder.encode(picture, qindex: qindex)
             seconds += CACurrentMediaTime() - t0
             bytes += frame.obu.count
+            if obus != nil {
+                withUnsafeBytes(of: UInt32(frame.obu.count).littleEndian) { streams += $0 }
+                streams += frame.obu
+            }
             if frame.timing.intraCopied > 0 { copied += 1 }
             var parsed: UnsafeMutablePointer<av1g_parsed>?
             guard av1g_parse(frame.obu, frame.obu.count, &parsed) == AV1G_OK, let p = parsed else {
@@ -196,6 +204,9 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
         }
         if let prefix {
             try Data(decoded).write(to: URL(fileURLWithPath: "\(prefix)-q\(q).raw"))
+        }
+        if let obus {
+            try Data(streams).write(to: URL(fileURLWithPath: "\(obus)-q\(q).obus"))
         }
     }
 }
