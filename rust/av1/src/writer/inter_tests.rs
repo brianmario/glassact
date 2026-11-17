@@ -947,7 +947,9 @@ fn decoders() {
     decoders_run(false);
 }
 
-/// [`decoders`] of 4:4:4 sequences ([`InterSeq::make_444`]): key and inter frames.
+/// [`decoders`] of 4:4:4 sequences ([`InterSeq::make_444`]): key and inter frames, inter frames
+/// deblocked and CDEF'd among them, with skipped inter blocks 64 wide or high (whose chroma tx edge
+/// inside them isn't filtered: [`crate::postfilter::LF_SKIP_W64`]).
 #[test]
 #[ignore]
 fn decoders_444_inter() {
@@ -973,6 +975,8 @@ fn decoders_run(c444: bool) {
         std::sync::atomic::AtomicU64::new(0),
     );
     let stills = std::sync::atomic::AtomicU64::new(0);
+    // inter frames deblocked, CDEF'd, and their skipped inter blocks 64 wide or high at a level
+    let filtered = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     seeds(n, |w, seed| {
         let Some(mut seq) = make_seq(seed, maxdim, nframes, c444) else {
             return;
@@ -984,6 +988,24 @@ fn decoders_run(c444: bool) {
             |c: &std::sync::atomic::AtomicU64, k: usize| c.fetch_add(k as u64, std::sync::atomic::Ordering::Relaxed);
         count(&sb128_frames, seq.frames.iter().filter(|r| r.fp.sb128 != 0).count());
         count(&headerless, seq.flags.iter().filter(|&&f| f != 0).count());
+        for r in seq
+            .frames
+            .iter()
+            .filter(|r| r.fp.frame_type == FRAME_INTER && r.fp.allow_intrabc == 0)
+        {
+            let deblocked = r.fp.loop_filter_level[0] != 0 || r.fp.loop_filter_level[1] != 0;
+            count(&filtered[0], deblocked as usize);
+            count(&filtered[1], (r.fp.enable_cdef != 0) as usize);
+            if deblocked && r.fp.lf_inter_off == 0 {
+                let skip64 = r.blocks.iter().zip(&r.inter).filter(|(b, i)| {
+                    let bs = b.bsize as i32;
+                    b.skip != 0
+                        && i.is_inter != 0
+                        && (crate::blockinfo::bw4(bs) == 16 || crate::blockinfo::bh4(bs) == 16)
+                });
+                count(&filtered[2], skip64.count());
+            }
+        }
         let outs = encode_seq(w, &mut seq, ENC_FIX_RANGE | ENC_TD | ENC_CHECK_EDGES)
             .unwrap_or_else(|(k, e)| panic!("seed {seed} frame {k}: {e}"));
         let kinds: Vec<&str> = seq
@@ -1012,8 +1034,10 @@ fn decoders_run(c444: bool) {
             stills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
+    let [deblocked, cdef, skip64] = filtered.map(|c| c.into_inner());
     eprintln!(
-        "{} frames decode exactly ({} with 128x128 superblocks, {} without a sequence header), and {} \
+        "{} frames decode exactly ({} with 128x128 superblocks, {} without a sequence header; inter frames \
+         deblocked {deblocked}, CDEF {cdef}, skipped inter blocks 64 wide or high deblocked {skip64}), and {} \
          still pictures with 128x128 superblocks; {}; {}; {}",
         frames.into_inner(),
         sb128_frames.into_inner(),
@@ -1023,7 +1047,15 @@ fn decoders_run(c444: bool) {
         sb128_coverage(),
         intrabc_coverage()
     );
+    assert!(
+        deblocked > 0 && cdef > 0,
+        "no inter frames filtered: deblocked {deblocked}, CDEF {cdef}"
+    );
     if c444 {
+        assert!(
+            skip64 > 0,
+            "no skipped inter blocks 64 wide or high in a deblocked 4:4:4 frame"
+        );
         // (4:4:4 chroma predicts at luma's positions, and is counted as luma)
         assert_phase_coverage_ex(1, false);
     } else {
