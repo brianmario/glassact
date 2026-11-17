@@ -1048,3 +1048,195 @@ fn streams_match_libaom() {
     }
     eprintln!("{total} frames");
 }
+
+/// A key frame (or still picture) of one skipped DC_PRED 64x64 a superblock, sides multiples of 64,
+/// in tile order: what the writer codes fast at any size.
+fn flat_record(w: u32, h: u32, c444: bool, video: bool, cols_log2: i32) -> Record {
+    let tiles = crate::writer::tile_layout_ex(w, h, cols_log2, -1, false).unwrap();
+    let mut fp = crate::types::FrameParams {
+        version: crate::types::DECISIONS_VERSION,
+        width: w,
+        height: h,
+        base_q_idx: 120,
+        video: video as u8,
+        tile_cols_log2: tiles.cols_log2 as i8,
+        tile_rows_log2: tiles.rows_log2 as i8,
+        chroma_format: c444 as u8,
+        ..Default::default()
+    };
+    fp.loop_filter_level = [10, 10, 5, 5];
+    let mut blocks = Vec::new();
+    for tr in 0..tiles.rows as usize {
+        for tc in 0..tiles.cols as usize {
+            for r in (tiles.mi_row_starts[tr]..tiles.mi_row_starts[tr + 1]).step_by(16) {
+                for c in (tiles.mi_col_starts[tc]..tiles.mi_col_starts[tc + 1]).step_by(16) {
+                    blocks.push(Block {
+                        mi_row: r as u16,
+                        mi_col: c as u16,
+                        bsize: BLOCK_64X64 as u8,
+                        skip: 1,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    let mut rec = Record::new(fp, blocks);
+    rec.layout().unwrap();
+    rec
+}
+
+/// `tu`'s frame with every tile's payload cut to one byte of `fill`, its tile sizes and OBU size
+/// rewritten: a well-formed unit of a few bytes for a whole frame.
+fn one_byte_tiles(tu: &[u8], fill: u8) -> Vec<u8> {
+    let p = crate::writer::parse(tu).unwrap();
+    let (offs, sizes) = (&p.tile_offsets, &p.tile_bytes);
+    let n = offs.len();
+    let tsb = if n > 1 {
+        (offs[1] - offs[0]) as usize - sizes[0] as usize
+    } else {
+        0
+    };
+    // the frame OBU: its header byte and size field end before its payload, which starts with the
+    // frame header; the first tile's size field (or payload) ends it
+    let first = offs[0] as usize - tsb;
+    let mut pos = 0;
+    let mut frame_at = None;
+    while pos < tu.len() {
+        let h = tu[pos];
+        let (ty, ext) = ((h >> 3) & 15, (h >> 2) & 1);
+        let start = pos;
+        pos += 1 + ext as usize;
+        let (mut sz, mut i) = (0usize, 0);
+        loop {
+            let b = tu[pos];
+            pos += 1;
+            sz |= ((b & 0x7f) as usize) << (7 * i);
+            i += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        if ty == 6 {
+            frame_at = Some((start, pos));
+            break;
+        }
+        pos += sz;
+    }
+    let (start, payload) = frame_at.unwrap();
+    let mut body = tu[payload..first].to_vec();
+    for k in 0..n {
+        if k + 1 < n {
+            body.extend(std::iter::repeat_n(0u8, tsb)); // tile_size_minus_1 = 0
+        }
+        body.push(fill);
+    }
+    let mut out = tu[..start].to_vec();
+    out.push(tu[start] | 2);
+    let mut v = body.len();
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if v != 0 { b | 0x80 } else { b });
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The process's peak resident memory in MB (getrusage's ru_maxrss: bytes on macOS).
+fn peak_mb() -> f64 {
+    #[repr(C)]
+    struct Rusage {
+        times: [i64; 4],
+        maxrss: i64,
+        rest: [i64; 13],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, r: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage {
+        times: [0; 4],
+        maxrss: 0,
+        rest: [0; 13],
+    };
+    // SAFETY: getrusage fills the caller's struct (RUSAGE_SELF).
+    unsafe { getrusage(0, &mut r) };
+    r.maxrss as f64 / (1 << 20) as f64 * if cfg!(target_vendor = "apple") { 1.0 } else { 1024.0 }
+}
+
+/// Frames at the size limit, exact; then the same frames' headers with one-byte tiles (a full-size
+/// decode from a few bytes) and with random tile data: every decode bounded in time, the memory
+/// what the pictures take.
+#[test]
+#[ignore]
+fn large_frames() {
+    let mut cases: Vec<(String, Record)> = vec![
+        ("8192x8192 4:2:0".into(), flat_record(8192, 8192, false, true, -1)),
+        ("8192x8192 4:4:4".into(), flat_record(8192, 8192, true, false, -1)),
+        ("8192x64, 64 tile columns".into(), flat_record(8192, 64, false, true, 6)),
+        (
+            "4096x4096, 64 tile columns".into(),
+            flat_record(4096, 4096, false, true, 6),
+        ),
+    ];
+    for seed in 0..400 {
+        if let Some(r) = fuzz_record(seed, 8192)
+            && r.fp.width <= MAX_DIM
+            && r.fp.height <= MAX_DIM
+            && r.fp.width as u64 * r.fp.height as u64 > 1 << 20
+        {
+            cases.push((format!("fuzz {seed}: {}x{}", r.fp.width, r.fp.height), r));
+            if cases.len() >= 8 {
+                break;
+            }
+        }
+    }
+    let mut w = Writer::new();
+    let mut d = Decoder::new(8);
+    let mut r = Rng(99);
+    for (what, mut rec) in cases {
+        let mut out = Output::default();
+        let opts = EncodeOpts {
+            flags: ENC_FIX_RANGE | ENC_TD,
+            seq_level_idx: -1,
+        };
+        w.encode(rec.as_mut(), &opts, &mut out).unwrap();
+        let t = Instant::now();
+        let pic = d.decode(&out.obu).unwrap_or_else(|e| panic!("{what}: {e}"));
+        same(&pic, &out).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let exact = ms(t);
+        let tiles = d.stats().tiles;
+        let tiny = one_byte_tiles(&out.obu, r.next() as u8);
+        let t = Instant::now();
+        let res = d.decode(&tiny).map(|_| ());
+        let tiny_ms = ms(t);
+        let mut random = out.obu.clone();
+        let len = random.len();
+        for b in &mut random[40.min(len)..] {
+            *b = r.next() as u8;
+        }
+        let t = Instant::now();
+        let res2 = d.decode(&random).map(|_| ());
+        let random_ms = ms(t);
+        eprintln!(
+            "{what}, {tiles} tiles, {} bytes: exact in {exact:.0} ms; {} bytes of one-byte tiles: {} in {tiny_ms:.0} ms; random tile data: {} in {random_ms:.0} ms; peak {:.0} MB",
+            out.obu.len(),
+            tiny.len(),
+            if res.is_ok() {
+                "decoded".to_string()
+            } else {
+                format!("{:?}", res.unwrap_err().msg)
+            },
+            if res2.is_ok() {
+                "decoded".to_string()
+            } else {
+                format!("{:?}", res2.unwrap_err().msg)
+            },
+            peak_mb()
+        );
+        assert!(tiny_ms < 5000.0 && random_ms < 5000.0, "{what}");
+    }
+}
