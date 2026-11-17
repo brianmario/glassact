@@ -2,6 +2,7 @@
 // virtual time, then the §7 settle and the golden canvas check.
 import Foundation
 import GlassActAV1
+import GlassActAV1Decode
 import GlassActCodec
 import GlassActCore
 import GlassActHybridVideo
@@ -58,6 +59,10 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     videoFaults.armed()
     videoFaults.now = { link.nowUS }
     var viewerCodecs: [UInt8] = []
+    // --decoder: the Viewer's AV1 decoder (--video hybrid); the own decoders made, for their stats
+    let viewerDecoder = opts.string("decoder")
+    if viewerDecoder != nil && videoMode != "hybrid" { throw BenchError("--decoder: with --video hybrid") }
+    var ownDecoders: [OwnAV1RegionDecoder] = []
     let vtPipeline = BenchVTPipeline()
     let score = ReplayVideoScore()
     score.now = { link.nowUS }
@@ -133,7 +138,20 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             }
             return BenchPipelinedEncoder(h, vtPipeline)
         }
-        decoderFactory = { scored(VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder()) }
+        switch viewerDecoder ?? (VTRegionDecoder.canDecodeAV1 ? "vt" : "aom") {
+        case "vt":
+            guard VTRegionDecoder.canDecodeAV1 else { throw BenchError("--decoder vt: this Mac has no hardware AV1 decode") }
+            decoderFactory = { scored(VTRegionDecoder()) }
+        case "aom":
+            guard AOMRegionEncoder.isAvailable else { throw BenchError("--decoder aom needs Apple silicon (libaom is arm64 only)") }
+            decoderFactory = { scored(AOMRegionDecoder()) }
+        default:
+            decoderFactory = {
+                let d = OwnAV1RegionDecoder()
+                ownDecoders.append(d)
+                return scored(d)
+            }
+        }
         hostCodecs = [VideoCodec.av1]
         viewerCodecs = [VideoCodec.av1]
     case "av1-hevc":
@@ -162,7 +180,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         throw BenchError("--video expects mock, vt, av1, hybrid or av1-hevc")
     }
     if videoFaults.active, let real = decoderFactory {
-        decoderFactory = { FaultingDecoder(real(), videoFaults) }
+        // (real() made the own decoder last, when it's ours)
+        decoderFactory = { FaultingDecoder(real(), videoFaults, checking: viewerDecoder == "own" ? ownDecoders.last : nil) }
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -504,6 +523,16 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     """)
     if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
+        print(score.decodeTimeSummary)
+        if !ownDecoders.isEmpty {
+            let st = ownDecoders.map(\.stats)
+            func sum(_ f: (OwnAV1RegionDecoder.Stats) -> UInt64) -> Double { Double(st.map(f).reduce(0, +)) / 1e6 }
+            let (n, k) = (st.map(\.framesShown).reduce(0, +), st.map(\.keyFramesShown).reduce(0, +))
+            func each(_ total: Double, _ count: Int) -> String { count == 0 ? "-" : String(format: "%.2f", total / Double(count)) }
+            print("  own decoder: \(ownDecoders.count) started, \(n) frames shown (\(k) key), \(st.map(\.failures).reduce(0, +)) failed · "
+                  + "ms a frame: key decode \(each(sum(\.keyDecodeNS), k)) + conversion \(each(sum(\.keyConvertNS), k)) · "
+                  + "inter decode \(each(sum(\.decodeNS) - sum(\.keyDecodeNS), n - k)) + conversion \(each(sum(\.convertNS) - sum(\.keyConvertNS), n - k))")
+        }
         if videoFaults.active {
             print(videoFaults.summary + " · sync requests ignored by the Host \(host.stats.videoSyncRequestsIgnored)"
                   + " · stream resets the Host saw \(host.stats.videoChannelResets)")

@@ -1,7 +1,9 @@
 // replay --mode loop's video faults, by count (deterministic), and the check that every frame
 // the Viewer shows is the encoder's own picture of it.
+import AV1Core
 import Foundation
 import GlassActAV1
+import GlassActAV1Decode
 import GlassActCodec
 import GlassActCore
 import libaom
@@ -19,7 +21,8 @@ import libaom
 /// With `checksPictures` (the hybrid, whose reconstruction the adapter returns), every frame the
 /// Viewer's decoder shows is decoded again by a libaom decoder that holds what the Viewer's does
 /// (rebuilt where it is, fed what it's fed), and compared with the encoder's reconstruction of
-/// that frame: a frame that predicted from a picture the Viewer never got wouldn't match.
+/// that frame: a frame that predicted from a picture the Viewer never got wouldn't match. With
+/// `--decoder own`, the Viewer's decoder's own planes are compared instead (no mirror).
 final class ReplayVideoFaults: @unchecked Sendable {
     var decodeAt: Set<Int> = []
     var resetAt: [Int] = []
@@ -58,6 +61,26 @@ final class ReplayVideoFaults: @unchecked Sendable {
 
     static func hash(_ planes: [[UInt8]]) -> UInt64 {
         XXH64.hash(planes[2], seed: XXH64.hash(planes[1], seed: XXH64.hash(planes[0])))
+    }
+
+    /// The frame `decoder` showed last, hashed as `hash` hashes the encoder's planes (cropped); nil
+    /// when it showed none.
+    static func hash(shownBy decoder: OwnAV1RegionDecoder, scratch: inout [UInt8]) -> UInt64? {
+        decoder.withShownPicture { p -> UInt64? in
+            let planes = [p.planes.0, p.planes.1, p.planes.2], strides = [p.stride.0, p.stride.1, p.stride.2]
+            let ws = [p.plane_w.0, p.plane_w.1, p.plane_w.2], hs = [p.plane_h.0, p.plane_h.1, p.plane_h.2]
+            var h: UInt64 = 0
+            for k in 0..<3 {
+                guard let base = planes[k] else { return nil }
+                let (w, rows) = (Int(ws[k]), Int(hs[k]))
+                if scratch.count < w * rows { scratch = [UInt8](repeating: 0, count: w * rows) }
+                scratch.withUnsafeMutableBytes { dst in
+                    for r in 0..<rows { (dst.baseAddress! + r * w).copyMemory(from: base + r * Int(strides[k]), byteCount: w) }
+                }
+                h = scratch.withUnsafeBytes { XXH64.hash(UnsafeRawBufferPointer(rebasing: $0[0..<(w * rows)]), seed: h) }
+            }
+            return h
+        } ?? nil
     }
 
     // the Viewer's side (the rig's one thread)
@@ -138,10 +161,13 @@ final class FaultingDecoder: VideoRegionDecoder {
     /// The libaom decoder that holds what `inner` holds.
     private var mirror: OpaquePointer?
     private var scratch: [UInt8] = []
+    /// `--decoder own`: the decoder whose planes are checked (no mirror then).
+    private let own: OwnAV1RegionDecoder?
 
-    init(_ inner: any VideoRegionDecoder, _ faults: ReplayVideoFaults) {
+    init(_ inner: any VideoRegionDecoder, _ faults: ReplayVideoFaults, checking own: OwnAV1RegionDecoder? = nil) {
         self.inner = inner
         self.faults = faults
+        self.own = own
     }
 
     func start(codec: UInt8, config: [UInt8], width: Int, height: Int) -> Bool {
@@ -152,7 +178,7 @@ final class FaultingDecoder: VideoRegionDecoder {
 
     private func rebuildMirror() {
         if let mirror { glassact_aom_dec_destroy(mirror) }
-        mirror = faults.checksPictures ? glassact_aom_dec_create(4) : nil
+        mirror = faults.checksPictures && own == nil ? glassact_aom_dec_create(4) : nil
     }
 
     @discardableResult
@@ -184,7 +210,13 @@ final class FaultingDecoder: VideoRegionDecoder {
             return false
         }
         awaitsSync = false
-        faults.noteShown(check: mirrorPicture(data), bytes: data)
+        let check: UInt64?
+        if let own {
+            check = faults.checksPictures ? ReplayVideoFaults.hash(shownBy: own, scratch: &scratch) : nil
+        } else {
+            check = mirrorPicture(data)
+        }
+        faults.noteShown(check: check, bytes: data)
         return true
     }
 

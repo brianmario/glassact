@@ -8,7 +8,7 @@ import GlassActCodec
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
                              "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "frames", "score-every",
                              "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
-                             "no-check-pictures", "fault-reset-untold"]
+                             "no-check-pictures", "fault-reset-untold", "decoder"]
 
 let replayCommand = Command(
     name: "replay",
@@ -36,6 +36,7 @@ let replayCommand = Command(
         .bool("no-check-pictures", "loop, --video hybrid: no picture check with --fault-* (the encoder as the product runs it, without its reconstruction)"),
         .bool("fault-reset-untold", "loop: with --fault-reset, the Host is never told (the Viewer's sync requests recover the region in place)"),
         .bool("check-pictures", "loop, --video hybrid: check every frame the Viewer shows against the encoder's reconstruction (on with any --fault-*)"),
+        .choice("decoder", ["vt", "aom", "own"], "loop, --video hybrid: the Viewer's AV1 decoder — vt (VideoToolbox, hardware), aom (libaom) or own (Glass Act's own, GlassActAV1Decode); default vt where this Mac decodes AV1 in hardware, else aom. With own, the picture check compares its own planes"),
         .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),

@@ -65,6 +65,24 @@ final class ReplayVideoScore {
         if !pendingSubmits.isEmpty { pendingSubmits.removeFirst() }
     }
 
+    /// Each frame the Viewer's decoder showed: its time in the decoder (real, ns; without the blit
+    /// and the scoring its pixels go to), and whether it was a sync frame.
+    private(set) var decodeTimes: [(ns: UInt64, sync: Bool)] = []
+
+    func decodeTime(_ ns: UInt64, sync: Bool) { decodeTimes.append((ns, sync)) }
+
+    var decodeTimeSummary: String {
+        func line(_ v: [UInt64]) -> String {
+            guard !v.isEmpty else { return "-" }
+            let s = v.sorted(), ms = { (x: UInt64) in Double(x) / 1e6 }
+            let mean = ms(s.reduce(0, +)) / Double(s.count)
+            return String(format: "n %d, mean %.2f, p50 %.2f, p90 %.2f, max %.2f ms", s.count, mean,
+                          ms(s[s.count / 2]), ms(s[min(s.count - 1, s.count * 9 / 10)]), ms(s.last!))
+        }
+        return "  decode (\(decoderName), real, without the blit): key frames " + line(decodeTimes.filter(\.sync).map(\.ns))
+            + " · inter " + line(decodeTimes.filter { !$0.sync }.map(\.ns))
+    }
+
     func decoded(_ data: [UInt8], pixels: UnsafeRawBufferPointer?, bytesPerRow: Int, decoder: String) {
         decoderName = decoder
         let h = Self.hash(data)
@@ -166,11 +184,18 @@ final class ScoringDecoder: VideoRegionDecoder {
     func decode(_ data: [UInt8], sync: Bool, onPixels: (_ pixels: UnsafeRawBufferPointer, _ bytesPerRow: Int) -> Void) -> Bool {
         var seen = false
         let name = String(describing: type(of: inner))
+        // the decoder's own time: the call less what its pixels cost here (scoring, the blit)
+        var downstream: UInt64 = 0
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let ok = inner.decode(data, sync: sync) { pixels, bytesPerRow in
+            let c0 = DispatchTime.now().uptimeNanoseconds
             seen = true
             score.decoded(data, pixels: pixels, bytesPerRow: bytesPerRow, decoder: name)
             onPixels(pixels, bytesPerRow)
+            downstream &+= DispatchTime.now().uptimeNanoseconds &- c0
         }
+        let spent = DispatchTime.now().uptimeNanoseconds &- t0 &- downstream
+        if ok { score.decodeTime(spent, sync: sync) }
         if ok && !seen { score.decoded(data, pixels: nil, bytesPerRow: 0, decoder: name) }
         return ok
     }
