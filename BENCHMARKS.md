@@ -137,6 +137,7 @@ the numbers and the reasoning.
 | VP8L tiles (vendored libwebp, 0x0A) | kept | scroll 14.6 → 9.83 MB/s, typing 313 → 159 KB/s | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | In-house spatial predictors + LZBITMAP | rejected | 0 % on the text corpus (728 → 728 B/tile) | [entry](#vp8l-tile-codec-vendored-libwebp-opcode-0x0a--in-house-exploration-2026-08-05) |
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
+| Lossless tiles against VP8L: per tile vs with earlier tiles as context (`scripts/tile-lossless-bound`) | measured | per tile, JPEG XL e10 is at best 8–12 % under VP8L and over it on text; 16 changed tiles coded together are 46 % smaller on typing, 12–20 % on UI, 3–7 % on photos and graphics | [entry](#room-under-vp8l-for-lossless-tiles-per-tile-or-across-tiles-2026-11-17) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
 | The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text (before the palettes below) | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
@@ -347,6 +348,37 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Room under VP8L for lossless tiles: per tile, or across tiles? (2026-11-17)
+
+The owner asked whether we could get smaller than VP8L everywhere. `scripts/tile-lossless-bound`
+(new) on the six `dumptiles` corpora (every 7th changed tile of a trace): cwebp lossless per tile,
+and as groups of 16 consecutive corpus tiles in one 256×256 image; cjxl lossless (`-d 0`) per
+tile at efforts 7, 9, 10, and grouped at 9. Bytes a tile (the file, so VP8L's includes its 20 B
+RIFF header; the product's VP8L z4 is the same within a byte):
+
+| Tiles | VP8L z4 | VP8L z9 | VP8L z9, groups of 16 | JXL e7 | e9 | e10 | JXL e9, groups of 16 |
+|---|---|---|---|---|---|---|---|
+| typing-cc | 417 | 413 | **226 (−46 %)** | 518 | 544 | 496 | 271 |
+| scroll-win | 381 | 369 | 328 (−14 %) | 427 | 421 | 380 | 378 |
+| tabs | 404 | 388 | 357 (−12 %) | 413 | 404 | 373 | 371 |
+| ide | 501 | 496 | 403 (−20 %) | 589 | 577 | 525 | 526 |
+| photos | 3332 | 3344 | 3247 (−3 %) | 3135 | 3037 | 3038 | 3046 |
+| cursor-drag | 2382 | 2349 | 2220 (−7 %) | 2271 | 2171 | 2088 | 2152 |
+
+- **Per tile, the room is small.** The best of anything here (JPEG XL at its slowest effort) is
+  8–12 % under VP8L on tabs, photos and graphics, even on scroll, and 5–19 % over it on IDE and
+  text. VP8L's own top effort gains 1–4 %.
+- **Across tiles, the room is large on text and UI.** The same tiles coded 16 to an image, in the
+  order they changed, are 46 % smaller on typing, 12–20 % on scroll, tabs and IDE, 3–7 % on photos
+  and graphics. Whole frames of spatial neighbours gained only 3–9 % (the settle-coalescing entry,
+  2026-08-10), so this is redundancy over time: changed tiles repeat glyphs and lines from tiles
+  sent before them, partly, where the tile cache (exact 64×64 repeats) and DELTA (against the
+  tile's own ACKed base) don't reach.
+- **What would take it:** coding a tile with references into content the Viewer is known to hold
+  (ACKed, hash-pinned as DELTA's base is), not alone. The 16-tile groups are a loose bound: in the
+  product a tile's history is the canvas the Viewer has, at the time, which this doesn't model.
+  The next measurement is that bound in the replay.
 
 ### Lossless 4:4:4 AV1 tiles from the hybrid: a bound before building it (2026-11-17)
 

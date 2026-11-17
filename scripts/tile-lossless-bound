@@ -1,0 +1,52 @@
+#!/usr/bin/env python3 -I
+"""Lossless bounds on `glassact-bench dumptiles` corpora (BENCHMARKS, 2026-11-17): VP8L (cwebp) per
+tile and as 16-tile 256x256 groups in corpus order, and JPEG XL (cjxl -d 0) at efforts 7, 9, 10. Measurement
+only: needs cwebp and cjxl on PATH (Homebrew); 4 worker processes.
+
+  scripts/tile-lossless-bound <corpus dir> <work dir> typing,scroll,...
+"""
+import os, sys, zlib, struct, subprocess, statistics
+from concurrent.futures import ThreadPoolExecutor
+SRC, WORK = sys.argv[1], sys.argv[2]
+NAMES = sys.argv[3].split(","); SIDE, TB = 64, 64 * 64 * 4
+def png(path, rgb, w, h):
+    rows = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+def tile_rgb(raw, i):
+    t = raw[i * TB:(i + 1) * TB]; out = bytearray(SIDE * SIDE * 3)
+    out[0::3] = t[2::4]; out[1::3] = t[1::4]; out[2::3] = t[0::4]; return bytes(out)
+def size(cmd, out):
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); return os.path.getsize(out)
+def webp_body(path):  # VP8L payload: the RIFF file minus its 20-byte RIFF+VP8L chunk header
+    return os.path.getsize(path) - 20
+pool = ThreadPoolExecutor(max_workers=4)
+for name in NAMES:
+    raw = open(f"{SRC}/{name}.raw", "rb").read(); n = len(raw) // TB
+    d = f"{WORK}/{name}"; os.makedirs(d, exist_ok=True)
+    tiles = [tile_rgb(raw, i) for i in range(n)]
+    for i, t in enumerate(tiles): png(f"{d}/t{i:04d}.png", t, SIDE, SIDE)
+    # groups of 16 tiles as one 256x256 image (corpus order; tiles are every 7th changed tile, so neighbours in time, not space)
+    groups = [list(range(g, min(g + 16, n))) for g in range(0, n, 16)]
+    for gi, g in enumerate(groups):
+        w = h = 256; img = bytearray(w * h * 3)
+        for k, i in enumerate(g):
+            ox, oy = (k % 4) * 64, (k // 4) * 64
+            for y in range(64): img[((oy + y) * w + ox) * 3:((oy + y) * w + ox + 64) * 3] = tiles[i][y * 192:(y + 1) * 192]
+        png(f"{d}/g{gi:03d}.png", bytes(img), w, h)
+    res = {}
+    def per_tile(label, cmd, ext, body=None):
+        def one(i):
+            out = f"{d}/t{i:04d}.{label}.{ext}"; s = size(cmd(f"{d}/t{i:04d}.png", out), out); return body(out) if body else s
+        res[label] = statistics.mean(pool.map(one, range(n)))
+    def per_group(label, cmd, ext, body=None):
+        def one(gi):
+            out = f"{d}/g{gi:03d}.{label}.{ext}"; s = size(cmd(f"{d}/g{gi:03d}.png", out), out); return body(out) if body else s
+        res[label] = sum(pool.map(one, range(len(groups)))) / n
+    per_tile("webp z4 file", lambda i, o: ["cwebp", "-lossless", "-z", "4", "-quiet", i, "-o", o], "webp")
+    per_tile("webp z9 file", lambda i, o: ["cwebp", "-lossless", "-z", "9", "-quiet", i, "-o", o], "webp")
+    per_group("webp z9, 16-tile groups", lambda i, o: ["cwebp", "-lossless", "-z", "9", "-quiet", i, "-o", o], "webp")
+    for e in (7, 9, 10):
+        per_tile(f"jxl e{e}", lambda i, o, e=e: ["cjxl", "-d", "0", "-e", str(e), "--num_threads", "1", i, o], "jxl")
+    per_group("jxl e9, 16-tile groups", lambda i, o: ["cjxl", "-d", "0", "-e", "9", "--num_threads", "1", i, o], "jxl")
+    print(f"== {name}: {n} tiles · " + " · ".join(f"{k} {v:.0f}" for k, v in res.items()), flush=True)
