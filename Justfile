@@ -4,10 +4,9 @@ default: test
 rust:
     scripts/build-rust
 
-# Rust tests: the crate's own, and the differential tests against the C++ it was ported from
+# Rust tests: the crate's own, including the snapshots that pin its outputs
 test-rust:
     cargo test --release --manifest-path rust/av1/Cargo.toml
-    cargo test --release --manifest-path rust/av1/Cargo.toml --no-default-features --features oracle
 
 # Run all package tests
 test: rust

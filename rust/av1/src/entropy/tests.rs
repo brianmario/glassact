@@ -199,7 +199,7 @@ impl<'a> Dec<'a> {
     }
 }
 
-/// Symbol streams decode back to themselves, with the same final CDFs (no oracle needed).
+/// Symbol streams decode back to themselves, with the same final CDFs.
 #[test]
 fn symbol_streams_decode_back() {
     let mut rnd = Rng(0x5eed_0004);
@@ -231,9 +231,9 @@ fn symbol_streams_decode_back() {
     }
 }
 
-mod oracle {
+mod snapshots {
     use super::*;
-    use crate::testsupport::snapshot::{Snapshot, same};
+    use crate::testsupport::snapshot::Snapshot;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -244,154 +244,20 @@ mod oracle {
         c: u32,
     }
 
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        fn oracle_entropy_cdfs_init(qidx: i32, out: *mut u16);
-        fn oracle_entropy_coeff_cdf_q_ctx(qidx: i32) -> i32;
-        fn oracle_entropy_cdfs_layout(out: *mut i64);
-        fn oracle_entropy_update_cdf(cdf: *mut u16, s: i32, n: i32);
-        fn oracle_entropy_ops(ops: *const Op, n: u32, words: *mut u16, out: *mut u8, cap: u32) -> i32;
-        fn oracle_entropy_split_or_psum(pc: *const u16, vert: i32) -> u32;
-        fn oracle_entropy_sym_pack(kind: u32, cdf: u32, s: u32, n: u32) -> u32;
-        fn oracle_entropy_code_symbols(
-            syms: *const u32,
-            n: u32,
-            qidx: i32,
-            out: *mut u8,
-            cap: u32,
-            cdfs: *mut u16,
-        ) -> i32;
-        fn oracle_entropy_bench_code_symbols(
-            syms: *const u32,
-            n: u32,
-            qidx: i32,
-            reps: i32,
-            out: *mut u8,
-            cap: u32,
-            bytes: *mut i32,
-        ) -> u64;
-        fn oracle_entropy_dsp_set_layout(out: *mut i64);
-        fn av1t_dsp_set_make(seed: u64) -> *const DspSet;
-        fn av1t_dsp_set_free(set: *const DspSet);
-    }
-
-    /// av1t_dsp_set (av1core_test.h)
-    #[cfg(feature = "oracle")]
-    #[repr(C)]
-    struct DspSet {
-        itx_count: i32,
-        itx_flagged_count: i32,
-        itx_cases: *const u8,
-        itx_case_size: u32,
-        itx_coeffs_per_case: u32,
-        itx_residual_per_case: u32,
-        itx_coeffs: *const i16,
-        itx_residual: *const i32,
-        itx_flags: *const u32,
-        pred_count: i32,
-        pred_cfl_count: i32,
-        pred_side: i32,
-        pred_cases: *const u8,
-        pred_case_size: u32,
-        pred_luma_size: u32,
-        pred_planes: *const u8,
-        pred_luma: *const u8,
-        pred_out: *const u8,
-        ec_count: i32,
-        ec_qindex: i32,
-        ec_symbol_count: i32,
-        ec_capacity: u32,
-        ec_cdfs_size: u32,
-        ec_symbol_size: u32,
-        ec_symbols: *const u8,
-        ec_offsets: *const i32,
-        ec_counts: *const i32,
-        ec_sizes: *const i32,
-        ec_bytes: *const u8,
-        priv_: *mut u8,
-    }
-
-    /// av1t_sym
-    #[cfg(feature = "oracle")]
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct DspSym {
-        cdf_off: u16,
-        s: u16,
-        n: u16,
-        is_bool: u16,
-    }
-
-    #[cfg(feature = "oracle")]
-    fn c_init(q: i32) -> Vec<u16> {
-        let mut v = vec![0u16; NCDF];
-        unsafe { oracle_entropy_cdfs_init(q, v.as_mut_ptr()) };
-        v
-    }
-
-    #[cfg(feature = "oracle")]
-    fn c_ops(ops: &[Op], words: &mut [u16]) -> Vec<u8> {
-        let cap = (ops.len() * 4 + 64) as u32;
-        let mut out = vec![0u8; cap as usize + 8];
-        let n = unsafe {
-            oracle_entropy_ops(
-                ops.as_ptr(),
-                ops.len() as u32,
-                words.as_mut_ptr(),
-                out.as_mut_ptr(),
-                cap,
-            )
-        };
-        assert!(n >= 0);
-        out.truncate(n as usize);
-        out
-    }
-
-    #[cfg(feature = "oracle")]
-    fn c_code_symbols(syms: &[u32], qidx: i32) -> (Vec<u8>, Vec<u16>) {
-        let cap = (syms.len() * 2 + 64) as u32;
-        let mut out = vec![0u8; cap as usize + 8];
-        let mut cdfs = vec![0u16; NCDF];
-        let n = unsafe {
-            oracle_entropy_code_symbols(
-                syms.as_ptr(),
-                syms.len() as u32,
-                qidx,
-                out.as_mut_ptr(),
-                cap,
-                cdfs.as_mut_ptr(),
-            )
-        };
-        assert!(n >= 0);
-        out.truncate(n as usize);
-        (out, cdfs)
-    }
-
     #[test]
-    fn cdfs_layout_matches_c() {
+    fn cdfs_layout_snapshot() {
         let mut s = Snapshot::new(&["layout"]);
         let ours: Vec<i64> = cdfs_arrays().iter().map(|a| 2 * a.0 as i64).collect();
-        #[cfg(feature = "oracle")]
-        {
-            let mut c = [0i64; 38];
-            unsafe { oracle_entropy_cdfs_layout(c.as_mut_ptr()) };
-            assert_eq!(c[0], size_of::<Cdfs>() as i64);
-            assert_eq!(&c[1..], &ours[..]);
-        }
         s.put("layout", &(size_of::<Cdfs>() as i64, &ours, cdfs_arrays()));
         s.check(&[("layout", 0xda2dad485ea2dd20)]);
     }
 
     #[test]
-    fn cdfs_init_matches_c_for_every_qindex() {
+    fn cdfs_init_snapshot_every_qindex() {
         let mut s = Snapshot::new(&["q_ctx", "init"]);
         for q in -1..=256 {
-            same!(s, "q_ctx", coeff_cdf_q_ctx(q) as i32, unsafe {
-                oracle_entropy_coeff_cdf_q_ctx(q)
-            });
+            s.put("q_ctx", &(coeff_cdf_q_ctx(q) as i32));
             let ours = Cdfs::new(q);
-            #[cfg(feature = "oracle")]
-            assert_eq!(&ours.words()[..], &c_init(q)[..], "qidx {q}");
             s.put("init", &ours.words()[..]);
             let mut again = Cdfs::new(255 - q);
             again.init(q);
@@ -401,7 +267,7 @@ mod oracle {
     }
 
     #[test]
-    fn update_cdf_matches_c() {
+    fn update_cdf_snapshot() {
         let mut snap = Snapshot::new(&["update_cdf"]);
         let mut rnd = Rng(77);
         for _ in 0..100_000 {
@@ -409,35 +275,24 @@ mod oracle {
             let mut a = [0u16; 17];
             random_cdf(&mut rnd, n, &mut a);
             let s = rnd.below(n as u32);
-            #[cfg(feature = "oracle")]
-            let mut c = a;
             update_cdf(&mut a, s, n as u32);
-            #[cfg(feature = "oracle")]
-            {
-                unsafe { oracle_entropy_update_cdf(c.as_mut_ptr(), s as i32, n as i32) };
-                assert_eq!(a, c);
-            }
             snap.put("update_cdf", &a);
         }
         snap.check(&[("update_cdf", 0x5b26227d7eaccefd)]);
     }
 
     #[test]
-    fn split_or_psum_and_sym_pack_match_c() {
+    fn split_or_psum_and_sym_pack_snapshot() {
         let mut snap = Snapshot::new(&["split_or_psum", "sym_pack"]);
         let mut rnd = Rng(5);
         for _ in 0..20_000 {
             let mut pc = [0u16; 11];
             random_cdf(&mut rnd, 10, &mut pc);
             for vert in [false, true] {
-                same!(snap, "split_or_psum", split_or_psum(&pc, vert), unsafe {
-                    oracle_entropy_split_or_psum(pc.as_ptr(), vert as i32)
-                });
+                snap.put("split_or_psum", &(split_or_psum(&pc, vert)));
             }
             let (k, id, s, n) = (rnd.below(4), rnd.next(), rnd.next(), rnd.next());
-            same!(snap, "sym_pack", sym_pack(k, id, s, n), unsafe {
-                oracle_entropy_sym_pack(k, id, s, n)
-            });
+            snap.put("sym_pack", &(sym_pack(k, id, s, n)));
         }
         snap.check(&[("split_or_psum", 0xf98a343a823fe632), ("sym_pack", 0x25df9c2d4253ab04)]);
     }
@@ -445,7 +300,7 @@ mod oracle {
     /// Random operation sequences over random CDFs of every size, every kind of operation, with
     /// both symbol paths, from empty streams to long ones; bytes and final CDFs must match.
     #[test]
-    fn random_ops_match_c() {
+    fn random_ops_snapshot() {
         let mut snap = Snapshot::new(&["bytes", "cdfs"]);
         let mut rnd = Rng(0x5eed_0001);
         for case in 0..400 {
@@ -520,10 +375,6 @@ mod oracle {
                     }
                 })
                 .collect();
-            #[cfg(feature = "oracle")]
-            let mut cw = words.clone();
-            #[cfg(feature = "oracle")]
-            let want = c_ops(&ops, &mut cw);
             let mut ec = Ec::with_capacity(16);
             let mut out = vec![0xAB];
             for _ in 0..2 {
@@ -540,15 +391,7 @@ mod oracle {
                         _ => ec.split_or(&w[o.a as usize..], o.c != 0, o.b != 0),
                     }
                 }
-                #[cfg(feature = "oracle")]
-                assert!(ec.len() <= want.len());
                 let n = ec.finish(&mut out);
-                #[cfg(feature = "oracle")]
-                {
-                    assert_eq!(n, want.len(), "case {case}");
-                    assert!(out[1..] == want[..], "case {case}: bytes differ");
-                    assert!(w == cw, "case {case}: CDFs differ");
-                }
                 assert_eq!(n, out.len() - 1);
                 snap.put("bytes", &out[1..]);
                 snap.put("cdfs", &w);
@@ -560,7 +403,7 @@ mod oracle {
 
     /// Symbol streams on the real CDF layout, for every coefficient q context.
     #[test]
-    fn code_symbols_matches_c() {
+    fn code_symbols_snapshot() {
         let mut snap = Snapshot::new(&["bytes", "cdfs"]);
         let mut rnd = Rng(0x5eed_0002);
         for case in 0..200 {
@@ -576,12 +419,6 @@ mod oracle {
             let mut out = Vec::new();
             code_symbols(&syms, &mut cdf, &mut ec);
             ec.finish(&mut out);
-            #[cfg(feature = "oracle")]
-            {
-                let (want, want_cdfs) = c_code_symbols(&syms, qidx);
-                assert!(out == want, "case {case}");
-                assert!(cdf.words()[..] == want_cdfs[..], "case {case}");
-            }
             snap.put("bytes", &out);
             snap.put("cdfs", &cdf.words()[..]);
         }
@@ -590,57 +427,10 @@ mod oracle {
 
     /// The range-coder cases the GPU is held to (av1t_dsp_set_make).
     #[test]
-    fn dsp_set_ec_cases_match() {
+    fn dsp_set_ec_cases_snapshot() {
         let mut snap = Snapshot::new(&["bytes"]);
-        #[cfg(feature = "oracle")]
-        {
-            let mut l = [0i64; 4];
-            unsafe { oracle_entropy_dsp_set_layout(l.as_mut_ptr()) };
-            assert_eq!(
-                l,
-                [
-                    size_of::<DspSet>() as i64,
-                    offset_of!(DspSet, ec_count) as i64,
-                    offset_of!(DspSet, ec_symbols) as i64,
-                    offset_of!(DspSet, ec_bytes) as i64
-                ]
-            );
-        }
         for seed in [0u64, 1, 0x5eed] {
-            #[cfg(feature = "oracle")]
-            // SAFETY: the set lives until av1t_dsp_set_free; the sizes are the set's own.
-            unsafe {
-                let set = &*av1t_dsp_set_make(seed);
-                assert_eq!(set.ec_symbol_size as usize, size_of::<DspSym>());
-                assert_eq!(set.ec_cdfs_size as usize, size_of::<Cdfs>());
-                let syms = core::slice::from_raw_parts(set.ec_symbols as *const DspSym, set.ec_symbol_count as usize);
-                let nec = set.ec_count as usize;
-                let offs = core::slice::from_raw_parts(set.ec_offsets, nec);
-                let cnts = core::slice::from_raw_parts(set.ec_counts, nec);
-                let sizes = core::slice::from_raw_parts(set.ec_sizes, nec);
-                let cap = set.ec_capacity as usize;
-                let bytes = core::slice::from_raw_parts(set.ec_bytes, nec * cap);
-                let mut ec = Ec::new();
-                let mut out = Vec::new();
-                for i in 0..nec {
-                    let mut cdf = Cdfs::new(set.ec_qindex);
-                    let w = cdf.words_mut();
-                    for s in &syms[offs[i] as usize..][..cnts[i] as usize] {
-                        if s.is_bool != 0 {
-                            ec.bool(s.s != 0);
-                        } else {
-                            ec.symbol_dyn(s.s as u32, &mut w[s.cdf_off as usize..], s.n as u32);
-                        }
-                    }
-                    out.clear();
-                    let n = ec.finish(&mut out);
-                    assert!(sizes[i] >= 0);
-                    assert_eq!(n, sizes[i] as usize);
-                    assert!(out[..] == bytes[i * cap..][..n], "seed {seed} stream {i}");
-                }
-                av1t_dsp_set_free(set);
-            }
-            // the same streams from the Rust set (testsupport's dsp_sets_match_c: the C++'s), hashed
+            // the set's streams (testsupport's dsp_sets_snapshot pins the set), hashed
             let set = crate::testsupport::DspSet::make(seed);
             let cap = set.ec_capacity as usize;
             let mut ec = Ec::new();
@@ -665,57 +455,7 @@ mod oracle {
         snap.check(&[("bytes", 0x7bb99b42b8b5e390)]);
     }
 
-    /// Symbols per second, Rust vs C++ (`cargo test --release --no-default-features --features
-    /// oracle -- --ignored --nocapture bench`).
-    #[cfg(feature = "oracle")]
-    #[test]
-    #[ignore]
-    fn bench_symbols() {
-        let mut rnd = Rng(0xbe9c);
-        let n = 4_000_000;
-        let syms = random_symstream(&mut rnd, n);
-        let reps = 5;
-        let qidx = 100;
-        let cap = (n * 2 + 64) as u32;
-        let mut cout = vec![0u8; cap as usize + 8];
-        let mut cbytes = 0;
-        let mut best_c = u64::MAX;
-        let mut best_r = u64::MAX;
-        let mut ec = Ec::new();
-        let mut out = Vec::new();
-        for _ in 0..7 {
-            let ns = unsafe {
-                oracle_entropy_bench_code_symbols(
-                    syms.as_ptr(),
-                    n as u32,
-                    qidx,
-                    reps,
-                    cout.as_mut_ptr(),
-                    cap,
-                    &mut cbytes,
-                )
-            };
-            best_c = best_c.min(ns);
-            let t0 = std::time::Instant::now();
-            for _ in 0..reps {
-                let mut cdf = Cdfs::new(qidx);
-                out.clear();
-                code_symbols(core::hint::black_box(&syms), &mut cdf, &mut ec);
-                ec.finish(&mut out);
-            }
-            best_r = best_r.min(t0.elapsed().as_nanos() as u64);
-        }
-        assert_eq!(out[..], cout[..cbytes as usize]);
-        let rate = |ns: u64| (n as f64 * reps as f64) / (ns as f64 * 1e-9) / 1e6;
-        println!(
-            "code_symbols, {n} symbols x {reps}, {} bytes: C++ {:.1} Msym/s, Rust {:.1} Msym/s",
-            out.len(),
-            rate(best_c),
-            rate(best_r)
-        );
-    }
-
-    /// Random call-site ops for oracle_entropy_sites: mostly coefficient symbols, as a tile's.
+    /// Random call-site ops: mostly coefficient symbols, as a tile's.
     fn random_sites(rnd: &mut Rng, n: usize) -> Vec<u32> {
         // (site, contexts, N)
         const SITES: [(u32, u32, u32); 9] = [
@@ -772,25 +512,11 @@ mod oracle {
         }
     }
 
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        fn oracle_entropy_sites(ops: *const u32, n: u32, qidx: i32, out: *mut u8, cap: u32) -> i32;
-        fn oracle_entropy_bench_sites(
-            ops: *const u32,
-            n: u32,
-            qidx: i32,
-            reps: i32,
-            out: *mut u8,
-            cap: u32,
-            bytes: *mut i32,
-        ) -> u64;
-    }
-
     #[test]
-    fn fixed_call_sites_match_c() {
+    fn fixed_call_sites_snapshot() {
         let mut snap = Snapshot::new(&["bytes"]);
         let mut rnd = Rng(0x5eed_0003);
-        for case in 0..50 {
+        for _ in 0..50 {
             let n = rnd.below(200_000) as usize;
             let ops = random_sites(&mut rnd, n);
             let qidx = rnd.below(256) as i32;
@@ -801,58 +527,8 @@ mod oracle {
             }
             let mut out = Vec::new();
             ec.finish(&mut out);
-            #[cfg(feature = "oracle")]
-            {
-                let cap = (n * 2 + 64) as u32;
-                let mut want = vec![0u8; cap as usize + 8];
-                let len = unsafe { oracle_entropy_sites(ops.as_ptr(), n as u32, qidx, want.as_mut_ptr(), cap) };
-                want.truncate(len as usize);
-                assert!(out == want, "case {case}");
-            }
-            let _ = case;
             snap.put("bytes", &out);
         }
         snap.check(&[("bytes", 0xa0ef67171ac8fabf)]);
-    }
-
-    /// The same at the writer's fixed call sites.
-    #[cfg(feature = "oracle")]
-    #[test]
-    #[ignore]
-    fn bench_call_sites() {
-        let mut rnd = Rng(0xbe9d);
-        let n = 4_000_000;
-        let ops = random_sites(&mut rnd, n);
-        let (reps, qidx) = (5, 100);
-        let cap = (n * 2 + 64) as u32;
-        let mut cout = vec![0u8; cap as usize + 8];
-        let mut cbytes = 0;
-        let (mut best_c, mut best_r) = (u64::MAX, u64::MAX);
-        let mut ec = Ec::new();
-        let mut out = Vec::new();
-        for _ in 0..7 {
-            let ns = unsafe {
-                oracle_entropy_bench_sites(ops.as_ptr(), n as u32, qidx, reps, cout.as_mut_ptr(), cap, &mut cbytes)
-            };
-            best_c = best_c.min(ns);
-            let t0 = std::time::Instant::now();
-            for _ in 0..reps {
-                let mut c = Cdfs::new(qidx);
-                out.clear();
-                for &op in core::hint::black_box(&ops) {
-                    rust_site(&mut ec, &mut c, op);
-                }
-                ec.finish(&mut out);
-            }
-            best_r = best_r.min(t0.elapsed().as_nanos() as u64);
-        }
-        assert_eq!(out[..], cout[..cbytes as usize]);
-        let rate = |ns: u64| (n as f64 * reps as f64) / (ns as f64 * 1e-9) / 1e6;
-        println!(
-            "call sites, {n} symbols x {reps}, {} bytes: C++ {:.1} Msym/s, Rust {:.1} Msym/s",
-            out.len(),
-            rate(best_c),
-            rate(best_r)
-        );
     }
 }

@@ -3,8 +3,8 @@
 //! tiny sizes, 64x64 and 128x128 superblocks), with the post-filters on and off. They encode the
 //! same apart from their coding as in one pass, parse back to the record that was written (which
 //! codes the same stream again), and (ignored: `cargo test --release -- --ignored --nocapture
-//! decoders_444`) decode in dav1d and aomdec to exactly the writer's reconstruction. There is no
-//! C++ oracle for 4:4:4 (oracle/cpp is 4:2:0): the decoders are the oracle.
+//! decoders_444`) decode in dav1d and aomdec to exactly the writer's reconstruction. The C++ the
+//! writer was ported from had no 4:4:4: the decoders were always its check.
 use super::inter_tests::{decode_check, expect_parsed, seeds};
 use super::palette_tests::add_palettes;
 use super::*;

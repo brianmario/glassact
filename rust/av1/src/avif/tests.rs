@@ -199,30 +199,13 @@ fn boxes_are_consistent() {
     assert!(n_ok > 1000);
 }
 
-mod oracle {
+mod snapshots {
     use super::*;
-    use crate::testsupport::snapshot::{Snapshot, same};
-    #[cfg(feature = "oracle")]
-    use crate::types::AvifMeta;
-
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        fn av1g_mux_avif(obus: *const u8, n: usize, w: u32, h: u32, avif: *mut *mut u8, size: *mut usize) -> i32;
-        fn av1g_mux_avif_ex(
-            obus: *const u8,
-            n: usize,
-            w: u32,
-            h: u32,
-            md: *const AvifMeta,
-            avif: *mut *mut u8,
-            size: *mut usize,
-        ) -> i32;
-        fn av1g_exif_orientation_to_irot_imir(orientation: i32, irot: *mut i32, imir: *mut i32);
-        fn free(p: *mut core::ffi::c_void);
-    }
+    use crate::testsupport::snapshot::Snapshot;
 
     /// Where the C++ would read past the end of `obus` (an OBU header with an extension flag as
-    /// the stream's last byte, no size field, sequence header type): not a comparable case.
+    /// the stream's last byte, no size field, sequence header type): skipped, as when the snapshot
+    /// was recorded against it.
     fn c_overreads(obus: &[u8]) -> bool {
         let n = obus.len();
         let mut pos = 0usize;
@@ -250,55 +233,22 @@ mod oracle {
         false
     }
 
-    #[cfg(feature = "oracle")]
-    fn c_mux(obus: &[u8], w: u32, h: u32, md: Option<&Meta>) -> Result<Vec<u8>, i32> {
-        let mut p = core::ptr::null_mut();
-        let mut size = 0usize;
-        let cm = md.map(|m| AvifMeta {
-            icc: if m.icc.is_empty() {
-                core::ptr::null()
-            } else {
-                m.icc.as_ptr()
-            },
-            icc_size: m.icc.len(),
-            irot: m.irot,
-            imir: m.imir,
-        });
-        // SAFETY: valid buffers; the C++ mallocs the result, freed below.
-        unsafe {
-            let r = match &cm {
-                None => av1g_mux_avif(obus.as_ptr(), obus.len(), w, h, &mut p, &mut size),
-                Some(m) => av1g_mux_avif_ex(obus.as_ptr(), obus.len(), w, h, m, &mut p, &mut size),
-            };
-            if r != 0 {
-                return Err(r);
-            }
-            let v = core::slice::from_raw_parts(p, size).to_vec();
-            free(p.cast());
-            Ok(v)
-        }
-    }
-
     #[test]
-    fn exif_orientations_match_c() {
+    fn exif_orientations_snapshot() {
         let mut s = Snapshot::new(&["irot_imir"]);
         for o in -3..12 {
-            same!(s, "irot_imir", exif_orientation_to_irot_imir(o), {
-                let (mut r, mut m) = (0, 0);
-                unsafe { av1g_exif_orientation_to_irot_imir(o, &mut r, &mut m) };
-                (r, m)
-            });
+            s.put("irot_imir", &(exif_orientation_to_irot_imir(o)));
         }
         s.check(&[("irot_imir", 0x4a96e5418a774022)]);
     }
 
     /// Random streams, with and without ICC, for every irot and imir (and out-of-range ones).
     #[test]
-    fn mux_matches_c() {
+    fn mux_snapshot() {
         let mut s = Snapshot::new(&["mux"]);
         let mut rnd = Rng(0x0a1f_0001);
         let (mut ok, mut compared) = (0, 0);
-        for case in 0..3000 {
+        for _ in 0..3000 {
             let obus = random_stream(&mut rnd);
             if c_overreads(&obus) {
                 continue;
@@ -329,12 +279,6 @@ mod oracle {
                 } else {
                     mux_avif_ex(&obus, w, h, md.as_ref())
                 };
-                #[cfg(feature = "oracle")]
-                {
-                    let want = c_mux(&obus, w, h, md.as_ref());
-                    assert!(ours == want, "case {case} meta {md:?}");
-                }
-                let _ = case;
                 s.put("mux", &ours);
                 ok += ours.is_ok() as u32;
                 compared += 1;

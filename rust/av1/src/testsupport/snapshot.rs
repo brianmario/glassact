@@ -4,12 +4,17 @@
 //! is a format change, not an optimization (README "Exact").
 //!
 //! Values feed in a fixed little-endian byte order, slices with their length, so a hash depends on
-//! the values alone (not on padding, pointers, threads or the platform). Tests that run cases on
-//! several threads hash each case on its own and fold the cases' hashes in case order
+//! the values alone (not on padding, pointers, threads or the platform; where the outputs
+//! themselves differ by architecture, [`Snapshot::check_arch`]). Tests that run cases on several
+//! threads hash each case on its own and fold the cases' hashes in case order
 //! ([`Snapshot::absorb`]).
 //!
 //! Recording: a test whose constants are missing or stale fails with every family's hash, in a
 //! line to paste into the test. Record from a tree whose outputs are known good.
+//!
+//! These replaced (2026-11-17) the differential tests against the C++ the crate was ported from:
+//! the same seeds, inputs and case counts, the same outputs, and the constants recorded from the
+//! build where the two agreed, on aarch64 and x86_64.
 use crate::testsupport::{FuzzCase, ItxCase, PredCase, Sym};
 use crate::types::*;
 
@@ -370,7 +375,7 @@ snap_struct!(PredCase {
 snap_struct!(Sym { cdf_off, s, n, is_bool });
 
 /// The random legal record of av1gpu's fuzzer for (seed, maxdim, big_pct) ([`FuzzCase::make`]) as
-/// a writer record (coefficients without the C++'s extra trailing zero).
+/// a writer record (coefficients without the extra trailing zero of the C++'s allocation).
 pub fn fuzz_record(seed: u64, maxdim: i32, big_pct: i32) -> Option<crate::writer::Record> {
     let c = FuzzCase::make(seed, maxdim, big_pct)?;
     Some(crate::writer::Record {
@@ -516,19 +521,6 @@ impl Snapshot {
         }
     }
 }
-
-/// `$rust`, fed to the family `$fam` of the snapshot `$s` (and returned); with the oracle feature,
-/// asserted equal to `$c` first.
-macro_rules! same {
-    ($s:expr, $fam:expr, $rust:expr, $c:expr $(, $($msg:tt)+)?) => {{
-        let v = $rust;
-        #[cfg(feature = "oracle")]
-        assert_eq!(v, $c $(, $($msg)+)?);
-        $s.put($fam, &v);
-        v
-    }};
-}
-pub(crate) use same;
 
 /// Collects per-case snapshots from threads; [`Cases::fold`] folds them in case order.
 pub struct Cases {

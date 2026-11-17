@@ -453,27 +453,10 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("tests/layouts.cpp doesn't know {what}"))
     }
 
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        // oracle/layout.cpp: sizeof / offsetof of the C structures, by name ("Block", "Block.skip", ...)
-        fn oracle_layout(what: *const core::ffi::c_char) -> i64;
-    }
-    fn c(what: &str) -> i64 {
-        let v = c_layout(what);
-        #[cfg(feature = "oracle")]
-        {
-            let s = std::ffi::CString::new(what).unwrap();
-            let o = unsafe { oracle_layout(s.as_ptr()) };
-            assert!(o >= 0, "oracle_layout doesn't know {what}");
-            assert_eq!(v, o, "{what}: tests/layouts.cpp and oracle_layout");
-        }
-        v
-    }
-
     macro_rules! check {
         ($t:ty, $name:literal, $($f:ident : $cf:literal),*) => {
-            assert_eq!(size_of::<$t>() as i64, c($name), "sizeof {}", $name);
-            $(assert_eq!(offset_of!($t, $f) as i64, c(concat!($name, ".", $cf)), "{}.{}", $name, $cf);)*
+            assert_eq!(size_of::<$t>() as i64, c_layout($name), "sizeof {}", $name);
+            $(assert_eq!(offset_of!($t, $f) as i64, c_layout(concat!($name, ".", $cf)), "{}.{}", $name, $cf);)*
         };
     }
 

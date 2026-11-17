@@ -418,105 +418,37 @@ pub fn for_each_txb_ex(
 mod tests {
     use super::*;
     use crate::dsp::Rng;
-    use crate::testsupport::snapshot::{Snapshot, same};
-    #[cfg(feature = "oracle")]
-    use core::ffi::{c_char, c_int};
-
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        fn oracle_dsp_int(what: *const c_char, a: c_int, b: c_int, c: c_int, d: c_int) -> i64;
-        fn oracle_bi_block_avail(
-            bsize: c_int,
-            r: c_int,
-            c: c_int,
-            mono: c_int,
-            r0: c_int,
-            r1: c_int,
-            c0: c_int,
-            c1: c_int,
-            out: *mut c_int,
-        );
-        fn oracle_bi_txb_edges(
-            plane: c_int,
-            x4: c_int,
-            y4: c_int,
-            tx_sz: c_int,
-            t: u32,
-            xi: c_int,
-            yi: c_int,
-            al: c_int,
-            au: c_int,
-            r1: c_int,
-            c1: c_int,
-            ordmap: *const u32,
-            stride: c_int,
-            out: *mut c_int,
-        );
-        fn oracle_bi_get_filter_type(
-            plane: c_int,
-            r: c_int,
-            c: c_int,
-            au: c_int,
-            al: c_int,
-            y: *const u8,
-            uv: *const u8,
-            mi_cols: c_int,
-        ) -> c_int;
-        fn oracle_bi_for_each_txb(
-            bsize: c_int,
-            r: c_int,
-            c: c_int,
-            d: c_int,
-            mono: c_int,
-            mr: c_int,
-            mc: c_int,
-            out: *mut c_int,
-            cap: c_int,
-        ) -> c_int;
-    }
-    #[cfg(feature = "oracle")]
-    fn ci(what: &str, a: i32, b: i32, c: i32, d: i32) -> i64 {
-        let s = std::ffi::CString::new(what).unwrap();
-        // SAFETY: plain ints.
-        let v = unsafe { oracle_dsp_int(s.as_ptr(), a, b, c, d) };
-        assert_ne!(v, -999999, "oracle_dsp_int doesn't know {what}");
-        v
-    }
+    use crate::testsupport::snapshot::Snapshot;
 
     #[test]
-    fn helpers_match() {
+    fn helpers_snapshot() {
         let mut s = Snapshot::new(&["block", "chroma", "tx", "mi"]);
         for bs in 0..BLOCK_SIZES {
-            same!(s, "block", bw4(bs) as i64, ci("bw4", bs, 0, 0, 0));
-            same!(s, "block", bh4(bs) as i64, ci("bh4", bs, 0, 0, 0));
-            same!(s, "block", max_tx_depth(bs) as i64, ci("max_tx_depth", bs, 0, 0, 0));
-            same!(s, "block", cfl_allowed(bs) as i64, ci("cfl_allowed", bs, 0, 0, 0));
+            s.put("block", &(bw4(bs) as i64));
+            s.put("block", &(bh4(bs) as i64));
+            s.put("block", &(max_tx_depth(bs) as i64));
+            s.put("block", &(cfl_allowed(bs) as i64));
             if bs != BLOCK_128X128 && bs != BLOCK_128X64 && bs != BLOCK_64X128 {
-                same!(s, "chroma", uv_bsize(bs, 1) as i64, ci("uv_bsize", bs, 0, 0, 0));
-                same!(s, "chroma", uv_tx_size(bs, 1) as i64, ci("uv_tx_size", bs, 0, 0, 0));
+                s.put("chroma", &(uv_bsize(bs, 1) as i64));
+                s.put("chroma", &(uv_tx_size(bs, 1) as i64));
             }
             for d in 0..=max_tx_depth(bs) {
-                same!(s, "tx", luma_tx_size(bs, d) as i64, ci("luma_tx_size", bs, d, 0, 0));
+                s.put("tx", &(luma_tx_size(bs, d) as i64));
             }
             for r in 0..4 {
                 for c in 0..4 {
                     for mono in 0..2 {
-                        same!(
-                            s,
-                            "chroma",
-                            has_chroma(bs, r, c, mono != 0, 1) as i64,
-                            ci("has_chroma", bs, r, c, mono)
-                        );
+                        s.put("chroma", &(has_chroma(bs, r, c, mono != 0, 1) as i64));
                     }
                 }
             }
         }
         for t in 0..TX_SIZES_ALL {
-            same!(s, "tx", tx_coeffs(t) as i64, ci("tx_coeffs", t, 0, 0, 0));
+            s.put("tx", &(tx_coeffs(t) as i64));
         }
         for w in 1..300 {
-            same!(s, "mi", mi_cols(w) as i64, ci("mi_cols", w, 0, 0, 0));
-            same!(s, "mi", mi_rows(w) as i64, ci("mi_rows", w, 0, 0, 0));
+            s.put("mi", &(mi_cols(w) as i64));
+            s.put("mi", &(mi_rows(w) as i64));
         }
         s.check(&[
             ("block", 0xcd6fd9cf474b41c4),
@@ -527,11 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn block_avail_and_for_each_txb_match() {
+    fn block_avail_and_for_each_txb_snapshot() {
         let mut s = Snapshot::new(&["block_avail", "for_each_txb"]);
         let mut r = Rng(21);
-        #[cfg(feature = "oracle")]
-        let mut out = vec![0i32; 6 * 512];
         for _ in 0..4000 {
             let bs = r.range(0, BLOCK_SIZES - 1);
             if bs == BLOCK_128X128 || bs == BLOCK_128X64 || bs == BLOCK_64X128 {
@@ -543,29 +473,12 @@ mod tests {
             let (r0, c0) = (row - r.range(0, 8), col - r.range(0, 8));
             let (r1, c1) = (row + r.range(1, 20), col + r.range(1, 20));
             let a = block_avail(bs, row, col, mono, 1, r0, r1, c0, c1);
-            same!(
-                s,
-                "block_avail",
-                [a.u, a.l, a.u_chroma, a.l_chroma].map(|v| v as i32),
-                {
-                    let mut o = [0i32; 4];
-                    // SAFETY: 4 ints out.
-                    unsafe { oracle_bi_block_avail(bs, row, col, mono as i32, r0, r1, c0, c1, o.as_mut_ptr()) };
-                    o
-                }
-            );
+            s.put("block_avail", &([a.u, a.l, a.u_chroma, a.l_chroma].map(|v| v as i32)));
             let d = r.range(0, max_tx_depth(bs));
             let mut mine = Vec::new();
             let n = for_each_txb(bs, row, col, d, mono, 1, mr, mc, |p, t, x4, y4, xi, yi| {
                 mine.extend([p, t, x4, y4, xi, yi])
             });
-            #[cfg(feature = "oracle")]
-            {
-                // SAFETY: room for 512 tx blocks.
-                let m = unsafe { oracle_bi_for_each_txb(bs, row, col, d, mono as i32, mr, mc, out.as_mut_ptr(), 512) };
-                assert_eq!(n, m);
-                assert_eq!(mine, out[..6 * m as usize]);
-            }
             s.put("for_each_txb", &(n, &mine));
         }
         s.check(&[
@@ -575,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn txb_edges_and_filter_type_match() {
+    fn txb_edges_and_filter_type_snapshot() {
         let mut s = Snapshot::new(&["txb_edges", "filter_type"]);
         let mut r = Rng(22);
         let (sb_cols, sb_rows) = (3usize, 3usize);
@@ -601,33 +514,9 @@ mod tests {
                 let (al, au) = (r.below(2) == 0, r.below(2) == 0);
                 let st = stride >> sub;
                 let e = txb_edges(plane, x4, y4, t_sz, t, xi, yi, al, au, tr1, tc1, &ordmap, st, 1);
-                same!(
-                    s,
+                s.put(
                     "txb_edges",
-                    [e.have_left, e.have_above, e.have_above_right, e.have_below_left].map(|v| v as i32),
-                    {
-                        let mut o = [0i32; 4];
-                        // SAFETY: the map covers the SB grid at this stride; 4 ints out.
-                        unsafe {
-                            oracle_bi_txb_edges(
-                                plane,
-                                x4,
-                                y4,
-                                t_sz,
-                                t,
-                                xi,
-                                yi,
-                                al as i32,
-                                au as i32,
-                                tr1,
-                                tc1,
-                                ordmap.as_ptr(),
-                                st as i32,
-                                o.as_mut_ptr(),
-                            )
-                        };
-                        o
-                    }
+                    &([e.have_left, e.have_above, e.have_above_right, e.have_below_left].map(|v| v as i32)),
                 );
             }
         }
@@ -638,16 +527,9 @@ mod tests {
             let plane = r.range(0, 2);
             let (row, col) = (r.range(2, mc - 3), r.range(2, mc - 3));
             let (au, al) = (r.below(2) == 0, r.below(2) == 0);
-            same!(
-                s,
+            s.put(
                 "filter_type",
-                get_filter_type(plane, row, col, au, al, &y, &uv, mc, 1),
-                {
-                    // SAFETY: maps of mc x mc; the neighbours read stay inside.
-                    unsafe {
-                        oracle_bi_get_filter_type(plane, row, col, au as i32, al as i32, y.as_ptr(), uv.as_ptr(), mc)
-                    }
-                }
+                &(get_filter_type(plane, row, col, au, al, &y, &uv, mc, 1)),
             );
         }
         s.check(&[("txb_edges", 0xb8819fe860da1b24), ("filter_type", 0x56384f5391598a74)]);

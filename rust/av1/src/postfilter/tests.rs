@@ -493,87 +493,15 @@ fn bench_postfilter() {
     println!("  cdef {:.1}x", s / v);
 }
 
-mod oracle {
+mod snapshots {
     use super::*;
-    use crate::testsupport::snapshot::{Snapshot, same};
-    #[cfg(feature = "oracle")]
-    use crate::types::DecisionRecord;
-    #[cfg(feature = "oracle")]
-    use core::ffi::{c_int, c_long, c_void};
+    use crate::testsupport::snapshot::Snapshot;
 
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        fn oracle_pf_frame(fp: *const FrameParams, out: *mut c_int);
-        fn oracle_pf_maps(
-            fp: *const FrameParams,
-            blocks: *const Block,
-            n: u32,
-            skip: *mut u8,
-            ty: *mut u8,
-            tu: *mut u8,
-            tv: *mut u8,
-            cdef: *mut i8,
-        );
-        fn oracle_pf_lf_line(
-            buf: *mut u8,
-            q0: c_long,
-            step: c_long,
-            plane: c_int,
-            fs: c_int,
-            limit: c_int,
-            blimit: c_int,
-            thresh: c_int,
-        );
-        fn oracle_pf_deblock(
-            fp: *const FrameParams,
-            blocks: *const Block,
-            n: u32,
-            planes: *const *mut u8,
-            stride: *const c_int,
-        );
-        fn oracle_pf_cdef(
-            fp: *const FrameParams,
-            blocks: *const Block,
-            n: u32,
-            src: *const *mut u8,
-            dst: *const *mut u8,
-            stride: *const c_int,
-        );
-        fn oracle_pf_cdef_direction(src: *const u8, stride: c_int, y_dir: *mut c_int, var: *mut c_int);
-        fn oracle_pf_cdef_constrain(diff: c_int, threshold: c_int, damping: c_int) -> c_int;
-        fn oracle_pf_cdef_pixel(
-            mi_rows: c_int,
-            mi_cols: c_int,
-            src: *const u8,
-            sstride: c_int,
-            plane: c_int,
-            x: c_int,
-            y: c_int,
-            pri: c_int,
-            sec: c_int,
-            damping: c_int,
-            dir: c_int,
-        ) -> c_int;
-        // Sources/AV1Core (av1g.h) and Sources/AV1CoreTestSupport (av1core_test.h)
-        fn av1g_postfilter(rec: *const DecisionRecord, planes: *const *mut u8, stride: *const c_int) -> c_int;
-        fn av1t_case_make(seed: u64, maxdim: c_int, big_pct: c_int) -> *mut c_void;
-        fn av1t_case_record(c: *mut c_void) -> *mut DecisionRecord;
-        fn av1t_case_free(c: *mut c_void);
-    }
-
-    /// The fuzzer's random legal records (testsupport's FuzzCase, the C++'s av1t_case_make), with
+    /// The fuzzer's random legal records (testsupport's FuzzCase), with
     /// this case's planes and random filter parameters on top of the record's.
     fn fuzz_case(r: &mut Rng, seed: u64) -> Case {
         let k = crate::testsupport::FuzzCase::make(seed, 160, 10).unwrap();
         let (mut fp, blocks) = (k.fp, k.blocks);
-        #[cfg(feature = "oracle")]
-        // SAFETY: the record and its arrays live until av1t_case_free; they are copied out first.
-        unsafe {
-            let k = av1t_case_make(seed, 160, 10);
-            let rec = &*av1t_case_record(k);
-            assert!(fp == rec.fp && blocks[..] == *core::slice::from_raw_parts(rec.blocks, rec.n_blocks as usize));
-            av1t_case_free(k);
-        }
         let mut c = random_case(r, 8);
         let keep = r.below(2) == 0; // the fuzzer's own filter parameters, or the random ones
         let (w, h, mono) = (fp.width, fp.height, fp.monochrome);
@@ -603,26 +531,6 @@ mod oracle {
         c
     }
 
-    #[cfg(feature = "oracle")]
-    unsafe extern "C" {
-        // oracle/postfilter.cpp: the per-block flags its maps mark with (av1g_pf_mark_block_flags;
-        // null: none), this thread's
-        fn oracle_pf_set_flags(flags: *const u8);
-    }
-
-    /// The flags the C maps of `c` mark with, from now on in this thread.
-    #[cfg(feature = "oracle")]
-    fn set_flags(c: &Case) {
-        // SAFETY: the flags (one per block) outlive the C calls on this case.
-        unsafe {
-            oracle_pf_set_flags(if c.flags.is_empty() {
-                core::ptr::null()
-            } else {
-                c.flags.as_ptr()
-            })
-        };
-    }
-
     fn cases(r: &mut Rng) -> Vec<Case> {
         let mut v: Vec<Case> = (0..40).map(|_| random_case(r, 220)).collect();
         for seed in 1..40 {
@@ -633,13 +541,8 @@ mod oracle {
         v
     }
 
-    #[cfg(feature = "oracle")]
-    fn ptrs(p: &mut [Vec<u8>; 3]) -> [*mut u8; 3] {
-        [p[0].as_mut_ptr(), p[1].as_mut_ptr(), p[2].as_mut_ptr()]
-    }
-
     #[test]
-    fn frame_and_maps_match() {
+    fn frame_and_maps_snapshot() {
         let mut s = Snapshot::new(&["frame", "maps"]);
         let mut r = Rng(41);
         for c in cases(&mut r) {
@@ -650,39 +553,15 @@ mod oracle {
             for a in [f.cdef_y_pri, f.cdef_y_sec, f.cdef_uv_pri, f.cdef_uv_sec] {
                 mine.extend(a);
             }
-            same!(s, "frame", mine, {
-                let mut o = [0i32; 46];
-                // SAFETY: 46 ints out.
-                unsafe { oracle_pf_frame(&c.fp, o.as_mut_ptr()) };
-                o
-            });
+            s.put("frame", &(mine));
             let mb = c.maps(&f);
-            #[cfg(feature = "oracle")]
-            {
-                set_flags(&c);
-                let mut cm = PfMapsBuf::new(&f);
-                // SAFETY: the buffers have PfMapsBuf::new's sizes, as the shim's maps.
-                unsafe {
-                    oracle_pf_maps(
-                        &c.fp,
-                        c.blocks.as_ptr(),
-                        c.blocks.len() as u32,
-                        cm.skip.as_mut_ptr(),
-                        cm.lf_tx[0].as_mut_ptr(),
-                        cm.lf_tx[1].as_mut_ptr(),
-                        cm.lf_tx[2].as_mut_ptr(),
-                        cm.cdef_idx.as_mut_ptr(),
-                    )
-                };
-                assert!(mb.skip == cm.skip && mb.lf_tx == cm.lf_tx && mb.cdef_idx == cm.cdef_idx);
-            }
             s.put("maps", &(&mb.skip, &mb.lf_tx, &mb.cdef_idx));
         }
         s.check(&[("frame", 0x996e2705a150ddaa), ("maps", 0x5be4dc6b9c633b7c)]);
     }
 
     #[test]
-    fn lf_line_matches() {
+    fn lf_line_snapshot() {
         let mut s = Snapshot::new(&["lf_line"]);
         let mut r = Rng(42);
         for _ in 0..200000 {
@@ -725,64 +604,28 @@ mod oracle {
                 ..Default::default()
             };
             let (limit, blimit, thresh) = lf_limits(&f, plane, 0).unwrap();
-            #[cfg(feature = "oracle")]
-            let mut c = buf.clone();
             lf_line(&mut buf, 8 * step, step, plane, fs, limit, blimit, thresh);
-            #[cfg(feature = "oracle")]
-            {
-                // SAFETY: the C function reads and writes within 7 samples of q0.
-                unsafe {
-                    oracle_pf_lf_line(
-                        c.as_mut_ptr(),
-                        8 * step as c_long,
-                        step as c_long,
-                        plane as c_int,
-                        fs,
-                        limit,
-                        blimit,
-                        thresh,
-                    )
-                };
-                assert_eq!(buf, c);
-            }
             s.put("lf_line", &buf);
         }
         s.check(&[("lf_line", 0x1144525607661505)]);
     }
 
     #[test]
-    fn deblock_matches() {
+    fn deblock_snapshot() {
         let mut s = Snapshot::new(&["deblock"]);
         let mut r = Rng(43);
-        #[allow(unused_mut)]
-        for mut c in cases(&mut r) {
+        for c in cases(&mut r) {
             let f = PfFrame::new(&c.fp);
             let mb = c.maps(&f);
             let mut mine = c.planes.clone();
             deblock_frame(&f, &mb.maps(), &mut split(&mut mine), &c.stride);
-            #[cfg(feature = "oracle")]
-            {
-                set_flags(&c);
-                let st = c.stride.map(|s| s as c_int);
-                // SAFETY: the planes cover the coded area at these strides.
-                unsafe {
-                    oracle_pf_deblock(
-                        &c.fp,
-                        c.blocks.as_ptr(),
-                        c.blocks.len() as u32,
-                        ptrs(&mut c.planes).as_ptr(),
-                        st.as_ptr(),
-                    )
-                };
-                assert!(mine == c.planes, "{:?}", c.fp);
-            }
             s.put("deblock", &mine);
         }
         s.check(&[("deblock", 0x4cfe0314162368d8)]);
     }
 
     #[test]
-    fn cdef_matches() {
+    fn cdef_snapshot() {
         let mut snap = Snapshot::new(&["cdef"]);
         let mut r = Rng(44);
         for c in cases(&mut r) {
@@ -793,66 +636,26 @@ mod oracle {
             let src: [&[u8]; 3] = [&c.planes[0], &c.planes[1], &c.planes[2]];
             let mut mine = c.planes.clone();
             cdef_frame(&f, &mb.maps(), &src, &c.stride, &mut split(&mut mine), &c.stride);
-            #[cfg(feature = "oracle")]
-            {
-                set_flags(&c);
-                let mut theirs = c.planes.clone();
-                let mut s = c.planes.clone();
-                let st = c.stride.map(|s| s as c_int);
-                // SAFETY: the planes cover the coded area at these strides.
-                unsafe {
-                    oracle_pf_cdef(
-                        &fp,
-                        c.blocks.as_ptr(),
-                        c.blocks.len() as u32,
-                        ptrs(&mut s).as_ptr(),
-                        ptrs(&mut theirs).as_ptr(),
-                        st.as_ptr(),
-                    )
-                };
-                assert!(mine == theirs, "{fp:?}");
-            }
             snap.put("cdef", &mine);
         }
         snap.check(&[("cdef", 0xb5ba6d91314d539f)]);
     }
 
     #[test]
-    fn postfilter_matches() {
+    fn postfilter_snapshot() {
         let mut s = Snapshot::new(&["postfilter"]);
         let mut r = Rng(45);
-        // (the C++ av1g_postfilter has no inter blocks)
-        #[allow(unused_mut)]
-        for mut c in cases(&mut r).into_iter().filter(|c| c.flags.is_empty()) {
+        // (the C++ av1g_postfilter had no inter blocks)
+        for c in cases(&mut r).into_iter().filter(|c| c.flags.is_empty()) {
             let mut mine = c.planes.clone();
             postfilter(&c.fp, &c.blocks, &mut split(&mut mine), &c.stride);
             s.put("postfilter", &mine);
-            #[cfg(feature = "oracle")]
-            let rec = DecisionRecord {
-                fp: c.fp,
-                n_blocks: c.blocks.len() as u32,
-                n_txb: 0,
-                n_coeffs: 0,
-                blocks: c.blocks.as_mut_ptr(),
-                block_txb: core::ptr::null_mut(),
-                txb: core::ptr::null_mut(),
-                coeffs: core::ptr::null_mut(),
-                inter: core::ptr::null_mut(),
-            };
-            #[cfg(feature = "oracle")]
-            {
-                let st = c.stride.map(|s| s as c_int);
-                // SAFETY: the record's blocks and the planes outlive the call.
-                let rc = unsafe { av1g_postfilter(&rec, ptrs(&mut c.planes).as_ptr(), st.as_ptr()) };
-                assert_eq!(rc, 0);
-                assert!(mine == c.planes, "{:?}", c.fp);
-            }
         }
         s.check(&[("postfilter", 0x407357a4acf9e6f4)]);
     }
 
     #[test]
-    fn cdef_pieces_match() {
+    fn cdef_pieces_snapshot() {
         let mut s = Snapshot::new(&["direction", "constrain", "pixel"]);
         let mut r = Rng(46);
         let src: Vec<u8> = (0..64 * 64).map(|_| r.next() as u8).collect();
@@ -866,17 +669,9 @@ mod oracle {
             } else {
                 (&smooth, 8)
             };
-            same!(s, "direction", cdef_direction(blk, stride), {
-                let (mut cd, mut cv) = (0, 0);
-                // SAFETY: an 8x8 block at this stride.
-                unsafe { oracle_pf_cdef_direction(blk.as_ptr(), stride as c_int, &mut cd, &mut cv) };
-                (cd, cv)
-            });
+            s.put("direction", &(cdef_direction(blk, stride)));
             let (diff, th, damp) = (r.range(-255, 255), r.range(0, 20), r.range(2, 7));
-            // SAFETY: plain ints.
-            same!(s, "constrain", cdef_constrain(diff, th, damp), unsafe {
-                oracle_pf_cdef_constrain(diff, th, damp)
-            });
+            s.put("constrain", &(cdef_constrain(diff, th, damp)));
             // a pixel near the frame's edges: MiRows x MiCols cut the 64 x 64 plane
             let (mr, mc) = (r.range(1, 16), r.range(1, 16));
             let plane = r.range(0, 2) as usize;
@@ -894,17 +689,7 @@ mod oracle {
                 ss: 1,
                 ..Default::default()
             };
-            same!(
-                s,
-                "pixel",
-                cdef_pixel(&f, &src, 64, plane, px, py, pri, sec, dmp, dir),
-                {
-                    // SAFETY: the plane is 64 x 64; taps stay inside the MiRows x MiCols region.
-                    unsafe {
-                        oracle_pf_cdef_pixel(mr, mc, src.as_ptr(), 64, plane as c_int, px, py, pri, sec, dmp, dir)
-                    }
-                }
-            );
+            s.put("pixel", &(cdef_pixel(&f, &src, 64, plane, px, py, pri, sec, dmp, dir)));
         }
         s.check(&[
             ("direction", 0x02ed5f980c530c8d),

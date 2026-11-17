@@ -15,10 +15,6 @@ crate-type = ["staticlib", "rlib"]
 default = ["capi"]
 # The C API Swift links (#[no_mangle] exports, include/glassact_av1.h).
 capi = []
-# Tests only: build the C++ original (Sources/AV1Core, AV1Encoder, AV1CoreTestSupport) and link
-# it, so tests can compare the port with it output for output. Use without capi (same symbols):
-#   cargo test --release --no-default-features --features oracle
-oracle = []
 
 [dependencies]
 

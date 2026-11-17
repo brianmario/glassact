@@ -1438,10 +1438,8 @@ impl Hybrid {
         &job.side.obu.obu
     }
 
-    /// av1enc_hybrid_set_reuse: keep unchanged tiles' closed loop and bitstream from picture to
-    /// picture (on by default).
-    /// The C++ hybrid's closed loop, for the differential tests: its rounding offset (0.375),
-    /// and the analysis's luma tx types kept.
+    /// The C++ hybrid's configuration, which the snapshot tests run (they were recorded against
+    /// it): its rounding offset (0.375), and the analysis's luma tx types kept.
     #[cfg(test)]
     pub(crate) fn as_cpp(&mut self) {
         self.quant_rnd = 0.375;
@@ -1554,6 +1552,8 @@ impl Hybrid {
         self.sb_qindex.extend_from_slice(map);
     }
 
+    /// av1enc_hybrid_set_reuse: keep unchanged tiles' closed loop and bitstream from picture to
+    /// picture (on by default).
     pub fn set_reuse(&mut self, on: bool) {
         self.reuse = on;
         if !on {
