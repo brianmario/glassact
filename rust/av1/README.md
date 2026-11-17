@@ -71,9 +71,9 @@ and the GPU use the same values. Never edit it by hand. The inter frames' tables
 
 Inter frames are checked against real decoders: the Swift `InterDecoderGateTests` (the vendored
 libaom), and `cargo test --release -- --ignored --nocapture decoders` (dav1d and aomdec in
-/opt/homebrew/bin, when installed). So are 4:4:4 key frames and still pictures (fp.chroma_format,
-the High profile: `decoders_444`, and the hybrid's `chroma444_key_frames`), which av1gpu's C++
-never had. The subsampling is a parameter of the frame
+/opt/homebrew/bin, when installed). So are 4:4:4 key frames, inter frames and still pictures
+(fp.chroma_format, the High profile: `decoders_444`, `decoders_444_inter`, the decoder's
+`decoders_agree`, and the hybrid's `chroma444_key_frames`), which av1gpu's C++ never had. The subsampling is a parameter of the frame
 (`ss`, 1 for 4:2:0 and 0 for 4:4:4; `blockinfo::chroma_ss`), not a second copy of the code.
 
 ## Rules

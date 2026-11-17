@@ -477,8 +477,8 @@ fn chroma444_headers() {
     assert_eq!((p.rec.fp.chroma_format, p.rec.fp.monochrome), (CHROMA_444, 0));
 }
 
-/// What 4:4:4 refuses: inter frames, monochrome, chroma formats other than 0 and 1, symbol
-/// streams; and a version 1 record's chroma_format is not read (4:2:0).
+/// What 4:4:4 refuses: monochrome, chroma formats other than 0 and 1, symbol streams (not inter
+/// frames, since 2026-11-17); and a version 1 record's chroma_format is not read (4:2:0).
 #[test]
 fn chroma444_refusals() {
     let rec = (0..40)
@@ -508,7 +508,9 @@ fn chroma444_refusals() {
     assert!(refused(&bad, &none).contains("chroma_format"), "chroma_format 2");
     let mut bad = rec.clone();
     (bad.fp.video, bad.fp.frame_type) = (1, FRAME_INTER);
-    assert!(refused(&bad, &none).contains("4:4:4"), "inter frame");
+    // (refused for its missing reference, not for its chroma)
+    let e = refused(&bad, &none);
+    assert!(!e.is_empty() && !e.contains("4:4:4"), "inter frame: {e}");
     let syms = Extras {
         record_syms: true,
         ..Extras::default()

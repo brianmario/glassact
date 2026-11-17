@@ -1,5 +1,5 @@
 //! Glass Act's AV1 decoder, for the streams the writer produces (the hybrid encoder's): still
-//! pictures, and key and inter frames of video streams, 8-bit 4:2:0, 4:4:4 key frames, monochrome;
+//! pictures, and key and inter frames of video streams, 8-bit 4:2:0 or 4:4:4, monochrome;
 //! 64x64 or 128x128 superblocks, uniform tiles, palettes, intra block copy, deblocking and CDEF,
 //! LAST_FRAME and the long-term GOLDEN_FRAME slots. Anything else is refused with an error, never
 //! decoded approximately: other profiles and bit depths, film grain, loop restoration, superres,
@@ -560,9 +560,6 @@ impl Decoder {
             mono: fp.monochrome != 0,
         };
         let inter = hdr.inter;
-        if inter && geo.ss == 0 {
-            return Err(err(ERR_INVALID, "4:4:4 inter frames not supported"));
-        }
         // the references: LAST_FRAME's slot, GOLDEN_FRAME's (its own, or LAST_FRAME's)
         let (last, golden) = if inter {
             let get = |s: u8| -> Result<usize, Error> {
@@ -792,7 +789,9 @@ impl Decoder {
         let ss = geo.ss as usize;
         let inter = hdr.inter;
         let lf_off = inter && fp.lf_inter_off != 0;
-        let pf_inner = inter && (lf_off || sq.sb128);
+        // (skipped inter blocks' unfiltered tx edges inside them: those larger than 64x64, and in
+        // 4:4:4 the chroma's of those 64 wide or high)
+        let pf_inner = inter && (lf_off || sq.sb128 || ss == 0);
         let pf_flags = if lf_off {
             PF_BLK_LF_ZERO | PF_BLK_INTER
         } else {
@@ -833,7 +832,7 @@ impl Decoder {
                             let rf = if inter { t.ref0[tk + j] } else { 0 };
                             let is_ref = rf as i32 == LAST_FRAME || rf == GOLDEN;
                             dst[j] = if pf_inner && is_ref {
-                                pf_skip_value(sk != 0, pf_flags, t.mi_size[tk + j] as i32)
+                                pf_skip_value(sk != 0, pf_flags, t.mi_size[tk + j] as i32, geo.ss)
                             } else {
                                 sk
                             };

@@ -252,9 +252,13 @@
  *   block's chroma is four 32x32s), CfL reads the co-located luma unaveraged (<< 3), palette
  *   colour index maps are the block's size for chroma too, intra block copy copies chroma at the
  *   luma displacement, and the post-filters work on chroma 4x4 edges and 8x8 CDEF blocks as on
- *   luma (chroma filter lengths and CDEF damping as for 4:2:0 chroma).  Key frames and still
- *   pictures only (inter frames are refused), not monochrome; the reconstruction and reference
- *   planes are width x height for every plane.  Version 1 records are 4:2:0.
+ *   luma (chroma filter lengths and CDEF damping as for 4:2:0 chroma).  Inter frames too: an
+ *   inter block's chroma predicts with the luma motion vector unscaled (at 1/16 chroma sample,
+ *   2 * mv) and luma's interpolation filters (4-tap where the block is 4 samples across), from
+ *   full-size reference planes; a skipped inter block's chroma tx edges inside it (at 32 in one
+ *   64 wide or high) aren't filtered.  Not monochrome; the reconstruction and reference planes
+ *   are width x height for every plane, and every frame of a stream has one chroma format (a
+ *   change is a new key frame).  Version 1 records are 4:2:0.
  * ==============================================================================
  */
 #ifndef AV1G_DECISIONS_H

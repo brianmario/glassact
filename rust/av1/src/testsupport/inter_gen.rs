@@ -25,7 +25,7 @@ use crate::dsp::{
 };
 use crate::tables::*;
 use crate::types::{
-    Block, BlockInter, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams, GOLDEN,
+    Block, BlockInter, CHROMA_444, DECISIONS_VERSION, ENC_NO_SEQ_HEADER, FRAME_INTER, FRAME_KEY, FrameParams, GOLDEN,
 };
 use crate::writer::{Record, apply_sb_qindex, legalize_sb_qindex, sb_grid, tile_layout_ex};
 
@@ -63,6 +63,8 @@ struct Gen<'a> {
     mi_cols: i32,
     mi_rows: i32,
     mono: bool,
+    /// the chroma subsampling: 1 (4:2:0), 0 (4:4:4)
+    ss: i32,
     tx_select: bool,
     inter_frame: bool,
     inter_pct: i32,
@@ -143,7 +145,7 @@ impl Gen<'_> {
             if self.tx_select && bs > BLOCK_4X4 {
                 b.tx_depth = rng.range(0, max_tx_depth(bs)) as u8;
             }
-            if has_chroma(bs, r, c, self.mono, 1) {
+            if has_chroma(bs, r, c, self.mono, self.ss) {
                 b.uv_mode = rng.range(0, if cfl_allowed(bs) { 13 } else { 12 }) as u8;
                 if b.uv_mode as i32 == UV_CFL_PRED {
                     loop {
@@ -309,6 +311,17 @@ impl InterSeq {
     /// The sequence of `seed`: sides up to `maxdim` (>= 8), `nframes` frames (>= 1). None if the
     /// drawn size can't be tiled (never for sides <= 4096).
     pub fn make(seed: u64, maxdim: i32, nframes: usize) -> Option<InterSeq> {
+        Self::make_ex(seed, maxdim, nframes, false)
+    }
+
+    /// [`InterSeq::make`] in 4:4:4 (fp.chroma_format [`CHROMA_444`], never monochrome): every
+    /// block has chroma, at the block's size. The same draws as 4:2:0's but for the blocks' chroma
+    /// fields, which every block now has.
+    pub fn make_444(seed: u64, maxdim: i32, nframes: usize) -> Option<InterSeq> {
+        Self::make_ex(seed, maxdim, nframes, true)
+    }
+
+    fn make_ex(seed: u64, maxdim: i32, nframes: usize, c444: bool) -> Option<InterSeq> {
         let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) ^ 0x1D872B41);
         rng.next();
         // 128x128 superblocks and the frames without a sequence header, from their own stream
@@ -341,7 +354,10 @@ impl InterSeq {
             tile_rows_log2: -1,
             ..FrameParams::default()
         };
-        base.monochrome = rng.chance(15) as u8;
+        base.monochrome = (rng.chance(15) && !c444) as u8;
+        if c444 {
+            base.chroma_format = CHROMA_444;
+        }
         base.enable_filter_intra = rng.chance(40) as u8;
         base.enable_intra_edge_filter = rng.chance(50) as u8;
         base.enable_cdef = rng.chance(50) as u8;
@@ -473,6 +489,7 @@ impl InterSeq {
                 mi_cols: mi_c,
                 mi_rows: mi_r,
                 mono: fp.monochrome != 0,
+                ss: (!c444) as i32,
                 tx_select: fp.tx_mode_select != 0,
                 inter_frame: !key,
                 inter_pct,

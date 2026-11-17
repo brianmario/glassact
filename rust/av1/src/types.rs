@@ -107,8 +107,8 @@ pub struct FrameParams {
     /// it); 0: GOLDEN_FRAME uses `ref_slot`, as every other reference does
     pub golden_slot: u8,
     /// [`CHROMA_420`] (0) or [`CHROMA_444`] (1: seq_profile 1, the chroma planes full size; key
-    /// frames and still pictures only, not monochrome). Read from version 2 records on; it takes
-    /// what was the structure's trailing padding byte, so its size is unchanged.
+    /// frames, inter frames and still pictures, not monochrome). Read from version 2 records on;
+    /// it takes what was the structure's trailing padding byte, so its size is unchanged.
     pub chroma_format: u8,
 }
 

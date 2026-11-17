@@ -113,15 +113,24 @@ pub const LF_ZERO: u8 = 2;
 /// block's size) except inside one larger than 64 that way.
 pub const LF_SKIP_W128: u8 = 4;
 pub const LF_SKIP_H128: u8 = 8;
+/// [`PfMaps::skip`]'s bits for a skipped inter block 64 wide ([`LF_SKIP_W64`]) or 64 high
+/// ([`LF_SKIP_H64`]) of a 4:4:4 frame: its chroma tx blocks are 32 that way (get_tx_size), and
+/// their edge at 32 inside it isn't a block edge, so it isn't filtered (libaom av1_loopfilter.c
+/// set_lpf_parameters: an edge between two skipped inter blocks is filtered only on a prediction
+/// block's edge, `pu_edge`, of the plane's block size). Only 4:4:4 frames' maps have them, and only
+/// chroma reads them (a skipped inter block's luma tx is the block's size, up to 64).
+pub const LF_SKIP_W64: u8 = 16;
+pub const LF_SKIP_H64: u8 = 32;
 /// Per-block flags of [`PfMapsBuf::mark_block_flags`] (av1g_pf_mark_block_flags, p_mark's
 /// `lfZero` bytes): the block's loop filter level is 0 (an inter block with fp.lf_inter_off; it
 /// implies [`PF_BLK_INTER`]), the block is inter.
 pub const PF_BLK_LF_ZERO: u8 = 1;
 pub const PF_BLK_INTER: u8 = 2;
 
-/// A block's [`PfMaps::skip`] value: its skip, [`LF_ZERO`], [`LF_SKIP_W128`] / [`LF_SKIP_H128`].
+/// A block's [`PfMaps::skip`] value: its skip, [`LF_ZERO`], [`LF_SKIP_W128`] / [`LF_SKIP_H128`],
+/// and in a frame whose chroma subsampling `ss` is 0 (4:4:4) [`LF_SKIP_W64`] / [`LF_SKIP_H64`].
 #[inline]
-pub fn pf_skip_value(skip: bool, flags: u8, bsize: i32) -> u8 {
+pub fn pf_skip_value(skip: bool, flags: u8, bsize: i32, ss: i32) -> u8 {
     let inter = flags & (PF_BLK_LF_ZERO | PF_BLK_INTER) != 0;
     let mut v = skip as u8;
     if flags & PF_BLK_LF_ZERO != 0 {
@@ -130,9 +139,13 @@ pub fn pf_skip_value(skip: bool, flags: u8, bsize: i32) -> u8 {
     if skip && inter {
         if bw4(bsize) > 16 {
             v |= LF_SKIP_W128;
+        } else if bw4(bsize) == 16 && ss == 0 {
+            v |= LF_SKIP_W64;
         }
         if bh4(bsize) > 16 {
             v |= LF_SKIP_H128;
+        } else if bh4(bsize) == 16 && ss == 0 {
+            v |= LF_SKIP_H64;
         }
     }
     v
@@ -181,7 +194,7 @@ impl PfMapsBuf {
         let (r0, c0, bs) = (b.mi_row as i32, b.mi_col as i32, b.bsize as i32);
         let (bw, bh) = (bw4(bs), bh4(bs));
         let tx_y = luma_tx_size(bs, b.tx_depth as i32) as u8;
-        let sk = pf_skip_value(b.skip != 0, flags, bs);
+        let sk = pf_skip_value(b.skip != 0, flags, bs, f.ss);
         for y in r0..(r0 + bh).min(f.mi_rows) {
             for x in c0..(c0 + bw).min(f.mi_cols) {
                 let k = (y * f.mi_cols + x) as usize;
@@ -399,13 +412,19 @@ pub(crate) fn lf_filter_size_sub(
     let sk = m.skip[row as usize * mc + col as usize];
     let (cur, prev) = if pass == 0 {
         let cur = Tx_Width[tx_sz] as i32;
-        if x_p & (cur - 1) != 0 || (sk & LF_SKIP_W128 != 0 && (x_p << sub) & 127 != 0) {
+        if x_p & (cur - 1) != 0
+            || (sk & LF_SKIP_W128 != 0 && (x_p << sub) & 127 != 0)
+            || (plane != 0 && sk & LF_SKIP_W64 != 0 && x_p & 63 != 0)
+        {
             return None;
         }
         (cur, Tx_Width[prev_tx_sz] as i32)
     } else {
         let cur = Tx_Height[tx_sz] as i32;
-        if y_p & (cur - 1) != 0 || (sk & LF_SKIP_H128 != 0 && (y_p << sub) & 127 != 0) {
+        if y_p & (cur - 1) != 0
+            || (sk & LF_SKIP_H128 != 0 && (y_p << sub) & 127 != 0)
+            || (plane != 0 && sk & LF_SKIP_H64 != 0 && y_p & 63 != 0)
+        {
             return None;
         }
         (cur, Tx_Height[prev_tx_sz] as i32)

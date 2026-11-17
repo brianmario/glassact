@@ -158,8 +158,18 @@ fn copy_variant(seq: &mut InterSeq, seed: u64) {
 
 /// Random sequence `seed` as the tests vary it: sometimes copy-heavy, reduced, with palettes.
 fn test_seq(seed: u64, maxdim: i32, nframes: usize) -> Option<InterSeq> {
+    test_seq_ex(seed, maxdim, nframes, false)
+}
+
+/// [`test_seq`], 4:4:4 with `c444` ([`InterSeq::make_444`]).
+fn test_seq_ex(seed: u64, maxdim: i32, nframes: usize, c444: bool) -> Option<InterSeq> {
     let copies = seed.is_multiple_of(2);
-    let mut seq = InterSeq::make(seed, if copies { 2 * maxdim } else { maxdim }, nframes)?;
+    let maxdim = if copies { 2 * maxdim } else { maxdim };
+    let mut seq = if c444 {
+        InterSeq::make_444(seed, maxdim, nframes)?
+    } else {
+        InterSeq::make(seed, maxdim, nframes)?
+    };
     if copies {
         copy_variant(&mut seq, seed);
     }
@@ -211,6 +221,46 @@ fn sequences_decode_as_written() {
     assert!(
         fast.written.load(Relaxed) < fast.copy.load(Relaxed) + fast.clean.load(Relaxed) + fast.filter.load(Relaxed)
     );
+    assert_eq!(full.copy.load(Relaxed) + full.clean.load(Relaxed), 0);
+}
+
+/// 4:4:4 sequences (key and inter frames; copy-heavy, reduced, with palettes) decode to exactly
+/// the writer's reconstruction, by the copy path and by the full one.
+#[test]
+fn sequences_444_decode_as_written() {
+    let (fast, full) = (Cov::default(), Cov::default());
+    let frames = AtomicU64::new(0);
+    seeds(100, |seed| {
+        let Some(mut seq) = test_seq_ex(seed, 200, 8, true) else {
+            return;
+        };
+        let mut w = Writer::with_threads(2);
+        let outs = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD)
+            .unwrap_or_else(|(k, e)| panic!("seed {seed} frame {k}: encode: {e}"));
+        let mut a = Decoder::new(1 + (seed % 3) as usize);
+        let mut b = Decoder::new(2);
+        b.set_full(true);
+        for (k, out) in outs.iter().enumerate() {
+            let inter = seq.frames[k].fp.frame_type == FRAME_INTER;
+            for (d, cov, what) in [(&mut a, &fast, "copy path"), (&mut b, &full, "full path")] {
+                let pic = d
+                    .decode(&out.obu)
+                    .unwrap_or_else(|e| panic!("seed {seed} frame {k} ({what}): {e}"));
+                assert_eq!(pic.chroma_format, CHROMA_444);
+                same(&pic, out).unwrap_or_else(|e| panic!("seed {seed} frame {k} ({what}): {e}"));
+                cov.add(&d.stats(), inter);
+            }
+            frames.fetch_add(inter as u64, Relaxed);
+        }
+    });
+    eprintln!(
+        "{} 4:4:4 inter frames; copy path: {}\nfull path: {}",
+        frames.load(Relaxed),
+        fast.report(),
+        full.report()
+    );
+    assert!(frames.load(Relaxed) > 500);
+    assert!(fast.copy.load(Relaxed) > 100 && fast.clean.load(Relaxed) > 500);
     assert_eq!(full.copy.load(Relaxed) + full.clean.load(Relaxed), 0);
 }
 
@@ -548,13 +598,19 @@ fn corpus(n: u64) -> Vec<Stream> {
     let mut v = Vec::new();
     let mut w = Writer::with_threads(1);
     for seed in 0..n {
-        if let Some(mut seq) = test_seq(seed, 96, 6)
-            && let Ok(outs) = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD)
-        {
-            v.push(Stream {
-                tus: outs.iter().map(|o| o.obu.clone()).collect(),
-                outs,
-            });
+        // (4:4:4 sequences for every other seed)
+        for c444 in [false, true] {
+            if c444 && seed % 2 == 0 {
+                continue;
+            }
+            if let Some(mut seq) = test_seq_ex(seed, 96, 6, c444)
+                && let Ok(outs) = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD)
+            {
+                v.push(Stream {
+                    tus: outs.iter().map(|o| o.obu.clone()).collect(),
+                    outs,
+                });
+            }
         }
         let mut stills = Vec::new();
         if let Some(r) = record_444(seed, 64, seed % 2 == 0) {
@@ -638,6 +694,8 @@ struct FuzzCount {
     /// decoded frames the oracle decoded identically; key frames after damage that decoded as
     /// they were written
     vouched: AtomicU64,
+    /// of those, 4:4:4 inter frames
+    vouched_444_inter: AtomicU64,
     resynced: AtomicU64,
     kinds: [AtomicU64; 7],
 }
@@ -799,6 +857,9 @@ fn fuzz_case(s: &Stream, seed: u64, d: &mut Decoder, count: &FuzzCount, progress
                     Ok(o) => {
                         same(&pic, &o).unwrap_or_else(|e| panic!("fuzz seed {seed} (kind {kind}) tu {i}: {e}"));
                         count.vouched.fetch_add(1, Relaxed);
+                        if !pic.key && pic.chroma_format == CHROMA_444 {
+                            count.vouched_444_inter.fetch_add(1, Relaxed);
+                        }
                     }
                     Err(e) => panic!(
                         "fuzz seed {seed} (kind {kind}) tu {i}: decoded, but the parser and writer refuse it: {e}"
@@ -881,7 +942,7 @@ fn fuzz(streams: u64, cases_per_stream: u64) {
     });
     let k: Vec<u64> = count.kinds.iter().map(|k| k.load(Relaxed)).collect();
     eprintln!(
-        "fuzz: {} streams, {} cases (truncated {}, bits flipped {}, random spans {}, random bytes {}, random OBUs {}, tile data {}, reordered {}), {} decodes in {:.1} s: {} reached the tile walk, {} decoded ({} identical to the parser and writer's), {} key frames after damage as written",
+        "fuzz: {} streams, {} cases (truncated {}, bits flipped {}, random spans {}, random bytes {}, random OBUs {}, tile data {}, reordered {}), {} decodes in {:.1} s: {} reached the tile walk, {} decoded ({} identical to the parser and writer's, {} of them 4:4:4 inter frames), {} key frames after damage as written",
         corpus.len(),
         count.cases.load(Relaxed),
         k[0],
@@ -896,10 +957,12 @@ fn fuzz(streams: u64, cases_per_stream: u64) {
         count.walked.load(Relaxed),
         count.decoded.load(Relaxed),
         count.vouched.load(Relaxed),
+        count.vouched_444_inter.load(Relaxed),
         count.resynced.load(Relaxed),
     );
     assert!(count.walked.load(Relaxed) > count.decodes.load(Relaxed) / 4);
     assert!(count.resynced.load(Relaxed) > 0);
+    assert!(count.vouched_444_inter.load(Relaxed) > 0);
 }
 
 /// Hostile input: truncated, bit-flipped, overwritten, random and reordered temporal units of real
@@ -951,8 +1014,8 @@ fn external(tool: &str, stream: &std::path::Path, out: &std::path::Path) -> Vec<
     v
 }
 
-/// The installed decoders (dav1d, aomdec) and this one decode random sequences (4:2:0 key and
-/// inter frames, copy-heavy ones) and 4:4:4 key frames identically.
+/// The installed decoders (dav1d, aomdec) and this one decode random sequences (4:2:0 and 4:4:4
+/// key and inter frames, copy-heavy ones) and 4:4:4 key frames identically.
 #[test]
 #[ignore]
 fn decoders_agree() {
@@ -967,10 +1030,16 @@ fn decoders_agree() {
     seeds(n, |seed| {
         let mut w = Writer::with_threads(2);
         let mut streams: Vec<(Vec<Output>, crate::types::FrameParams, String)> = Vec::new();
-        if let Some(mut seq) = test_seq(seed, maxdim, 8) {
-            // (a reduced stream's frames are its frames' size, which the IVF header's isn't)
-            let outs = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD).unwrap();
-            streams.push((outs, seq.frames[0].fp, format!("seq {seed}")));
+        for c444 in [false, true] {
+            if let Some(mut seq) = test_seq_ex(seed, maxdim, 8, c444) {
+                // (a reduced stream's frames are its frames' size, which the IVF header's isn't)
+                let outs = encode_seq(&mut w, &mut seq, ENC_FIX_RANGE | ENC_TD).unwrap();
+                if c444 {
+                    f444.fetch_add(outs.len() as u64, Relaxed);
+                }
+                let what = format!("seq {seed}{}", if c444 { " 4:4:4" } else { "" });
+                streams.push((outs, seq.frames[0].fp, what));
+            }
         }
         for filters in [true, false] {
             if let Some(mut rec) = record_444(seed, maxdim, filters) {
@@ -1011,7 +1080,7 @@ fn decoders_agree() {
         }
     });
     eprintln!(
-        "{} frames ({} 4:4:4 pictures) decode identically here and in {}",
+        "{} frames ({} 4:4:4 frames and pictures) decode identically here and in {}",
         frames.load(Relaxed),
         f444.load(Relaxed),
         tools.join(", ")

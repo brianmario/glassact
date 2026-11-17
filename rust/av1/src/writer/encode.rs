@@ -1086,15 +1086,12 @@ fn check_frame(fp: &FrameParams) -> Res<()> {
     if fp.allow_screen_content_tools > 1 {
         fail!(ERR_INVALID, "allow_screen_content_tools must be 0/1");
     }
-    // 4:4:4 (version 2): key frames and still pictures, with chroma
+    // 4:4:4 (version 2): key frames, inter frames and still pictures, with chroma
     if fp.version >= 2 && fp.chroma_format > CHROMA_444 {
         fail!(ERR_INVALID, "chroma_format must be 0 (4:2:0) or 1 (4:4:4)");
     }
-    if chroma_ss(fp) == 0 && (fp.monochrome != 0 || fp.frame_type != FRAME_KEY) {
-        fail!(
-            ERR_INVALID,
-            "4:4:4 (chroma_format 1) is for key frames and still pictures with chroma: not monochrome, not inter frames"
-        );
+    if chroma_ss(fp) == 0 && fp.monochrome != 0 {
+        fail!(ERR_INVALID, "4:4:4 (chroma_format 1) has chroma: not monochrome");
     }
     if fp.allow_intrabc > 1
         || (fp.allow_intrabc != 0
@@ -1903,9 +1900,10 @@ fn recon(
     let ss = f.ss as usize;
     let (mc, mr) = (f.mi_cols as usize, f.mi_rows as usize);
     // the post-filters' skip map: with lf_inter_off, inter blocks' level is 0; with 128x128
-    // superblocks, skipped inter blocks larger than 64x64 have unfiltered tx edges inside
+    // superblocks, skipped inter blocks larger than 64x64 have unfiltered tx edges inside, and in
+    // 4:4:4 those 64 wide or high have them in chroma (its tx blocks are 32 at most)
     let lf_off = f.inter && fp.lf_inter_off != 0;
-    let inner = f.inter && f.sb128;
+    let inner = f.inter && (f.sb128 || f.ss == 0);
     let mut pf_skip = core::mem::take(&mut frame.pf_skip);
     if lf_off || inner {
         pf_skip.clear();
@@ -1921,7 +1919,7 @@ fn recon(
                 for (x, d) in pf_skip[(r0 + y) * mc + c0..][..mw].iter_mut().enumerate() {
                     let k = y * mw + x;
                     *d = if t.ref0[k] as i32 == LAST_FRAME || t.ref0[k] == crate::types::GOLDEN {
-                        pf_skip_value(t.skip[k] != 0, flags, t.mi_size[k] as i32)
+                        pf_skip_value(t.skip[k] != 0, flags, t.mi_size[k] as i32, f.ss)
                     } else {
                         t.skip[k]
                     };

@@ -127,6 +127,18 @@ fn inter_sequences_round_trip() {
     assert!(golden > 1000);
 }
 
+/// 4:4:4 sequences ([`InterSeq::make_444`]: key and inter frames, every tool of 4:2:0's, chroma at
+/// full size) round-trip as [`inter_sequences_round_trip`]'s do, reduced ones too.
+#[test]
+fn inter_444_sequences_round_trip() {
+    let before = GOLDEN_BLOCKS.load(std::sync::atomic::Ordering::Relaxed);
+    let frames =
+        round_trip_seqs_ex(120, 200, false, true, |_| true) + round_trip_seqs_ex(30, 200, true, true, |_| true);
+    let golden = GOLDEN_BLOCKS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    eprintln!("{frames} 4:4:4 frames; {golden} GOLDEN_FRAME blocks");
+    assert!(frames > 700 && golden > 500);
+}
+
 /// Random sequences whose frames are all coded smaller than their stream (decisions.h "Reduced
 /// frames") round-trip as [`inter_sequences_round_trip`]'s do.
 #[test]
@@ -190,9 +202,23 @@ fn sb128_sequences_round_trip() {
 static GOLDEN_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
+    round_trip_seqs_ex(n, maxdim, reduced, false, pick)
+}
+
+/// The sequence of `seed`, 4:2:0 or (`c444`) 4:4:4.
+pub(crate) fn make_seq(seed: u64, maxdim: i32, nframes: usize, c444: bool) -> Option<InterSeq> {
+    if c444 {
+        InterSeq::make_444(seed, maxdim, nframes)
+    } else {
+        InterSeq::make(seed, maxdim, nframes)
+    }
+}
+
+/// [`round_trip_seqs`], of 4:4:4 sequences with `c444` ([`InterSeq::make_444`]).
+fn round_trip_seqs_ex(n: u64, maxdim: i32, reduced: bool, c444: bool, pick: impl Fn(&InterSeq) -> bool + Sync) -> u64 {
     let frames = std::sync::atomic::AtomicU64::new(0);
     seeds(n, |w, seed| {
-        let Some(mut seq) = InterSeq::make(seed, maxdim, 6) else {
+        let Some(mut seq) = make_seq(seed, maxdim, 6, c444) else {
             return;
         };
         if !pick(&seq) {
@@ -245,7 +271,7 @@ fn round_trip_seqs(n: u64, maxdim: i32, reduced: bool, pick: impl Fn(&InterSeq) 
         }
         frames.fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if seed % 8 == 0 || (seq.frames[0].fp.sb128 != 0 && seed % 3 == 0) {
-            let Some(mut again) = InterSeq::make(seed, maxdim, 6) else {
+            let Some(mut again) = make_seq(seed, maxdim, 6, c444) else {
                 return;
             };
             if reduced {
@@ -911,13 +937,28 @@ pub(crate) fn ivf(outs: &[Output], w: u32, h: u32) -> Vec<u8> {
 #[test]
 #[ignore]
 fn decoders() {
+    decoders_run(false);
+}
+
+/// [`decoders`] of 4:4:4 sequences ([`InterSeq::make_444`]): key and inter frames.
+#[test]
+#[ignore]
+fn decoders_444_inter() {
+    decoders_run(true);
+}
+
+fn decoders_run(c444: bool) {
     let tools = [
         ("dav1d", vec!["-q", "-i", "IN", "-o", "OUT"]),
         ("aomdec", vec!["--rawvideo", "-o", "OUT", "IN"]),
     ];
     let env = |k: &str, d: u64| std::env::var(k).map_or(d, |v| v.parse().unwrap());
     let (n, maxdim, nframes) = (env("SEQS", 60), env("MAXDIM", 160) as i32, env("FRAMES", 8) as usize);
-    let dir = std::env::temp_dir().join(format!("glassact-av1-decoders-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "glassact-av1-decoders{}-{}",
+        if c444 { "-444" } else { "" },
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let frames = std::sync::atomic::AtomicU64::new(0);
     let (sb128_frames, headerless) = (
@@ -926,7 +967,7 @@ fn decoders() {
     );
     let stills = std::sync::atomic::AtomicU64::new(0);
     seeds(n, |w, seed| {
-        let Some(mut seq) = InterSeq::make(seed, maxdim, nframes) else {
+        let Some(mut seq) = make_seq(seed, maxdim, nframes, c444) else {
             return;
         };
         if seed % 3 == 1 {
@@ -975,9 +1016,14 @@ fn decoders() {
         sb128_coverage(),
         intrabc_coverage()
     );
-    assert_phase_coverage(1);
+    if c444 {
+        // (4:4:4 chroma predicts at luma's positions, and is counted as luma)
+        assert_phase_coverage_ex(1, false);
+    } else {
+        assert_phase_coverage(1);
+        assert_intrabc_coverage(1);
+    }
     assert_sb128_coverage(1);
-    assert_intrabc_coverage(1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1144,11 +1190,17 @@ pub(super) fn coverage() -> String {
 /// filter variants (8-tap, and 4-tap for 4-or-fewer-sample blocks), has been predicted at least
 /// `n` times along each axis in this process; and NEWMV differences coded fr and hp bits.
 pub(super) fn assert_phase_coverage(n: u64) {
+    assert_phase_coverage_ex(n, true);
+}
+
+/// [`assert_phase_coverage`], of luma alone without `chroma` (4:4:4 chroma, which predicts at
+/// luma's positions, counts as luma).
+pub(super) fn assert_phase_coverage_ex(n: u64, chroma: bool) {
     let s = super::walk::INTER_STAT
         .each_ref()
         .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
     let p = &s[super::walk::INTER_STAT_PHASE..];
-    for plane in 0..2 {
+    for plane in 0..1 + chroma as usize {
         for four in 0..2 {
             for ph in 1..16 {
                 if plane == 0 && ph % 2 != 0 {

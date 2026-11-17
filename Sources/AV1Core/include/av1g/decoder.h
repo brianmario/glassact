@@ -8,7 +8,7 @@
  *   av1g_decoder_reset()          forget the stream (the next frame must be a key frame)
  *   av1g_decoder_destroy()
  *
- * The toolset: still pictures, key and inter frames, 8-bit 4:2:0, 4:4:4 key frames, monochrome,
+ * The toolset: still pictures, key and inter frames, 8-bit 4:2:0 or 4:4:4, monochrome,
  * 64x64 or 128x128 superblocks, uniform tiles, palettes, intra block copy, deblocking and CDEF,
  * LAST_FRAME and GOLDEN_FRAME references, frames up to AV1G_DEC_MAX_DIM a side (or the caller's
  * cap).  Anything else is refused with an error (AV1G_ERR_INVALID), never decoded approximately.
