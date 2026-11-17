@@ -9,7 +9,9 @@
 //! without post-filters. With [`Hybrid::set_chroma_444`], key frames are 4:4:4 (fp.chroma_format):
 //! the planes are full size, and the chroma decisions are the closed loop's own (the reference
 //! engine's rule, [`decide::Decider::best_chroma`], whatever the flags say: the Metal analysis's
-//! chroma decision is 4:2:0's); inter frames are refused.
+//! chroma decision is 4:2:0's); inter frames are refused. With [`Hybrid::set_palette`], intra
+//! blocks may become palette blocks, decided by cost before the closed loop ([`palette`]): luma,
+//! and in 4:4:4 chroma too.
 //!
 //! From av1gpu's CPU reference engine (BSD-2): its forward transform (here also in float), padded
 //! source, Hadamard cost proxy, chroma decisions and quantization hook, which the reference engine

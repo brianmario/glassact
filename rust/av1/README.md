@@ -14,7 +14,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 | `entropy` | the range encoder, CDF contexts, symbol streams |
 | `avif` | the AVIF muxer |
 | `enc` | the Metal encoder's host half: derived tables as MSL, the GPU entropy plan, the post-filter frame, tune=iq and the CDEF search's host half |
-| `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided (and inter blocks); key frames' intra block copies (`hybrid::intrabc`) |
+| `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided (and inter blocks); key frames' intra block copies (`hybrid::intrabc`); palette blocks by cost, luma and in 4:4:4 chroma (`hybrid::palette`) |
 | `motion` | inter frames' exact copies: 64x64s that equal the previous source, unchanged or shifted, as skip inter blocks (with 128x128 superblocks, a 128x128 of one shift as one block) |
 | `pool` | the worker threads every parallel loop shares, started once and parked between loops |
 | `testsupport` | random legal records and inter sequences, the reference engine, the GPU's DSP cases (tests only) |
