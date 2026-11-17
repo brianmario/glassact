@@ -9,23 +9,38 @@ import Testing
 /// libaom: on every random legal record (deblocking levels and sharpness,
 /// CDEF presets, skip and tx-size maps, frame edges, 128x128 superblocks),
 /// deblocking and CDEF of the reconstruction before them give av1core's
-/// filtered picture exactly.
+/// filtered picture exactly, in 4:2:0 and in 4:4:4 (the High profile: chroma
+/// on luma's grid, its 4-sample edges and 8×8 CDEF blocks).
 @Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct PostfilterTests {
     @available(macOS 27, *)
     @Test(arguments: 0..<6)
     func filtersMatchAV1Core(chunk: UInt64) throws {
+        try filtersMatch(chunk: chunk, sb128: chunk >= 4, chroma444: false)
+    }
+
+    /// 4:4:4 records (chunks 2 and 3: 128x128 superblocks).
+    @available(macOS 27, *)
+    @Test(arguments: 0..<4)
+    func filters444MatchAV1Core(chunk: UInt64) throws {
+        try filtersMatch(chunk: chunk, sb128: chunk >= 2, chroma444: true)
+    }
+
+    @available(macOS 27, *)
+    func filtersMatch(chunk: UInt64, sb128 big: Bool, chroma444: Bool) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let postfilter = try AV1MetalPostfilter(device: device)
         let perChunk: UInt64 = 50
         var filtered = 0
-        // chunks 4 and 5: 128x128 superblocks (blocks up to 128x128, CDEF per 64x64 of them)
-        let sb128: Int32 = chunk >= 4 ? 1 : 0
+        // 128x128 superblocks: blocks up to 128x128, CDEF per 64x64 of them
+        let sb128: Int32 = big ? 1 : 0
         for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
-            let fuzzCase = try #require(av1t_case_make_ex(seed, sb128 != 0 ? 420 : 300, 2, sb128), "seed \(seed): no record")
+            let fuzzCase = try #require(chroma444 ? av1t_case_make_444(seed, big ? 420 : 300, 2, sb128)
+                                                  : av1t_case_make_ex(seed, big ? 420 : 300, 2, sb128), "seed \(seed): no record")
             defer { av1t_case_free(fuzzCase) }
             let record = try #require(av1t_case_record(fuzzCase))
             let fp = record.pointee.fp
+            #expect((fp.chroma_format == UInt8(AV1G_CHROMA_444)) == chroma444, "seed \(seed): the record's chroma format")
             // before the filters (this also repairs the coefficients the second encode codes)
             var before = av1g_output(), after = av1g_output()
             defer { av1g_output_free(&before); av1g_output_free(&after) }
@@ -60,12 +75,26 @@ struct PostfilterTests {
     @available(macOS 27, *)
     @Test(arguments: 0..<6)
     func interFiltersMatchAV1Core(chunk: UInt64) throws {
+        try interFiltersMatch(chunk: chunk, maxdim: chunk >= 4 ? 420 : 240, chroma444: false)
+    }
+
+    /// 4:4:4 sequences: a skipped inter block 64 wide or high has chroma tx blocks of 32, whose
+    /// edge inside it isn't filtered (AV1G_PF_SKIP_W64 / H64).
+    @available(macOS 27, *)
+    @Test(arguments: 0..<4)
+    func interFilters444MatchAV1Core(chunk: UInt64) throws {
+        try interFiltersMatch(chunk: chunk, maxdim: chunk >= 2 ? 420 : 240, chroma444: true)
+    }
+
+    @available(macOS 27, *)
+    func interFiltersMatch(chunk: UInt64, maxdim: Int32, chroma444: Bool) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let postfilter = try AV1MetalPostfilter(device: device)
         let perChunk: UInt64 = 12
         var lfOff = 0, sb128Frames = 0
         for seed in (1 + chunk * perChunk)...((chunk + 1) * perChunk) {
-            let sequence = try #require(av1t_inter_case_make(seed, chunk >= 4 ? 420 : 240, 6), "seed \(seed): no sequence")
+            let sequence = try #require(chroma444 ? av1t_inter_case_make_444(seed, maxdim, 6) : av1t_inter_case_make(seed, maxdim, 6),
+                                        "seed \(seed): no sequence")
             defer { av1t_inter_case_free(sequence) }
             var outputs: [av1g_output] = []
             defer { for i in outputs.indices { av1g_output_free(&outputs[i]) } }
@@ -73,6 +102,7 @@ struct PostfilterTests {
             for k in 0..<Int(av1t_inter_case_frames(sequence)) {
                 let record = try #require(av1t_inter_case_record(sequence, Int32(k)))
                 let fp = record.pointee.fp
+                #expect((fp.chroma_format == UInt8(AV1G_CHROMA_444)) == chroma444, "seed \(seed) frame \(k): the record's chroma format")
                 var refs = [av1g_ref_planes](repeating: av1g_ref_planes(), count: 8)
                 for (s, f) in slots.enumerated() where f >= 0 {
                     let o = outputs[f]

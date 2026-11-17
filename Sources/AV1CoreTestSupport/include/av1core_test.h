@@ -18,6 +18,9 @@ av1t_case *av1t_case_make(uint64_t seed, int maxdim, int big_pct);
 // av1t_case_make with 128x128 superblocks (sb128 = 1: fp.sb128, the partition starting at 128x128
 // with every type its node allows); sb128 = 0: av1t_case_make.
 av1t_case *av1t_case_make_ex(uint64_t seed, int maxdim, int big_pct, int sb128);
+// av1t_case_make_ex in 4:4:4 (fp.chroma_format AV1G_CHROMA_444, never monochrome): every block
+// with chroma, at the block's size.
+av1t_case *av1t_case_make_444(uint64_t seed, int maxdim, int big_pct, int sb128);
 av1g_decision_record *av1t_case_record(av1t_case *c);
 void av1t_case_free(av1t_case *c);
 
@@ -33,6 +36,8 @@ void av1t_case_free(av1t_case *c);
 // inter frame the slots in fp.refresh_frame_flags), which the caller tracks.
 typedef struct av1t_inter_case av1t_inter_case;
 av1t_inter_case *av1t_inter_case_make(uint64_t seed, int maxdim, int nframes);
+// av1t_inter_case_make in 4:4:4 (fp.chroma_format AV1G_CHROMA_444, never monochrome).
+av1t_inter_case *av1t_inter_case_make_444(uint64_t seed, int maxdim, int nframes);
 int av1t_inter_case_frames(const av1t_inter_case *c);
 // The encode flags frame `frame` adds to its options: AV1G_ENC_NO_SEQ_HEADER for some frames after
 // the first (a stream's later frames without their own sequence header), else 0.

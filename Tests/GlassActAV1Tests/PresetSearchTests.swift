@@ -7,7 +7,7 @@ import Testing
 /// The GPU's CDEF preset search (l_select) is the sequential reference's
 /// (av1enc_cdef_select_cpu) on random SSE tables: every size of picture from
 /// one 64×64 to more than a thread each, monochrome, ties, and the largest
-/// SSE a 64×64 can have.
+/// SSE a 64×64 can have (4:2:0's, and 4:4:4's, whose chroma is two 64×64s).
 @Suite(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
 struct PresetSearchTests {
     @available(macOS 27, *)
@@ -17,13 +17,15 @@ struct PresetSearchTests {
         let postfilter = try AV1MetalPostfilter(device: device)
         var rng = SplitMix64(seed: UInt64(sbCols * 1000 + sbRows))
         let nsb = sbCols * sbRows
-        for trial in 0..<6 {
+        for trial in 0..<7 {
             let mono = trial == 5
-            // trial 0: few distinct values (ties everywhere); 4: the largest a 64×64 has
-            let top: UInt32 = trial == 0 ? 3 : trial == 4 ? 4096 * 255 * 255 : 1 << UInt32(8 + 4 * trial)
+            // trial 0: few distinct values (ties everywhere); 4: the largest a 4:2:0 64×64 has; 6:
+            // the largest a 4:4:4 one has (chroma twice luma's)
+            let top: UInt32 = trial == 0 ? 3 : trial >= 4 && trial != 5 ? 4096 * 255 * 255 : 1 << UInt32(8 + 4 * trial)
+            let chromaTop = trial == 6 ? 2 * top : top / 2
             let luma = (0..<4 * nsb).map { _ in UInt32.random(in: 0...top, using: &rng) }
             let chroma = mono ? [UInt32](repeating: 0, count: 4 * nsb)
-                : (0..<4 * nsb).map { _ in UInt32.random(in: 0...top / 2, using: &rng) }
+                : (0..<4 * nsb).map { _ in UInt32.random(in: 0...chromaTop, using: &rng) }
             let gpu = try postfilter.presetSearch(lumaSSE: luma, chromaSSE: chroma, sbCols: sbCols, mono: mono)
             let bits = AV1MetalPostfilter.maxCDEFBits + 1
             var lev = [Int32](repeating: 0, count: 16 * bits), tot = [UInt64](repeating: 0, count: bits)

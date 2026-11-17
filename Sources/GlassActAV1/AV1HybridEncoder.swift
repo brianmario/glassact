@@ -47,8 +47,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// of format, as of size, is a key frame. The GPU's analysis decides the partition, luma
         /// modes and motion from a 4:2:0 copy of the chroma (2×2 means; inter frames' against the
         /// picture before's copy); the closed loop decides chroma and codes every plane from the
-        /// real ones, its inter blocks predicting from full-size references. No post-filters (the
-        /// GPU's are 4:2:0's), with intra block copy or not.
+        /// real ones, its inter blocks predicting from full-size references. The GPU's post-filters
+        /// and their search filter it as 4:2:0's, on its full-size planes.
         public var chroma444: Bool
 
         public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {
@@ -186,8 +186,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var chroma444Palettes = true
 
     /// Research: a 4:4:4 picture of a stream is deblocked and CDEF-filtered on the CPU
-    /// (`av1enc_hybrid_postfilter_cpu`; the GPU's filters are 4:2:0's), as `postfilters` says;
-    /// off: none (BENCHMARKS "4:4:4 inter frames" has what they were worth).
+    /// (`av1enc_hybrid_postfilter_cpu`), as `postfilters` says, not on the GPU (BENCHMARKS "4:4:4
+    /// inter frames" has what they were worth and cost there).
     public var chroma444CPUFilters = false
 
     /// The shapes a 4:4:4 picture's analysis leaves out with `chroma444Palettes`: 4×4, 4×8 and 8×4
@@ -649,6 +649,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// reconstruction as is, and a tile decodes to the same samples alone
     /// as in its frame (the filters cross tile edges).
     public var postfilters = true
+
+    /// CDEF where the filters run (on): off, every picture is deblocked alone (CDEF signalled
+    /// but inactive, as libaom does at qindex 32 and under), as `newPictureEffort`'s are.
+    public var usesCDEF = true
 
     /// Time the GPU's stages one by one (`AV1MetalEncoder.profilesStages`):
     /// for measurement, as it serializes them.
@@ -1623,8 +1627,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // inter frame's straight there, a key frame's copied)
         var geometry = av1g_frame_params()
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
-        // (4:4:4: none, the filters' buffers being 4:2:0's: the closed loop keeps its own)
-        var store = interFrames && postfilters && !p.chroma444 ? try postfilter.reconstructionBuffers(params: geometry) : []
+        if p.chroma444 { (geometry.version, geometry.chroma_format) = (UInt32(AV1G_DECISIONS_VERSION), UInt8(AV1G_CHROMA_444)) }
+        // (the CPU's filters, research, read the closed loop's own)
+        let gpuFilters = postfilters && !(p.chroma444 && chroma444CPUFilters)
+        var store = interFrames && gpuFilters ? try postfilter.reconstructionBuffers(params: geometry) : []
         var into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
         // The previous picture where the filters left it is the closed loop's reference. Without
         // CDEF (qindex 32 and under, or `newPictureEffort`'s) that is the buffers they deblocked in
@@ -1733,17 +1739,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             strides.append(ownSource ? Int(stride) : partition.sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
-        // (a 4:4:4 picture has none either: the GPU's filters and their search are 4:2:0's)
-        guard postfilters, !copies, !p.chroma444 else {
-            // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames;
-            // a 4:4:4 one has none, in any frame, unless the CPU filters it)
+        guard gpuFilters, !copies else {
+            // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
             filtered()  // (none on the GPU)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
-            let cpuFilters = p.chroma444 && postfilters && chroma444CPUFilters
-            let filtered = cpuFilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
+            let filtered = postfilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
             // (a 4:4:4 stream's reference without its planes copied out: the closed loop's own)
             let inPlace = p.chroma444 && interFrames && !returnsPlanes && filtered == nil && !copies && store.isEmpty
-            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames && (!p.chroma444 || cpuFilters),
+            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames,
                                   filtered: filtered, cropsPlanes: !inPlace, timing: timing, t0: t0, t1: t1)
             filteredLast = false
             if inPlace {
@@ -1774,13 +1777,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         postfilter.signalsWhenDone = (metal.gate, filtersDone + 1)
         Self.trace("filters signal \(filtersDone + 1)")
         defer { postfilter.signalsWhenDone = nil }
+        // (a 4:4:4 picture's search targets the closed loop's source: the analysis's chroma is a
+        // 4:2:0 copy)
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
-                                           sourceBuffers: analysisSource.isEmpty ? nil : partition.source,
+                                           sourceBuffers: ownSource ? nil : partition.source,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
-                                           cropsOutput: returnsPlanes, cdef: !fast || newPictureEffort?.cdef != false)
+                                           cropsOutput: returnsPlanes, cdef: usesCDEF && (!fast || newPictureEffort?.cdef != false))
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         Self.trace("filters end")
@@ -1897,7 +1902,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         guard previousOnGPU || inCPU != nil else { return previous?.planes ?? [] }
         let p = inCPU?.planes ?? postfilter.outputPlanes, s = inCPU?.strides ?? postfilter.outputStrides
         guard p.count == 3, s.count == 3 else { return [] }
-        let full = inCPU != nil  // (4:4:4's: the GPU's are 4:2:0's)
+        let full = previous?.source.chroma444 == true
         return (0..<3).map { k in
             let (w, h) = k == 0 || full ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
             var out = [UInt8](repeating: 0, count: w * h)

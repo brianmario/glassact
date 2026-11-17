@@ -5,7 +5,8 @@ public import Metal
 
 /// The decoder's post-filters on Metal (research): deblocking and CDEF of an
 /// intra picture's reconstruction, exactly as a decoder applies them, and the
-/// search that chooses their strengths. av1gpu's GPU post-filter
+/// search that chooses their strengths. 4:2:0, 4:4:4 (`chroma_format`) or
+/// monochrome. av1gpu's GPU post-filter
 /// (av1core/src/gpu_postfilter.cu) over av1core's shared av1g/postfilter.h,
 /// and its strength search (av1f/src/lfsearch.cu).
 ///
@@ -75,7 +76,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// av1g_frame_params up to its last field (the rest is padding).
     private static let keyBytes = MemoryLayout<av1g_frame_params>.offset(of: \av1g_frame_params.chroma_format)!
         + MemoryLayout.size(ofValue: av1g_frame_params().chroma_format)
-    /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, chroma half;
+    /// The last `search`'s filtered picture where it lives (MiCols·4 wide rows, 4:2:0 chroma half;
     /// the picture's samples at the top left), valid until the next call: what a caller that
     /// doesn't take `Search.planes` reads instead.
     public private(set) var outputPlanes: [UnsafePointer<UInt8>] = [], outputStrides: [Int] = []
@@ -104,10 +105,10 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     }
 
     /// The picture a decoder outputs, from its reconstruction before the
-    /// filters: `planes` are MiCols·4 × MiRows·4 (chroma half that each way),
-    /// tightly packed, because the filters read past the picture's edge. The
-    /// result is cropped: Y width × height, U and V half that, rounded up (Y
-    /// only for a monochrome picture). `lfZero` (per block, nonzero where its
+    /// filters: `planes` are MiCols·4 × MiRows·4 (4:2:0 chroma half that each
+    /// way), tightly packed, because the filters read past the picture's edge.
+    /// The result is cropped: Y width × height, 4:2:0's U and V half that,
+    /// rounded up (Y only for a monochrome picture). `lfZero` (per block, nonzero where its
     /// loop filter level is 0: an inter block of a frame with lf_inter_off)
     /// defaults to none.
     public func filter(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
@@ -291,7 +292,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             for p in 0..<job.nPlanes {
                 for target in inPlace ? [job.output[p]] : [job.source[p], job.output[p]] {
                     Self.copy(planes[p], stride: job.pw[p], into: target, width: job.pw[p], height: job.ph[p],
-                              superblocks: list, side: p == 0 ? 64 : 32, sbCols: sbCols)
+                              superblocks: list, side: job.side(p), sbCols: sbCols)
                 }
             }
         }
@@ -314,7 +315,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         let ring = try (0..<job.nPlanes).map { try job.scratch("ring\($0)", inPlace ? 0 : job.pw[$0] * job.ph[$0]) }
         for p in 0..<job.nPlanes where !ringList.isEmpty {
             Self.copy(job.source[p].contents().assumingMemoryBound(to: UInt8.self), stride: job.pw[p], into: ring[p],
-                      width: job.pw[p], height: job.ph[p], superblocks: ringList, side: p == 0 ? 64 : 32, sbCols: sbCols)
+                      width: job.pw[p], height: job.ph[p], superblocks: ringList, side: job.side(p), sbCols: sbCols)
         }
         try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero, only: outerList)
         let target = try (0..<3).map {
@@ -322,7 +323,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         }
         for p in 0..<job.nPlanes where target[p] !== sourceBuffers?[p] {
             Self.copy(source[p], stride: sourceStrides?[p] ?? job.pw[p], into: target[p], width: job.pw[p], height: job.ph[p],
-                      superblocks: innerList, side: p == 0 ? 64 : 32, sbCols: sbCols)
+                      superblocks: innerList, side: job.side(p), sbCols: sbCols)
         }
         let innerBuffer = try job.scratch("innerList", 4 * max(1, innerList.count))
         let outerBuffer = try job.scratch("outerList", 4 * max(1, outerList.count))
@@ -483,15 +484,14 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     private var lastJob: Job?
     private func job(params fp: av1g_frame_params, blocks: UnsafeBufferPointer<av1g_block>,
                      planes: [UnsafePointer<UInt8>], lfZero: [UInt8]?) throws -> Job {
-        // (the kernels, the strength search and blockinfo.h are 4:2:0's)
-        guard fp.chroma_format == UInt8(AV1G_CHROMA_420) else { throw Failure.metal("the post-filters are 4:2:0 only") }
         let job = try job(geometry: fp)
         try job.load(params: fp, blocks: blocks, planes: planes, lfZero: lfZero)
         return job
     }
 
     private func job(geometry fp: av1g_frame_params) throws -> Job {
-        if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3) {
+        if let j = lastJob, j.width == Int(fp.width), j.height == Int(fp.height), j.nPlanes == (fp.monochrome != 0 ? 1 : 3),
+           j.ss == Job.chromaSubsampling(fp) {
             return j
         }
         let job = try Job(self, params: fp)
@@ -499,8 +499,8 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         return job
     }
 
-    /// The buffers `search` deblocks a picture of `fp`'s size (and monochrome) in: MiCols·4 ×
-    /// MiRows·4 (chroma half), tight. A closed loop that reconstructs into them saves `search`
+    /// The buffers `search` deblocks a picture of `fp`'s size (and monochrome and chroma format) in:
+    /// MiCols·4 × MiRows·4 (4:2:0 chroma half), tight. A closed loop that reconstructs into them saves `search`
     /// copying its reconstruction there. They stay this geometry's until `search` filters
     /// another.
     public func reconstructionBuffers(params fp: av1g_frame_params) throws -> [any MTLBuffer] {
@@ -568,6 +568,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     final class Job {
         let filter: AV1MetalPostfilter
         let width: Int, height: Int, miCols: Int, miRows: Int, sbCols: Int, sbRows: Int, nPlanes: Int
+        /// The chroma planes' subsampling, both ways: 1 (4:2:0) or 0 (4:4:4).
+        let ss: Int
+        /// The planes' widths and heights (MiCols·4 × MiRows·4, 4:2:0 chroma half).
         let pw: [Int], ph: [Int]
         var made: [any MTLBuffer] = []
         var source: [any MTLBuffer] = [], output: [any MTLBuffer] = []
@@ -597,14 +600,15 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             sbCols = (miCols + 15) >> 4
             sbRows = (miRows + 15) >> 4
             nPlanes = fp.monochrome != 0 ? 1 : 3
-            pw = [miCols * 4, miCols * 2, miCols * 2]
-            ph = [miRows * 4, miRows * 2, miRows * 2]
+            ss = Self.chromaSubsampling(fp)
+            pw = [miCols * 4, (miCols * 4) >> ss, (miCols * 4) >> ss]
+            ph = [miRows * 4, (miRows * 4) >> ss, (miRows * 4) >> ss]
             source = try (0..<3).map { try make(pw[$0] * ph[$0]) }
             output = try (0..<3).map { try make(pw[$0] * ph[$0]) }
-            let nmi = miRows * miCols, nuv = (miRows / 2) * (miCols / 2)
+            let nmi = miRows * miCols, nuv = (miRows >> ss) * (miCols >> ss)
             let skip = try make(nmi), txY = try make(nmi), txU = try make(nuv), txV = try make(nuv)
             cdefIdx = try make(sbCols * sbRows)
-            let dirVar = try make(4 * nuv)
+            let dirVar = try make(4 * (miRows / 2) * (miCols / 2))  // per luma 8×8
             blockBuffer = try make(16)
             lfZeroBuffer = try make(16)
             frame = try make(av1enc_pf_frame(nil, nil, nil, 0))
@@ -615,6 +619,15 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             addrs.cdefIdx = cdefIdx.gpuAddress
             addrs.cdefDirVar = dirVar.gpuAddress
         }
+
+        /// The chroma subsampling of a picture of `fp`: 0 for 4:4:4, 1 for 4:2:0 (and a version 1
+        /// record's, which is 4:2:0).
+        static func chromaSubsampling(_ fp: av1g_frame_params) -> Int {
+            fp.version >= 2 && fp.chroma_format == UInt8(AV1G_CHROMA_444) ? 0 : 1
+        }
+
+        /// A 64×64's side in plane `p`.
+        func side(_ p: Int) -> Int { p == 0 ? 64 : 64 >> ss }
 
         /// A picture's reconstruction before the filters (there already when `planes` are the
         /// buffers' contents), blocks and parameters.
@@ -639,7 +652,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
             guard planes.count >= nPlanes else { throw Failure.metal("\(nPlanes) planes needed") }
             for p in 0..<nPlanes where planes[p] != UnsafePointer(source[p].contents().assumingMemoryBound(to: UInt8.self)) {
                 AV1MetalPostfilter.copy(planes[p], stride: pw[p], into: source[p], width: pw[p], height: ph[p],
-                                        superblocks: superblocks, side: p == 0 ? 64 : 32, sbCols: sbCols)
+                                        superblocks: superblocks, side: side(p), sbCols: sbCols)
             }
             try load(params: fp, blocks: blocks, lfZero: lfZero)
         }
@@ -837,8 +850,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         func cdef(_ compute: any MTLComputeCommandEncoder) {
             begin(compute, "p_cdef")
             for p in 0..<3 { compute.setBuffer(output[p], offset: 0, index: 3 + p) }
-            // a thread a 4x4 of luma, or a 4x2 of chroma: U beside V in the second layer
-            grid(compute, miCols, miRows, nPlanes > 1 ? 2 : 1, tw: 8, th: 8)
+            // a thread a 4x4 of luma, or a 4x2 of 4:2:0 chroma: U beside V in the second layer (4:4:4:
+            // a 4x4, U and V in a layer each)
+            grid(compute, miCols, miRows, nPlanes == 1 ? 1 : ss == 0 ? 3 : 2, tw: 8, th: 8)
         }
 
         func superblockCDEF() -> [Int8] {
@@ -847,7 +861,7 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
 
         func cropped(_ planes: [any MTLBuffer]) -> [[UInt8]] {
             (0..<nPlanes).map { p in
-                let w = p == 0 ? width : (width + 1) / 2, h = p == 0 ? height : (height + 1) / 2
+                let w = p == 0 ? width : (width + ss) >> ss, h = p == 0 ? height : (height + ss) >> ss
                 let base = planes[p].contents().assumingMemoryBound(to: UInt8.self)
                 return [UInt8](unsafeUninitializedCapacity: w * h) { d, count in
                     for row in 0..<h { (d.baseAddress! + row * w).update(from: base + row * pw[p], count: w) }

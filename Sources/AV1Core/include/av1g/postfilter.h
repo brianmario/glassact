@@ -11,8 +11,10 @@
  * Order (spec 7.14 / 7.15): deblock every plane - pass 0 (vertical edges) of a plane
  * completes before its pass 1 (horizontal edges); within a pass all edges are independent
  * - then CDEF reads the deblocked frame and writes a separate output frame; all 8x8 blocks
- * are independent.  8-bit, 4:2:0 or monochrome, no segmentation / delta-lf / lossless;
- * lfLevel[] are the effective levels (Y vertical, Y horizontal, U, V).
+ * are independent.  8-bit, 4:2:0, 4:4:4 or monochrome, no segmentation / delta-lf / lossless;
+ * lfLevel[] are the effective levels (Y vertical, Y horizontal, U, V).  In 4:4:4 (chroma444) the
+ * chroma planes are filtered on luma's grid: every 4x4 edge, and 8x8 CDEF blocks whose direction is
+ * luma's, with chroma's filter lengths and damping as in 4:2:0 (rust/av1/src/postfilter.rs).
  *
  * Define AV1G_PF_STAT(kind) before including to count filter paths (tests only).
  *
@@ -36,13 +38,15 @@ enum { AV1G_PF_LF_MASKED = 0, AV1G_PF_LF_NARROW_HEV, AV1G_PF_LF_NARROW, AV1G_PF_
 
 typedef struct av1g_pf_frame {
     int W, H, MiRows, MiCols, mono;
+    int chroma444;                       /* Glass Act: 1: 4:4:4 (chroma planes luma's size), 0: 4:2:0 (half each way) */
     AV1G_DEV uint8_t *plane[3];          /* frame being deblocked in place / CDEF source */
     int stride[3];
     AV1G_DEV uint8_t *skip;              /* Skips (bit 0), MiRows x MiCols, stride MiCols; bit 1 (AV1G_PF_LF_ZERO): the block's loop filter level is 0;
-                                            AV1G_PF_SKIP_W128 / H128: a skipped inter block 128 wide / high */
-    AV1G_DEV uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows/2) x (MiCols/2), stride MiCols/2 */
+                                            AV1G_PF_SKIP_W128 / H128: a skipped inter block 128 wide / high;
+                                            AV1G_PF_SKIP_W64 / H64 (4:4:4): one 64 wide / high */
+    AV1G_DEV uint8_t *lfTx[3];           /* LoopfilterTxSizes: luma like skip; chroma (MiRows >> ss) x (MiCols >> ss), stride MiCols >> ss */
     AV1G_DEV int8_t *cdefIdx;            /* per 64x64, raster, stride sbCols; -1 = no CDEF (no non-skip block in it) */
-    AV1G_DEV int32_t *cdefDirVar;        /* optional (GPU path): per 8x8, (var << 3) | yDir, stride MiCols/2 */
+    AV1G_DEV int32_t *cdefDirVar;        /* optional (GPU path): per luma 8x8, (var << 3) | yDir, stride MiCols/2 */
     int sbCols, sbRows;
     int lfLevel[4];             /* effective loop filter levels Y vert, Y horz, U, V (0..63); 0 = off */
     int sharpness;              /* 0..7 */
@@ -58,6 +62,7 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
     f->MiRows = av1g_mi_rows((int)fp->height);
     f->MiCols = av1g_mi_cols((int)fp->width);
     f->mono = fp->monochrome;
+    f->chroma444 = fp->version >= 2 && fp->chroma_format == AV1G_CHROMA_444;
     f->sbCols = (f->MiCols + 15) >> 4;
     f->sbRows = (f->MiRows + 15) >> 4;
     for (int i = 0; i < 4; i++) f->lfLevel[i] = fp->loop_filter_level[i];
@@ -73,6 +78,10 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
     }
 }
 
+/* The chroma planes' subsampling, both ways (1: 4:2:0, 0: 4:4:4), and plane p's (0 for luma). */
+AV1G_HD int av1g_pf_ss(AV1G_CONST const av1g_pf_frame *f) { return f->chroma444 ? 0 : 1; }
+AV1G_HD int av1g_pf_sub(AV1G_CONST const av1g_pf_frame *f, int plane) { return plane ? av1g_pf_ss(f) : 0; }
+
 /* The skip map's bit for a block whose loop filter level is 0: an inter block of an inter frame
  * with fp.lf_inter_off (Glass Act). */
 #define AV1G_PF_LF_ZERO 2
@@ -84,6 +93,13 @@ AV1G_HD void av1g_pf_frame_init(const av1g_frame_params *fp, av1g_pf_frame *f) {
  * one larger than 64 that way. */
 #define AV1G_PF_SKIP_W128 4
 #define AV1G_PF_SKIP_H128 8
+/* The skip map's bits for a skipped inter block 64 wide (W64) or 64 high (H64) of a 4:4:4 frame: its
+ * chroma tx blocks are 32 that way (av1g_uv_tx_size_ss), and their edge at 32 inside it isn't a block
+ * edge, so it isn't filtered (libaom av1_loopfilter.c set_lpf_parameters: between two skipped inter
+ * blocks only a prediction block's edge is).  Only 4:4:4 frames' maps have them, and only chroma
+ * reads them (a skipped inter block's luma tx is the block's size, up to 64). */
+#define AV1G_PF_SKIP_W64 16
+#define AV1G_PF_SKIP_H64 32
 /* av1g_pf_mark_block_flags' per-block flags (p_mark's lfZero bytes): the block's loop filter level
  * is 0 (an inter block with fp.lf_inter_off; implies AV1G_PF_BLK_INTER), the block is inter. */
 #define AV1G_PF_BLK_LF_ZERO 1
@@ -97,11 +113,14 @@ AV1G_HD void av1g_pf_mark_block_flags(AV1G_CONST const av1g_pf_frame *f, const a
     const int bw4 = av1g_bw4(bs), bh4 = av1g_bh4(bs);
     const int txY = av1g_luma_tx_size(bs, b->tx_depth);
     const int inter = (flags & (AV1G_PF_BLK_LF_ZERO | AV1G_PF_BLK_INTER)) != 0;
+    const int ss = av1g_pf_ss(f);
     int sk = b->skip ? 1 : 0;
     if (flags & AV1G_PF_BLK_LF_ZERO) sk |= AV1G_PF_LF_ZERO;
     if (b->skip && inter) {
         if (bw4 > 16) sk |= AV1G_PF_SKIP_W128;
+        else if (bw4 == 16 && !ss) sk |= AV1G_PF_SKIP_W64;
         if (bh4 > 16) sk |= AV1G_PF_SKIP_H128;
+        else if (bh4 == 16 && !ss) sk |= AV1G_PF_SKIP_H64;
     }
     for (int y = r0; y < r0 + bh4 && y < f->MiRows; y++)
         for (int x = c0; x < c0 + bw4 && x < f->MiCols; x++) {
@@ -109,9 +128,9 @@ AV1G_HD void av1g_pf_mark_block_flags(AV1G_CONST const av1g_pf_frame *f, const a
             f->skip[k] = (uint8_t)sk;
             f->lfTx[0][k] = (uint8_t)txY;
         }
-    if (av1g_has_chroma(bs, r0, c0, f->mono)) {
-        const int uvSz = av1g_uv_bsize(bs), txUV = av1g_uv_tx_size(bs);
-        const int cr = f->MiRows >> 1, cc = f->MiCols >> 1, y0 = r0 >> 1, x0 = c0 >> 1;
+    if (av1g_has_chroma_ss(bs, r0, c0, f->mono, ss)) {
+        const int uvSz = av1g_uv_bsize_ss(bs, ss), txUV = av1g_uv_tx_size_ss(bs, ss);
+        const int cr = f->MiRows >> ss, cc = f->MiCols >> ss, y0 = r0 >> ss, x0 = c0 >> ss;
         const int w = av1g_bw4(uvSz), h = av1g_bh4(uvSz);
         for (int y = y0; y < y0 + h && y < cr; y++)
             for (int x = x0; x < x0 + w && x < cc; x++) {
@@ -209,9 +228,9 @@ AV1G_HD void av1g_lf_line(uint8_t *q0p, ptrdiff_t step, int plane, int filterSiz
 }
 
 /* Edge loop filter process (7.14.2): plane, pass, luma 4x4 position (row, col) - the 4
- * lines of one edge segment.  Callers visit row/col in steps of 2 for chroma. */
+ * lines of one edge segment.  Callers visit row/col in steps of 2 for 4:2:0 chroma (1 << ss). */
 AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass, int row, int col) {
-    const int sub = plane ? 1 : 0;
+    const int sub = av1g_pf_sub(f, plane);
     const int x = col * 4, y = row * 4;
     if (x >= f->W || y >= f->H) return;
     if (pass == 0 && x == 0) return;
@@ -227,7 +246,8 @@ AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass
     if (f->skip[(size_t)row * f->MiCols + col] & f->skip[(size_t)prevRow * f->MiCols + prevCol] & AV1G_PF_LF_ZERO) return;
     /* applyFilter = isTxEdge && (isBlockEdge || !skip || isIntra): an intra block's edges are its
      * tx edges, and a coded one's; a skipped inter block's tx edges are its block edges but inside
-     * one 128 wide / high (AV1G_PF_SKIP_W128 / H128: at 64 samples, off the 128 grid) */
+     * one 128 wide / high (AV1G_PF_SKIP_W128 / H128: at 64 samples, off the 128 grid), and in 4:4:4
+     * chroma inside one 64 wide / high (AV1G_PF_SKIP_W64 / H64: at 32, off the 64 grid) */
     const int sk = f->skip[(size_t)row * f->MiCols + col];
     int cur, prev;
     if (pass == 0) {
@@ -235,11 +255,13 @@ AV1G_HD void av1g_lf_edge(AV1G_CONST const av1g_pf_frame *f, int plane, int pass
         prev = AV1G_T(Tx_Width)[prevTxSz];
         if (xP & (cur - 1)) return;
         if ((sk & AV1G_PF_SKIP_W128) && ((xP << sub) & 127)) return;
+        if (plane && (sk & AV1G_PF_SKIP_W64) && (xP & 63)) return;
     } else {
         cur = AV1G_T(Tx_Height)[txSz];
         prev = AV1G_T(Tx_Height)[prevTxSz];
         if (yP & (cur - 1)) return;
         if ((sk & AV1G_PF_SKIP_H128) && ((yP << sub) & 127)) return;
+        if (plane && (sk & AV1G_PF_SKIP_H64) && (yP & 63)) return;
     }
     const int baseSize = prev < cur ? prev : cur;
     const int cap = plane ? 8 : 16;
@@ -264,7 +286,7 @@ AV1G_HD void av1g_deblock_frame(AV1G_CONST const av1g_pf_frame *f) {
     if (!f->lfLevel[0] && !f->lfLevel[1]) return;
     for (int p = 0; p < (f->mono ? 1 : 3); p++) {
         if (p > 0 && !f->lfLevel[1 + p]) continue;
-        const int step = p ? 2 : 1;
+        const int step = 1 << av1g_pf_sub(f, p);
         for (int pass = 0; pass < 2; pass++)
             for (int row = 0; row < f->MiRows; row += step)
                 for (int col = 0; col < f->MiCols; col += step) av1g_lf_edge(f, p, pass, row, col);
@@ -380,7 +402,7 @@ AV1G_HD av1g_cdef_blk av1g_cdef_params(AV1G_CONST const av1g_pf_frame *f, int id
     o.ySec = f->cdefYSec[idx];
     o.uvPri = f->cdefUVPri[idx];
     o.uvSec = f->cdefUVSec[idx];
-    o.uvDir = o.uvPri == 0 ? 0 : yDir;  /* Cdef_Uv_Dir[1][1] is the identity (4:2:0) */
+    o.uvDir = o.uvPri == 0 ? 0 : yDir;  /* Cdef_Uv_Dir[1][1] (4:2:0) and [0][0] (4:4:4) are the identity */
     return o;
 }
 
@@ -406,7 +428,7 @@ AV1G_TABLE(int8_t, Cdef_Directions, [8][2][2], {-1, 1, -2, 2, 0, 1, -1, 2, 0, 1,
  * plane src.  damping: CdefDamping for luma, CdefDamping - 1 for chroma. */
 AV1G_HD int av1g_cdef_pixel(AV1G_CONST const av1g_pf_frame *f, const uint8_t *src, int sstride, int plane, int x, int y, int priStr,
                             int secStr, int damping, int dir) {
-    const int sub = plane ? 1 : 0;
+    const int sub = av1g_pf_sub(f, plane);
     const int x0v = src[(size_t)y * sstride + x];
     /* Glass Act: a strength of 0 leaves its taps unread.  They add nothing to the sum, and the
      * clamp to every tap's range, theirs included, can't bind without them: a set's weights total
@@ -448,7 +470,7 @@ AV1G_HD void av1g_cdef_block(AV1G_CONST const av1g_pf_frame *f, uint8_t *const d
     const av1g_cdef_blk o = av1g_cdef_setup(f, f->plane[0], f->stride[0], r, c);
     if (o.filtered) AV1G_PF_STAT(AV1G_PF_CDEF_FILTERED);
     for (int p = 0; p < (f->mono ? 1 : 3); p++) {
-        const int sub = p ? 1 : 0, x0 = (c * 4) >> sub, y0 = (r * 4) >> sub, w = 8 >> sub;
+        const int sub = av1g_pf_sub(f, p), x0 = (c * 4) >> sub, y0 = (r * 4) >> sub, w = 8 >> sub;
         const uint8_t *src = f->plane[p];
         const int ss = f->stride[p];
         for (int i = 0; i < w; i++)

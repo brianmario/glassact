@@ -1,7 +1,9 @@
 import AV1Core
+import AV1CoreTestSupport
 import AV1Encoder
 import Foundation
 import GlassActAV1
+import GlassActTestSupport
 import Metal
 import Testing
 import libaom
@@ -152,6 +154,136 @@ struct StrengthSearchTests {
         let before0 = psnr(encoded.reconstruction[0], picture.y), after0 = psnr(search.planes[0], picture.y)
         // and filtering helps, or at least doesn't hurt (libaom's level from q isn't an SSE optimum)
         #expect(after0 > before0 - 0.1, "\(label): \(before0) dB before the filters, \(after0) after")
+    }
+
+    /// The same search on 4:4:4 pictures (AV1MetalEncoder codes 4:2:0 only): random legal 4:4:4
+    /// records at a q where tune=iq turns CDEF off, halves its strengths, and keeps them whole, their
+    /// reconstruction before the filters, and a source near it (the reconstruction with noise). The
+    /// SSE tables are av1core's CDEF, the presets the reference's, and the record coded with the
+    /// choices decodes in libaom to exactly the picture the search filtered.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [24, 120, 240])
+    func search444IsTheReferencesAndDecodes(qindex: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let postfilter = try AV1MetalPostfilter(device: device)
+        var searched = 0
+        for seed in UInt64(1)...12 {
+            let fuzzCase = try #require(av1t_case_make_444(seed, 520, 30, 0), "seed \(seed): no record")
+            defer { av1t_case_free(fuzzCase) }
+            let record = try #require(av1t_case_record(fuzzCase))
+            #expect(record.pointee.fp.chroma_format == UInt8(AV1G_CHROMA_444), "seed \(seed): the record's chroma format")
+            // (a picture with intra block copies has no post-filters)
+            guard record.pointee.fp.allow_intrabc == 0 else { continue }
+            // the q under test, the frame's (no per-64×64 qindex)
+            record.pointee.fp.base_q_idx = UInt8(qindex)
+            record.pointee.fp.delta_q_present = 0
+            for k in 0..<Int(record.pointee.n_blocks) { record.pointee.blocks[k].sb_qindex = 0 }
+            let width = Int(record.pointee.fp.width), height = Int(record.pointee.fp.height)
+            let label = "seed \(seed) \(width)×\(height) q\(qindex)"
+            let miCols = 2 * ((width + 7) >> 3), miRows = 2 * ((height + 7) >> 3), sbCols = (miCols + 15) >> 4
+            let (pw, ph) = (miCols * 4, miRows * 4)
+            var before = av1g_output()
+            defer { av1g_output_free(&before) }
+            var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_FIX_RANGE) | UInt32(AV1G_ENC_PREFILTER_RECON), seq_level_idx: -1)
+            let prc = av1g_encode(record, &options, &before)
+            try #require(prc == AV1G_OK, "\(label): \(withUnsafeBytes(of: &before.error) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) })")
+            let unfiltered = [before.recon.0, before.recon.1, before.recon.2].map { Array(UnsafeBufferPointer(start: $0!, count: pw * ph)) }
+            var rng = SplitMix64(seed: seed)
+            let source = unfiltered.map { plane in plane.map { UInt8(clamping: Int($0) + Int.random(in: -12...12, using: &rng)) } }
+            let blocks = UnsafeBufferPointer(start: record.pointee.blocks, count: Int(record.pointee.n_blocks))
+            let search = try withPlanes(unfiltered) { planes in
+                try withPlanes(source) { sources in
+                    try postfilter.search(params: record.pointee.fp, blocks: blocks, planes: planes, source: sources)
+                }
+            }
+            let fp = search.params
+            let nsb = search.superblockCDEF.count
+            #expect(nsb == sbCols * ((miRows + 15) >> 4), "\(label): \(nsb) 64×64s")
+            if !search.lumaSSE.isEmpty {
+                // 1. the SSE tables are av1core's CDEF (relative to no CDEF)
+                let nc = search.lumaSSE.count / nsb
+                let pri = [0, 11], sec = [0, 2]
+                func cpuSSE(_ c: Int) throws -> (luma: [Int], chroma: [Int]) {
+                    var p = fp
+                    p.cdef_bits = 0
+                    p.cdef_y_pri.0 = UInt8(pri[c / 2]); p.cdef_y_sec.0 = UInt8(sec[c % 2])
+                    p.cdef_uv_pri.0 = UInt8(pri[c / 2]); p.cdef_uv_sec.0 = UInt8(sec[c % 2])
+                    var py = unfiltered[0], pu = unfiltered[1], pv = unfiltered[2]
+                    var copy = record.pointee
+                    copy.fp = p
+                    var bs = blocks.map { b -> av1g_block in var b = b; b.cdef_idx = 0; return b }
+                    let rc = bs.withUnsafeMutableBufferPointer { bp -> Int32 in
+                        copy.blocks = bp.baseAddress
+                        return py.withUnsafeMutableBufferPointer { y in
+                            pu.withUnsafeMutableBufferPointer { u in
+                                pv.withUnsafeMutableBufferPointer { v in
+                                    let ptrs: [UnsafeMutablePointer<UInt8>?] = [y.baseAddress, u.baseAddress, v.baseAddress]
+                                    return ptrs.withUnsafeBufferPointer { av1g_postfilter(&copy, $0.baseAddress, [Int32(pw), Int32(pw), Int32(pw)]) }
+                                }
+                            }
+                        }
+                    }
+                    try #require(rc == AV1G_OK, "\(label)")
+                    let planes = [py, pu, pv]
+                    var luma = [Int](repeating: 0, count: nsb), chroma = [Int](repeating: 0, count: nsb)
+                    for p in 0..<3 {
+                        for y in 0..<ph {
+                            for x in 0..<pw {
+                                let d = Int(planes[p][y * pw + x]) - Int(source[p][y * pw + x])
+                                let sb = (y >> 6) * sbCols + (x >> 6)
+                                if p == 0 { luma[sb] += d * d } else { chroma[sb] += d * d }
+                            }
+                        }
+                    }
+                    return (luma, chroma)
+                }
+                let base = try cpuSSE(0)
+                for c in 1..<nc {
+                    let cpu = try cpuSSE(c)
+                    for sb in 0..<nsb where search.superblockCDEF[sb] >= 0 {
+                        let gpuY = Int(search.lumaSSE[sb * nc + c]) - Int(search.lumaSSE[sb * nc])
+                        let gpuUV = Int(search.chromaSSE[sb * nc + c]) - Int(search.chromaSSE[sb * nc])
+                        #expect(gpuY == cpu.luma[sb] - base.luma[sb] && gpuUV == cpu.chroma[sb] - base.chroma[sb],
+                                "\(label): SB \(sb) candidate \(c): GPU ΔSSE \(gpuY)/\(gpuUV), av1core \(cpu.luma[sb] - base.luma[sb])/\(cpu.chroma[sb] - base.chroma[sb])")
+                    }
+                }
+                // 2. the preset search is the reference's
+                let bits = search.presets.count
+                var lev = [Int32](repeating: 0, count: 16 * bits), tot = [UInt64](repeating: 0, count: bits)
+                av1enc_cdef_select_cpu(search.lumaSSE, search.chromaSSE, Int32(nc), Int32(nsb), 0, Int32(bits - 1), 4, 0, &lev, &tot)
+                #expect(tot == search.presetSSE, "\(label): preset SSE GPU \(search.presetSSE), CPU \(tot)")
+                #expect(lev == search.presets.flatMap { $0 }, "\(label): presets differ")
+                searched += 1
+            }
+
+            // 3. coded with the choices, the record decodes in libaom to the filtered picture
+            var coded = record.pointee
+            coded.fp = fp
+            var bs = blocks.map { b -> av1g_block in
+                var b = b
+                b.cdef_idx = max(0, search.superblockCDEF[(Int(b.mi_row) >> 4) * sbCols + (Int(b.mi_col) >> 4)])
+                return b
+            }
+            var output = av1g_output()
+            defer { av1g_output_free(&output) }
+            let rc = bs.withUnsafeMutableBufferPointer { bp -> Int32 in
+                coded.blocks = bp.baseAddress
+                var options = av1g_encode_opts(flags: UInt32(AV1G_ENC_TD) | UInt32(AV1G_ENC_FIX_RANGE), seq_level_idx: -1)
+                return av1g_encode(&coded, &options, &output)
+            }
+            try #require(rc == AV1G_OK, "\(label)")
+            let decoder = try #require(glassact_aom_dec_create(1))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var frame = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, output.obu, output.obu_size, &frame) == 0, "\(label): libaom")
+            for p in 0..<3 {
+                let theirs = try #require(frame.planesTuple(p))
+                let stride = Int(frame.stridesTuple(p))
+                let rows = (0..<height).filter { r in (0..<width).contains { search.planes[p][r * width + $0] != theirs[r * stride + $0] } }
+                #expect(rows.isEmpty, "\(label): plane \(p) differs from libaom on \(rows.count) rows")
+            }
+        }
+        if qindex > 32 { #expect(searched >= 6, "only \(searched) pictures searched CDEF") }
     }
 
     func psnr(_ a: [UInt8], _ b: [UInt8]) -> Double {

@@ -5,6 +5,9 @@
 // Order (spec 7.14 / 7.15): p_mark fills the maps; p_deblock pass 0 (vertical edges), then
 // pass 1 (horizontal), every plane at once; then CDEF reads the deblocked planes and writes
 // separate output planes.
+//
+// 4:2:0 or 4:4:4 (the frame's chroma444): a 4:4:4 chroma plane is luma's size, filtered on luma's
+// grid, and its threads are laid out as luma's (a layer a plane where 4:2:0 puts U beside V).
 #include "av1g/hd.h"
 #include "av1g/enums_gen.h"
 #include "av1g/spec_tables.h"
@@ -26,7 +29,7 @@ kernel void p_mark(constant av1g_pf_frame &f [[buffer(0)]], device const av1g_bl
 // one thread per (plane, 4x4 edge position); chroma positions in chroma 4x4 units
 kernel void p_deblock(constant av1g_pf_frame &f [[buffer(0)]], constant int32_t &pass [[buffer(2)]],
                       uint3 g [[thread_position_in_grid]]) {
-    const int plane = (int)g.z, sub = plane ? 1 : 0;
+    const int plane = (int)g.z, sub = av1g_pf_sub(&f, plane);
     const int col = (int)g.x, row = (int)g.y;
     if (col >= (f.MiCols >> sub) || row >= (f.MiRows >> sub)) return;
     av1g_lf_edge(&f, plane, pass, row << sub, col << sub);
@@ -45,7 +48,7 @@ kernel void p_cdef_dir(constant av1g_pf_frame &f [[buffer(0)]], uint2 g [[thread
 // CDEF over the n samples of the 4-wide block at (bx, by) of a plane, all in one 8x8, whose
 // parameters are read once (a block CDEF leaves alone has strengths of 0: its samples as they are)
 static inline void pf_cdef_block(constant av1g_pf_frame &f, device uint8_t *out, int plane, int bx, int by, int n) {
-    const int sub = plane ? 1 : 0;
+    const int sub = av1g_pf_sub(&f, plane);
     const int r = ((by << sub) >> 3) * 2, c = ((bx << sub) >> 3) * 2;
     const int idx = av1g_cdef_active_idx(&f, r, c);
     device const uint8_t *src = f.plane[plane];
@@ -58,7 +61,7 @@ static inline void pf_cdef_block(constant av1g_pf_frame &f, device uint8_t *out,
         sec = plane ? b.uvSec : b.ySec;
         dir = plane ? b.uvDir : b.yDir;
     }
-    const int damping = f.cdefDamping - sub;
+    const int damping = plane ? f.cdefDamping - 1 : f.cdefDamping;
     for (int i = 0; i < n; i++) {
         const int x = bx + (i & 3), y = by + (i >> 2);
         out[y * ss + x] = (uint8_t)av1g_cdef_pixel(&f, src, ss, plane, x, y, pri, sec, damping, dir);
@@ -67,15 +70,16 @@ static inline void pf_cdef_block(constant av1g_pf_frame &f, device uint8_t *out,
 
 // A thread takes a 4x4 of luma (z = 0) or a 4x2 of one chroma plane (z = 1: U in the left half of
 // the grid, V in the right), so a layer of MiCols x MiRows threads covers its samples exactly;
-// outputs have the sources' strides. (MiCols and MiRows are even.)
+// outputs have the sources' strides. (MiCols and MiRows are even.) 4:4:4: a 4x4 of luma (z = 0),
+// U (z = 1) or V (z = 2).
 kernel void p_cdef(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *outY [[buffer(3)]],
                    device uint8_t *outU [[buffer(4)]], device uint8_t *outV [[buffer(5)]],
                    uint3 g [[thread_position_in_grid]]) {
     const int nu = f.MiCols >> 1;  // U's threads of a chroma row
     int gx = (int)g.x;
     if (gx >= f.MiCols || (int)g.y >= f.MiRows) return;
-    if (g.z == 0) {
-        pf_cdef_block(f, outY, 0, gx * 4, (int)g.y * 4, 16);
+    if (g.z == 0 || f.chroma444) {
+        pf_cdef_block(f, g.z == 0 ? outY : g.z == 1 ? outU : outV, (int)g.z, gx * 4, (int)g.y * 4, 16);
     } else {
         const int plane = gx < nu ? 1 : 2;
         if (plane == 2) gx -= nu;
@@ -176,6 +180,61 @@ static inline int lf_pri_sum(thread const LfTaps &t, int x0, int adj, int dAdj) 
 #define LF_NSEC 2
 #define LF_NC (LF_NPRI * LF_NSEC)
 
+// Adds a block's samples' squared errors for every candidate to acc: the n samples of the 4-wide
+// block at (bx, by) of a plane, all of one 8x8 (whose parameters are read once). (The sums are
+// whole numbers: any order.)
+static inline void lf_cdef_sse_block(constant av1g_pf_frame &f, constant LfCand &cd, device const uint8_t *tg,
+                                     int plane, int bx, int by, int n, thread uint32_t (&acc)[LF_NC]) {
+    const int sub = av1g_pf_sub(&f, plane);
+    const int ly = by << sub, lx = bx << sub;  // luma position of the samples' 8x8
+    const int n8c = f.MiCols >> 1;
+    // (MiCols and MiRows are even: a block is inside the frame or outside it, whole)
+    if ((lx >> 2) >= f.MiCols || (ly >> 2) >= f.MiRows || av1g_cdef_active_idx(&f, (ly >> 3) * 2, (lx >> 3) * 2) < 0) return;
+    const int dv = f.cdefDirVar[(ly >> 3) * n8c + (lx >> 3)];
+    const int yDir = dv & 7, var = dv >> 3;
+    int varStr = 0;
+    if (var >> 6) { varStr = av1g_floor_log2((uint32_t)(var >> 6)); if (varStr > 12) varStr = 12; }
+    device const uint8_t *src = f.plane[plane];
+    const int st = f.stride[plane];
+    const int damping = plane ? f.cdefDamping - 1 : f.cdefDamping;
+    const int MiRows = f.MiRows, MiCols = f.MiCols;
+    const bool inside = bx >= 2 && by >= 2 && ((lx >> 2) + 1 + sub) < MiCols && ((ly >> 2) + 1 + sub) < MiRows;
+    // the candidates' strengths, and their damping, are the block's: worked out once (chroma's
+    // primary strengths aren't luma's variance-adjusted ones)
+    int secAdj[LF_NSEC], priStr[LF_NPRI], priAdj[LF_NPRI];
+    for (int si = 0; si < LF_NSEC; si++) secAdj[si] = av1g_cdef_damping_adj(cd.sec[si], damping);
+    for (int pi = 0; pi < LF_NPRI; pi++) {
+        const int pri = cd.pri[pi];
+        priStr[pi] = plane ? pri : (var ? (pri * (4 + varStr) + 8) >> 4 : 0);
+        priAdj[pi] = av1g_cdef_damping_adj(priStr[pi], damping);
+    }
+    for (int i = 0; i < n; i++) {
+        const int x = bx + (i & 3), y = by + (i >> 2);
+        const int target = tg[y * st + x];
+        const int x0 = src[y * st + x];
+        LfTaps tA, t0;
+        lf_gather(tA, src, st, x, y, yDir, sub, MiRows, MiCols, inside, x0);
+        lf_gather_sec(t0, src, st, x, y, 0, sub, MiRows, MiCols, inside);
+        int SA[LF_NSEC], S0[LF_NSEC];
+        for (int si = 0; si < LF_NSEC; si++) {
+            SA[si] = lf_sec_sum(tA, x0, cd.sec[si], secAdj[si]);
+            S0[si] = lf_sec_sum(t0, x0, cd.sec[si], secAdj[si]);
+        }
+        for (int pi = 0; pi < LF_NPRI; pi++) {
+            const int pri = cd.pri[pi], adj = priStr[pi];
+            const int P = pri ? lf_pri_sum(tA, x0, adj, priAdj[pi]) : 0;
+            for (int si = 0; si < LF_NSEC; si++) {
+                const int sum = P + (pri ? SA[si] : S0[si]);
+                int v = x0 + ((8 + sum - (sum < 0)) >> 4);
+                // the clamp binds only where both sets of taps are read (av1g_cdef_pixel)
+                if (adj && cd.sec[si]) v = v < tA.mn ? tA.mn : v > tA.mx ? tA.mx : v;
+                const int e = v - target;
+                acc[pi * LF_NSEC + si] += (uint32_t)(e * e);
+            }
+        }
+    }
+}
+
 // one threadgroup (256 threads) per 64x64: luma, then both chroma planes; targets are the source
 // planes, padded like the reconstruction, with its strides
 static void lf_cdef_sse_sb(constant av1g_pf_frame &f, constant LfCand &cd, device const uint8_t *s0,
@@ -184,67 +243,25 @@ static void lf_cdef_sse_sb(constant av1g_pf_frame &f, constant LfCand &cd, devic
                            threadgroup uint32_t (&red)[8][LF_NC]) {
     const int sbr = (int)sb / f.sbCols, sbc = (int)sb % f.sbCols;
     const bool active = f.cdefIdx[sb] >= 0;
-    const int n8c = f.MiCols >> 1;
+    // a thread's 4x4 of a 64x64 of luma (a SIMD-group's 32 threads take a 32x16 of it), and of a
+    // 4:4:4 chroma plane
+    const int q = (int)(tid >> 5), i = (int)(tid & 31);
+    const int bx4 = sbc * 64 + ((q & 1) * 8 + (i & 7)) * 4, by4 = sbr * 64 + ((q >> 1) * 4 + (i >> 3)) * 4;
     for (int pass = 0; pass < (f.mono ? 1 : 2); pass++) {
         uint32_t acc[LF_NC];
         for (int j = 0; j < LF_NC; j++) acc[j] = 0;
         if (active) {
-            // A thread takes a 4x4 of luma (16 samples), then a 4x2 of one chroma plane (8): samples
-            // of one 8x8, whose parameters it reads once. (The sums are whole numbers: any order.)
-            int plane, bx, by, n;
+            // A thread takes a 4x4 of luma (16 samples), then of both 4:4:4 chroma planes, or a 4x2
+            // of one 4:2:0 chroma plane (8): samples of one 8x8, whose parameters it reads once.
             if (pass == 0) {
-                // (a SIMD-group's 32 threads take a 32x16 of the 64x64)
-                const int q = (int)(tid >> 5), i = (int)(tid & 31);
-                plane = 0; bx = sbc * 64 + ((q & 1) * 8 + (i & 7)) * 4; by = sbr * 64 + ((q >> 1) * 4 + (i >> 3)) * 4; n = 16;
-            }
-            else { plane = 1 + (int)(tid >> 7); bx = sbc * 32 + (int)(tid & 7) * 4; by = sbr * 32 + (int)((tid >> 3) & 15) * 2; n = 8; }
-            const int sub = plane ? 1 : 0;
-            const int ly = by << sub, lx = bx << sub;  // luma position of the samples' 8x8
-            // (MiCols and MiRows are even: a block is inside the frame or outside it, whole)
-            if ((lx >> 2) < f.MiCols && (ly >> 2) < f.MiRows && av1g_cdef_active_idx(&f, (ly >> 3) * 2, (lx >> 3) * 2) >= 0) {
-                const int dv = f.cdefDirVar[(ly >> 3) * n8c + (lx >> 3)];
-                const int yDir = dv & 7, var = dv >> 3;
-                int varStr = 0;
-                if (var >> 6) { varStr = av1g_floor_log2((uint32_t)(var >> 6)); if (varStr > 12) varStr = 12; }
-                device const uint8_t *src = f.plane[plane];
-                const int st = f.stride[plane];
-                device const uint8_t *tg = plane == 0 ? s0 : plane == 1 ? s1 : s2;
-                const int damping = plane ? f.cdefDamping - 1 : f.cdefDamping;
-                const int MiRows = f.MiRows, MiCols = f.MiCols;
-                const bool inside = bx >= 2 && by >= 2 && ((lx >> 2) + 1 + sub) < MiCols && ((ly >> 2) + 1 + sub) < MiRows;
-                // the candidates' strengths, and their damping, are the block's: worked out once
-                int secAdj[LF_NSEC], priStr[LF_NPRI], priAdj[LF_NPRI];
-                for (int si = 0; si < LF_NSEC; si++) secAdj[si] = av1g_cdef_damping_adj(cd.sec[si], damping);
-                for (int pi = 0; pi < LF_NPRI; pi++) {
-                    const int pri = cd.pri[pi];
-                    priStr[pi] = sub ? pri : (var ? (pri * (4 + varStr) + 8) >> 4 : 0);
-                    priAdj[pi] = av1g_cdef_damping_adj(priStr[pi], damping);
-                }
-                for (int i = 0; i < n; i++) {
-                    const int x = bx + (i & 3), y = by + (i >> 2);
-                    const int target = tg[y * st + x];
-                    const int x0 = src[y * st + x];
-                    LfTaps tA, t0;
-                    lf_gather(tA, src, st, x, y, yDir, sub, MiRows, MiCols, inside, x0);
-                    lf_gather_sec(t0, src, st, x, y, 0, sub, MiRows, MiCols, inside);
-                    int SA[LF_NSEC], S0[LF_NSEC];
-                    for (int si = 0; si < LF_NSEC; si++) {
-                        SA[si] = lf_sec_sum(tA, x0, cd.sec[si], secAdj[si]);
-                        S0[si] = lf_sec_sum(t0, x0, cd.sec[si], secAdj[si]);
-                    }
-                    for (int pi = 0; pi < LF_NPRI; pi++) {
-                        const int pri = cd.pri[pi], adj = priStr[pi];
-                        const int P = pri ? lf_pri_sum(tA, x0, adj, priAdj[pi]) : 0;
-                        for (int si = 0; si < LF_NSEC; si++) {
-                            const int sum = P + (pri ? SA[si] : S0[si]);
-                            int v = x0 + ((8 + sum - (sum < 0)) >> 4);
-                            // the clamp binds only where both sets of taps are read (av1g_cdef_pixel)
-                            if (adj && cd.sec[si]) v = v < tA.mn ? tA.mn : v > tA.mx ? tA.mx : v;
-                            const int e = v - target;
-                            acc[pi * LF_NSEC + si] += (uint32_t)(e * e);
-                        }
-                    }
-                }
+                lf_cdef_sse_block(f, cd, s0, 0, bx4, by4, 16, acc);
+            } else if (f.chroma444) {
+                lf_cdef_sse_block(f, cd, s1, 1, bx4, by4, 16, acc);
+                lf_cdef_sse_block(f, cd, s2, 2, bx4, by4, 16, acc);
+            } else {
+                const int plane = 1 + (int)(tid >> 7);
+                lf_cdef_sse_block(f, cd, plane == 1 ? s1 : s2, plane, sbc * 32 + (int)(tid & 7) * 4,
+                                  sbr * 32 + (int)((tid >> 3) & 15) * 2, 8, acc);
             }
         }
         for (int j = 0; j < LF_NC; j++) {
@@ -516,12 +533,13 @@ kernel void l_assign_c(constant av1g_pf_frame &f [[buffer(0)]], device const uin
 }
 
 // p_cdef_r's dispatch over the redo list (64-thread threadgroups, 256 threads a 64x64 and
-// layer: luma, then both chroma planes), and the presets kept for the next picture
+// layer: luma, then both chroma planes, or 4:4:4's U, then V), and the presets kept for the next
+// picture
 kernel void l_finish(constant av1g_pf_frame &f [[buffer(0)]], constant PfSelArgs &a [[buffer(6)]],
                      device PfSel &sel [[buffer(7)]], device PfCdef &keep [[buffer(10)]]) {
     sel.tg[0] = sel.n * 4;
     sel.tg[1] = 1;
-    sel.tg[2] = a.nPlanes > 1 ? 2 : 1;
+    sel.tg[2] = a.nPlanes == 1 ? 1 : f.chroma444 ? 3 : 2;
     sel.sbCols = (uint32_t)f.sbCols;
     keep.bits = sel.bits;
     for (int j = 0; j < 8; j++) {
@@ -544,8 +562,8 @@ struct PfRegion {
 kernel void p_deblock_r(constant av1g_pf_frame &f [[buffer(0)]], constant int32_t &pass [[buffer(2)]],
                         constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
                         uint3 g [[thread_position_in_grid]]) {
-    const int plane = (int)g.z, sub = plane ? 1 : 0;
-    const uint32_t j = g.x / 256, k = g.x % 256;  // 16 x 16 luma 4x4 positions per SB, 8 x 8 chroma
+    const int plane = (int)g.z, sub = av1g_pf_sub(&f, plane);
+    const uint32_t j = g.x / 256, k = g.x % 256;  // 16 x 16 luma 4x4 positions per SB, 8 x 8 of 4:2:0 chroma
     if (j >= R.n) return;
     const int side = 16 >> sub;
     if ((int)k >= side * side) return;
@@ -573,7 +591,8 @@ kernel void p_cdef_dir_r(constant av1g_pf_frame &f [[buffer(0)]], constant PfReg
 }
 
 // p_cdef over the listed 64x64s: 256 threads a 64x64 and layer (z = 0: luma, a 4x4 a thread, a
-// threadgroup of 64 a 32x32; z = 1: chroma, a 4x2 a thread, U then V, a threadgroup a 32x16)
+// threadgroup of 64 a 32x32; z = 1: chroma, a 4x2 a thread, U then V, a threadgroup a 32x16; 4:4:4:
+// z = 1 U and z = 2 V as luma)
 kernel void p_cdef_r(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *outY [[buffer(3)]],
                      device uint8_t *outU [[buffer(4)]], device uint8_t *outV [[buffer(5)]],
                      constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
@@ -583,10 +602,10 @@ kernel void p_cdef_r(constant av1g_pf_frame &f [[buffer(0)]], device uint8_t *ou
     if (j >= R.n) return;
     const uint32_t sb = list[j];
     const int sbc = (int)(sb % R.sbCols), sbr = (int)(sb / R.sbCols);
-    if (g.z == 0) {
+    if (g.z == 0 || f.chroma444) {
         const int q = k >> 6, i = k & 63;
         const int c = sbc * 16 + (q & 1) * 8 + (i & 7), r = sbr * 16 + (q >> 1) * 8 + (i >> 3);
-        if (c < f.MiCols && r < f.MiRows) pf_cdef_block(f, outY, 0, c * 4, r * 4, 16);
+        if (c < f.MiCols && r < f.MiRows) pf_cdef_block(f, g.z == 0 ? outY : g.z == 1 ? outU : outV, (int)g.z, c * 4, r * 4, 16);
     } else {
         const int plane = 1 + (k >> 7), i = k & 127;
         const int c = sbc * 8 + (i & 7), r = sbr * 16 + (i >> 3);
@@ -600,7 +619,7 @@ kernel void p_copy_r(constant av1g_pf_frame &f [[buffer(0)]], device const uint8
                      device const uint8_t *fromU [[buffer(4)]], device const uint8_t *fromV [[buffer(5)]],
                      constant PfRegion &R [[buffer(8)]], device const uint32_t *list [[buffer(9)]],
                      uint3 g [[thread_position_in_grid]]) {
-    const int plane = (int)g.z, sub = plane ? 1 : 0;
+    const int plane = (int)g.z, sub = av1g_pf_sub(&f, plane);
     const uint32_t j = g.x / 4096, k = g.x % 4096;
     if (j >= R.n) return;
     const int side = 64 >> sub;

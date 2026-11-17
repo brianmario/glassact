@@ -1,5 +1,6 @@
 /* av1g/blockinfo.h - block / transform geometry rules of the AV1 syntax that every
- * engine needs (host + device).  4:2:0 or monochrome, no 128x128 blocks. */
+ * engine needs (host + device).  4:2:0 or monochrome, no 128x128 blocks; the _ss functions take
+ * the chroma subsampling (1: 4:2:0, 0: 4:4:4). */
 #ifndef AV1G_BLOCKINFO_H
 #define AV1G_BLOCKINFO_H
 
@@ -22,6 +23,12 @@ AV1G_HD int av1g_has_chroma(int bsize, int mi_row, int mi_col, int mono) {
     return 1;
 }
 
+/* Glass Act: av1g_has_chroma with the chroma subsampling ss (1: 4:2:0, 0: 4:4:4, where every
+ * block has chroma) */
+AV1G_HD int av1g_has_chroma_ss(int bsize, int mi_row, int mi_col, int mono, int ss) {
+    return ss ? av1g_has_chroma(bsize, mi_row, mi_col, mono) : !mono;
+}
+
 /* luma TxSize of an intra block for a given tx_depth (read_tx_size) */
 AV1G_HD int av1g_luma_tx_size(int bsize, int tx_depth) {
     int t = AV1G_T(Max_Tx_Size_Rect)[bsize];
@@ -37,9 +44,13 @@ AV1G_HD int av1g_max_tx_depth(int bsize) {
 /* chroma block size (get_plane_residual_size, plane > 0, 4:2:0) */
 AV1G_HD int av1g_uv_bsize(int bsize) { return AV1G_T(Subsampled_Size)[bsize][1][1]; }
 
-/* chroma TxSize (get_tx_size for plane > 0) */
-AV1G_HD int av1g_uv_tx_size(int bsize) {
-    int uvTx = AV1G_T(Max_Tx_Size_Rect)[av1g_uv_bsize(bsize)];
+/* Glass Act: av1g_uv_bsize with the chroma subsampling ss (1: 4:2:0, 0: 4:4:4, the block's size) */
+AV1G_HD int av1g_uv_bsize_ss(int bsize, int ss) { return AV1G_T(Subsampled_Size)[bsize][ss][ss]; }
+
+/* chroma TxSize (get_tx_size for plane > 0) with the chroma subsampling ss: the largest of the
+ * chroma block, 64-sample sides capped at 32 (in 4:4:4 a 64x64 block's chroma is four 32x32s) */
+AV1G_HD int av1g_uv_tx_size_ss(int bsize, int ss) {
+    int uvTx = AV1G_T(Max_Tx_Size_Rect)[av1g_uv_bsize_ss(bsize, ss)];
     int w = AV1G_T(Tx_Width)[uvTx], h = AV1G_T(Tx_Height)[uvTx];
     if (w == 64 || h == 64) {
         if (w == 16) return AV1G_TX_16X32;
@@ -48,6 +59,9 @@ AV1G_HD int av1g_uv_tx_size(int bsize) {
     }
     return uvTx;
 }
+
+/* chroma TxSize (get_tx_size for plane > 0), 4:2:0 */
+AV1G_HD int av1g_uv_tx_size(int bsize) { return av1g_uv_tx_size_ss(bsize, 1); }
 
 /* CflAllowed for a non-lossless block */
 AV1G_HD int av1g_cfl_allowed(int bsize) {

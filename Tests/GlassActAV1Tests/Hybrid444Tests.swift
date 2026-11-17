@@ -6,8 +6,9 @@ import Metal
 import Testing
 import libaom
 
-/// The hybrid encoder's 4:4:4 key frames (`Picture.chroma444`, the High profile): every one
-/// decodes in libaom to exactly the picture the encoder reports, at sizes down to a few samples,
+/// The hybrid encoder's 4:4:4 key frames (`Picture.chroma444`, the High profile), post-filtered
+/// on the GPU: every one decodes in libaom to exactly the picture the encoder reports, at sizes
+/// down to a few samples,
 /// with intra block copy on (and copying) and off; streams of 4:4:4 inter frames decode to theirs
 /// too; and a 4:4:4 picture leaves nothing behind that changes the 4:2:0 pictures coded after it.
 @Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
@@ -95,7 +96,13 @@ struct Hybrid444Tests {
         for (i, picture) in pictures.enumerated() {
             let frame = try encoder.encode(picture, qindex: qindex)
             #expect(frame.params.chroma_format == UInt8(AV1G_CHROMA_444), "\(label): picture \(i) isn't 4:4:4")
-            #expect(frame.params.loop_filter_level == (0, 0, 0, 0) && frame.params.enable_cdef == 0, "\(label): picture \(i) filters")
+            // filtered as 4:2:0's (deblocking at tune=iq's level for the q, every plane, and CDEF), but
+            // where it copies (the format leaves a picture with intra block copies unfiltered)
+            let lf = frame.params.loop_filter_level
+            if frame.params.allow_intrabc == 0 {
+                #expect(frame.params.enable_cdef == 1 && lf.0 == lf.2 && lf.0 == lf.3 && (qindex < 40 || lf.0 > 0),
+                        "\(label): picture \(i) isn't filtered: levels \(lf), CDEF \(frame.params.enable_cdef)")
+            }
             #expect(frame.planes.map(\.count) == [Int](repeating: width * height, count: 3), "\(label): picture \(i)'s planes")
             if frame.timing.intraCopied > 0 {
                 copied += 1
@@ -178,8 +185,10 @@ struct Hybrid444Tests {
         let keys = frames.map { $0.params.frame_type != UInt8(AV1G_FRAME_INTER) }
         #expect(keys == [true, false, false, false, false, true, true, false], "\(label): key frames \(keys)")
         #expect(frames.map { $0.params.chroma_format } == pictures.map { UInt8($0.chroma444 ? AV1G_CHROMA_444 : AV1G_CHROMA_420) })
-        for (i, (f, p)) in zip(frames, pictures).enumerated() where p.chroma444 {
-            #expect(f.params.loop_filter_level == (0, 0, 0, 0) && f.params.enable_cdef == 0, "\(label): frame \(i) filters")
+        // (4:4:4 frames filtered as 4:2:0's, deblocking and CDEF, but where a key frame copies)
+        for (i, (f, p)) in zip(frames, pictures).enumerated() where p.chroma444 && f.params.allow_intrabc == 0 {
+            let lf = f.params.loop_filter_level
+            #expect(f.params.enable_cdef == 1 && lf.0 > 0 && lf.0 == lf.2 && lf.0 == lf.3, "\(label): frame \(i) isn't filtered: levels \(lf)")
         }
         #expect(frames[3].timing.copiedGolden + frames[3].timing.copied > 0.9, "\(label): picture 3 copies \(frames[3].timing.copied)")
         // (picture 4 is picture 3 five columns over: 4:4:4 copies at that odd shift, 4:2:0 couldn't)

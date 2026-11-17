@@ -1,10 +1,9 @@
-//! The post-filters of a picture the GPU's filters don't take (4:4:4: theirs are 4:2:0's), on the
-//! CPU: deblocking at tune=iq's level from the qindex, then CDEF with the GPU's search on the
-//! crate's own filters ([`crate::postfilter`]) and its searches ([`crate::enc::lfsearch`]): SSE
-//! tables per 64x64 and candidate (libaom's CDEF_FAST_SEARCH_LVL4: primary {0, 11} x secondary
-//! {0, 2}), [`cdef_select_cpu`]'s presets, [`cdef_bits`]' RD choice of how many, every active 64x64
-//! the cheapest of them. What [`crate::hybrid`]'s caller does on the GPU for 4:2:0
-//! (`AV1MetalPostfilter.search`), as libaom's tune=iq frame decisions say.
+//! A 4:4:4 picture's post-filters on the CPU (research; the encoder's run on the GPU,
+//! `AV1MetalPostfilter.search`): deblocking at tune=iq's level from the qindex, then CDEF with the
+//! GPU's search on the crate's own filters ([`crate::postfilter`]) and its searches
+//! ([`crate::enc::lfsearch`]): SSE tables per 64x64 and candidate (libaom's CDEF_FAST_SEARCH_LVL4:
+//! primary {0, 11} x secondary {0, 2}), [`cdef_select_cpu`]'s presets, [`cdef_bits`]' RD choice of
+//! how many, every active 64x64 the cheapest of them, as libaom's tune=iq frame decisions say.
 use super::{Error, Hybrid, error};
 use crate::blockinfo::chroma_ss;
 use crate::enc::lfsearch::{cdef_bits, cdef_presets, cdef_select_cpu};

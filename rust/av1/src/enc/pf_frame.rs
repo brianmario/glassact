@@ -4,7 +4,7 @@ use crate::postfilter::PfFrame;
 use crate::types::{FrameParams, GaPfAddrs};
 
 /// av1g_pf_frame (av1g/postfilter.h) as the kernels read it: the device addresses as u64, with the
-/// C layout's padding spelled out (zero), so its bytes are the C++'s.
+/// C layout's padding spelled out (zero), so its bytes are the C++'s (4:2:0's: `chroma444` is 0).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuPfFrame {
@@ -13,7 +13,9 @@ pub struct GpuPfFrame {
     pub mi_rows: i32,
     pub mi_cols: i32,
     pub mono: i32,
-    pub _pad0: i32,
+    /// 1: 4:4:4 (the chroma planes luma's size), 0: 4:2:0; the C struct's padding before
+    /// Glass Act's field, so 4:2:0's bytes are what they were
+    pub chroma444: i32,
     pub plane: [u64; 3],
     pub stride: [i32; 3],
     pub _pad1: i32,
@@ -55,6 +57,7 @@ pub fn pf_frame(fp: &FrameParams, a: &GaPfAddrs) -> GpuPfFrame {
         mi_rows: f.mi_rows,
         mi_cols: f.mi_cols,
         mono: fp.monochrome as i32,
+        chroma444: (f.ss == 0) as i32,
         plane: a.plane,
         stride: a.stride,
         skip: a.skip,

@@ -262,3 +262,27 @@ mod snapshots {
         s.check(&[("msl", 0x0ab5c016d14c4785)]);
     }
 }
+
+/// The post-filters' frame says 4:4:4 (`chroma444`, in the C struct's padding after `mono`) for a
+/// 4:4:4 record, and nothing new for a 4:2:0 one (pf_frame_snapshot pins 4:2:0's bytes).
+#[test]
+fn pf_frame_marks_444() {
+    use crate::types::{CHROMA_444, DECISIONS_VERSION, FrameParams, GaPfAddrs};
+    let mut fp = FrameParams {
+        version: DECISIONS_VERSION,
+        width: 640,
+        height: 360,
+        ..Default::default()
+    };
+    let a = GaPfAddrs::default();
+    let f = pf_frame(&fp, &a);
+    assert_eq!(f.chroma444, 0);
+    assert_eq!(&f.as_bytes()[20..24], &[0; 4]);
+    fp.chroma_format = CHROMA_444;
+    let f = pf_frame(&fp, &a);
+    assert_eq!(f.chroma444, 1);
+    assert_eq!(&f.as_bytes()[20..24], &1i32.to_ne_bytes());
+    // a version 1 record is 4:2:0 whatever its chroma_format
+    fp.version = 1;
+    assert_eq!(pf_frame(&fp, &a).chroma444, 0);
+}

@@ -1390,6 +1390,18 @@ pub extern "C" fn av1t_case_make_ex(seed: u64, maxdim: c_int, big_pct: c_int, sb
     }
 }
 
+/// av1t_case_make_444: [`crate::testsupport::FuzzCase::make_444`] (a 4:4:4 record).
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_case_make_444(seed: u64, maxdim: c_int, big_pct: c_int, sb128: c_int) -> *mut CaseHandle {
+    match crate::testsupport::FuzzCase::make_444(seed, maxdim, big_pct, sb128 != 0) {
+        Some(mut case) => {
+            let rec = case.record();
+            Box::into_raw(Box::new(CaseHandle { case, rec }))
+        }
+        None => ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1t_case_record(c: *mut CaseHandle) -> *mut DecisionRecord {
     // SAFETY: c came from av1t_case_make; the record points into its vectors.
@@ -1414,6 +1426,18 @@ pub struct InterCaseHandle {
 #[unsafe(no_mangle)]
 pub extern "C" fn av1t_inter_case_make(seed: u64, maxdim: c_int, nframes: c_int) -> *mut InterCaseHandle {
     match crate::testsupport::inter_seq_make(seed, maxdim, nframes.max(1) as usize) {
+        Some(mut seq) => {
+            let recs = seq.frames.iter_mut().map(|r| r.as_c()).collect();
+            Box::into_raw(Box::new(InterCaseHandle { seq, recs }))
+        }
+        None => ptr::null_mut(),
+    }
+}
+
+/// av1t_inter_case_make_444: [`crate::testsupport::InterSeq::make_444`] (a 4:4:4 sequence).
+#[unsafe(no_mangle)]
+pub extern "C" fn av1t_inter_case_make_444(seed: u64, maxdim: c_int, nframes: c_int) -> *mut InterCaseHandle {
+    match crate::testsupport::InterSeq::make_444(seed, maxdim, nframes.max(1) as usize) {
         Some(mut seq) => {
             let recs = seq.frames.iter_mut().map(|r| r.as_c()).collect();
             Box::into_raw(Box::new(InterCaseHandle { seq, recs }))
