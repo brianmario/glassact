@@ -141,6 +141,8 @@ the numbers and the reasoning.
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
 | The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
+| Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
+| The own decoder's 4:2:0 chroma scaled up with vImage's Lanczos before converting, instead of vImage's 4:2:0 conversion (`av1-viewer-decoder`) | rejected | +0.03 dB (47.92 → 47.95, VideoToolbox 48.19), conversion 0.60 → 14.9 ms a 5K frame | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
@@ -336,6 +338,59 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Our own AV1 decoder in the Viewer's place, stage 2 (2026-11-16)
+
+The Swift half of the decoder in the entry below, on branch `av1-viewer-decoder` (off `metal-av1`):
+a Viewer that shows the hybrid's streams without VideoToolbox, for 4:4:4 (which VideoToolbox
+refuses), M1 / M2 (no AV1 hardware) and Intel (no libaom). In no app yet, and no Viewer offers a
+codec on its strength.
+
+**What was built.**
+- **A size cap** in the Rust decoder (`Decoder::with_max_size`, `av1g_decoder_create_capped`;
+  `Decoder::new` unchanged): a sequence header or frame larger than the cap fails before anything is
+  allocated for it. `tests/decoder_cap.rs` (a counting allocator over the live heap): 28 bytes for a
+  4096x2048 frame (one byte a tile) cost an uncapped decoder 42 MB; one capped at 1280x720 refuses it
+  having allocated 86 bytes (the message). 2,880 hostile cases (truncated, size fields flipped,
+  headers flipped, spans overwritten) under each stream's own size as the cap stay within nine
+  pictures, the filters' and tiles' planes and a fixed part (at most 12 % of that bound).
+- **`OwnAV1RegionDecoder`** (`GlassActAV1Decode`, beside `GlassActHybridVideo`; GlassActCore still
+  doesn't link the Rust library): capped at the region's size from VIDEO_START; the shown frame to
+  BGRA with vImage by the matrix and range its sequence header gives (the streams BT.709, stills
+  BT.601, full range); 4:4:4 interleaved to AYpCbCr and converted in place (vImage has no planar
+  4:4:4 conversion); a reduced frame converted at its coded size and scaled up to the region
+  (VideoToolbox hands it over scaled). Any error resets the decoder and drops frames until a sync
+  frame, as `VTRegionDecoder`. The BGRA buffer and every conversion are made at `start`. Tests
+  (`AV1DecodeTests`): key and inter frames the encoder's pictures in Y, U, V; damage, and inter
+  frames after it, fail until the next key frame; a stream larger than the region refused; 4:4:4 key
+  frames 640x360 down to 17x9 exact; the BGRA within 2 of the signalled conversion (a decoder that
+  took BT.601 for BT.709 is off by 28–35).
+- **`replay --video hybrid --decoder own`** (also `vt`, `aom`): with `own` the picture check hashes
+  the decoder's own planes, not a libaom mirror's. Every real codec's run now prints the decoder's
+  time a frame (the call less the scoring and blit its pixels go to).
+
+**The replay** (tabs, `glassact-1794265876`, the whole trace, `--latency 10-10 --golden`; faults at
+the Viewer's / Host's frames 200, 600, 1000, 1400; every run settled byte-exact; the same written
+stream digest for both decoders in each pair):
+
+| run | VideoToolbox (M4 Pro, hardware) | own |
+|---|---|---|
+| `--check-pictures` | 1699 shown, 1699 the encoder's picture | 1699, 1699 |
+| `--fault-decode` | 1691 / 1691; 4 recovered, 33 ms each, 2 frames unshown each | the same |
+| `--fault-reset` | 1595 / 1595; 4 recovered, 526 ms median, 926 max, none unshown | the same |
+| decode a frame (`--no-check-pictures --score-every 0`) | key 22.6 ms mean; inter 9.56 mean, 9.26 p50, 11.7 p90 | key 23.1 (decode 20.7 + conversion 2.5); inter 1.74, 1.60, 1.80 (1.13 + 0.61) |
+| the Viewer's video CPU (decode and blit), whole run | 23.5 s | 8.9 s |
+| PSNR of what's shown, `--check-pictures` / decode / reset runs | 49.43 / 51.52 / 51.14 dB | 49.05 / 50.90 / 50.55 |
+
+Times are wall time on the engine's queue (the own decoder's stages run on up to all cores;
+VideoToolbox's call waits on the media engine), load average 7–12: provisional. SSIM is equal.
+**PSNR** is 0.4–0.6 dB under VideoToolbox's on the same pictures, so the difference is in the BGRA
+conversion; scaling the chroma up with Lanczos first doesn't close it (the first 600 frames, every
+second scored: 47.92 → 47.95 dB against VideoToolbox's 48.19, for 25× the conversion time: rejected), so it isn't the chroma upsampling. Not looked into further.
+
+**Not done** (each its own step): the Rust library for iPadOS and x86_64 in the Xcode projects, the
+apps' wiring, a codec offer (and a caps bit for 4:4:4), and the av1C (`AV1Config.build` writes 4:2:0
+whatever the stream is).
 
 ### Our own AV1 decoder, stage 1 (2026-11-16)
 
