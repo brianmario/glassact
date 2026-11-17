@@ -19,6 +19,7 @@ let av1TilesCommand = Command(
         .string("corpus", "<file>", required: true, "tiles, raw BGRA 64×64, concatenated (glassact-bench dumptiles)"),
         .string("q", "<list>", "AV1 quantizers 0–63 (libaom's scale), comma-separated (default 8,20,32,44)"),
         .string("out", "<prefix>", "write each quantizer's decoded tiles to <prefix>-q<q>.raw (BGRA, the corpus's order)"),
+        .bool("palette", "with --chroma 444: intra blocks may be luma palette blocks, decided by cost (AV1HybridEncoder.palette); prints how many are"),
         .string("chroma", "<420|444>", "AV1 key frames' chroma: 420 (default; BT.709 video range) or 444 (High profile; BT.601 full range, as the sequence header signals; every tile checked against libaom's decode)"),
     ],
     run: { opts in try cmdAV1Tiles(opts: opts) }
@@ -66,7 +67,7 @@ func cmdAV1Tiles(opts: Options) throws {
     }
 
     if chroma == "444" {
-        try av1Tiles444(corpus: corpus, n: n, qs: qs, device: device, out: opts.string("out"))
+        try av1Tiles444(corpus: corpus, n: n, qs: qs, device: device, out: opts.string("out"), palette: opts.has("palette"))
         return
     }
 
@@ -130,7 +131,7 @@ func cmdAV1Tiles(opts: Options) throws {
 /// default too). Every tile is decoded by libaom and must equal the encoder's picture exactly; with
 /// `out`, the decoded tiles (and the conversion alone) back to BGRA by the same matrix.
 @available(macOS 27, *)
-private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?) throws {
+private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?, palette: Bool) throws {
     let side = 64, tileBytes = side * side * 4
     func tile(_ i: Int) -> YUV444 {
         corpus.withUnsafeBytes { YUV444(bgra: UnsafeRawBufferPointer(rebasing: $0[i * tileBytes..<(i + 1) * tileBytes]), width: side, height: side) }
@@ -151,8 +152,10 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
     let encoder = try AV1HybridEncoder(device: device)
     encoder.reusesAnalysis = false
     encoder.tiling = (0, 0)
+    encoder.palette = palette
     for q in qs {
         let qindex = q == 63 ? 255 : max(1, 4 * q)
+        let before = encoder.paletteStats
         var bytes = 0, payload = 0, copied = 0
         var decoded = [UInt8]()
         decoded.reserveCapacity(prefix == nil ? 0 : corpus.count)
@@ -186,6 +189,11 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
         }
         print(String(format: "  AV1 4:4:4 q%-2d %7.1f B a tile (stream; tile payload %.1f B) · %6.1f µs a tile (one at a time, GPU round trips included) · %d copy (intra block copy), the rest unfiltered · libaom decodes all exactly",
                      q, Double(bytes) / Double(n), Double(payload) / Double(n), seconds / Double(n) * 1e6, copied))
+        let after = encoder.paletteStats
+        if after.count > 5, before.count > 5, after[1] > before[1] {
+            print(String(format: "    palette: %.0f of %.0f eligible blocks tried, %.0f chosen (%.1f %% of the eligible area)",
+                         after[2] - before[2], after[1] - before[1], after[3] - before[3], 100 * (after[5] - before[5]) / max(1, after[4] - before[4])))
+        }
         if let prefix {
             try Data(decoded).write(to: URL(fileURLWithPath: "\(prefix)-q\(q).raw"))
         }

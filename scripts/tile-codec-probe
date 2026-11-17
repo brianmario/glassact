@@ -94,7 +94,7 @@ def main():
             line = f"  {cname:18s} {statistics.mean(sizes):8.1f} B a tile (AV1 data {statistics.mean(r[3] for r in res):7.1f} B) · {statistics.median(times)*1000:6.1f} ms a process"
             if not lossless:
                 sc = sorted(r[2] for r in res)
-                line += f" · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}"
+                line += f" · SSIMULACRA2 mean {statistics.mean(sc):6.2f}, p10 {sc[len(sc)//10]:6.2f}"
             print(line, flush=True)
         qs = sorted(int(f[len(name) + 2:-4]) for f in os.listdir(D)
                     if f.startswith(f"{name}-q") and f.endswith(".raw") and f[len(name) + 2:-4].isdigit())
@@ -108,6 +108,6 @@ def main():
                 return score(refs[i], p)
             sc = sorted(pool.map(one, range(n)))
             label = "conversion only      " if q == "conv" else f"hybrid AV1 q{q:<2d}       "
-            print(f"  {label} (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):5.1f}, p10 {sc[len(sc)//10]:5.1f}", flush=True)
+            print(f"  {label} (sizes from av1tiles) · SSIMULACRA2 mean {statistics.mean(sc):6.2f}, p10 {sc[len(sc)//10]:6.2f}", flush=True)
 
 main()
