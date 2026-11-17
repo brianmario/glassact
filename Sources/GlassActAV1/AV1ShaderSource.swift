@@ -20,11 +20,13 @@ public import Metal
 /// older Hosts keep HEVC (DESIGN §4.6).
 ///
 /// ## Deviations
-/// Compiled at run time from the source tree (`#filePath`), not from a
-/// metallib built with the package: this Mac has no Metal toolchain
-/// (`xcodebuild -downloadComponent MetalToolchain`), and while the port is
-/// research only tests and the bench load it. Shipping it means building a
-/// metallib, which also moves compile errors to build time.
+/// Compiled at run time from source, not from a metallib built with the
+/// package: this Mac has no Metal toolchain (`xcodebuild -downloadComponent
+/// MetalToolchain`). The source is the app's copy where there is one (the
+/// Host: `scripts/build-rust --xcode --shaders` copies the three directories
+/// into its Resources/AV1Shaders as they are under `Sources/`), else the
+/// source tree (`#filePath`: tests, the bench). A metallib would move compile
+/// errors to build time.
 public enum AV1ShaderSource {
     /// Where quoted includes are looked up, in order.
     public static let defaultIncludeDirectories: [URL] = [
@@ -53,8 +55,19 @@ public enum AV1ShaderSource {
         return device.supportsFamily(.apple7) && !device.name.localizedCaseInsensitiveContains("paravirtual")
     }
 
-    /// `Sources/`.
-    static let sourceRoot = URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+    /// `Sources/`, or the app's copy of the kernels' part of it.
+    static let sourceRoot = bundledSourceRoot(in: Bundle.main) ?? sourceTreeRoot
+
+    /// The source tree's `Sources/`.
+    static let sourceTreeRoot = URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+
+    /// The kernels' sources an app carries (Resources/AV1Shaders), nil for none.
+    public static func bundledSourceRoot(in bundle: Bundle) -> URL? {
+        guard let root = bundle.resourceURL?.appending(path: "AV1Shaders", directoryHint: .isDirectory),
+              FileManager.default.fileExists(atPath: root.appending(path: "GlassActAV1/Shaders/encoder.metal").path)
+        else { return nil }
+        return root
+    }
 
     public enum Failure: Error, CustomStringConvertible {
         case missingInclude(String, from: String)

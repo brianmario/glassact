@@ -61,11 +61,17 @@ struct VideoRegionTable {
         var requestSync = false
     }
 
-    private let decoderFactory: (() -> any VideoRegionDecoder)?
+    /// A region's decoder for the codec its START names (nil: one this viewer doesn't decode).
+    private let decoderFactory: ((UInt8) -> (any VideoRegionDecoder)?)?
     private var slots = [Slot](repeating: Slot(), count: slotCount)
 
+    init(decoders: ((UInt8) -> (any VideoRegionDecoder)?)?) {
+        decoderFactory = decoders
+    }
+
+    /// One decoder for every codec.
     init(decoderFactory: (() -> any VideoRegionDecoder)?) {
-        self.decoderFactory = decoderFactory
+        self.init(decoders: decoderFactory.map { f in { _ in f() } })
     }
 
     /// Whether region video can be decoded at all (a decoder factory was
@@ -78,9 +84,9 @@ struct VideoRegionTable {
     }
 
     /// START: (re)builds the region's decoder. Returns false — region
-    /// dropped — for an out-of-range slot or rect, no decoder factory, or a
-    /// codec/config the decoder refuses (the host's dissolve repaint
-    /// eventually restores the area losslessly).
+    /// dropped — for an out-of-range slot or rect, no decoder factory or none
+    /// for the codec, or a codec/config the decoder refuses (the host's
+    /// dissolve repaint eventually restores the area losslessly).
     mutating func start(region: Int, generation: UInt32, x: Int, y: Int, w: Int, h: Int,
                         codec: UInt8, config: [UInt8], grid: TileGrid) -> Bool {
         guard region < Self.slotCount,
@@ -89,8 +95,7 @@ struct VideoRegionTable {
             return false
         }
         slots[region].decoder?.stop()
-        let decoder = factory()
-        guard decoder.start(codec: codec, config: config, width: w, height: h) else {
+        guard let decoder = factory(codec), decoder.start(codec: codec, config: config, width: w, height: h) else {
             slots[region] = Slot()
             return false
         }

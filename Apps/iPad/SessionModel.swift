@@ -1,3 +1,4 @@
+import GlassActAV1Decode
 import GlassActCore
 import GlassActSession
 import GlassActTransport
@@ -299,7 +300,7 @@ final class SessionModel {
         note(trustingOnFirstUse ? "connecting to a new host (trust on first use)…" : "connecting…")
 
         let controller = ViewerController(host: host, port: port, fingerprint: fingerprint, identity: identity,
-                                          av1: av1, deviceName: Self.deviceName)
+                                          videoDecoders: .glassAct(av1: av1), deviceName: Self.deviceName)
         controller.pasteboard = IPadPasteboard()
         controller.onStatus = { text in
             Self.log.notice("\(text, privacy: .public)")

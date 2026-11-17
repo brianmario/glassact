@@ -2,6 +2,7 @@ import CoreGraphics
 import CoreText
 import Foundation
 import GlassActCore
+import GlassActHybridVideo
 import GlassActTransport
 import GlassActWire
 
@@ -22,6 +23,8 @@ struct Options {
     var port: UInt16 = 4533
     var width = 1600, height = 1000
     var video = true
+    /// The AV1 encoder, as the Host's (`HostController.av1Encoder`); `--libaom` switches.
+    var av1: HostVideoEncoders.AV1 = .glassAct
     var motion = true
     var signInPassword: String?
     /// Ask for new keys, approving each this long after its first dial.
@@ -38,14 +41,17 @@ struct Options {
                 let parts = (next() ?? "").split(separator: "x").compactMap { Int($0) }
                 if parts.count == 2 { (o.width, o.height) = (parts[0], parts[1]) }
             case "--tiles-only": o.video = false
+            case "--libaom": o.av1 = .libaom
             case "--still": o.motion = false
             case "--sign-in-password": o.signInPassword = next()
             case "--ask-after": o.askAfter = next().flatMap(Double.init)
             case "-h", "--help":
                 print("""
-                    usage: glassact-testhost [--port 4533] [--size 1600x1000] [--tiles-only] [--still]
+                    usage: glassact-testhost [--port 4533] [--size 1600x1000] [--tiles-only] [--libaom] [--still]
                                              [--sign-in-password P | --ask-after SECONDS]
-                    A Glass Act host with a synthetic screen, for developing viewers.
+                    A Glass Act host with a synthetic screen, for developing viewers. Its AV1 is
+                    Glass Act's encoder, as the Host's (macOS 27, Apple-silicon GPU); --libaom
+                    runs libaom's instead, as older releases did.
                     """)
                 exit(0)
             default:
@@ -419,17 +425,12 @@ final class TestHost: @unchecked Sendable {
 
     private func makeEngine(startFrameSeq: UInt32) {
         guard let transport else { return }
-        let queue = self.queue
+        let encoders = HostVideoEncoders(choice: options.av1, callbackQueue: queue)
         let engine = HostEngine(
             width: scene.width, height: scene.height, transport: transport,
-            videoEncoderFactory: options.video ? { codec in
-                switch codec {
-                case VideoCodec.hevc: VTHEVCRegionEncoder(callbackQueue: queue)
-                case VideoCodec.av1: AOMRegionEncoder(callbackQueue: queue)
-                default: nil
-                }
-            } : nil,
-            videoCodecPreference: AOMRegionEncoder.isAvailable ? [VideoCodec.av1, VideoCodec.hevc] : [VideoCodec.hevc],
+            videoEncoderFactory: options.video ? { encoders.encoder(forCodec: $0) } : nil,
+            videoCodecPreference: encoders.preference,
+            videoAV1FromGlassAct: encoders.av1FromGlassAct,
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
         engine.extraHelloCaps = (geometrySettled ? WireCaps.geometryFinal : 0) | WireCaps.virtualDisplay
@@ -506,7 +507,9 @@ struct FixedAccount: PasswordVerifier {
 }
 
 setvbuf(stdout, nil, _IOLBF, 0) // a line at a time, even into a pipe or a file
-let host = TestHost(options: Options.parse(CommandLine.arguments))
+let options = Options.parse(CommandLine.arguments)
+if options.video { HostVideoEncoders.prepare(options.av1) }
+let host = TestHost(options: options)
 do {
     try host.start()
 } catch {

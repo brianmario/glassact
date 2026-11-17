@@ -6,9 +6,9 @@ import GlassActWire
 import Metal
 import QuartzCore
 
-/// Video regions (§4.6): AV1 from the Metal/CPU hybrid encoder (`AV1HybridEncoder`, research),
-/// behind the contract `AOMRegionEncoder` keeps, for a Host to put in libaom's place. Not wired
-/// into the Host yet: the bench's `replay --video hybrid` drives it.
+/// Video regions (§4.6): AV1 from the Metal/CPU hybrid encoder (`AV1HybridEncoder`), behind the
+/// contract `AOMRegionEncoder` keeps: the Host's AV1 (`HostVideoEncoders`), and the bench's
+/// `replay --video hybrid`.
 ///
 /// - **Aim**: where libaom aims, so the two compare at equal targets: `targetPercent` (40 %) of the
 ///   same base bitrate (`AOMRegionEncoder.baseBitrate`), quality ladder and link cap
@@ -30,7 +30,10 @@ import QuartzCore
 ///   between starts.
 /// - **One encoder for the process** (`Shared`): the hybrid's kernels compile once, and regions
 ///   form and dissolve often. Its calls run on one serial queue, so a region's stream ends there
-///   before the next one's starts; only the region that started last may submit.
+///   before the next one's starts; only the region that started last may submit. The first
+///   `start` compiles them, on the caller's queue, unless `prepare()` already has on its own:
+///   the Host prepares at launch and offers the encoder only once `isReady`, so a region never
+///   waits on the compile.
 ///
 /// Concurrency (`@unchecked Sendable`): the region's state belongs to the caller's queue (the
 /// engine's); the rate controller is shared with the encoder's begin queue and writer threads
@@ -44,6 +47,18 @@ import QuartzCore
 public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     /// An Apple-silicon GPU that runs the encoder's kernels.
     public static var isAvailable: Bool { AV1ShaderSource.hasCapableGPU }
+
+    /// Compiles the encoder's kernels (makes the process's encoder) on a queue of its own, once;
+    /// `isReady` says when it's done. Nothing where the encoder isn't available.
+    public static func prepare() {
+        guard isAvailable, Shared.preparation.begin() else { return }
+        DispatchQueue.global(qos: .utility).async {
+            Shared.preparation.end(ready: Shared.instance != nil)
+        }
+    }
+
+    /// The process's encoder exists: its kernels compiled (`prepare()`, or a region's `start`).
+    public static var isReady: Bool { Shared.preparation.isReady }
     public var codecID: UInt8 { VideoCodec.av1 }
 
     /// Experiments (the bench), as `AOMRegionEncoder`'s: the share of the target and the link cap
@@ -308,9 +323,39 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// The process's hybrid encoder and the queue its calls run on.
     final class Shared: @unchecked Sendable {
         static let instance: Shared? = {
-            guard let device = MTLCreateSystemDefaultDevice(), let e = try? AV1HybridEncoder(device: device) else { return nil }
+            guard let device = MTLCreateSystemDefaultDevice(), let e = try? AV1HybridEncoder(device: device) else {
+                preparation.end(ready: false)
+                return nil
+            }
+            preparation.end(ready: true)
             return Shared(encoder: e)
         }()
+
+        static let preparation = Preparation()
+
+        /// Whether the encoder is being made, or was, and how that went.
+        final class Preparation: @unchecked Sendable {
+            private let lock = NSLock()
+            private var started = false
+            private var ready = false
+
+            /// True for the first caller: it makes the encoder.
+            func begin() -> Bool {
+                lock.withLock {
+                    defer { started = true }
+                    return !started
+                }
+            }
+
+            func end(ready: Bool) {
+                lock.withLock {
+                    started = true
+                    self.ready = ready
+                }
+            }
+
+            var isReady: Bool { lock.withLock { ready } }
+        }
 
         let encoder: AV1HybridEncoder
         let control = DispatchQueue(label: "glassact.hybrid.control", qos: .userInteractive)

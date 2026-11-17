@@ -6,10 +6,11 @@ import Foundation
 public enum WireCaps {
     /// Video regions (§4.6) over the dedicated reliable video stream, HEVC.
     public static let videoHEVC: UInt32 = 1 << 0
-    /// AV1 video regions (§4.6). The Host advertises it on Apple silicon
-    /// (software libaom, vendored); a Viewer advertises it only when its
-    /// user opts in and it can decode AV1. The rig's alternate mock codec
-    /// (0x7E) maps here too, to test codec negotiation.
+    /// AV1 video regions (§4.6), codec 3. The Host advertises it when it
+    /// has an AV1 encoder (Glass Act's, or libaom in older releases); a
+    /// Viewer advertises it only when its user opts in and it decodes any
+    /// AV1 stream (VideoToolbox, in hardware). The rig's alternate mock
+    /// codec (0x7E) maps here too, to test codec negotiation.
     public static let videoAV1: UInt32 = 1 << 1
     /// Host → viewer in HELLO: send RECEIVED reports (bytes received, every
     /// 250 ms), so the host can see the rate the link actually delivers.
@@ -30,7 +31,16 @@ public enum WireCaps {
     /// Screen Recording permission) and therefore supports single-window mode.
     /// The viewer greys out the mode when this bit is absent.
     public static let windowList: UInt32 = 1 << 6
-    // Bits 7 and 8 are unassigned.
+    /// AV1 from Glass Act's own encoder (§4.6), codec 3 as `videoAV1`. A
+    /// Viewer advertises it when its user opts in and it decodes the hybrid
+    /// encoder's streams (VideoToolbox, or Glass Act's decoder, which takes
+    /// only that encoder's toolset); a Host advertises it when its AV1 is
+    /// Glass Act's encoder. A Host whose AV1 is Glass Act's sends it to a
+    /// Viewer with either AV1 bit; one whose AV1 is libaom's only to a
+    /// Viewer with `videoAV1`. (Bit 7 was `videoOverlay` before wire
+    /// version 4, which no peer this one can talk to ever sent.)
+    public static let videoAV1GlassAct: UInt32 = 1 << 7
+    // Bit 8 is unassigned.
     /// Host → viewer in HELLO: the host saves VIEWER_LOG uploads (the
     /// viewer's "Send Logs to Host").
     public static let logUpload: UInt32 = 1 << 9
@@ -51,6 +61,15 @@ public enum WireCaps {
     public static func bit(forVideoCodec codec: UInt8) -> UInt32 {
         codec == VideoCodec.av1 || codec == 0x7E ? videoAV1 : videoHEVC
     }
+
+    /// The Viewer caps bits under which a Host may send `codec`: AV1 from
+    /// Glass Act's encoder (`glassActAV1`) to a Viewer with `videoAV1` or
+    /// `videoAV1GlassAct`; any other codec under its one bit
+    /// (`bit(forVideoCodec:)`), libaom's AV1 included.
+    public static func viewerBits(forVideoCodec codec: UInt8, glassActAV1: Bool) -> UInt32 {
+        let bit = bit(forVideoCodec: codec)
+        return glassActAV1 && bit == videoAV1 ? videoAV1 | videoAV1GlassAct : bit
+    }
 }
 
 /// Video-region codec identifiers carried in VIDEO_START (§3.7). The wire is
@@ -60,8 +79,10 @@ public enum VideoCodec {
     public static let hevc: UInt8 = 1
     /// Reserved: 2 = H.264. Do not reuse.
     public static let reservedH264: UInt8 = 2
-    /// AV1, software-encoded with libaom on Apple silicon Hosts, for a
-    /// Viewer that opts in. The config record is the ISO `av1C` box.
+    /// AV1, for a Viewer that opts in: from Glass Act's own encoder (the
+    /// hybrid, macOS 27 Hosts with an Apple-silicon GPU), or libaom's in
+    /// older releases; the same id for both (§4.6 has the pairings). The
+    /// config record is the ISO `av1C` box.
     public static let av1: UInt8 = 3
 
     /// Human-readable name for status lines and logs.

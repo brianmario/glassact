@@ -467,14 +467,11 @@ struct SettingsSheet: View {
                         .pickerStyle(.segmented)
                     }
                     Toggle("Use AV1 Video", isOn: $model.av1)
-                        .disabled(!VTRegionDecoder.canDecodeAV1)
                 } header: {
                     Text("On a Slow Network")
                 } footer: {
                     Text("Balanced keeps text crisp at fewer frames per second. Sharp Text also keeps moving content sharper when the network has room. Smooth Motion lets moving content soften so more frames get through. "
-                         + (VTRegionDecoder.canDecodeAV1
-                            ? "AV1 keeps moving text sharper than HEVC but uses more bandwidth, and needs a Mac with Apple silicon."
-                            : "AV1 needs an iPad with an M3 chip or later."))
+                         + "AV1 keeps text sharper than HEVC on less bandwidth, and needs an up-to-date Mac with Apple silicon and macOS 27.")
                 }
                 Section {
                     LabeledContent("This iPad’s key") {

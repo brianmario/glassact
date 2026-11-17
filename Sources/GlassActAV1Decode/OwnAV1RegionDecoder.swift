@@ -6,9 +6,10 @@ import GlassActWire
 
 /// Video regions (§4.6): Glass Act's own AV1 decoder (`rust/av1`'s, `av1g/decoder.h`) as a Viewer's
 /// region decoder, for the hybrid encoder's streams where VideoToolbox can't show them: 4:4:4 (which
-/// it refuses on every Mac), Macs with no AV1 hardware (M1, M2) and Intel Macs. It decodes the
-/// writer's toolset only (decoder.h), and on the CPU. Not in the apps yet: GlassActCore doesn't
-/// link the Rust library, and no Viewer offers a codec on its strength.
+/// it refuses on every Mac), Macs and iPads with no AV1 hardware (M1, M2, older iPads) and Intel
+/// Macs. It decodes the writer's toolset only (decoder.h), and on the CPU, so a Viewer offers it
+/// under its own caps bit, `videoAV1GlassAct` (`ViewerVideoDecoders.glassAct`), never for libaom's
+/// streams.
 ///
 /// - **Start**: `VideoCodec.av1` with an `av1C` config (its sequence header isn't needed: every key
 ///   frame carries one). The decoder is capped at the region's size

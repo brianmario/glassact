@@ -1,4 +1,5 @@
 import AppKit
+import GlassActAV1Decode
 import GlassActCore
 import GlassActSession
 import GlassActTransport
@@ -465,7 +466,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         note(trustingOnFirstUse ? "connecting to a new host (trust on first use)…" : "connecting…")
         let controller = ViewerController(host: host, port: port, fingerprint: fingerprint,
                                           identity: viewerIdentity, cursorMetadata: cursorMetadata,
-                                          av1: settings.videoAV1)
+                                          videoDecoders: .glassAct(av1: settings.videoAV1))
         controller.pasteboard = MacPasteboard()
         controller.onStatus = { text in
             print("glassact-viewer: \(text)")

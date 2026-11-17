@@ -21,10 +21,15 @@ let package = Package(
     name: "glassact",
     platforms: [.macOS("15.5"), .iOS("27")],
     products: [
-        .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession", "GlassActShare"]),
-        // What a viewer needs, without the Host's screen capture
-        // (GlassActShare, macOS only): the iPad Viewer links this.
-        .library(name: "GlassActViewer", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession"]),
+        // The Mac apps': the Host's AV1 encoder (GlassActHybridVideo) and the Viewer's AV1
+        // decoder (GlassActAV1Decode) link the Rust library (scripts/build-rust, which the apps'
+        // Xcode targets run).
+        .library(name: "GlassAct", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession",
+                                             "GlassActShare", "GlassActHybridVideo", "GlassActAV1Decode"]),
+        // What a viewer needs, without the Host's screen capture and AV1 encoder
+        // (GlassActShare, GlassActHybridVideo: macOS only): the iPad Viewer links this.
+        .library(name: "GlassActViewer", targets: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActSession",
+                                                   "GlassActAV1Decode"]),
         .executable(name: "glassact", targets: ["glassact"]),
         .executable(name: "glassact-bench", targets: ["glassact-bench"]),
         .executable(name: "glassact-trace", targets: ["glassact-trace"]),
@@ -72,16 +77,18 @@ let package = Package(
         ),
         // The AV1 CPU code's C API (a port of av1gpu, BSD-2, Sources/AV1Core/LICENSE):
         // the DecisionRecord, the bitstream writer with the exact reconstruction,
-        // the post-filters. It's implemented in Rust (rust/av1), built by
-        // scripts/build-rust into .build/rust/libglassact_av1.a (`just` runs it),
-        // and linked here. include/av1g also holds the decoder-mirroring DSP
-        // headers the Metal kernels compile. Research for now; nothing in the
-        // apps uses it.
+        // the post-filters, the decoder. It's implemented in Rust (rust/av1), built
+        // by scripts/build-rust into .build/rust/libglassact_av1.a (`just` runs it; the
+        // apps' Xcode targets run it too), and linked here. The Mac's is found in .build/rust;
+        // iPadOS's and its Simulator's (both arm64, so not one universal file) are in
+        // .build/rust/iphoneos and iphonesimulator, and the iPad app's LIBRARY_SEARCH_PATHS
+        // picks one by PLATFORM_NAME (SwiftPM refuses build-setting macros in unsafeFlags).
+        // include/av1g also holds the decoder-mirroring DSP headers the Metal kernels compile.
         .target(
             name: "AV1Core",
             exclude: ["LICENSE", "THIRD_PARTY_NOTICES.md"],
             linkerSettings: [
-                .unsafeFlags(["-L", Context.packageDirectory + "/.build/rust"]),
+                .unsafeFlags(["-L", Context.packageDirectory + "/.build/rust"], .when(platforms: [.macOS])),
                 .linkedLibrary("glassact_av1"),
             ]
         ),
@@ -100,8 +107,9 @@ let package = Package(
             exclude: ["Shaders"],
             swiftSettings: strictLibrary
         ),
-        // The hybrid as a video region encoder (VideoRegionEncoder) with bitrate targeting, for a
-        // Host to use in libaom's place: macOS only, and in no product the iPad Viewer links.
+        // The hybrid as a video region encoder (VideoRegionEncoder) with bitrate targeting: the
+        // Host's AV1 (macOS 27+, an Apple-silicon GPU), and the Host's choice of video encoders
+        // (HostVideoEncoders, libaom kept behind it). macOS only: in no product the iPad Viewer links.
         .target(
             name: "GlassActHybridVideo",
             dependencies: ["GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire"],
@@ -109,7 +117,9 @@ let package = Package(
         ),
         // Glass Act's own AV1 decoder (rust/av1's, through AV1Core) as a video region decoder
         // (VideoRegionDecoder), for a Viewer with no other decoder for the hybrid's streams:
-        // 4:4:4, M1/M2, Intel. In no product yet: GlassActCore itself doesn't link the Rust library.
+        // 4:4:4, M1/M2, Intel, older iPads; and the Viewer's choice of decoders
+        // (ViewerVideoDecoders.glassAct). Kept out of GlassActCore and GlassActSession, which
+        // don't link the Rust library: the apps hand the choice to their session.
         .target(
             name: "GlassActAV1Decode",
             dependencies: ["AV1Core", "GlassActCore", "GlassActWire"],
@@ -159,7 +169,7 @@ let package = Package(
         // Viewer in the Simulator) without sharing a real one. Mac only.
         .executableTarget(
             name: "glassact-testhost",
-            dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport"],
+            dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport", "GlassActHybridVideo"],
             swiftSettings: strict
         ),
         .executableTarget(
@@ -178,7 +188,8 @@ let package = Package(
         .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActCore", "GlassActWire", "GlassActTestSupport", "libaom"],
                     exclude: ["Shaders"], swiftSettings: strict),
-        .testTarget(name: "AV1DecodeTests", dependencies: ["GlassActAV1Decode", "GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire", "GlassActTestSupport"],
+        .testTarget(name: "AV1DecodeTests", dependencies: ["GlassActAV1Decode", "GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire", "GlassActTestSupport",
+                                                         "GlassActHybridVideo", "GlassActTransport", "GlassActCodec"],
                     swiftSettings: strict),
         .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire"],
                     swiftSettings: strict),
