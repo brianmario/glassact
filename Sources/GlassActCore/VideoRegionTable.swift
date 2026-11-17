@@ -38,6 +38,9 @@ struct VideoRegionTable {
         var decoder: (any VideoRegionDecoder)?
         var failingSinceUS: UInt64 = 0 // first undecodable frame of the current streak
         var syncRequestedUS: UInt64 = 0 // last SYNC_REQUEST of the current streak
+        /// The video stream was replaced under the region (`awaitSyncAll`):
+        /// frames until the next sync frame are undecodable.
+        var awaitingSync = false
     }
 
     /// What one video FRAME did.
@@ -116,7 +119,10 @@ struct VideoRegionTable {
         }
         let slot = slots[region]
         var blits = 0
-        let decoded = decoder.decode(data, sync: sync) { pixels, rowBytes in
+        // After a stream reset, an inter frame may predict from frames lost
+        // with the old stream, and a decoder can't tell (AV1's reference
+        // slots, HEVC's DPB): only a sync frame is decodable then.
+        let decoded = !(slot.awaitingSync && !sync) && decoder.decode(data, sync: sync) { pixels, rowBytes in
             guard rowBytes >= slot.w * 4, pixels.count >= (slot.h - 1) * rowBytes + slot.w * 4 else { return }
             // Tile-wise blit, LWW-gated by the frame's stamp: a tile that a
             // NEWER record already wrote (dissolve repaint that crossed this
@@ -171,6 +177,7 @@ struct VideoRegionTable {
         }
         var result = FrameResult(blits: blits, decoded: decoded)
         if decoded {
+            slots[region].awaitingSync = false
             slots[region].failingSinceUS = 0
             slots[region].syncRequestedUS = 0
             return result
@@ -203,6 +210,15 @@ struct VideoRegionTable {
         slots[region].decoder?.stop()
         slots[region] = Slot()
         return true
+    }
+
+    /// The video stream was replaced (§5): frames in flight on the old one are
+    /// gone, so every live region's next decodable frame is a sync frame. A
+    /// Host that saw the loss dissolves the region (its STOP and repaint, then
+    /// a new START, follow on the new stream); one that didn't answers the
+    /// region's SYNC_REQUEST, and it recovers in place.
+    mutating func awaitSyncAll() {
+        for i in 0..<slots.count where slots[i].active { slots[i].awaitingSync = true }
     }
 
     /// Stops every region's decoder and clears all slots (in-session

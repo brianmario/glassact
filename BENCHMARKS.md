@@ -195,6 +195,7 @@ the numbers and the reasoning.
 | Half-resolution encode, upscaled | rejected | text tops out near SSIM 0.93; full res passes it at 1 Mbit/s | [entry](#video-layer-quality-low-latency-rc-and-half-res-encode-measured-2026-09-29) |
 | VT constant quality factor (macOS 27) | rejected | byte-identical while a bitrate is set; Apple's preset adds ~130 ms of lookahead | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
 | VT low-latency super-resolution | rejected | input capped at 1280 px; nothing screen-sized fits | [entry](#macos-27-videotoolbox-constant-quality-and-super-resolution--neither-usable-2026-10-10) |
+| After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
 
 **Rate control and transport**
 
@@ -258,6 +259,25 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video: frames that predict from lost ones after a stream reset (2026-11-16)
+
+Found on `metal-av1` while checking every way a Viewer loses video state with the AV1 hybrid
+encoder (its BENCHMARKS there has the whole recovery matrix). Both gaps are in the shared engine,
+so HEVC and libaom regions take the same path. Correctness only; no byte or time cost.
+
+- **A video stream reset.** Frames the Host sent before it heard of the loss went out on the
+  replacement stream under the same generation, after the frames lost with the old one, and
+  could predict from them (HEVC's DPB, AV1's reference slots); a decoder can't tell. In the
+  `metal-av1` replay with four stream resets on a whole trace, where every frame the Viewer shows
+  is checked against the encoder's reconstruction (an AV1 decoder mirrors the Viewer's, so the
+  check runs for AV1 streams), 3 of 549 frames shown were not the encoder's pictures. Now the
+  Viewer's live regions take only a sync frame after a reset (`VideoRegionTable.awaitSyncAll`):
+  0 of 549. Test: `videoStreamResetWaitsForASyncFrame`.
+- **A frame before START without its config** (the region's first frame, which carries it,
+  failed) was dropped silently with its claims, and so was every frame after it: the region
+  streamed nothing while motion lasted. It now counts as a failed delivery, so 30 of them dissolve
+  the region (DESIGN §4.6). Test: `framesThatCantStartTheRegionDissolveIt`.
 
 ### The trace recorder: raw to disk, compressed afterwards (2026-11-03)
 

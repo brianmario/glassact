@@ -85,6 +85,35 @@ import GlassActTestSupport
         #expect(viewer.stats.videoFramesApplied == 1)
     }
 
+    /// Frames the host sent on the replacement stream before it saw the old
+    /// one fail predict from frames lost with it, and a decoder can't tell:
+    /// the live region shows none of them, asks for a sync frame, and
+    /// resumes in place on it.
+    @Test func videoStreamResetWaitsForASyncFrame() {
+        let (viewer, capture) = makeVideoViewer()
+        func frame(_ seq: UInt32, sync: Bool) -> Data {
+            Data(VideoMessage.frame(region: 0, generation: 1, seq: seq, sync: sync, captureUS: 0,
+                                    data: [0] + [UInt8](repeating: UInt8(seq), count: 128 * 64 * 4)).encoded())
+        }
+        viewer.handleVideo(frame(5, sync: true), nowUS: 1_000)
+        viewer.handleVideo(frame(6, sync: false), nowUS: 2_000)
+        #expect(viewer.stats.videoFramesApplied == 2)
+        viewer.resetVideoStream()
+        viewer.handleVideo(frame(9, sync: false), nowUS: 3_000)  // (7 and 8 went with the old stream)
+        viewer.handleVideo(frame(10, sync: false), nowUS: 4_000)
+        #expect(viewer.stats.videoFramesApplied == 2, "an inter frame after the reset was shown")
+        #expect(viewer.stats.videoDecodeFailures == 2)
+        let requests = controlMessages(capture.sentControl).filter {
+            if case .syncRequest(0, 1) = $0 { return true }
+            return false
+        }
+        #expect(requests.count == 1)
+        viewer.handleVideo(frame(11, sync: true), nowUS: 5_000)
+        viewer.handleVideo(frame(12, sync: false), nowUS: 6_000)
+        #expect(viewer.stats.videoFramesApplied == 4, "the sync frame and the ones after it")
+        #expect(viewer.state == .running)
+    }
+
     /// A region whose decoder keeps failing (dead hardware session, no sync
     /// frame to resync on — encoders only send them on demand) asks for a
     /// sync frame, and when none fixes it within the 2 s deadline escalates
@@ -164,6 +193,42 @@ import GlassActTestSupport
         }
         #expect(h.host.stats.videoFramesSent == framesBefore, "empty deliveries must never hit the wire")
         #expect(h.host.stats.videoEncoderFailures == 1, "a dead encoder must dissolve the region")
+        #expect(h.settle(maxSimMS: 120_000))
+        #expect(h.canvasMatchesFrame())
+    }
+
+    /// Encoder whose frames never carry the config START needs (its first,
+    /// which would, failed): nothing it makes is decodable.
+    final class ConfiglessEncoder: VideoRegionEncoder {
+        let inner = MockVideoEncoder()
+        var codecID: UInt8 { inner.codecID }
+        func start(width: Int, height: Int,
+                   onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
+            inner.start(width: width, height: height) { data, sync, _ in onFrame(data, sync, nil) }
+        }
+        func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
+            inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
+        }
+        func stop() { inner.stop() }
+    }
+
+    /// Frames before START without its config count as failed deliveries:
+    /// the region dissolves instead of streaming nothing while motion lasts.
+    @Test func framesThatCantStartTheRegionDissolveIt() {
+        var rng = SplitMix64(seed: 2603)
+        let h = Harness(width: 640, height: 640, video: true,
+                        encoderFactory: { _ in ConfiglessEncoder() })
+        h.frame.fillRandom(&rng)
+        h.encodeFrame()
+        #expect(h.host.activeVideoRegionCount == 1)
+        for _ in 0..<(HostEngine.videoMaxEmptyDeliveries + 5) {
+            h.frame.fillRect(x: 0, y: 0, w: 640, h: 640, &rng)
+            h.encodeFrame(dirtyRects: [DirtyRect(x: 0, y: 0, width: 640, height: 640)])
+            h.run(untilUS: h.now + 16_000)
+            if h.host.stats.videoEncoderFailures > 0 { break }
+        }
+        #expect(h.host.stats.videoFramesSent == 0)
+        #expect(h.host.stats.videoEncoderFailures == 1, "a region that can't start must dissolve")
         #expect(h.settle(maxSimMS: 120_000))
         #expect(h.canvasMatchesFrame())
     }
