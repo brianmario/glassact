@@ -41,11 +41,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public struct Picture: Sendable {
         public var y: [UInt8], u: [UInt8], v: [UInt8]
         public var width: Int, height: Int
-        /// The chroma planes are full size: the picture is coded as a 4:4:4 key frame (AV1's High
-        /// profile), whose decoded planes (`Frame.planes`) are full size too. Key frames only: a
-        /// stream with `interFrames` refuses it. The GPU's analysis decides the partition and luma
-        /// modes from a 4:2:0 copy of the chroma (2×2 means); the closed loop decides chroma from
-        /// the real planes. No post-filters (the GPU's are 4:2:0's), with intra block copy or not.
+        /// The chroma planes are full size: the picture is coded 4:4:4 (AV1's High profile), and its
+        /// decoded planes (`Frame.planes`) are full size too. In a stream with `interFrames` every
+        /// picture after the first of a chroma format is an inter frame as 4:2:0's are, and a change
+        /// of format, as of size, is a key frame. The GPU's analysis decides the partition, luma
+        /// modes and motion from a 4:2:0 copy of the chroma (2×2 means; inter frames' against the
+        /// picture before's copy); the closed loop decides chroma and codes every plane from the
+        /// real ones, its inter blocks predicting from full-size references. No post-filters (the
+        /// GPU's are 4:2:0's), with intra block copy or not.
         public var chroma444: Bool
 
         public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {
@@ -897,10 +900,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// Whether picture `index` is a key frame, and an inter frame's copies (the copy queue).
     private func copyStep(_ s: Stream, _ index: Int, _ p: Picture, forceKey: Bool,
                           into out: Handoff<(copies: Copies, key: Bool)>) {
-        let sameSize = s.lastCopied.map { $0.width == p.width && $0.height == p.height } ?? false
+        // (a change of size or chroma format is a key frame)
+        let sameSize = s.lastCopied.map { $0.width == p.width && $0.height == p.height && $0.chroma444 == p.chroma444 } ?? false
         let key = !interFrames || index == 0 || forceKey || !sameSize
         var copies = Copies()
-        if interFrames && !p.chroma444 {  // (a 4:4:4 picture fails in `begin`)
+        if interFrames {
             if key {
                 if index > 0 { copyFinder.reset() }  // (every slot then holds the key frame)
             } else if let last = s.lastCopied {
@@ -1319,10 +1323,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
 
         private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
-            guard prev.width == p.width, prev.height == p.height else {
+            guard prev.width == p.width, prev.height == p.height, prev.chroma444 == p.chroma444 else {
                 reset()  // (a key frame, which every slot then holds)
                 return Copies()
             }
+            // (4:4:4: full-size chroma, copied at the luma shift, odd ones too; the long-term
+            // pictures are the stream's, so its format)
+            av1enc_motion_set_chroma_444(motion, p.chroma444 ? 1 : 0)
             let tm = CACurrentMediaTime()
             var keepsKey = -1
             if keyPending {
@@ -1331,7 +1338,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
             var m = [Int32](repeating: 0, count: 3 * nsb)
-            let strides: [Int32] = [Int32(p.width), Int32((p.width + 1) / 2), Int32((p.width + 1) / 2)]
+            let cw = Int32(p.chromaSize.width)
+            let strides: [Int32] = [Int32(p.width), cw, cw]
             var chosen: Int32 = -1
             AV1HybridEncoder.planes(p) { cur in
                 AV1HybridEncoder.planes(prev) { before in
@@ -1468,12 +1476,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
     private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
         Self.trace("begin")
-        // a 4:4:4 picture: a key frame alone, its analysis on a 4:2:0 copy of its chroma
+        // a 4:4:4 picture: its analysis on a 4:2:0 copy of its chroma
         var analysisChroma: (u: [UInt8], v: [UInt8])?
         if p.chroma444 {
-            guard !interFrames else {
-                throw Failure.encode("4:4:4 pictures are coded as key frames alone: a stream with interFrames is 4:2:0")
-            }
             guard p.y.count == p.width * p.height, p.u.count == p.y.count, p.v.count == p.y.count else {
                 throw Failure.encode("4:4:4 picture \(p.width)×\(p.height): planes of \(p.y.count), \(p.u.count), \(p.v.count) samples")
             }
@@ -1580,12 +1585,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // (a key frame's pads its own, which the next picture's compares tiles with)
         let analysisSource: [UnsafePointer<UInt8>?] = partition.source.count == 3
             ? partition.source.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) } : []
-        let padded = reference != nil && sbMotionIn != nil ? analysisSource : []
+        // (4:4:4: not the analysis's, whose chroma is a 4:2:0 copy; the closed loop pads its own)
+        let padded = reference != nil && sbMotionIn != nil && !p.chroma444 ? analysisSource : []
         // a stream's reconstruction goes into the filters' buffers, which deblock it in place (an
         // inter frame's straight there, a key frame's copied)
         var geometry = av1g_frame_params()
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
-        var store = interFrames && postfilters ? try postfilter.reconstructionBuffers(params: geometry) : []
+        // (4:4:4: none, the filters' buffers being 4:2:0's: the closed loop keeps its own)
+        var store = interFrames && postfilters && !p.chroma444 ? try postfilter.reconstructionBuffers(params: geometry) : []
         var into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
         // The previous picture where the filters left it is the closed loop's reference. Without
         // CDEF (qindex 32 and under, or `newPictureEffort`'s) that is the buffers they deblocked in
@@ -1631,7 +1638,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                         lumaTx.withUnsafeBufferPointer { types in
                             inter.withUnsafeBufferPointer { inter in
                                 Self.reference(refPlanes, gpu: gpuRef, golden: video.golden_slot != 0 ? slotPlanes[Int(video.golden_slot) - 1] : [],
-                                               width: p.width) { ref in
+                                               width: p.width, chromaWidth: p.chromaSize.width) { ref in
                                     withUnsafePointer(to: video) { vp in
                                     av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
                                                                  UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
@@ -1682,23 +1689,26 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             timing.intraCopied = Double(area) / Double(p.width * p.height)
         }
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
+        // (a 4:4:4 picture's source is the closed loop's: the analysis's chroma is a 4:2:0 copy)
+        let ownSource = analysisSource.isEmpty || p.chroma444
         for plane in 0..<3 {
             var stride: Int32 = 0
             guard let r = store.isEmpty || copies ? av1enc_hybrid_recon(cpu, Int32(plane)) : UnsafePointer(into[plane]),
-                  let s = analysisSource.isEmpty ? av1enc_hybrid_source(cpu, Int32(plane), &stride) : analysisSource[plane]
+                  let s = ownSource ? av1enc_hybrid_source(cpu, Int32(plane), &stride) : analysisSource[plane]
             else { throw Failure.encode("no reconstruction") }
             recon.append(r)
             source.append(s)
-            strides.append(analysisSource.isEmpty ? Int(stride) : partition.sourceStrides[plane])
+            strides.append(ownSource ? Int(stride) : partition.sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
         // (a 4:4:4 picture has none either: the GPU's filters and their search are 4:2:0's)
         guard postfilters, !copies, !p.chroma444 else {
-            // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
+            // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames;
+            // a 4:4:4 one has none, in any frame)
             filtered()  // (none)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
-            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames, timing: timing,
-                                  t0: t0, t1: t1)
+            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames && !p.chroma444,
+                                  timing: timing, t0: t0, t1: t1)
             filteredLast = false
             remember(p, frame.planes, sbMotion)
             written?(.success(frame))
@@ -1805,11 +1815,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         return try planes(first) { try planes(ps.dropFirst(), before + $0, body) }
     }
 
-    /// The reference picture (cropped planes, tight) as av1g_ref_planes; nil when there's none.
-    /// With `golden` (tight planes), two: the reference's, then GOLDEN_FRAME's.
+    /// The reference picture (cropped planes, tight; chroma `chromaWidth` wide, by default half
+    /// `width` rounded up) as av1g_ref_planes; nil when there's none. With `golden` (tight
+    /// planes), two: the reference's, then GOLDEN_FRAME's.
     static func reference<R>(_ planes: [[UInt8]], gpu: ([UnsafePointer<UInt8>], [Int])?, golden: [[UInt8]] = [],
-                             width: Int, _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
-        let cw = Int32((width + 1) / 2)
+                             width: Int, chromaWidth: Int? = nil, _ body: (UnsafePointer<av1g_ref_planes>?) -> R) -> R {
+        let cw = Int32(chromaWidth ?? (width + 1) / 2)
         func tight(_ q: [[UInt8]], _ body: (av1g_ref_planes) -> R) -> R {
             q[0].withUnsafeBufferPointer { y in
                 q[1].withUnsafeBufferPointer { u in

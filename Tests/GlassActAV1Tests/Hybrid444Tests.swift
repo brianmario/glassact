@@ -8,8 +8,8 @@ import libaom
 
 /// The hybrid encoder's 4:4:4 key frames (`Picture.chroma444`, the High profile): every one
 /// decodes in libaom to exactly the picture the encoder reports, at sizes down to a few samples,
-/// with intra block copy on (and copying) and off; a stream with inter frames refuses them; and a
-/// 4:4:4 picture leaves nothing behind that changes the 4:2:0 pictures coded after it.
+/// with intra block copy on (and copying) and off; streams of 4:4:4 inter frames decode to theirs
+/// too; and a 4:4:4 picture leaves nothing behind that changes the 4:2:0 pictures coded after it.
 @Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
                 "needs an Apple-silicon GPU (not a VM's paravirtual one) and libaom (arm64)"))
 struct Hybrid444Tests {
@@ -118,32 +118,103 @@ struct Hybrid444Tests {
         if width >= 333 { #expect(stats.count > 11 && stats[3] > 0 && stats[11] > 0, "\(label): palettes \(stats)") }
     }
 
-    /// A stream with inter frames refuses a 4:4:4 picture (its inter frames would be 4:2:0's), with
-    /// an error rather than a 4:2:0 frame, and the encoder codes the next stream as a fresh one would.
+    /// A 4:4:4 stream (`interFrames`): a key frame, then inter frames that copy (unchanged, and
+    /// at odd shifts, which 4:4:4 copies exactly), code what changed (one-sample colour stripes
+    /// whose phase moves, new glyphs), return to the key frame's picture (GOLDEN_FRAME's), and
+    /// change chroma format and back (each change a key frame). libaom decodes every frame, as one
+    /// stream, to exactly the picture the encoder reports; each picture's chroma is near its
+    /// source (a closed loop that coded the analysis's 4:2:0 copy of it would still decode
+    /// exactly, but lose the stripes); and a 4:2:0 stream after it codes as on a fresh encoder.
     @available(macOS 27, *)
-    @Test func interFramesRefuse444() throws {
+    @Test(arguments: [true, false])
+    func interFrames444DecodeToTheirPictures(intraBlockCopy: Bool) throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let (width, height) = (640, 384)
         func make() throws -> AV1HybridEncoder {
             let e = try AV1HybridEncoder(device: device)
             e.tiling = (1, 0)
             e.interFrames = true
+            e.intraBlockCopy = intraBlockCopy
             return e
         }
-        let encoder = try make()
-        #expect(throws: AV1HybridEncoder.Failure.self) {
-            _ = try encoder.encode(Self.picture(width: width, height: height, seed: 1), qindex: 80)
+        let label = "intra block copy \(intraBlockCopy)"
+        let base = Self.picture(width: width, height: height, seed: 0x5EED)
+        func moved(_ p: AV1HybridEncoder.Picture, rows dy: Int, cols dx: Int, from top: Int) -> AV1HybridEncoder.Picture {
+            var q = p
+            for r in top..<height {
+                for c in 0..<width {
+                    let (sr, sc) = (min(height - 1, r + dy), min(width - 1, max(0, c + dx)))
+                    (q.y[r * width + c], q.u[r * width + c], q.v[r * width + c]) =
+                        (p.y[sr * width + sc], p.u[sr * width + sc], p.v[sr * width + sc])
+                }
+            }
+            return q
         }
-        let base = PartitionTests.Picture(width: width, height: height)
-        let pictures = (0..<3).map { i -> AV1HybridEncoder.Picture in
-            var y = base.y
+        func stripes(_ p: AV1HybridEncoder.Picture, phase: Int) -> AV1HybridEncoder.Picture {
+            var q = p
+            for r in 0..<height {
+                for c in (width * 3 / 4)..<width {
+                    q.u[r * width + c] = (c + phase) % 2 == 0 ? 70 : 190
+                    q.v[r * width + c] = (r + phase) % 2 == 0 ? 60 : 200
+                }
+            }
+            return q
+        }
+        let p420 = PartitionTests.Picture(width: width, height: height)
+        let pictures: [AV1HybridEncoder.Picture] = [
+            base,
+            stripes(moved(base, rows: 3, cols: 0, from: 100), phase: 1),
+            stripes(moved(base, rows: 10, cols: 0, from: 100), phase: 0),
+            base,  // (the key frame's picture again: GOLDEN_FRAME's)
+            moved(base, rows: 0, cols: 5, from: 0),
+            AV1HybridEncoder.Picture(y: p420.y, u: p420.u, v: p420.v, width: width, height: height),
+            base,
+            stripes(moved(base, rows: 0, cols: -3, from: 50), phase: 1),
+        ]
+        let encoder = try make()
+        var frames: [AV1HybridEncoder.Frame] = []
+        try encoder.encode(count: pictures.count, qindex: 72, picture: { pictures[$0] }, output: { _, f in frames.append(f) })
+        #expect(frames.count == pictures.count)
+        let keys = frames.map { $0.params.frame_type != UInt8(AV1G_FRAME_INTER) }
+        #expect(keys == [true, false, false, false, false, true, true, false], "\(label): key frames \(keys)")
+        #expect(frames.map { $0.params.chroma_format } == pictures.map { UInt8($0.chroma444 ? AV1G_CHROMA_444 : AV1G_CHROMA_420) })
+        for (i, (f, p)) in zip(frames, pictures).enumerated() where p.chroma444 {
+            #expect(f.params.loop_filter_level == (0, 0, 0, 0) && f.params.enable_cdef == 0, "\(label): frame \(i) filters")
+        }
+        #expect(frames[3].timing.copiedGolden + frames[3].timing.copied > 0.9, "\(label): picture 3 copies \(frames[3].timing.copied)")
+        // (picture 4 is picture 3 five columns over: 4:4:4 copies at that odd shift, 4:2:0 couldn't)
+        #expect(frames[4].timing.shifted > 0.3, "\(label): odd shifts not copied: \(frames.map { ($0.timing.copied, $0.timing.shifted) })")
+        // one libaom decoder for the stream
+        let decoder = try #require(glassact_aom_dec_create(1))
+        defer { glassact_aom_dec_destroy(decoder) }
+        for (i, (frame, picture)) in zip(frames, pictures).enumerated() {
+            var f = glassact_aom_frame()
+            try #require(glassact_aom_dec_decode(decoder, frame.obu, frame.obu.count, &f) == 0, "\(label): libaom rejected frame \(i)")
+            let (cw, ch) = picture.chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+            for p in 0..<3 {
+                let (w, h) = p == 0 ? (width, height) : (cw, ch)
+                let src = try #require(f.planesTuple(p))
+                let stride = Int(f.stridesTuple(p))
+                let rows = (0..<h).filter { r in (0..<w).contains { frame.planes[p][r * w + $0] != src[r * stride + $0] } }
+                #expect(frame.planes[p].count == w * h && rows.isEmpty, "\(label): frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+            }
+            guard picture.chroma444 else { continue }
+            for (p, source) in [(1, picture.u), (2, picture.v)] {
+                var sse = 0
+                for k in 0..<(width * height) { let d = Int(frame.planes[p][k]) - Int(source[k]); sse += d * d }
+                #expect(Double(sse) / Double(width * height) < 150, "\(label): frame \(i) plane \(p) is far from its source (MSE \(Double(sse) / Double(width * height)))")
+            }
+        }
+        // a 4:2:0 stream after it codes as on a fresh encoder
+        let after420 = (0..<3).map { i -> AV1HybridEncoder.Picture in
+            var y = p420.y
             for k in stride(from: i * 5, to: y.count, by: 641) { y[k] = UInt8(truncatingIfNeeded: k) }
-            return AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height)
+            return AV1HybridEncoder.Picture(y: y, u: p420.u, v: p420.v, width: width, height: height)
         }
         var after: [[UInt8]] = [], fresh: [[UInt8]] = []
-        try encoder.encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { _, f in after.append(f.obu) })
-        try make().encode(count: pictures.count, qindex: 80, picture: { pictures[$0] }, output: { _, f in fresh.append(f.obu) })
-        #expect(after.count == 3 && after == fresh, "a stream after the refused picture codes differently")
+        try encoder.encode(count: after420.count, qindex: 80, picture: { after420[$0] }, output: { _, f in after.append(f.obu) })
+        try make().encode(count: after420.count, qindex: 80, picture: { after420[$0] }, output: { _, f in fresh.append(f.obu) })
+        #expect(after.count == 3 && after == fresh, "\(label): a 4:2:0 stream after a 4:4:4 one codes differently")
     }
 
     /// 4:2:0, then 4:4:4, then 4:2:0 again on one encoder (analysis and tiles kept, the filters'

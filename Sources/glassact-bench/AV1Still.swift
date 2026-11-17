@@ -248,13 +248,15 @@ private func withPlaneArrays<R>(_ planes: [[UInt8]], _ body: ([UnsafePointer<UIn
 }
 
 /// An 8-bit 4:2:0 picture, tightly packed: Y width × height, U and V half
-/// that (rounded up). BT.709 video range, as the Host's encoders take it.
+/// that (rounded up). BT.709 video range, as the Host's encoders take it. Or,
+/// with `chroma444` (av1seq --chroma 444), a 4:4:4 one: U and V width × height.
 struct YUV420 {
     let width: Int, height: Int
     var planes: [[UInt8]]
+    var chroma444 = false
 
-    var chromaWidth: Int { (width + 1) / 2 }
-    var chromaHeight: Int { (height + 1) / 2 }
+    var chromaWidth: Int { chroma444 ? width : (width + 1) / 2 }
+    var chromaHeight: Int { chroma444 ? height : (height + 1) / 2 }
 
     init(width: Int, height: Int, planes: [[UInt8]]) {
         self.width = width
@@ -356,12 +358,12 @@ struct YUV420 {
         return try decode(stream, width: width, height: height, with: dec)
     }
 
-    /// The next frame of a stream `dec` is decoding.
-    static func decode(_ stream: [UInt8], width: Int, height: Int, with dec: OpaquePointer) throws -> YUV420 {
+    /// The next frame of a stream `dec` is decoding (`chroma444`: a 4:4:4 stream's).
+    static func decode(_ stream: [UInt8], width: Int, height: Int, with dec: OpaquePointer, chroma444: Bool = false) throws -> YUV420 {
         var f = glassact_aom_frame()
         guard glassact_aom_dec_decode(dec, stream, stream.count, &f) == 0 else { throw BenchError("libaom couldn't decode the stream") }
         guard Int(f.width) == width, Int(f.height) == height else { throw BenchError("libaom decoded \(f.width)×\(f.height)") }
-        let cw = (width + 1) / 2, ch = (height + 1) / 2
+        let cw = chroma444 ? width : (width + 1) / 2, ch = chroma444 ? height : (height + 1) / 2
         let sizes = [(width, height), (cw, ch), (cw, ch)]
         let ptrs = [f.planes.0, f.planes.1, f.planes.2], strides = [f.strides.0, f.strides.1, f.strides.2]
         let planes = (0..<3).map { p -> [UInt8] in
@@ -370,15 +372,21 @@ struct YUV420 {
             for y in 0..<h { for x in 0..<w { out[y * w + x] = ptrs[p]![y * Int(strides[p]) + x] } }
             return out
         }
-        return YUV420(width: width, height: height, planes: planes)
+        var out = YUV420(width: width, height: height, planes: planes)
+        out.chroma444 = chroma444
+        return out
     }
 
-    func psnrY(_ reference: YUV420) -> Double {
+    func psnrY(_ reference: YUV420) -> Double { psnr(plane: 0, reference) }
+
+    /// Plane `p`'s PSNR against `reference`'s (pictures of one format).
+    func psnr(plane p: Int, _ reference: YUV420) -> Double {
+        let n = planes[p].count
         var sse = 0
-        for i in 0..<(width * height) {
-            let d = Int(planes[0][i]) - Int(reference.planes[0][i])
+        for i in 0..<n {
+            let d = Int(planes[p][i]) - Int(reference.planes[p][i])
             sse += d * d
         }
-        return sse == 0 ? .infinity : 10 * log10(255 * 255 * Double(width * height) / Double(sse))
+        return sse == 0 ? .infinity : 10 * log10(255 * 255 * Double(n) / Double(sse))
     }
 }

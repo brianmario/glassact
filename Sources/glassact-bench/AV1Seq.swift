@@ -96,6 +96,7 @@ let av1SeqCommand = Command(
         .int("ml-min-coded", "<n>", 1...1_000_000, "with --ml-prune: also in pictures coding at least this many 64x64s"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
         .string("dump-sse", "<dir>", "also write each decoded frame's squared error by 4x4 (UInt32, Y then U then V, rows of ceil(w/4)), the hybrid's as hNNN.sse and libaom's as aNNN.sse, and each picture's 64x64 luma statistics as sNNN.stats (Float32 per 64x64: variance, distinct values, share of strong horizontal or vertical edges), for per-block study"),
+        .string("chroma", "<420|444>", "the pictures' chroma: 420 (default; BT.709 video range) or 444 (the High profile, BT.709 full range as a 4:4:4 stream signals; every frame checked against libaom's decode; not with --score-rgb, --stream-width, --ref-from-half, --two-steps, --vt-decode, --aom-speed, --dump-partition)"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
     run: { opts in
@@ -135,6 +136,32 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     defer { full.deallocate(); bgra.deallocate() }
     var rects: [DirtyRect] = []
     var pictures: [YUV420] = []
+    // --chroma 444: the pictures 4:4:4, BT.709 full range (YCbCr444Converter, as the live encoder
+    // converts them)
+    let chroma = opts.string("chroma") ?? "420"
+    guard chroma == "420" || chroma == "444" else { throw BenchError("--chroma \(chroma): not 420 or 444") }
+    let c444 = chroma == "444"
+    if c444, let bad = ["score-rgb", "stream-width", "ref-from-half", "two-steps", "vt-decode", "aom-speed", "dump-partition"].first(where: opts.has) {
+        throw BenchError("--chroma 444: not with --\(bad)")
+    }
+    let converter444 = c444 ? YCbCr444Converter() : nil
+    if c444, converter444 == nil { throw BenchError("vImage: no BGRA → 4:4:4 conversion") }
+    func yuv(_ b: UnsafeMutableRawBufferPointer) throws -> YUV420 {
+        guard let converter444 else { return try YUV420(bgra: b, width: width, height: height) }
+        var y = [UInt8](repeating: 0, count: width * height), u = y, v = y
+        let ok = y.withUnsafeMutableBytes { yp in
+            u.withUnsafeMutableBytes { up in
+                v.withUnsafeMutableBytes { vp in
+                    converter444.convert(bgra: UnsafeRawBufferPointer(b), width: width, height: height,
+                                         y: yp.baseAddress!, u: up.baseAddress!, v: vp.baseAddress!)
+                }
+            }
+        }
+        guard ok else { throw BenchError("vImage: BGRA → 4:4:4 failed") }
+        var p = YUV420(width: width, height: height, planes: [y, u, v])
+        p.chroma444 = true
+        return p
+    }
     var index = 0
     var stamps: [UInt64] = []
     var firstBGRA: [UInt8] = []
@@ -150,7 +177,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             defer { mixIndex[k] += 1 }
             guard mixIndex[k] >= skip else { continue }
             resample(mixFull[k], mixes[k].header.width, mixes[k].header.height, into: bgra, width, height)
-            return try YUV420(bgra: bgra, width: width, height: height)
+            return try yuv(bgra)
         }
         return nil
     }
@@ -175,7 +202,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             resample(full, srcW, srcH, into: bgra, width, height)
         }
         if pictures.isEmpty, opts.has("ref-from-half") { firstBGRA = Array(UnsafeRawBufferPointer(bgra)) }
-        pictures.append(try YUV420(bgra: bgra, width: width, height: height))
+        pictures.append(try yuv(bgra))
     }
     guard !pictures.isEmpty else { throw BenchError("no frames after --skip \(skip)") }
     // --then: the following traces' pictures, each from its own skip, after the first's
@@ -190,7 +217,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             defer { k += 1 }
             guard k >= t.skip, (k - t.skip) % every == 0 else { continue }
             resample(f, r.header.width, r.header.height, into: bgra, width, height)
-            pictures.append(try YUV420(bgra: bgra, width: width, height: height))
+            pictures.append(try yuv(bgra))
             stamps.append(meta.timestampUS)
             taken += 1
         }
@@ -198,7 +225,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     func picture(_ i: Int) -> AV1HybridEncoder.Picture {
         AV1HybridEncoder.Picture(y: pictures[i].planes[0], u: pictures[i].planes[1], v: pictures[i].planes[2],
-                                 width: width, height: height)
+                                 width: width, height: height, chroma444: c444)
     }
     let serial = opts.has("serial"), inter = opts.has("inter")
     if serial && inter { throw BenchError("--serial codes every picture alone: not with --inter") }
@@ -428,10 +455,28 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     var psnrAgain = 0.0
     guard let decoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
     defer { glassact_aom_dec_destroy(decoder) }
+    var psnrUV = (0.0, 0.0), keyPSNR = (Double.nan, Double.nan, Double.nan)
+    var singles: OpaquePointer?
+    defer { if let singles { glassact_aom_dec_destroy(singles) } }
     for (i, f) in frames.enumerated() {
         // intra frames each alone; a stream in order
-        let decoded = inter ? try YUV420.decode(f.obu, width: width, height: height, with: decoder)
-                            : try YUV420.decode(f.obu, width: width, height: height)
+        let decoded: YUV420
+        if inter {
+            decoded = try YUV420.decode(f.obu, width: width, height: height, with: decoder, chroma444: c444)
+        } else if c444 {
+            // (a fresh decoder each)
+            if let singles { glassact_aom_dec_destroy(singles) }
+            singles = glassact_aom_dec_create(4)
+            guard let singles else { throw BenchError("libaom: no decoder") }
+            decoded = try YUV420.decode(f.obu, width: width, height: height, with: singles, chroma444: true)
+        } else {
+            decoded = try YUV420.decode(f.obu, width: width, height: height)
+        }
+        if c444 {
+            let (u, v) = (decoded.psnr(plane: 1, pictures[i]), decoded.psnr(plane: 2, pictures[i]))
+            (psnrUV.0, psnrUV.1) = (psnrUV.0 + u, psnrUV.1 + v)
+            if keyPSNR.0.isNaN, f.params.frame_type != UInt8(AV1G_FRAME_INTER) { keyPSNR = (decoded.psnrY(pictures[i]), u, v) }
+        }
         for p in 0..<3 where !f.planes.isEmpty && decoded.planes[p] != f.planes[p] {
             throw BenchError("frame \(i): libaom's decode differs from the encoder's picture in plane \(p)")
         }
@@ -509,6 +554,12 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let bytes = frames.map(\.obu.count).reduce(0, +)
     print(String(format: "  hybrid     %.1f fps (%.1f ms a frame) · %@ a frame · PSNR-Y %.2f · all %d decoded exactly",
                  n / seconds, seconds / n * 1000, formatBytes(bytes / frames.count), psnr / n, frames.count))
+    if c444 {
+        // (the key frame's, and the inter frames' mean: a closed loop that read the wrong chroma
+        // would decode exactly and score low)
+        print(String(format: "             4:4:4: PSNR-U %.2f · PSNR-V %.2f (mean); the first key frame's PSNR-Y/U/V %.2f / %.2f / %.2f",
+                     psnrUV.0 / n, psnrUV.1 / n, keyPSNR.0, keyPSNR.1, keyPSNR.2))
+    }
     if opts.has("frame-bytes") {
         // each frame's size against what it coded (the rate controller's model)
         let nsb = ((width + 63) / 64) * ((height + 63) / 64)
