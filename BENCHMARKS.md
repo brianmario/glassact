@@ -148,6 +148,7 @@ the numbers and the reasoning.
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
 | The own decoder's 4:2:0 chroma scaled up with vImage's Lanczos before converting, instead of vImage's 4:2:0 conversion (`av1-viewer-decoder`) | rejected | +0.03 dB (47.92 → 47.95, VideoToolbox 48.19), conversion 0.60 → 14.9 ms a 5K frame | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
+| Lossless 4:4:4 AV1 tiles from the hybrid (qindex 0, identity matrix) | not built | at qindex 1, short of lossless, text and UI tiles already cost 9–34 % more than VP8L's lossless ones | [entry](#lossless-444-av1-tiles-from-the-hybrid-a-bound-before-building-it-2026-11-17) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
@@ -346,6 +347,31 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Lossless 4:4:4 AV1 tiles from the hybrid: a bound before building it (2026-11-17)
+
+The owner asked whether 4:4:4 means lossless AVIF tiles. Lossless AV1 needs two more things
+the encoder doesn't have: qindex 0 (only 4×4 Walsh–Hadamard transforms, no filters) and the
+identity matrix (RGB coded as G, B, R, so no colour conversion). Before building them, the
+bound: the hybrid's 4:4:4 tiles at its finest quantizers (`av1tiles --chroma 444 --q 0,1,2` is
+qindex 1, 4, 8), with palettes, against VP8L z4, what ships. Bytes a tile (the stream),
+SSIMULACRA2 mean; the conversion alone (BT.601 full range and back) scores 95.4–97.9:
+
+| Tiles | VP8L z4 (lossless) | qindex 1 | qindex 4 | qindex 8 |
+|---|---|---|---|---|
+| typing-cc | 417 | 556 · 96.15 (+34 %) | 509 · 96.01 | 463 · 95.79 |
+| scroll-win | 381 | 455 · 97.57 (+19 %) | 399 · 97.29 | 343 · 96.99 |
+| tabs | 404 | 442 · 97.70 (+9 %) | 385 · 97.54 | 334 · 97.29 |
+| ide | 501 | 567 · 96.07 (+13 %) | 486 · 95.86 | 412 · 95.58 |
+| photos | 3332 | 2767 · 95.40 (−17 %) | 2277 · 94.87 | 1862 · 94.34 |
+| cursor-drag | 2381 | 1668 · 94.58 (−30 %) | 1228 · 94.24 | 899 · 93.91 |
+
+At qindex 1, short of lossless and within a point of the conversion's ceiling, text and UI
+tiles already cost 9–34 % more than VP8L's lossless ones. Lossless costs more again: 4×4
+transforms only, and RGB, which decorrelates worse than YCbCr (libaom's lossless AV1 was 2.7×
+its own q90 on typing-cc, 2026-11-16). Photos and graphics are 17–30 % under VP8L at
+qindex 1, and libaom's lossless AV1 was 1.2× VP8L on them. **Lossless AV1 tiles: not built.**
+Encode times 2.2–14.6 ms a tile, one at a time (load average 9–14).
 
 ### The Rust AV1 crate's C++ reference retired: snapshot tests (2026-11-17)
 
