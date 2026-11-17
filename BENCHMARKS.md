@@ -355,9 +355,9 @@ which.
 
 ### Metal AV1: a lone new 5K picture, stage by stage and kernel by kernel; its serial set-up, copies and a new cache's analysis cut (2026-11-17)
 
-The hybrid as the Host's live encoder holds one picture in flight, so a new 5K picture's latency
-is the sum of every stage: none of the pipelining the earlier period entries measured hides any of
-it. Measured with `av1seq --push lone` (each picture submitted as the one before comes out) on the
+The product's replay holds one picture in flight and the Host's engine at most two, so a new 5K
+picture's latency is the sum of every stage: little of the pipelining the earlier period entries
+measured hides any of it. Measured with `av1seq --push lone` (each picture submitted as the one before comes out) on the
 all-new stream (the rotation at 5K q20, `--no-golden`, 24 pictures, `--tiles 3x0`, the defaults:
 every inter picture fast at qindex 87), and on the app-switching trace
 (`glassact-1793737268.scap`, 300 pictures) at q20 and at 6 Mbit/s (`--push-kbit 6000`).
@@ -419,14 +419,17 @@ counter set isn't among `xctrace`'s recording options, `MTLDevice.counterSets` o
 timestamps (at stage boundaries), and Xcode 27 has no command-line replayer for a `.gputrace`. Metal reports no register counts
 either. So occupancy, limiters and registers per kernel are not measured; what is:
 - The thread-per-block kernels (`k_analysis_small_*`, 4x4 and 8x8 on a new picture: 21 % of the GPU)
-  spill 208–1008 B a thread (8x16 / 16x8, used by key frames, 1.6–1.9 KB): register-bound, as on
-  2026-10-31, and their lanes wait on each other's mode masks (2026-11-09).
+  spill 208–1008 B a thread (8x16 / 16x8, used by key frames, 1.6–1.9 KB): register-bound by
+  their spills (inferred, as on 2026-10-31: no counters say so), and their lanes wait on each
+  other's mode masks (2026-11-09).
 - The SIMD-group kernels mostly don't spill (16x16 none, 32x32 32 B, the 16x32 / 32x16 shapes
   190–240 B) except 64x64 (768 B) and `k_dp` (784 B).
 - The motion search spills once (112 B, one of `k_proj_sums` / `k_proj` / `k_me` / `k_inter_sad`);
   the inter candidates don't. `k_me` (1.57 ms, the second kernel) was measured window-search-bound
   on 2026-11-12.
-- Learned pruning's passes spill 16–336 B (four of five).
+- Learned pruning's passes spill 16–336 B (four of five), and the leaves' 352 / 240 B are
+  `k_leaf_small` / `k_leaf` by dispatch order: those attributions, like the motion search's, are
+  inferred from the order of a stage's spill events.
 The previous rounds left a few percent a kernel (2026-11-09, -11, -12); nothing here is out of line
 with them, and the GPU is 36 % of the latency: the CPU's serial stages were the untouched ones.
 
@@ -456,7 +459,7 @@ with GOLDEN_FRAME pipelined and in a burst, decoded exactly; Rust tests 153, the
 |---|---|---|
 | A picture's set-up copies (the padded source; the cache's remembered source, each run of changed SBs one span a line) in bands on every core | `4589d9f` | a lone new picture's set-up 2.86 → 1.22 ms |
 | The copy finder's shift vote by an open-addressing table of the previous lines, not a sort and two binary searches a line (the sorted vote kept as the test's reference) | `f48adb4` | copies 3.08 → 1.72 ms |
-| A cache made anew takes its predecessor's buffers when they are large enough, cleared by a blit in its first command buffer (behind the read waits and the queue's order), the other keep and stale pair | `1569ecb`, `b06de48` | the ten rebuilt pictures' set-up 4.65–4.96 → 1.19–1.25 ms; the clear ≈ 0.3 ms of GPU |
+| A cache made anew takes its predecessor's buffers when they are large enough, cleared by a blit in its first command buffer (behind the read waits and the queue's order), the other keep and stale pair | `1569ecb`, `b06de48`, `608cf21` | the ten rebuilt pictures' set-up 4.65–4.96 → 1.19–1.25 ms; the clear ≈ 0.3 ms of GPU (`--profile` commits it on its own, so its stages read as before: motion search 1.71 / 1.72 → 1.72 / 1.72) |
 | A new cache's first inter frame analyzes only the SBs it codes, its choices by size (a shape's kernel, the projections' table) made as for every SB; SBs it skipped are marked unanalyzed for a picture without copies | `297d631` | the rebuilt pictures' motion search 7.4–9.0 → 2.0–4.0 ms of GPU, submit to frame 27.6–28.1 → 21.5–25.0 ms |
 
 All of it against `f41defe`, interleaved:
@@ -465,7 +468,7 @@ All of it against `f41defe`, interleaved:
 |---|---|---|
 | the rotation, lone: submit to frame p50 (3 runs) | 40.7 / 40.8 / 40.8 ms | 37.2 / 37.4 / 37.7 ms |
 | … begin → frame, median; copies; set-up | 37.5; 3.04; 2.67 ms | 35.5; 1.66; 1.20 ms |
-| the rotation, `--push every=16.7` (two pictures in flight, as the Host): pictures a second, p50 | 39.9 / 40.0, 51.2 / 50.9 ms | 43.3 / 42.5, 49.5 / 48.2 ms |
+| the rotation, `--push every=16.7` (two pictures in flight, as the Host; 2 runs): pictures a second, p50 | 39.9 / 40.0, 51.2 / 50.9 ms | 43.3 / 42.5, 49.5 / 48.2 ms |
 | the rotation, `--push burst`: pictures a second (3 runs) | 55.1–55.6 | 56.0–56.6 |
 | the app-switching trace at 6 Mbit/s, lone (3 runs): the ten rebuilt pictures' submit to frame, median | 31.7–32.6 ms | 20.4–20.6 ms |
 | … the switch's new picture (284) and the one after it | 41.5–41.9, 38.9–39.1 ms | 35.8–36.1, 27.1–27.7 ms |
@@ -486,14 +489,17 @@ All of it against `f41defe`, interleaved:
 
 **A caution for byte checks of rate-controlled streams:** with `--push every=…` the rate controller
 decides a picture's qindex with up to one earlier picture's size unknown, so a faster build can
-decide differently and code different (valid) bytes; every such run here that decided the same
-qindex sequence as the base coded the same bytes. Lone pictures and `--push burst` at a fixed q
-are deterministic.
+decide differently and code different (valid) bytes. The base build's 40-picture stream at 20
+Mbit/s came out the same in 6 runs of 6, this branch's in 7 of 13; with `--frame-bytes`, the run
+that differed had pictures 0–9 the same, bytes and qindex, and first decided picture 10's qindex
+differently (78 against 73): the timing, not the encoder. Lone pictures and `--push burst` at a
+fixed q are deterministic.
 
 **Why `every=16.7` ran at 40 a second:** the bench, as the Host's engine, keeps at most two
-pictures in flight, so on new content its rate is two over a lone picture's latency (2 / 50 ms).
-60 a second at 5K on a full-screen change therefore needs a lone picture's latency under ≈ 33 ms
-(it is 37.5 now), or a third picture in flight.
+pictures in flight, so on new content its rate is two over a picture's latency with two in flight
+(2 / 50 ms; 48–50 ms now, against 37.5 lone: two pictures share the cores and the GPU). 60 a
+second at 5K on a full-screen change needs that latency under ≈ 33 ms, so a lone picture's under
+33 ms is the least it takes; or a third picture in flight.
 
 **The writer, by parts** (timing builds, the streams invalid: `Ec::symbol` and `Ec::bool` compiled
 to nothing, then also without the CDF update; writer median, photos picture):
