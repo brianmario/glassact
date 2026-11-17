@@ -831,7 +831,11 @@ mod tests {
             let distinct = if case % 4 == 0 { 1 + rng(&mut s) % 40 } else { u64::MAX };
             let line = |s: &mut u64| {
                 let v = rng(s);
-                if distinct == u64::MAX { v } else { (v % distinct).wrapping_mul(0x1_0000_0001) }
+                if distinct == u64::MAX {
+                    v
+                } else {
+                    (v % distinct).wrapping_mul(0x1_0000_0001)
+                }
             };
             t.before.clear();
             t.before.extend((0..n).map(|_| line(&mut s)));
