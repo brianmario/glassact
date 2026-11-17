@@ -1257,6 +1257,7 @@ mod tests {
             count: [0; 256],
             vals: [0; 256],
             n: 3,
+            exact8: 0,
         };
         (h.count[10], h.count[90], h.count[200]) = (30, 14, 20);
         h.vals[..3].copy_from_slice(&[10, 90, 200]);
@@ -1298,6 +1299,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 2-D k-means finds a few exact (U, V) pairs exactly, sorted by U then V.
+    #[test]
+    fn cluster_pairs() {
+        let keys = [10u16 << 8 | 200, 10 << 8 | 30, 90 << 8 | 90];
+        let cnt = [20u32, 30, 14];
+        let mut sorted: Vec<(u16, u32)> = keys.iter().copied().zip(cnt).collect();
+        sorted.sort();
+        let (k, c): (Vec<u16>, Vec<u32>) = sorted.into_iter().unzip();
+        let mut out = [(0u8, 0u8); 8];
+        assert_eq!(cluster_uv(&k, &c, 3, &mut out), 3);
+        assert_eq!(&out[..3], &[(10, 30), (10, 200), (90, 90)]);
+        assert_eq!(cluster_uv(&k, &c, 8, &mut out), 3);
+    }
+
+    /// The V colours' bits: deltas where shorter than literals, with their flag.
+    #[test]
+    fn v_colour_bits() {
+        // a delta of 2 in 4 bits, its sign: 1 + 2 + 8 + 5 against 1 + 16
+        assert_eq!(v_color_bits(&[10, 12]), 16.0);
+        // a delta of -56 takes 6 bits: literals
+        assert_eq!(v_color_bits(&[0, 200]), 17.0);
+        // U's colours, non-decreasing: a literal and a zero delta (5 bits)
+        assert_eq!(u_color_bits(&[], &[40, 40]), 15.0);
     }
 
     /// The colours' bits: a literal, then deltas; cached colours a bit each.
