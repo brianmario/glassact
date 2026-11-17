@@ -156,6 +156,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// inter frames" has what they were worth and cost there).
     public var chroma444CPUFilters = false
 
+    /// A 4:4:4 picture's chroma modes decided by the closed loop on the CPU, on the real planes
+    /// (the reference engine's rule), not by the GPU's leaf kernel on the analysis's 4:2:0 copy
+    /// (off). Against the GPU's: +2.1 % BD-rate on new screen pictures (the 5K rotation), −4.9 % on
+    /// video, 0.0 to −0.5 % on the other screens, at 1.7–35 ms of CPU a 5K picture (BENCHMARKS "the
+    /// hybrid's 4:4:4 work on the GPU").
+    public var chroma444CPUChroma = false
+
     /// The shapes a 4:4:4 picture's analysis leaves out with `chroma444Palettes`: 4×4, 4×8 and 8×4
     /// (GpParams.shapeMask bits 0–2), which a palette can't be. Out of whichever it would try: a key
     /// frame's preset's, an inter frame's (a mostly-new picture's fewer, `newPictureShapeMask`).
@@ -1650,7 +1657,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                     av1enc_hybrid_closed_loop_ex(cpu, y.baseAddress, u.baseAddress, v.baseAddress, UInt32(p.width),
                                                                  UInt32(p.height), blocks.baseAddress, UInt32(blocks.count),
                                                                  gpuDecides ? types.baseAddress : nil,
-                                                                 gpuDecides && partition.hasChroma ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
+                                                                 gpuDecides && partition.hasChroma && !(p.chroma444 && chroma444CPUChroma)
+                                                                     ? Int32(AV1ENC_HYBRID_GIVEN_CHROMA) : 0,
                                                                  Int32(qindex), Int32(tiling.columnsLog2), Int32(tiling.rowsLog2),
                                                                  interFrames ? vp : nil, inter.isEmpty ? nil : inter.baseAddress,
                                                                  ref, padded.isEmpty ? nil : padded, into.isEmpty ? nil : into,

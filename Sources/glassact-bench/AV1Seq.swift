@@ -99,6 +99,7 @@ let av1SeqCommand = Command(
         .string("dump-sse", "<dir>", "also write each decoded frame's squared error by 4x4 (UInt32, Y then U then V, rows of ceil(w/4)), the hybrid's as hNNN.sse and libaom's as aNNN.sse, and each picture's 64x64 luma statistics as sNNN.stats (Float32 per 64x64: variance, distinct values, share of strong horizontal or vertical edges), for per-block study"),
         .string("chroma", "<420|444>", "the pictures' chroma: 420 (default; BT.709 video range) or 444 (the High profile, BT.709 full range as a 4:4:4 stream signals; every frame checked against libaom's decode; not with --score-rgb, --stream-width, --ref-from-half, --two-steps, --vt-decode, --aom-speed, --dump-partition)"),
         .bool("cpu-filters", "with --chroma 444: deblock and CDEF the pictures on the CPU (AV1HybridEncoder.chroma444CPUFilters, research; off: on the GPU)"),
+        .bool("444-cpu-chroma", "with --chroma 444: chroma modes decided on the CPU on the real planes (AV1HybridEncoder.chroma444CPUChroma), not by the GPU on the analysis's 4:2:0 copy"),
         .bool("no-444-palettes", "with --chroma 444: no palettes and every shape, as 4:2:0 pictures are analyzed (AV1HybridEncoder.chroma444Palettes off)"),
         .string("dump-partition", "<dir>", "instead of encoding: each picture's luma and the GPU's full search's leaf blocks (no pruning, no angle deltas), for offline study"),
     ],
@@ -280,6 +281,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     encoder.intraBlockCopy = !opts.has("no-intrabc")
     encoder.palette = opts.has("palette")
     encoder.chroma444Palettes = !opts.has("no-444-palettes")
+    encoder.chroma444CPUChroma = opts.has("444-cpu-chroma")
     encoder.chroma444CPUFilters = opts.has("cpu-filters")
     encoder.goldenFrames = !opts.has("no-golden")
     if opts.has("long-term") { encoder.longTermReferences = opts.int("long-term", 1) }
