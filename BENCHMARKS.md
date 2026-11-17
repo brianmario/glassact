@@ -379,17 +379,20 @@ stream digest for both decoders in each pair):
 | `--fault-decode` | 1691 / 1691; 4 recovered, 33 ms each, 2 frames unshown each | the same |
 | `--fault-reset` | 1595 / 1595; 4 recovered, 526 ms median, 926 max, none unshown | the same |
 | decode a frame (`--no-check-pictures --score-every 0`) | key 22.6 ms mean; inter 9.56 mean, 9.26 p50, 11.7 p90 | key 23.1 (decode 20.7 + conversion 2.5); inter 1.74, 1.60, 1.80 (1.13 + 0.61) |
-| the Viewer's video CPU (decode and blit), whole run | 23.5 s | 8.9 s |
+| the Viewer's video wall time on the engine queue (decode and blit, not CPU time), whole run | 23.5 s | 8.9 s |
 | PSNR of what's shown, `--check-pictures` / decode / reset runs | 49.43 / 51.52 / 51.14 dB | 49.05 / 50.90 / 50.55 |
 
 Times are wall time on the engine's queue (the own decoder's stages run on up to all cores;
 VideoToolbox's call waits on the media engine), load average 7–12: provisional. SSIM is equal.
 **PSNR** is 0.4–0.6 dB under VideoToolbox's on the same pictures, so the difference is in the BGRA
 conversion; scaling the chroma up with Lanczos first doesn't close it (the first 600 frames, every
-second scored: 47.92 → 47.95 dB against VideoToolbox's 48.19, for 25× the conversion time: rejected), so it isn't the chroma upsampling. Not looked into further.
+second scored: 47.92 → 47.95 dB against VideoToolbox's 48.19, for 25× the conversion time: rejected), so it isn't the chroma upsampling. As mean squared error the gap is the same
+in all three runs (0.068, 0.070, 0.073), which points at the conversion's precision (vImage's
+8-bit fixed point), not a wrong matrix, range or upsampling; not looked into further.
 
 **Not done** (each its own step): the Rust library for iPadOS and x86_64 in the Xcode projects, the
-apps' wiring, a codec offer (and a caps bit for 4:4:4), and the av1C (`AV1Config.build` writes 4:2:0
+apps' wiring, a codec offer (its own caps bit: this decoder takes only the hybrid's toolset, so a
+Viewer offering AV1 on its strength would be sent libaom streams it refuses; 4:4:4 that bit or another), and the av1C (`AV1Config.build` writes 4:2:0
 whatever the stream is).
 
 ### Our own AV1 decoder, stage 1 (2026-11-16)
