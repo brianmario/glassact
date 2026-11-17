@@ -107,6 +107,14 @@ let package = Package(
             dependencies: ["GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire"],
             swiftSettings: strictLibrary
         ),
+        // Glass Act's own AV1 decoder (rust/av1's, through AV1Core) as a video region decoder
+        // (VideoRegionDecoder), for a Viewer with no other decoder for the hybrid's streams:
+        // 4:4:4, M1/M2, Intel. In no product yet: GlassActCore itself doesn't link the Rust library.
+        .target(
+            name: "GlassActAV1Decode",
+            dependencies: ["AV1Core", "GlassActCore", "GlassActWire"],
+            swiftSettings: strictLibrary
+        ),
         // av1gpu's random legal records and CPU reference engine, for tests (Rust too).
         .target(
             name: "AV1CoreTestSupport",
@@ -144,7 +152,7 @@ let package = Package(
         .executableTarget(
             name: "glassact-bench",
             dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActShare",
-                           "GlassActAV1", "AV1Core", "libaom", "GlassActHybridVideo"],
+                           "GlassActAV1", "AV1Core", "libaom", "GlassActHybridVideo", "GlassActAV1Decode"],
             swiftSettings: strict
         ),
         // A Host with a synthetic screen, for developing a viewer (the iPad
@@ -170,6 +178,8 @@ let package = Package(
         .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
         .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActCore", "GlassActWire", "GlassActTestSupport", "libaom"],
                     exclude: ["Shaders"], swiftSettings: strict),
+        .testTarget(name: "AV1DecodeTests", dependencies: ["GlassActAV1Decode", "GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire", "GlassActTestSupport"],
+                    swiftSettings: strict),
         .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire"],
                     swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
