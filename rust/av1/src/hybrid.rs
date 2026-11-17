@@ -6,10 +6,11 @@
 //! parallel threads; then skip flags for all-zero blocks. The caller filters the reconstruction and
 //! writes the bitstream ([`Hybrid::write`]). With [`Hybrid::set_intrabc`], a key frame's blocks go
 //! through the intra block copy search first ([`intrabc`]), and a frame that copies is written
-//! without post-filters. With [`Hybrid::set_chroma_444`], key frames are 4:4:4 (fp.chroma_format):
+//! without post-filters. With [`Hybrid::set_chroma_444`], pictures are 4:4:4 (fp.chroma_format):
 //! the planes are full size, and the chroma decisions are the closed loop's own (the reference
 //! engine's rule, [`decide::Decider::best_chroma`], whatever the flags say: the Metal analysis's
-//! chroma decision is 4:2:0's); inter frames are refused. With [`Hybrid::set_palette`], intra
+//! chroma decision is 4:2:0's), and so are inter frames, whose references are full size too.
+//! With [`Hybrid::set_palette`], intra
 //! blocks may become palette blocks, decided by cost before the closed loop ([`palette`]): luma,
 //! and in 4:4:4 chroma too.
 //!
@@ -542,12 +543,6 @@ impl Hybrid {
         let (cw, ch) = ((w + ss) >> ss, (h + ss) >> ss);
         let n = blocks.len();
         let (rw, rh) = (mi_cols(width as i32) as usize * 4, mi_rows(height as i32) as usize * 4);
-        if self.chroma444 && video.is_some_and(|v| v.fp.frame_type == FRAME_INTER) {
-            return Err(error(
-                ERR_INVALID,
-                "4:4:4 is for key frames: inter frames are 4:2:0 only",
-            ));
-        }
         if n == 0
             || w < 1
             || h < 1

@@ -215,10 +215,13 @@ double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 typedef struct av1enc_motion av1enc_motion;
 av1enc_motion *av1enc_motion_create(void);
 void av1enc_motion_destroy(av1enc_motion *m);
+// The pictures the handle classifies are 4:4:4 (on: their chroma planes w x h, copied at the luma
+// shift, odd ones too) or 4:2:0 (off, the default: chroma half, even shifts only).
+void av1enc_motion_set_chroma_444(av1enc_motion *m, int on);
 // Per 64x64 (raster) of cur: whether it equals prev unchanged, or else at a candidate shift (the
 // left or upper neighbour's, or up to max_candidates from row and column hashes; even and at most
-// 1000 samples each way). `planes` planes (1 or 3: Y w x h, chroma half that, rounded up) at their
-// strides. out (optional): 3 ints per 64x64, copy (0/1), dx, dy (it copies prev at x + dx,
+// 1000 samples each way; odd ones too in 4:4:4). `planes` planes (1 or 3: Y w x h, chroma half
+// that, rounded up, or w x h after av1enc_motion_set_chroma_444) at their strides. out (optional): 3 ints per 64x64, copy (0/1), dx, dy (it copies prev at x + dx,
 // y + dy). Returns the copies' count.
 int av1enc_motion_classify(av1enc_motion *m, const uint8_t *const cur[3], const int cur_stride[3],
                            const uint8_t *const prev[3], const int prev_stride[3], int width, int height, int planes,

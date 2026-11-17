@@ -772,7 +772,7 @@ fn ivf1(obu: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// closed loop decides chroma itself (given chroma ignored), codes the same on one thread as on
 /// all, its record is 4:4:4 and the write keeps it so; the bitstream parses back to the record,
 /// whose writer reconstruction is the closed loop's post-filtered, and (where installed) dav1d
-/// and aomdec decode exactly that. Inter frames are refused.
+/// and aomdec decode exactly that. (Inter frames: [`chroma444_inter_frames`].)
 #[test]
 fn chroma444_key_frames() {
     use crate::writer::parse_with;
@@ -1007,28 +1007,317 @@ fn chroma444_key_frames() {
     );
     assert!(stale_checks >= 2);
     assert!(palettes[0] > 0 && palettes[1] > 0, "palettes {palettes:?}");
-    // inter frames are 4:2:0 only
-    let pic = screen_pic(64, 64, 9, false);
-    let (u, v) = to_444(&pic);
-    let tiles = tile_layout(64, 64, 0, 0).unwrap();
-    let blocks = partition(&pic, &tiles, &mut Rng(3), Style::Variance, false);
-    let mut hy = Hybrid::new();
-    hy.set_chroma_444(true);
-    let vfp = FrameParams {
-        video: 1,
-        frame_type: FRAME_INTER,
-        allow_screen_content_tools: 1,
-        ..FrameParams::default()
-    };
-    let vid = Video {
-        fp: vfp,
-        inter: &[],
-        reference: None,
-        golden: None,
-        padded: None,
-    };
-    let r = hy.closed_loop_ex(&pic.y, &u, &v, 64, 64, &blocks, None, 0, 90, 0, 0, Some(&vid), None);
-    assert!(r.is_err_and(|e| e.msg.contains("4:4:4")));
+}
+
+/// An IVF file of frames' OBUs.
+fn ivf_n(obus: &[Vec<u8>], w: usize, h: usize) -> Vec<u8> {
+    let mut v = ivf1(&[], w, h)[..32].to_vec();
+    v[24..28].copy_from_slice(&(obus.len() as u32).to_le_bytes());
+    for (k, obu) in obus.iter().enumerate() {
+        v.extend_from_slice(&(obu.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(k as u64).to_le_bytes());
+        v.extend_from_slice(obu);
+    }
+    v
+}
+
+/// 4:4:4 inter frames from the closed loop: a key frame, then inter frames with copies
+/// (unchanged, and shifted by odd amounts, which 4:4:4 copies exactly:
+/// [`crate::motion::Motion::set_chroma_444`]), copies of an older picture (GOLDEN_FRAME), coded
+/// inter blocks with sub-sample motion and a residual, and intra blocks (CfL, palettes); 64x64 and
+/// 128x128 superblocks, one tile and several. Copies hold their reference's samples in every
+/// plane; each frame parses back to its record; our decoder (and dav1d and aomdec, where
+/// installed) decode every frame to the closed loop's reconstruction; one thread codes what all do.
+#[test]
+fn chroma444_inter_frames() {
+    use crate::motion::{Motion, Plane};
+    use crate::writer::{ParseState, parse_with, tile_layout_ex};
+    let tools: Vec<(&str, Vec<&str>)> = vec![
+        ("dav1d", vec!["-q", "-i", "IN", "-o", "OUT"]),
+        ("aomdec", vec!["--rawvideo", "-o", "OUT", "IN"]),
+    ];
+    let (mut decoded, mut odd_copies, mut golden_copies, mut coded_inter, mut cfl, mut pal) = (0, 0, 0, 0, 0, 0);
+    for (seed, (w, h), sb128, (cl, rl)) in [
+        (1u64, (600usize, 400usize), false, (0, 0)),
+        (2, (600, 400), true, (1, 0)),
+        (3, (333, 517), false, (1, 1)),
+        (4, (77, 45), false, (0, 0)),
+    ] {
+        let what = format!("seed {seed} {w}x{h}{}", if sb128 { " sb128" } else { "" });
+        let mut rng = Rng(seed * 31 + 7);
+        // the pictures, each plane w x h
+        let base = screen_pic(w, h, seed, false);
+        let (u0, v0) = to_444(&base);
+        let f0 = [base.y.clone(), u0, v0];
+        let other = screen_pic(w, h, seed + 100, true);
+        let (ou, ov) = to_444(&other);
+        let other = [other.y.clone(), ou, ov];
+        // 1: below row 128 scrolled up 13 rows (new rows at the bottom), and a new rectangle above
+        // 2: below row 128 back to 0's (GOLDEN_FRAME's), and another new rectangle above
+        let mut f1 = f0.clone();
+        let mut f2 = f0.clone();
+        for p in 0..3 {
+            for y in 128.min(h)..h {
+                for x in 0..w {
+                    f1[p][y * w + x] = if y + 13 < h {
+                        f0[p][(y + 13) * w + x]
+                    } else {
+                        rng.below(256) as u8
+                    };
+                }
+            }
+            for y in 8..(120.min(h)) {
+                for x in w / 4..(w * 3 / 4) {
+                    f1[p][y * w + x] = other[p][y * w + x];
+                    f2[p][y * w + x] = other[p][((y + 40) % h) * w + (x + 17) % w];
+                }
+            }
+        }
+        let frames = [f0, f1, f2];
+        fn planes(f: &[Vec<u8>; 3], w: usize, h: usize) -> [Plane<'_>; 3] {
+            core::array::from_fn(|p| Plane {
+                data: &f[p],
+                stride: w,
+                width: w,
+                height: h,
+            })
+        }
+        fn rp(r: &[Vec<u8>], rw: [u32; 3]) -> RefPicture<'_> {
+            RefPicture {
+                plane: [&r[0], &r[1], &r[2]],
+                stride: rw.map(|x| x as usize),
+                cdfs: None,
+            }
+        }
+        let (mc, mr) = (mi_cols(w as i32), mi_rows(h as i32));
+        let sb_cols = w.div_ceil(64);
+        let tiles = if sb128 {
+            tile_layout(w as u32, h as u32, 0, 0).unwrap()
+        } else {
+            tile_layout(w as u32, h as u32, cl, rl).unwrap()
+        };
+        let tiles128 = sb128.then(|| tile_layout_ex(w as u32, h as u32, cl, rl, true).unwrap());
+        let run = |threads: usize, count: bool, stats: &mut [usize; 6]| -> Vec<Vec<u8>> {
+            let mut rng = Rng(seed * 101 + 3);
+            let mut m = Motion::new();
+            m.set_chroma_444(true);
+            let mut hy = Hybrid::new();
+            hy.threads = threads;
+            hy.set_chroma_444(true);
+            hy.set_palette(true);
+            let mut ps = ParseState::default();
+            let mut recons: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut rws = Vec::new();
+            let mut obus = Vec::new();
+            for (k, f) in frames.iter().enumerate() {
+                let pic = Pic {
+                    w,
+                    h,
+                    y: f[0].clone(),
+                    u: vec![128; w.div_ceil(2) * h.div_ceil(2)],
+                    v: vec![128; w.div_ceil(2) * h.div_ceil(2)],
+                };
+                let blocks = partition(&pic, &tiles, &mut rng, Style::Variance, true);
+                let mut fp = FrameParams {
+                    video: 1,
+                    sb128: sb128 as u8,
+                    ..Default::default()
+                };
+                let (mut blocks, mut inter) = (blocks, Vec::new());
+                let mut sbs = Vec::new();
+                if k > 0 {
+                    let (cur, prev, gold) = (planes(f, w, h), planes(&frames[k - 1], w, h), planes(&frames[0], w, h));
+                    m.classify_ex(&cur, &prev, (k == 2).then_some(&gold), 3, 4);
+                    sbs = m.sbs.clone();
+                    m.apply_ex(&sbs, sb_cols, &blocks, None, None, mr, mc, tiles128.as_ref())
+                        .unwrap();
+                    (blocks, inter) = (m.blocks.clone(), m.inter.clone());
+                    // coded inter blocks: every 4th intra block of 8x8 and up predicts from
+                    // LAST_FRAME at a quarter-sample motion vector, with a residual
+                    for (i, (b, bi)) in blocks.iter_mut().zip(inter.iter_mut()).enumerate() {
+                        let bs = b.bsize as i32;
+                        if bi.is_inter == 0
+                            && i % 4 == 1
+                            && bw4(bs) >= 2
+                            && bh4(bs) >= 2
+                            && bw4(bs) <= 16
+                            && bh4(bs) <= 16
+                        {
+                            *b = Block {
+                                mi_row: b.mi_row,
+                                mi_col: b.mi_col,
+                                bsize: b.bsize,
+                                ..Block::default()
+                            };
+                            (bi.is_inter, bi.mv_row, bi.mv_col) =
+                                (1, -26 + 2 * (i % 5) as i16, 14 - 4 * (i % 3) as i16);
+                        }
+                    }
+                    (
+                        fp.frame_type,
+                        fp.refresh_frame_flags,
+                        fp.mv_precision,
+                        fp.allow_screen_content_tools,
+                    ) = (FRAME_INTER, 1, 1, 1);
+                    fp.golden_slot = if k == 2 { 2 } else { 0 };
+                } else if let Some(t) = tiles128.as_ref() {
+                    m.apply_ex(&[], 0, &blocks, None, None, mr, mc, Some(t)).unwrap();
+                    blocks = m.blocks.clone();
+                }
+                let video = Video {
+                    fp,
+                    inter: &inter,
+                    reference: (k > 0).then(|| rp(&recons[k - 1], rws[k - 1])),
+                    golden: (k == 2).then(|| rp(&recons[0], rws[0])),
+                    padded: None,
+                };
+                hy.closed_loop_ex(
+                    &f[0],
+                    &f[1],
+                    &f[2],
+                    w as u32,
+                    h as u32,
+                    &blocks,
+                    None,
+                    0,
+                    90,
+                    cl,
+                    rl,
+                    Some(&video),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{what} frame {k}: {e}"));
+                let rec = hy.record().clone();
+                assert_eq!(rec.fp.chroma_format, CHROMA_444, "{what} frame {k}");
+                let rw = hy.output().recon_w;
+                let recon: Vec<Vec<u8>> = (0..3).map(|p| hy.recon(p).unwrap().to_vec()).collect();
+                // copies are their reference's samples, every plane full size
+                for (s, sm) in sbs.iter().enumerate().filter(|(_, sm)| sm.copy) {
+                    let (from, frw) = if sm.golden {
+                        (&recons[0], rws[0])
+                    } else {
+                        (&recons[k - 1], rws[k - 1])
+                    };
+                    let (sx, sy) = (s % sb_cols, s / sb_cols);
+                    for p in 0..3 {
+                        for y in sy * 64..((sy + 1) * 64).min(h) {
+                            for x in sx * 64..((sx + 1) * 64).min(w) {
+                                let (qx, qy) = ((x as i32 + sm.shift.dx) as usize, (y as i32 + sm.shift.dy) as usize);
+                                assert_eq!(
+                                    recon[p][y * rw[p] as usize + x],
+                                    from[p][qy * frw[p] as usize + qx],
+                                    "{what} frame {k}: 64x64 {s} plane {p} ({x}, {y})"
+                                );
+                            }
+                        }
+                    }
+                    if count {
+                        stats[0] += (sm.shift.dy & 1 != 0 || sm.shift.dx & 1 != 0) as usize;
+                        stats[1] += sm.golden as usize;
+                    }
+                }
+                if count {
+                    for (i, b) in rec.blocks.iter().enumerate() {
+                        let inter_b = rec.inter.get(i).is_some_and(|x| x.is_inter != 0);
+                        let coded = (rec.block_txb[i]..rec.block_txb[i + 1]).any(|t| rec.txb[t as usize].eob > 0);
+                        stats[2] += (k > 0 && inter_b && coded) as usize;
+                        stats[3] += (k > 0 && !inter_b && b.uv_mode as i32 == UV_CFL_PRED) as usize;
+                        stats[4] +=
+                            (k > 0 && rec.palette.get(i).is_some_and(|p| p.size_y != 0 || p.size_uv != 0)) as usize;
+                    }
+                }
+                let mut wfp = rec.fp;
+                (wfp.loop_filter_level, wfp.enable_cdef) = ([0; 4], 0);
+                let obu = hy.write(&wfp, None, sb_cols).unwrap().to_vec();
+                let p = parse_with(&obu, Some(&mut ps)).unwrap_or_else(|e| panic!("{what} frame {k}: parse: {e}"));
+                assert_eq!(p.rec.fp.chroma_format, CHROMA_444);
+                assert_eq!(p.rec.blocks.len(), hy.record().blocks.len(), "{what} frame {k}");
+                assert_eq!(p.rec.inter, hy.record().inter, "{what} frame {k}");
+                obus.push(obu);
+                recons.push(recon);
+                rws.push(rw);
+            }
+            // our decoder, then dav1d and aomdec: every frame the closed loop's reconstruction
+            let mut want = Vec::new();
+            let mut d = crate::decoder::Decoder::new(2);
+            for (k, obu) in obus.iter().enumerate() {
+                let pic = d
+                    .decode(obu)
+                    .unwrap_or_else(|e| panic!("{what} frame {k}: our decoder: {e}"));
+                for p in 0..3 {
+                    for y in 0..h {
+                        let row = &recons[k][p][y * rws[k][p] as usize..][..w];
+                        assert!(
+                            &pic.planes[p][y * pic.stride[p]..][..w] == row,
+                            "{what} frame {k}: our decoder differs in plane {p} row {y}"
+                        );
+                        want.extend_from_slice(row);
+                    }
+                }
+            }
+            if count {
+                let dir = std::env::temp_dir().join(format!("glassact-444i-{}-{seed}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let inp = dir.join("s.ivf");
+                std::fs::write(&inp, ivf_n(&obus, w, h)).unwrap();
+                for (tool, args) in &tools {
+                    let path = format!("/opt/homebrew/bin/{tool}");
+                    if !std::path::Path::new(&path).exists() {
+                        continue;
+                    }
+                    let out = dir.join(format!("{tool}.yuv"));
+                    let args: Vec<String> = args
+                        .iter()
+                        .map(|a| match *a {
+                            "IN" => inp.display().to_string(),
+                            "OUT" => out.display().to_string(),
+                            a => a.to_string(),
+                        })
+                        .collect();
+                    let st = std::process::Command::new(&path).args(&args).output().unwrap();
+                    assert!(
+                        st.status.success(),
+                        "{what}: {tool}: {}",
+                        String::from_utf8_lossy(&st.stderr)
+                    );
+                    let got = std::fs::read(&out).unwrap();
+                    assert_eq!(got.len(), want.len(), "{what}: {tool} output size");
+                    if got != want {
+                        let i = (0..got.len()).find(|&i| got[i] != want[i]).unwrap();
+                        panic!(
+                            "{what}: {tool} differs first in frame {} plane {}",
+                            i / (3 * w * h),
+                            (i / (w * h)) % 3
+                        );
+                    }
+                    stats[5] += obus.len();
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            obus
+        };
+        let mut stats = [0usize; 6];
+        let all = run(Hybrid::new().threads, true, &mut stats);
+        let one = run(1, false, &mut [0; 6]);
+        assert!(one == all, "{what}: threads");
+        eprintln!(
+            "{what}: {} bytes; odd copies {}, GOLDEN copies {}, coded inter blocks {}, CfL {}, palettes {} (inter frames)",
+            all.iter().map(|o| o.len()).sum::<usize>(),
+            stats[0],
+            stats[1],
+            stats[2],
+            stats[3],
+            stats[4]
+        );
+        odd_copies += stats[0];
+        golden_copies += stats[1];
+        coded_inter += stats[2];
+        cfl += stats[3];
+        pal += stats[4];
+        decoded += stats[5];
+    }
+    eprintln!("{decoded} frames decoded exactly by the installed decoders");
+    assert!(odd_copies > 10 && golden_copies > 10 && coded_inter > 20 && cfl > 0 && pal > 0);
 }
 
 /// The C API's 4:4:4 (av1enc_hybrid_set_chroma_444): full-size chroma planes read, the record

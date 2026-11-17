@@ -36,11 +36,27 @@ pub struct Plane<'a> {
 /// displaced area must lie inside `prev` (no edge extension). Chroma shifts are half the luma ones,
 /// so an odd luma shift can't be an exact chroma copy and doesn't match.
 pub fn sb_matches(cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, sb_x: usize, sb_y: usize, shift: Shift) -> bool {
-    if planes == 3 && (shift.dx & 1 != 0 || shift.dy & 1 != 0) {
+    sb_matches_ss(cur, prev, planes, 1, sb_x, sb_y, shift)
+}
+
+/// [`sb_matches`] with the chroma subsampling `ss`: 1 (4:2:0, as there) or 0 (4:4:4: chroma 64 x 64
+/// at the luma shift, odd ones too: a 4:4:4 inter block's chroma predicts at its luma motion
+/// vector, so a whole-sample one is an exact copy in every plane).
+pub fn sb_matches_ss(
+    cur: &[Plane; 3],
+    prev: &[Plane; 3],
+    planes: usize,
+    ss: usize,
+    sb_x: usize,
+    sb_y: usize,
+    shift: Shift,
+) -> bool {
+    if planes == 3 && ss != 0 && (shift.dx & 1 != 0 || shift.dy & 1 != 0) {
         return false;
     }
     for p in 0..planes {
-        let (side, sub) = if p == 0 { (64, 0) } else { (32, 1) };
+        let sub = if p == 0 { 0 } else { ss };
+        let side = 64 >> sub;
         let (c, q) = (&cur[p], &prev[p]);
         let x0 = sb_x * side;
         let y0 = sb_y * side;
@@ -368,6 +384,9 @@ pub struct Motion {
     threads: usize,
     /// [`Motion::apply_ex`]'s per-64x64 runs of input blocks
     runs: Vec<(u32, u32)>,
+    /// the pictures' chroma subsampling: 1 (4:2:0, the default) or 0 (4:4:4:
+    /// [`Motion::set_chroma_444`])
+    ss: usize,
 }
 
 impl Default for Motion {
@@ -389,7 +408,20 @@ impl Motion {
             candidates: Vec::new(),
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
             runs: Vec::new(),
+            ss: 1,
         }
+    }
+
+    /// av1enc_motion_set_chroma_444: the pictures [`Motion::classify`] and the rest compare are
+    /// 4:4:4 (their chroma planes the luma's size, copied at the luma shift, odd ones too) or 4:2:0
+    /// (off, the default).
+    pub fn set_chroma_444(&mut self, on: bool) {
+        self.ss = (!on) as usize;
+    }
+
+    /// Whether the pictures are 4:4:4 ([`Motion::set_chroma_444`]).
+    pub fn chroma_444(&self) -> bool {
+        self.ss == 0
     }
 
     /// Per 64x64 of `cur`: whether it equals `prev` ([`sb_matches`]) unchanged, or else at a
@@ -479,20 +511,26 @@ impl Motion {
 
     /// The copies of `golden` among the 64x64s that aren't copies yet; returns how many.
     fn classify_golden(&mut self, cur: &[Plane; 3], g: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
-        let sb_cols = self.sb_cols;
+        let (sb_cols, ss) = (self.sb_cols, self.ss);
         let rows_per = self.sb_rows.div_ceil(self.threads.max(1)).max(1);
         let mut parts: Vec<_> = self.sbs.chunks_mut(rows_per * sb_cols).enumerate().collect();
         crate::pool::each(&mut parts, |(k, part)| {
             for (i, m) in part.iter_mut().enumerate() {
                 let s = *k * rows_per * sb_cols + i;
-                if !m.copy && sb_matches(cur, g, planes, s % sb_cols, s / sb_cols, Shift::default()) {
-                    *m = SbMotion { copy: true, shift: Shift::default(), golden: true };
+                if !m.copy && sb_matches_ss(cur, g, planes, ss, s % sb_cols, s / sb_cols, Shift::default()) {
+                    *m = SbMotion {
+                        copy: true,
+                        shift: Shift::default(),
+                        golden: true,
+                    };
                 }
             }
         });
         let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
         let usable = |s: &Shift| {
-            s.dx.abs() <= MAX_SHIFT && s.dy.abs() <= MAX_SHIFT && (planes == 1 || (s.dx & 1 == 0 && s.dy & 1 == 0))
+            s.dx.abs() <= MAX_SHIFT
+                && s.dy.abs() <= MAX_SHIFT
+                && (planes == 1 || ss == 0 || (s.dx & 1 == 0 && s.dy & 1 == 0))
         };
         let cands: Vec<Shift> = if changed.contains(&1) && max_candidates > 0 {
             self.finder
@@ -515,15 +553,20 @@ impl Motion {
                 .into_iter()
                 .chain(left)
                 .chain(cands.iter().copied())
-                .find(|&d| sb_matches(cur, g, planes, x, y, d));
+                .find(|&d| sb_matches_ss(cur, g, planes, ss, x, y, d));
             if let Some(d) = found {
-                self.sbs[s] = SbMotion { copy: true, shift: d, golden: true };
+                self.sbs[s] = SbMotion {
+                    copy: true,
+                    shift: d,
+                    golden: true,
+                };
             }
         }
         self.sbs.iter().filter(|m| m.copy && m.golden).count()
     }
 
     fn classify_last(&mut self, cur: &[Plane; 3], prev: &[Plane; 3], planes: usize, max_candidates: usize) -> usize {
+        let ss = self.ss;
         let (sb_cols, sb_rows) = (cur[0].width.div_ceil(64), cur[0].height.div_ceil(64));
         (self.sb_cols, self.sb_rows) = (sb_cols, sb_rows);
         self.sbs.clear();
@@ -539,7 +582,7 @@ impl Motion {
         crate::pool::each(&mut parts, |(k, part)| {
             for (i, m) in part.iter_mut().enumerate() {
                 let s = *k * rows_per * sb_cols + i;
-                m.copy = sb_matches(cur, prev, planes, s % sb_cols, s / sb_cols, Shift::default());
+                m.copy = sb_matches_ss(cur, prev, planes, ss, s % sb_cols, s / sb_cols, Shift::default());
             }
         });
         let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
@@ -547,7 +590,9 @@ impl Motion {
             return self.sbs.len();
         }
         let usable = |s: &Shift| {
-            s.dx.abs() <= MAX_SHIFT && s.dy.abs() <= MAX_SHIFT && (planes == 1 || (s.dx & 1 == 0 && s.dy & 1 == 0))
+            s.dx.abs() <= MAX_SHIFT
+                && s.dy.abs() <= MAX_SHIFT
+                && (planes == 1 || ss == 0 || (s.dx & 1 == 0 && s.dy & 1 == 0))
         };
         let cands: Vec<Shift> = self
             .finder
@@ -568,9 +613,13 @@ impl Motion {
                 .into_iter()
                 .chain(left)
                 .chain(cands.iter().copied())
-                .find(|&d| sb_matches(cur, prev, planes, x, y, d));
+                .find(|&d| sb_matches_ss(cur, prev, planes, ss, x, y, d));
             if let Some(d) = found {
-                self.sbs[s] = SbMotion { copy: true, shift: d, golden: false };
+                self.sbs[s] = SbMotion {
+                    copy: true,
+                    shift: d,
+                    golden: false,
+                };
             }
         }
         self.sbs.iter().filter(|m| m.copy).count()

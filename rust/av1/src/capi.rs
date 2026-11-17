@@ -1498,16 +1498,17 @@ pub unsafe extern "C" fn av1enc_motion_destroy(m: *mut crate::motion::Motion) {
     }
 }
 
-/// `planes` planes (Y w x h, chroma half, rounded up) at their strides.
+/// `planes` planes (Y w x h, chroma half, rounded up, or with `c444` w x h too) at their strides.
 unsafe fn motion_planes<'a>(
     p: *const *const u8,
     s: *const c_int,
     width: c_int,
     height: c_int,
     planes: c_int,
+    c444: bool,
 ) -> [crate::motion::Plane<'a>; 3] {
     let mk = |i: usize| {
-        let (w, h) = if i == 0 {
+        let (w, h) = if i == 0 || c444 {
             (width as usize, height as usize)
         } else {
             ((width as usize).div_ceil(2), (height as usize).div_ceil(2))
@@ -1525,6 +1526,16 @@ unsafe fn motion_planes<'a>(
     };
     let three = planes == 3;
     [mk(0), mk(if three { 1 } else { 0 }), mk(if three { 2 } else { 0 })]
+}
+
+/// av1enc_motion_set_chroma_444: [`crate::motion::Motion::set_chroma_444`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_set_chroma_444(m: *mut crate::motion::Motion, on: c_int) {
+    if m.is_null() {
+        return;
+    }
+    // SAFETY: the handle
+    unsafe { (*m).set_chroma_444(on != 0) };
 }
 
 #[unsafe(no_mangle)]
@@ -1579,13 +1590,15 @@ pub unsafe extern "C" fn av1enc_motion_classify_ex(
     }
     // SAFETY: the handle; the pictures' planes (golden's when given); out holds 3 ints per 64x64
     // (av1enc.h)
-    let (c, q) = unsafe {
+    let (c, q, c444) = unsafe {
+        let c444 = (*m).chroma_444();
         (
-            motion_planes(cur, cur_stride, width, height, planes),
-            motion_planes(prev, prev_stride, width, height, planes),
+            motion_planes(cur, cur_stride, width, height, planes, c444),
+            motion_planes(prev, prev_stride, width, height, planes, c444),
+            c444,
         )
     };
-    let g = (!golden.is_null()).then(|| unsafe { motion_planes(golden, golden_stride, width, height, planes) });
+    let g = (!golden.is_null()).then(|| unsafe { motion_planes(golden, golden_stride, width, height, planes, c444) });
     let m = unsafe { &mut *m };
     let n = m.classify_ex(&c, &q, g.as_ref(), planes as usize, max_candidates.max(0) as usize);
     if !out.is_null() {
@@ -1623,15 +1636,26 @@ pub unsafe extern "C" fn av1enc_motion_classify_multi(
     }
     // SAFETY: the handle; the pictures' planes (count goldens', 3 pointers and 3 strides each, in
     // order); out holds 3 ints per 64x64 (av1enc.h)
-    let (c, q) = unsafe {
+    let (c, q, c444) = unsafe {
+        let c444 = (*m).chroma_444();
         (
-            motion_planes(cur, cur_stride, width, height, planes),
-            motion_planes(prev, prev_stride, width, height, planes),
+            motion_planes(cur, cur_stride, width, height, planes, c444),
+            motion_planes(prev, prev_stride, width, height, planes, c444),
+            c444,
         )
     };
     let g: Vec<[crate::motion::Plane; 3]> = (0..count as usize)
         // SAFETY: as above, golden k's 3 pointers and strides
-        .map(|k| unsafe { motion_planes(goldens.add(3 * k), golden_strides.add(3 * k), width, height, planes) })
+        .map(|k| unsafe {
+            motion_planes(
+                goldens.add(3 * k),
+                golden_strides.add(3 * k),
+                width,
+                height,
+                planes,
+                c444,
+            )
+        })
         .collect();
     // SAFETY: the handle
     let m = unsafe { &mut *m };
