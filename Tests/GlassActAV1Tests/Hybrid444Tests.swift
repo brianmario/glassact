@@ -113,6 +113,9 @@ struct Hybrid444Tests {
         }
         if intraBlockCopy && width >= 1280 { #expect(copied == pictures.count, "\(label): \(copied) pictures copied") }
         if !intraBlockCopy { #expect(copied == 0, "\(label)") }
+        // (4:4:4 pictures code palettes, luma and chroma, by default: these decoded with them)
+        let stats = encoder.paletteStats
+        if width >= 333 { #expect(stats.count > 11 && stats[3] > 0 && stats[11] > 0, "\(label): palettes \(stats)") }
     }
 
     /// A stream with inter frames refuses a 4:4:4 picture (its inter frames would be 4:2:0's), with

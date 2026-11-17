@@ -376,7 +376,8 @@ fn same_palettes(a: &Record, a0: usize, b: &Record, b0: usize, n: usize) -> bool
         let ss = (a.fp.chroma_format == CHROMA_420) as i32;
         let (mc, mr) = (mi_cols(a.fp.width as i32), mi_rows(a.fp.height as i32));
         let uv = crate::writer::map_dims(bs, blk.mi_row as i32, blk.mi_col as i32, mr, mc, true, ss);
-        let len = (pa.size_y != 0) as usize * (bw4(bs) * bh4(bs) * 16) as usize + (pa.size_uv != 0) as usize * uv.w * uv.h;
+        let len =
+            (pa.size_y != 0) as usize * (bw4(bs) * bh4(bs) * 16) as usize + (pa.size_uv != 0) as usize * uv.w * uv.h;
         let (ma, mb) = (pa.map_off as usize, pb.map_off as usize);
         match (a.palette_map.get(ma..ma + len), b.palette_map.get(mb..mb + len)) {
             (Some(x), Some(y)) => x == y,

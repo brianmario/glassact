@@ -34,6 +34,18 @@ const NONE: u32 = u32::MAX;
 /// (photographic content).
 const GATE_COVER: u32 = 50;
 
+/// 4:4:4 screen content: a block at least `SCREEN_COVER` % of whose samples (or (U, V) pairs) are
+/// exactly its gate's 8 values keeps its decided luma (chroma) only where that costs under
+/// 1 / `SCREEN_BIAS_Y` (`_UV`) of the best palette's J. The decided side is priced open loop, its
+/// prediction from the source's edges and its residual by the trials' rate proxy, both optimistic
+/// against a palette, which needs no edges and whose side bits are exact. Measured on the 4:4:4
+/// tile corpora (BENCHMARKS "the hybrid's 4:4:4 tiles against libaom's"): at equal SSIMULACRA2,
+/// 1.4 / 1.6 take typing from +11 % to −1 % of libaom's bytes and UI 3–4 points lower; applied
+/// to every block they cost photos 3.5 points (palettes on smooth content), which the gate avoids.
+const SCREEN_COVER: f64 = 80.0;
+const SCREEN_BIAS_Y: f64 = 1.4;
+const SCREEN_BIAS_UV: f64 = 1.6;
+
 /// The bits of the symbols the decision prices, from the default CDFs.
 pub(crate) struct PalCosts {
     kf_y: [[[f32; 13]; 5]; 5],
@@ -377,6 +389,8 @@ pub(crate) struct Hist {
     count: [u32; 256],
     vals: [u8; 256],
     n: usize,
+    /// the samples that are exactly the gate's 8 values
+    exact8: u32,
 }
 
 /// k-means of the block's values into at most `k` colours (strictly increasing into `out`);
@@ -480,6 +494,7 @@ fn gate(s: &[u8], ss: usize, w: usize, h: usize) -> Option<Hist> {
         count: [0; 256],
         vals: [0; 256],
         n: 0,
+        exact8: 0,
     };
     for i in 0..h {
         for &v in &s[i * ss..][..w] {
@@ -508,6 +523,7 @@ fn gate(s: &[u8], ss: usize, w: usize, h: usize) -> Option<Hist> {
         }
         let Some((_, v)) = best else { break };
         let v = v as usize;
+        g.exact8 += g.count[v];
         for t in v.saturating_sub(2)..=(v + 2).min(255) {
             if !taken[t] {
                 taken[t] = true;
@@ -770,6 +786,11 @@ fn decide_block(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: 
         );
     }
     let j_intra = cx.hook.intra_luma_j(&mut sc.q, tx_sz, &sc.pred, w, s, ss, qs.0, qs.1) + lambda * intra_bits as f64;
+    let j_intra = if cx.ss == 0 && g.exact8 as f64 * 100.0 >= SCREEN_COVER * (w * h) as f64 {
+        j_intra * SCREEN_BIAS_Y
+    } else {
+        j_intra
+    };
 
     // ---- as palettes ----
     let mut fixed = mode_bits(cx, u, &nb, bs, chroma, DC_PRED, 0, b.uv_mode) + costs.has_y[bctx][pctx][1];
@@ -1131,6 +1152,13 @@ fn decide_uv(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: u32
         );
     }
 
+    let exact8: u32 = (0..m)
+        .filter(|&i| top.contains(&sc.pairs[i]))
+        .map(|i| sc.pair_n[i])
+        .sum();
+    if exact8 as f64 * 100.0 >= SCREEN_COVER * (w * h) as f64 {
+        j_cur *= SCREEN_BIAS_UV;
+    }
     // ---- as palettes ----
     let bctx = (Mi_Width_Log2[bs as usize] + Mi_Height_Log2[bs as usize] - 2) as usize;
     let fixed = uv_bits(DC_PRED as usize) + costs.has_uv[ctx][1];
