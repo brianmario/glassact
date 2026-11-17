@@ -140,7 +140,7 @@ the numbers and the reasoning.
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
 | The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
-| Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 2.6, dav1d 1.1), photos 3.3 (5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
+| Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
 | Route codecs by cheap signals (LZ4 size) | rejected | gating VP8L at LZ4 ≤ 12 KB costs +18.6 % bytes | [entry](#codec-routing-measurement-glassact-bench-routescan-2026-08-05) |
@@ -369,18 +369,19 @@ tile walk) in `hostile_input_long`. Frames are at most 8192 a side. Anything out
 toolset is refused.
 
 **Speed** (`examples/own_decode.rs`; aomdec and dav1d per frame as whole-stream runs less a
-first-frame-only run; M4 Pro, 8 threads, load average 8–13, so provisional):
+first-frame-only run; aomdec writing raw frames to /dev/null, as the first measurement ran it, with
+`--noblit` (no output) in brackets for typing and photos; M4 Pro, 8 threads, load average 8–13, so
+provisional):
 
 | Stream | ours: key; inter median / max | parse + writer (the first measurement's) | aomdec, 8 threads / 1 | dav1d, 8 threads (frame delay 1) |
 |---|---|---|---|---|
-| typing-cc | 15.7 ms; 0.83 / 3.7 | 77; 15.9 | 2.61 / 5.73 ms a frame | 1.10 (0.86) |
+| typing-cc | 15.7 ms; 0.83 / 3.7 | 77; 15.9 | 2.61 (1.83) / 5.73 ms a frame | 1.10 (0.86) |
 | tabs | 16.6; 0.82 / 3.7 | 76; 16.1 | 2.63 / 5.81 | 1.06 (0.86) |
 | app switching | 11.1; 0.81 / 4.3 | 43; 16.0 | 2.69 / 5.84 | 1.16 (0.94) |
-| photos | 42.5; 3.26 / 33.6 | 221; 22.6 | 5.09 / 18.5 | 2.13 (2.32) |
+| photos | 42.5; 3.26 / 33.6 | 221; 22.6 | 5.09 (4.2) / 18.5 | 2.13 (2.32) |
 
-On one thread: typing 85 ms key, 4.3 ms inter; photos 228 / 17.4. So copy-heavy inter frames are a
-third of libaom's 8-thread time and level with dav1d's; photos are two thirds of libaom's and 1.5×
-dav1d's. Where a copy-heavy inter frame's 0.8 ms goes: the tile walks 0.48 (parsing 3,600 64x64s and
+On one thread: typing 85 ms key, 4.3 ms inter; photos 228 / 17.4. So copy-heavy inter frames take under half of libaom's 8-thread time (a third
+counting its output) and are level with dav1d's; photos about four fifths of libaom's, 1.5× dav1d's. Where a copy-heavy inter frame's 0.8 ms goes: the tile walks 0.48 (parsing 3,600 64x64s and
 clearing the tiles' maps), the frame's maps and each 64x64's kind 0.44, filters and copies 0.16.
 A warm decoder allocates ~17 times (1.3 KB) a frame: the pool's job per stage and each stage's
 queue lock (`tests/decoder_alloc.rs`).
