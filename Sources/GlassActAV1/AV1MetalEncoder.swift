@@ -1523,7 +1523,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             var gated = !splits
             func open() throws -> any MTLComputeCommandEncoder {
                 if let compute { return compute }
-                guard let c = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
+                guard var c = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
                 // the earlier pictures' results this one's overwrite are read (`waitsForRead`)
                 if waitsForRead > 0 { c.encodeWaitForEvent(encoder.readEvent, value: waitsForRead) }
                 // and whatever the caller orders it behind (`beginPartition(after:)`)
@@ -1537,6 +1537,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     guard let blit = c.makeBlitCommandEncoder() else { throw Failure.metal("no blit encoder") }
                     for (b, length) in clears where length > 0 { blit.fill(buffer: b, range: 0..<length, value: 0) }
                     blit.endEncoding()
+                    if profiling {  // (on its own, so that no stage's time holds it)
+                        c.commit()
+                        c.waitUntilCompleted()
+                        guard let next = encoder.queue.makeCommandBuffer() else { throw Failure.metal("no command buffer") }
+                        c = next
+                    }
                 }
                 guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
