@@ -167,7 +167,10 @@ impl Default for ShiftFinder {
 struct BandScratch {
     now: Vec<u64>,
     before: Vec<u64>,
+    #[cfg(test)]
     index: Vec<(u64, u32)>,
+    /// [`BandScratch::vote`]'s table of `before`'s lines: (hash, first line, count; 0: empty)
+    table: Vec<(u64, u32, u32)>,
     votes: Vec<(i32, u32)>,
     col_hash: Vec<u32>,
 }
@@ -254,8 +257,62 @@ impl BandScratch {
     }
 
     /// Offsets d (now[i] == before[i + d], d != 0) supported by at least 8 lines, each with its
-    /// count. Lines that repeat (blank rows) don't vote.
+    /// count. Lines that repeat (blank rows) don't vote. `before`'s lines go into an
+    /// open-addressing table (key, first line, count), so each changed line finds whether its hash
+    /// is in `before` exactly once with one probe sequence: the same votes in the same order as
+    /// [`BandScratch::vote_sorted`]'s sort and binary searches, which were most of the copy
+    /// finder's time on a new picture.
     fn vote(&mut self) -> Vec<(i32, u32)> {
+        let (now, before) = (&self.now, &self.before);
+        let bits = (2 * before.len()).max(16).next_power_of_two().trailing_zeros();
+        let mask = (1usize << bits) - 1;
+        let slot = |k: u64| (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - bits)) as usize;
+        self.table.clear();
+        self.table.resize(mask + 1, (0, 0, 0));
+        for (i, &k) in before.iter().enumerate() {
+            let mut s = slot(k);
+            loop {
+                let e = &mut self.table[s];
+                if e.2 == 0 {
+                    *e = (k, i as u32, 1);
+                    break;
+                }
+                if e.0 == k {
+                    e.2 += 1;
+                    break;
+                }
+                s = (s + 1) & mask;
+            }
+        }
+        self.votes.clear();
+        for (i, &k) in now.iter().enumerate() {
+            if before[i] == k {
+                continue; // unchanged line
+            }
+            let mut s = slot(k);
+            let at = loop {
+                let e = self.table[s];
+                if e.2 == 0 {
+                    break None; // absent
+                }
+                if e.0 == k {
+                    break (e.2 == 1).then_some(e.1); // (not distinctive)
+                }
+                s = (s + 1) & mask;
+            };
+            let Some(at) = at else { continue };
+            let d = at as i32 - i as i32;
+            match self.votes.iter_mut().find(|(s, _)| *s == d) {
+                Some((_, c)) => *c += 1,
+                None => self.votes.push((d, 1)),
+            }
+        }
+        self.votes.iter().copied().filter(|&(d, c)| d != 0 && c >= 8).collect()
+    }
+
+    /// [`BandScratch::vote`] by a sort of `before` and binary searches: the reference.
+    #[cfg(test)]
+    fn vote_sorted(&mut self) -> Vec<(i32, u32)> {
         let (now, before) = (&self.now, &self.before);
         self.index.clear();
         self.index
@@ -760,6 +817,41 @@ mod tests {
         *s ^= *s >> 7;
         *s ^= *s << 17;
         *s
+    }
+
+    /// The table's vote equals the sorted one: lines shifted by several offsets, repeated lines
+    /// (blank rows), lines that collide in the table, unchanged lines and new ones.
+    #[test]
+    fn vote_matches_the_sorted_vote() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut t = BandScratch::default();
+        for case in 0..400 {
+            let n = 16 + (rng(&mut s) % 3000) as usize;
+            // few distinct values in some cases: many repeats and table collisions
+            let distinct = if case % 4 == 0 { 1 + rng(&mut s) % 40 } else { u64::MAX };
+            let line = |s: &mut u64| {
+                let v = rng(s);
+                if distinct == u64::MAX { v } else { (v % distinct).wrapping_mul(0x1_0000_0001) }
+            };
+            t.before.clear();
+            t.before.extend((0..n).map(|_| line(&mut s)));
+            t.now.clear();
+            let shifts = [0i64, 3, -5, 17, -40, 200];
+            for i in 0..n {
+                let d = shifts[(rng(&mut s) % 6) as usize];
+                let j = i as i64 + d;
+                let v = match rng(&mut s) % 5 {
+                    0 => line(&mut s),
+                    1 => t.before[i],
+                    _ if (0..n as i64).contains(&j) => t.before[j as usize],
+                    _ => line(&mut s),
+                };
+                t.now.push(v);
+            }
+            let a = t.vote();
+            let b = t.vote_sorted();
+            assert_eq!(a, b, "case {case}");
+        }
     }
 
     #[test]
