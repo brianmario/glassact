@@ -465,22 +465,53 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// the entries that do; a slot nothing points into is free (`users` 0, arrays empty).
         var generations: [(blocks: [av1g_block], types: [UInt8], inter: [av1g_block_inter])] = []
         var users: [Int] = []
-        init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
+        /// The blocks and SBs its buffers hold (at least the picture's: a recycled cache's).
+        let blockCapacity: Int, sbCapacity: Int
+        /// The ranges of its buffers the first analysis that uses it clears on the GPU before
+        /// anything else (`takeClears`), when it took an earlier cache's buffers; empty otherwise.
+        private var clears: [(buffer: any MTLBuffer, length: Int)] = []
+
+        /// A cache for pictures of `key`. With `old` (the cache it replaces), when its buffers are
+        /// large enough, it takes them, and they read as new ones do: zero, where the analysis uses
+        /// them. They are cleared on the GPU, behind the analyses still using them, not on the CPU
+        /// as the picture is set up (a 5K picture's are ≈ 100 MB: its set-up was 4.3 ms, not 1).
+        init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int, recycling old: AnalysisCache? = nil) throws {
             self.key = key
+            let lengths = [blocks * MemoryLayout<GpBlockRes>.stride, blocks * MemoryLayout<GpInterRes>.stride,
+                           nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride, nSb * 2,
+                           nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride, nSb * 4]
+            if let old, old.blockCapacity >= blocks, old.sbCapacity >= nSb {
+                (blockResults, interResults, leaves, leafCount, leafDecisions, sbJ) =
+                    (old.blockResults, old.interResults, old.leaves, old.leafCount, old.leafDecisions, old.sbJ)
+                (keeps, stales) = (old.keeps, old.stales)
+                // (the old cache's last picture may still read its own keep and stale lists:
+                // the next picture takes the other pair, as it would have)
+                flip = old.flip
+                (blockCapacity, sbCapacity) = (old.blockCapacity, old.sbCapacity)
+                clears = zip([blockResults, interResults, leaves, leafCount, leafDecisions, sbJ], lengths).map { ($0, $1) }
+                return
+            }
             func make(_ n: Int) throws -> any MTLBuffer {
                 guard let b = device.makeBuffer(length: max(16, n), options: .storageModeShared)
                 else { throw Failure.metal("no buffer of \(n) bytes") }
                 memset(b.contents(), 0, b.length)
                 return b
             }
-            blockResults = try make(blocks * MemoryLayout<GpBlockRes>.stride)
-            interResults = try make(blocks * MemoryLayout<GpInterRes>.stride)
-            leaves = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeaf>.stride)
-            leafCount = try make(nSb * 2)
-            leafDecisions = try make(nSb * Int(GP_MAX_LEAVES) * MemoryLayout<GpLeafDecision>.stride)
-            sbJ = try make(nSb * 4)
+            blockResults = try make(lengths[0])
+            interResults = try make(lengths[1])
+            leaves = try make(lengths[2])
+            leafCount = try make(lengths[3])
+            leafDecisions = try make(lengths[4])
+            sbJ = try make(lengths[5])
             keeps = [try make(nSb), try make(nSb)]
             stales = [try make(nSb * 4), try make(nSb * 4)]
+            (blockCapacity, sbCapacity) = (blocks, nSb)
+        }
+
+        /// The clears its first analysis does before anything else (once).
+        func takeClears() -> [(buffer: any MTLBuffer, length: Int)] {
+            defer { clears = [] }
+            return clears
         }
 
         /// Sets `keep` from the new source against the previous one, and remembers the new one.
@@ -596,7 +627,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
-        cache = try AnalysisCache(key: key, device: device, blocks: blocks, superblocks: superblocks)
+        cache = try AnalysisCache(key: key, device: device, blocks: blocks, superblocks: superblocks, recycling: cache)
         return cache
     }
 
@@ -1115,6 +1146,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The cache it keeps results in, and its SBs' kept flags (the cache's `keep` then).
         let cacheRef: AnalysisCache?
         let keptFlags: (any MTLBuffer)?
+        /// A recycled cache's buffers, cleared on the GPU ahead of this picture's analysis
+        /// (`AnalysisCache.takeClears`).
+        var clears: [(buffer: any MTLBuffer, length: Int)] = []
 
         /// With `closedLoop` false the closed loop's buffers (reconstruction,
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
@@ -1351,6 +1385,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             keptSuperblocks = cache?.keptCount ?? 0
             cacheRef = cache
             keptFlags = sbKeep
+            clears = cache?.takeClears() ?? []
             encoder.referenceSource = src
             encoder.lastKeptSuperblocks = keptSuperblocks
             let out = closedLoop ? nSb : 0
@@ -1464,6 +1499,15 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 if waitsForRead > 0 { c.encodeWaitForEvent(encoder.readEvent, value: waitsForRead) }
                 // and whatever the caller orders it behind (`beginPartition(after:)`)
                 if gateValue > 0, gated { c.encodeWaitForEvent(encoder.gate, value: gateValue) }
+                // a recycled cache's buffers, zero as new ones are, before this analysis writes
+                // them and after the analyses and reads before it (the waits above, and the
+                // queue's order: the buffers are tracked)
+                if !clears.isEmpty {
+                    guard let blit = c.makeBlitCommandEncoder() else { throw Failure.metal("no blit encoder") }
+                    for (b, length) in clears where length > 0 { blit.fill(buffer: b, range: 0..<length, value: 0) }
+                    blit.endEncoding()
+                    clears = []
+                }
                 guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
                 for b in buffers { e.useResource(b, usage: [.read, .write]) }
@@ -1486,6 +1530,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             // every SB keeps the previous picture's analysis, and its results are in the cache
             if !closedLoop, !profiling, staleSuperblocks == 0 {
+                assert(clears.isEmpty, "a recycled cache's first picture analyzes every SB")
                 if wait { encoder.lastGPUSeconds = 0 }
                 return nil
             }
