@@ -25,7 +25,9 @@ jobs:
       # heavy engine tests a hosted VM starves them (a burst arriving 94 %
       # whole, a session not converging in 25 s), so they get a step of
       # their own. A new real-network suite belongs here too.
-      QUIC_SUITES: AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
+      # (AV1SessionQUICTests needs Glass Act's AV1 encoder, a real Apple-silicon GPU: it skips
+      # itself on a hosted runner's paravirtual one.)
+      QUIC_SUITES: AV1SessionQUICTests|AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
@@ -64,6 +66,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust targets
+        # Each app target runs scripts/build-rust --xcode, which builds the Rust AV1 library
+        # (rust/av1) for the platform and architectures Xcode asks for: the Mac apps link it
+        # universal, the iPad app for iPadOS (and the Simulator). The script adds a missing
+        # target itself; adding them here keeps that out of the build's time and log.
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
       - name: Build Host
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host
@@ -82,7 +90,7 @@ jobs:
       - name: Build the viewer package for iPadOS
         # The package targets iPadOS 27 too (the iPad Viewer), so
         # availability mistakes and Mac-only APIs outside `#if os(macOS)`
-        # fail here.
+        # fail here. (A library product: nothing links the Rust library.)
         run: >
           xcodebuild -scheme GlassActViewer -destination 'generic/platform=iOS'
           CODE_SIGNING_ALLOWED=NO build
@@ -102,6 +110,7 @@ jobs:
         run: scripts/build-rust --universal
       - name: Build package and tests (x86_64)
         run: swift build --arch x86_64 --build-tests
+      # (The apps' Xcode targets build the Rust library universal themselves.)
       - name: Build Host (universal Release)
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host

@@ -78,6 +78,14 @@ a test checks is the rule in this document.
   - Past the parser, the vendored libwebp decoders are fuzzed too, with
     mutated real WEBPL tiles and striped keyframes. A decode either fails
     or fills exactly the expected rect, and never writes outside it.
+  - So is Glass Act's own AV1 decoder (`rust/av1`'s `decoder`, the
+    Viewer's AV1 where VideoToolbox has none, §4.6): truncated, bit-flipped,
+    overwritten and random temporal units of real streams, random OBU
+    structures, reordering and resets (`hostile_input`, 7,200 cases in
+    `cargo test --release`; `hostile_input_long`, 270,000). Every decoded
+    frame is checked against the parser and the writer's reconstruction, and
+    the decoder is capped at the region's size before it allocates
+    (`decoder_cap.rs`). Anything outside the writer's toolset is refused.
 - **INV-7 No allocation / no ARC in per-frame tile paths** (§8). These
   exceptions are known and documented:
   - libwebp allocates when it encodes.
@@ -331,8 +339,10 @@ with a single preamble byte `0x56` ('V'), then carries TLVs framed as in §3.5.
 byte t/8, LSB first. Missing trailing bytes count as 0.
 
 **Codec ids:**
-- `VideoCodec`: 1 = HEVC, 3 = AV1 (config record: the ISO `av1C` box). 2
-  (H.264) is reserved. 0x7E and 0x7F are mock codecs for tests.
+- `VideoCodec`: 1 = HEVC, 3 = AV1 (config record: the ISO `av1C` box),
+  from Glass Act's encoder or libaom's, the same id for both (§4.6 has why
+  and the pairings). 2 (H.264) is reserved. 0x7E and 0x7F are mock codecs
+  for tests.
 - `KeyframeCodec`: 1 = striped VP8L (lossless), 2 = reserved (JXL),
   3 = striped WebP-lossy. Codec 3 is a transient paint: it never advances
   `tileSeq` and is never ACKed.
@@ -344,13 +354,13 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | bit | name | meaning |
 |---|---|---|
 | 0 | videoHEVC | HEVC video regions |
-| 1 | videoAV1 | AV1 regions: an Apple silicon Host (vendored libaom) offers it; a Viewer advertises it only when its user opts in. The test rig's alternate mock codec (0x7E) maps here too |
+| 1 | videoAV1 | AV1 regions (codec 3): a Host with an AV1 encoder offers it; a Viewer advertises it only when its user opts in and it decodes any AV1 stream (VideoToolbox, in hardware). The test rig's alternate mock codec (0x7E) maps here too |
 | 2 | deliveryReports | the host asks for RECEIVED (§3.5) and bounds video by the link it reports (§4.9). Only the host's bit matters: a viewer sends RECEIVED when the host's HELLO carries it |
 | 3 | smoothnessPreference | the host understands QUALITY preference 2 (§4.6). Hosts without it reject a 2 as malformed, so only the host's bit matters: a viewer sends 2 only when the host's HELLO carries it |
 | 4 | cursor | cursor as metadata (host stops burning it into pixels) |
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
-| 7 | — | unassigned |
+| 7 | videoAV1GlassAct | AV1 from Glass Act's encoder (codec 3, §4.6): a Viewer advertises it when its user opts in and it decodes the hybrid's streams (VideoToolbox, or Glass Act's decoder, which takes only that toolset); a Host, when its AV1 is Glass Act's. Such a Host sends AV1 to a Viewer with bit 1 or 7; a libaom Host only with bit 1. (Bit 7 was `videoOverlay` before wire version 4, which no peer of this one ever sent) |
 | 8 | — | unassigned |
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
@@ -582,9 +592,49 @@ side.
 **Codecs:** the encoder factory is keyed by codec id. The host's preference
 list is intersected with the viewer's caps, and the region starts on the
 first negotiated codec whose encoder starts; START carries its id.
-- An Apple silicon Host prefers AV1 (codec 3, caps bit 1), then HEVC. A
+- A Host whose AV1 encoder runs prefers AV1 (codec 3), then HEVC. A
   Viewer advertises AV1 only when its user opts in, so the choice is the
   Viewer's; every other session runs HEVC.
+- **Whose AV1** (`HostVideoEncoders`, `ViewerVideoDecoders`; the table
+  below):
+  - The Host's AV1 is Glass Act's own encoder (`HybridRegionEncoder`, the
+    hybrid), on macOS 27 with an Apple-silicon GPU. Elsewhere (macOS
+    15.5–26, Intel, a VM's GPU) the Host offers HEVC only. Its kernels
+    compile once a process (about 6 s), started at launch
+    (`HybridRegionEncoder.prepare`); until they have, the factory has no
+    AV1 encoder and regions start on HEVC, not on a stalled queue.
+  - libaom's encoder (`AOMRegionEncoder`, below) stays in the package,
+    unused: `HostController.av1Encoder = .libaom` switches back to it. It's
+    no fallback where Glass Act's can't run, nor the other way round.
+  - A Viewer with VideoToolbox's AV1 (M3 and later) decodes any AV1 and
+    offers caps bits 1 and 7. One without it decodes with Glass Act's own
+    decoder (`OwnAV1RegionDecoder`), which takes only the hybrid's toolset,
+    and offers bit 7 alone. Its region decoder is VideoToolbox's whenever
+    it has it, since only then can libaom's streams come.
+  - A Host whose AV1 is Glass Act's sends it under bit 1 or 7; one whose AV1
+    is libaom's (a released Host, or this one switched back) only under
+    bit 1. Released Hosts don't know bit 7, and released Viewers never send
+    it.
+- **Codec id 3 for both encoders.** Both streams are standard AV1 with an
+  `av1C` config, and the Viewer picks its decoder by what it has, not by
+  who encoded. A new id would cost released M3 Viewers their AV1: they
+  offer only bit 1, and to them an unknown id maps to the HEVC bit, so a
+  START with it reaches VideoToolbox's decoder, which refuses it, and the
+  region shows nothing. Negotiation, not the id, keeps libaom's streams
+  from Glass Act's decoder.
+
+  | Host ↓ · Viewer → | new, AV1 hardware | new, no AV1 hardware | released, AV1 hardware, opted in | AV1 off, or released without the hardware |
+  |---|---|---|---|---|
+  | new, Glass Act's encoder runs | Glass Act's AV1, VideoToolbox | Glass Act's AV1, Glass Act's decoder | Glass Act's AV1, VideoToolbox | HEVC |
+  | new, macOS 15.5–26 or Intel | HEVC | HEVC | HEVC | HEVC |
+  | new, switched back to libaom | libaom's AV1, VideoToolbox | HEVC | libaom's AV1, VideoToolbox | HEVC |
+  | released, Apple silicon (libaom) | libaom's AV1, VideoToolbox | HEVC | libaom's AV1, VideoToolbox | HEVC |
+  | released, Intel | HEVC | HEVC | HEVC | HEVC |
+
+  `AV1PairingTests` runs every cell through the engines, the released
+  peers as the caps they send; `AV1SessionQUICTests` runs the first row's
+  first two over real QUIC, every frame Glass Act's decoder shows checked
+  against the encoder's reconstruction.
 - Even then AV1 runs only while the link has room (`LinkRoomPolicy`): its
   quality floor keeps frames large, and on a thin link the send gate
   admits fewer of them than of HEVC's. Judged once a second on the link
@@ -603,7 +653,6 @@ first negotiated codec whose encoder starts; START carries its id.
   codec. Switching mid-motion would cost a whole-screen sync frame on the
   new encoder, which on a link near the threshold costs more than either
   codec alone.
-- On Intel, libaom isn't compiled in and the Host offers HEVC only.
 
 **Lifecycle:**
 - Each region is a *generation*. The viewer drops stragglers from older
@@ -630,16 +679,28 @@ first negotiated codec whose encoder starts; START carries its id.
 - While the viewer has paused content (§4.10) the region idles: nothing is
   encoded and it doesn't dissolve, so resuming continues it.
 
-**AV1 encoder** (`AOMRegionEncoder`, vendored libaom): realtime speed 9
-with screen tools, CBR with a one-second rate buffer, no dropped frames, key
-frames on demand (up to 15 average frames each), at most 8 threads. It aims at
-40 % of the same base bitrate and link cap as HEVC (at 100 % CBR spent the link
-exactly and bursts made the send gate drop frames), the same quality ladder, and the
-frame-QP ceiling mapped to libaom's quantizer scale (34 → 42). BGRA → I420
-on the engine's queue, the encode on its own queue; one delivery per submit.
-It's a sharpness and latency choice, not a bandwidth saving: at equal bytes
-HEVC looks better on text and photos, AV1 better on scrolling (BENCHMARKS "AV1
-back, as a Viewer opt-in").
+**AV1 encoder** (`HybridRegionEncoder`, Glass Act's own: the Metal kernels
+and the Rust closed loop, `GlassActHybridVideo`). It aims where libaom
+aimed, so the two compare at equal targets: 40 % of the same base bitrate
+and link cap as HEVC (60 % under smooth motion), the same quality ladder,
+the frame-QP ceiling mapped to libaom's quantizer scale and on to qindex
+(34 → 42 → 168; smooth motion's ceiling quantizer 60, qindex 240).
+`HybridRateController` picks each picture's qindex, budgeting by capture
+time; a key frame may spend 2.5 s of the aim and at most 1 s of the link.
+BGRA → I420 (full range, BT.709, as its sequence header says) on the
+engine's queue; the encode runs on the encoder's own queues and threads,
+one delivery per submit, one encoder per process. It spends a third to a
+half of libaom's bytes at PSNR within 1–2 dB of it, and more frames get
+through a 6 Mbit/s link (BENCHMARKS "the hybrid as a live video encoder").
+
+**libaom** (`AOMRegionEncoder`, vendored; the Host's AV1 before Glass Act's,
+kept unused): realtime speed 9 with screen tools, CBR with a one-second
+rate buffer, no dropped frames, key frames on demand (up to 15 average
+frames each), at most 8 threads, arm64 only. It aims as above (at 100 % CBR
+spent the link exactly and bursts made the send gate drop frames). BGRA →
+I420 on the engine's queue, the encode on its own queue; one delivery per
+submit. Against HEVC it was a sharpness and latency choice, not a bandwidth
+saving (BENCHMARKS "AV1 back, as a Viewer opt-in").
 
 **HEVC encoder** (`VTHEVCRegionEncoder`):
 - Realtime, no B-frames, IDR only on demand, capture-time PTS.
@@ -1172,6 +1233,12 @@ Sources/
                            clipboard, log upload), SessionLog, AgentDriver, HeadlessAgent,
                            agent socket, MCP (the socket, MCP and daemon are macOS only)
   GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
+  AV1Core/ AV1Encoder/     the AV1 code's C API and the kernels' shared headers; implemented by
+                           rust/av1 (scripts/build-rust → .build/rust/libglassact_av1.a)
+  GlassActAV1/             the Metal AV1 encoder and the hybrid (AV1HybridEncoder), kernels in Shaders/
+  GlassActHybridVideo/     the hybrid as the Host's AV1 (HybridRegionEncoder), HostVideoEncoders
+  GlassActAV1Decode/       Glass Act's AV1 decoder as a Viewer's (OwnAV1RegionDecoder),
+                           ViewerVideoDecoders.glassAct
   glassact/                CLI + MCP server + headless daemon
   glassact-bench/          replay, synth, goldens, codec experiments
   glassact-testhost/       a Host with a synthetic screen that draws the input it gets, for
@@ -1180,7 +1247,8 @@ Sources/
 Tests/                     WireTests CodecTests CoreTests TransportTests SessionTests ShareTests
                            (+ GlassActTestSupport)
 ThirdParty/libwebp/        vendored, BSD-3 (VP8L encode/decode)
-ThirdParty/libaom/         vendored, BSD-2, arm64 only (AV1 realtime encode; decode for tests)
+ThirdParty/libaom/         vendored, BSD-2, arm64 only (AV1 realtime encode, kept unused; decode for tests)
+rust/av1/                  the AV1 CPU code (std only), a port of av1gpu (BSD-2)
 scripts/vendor-libaom      re-vendors libaom from a checkout
 Apps/GlassActApps.xcodeproj
   Host/                    menu-bar app: capture, input, approvals, agents policy
@@ -1199,11 +1267,22 @@ The apps stay thin, with UI and wiring only. Logic lives in the package, so
 `swift test` covers it.
 
 Two library products: `GlassAct` (everything, for the Mac apps) and
-`GlassActViewer` (Wire, Codec, Core, Transport and Session: what a viewer
-needs). The second also builds for iPadOS 27, for an iPad Viewer: Mac-only
+`GlassActViewer` (Wire, Codec, Core, Transport, Session and AV1Decode: what a
+viewer needs). The second also builds for iPadOS 27, for an iPad Viewer: Mac-only
 code there (sign-in's password check, the agent socket and MCP server, the
 Mac's computer name) sits behind `#if os(macOS)`, and CI builds the product
 for iPadOS so nothing slips past it.
+
+Both link the Rust library (GlassActHybridVideo and GlassActAV1Decode, through
+AV1Core); GlassActCore and GlassActSession don't, so the CLI and the
+agents build without it, and an app hands its session the decoders
+(`ViewerSession.Options.videoDecoders`). Xcode never runs `just`: each app
+target's first build phase runs `scripts/build-rust --xcode`, which builds
+the library for the platform and architectures it's building (universal
+for the Mac apps; iPadOS and its Simulator into `.build/rust/iphoneos` and
+`iphonesimulator`, found by the iPad target's `LIBRARY_SEARCH_PATHS`, since
+both are arm64), and for the Host copies the kernels' sources into its
+Resources (`--shaders`; `AV1ShaderSource` reads them there).
 
 ---
 
@@ -1375,11 +1454,15 @@ What an observer still sees:
 **The Viewer is sandboxed** (App Sandbox, outgoing network only). It's the
 app that decodes untrusted data from any Host it connects to (tile codecs,
 video, the wire), so a flaw in its own code stays inside its container.
-Video is the exception: VideoToolbox decodes it in a system service outside
-the sandbox. So the Viewer decodes only what it offered: a VIDEO_START for
-a codec it didn't advertise in HELLO_OK is dropped (hardware AV1 stays off
-unless the person opted in), and window thumbnails go only through the
-WebP or AVIF decoder they claim, at most 1024 px a side. Its data
+VideoToolbox's video is the exception: HEVC, and AV1 where the Mac has AV1
+hardware, decode in a system service outside the sandbox. Glass Act's own
+AV1 decoder (a Viewer without that hardware, §4.6) runs in the Viewer's
+process, inside the sandbox: Rust, safe by default, capped at the region's
+size before it allocates, and fuzzed (INV-6). So the Viewer decodes only
+what it offered: a VIDEO_START for a codec it didn't advertise in HELLO_OK
+is dropped (AV1 stays off unless the person opted in), and window
+thumbnails go only through the WebP or AVIF decoder they claim, at most
+1024 px a side. Its data
 (known hosts, logs, the agent socket) lives in its container; its key is in
 the keychain. It uses no private API. Its session log is mirrored to the
 unified log (subsystem `app.glassact.viewer`), since other apps can't read

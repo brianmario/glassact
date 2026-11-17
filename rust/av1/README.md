@@ -27,7 +27,8 @@ results.
 ## Building and testing
 
 ```sh
-scripts/build-rust                  # .build/rust/libglassact_av1.a, which the package links (just runs it)
+scripts/build-rust                  # .build/rust/libglassact_av1.a, which the package links (just runs it;
+                                    # --xcode in the apps' build phases, --universal for x86_64 too)
 just test-rust                      # the crate's tests, and the differential tests below
 cargo test --release --no-default-features --features oracle   # just the differential tests
 cargo test --release -- --ignored --nocapture bench            # micro-benchmarks

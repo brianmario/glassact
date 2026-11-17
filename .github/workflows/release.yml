@@ -87,6 +87,10 @@ jobs:
           printf '%s' "$SPARKLE_KEY" > "$RUNNER_TEMP/sparkle.key"
           echo "SPARKLE_KEY_FILE=$RUNNER_TEMP/sparkle.key" >> "$GITHUB_ENV"
 
+      - name: Rust targets
+        # The apps' Xcode targets build the Rust AV1 library (scripts/build-rust --xcode), universal.
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Build, sign, notarize
         run: Apps/ci-release.sh
 
