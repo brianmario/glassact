@@ -850,10 +850,15 @@ impl Hybrid {
                 for i in 0..ntiles {
                     let m = &mem[i];
                     let ((b0, b1), (p0, p1)) = (range(i), prange(i));
+                    // (a chroma palette replaced its block's decision: not what it'd decide again)
                     keep_chroma[i] = m.valid
                         && m.cpu_chroma
                         && !src_changed[i]
                         && b1 - b0 == p1 - p0
+                        && prev
+                            .palette
+                            .get(p0..p1)
+                            .is_none_or(|ps| ps.iter().all(|p| p.size_uv == 0))
                         && rec.blocks[b0..b1]
                             .iter()
                             .zip(&prev.blocks[p0..p1])
@@ -969,7 +974,7 @@ impl Hybrid {
                     let row = rec.blocks[k].mi_row >> sb_shift;
                     let (start, base) = (k, map_len);
                     while k < b1 && rec.blocks[k].mi_row >> sb_shift == row {
-                        map_len += palette::slot(&rec.blocks[k], is_inter(k)).unwrap_or(0);
+                        map_len += palette::slot(&rec.blocks[k], is_inter(k), ss).unwrap_or(0);
                         k += 1;
                     }
                     pal_units.push((i as u32, start as u32, k as u32, base as u32));
@@ -1032,7 +1037,7 @@ impl Hybrid {
             }
             drop(units);
             pal_stats.add(&st);
-            if st.chosen == 0 {
+            if st.chosen == 0 && st.uv_chosen == 0 {
                 rec.palette.clear();
                 rec.palette_map.clear();
             } else {
@@ -1468,7 +1473,7 @@ impl Hybrid {
     /// blocks, the eligible blocks' area and the palette blocks' (samples), the decisions' seconds;
     /// then from writes, with GA_PALETTE_BITS set: all blocks' bits, intra blocks', palette
     /// blocks'; then the palette blocks past the picture's right or bottom edge.
-    pub fn palette_stats(&self) -> [f64; 11] {
+    pub fn palette_stats(&self) -> [f64; 12] {
         let s = &self.pal_stats;
         let b = self.side.as_ref().map_or([0.0; 3], |w| w.bits);
         [
@@ -1483,6 +1488,7 @@ impl Hybrid {
             b[1],
             b[2],
             s.at_edge as f64,
+            s.uv_chosen as f64,
         ]
     }
 

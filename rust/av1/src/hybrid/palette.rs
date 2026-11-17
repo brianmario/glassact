@@ -21,8 +21,8 @@
 use super::decide::SrcView;
 use super::quant::{QuantHook, Scratch};
 use super::rdoq::sym_bits;
-use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma};
-use crate::dsp::{EDGE_LEN, Edge, build_edges, is_directional, predict_intra};
+use crate::blockinfo::{bh4, bw4, cfl_allowed, has_chroma, uv_tx_size};
+use crate::dsp::{EDGE_LEN, Edge, build_edges, chroma_tx_type, is_directional, predict_intra, round2signed};
 use crate::entropy::{Cdfs, InterCdfs};
 use crate::tables::*;
 use crate::types::{Block, BlockInter, BlockPalette};
@@ -46,6 +46,12 @@ pub(crate) struct PalCosts {
     size_y: [[f32; 7]; 7],
     /// [colours - 2][colour context][rank]
     color: [[[f32; 8]; 5]; 7],
+    /// 4:4:4 chroma palettes: their sizes and colour indices, and CfL's alphas (the chroma as
+    /// decided)
+    size_uv: [[f32; 7]; 7],
+    color_uv: [[[f32; 8]; 5]; 7],
+    cfl_sign: [f32; 8],
+    cfl_alpha: [[f32; 16]; 6],
 }
 
 impl PalCosts {
@@ -62,6 +68,10 @@ impl PalCosts {
             has_uv: [[0.0; 2]; 2],
             size_y: [[0.0; 7]; 7],
             color: [[[0.0; 8]; 5]; 7],
+            size_uv: [[0.0; 7]; 7],
+            color_uv: [[[0.0; 8]; 5]; 7],
+            cfl_sign: [0.0; 8],
+            cfl_alpha: [[0.0; 16]; 6],
         });
         for a in 0..5 {
             for l in 0..5 {
@@ -96,6 +106,7 @@ impl PalCosts {
             }
             for s in 0..7 {
                 p.size_y[b][s] = sym_bits(&ic.palette_y_size[b], s);
+                p.size_uv[b][s] = sym_bits(&ic.palette_uv_size[b], s);
             }
         }
         for k in 0..2 {
@@ -103,17 +114,29 @@ impl PalCosts {
                 p.has_uv[k][s] = sym_bits(&c.palette_uv_mode[k], s);
             }
         }
-        let cc = &ic.palette_y_color;
-        for ctx in 0..5 {
-            for r in 0..8 {
-                let at = |n: usize, cdf: &[u16]| if r < n { sym_bits(cdf, r) } else { 0.0 };
-                p.color[0][ctx][r] = at(2, &cc.c2[ctx]);
-                p.color[1][ctx][r] = at(3, &cc.c3[ctx]);
-                p.color[2][ctx][r] = at(4, &cc.c4[ctx]);
-                p.color[3][ctx][r] = at(5, &cc.c5[ctx]);
-                p.color[4][ctx][r] = at(6, &cc.c6[ctx]);
-                p.color[5][ctx][r] = at(7, &cc.c7[ctx]);
-                p.color[6][ctx][r] = at(8, &cc.c8[ctx]);
+        for (cc, out) in [
+            (&ic.palette_y_color, &mut p.color),
+            (&ic.palette_uv_color, &mut p.color_uv),
+        ] {
+            for ctx in 0..5 {
+                for r in 0..8 {
+                    let at = |n: usize, cdf: &[u16]| if r < n { sym_bits(cdf, r) } else { 0.0 };
+                    out[0][ctx][r] = at(2, &cc.c2[ctx]);
+                    out[1][ctx][r] = at(3, &cc.c3[ctx]);
+                    out[2][ctx][r] = at(4, &cc.c4[ctx]);
+                    out[3][ctx][r] = at(5, &cc.c5[ctx]);
+                    out[4][ctx][r] = at(6, &cc.c6[ctx]);
+                    out[5][ctx][r] = at(7, &cc.c7[ctx]);
+                    out[6][ctx][r] = at(8, &cc.c8[ctx]);
+                }
+            }
+        }
+        for s in 0..8 {
+            p.cfl_sign[s] = sym_bits(&c.cfl_sign, s);
+        }
+        for ctx in 0..6 {
+            for a in 0..16 {
+                p.cfl_alpha[ctx][a] = sym_bits(&c.cfl_alpha[ctx], a);
             }
         }
         p
@@ -133,6 +156,8 @@ pub(crate) struct Stats {
     pub chosen_area: u64,
     /// palette blocks past the picture's right or bottom edge (its width and height in samples)
     pub at_edge: u64,
+    /// 4:4:4: blocks with a chroma palette
+    pub uv_chosen: u64,
 }
 
 impl Stats {
@@ -143,18 +168,19 @@ impl Stats {
         self.chosen += o.chosen;
         self.chosen_area += o.chosen_area;
         self.at_edge += o.at_edge;
+        self.uv_chosen += o.uv_chosen;
     }
 }
 
-/// A block's colour index map's size in the record (luma, the whole block), or None where it can't
-/// have a palette.
+/// A block's colour index maps' size in the record (luma, the whole block; in 4:4:4, `ss` 0, as
+/// much again for chroma), or None where it can't have a palette.
 #[inline]
-pub(crate) fn slot(b: &Block, inter: bool) -> Option<usize> {
+pub(crate) fn slot(b: &Block, inter: bool, ss: i32) -> Option<usize> {
     let bs = b.bsize as i32;
     if inter || !(BLOCK_8X8..BLOCK_SIZES).contains(&bs) || bw4(bs) > 16 || bh4(bs) > 16 {
         return None;
     }
-    Some(16 * (bw4(bs) * bh4(bs)) as usize)
+    Some(16 * (bw4(bs) * bh4(bs)) as usize * if ss == 0 { 2 } else { 1 })
 }
 
 /// A worker's buffers, kept from picture to picture.
@@ -165,6 +191,10 @@ pub(crate) struct PalScratch {
     pred: Vec<u8>,
     map: Vec<u8>,
     best_map: Vec<u8>,
+    /// 4:4:4 chroma: U and V predictions, the (U, V) pairs a block has (sorted keys), with counts
+    pred_uv: [Vec<u8>; 2],
+    pairs: Vec<u16>,
+    pair_n: Vec<u32>,
 }
 
 impl PalScratch {
@@ -175,6 +205,9 @@ impl PalScratch {
             pred: vec![0; 64 * 64],
             map: vec![0; 64 * 64],
             best_map: vec![0; 64 * 64],
+            pred_uv: [vec![0; 32 * 32], vec![0; 32 * 32]],
+            pairs: Vec::with_capacity(32 * 32),
+            pair_n: Vec::with_capacity(32 * 32),
         }
     }
 }
@@ -318,10 +351,15 @@ fn ctx_rank(map: &[u8], w: usize, r: usize, c: usize) -> (usize, usize) {
 /// The colour index map's bits: the first index (NS(n)), then every other on-screen index with its
 /// colour context (the order the writer codes them in doesn't change any context).
 fn map_bits(costs: &PalCosts, map: &[u8], w: usize, ow: usize, oh: usize, n: usize) -> f32 {
+    map_bits_with(&costs.color, map, w, ow, oh, n)
+}
+
+/// [`map_bits`] with the given colour index costs (luma's or chroma's).
+fn map_bits_with(color: &[[[f32; 8]; 5]; 7], map: &[u8], w: usize, ow: usize, oh: usize, n: usize) -> f32 {
     let wb = 32 - (n as u32).leading_zeros();
     let m = (1u32 << wb) - n as u32;
     let mut bits = if (map[0] as u32) < m { wb - 1 } else { wb } as f32;
-    let tab = &costs.color[n - 2];
+    let tab = &color[n - 2];
     for r in 0..oh {
         for c in 0..ow {
             if r == 0 && c == 0 {
@@ -416,12 +454,15 @@ pub(crate) fn decide_unit(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit) {
     for k in 0..u.blocks.len() {
         let b = u.blocks[k];
         let is_inter = u.inter.get(k).is_some_and(|i| i.is_inter != 0);
-        if let Some(size) = slot(&b, is_inter) {
+        if let Some(size) = slot(&b, is_inter, cx.ss) {
             u.stats.eligible += 1;
-            u.stats.eligible_area += size as u64;
+            u.stats.eligible_area += (16 * bw4(b.bsize as i32) * bh4(b.bsize as i32)) as u64;
             let (map_off, at) = (u.map_base + off as u32, off);
             off += size;
             decide_block(cx, sc, u, k, map_off, at);
+            if cx.ss == 0 {
+                decide_uv(cx, sc, u, k, map_off, at);
+            }
         }
         let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
         for y in r.max(u.r0)..(r + bh4(bs)).min(cx.mi_rows).min(u.r0 + gh as i32) {
@@ -508,13 +549,18 @@ fn neighbours(sc: &PalScratch, u: &Unit, r: i32, c: i32) -> Nb {
 /// The colour cache (get_palette_cache): the above (inside the same 64 rows) and left blocks'
 /// colours, merged.
 fn cache_of(u: &Unit, nb: &Nb, r: i32) -> ([u8; 16], usize) {
+    cache_of_plane(u, nb, r, 0)
+}
+
+/// [`cache_of`] for plane type `uv` (0 luma, 1 the U colours).
+fn cache_of_plane(u: &Unit, nb: &Nb, r: i32, uv: usize) -> ([u8; 16], usize) {
     let (mut cache, mut cn) = ([0u8; 16], 0usize);
     let colors = |j: u32| -> &[u8] {
         if j == NONE {
             return &[];
         }
         let p = &u.pal[j as usize];
-        &p.colors[0][..p.size_y as usize]
+        &p.colors[uv][..if uv == 0 { p.size_y } else { p.size_uv } as usize]
     };
     let a = if (r * 4) % 64 != 0 { colors(nb.above) } else { &[] };
     let l = colors(nb.left);
@@ -757,6 +803,428 @@ fn decide_block(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: 
     u.stats.at_edge += (x + w > cx.width as usize || y + h > cx.height as usize) as u64;
 }
 
+/// The bits of the U colours of a chroma palette as palette_colors codes them (the writer's order:
+/// cache flags, a literal, then deltas; `colors` non-decreasing, deltas from 0).
+fn u_color_bits(cache: &[u8], colors: &[u8]) -> f32 {
+    let n = colors.len();
+    let mut used = [false; 8];
+    for &cv in cache {
+        if let Some(k) = (0..n).find(|&k| !used[k] && colors[k] == cv) {
+            used[k] = true;
+        }
+    }
+    let (mut rest, mut nrest) = ([0u8; 8], 0);
+    for k in 0..n {
+        if !used[k] {
+            rest[nrest] = colors[k];
+            nrest += 1;
+        }
+    }
+    let (mut bits, mut idx) = (0i32, 0usize);
+    for &cv in cache {
+        if idx >= n {
+            break;
+        }
+        bits += 1;
+        if colors.contains(&cv) {
+            idx += 1;
+        }
+    }
+    let mut k = 0;
+    if idx < n {
+        bits += 8;
+        idx += 1;
+        k += 1;
+    }
+    if idx < n {
+        let min_bits = 5;
+        let max_delta = (1..nrest).map(|i| (rest[i] - rest[i - 1]) as u32).max().unwrap_or(0);
+        let extra = ((32 - max_delta.leading_zeros() as i32) - min_bits).clamp(0, 3);
+        bits += 2;
+        let mut palette_bits = min_bits + extra;
+        while idx < n {
+            bits += palette_bits;
+            let range = 256 - rest[k.min(nrest - 1)] as i32;
+            let cl = if range < 2 {
+                0
+            } else {
+                32 - ((range - 1) as u32).leading_zeros() as i32
+            };
+            palette_bits = palette_bits.min(cl);
+            idx += 1;
+            k += 1;
+        }
+    }
+    bits as f32
+}
+
+/// The bits of the V colours as palette_colors_v codes them: deltas (wrapping) or literals,
+/// whichever is shorter, and the flag that says which.
+fn v_color_bits(colors: &[u8]) -> f32 {
+    let n = colors.len();
+    let mut deltas = [0i32; 8];
+    for i in 1..n {
+        let mut d = colors[i] as i32 - colors[i - 1] as i32;
+        if d > 128 {
+            d -= 256;
+        } else if d < -128 {
+            d += 256;
+        }
+        deltas[i] = d;
+    }
+    let max = deltas[1..n].iter().map(|d| d.unsigned_abs()).max().unwrap_or(0);
+    let bits = (32 - max.leading_zeros() as i32).max(4);
+    let literal = 8 * n as i32;
+    let cost = if bits <= 7 {
+        (2 + 8 + deltas[1..n].iter().map(|&d| bits + (d != 0) as i32).sum::<i32>()).min(literal)
+    } else {
+        literal
+    };
+    (1 + cost) as f32
+}
+
+/// 2-D k-means of the block's (U, V) pairs (`keys` U << 8 | V, distinct, with their counts) into at
+/// most `k` colours, sorted by U then V into `out`; returns how many.
+fn cluster_uv(keys: &[u16], cnt: &[u32], k: usize, out: &mut [(u8, u8); 8]) -> usize {
+    let at = |i: usize| ((keys[i] >> 8) as f64, (keys[i] & 0xFF) as f64);
+    let d2 = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0) * (a.0 - b.0) + (a.1 - b.1) * (a.1 - b.1);
+    let mut c = [(0f64, 0f64); 8];
+    let mut best = 0;
+    for i in 0..keys.len() {
+        if cnt[i] > cnt[best] {
+            best = i;
+        }
+    }
+    c[0] = at(best);
+    let mut n = 1;
+    while n < k {
+        let (mut bi, mut bs) = (0usize, 0f64);
+        for i in 0..keys.len() {
+            let d = c[..n].iter().map(|&x| d2(at(i), x)).fold(f64::MAX, f64::min);
+            let s = cnt[i] as f64 * d;
+            if s > bs {
+                (bi, bs) = (i, s);
+            }
+        }
+        if bs == 0.0 {
+            break;
+        }
+        c[n] = at(bi);
+        n += 1;
+    }
+    for _ in 0..12 {
+        let (mut su, mut sv, mut num) = ([0f64; 8], [0f64; 8], [0f64; 8]);
+        for i in 0..keys.len() {
+            let p = at(i);
+            let mut j = 0;
+            for q in 1..n {
+                if d2(p, c[q]) < d2(p, c[j]) {
+                    j = q;
+                }
+            }
+            su[j] += cnt[i] as f64 * p.0;
+            sv[j] += cnt[i] as f64 * p.1;
+            num[j] += cnt[i] as f64;
+        }
+        let mut moved = false;
+        for i in 0..n {
+            if num[i] > 0.0 {
+                let m = ((su[i] / num[i]).round(), (sv[i] / num[i]).round());
+                moved |= m != c[i];
+                c[i] = m;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    let mut v: [(u8, u8); 8] = [(0, 0); 8];
+    for i in 0..n {
+        v[i] = (c[i].0.clamp(0.0, 255.0) as u8, c[i].1.clamp(0.0, 255.0) as u8);
+    }
+    v[..n].sort_unstable();
+    let mut m = 0;
+    for i in 0..n {
+        if m == 0 || out[m - 1] != v[i] {
+            out[m] = v[i];
+            m += 1;
+        }
+    }
+    m
+}
+
+/// 4:4:4: block `k`'s chroma as decided, or a chroma palette (U and V colours of 2..8 pairs, one
+/// index map), whichever has the lower J, open loop on the source as [`decide_block`] prices luma:
+/// each plane's residual through the closed loop's quantizer, the symbols' bits from the default
+/// CDFs. Blocks up to 32x32 (one chroma tx block), after the luma decision (its palette is the
+/// context of has_palette_uv's).
+fn decide_uv(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: u32, at: usize) {
+    let b = u.blocks[k];
+    let (bs, r, c) = (b.bsize as i32, b.mi_row as i32, b.mi_col as i32);
+    let (w, h) = (4 * bw4(bs) as usize, 4 * bh4(bs) as usize);
+    if w > 32 || h > 32 {
+        return;
+    }
+    let (x, y) = (c as usize * 4, r as usize * 4);
+    let (sp, st) = (
+        [cx.src.at(1, x, y), cx.src.at(2, x, y)],
+        [cx.src.stride[1], cx.src.stride[2]],
+    );
+    // the block's (U, V) pairs, distinct, with counts
+    sc.pairs.clear();
+    for i in 0..h {
+        for j in 0..w {
+            sc.pairs
+                .push((sp[0][i * st[0] + j] as u16) << 8 | sp[1][i * st[1] + j] as u16);
+        }
+    }
+    sc.pairs.sort_unstable();
+    sc.pair_n.clear();
+    let mut m = 0;
+    for i in 0..sc.pairs.len() {
+        let v = sc.pairs[i];
+        if m > 0 && sc.pairs[m - 1] == v {
+            *sc.pair_n.last_mut().expect("a pair") += 1;
+        } else {
+            sc.pairs[m] = v;
+            sc.pair_n.push(1);
+            m += 1;
+        }
+    }
+    sc.pairs.truncate(m);
+    if m < 2 {
+        return;
+    }
+    // the gate: most samples within ±2 (both ways) of the 8 likeliest pairs
+    let mut top = [u16::MAX; 8];
+    for t in 0..8.min(m) {
+        let mut bi = usize::MAX;
+        for i in 0..m {
+            if !top[..t].contains(&sc.pairs[i]) && (bi == usize::MAX || sc.pair_n[i] > sc.pair_n[bi]) {
+                bi = i;
+            }
+        }
+        top[t] = sc.pairs[bi];
+    }
+    let near = |a: u16, b: u16| {
+        ((a >> 8) as i32 - (b >> 8) as i32).abs() <= 2 && ((a & 0xFF) as i32 - (b & 0xFF) as i32).abs() <= 2
+    };
+    let covered: u32 = (0..m)
+        .filter(|&i| top.iter().any(|&t| t != u16::MAX && near(sc.pairs[i], t)))
+        .map(|i| sc.pair_n[i])
+        .sum();
+    if covered * 100 < GATE_COVER * (w * h) as u32 {
+        return;
+    }
+    let costs = cx.costs;
+    let qs = quant(cx, &b);
+    let lambda = qs.2;
+    let tx_sz = uv_tx_size(bs, 0);
+    let (lw, lh) = (
+        Tx_Width_Log2[tx_sz as usize] as i32,
+        Tx_Height_Log2[tx_sz as usize] as i32,
+    );
+    let nb = neighbours(sc, u, r, c);
+    let size_y = u.pal[k].size_y;
+    let ctx = (size_y > 0) as usize;
+    let ym = u.blocks[k].y_mode as usize;
+    let uv_bits = |mode: usize| {
+        if cfl_allowed(bs) {
+            costs.uv_cfl[ym][mode.min(13)]
+        } else {
+            costs.uv_nocfl[ym][mode.min(12)]
+        }
+    };
+
+    // ---- as decided ----
+    let uvm = b.uv_mode as i32;
+    let mut cur_bits = uv_bits(uvm as usize);
+    if uvm == DC_PRED {
+        cur_bits += costs.has_uv[ctx][0];
+    }
+    if is_directional(uvm) && bs >= BLOCK_8X8 {
+        cur_bits += costs.angle[(uvm - V_PRED) as usize][(b.angle_delta_uv as i32 + MAX_ANGLE_DELTA) as usize];
+    }
+    let cfl = uvm == UV_CFL_PRED;
+    if cfl {
+        let sgn = |a: i8| {
+            if a == 0 {
+                0
+            } else if a < 0 {
+                1
+            } else {
+                2
+            }
+        };
+        let (su, sv) = (sgn(b.cfl_alpha_u), sgn(b.cfl_alpha_v));
+        cur_bits += costs.cfl_sign[(su * 3 + sv - 1) as usize];
+        if su != 0 {
+            cur_bits += costs.cfl_alpha[((su - 1) * 3 + sv) as usize][b.cfl_alpha_u.unsigned_abs() as usize - 1];
+        }
+        if sv != 0 {
+            cur_bits += costs.cfl_alpha[((sv - 1) * 3 + su) as usize][b.cfl_alpha_v.unsigned_abs() as usize - 1];
+        }
+    }
+    // CfL's luma: the source's, << 3 (4:4:4), less its average
+    let mut l_avg = 0i32;
+    if cfl {
+        let (s0, ls) = (cx.src.at(0, x, y), cx.src.stride[0]);
+        let mut sum = 0i64;
+        for i in 0..h {
+            for j in 0..w {
+                sum += (s0[i * ls + j] as i64) << 3;
+            }
+        }
+        let n = (w * h) as i64;
+        l_avg = ((sum + n / 2) / n) as i32;
+    }
+    let ty = chroma_tx_type(tx_sz, uvm, false);
+    let mut j_cur = lambda * cur_bits as f64;
+    for pl in 0..2 {
+        let (mut ea, mut el): (Edge, Edge) = ([0; EDGE_LEN], [0; EDGE_LEN]);
+        build_edges(
+            cx.src.p[pl + 1],
+            st[pl],
+            x as i32,
+            y as i32,
+            lw,
+            lh,
+            nb.avail_l,
+            nb.avail_u,
+            false,
+            false,
+            cx.mi_cols * 4 - 1,
+            cx.mi_rows * 4 - 1,
+            &mut ea,
+            &mut el,
+        );
+        let pred = &mut sc.pred_uv[pl];
+        predict_intra(
+            if cfl { DC_PRED } else { uvm },
+            if cfl { 0 } else { b.angle_delta_uv as i32 },
+            nb.avail_l,
+            nb.avail_u,
+            lw,
+            lh,
+            &ea,
+            &el,
+            pred,
+            w,
+        );
+        if cfl {
+            let alpha = if pl == 0 { b.cfl_alpha_u } else { b.cfl_alpha_v } as i32;
+            let (s0, ls) = (cx.src.at(0, x, y), cx.src.stride[0]);
+            for i in 0..h {
+                for j in 0..w {
+                    let l = ((s0[i * ls + j] as i32) << 3) - l_avg;
+                    let v = pred[i * w + j] as i32 + round2signed(alpha * l, 6);
+                    pred[i * w + j] = v.clamp(0, 255) as u8;
+                }
+            }
+        }
+        j_cur += cx.hook.intra_chroma_j(
+            &mut sc.q,
+            tx_sz,
+            ty,
+            &sc.pred_uv[pl],
+            w,
+            sp[pl],
+            st[pl],
+            qs.0,
+            qs.1,
+            pl as i32 + 1,
+        );
+    }
+
+    // ---- as palettes ----
+    let bctx = (Mi_Width_Log2[bs as usize] + Mi_Height_Log2[bs as usize] - 2) as usize;
+    let fixed = uv_bits(DC_PRED as usize) + costs.has_uv[ctx][1];
+    if lambda * (fixed + costs.size_uv[bctx][0] + 2.0) as f64 >= j_cur {
+        return;
+    }
+    let (cache, cn) = cache_of_plane(u, &nb, r, 1);
+    let d = map_dims(bs, r, c, cx.mi_rows, cx.mi_cols, true, 0);
+    let mut best: Option<(usize, [(u8, u8); 8])> = None;
+    let mut best_j = j_cur;
+    let mut cols = [(0u8, 0u8); 8];
+    let (mut last_n, mut prev_j) = (0, f64::MAX);
+    for kk in 2..=8usize.min(m) {
+        let n = cluster_uv(&sc.pairs, &sc.pair_n, kk, &mut cols);
+        if n < 2 || n == last_n {
+            continue;
+        }
+        last_n = n;
+        let (mut us, mut vs) = ([0u8; 8], [0u8; 8]);
+        for i in 0..n {
+            (us[i], vs[i]) = cols[i];
+        }
+        // the map: the on-screen part from the source, repeated past it as the decoder does
+        for yy in 0..h {
+            let sy = yy.min(d.oh - 1);
+            for xx in 0..w {
+                let sx = xx.min(d.ow - 1);
+                let (pu, pv) = (sp[0][sy * st[0] + sx] as i32, sp[1][sy * st[1] + sx] as i32);
+                let mut bj = 0;
+                let mut bd = i32::MAX;
+                for (q, &(cu, cv)) in cols[..n].iter().enumerate() {
+                    let dd = (pu - cu as i32) * (pu - cu as i32) + (pv - cv as i32) * (pv - cv as i32);
+                    if dd < bd {
+                        (bd, bj) = (dd, q);
+                    }
+                }
+                sc.map[yy * w + xx] = bj as u8;
+            }
+        }
+        let side = fixed
+            + costs.size_uv[bctx][n - 2]
+            + u_color_bits(&cache[..cn], &us[..n])
+            + v_color_bits(&vs[..n])
+            + map_bits_with(&costs.color_uv, &sc.map, w, d.ow, d.oh, n);
+        if lambda * side as f64 >= best_j {
+            break;
+        }
+        let mut jp = lambda * side as f64;
+        for pl in 0..2 {
+            let colors = if pl == 0 { &us } else { &vs };
+            for (p, &mi) in sc.pred_uv[pl][..w * h].iter_mut().zip(&sc.map[..w * h]) {
+                *p = colors[mi as usize];
+            }
+            jp += cx.hook.intra_chroma_j(
+                &mut sc.q,
+                tx_sz,
+                DCT_DCT,
+                &sc.pred_uv[pl],
+                w,
+                sp[pl],
+                st[pl],
+                qs.0,
+                qs.1,
+                pl as i32 + 1,
+            );
+        }
+        if jp < best_j {
+            best_j = jp;
+            best = Some((n, cols));
+            sc.best_map[..w * h].copy_from_slice(&sc.map[..w * h]);
+        } else if jp > prev_j {
+            break;
+        }
+        prev_j = jp;
+    }
+    let Some((n, cols)) = best else { return };
+    let bm = &mut u.blocks[k];
+    (bm.uv_mode, bm.angle_delta_uv, bm.cfl_alpha_u, bm.cfl_alpha_v) = (DC_PRED as u8, 0, 0, 0);
+    let p = &mut u.pal[k];
+    p.size_uv = n as u8;
+    p.map_off = map_off;
+    for i in 0..n {
+        (p.colors[1][i], p.colors[2][i]) = cols[i];
+    }
+    let off = at + if size_y > 0 { w * h } else { 0 };
+    u.map[off..off + w * h].copy_from_slice(&sc.best_map[..w * h]);
+    u.stats.uv_chosen += 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,7 +1263,9 @@ mod tests {
             for _ in 0..50 {
                 let (w, h) = (16, 16);
                 // runs, as glyph maps have, and noise
-                let map: Vec<u8> = (0..w * h).map(|_| (next() % (n as u32 + 3)).min(n as u32 - 1) as u8).collect();
+                let map: Vec<u8> = (0..w * h)
+                    .map(|_| (next() % (n as u32 + 3)).min(n as u32 - 1) as u8)
+                    .collect();
                 for r in 0..h {
                     for c in 0..w {
                         if r == 0 && c == 0 {

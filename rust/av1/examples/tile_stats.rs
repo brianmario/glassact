@@ -29,8 +29,15 @@ fn main() {
         let mut at = 0;
         let (mut pics, mut failed, mut bytes, mut payload, mut blockbits) = (0usize, 0usize, 0f64, 0f64, 0f64);
         let mut by_size: Vec<Acc> = (0..22).map(|_| Acc::default()).collect();
-        let (mut pal_y, mut pal_uv, mut pal_both, mut cfl, mut fi, mut ibc, mut other) =
-            (Acc::default(), Acc::default(), Acc::default(), Acc::default(), Acc::default(), Acc::default(), Acc::default());
+        let (mut pal_y, mut pal_uv, mut pal_both, mut cfl, mut fi, mut ibc, mut other) = (
+            Acc::default(),
+            Acc::default(),
+            Acc::default(),
+            Acc::default(),
+            Acc::default(),
+            Acc::default(),
+            Acc::default(),
+        );
         let mut pal_y_sizes = [0f64; 9];
         let mut pal_uv_sizes = [0f64; 9];
         let mut nz = [0f64; 3];
@@ -142,8 +149,8 @@ fn main() {
         );
         println!("  by size: blocks a picture · share of area · bytes a picture");
         let names = [
-            "4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32", "64x64", "64x128",
-            "128x64", "128x128", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16",
+            "4x4", "4x8", "8x4", "8x8", "8x16", "16x8", "16x16", "16x32", "32x16", "32x32", "32x64", "64x32", "64x64",
+            "64x128", "128x64", "128x128", "4x16", "16x4", "8x32", "32x8", "16x64", "64x16",
         ];
         let tot_area: f64 = by_size.iter().map(|a| a.area).sum();
         for (i, a) in by_size.iter().enumerate() {
@@ -177,10 +184,41 @@ fn main() {
                 );
             }
         }
-        println!("  palette sizes Y {:?}", &pal_y_sizes[2..].iter().map(|v| v / n).map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
-        println!("  palette sizes UV {:?}", &pal_uv_sizes[2..].iter().map(|v| v / n).map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
-        println!("  y modes (% of intra area) {:?}", ymodes.iter().map(|v| (1000.0 * v / tot_area).round() / 10.0).collect::<Vec<_>>());
-        println!("  uv modes (% of intra area) {:?}", uvmodes.iter().map(|v| (1000.0 * v / tot_area).round() / 10.0).collect::<Vec<_>>());
-        println!("  coefficients up to eob a picture: Y {:.0}, U {:.0}, V {:.0}", nz[0] / n, nz[1] / n, nz[2] / n);
+        println!(
+            "  palette sizes Y {:?}",
+            &pal_y_sizes[2..]
+                .iter()
+                .map(|v| v / n)
+                .map(|v| (v * 100.0).round() / 100.0)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  palette sizes UV {:?}",
+            &pal_uv_sizes[2..]
+                .iter()
+                .map(|v| v / n)
+                .map(|v| (v * 100.0).round() / 100.0)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  y modes (% of intra area) {:?}",
+            ymodes
+                .iter()
+                .map(|v| (1000.0 * v / tot_area).round() / 10.0)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  uv modes (% of intra area) {:?}",
+            uvmodes
+                .iter()
+                .map(|v| (1000.0 * v / tot_area).round() / 10.0)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  coefficients up to eob a picture: Y {:.0}, U {:.0}, V {:.0}",
+            nz[0] / n,
+            nz[1] / n,
+            nz[2] / n
+        );
     }
 }

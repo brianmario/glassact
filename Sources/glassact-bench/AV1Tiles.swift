@@ -20,6 +20,8 @@ let av1TilesCommand = Command(
         .string("q", "<list>", "AV1 quantizers 0–63 (libaom's scale), comma-separated (default 8,20,32,44)"),
         .string("out", "<prefix>", "write each quantizer's decoded tiles to <prefix>-q<q>.raw (BGRA, the corpus's order)"),
         .string("obus", "<prefix>", "with --chroma 444: write each quantizer's streams to <prefix>-q<q>.obus (per tile a little-endian u32 length and its OBUs; rust/av1 examples/tile_stats reads them)"),
+        .string("preset", "<name>", "with --chroma 444: the analysis's preset (AV1MetalEncoder.Preset; default the encoder's)"),
+        .string("shapes", "<hex>", "with --chroma 444: the analysis's shapes (GpParams.shapeMask bits, hex), in place of the preset's"),
         .bool("palette", "with --chroma 444: intra blocks may be luma palette blocks, decided by cost (AV1HybridEncoder.palette); prints how many are"),
         .string("chroma", "<420|444>", "AV1 key frames' chroma: 420 (default; BT.709 video range) or 444 (High profile; BT.601 full range, as the sequence header signals; every tile checked against libaom's decode)"),
     ],
@@ -69,7 +71,10 @@ func cmdAV1Tiles(opts: Options) throws {
 
     if chroma == "444" {
         try av1Tiles444(corpus: corpus, n: n, qs: qs, device: device, out: opts.string("out"), palette: opts.has("palette"),
-                        obus: opts.string("obus"))
+                        obus: opts.string("obus"), preset: try opts.string("preset").map {
+                            guard let p = AV1MetalEncoder.Preset(rawValue: $0) else { throw BenchError("--preset \($0)") }
+                            return p
+                        }, shapes: opts.string("shapes").flatMap { Int32($0, radix: 16) })
         return
     }
 
@@ -134,7 +139,7 @@ func cmdAV1Tiles(opts: Options) throws {
 /// `out`, the decoded tiles (and the conversion alone) back to BGRA by the same matrix.
 @available(macOS 27, *)
 private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevice, out prefix: String?, palette: Bool,
-                         obus: String? = nil) throws {
+                         obus: String? = nil, preset: AV1MetalEncoder.Preset? = nil, shapes: Int32? = nil) throws {
     let side = 64, tileBytes = side * side * 4
     func tile(_ i: Int) -> YUV444 {
         corpus.withUnsafeBytes { YUV444(bgra: UnsafeRawBufferPointer(rebasing: $0[i * tileBytes..<(i + 1) * tileBytes]), width: side, height: side) }
@@ -156,6 +161,8 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
     encoder.reusesAnalysis = false
     encoder.tiling = (0, 0)
     encoder.palette = palette
+    if let preset { encoder.preset = preset }
+    if let shapes { encoder.shapeMask = shapes }
     for q in qs {
         let qindex = q == 63 ? 255 : max(1, 4 * q)
         let before = encoder.paletteStats
@@ -199,8 +206,9 @@ private func av1Tiles444(corpus: [UInt8], n: Int, qs: [Int], device: any MTLDevi
                      q, Double(bytes) / Double(n), Double(payload) / Double(n), seconds / Double(n) * 1e6, copied))
         let after = encoder.paletteStats
         if after.count > 5, before.count > 5, after[1] > before[1] {
-            print(String(format: "    palette: %.0f of %.0f eligible blocks tried, %.0f chosen (%.1f %% of the eligible area)",
-                         after[2] - before[2], after[1] - before[1], after[3] - before[3], 100 * (after[5] - before[5]) / max(1, after[4] - before[4])))
+            print(String(format: "    palette: %.0f of %.0f eligible blocks tried, %.0f chosen (%.1f %% of the eligible area); %.0f chroma palettes",
+                         after[2] - before[2], after[1] - before[1], after[3] - before[3], 100 * (after[5] - before[5]) / max(1, after[4] - before[4]),
+                         after.count > 11 ? after[11] - before[11] : 0))
         }
         if let prefix {
             try Data(decoded).write(to: URL(fileURLWithPath: "\(prefix)-q\(q).raw"))

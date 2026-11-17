@@ -781,16 +781,22 @@ fn chroma444_key_frames() {
         ("aomdec", vec!["--rawvideo", "-o", "OUT", "IN"]),
     ];
     let (mut decoded, mut stale_checks) = (0, 0);
-    for (seed, (w, h), (cl, rl), style, abc) in [
-        (1u64, (600usize, 400usize), (0, 0), Style::Variance, false),
-        (2, (600, 400), (1, 0), Style::Random, false),
-        (3, (333, 517), (0, 1), Style::Variance, false),
-        (4, (77, 45), (0, 0), Style::Random, false),
-        (5, (13, 7), (0, 0), Style::Variance, false),
-        (6, (600, 400), (0, 0), Style::Variance, true),
-        (7, (333, 517), (1, 1), Style::Random, true),
+    let mut palettes = [0usize; 2];
+    for (seed, (w, h), (cl, rl), style, abc, pal) in [
+        (1u64, (600usize, 400usize), (0, 0), Style::Variance, false, false),
+        (2, (600, 400), (1, 0), Style::Random, false, false),
+        (3, (333, 517), (0, 1), Style::Variance, false, false),
+        (4, (77, 45), (0, 0), Style::Random, false, false),
+        (5, (13, 7), (0, 0), Style::Variance, false, false),
+        (6, (600, 400), (0, 0), Style::Variance, true, false),
+        (7, (333, 517), (1, 1), Style::Random, true, false),
+        // palette blocks, luma and chroma (Hybrid::set_palette), past the picture's edges too
+        (8, (600, 400), (0, 0), Style::Variance, false, true),
+        (9, (333, 517), (1, 1), Style::Random, false, true),
+        (10, (77, 45), (0, 0), Style::Variance, false, true),
+        (11, (600, 400), (0, 0), Style::Variance, true, true),
     ] {
-        let what = format!("seed {seed} {w}x{h}");
+        let what = format!("seed {seed} {w}x{h}{}", if pal { " palettes" } else { "" });
         let pic = screen_pic(w, h, seed, seed == 3);
         let (mut u, mut v) = to_444(&pic);
         let mut y = pic.y.clone();
@@ -815,6 +821,7 @@ fn chroma444_key_frames() {
             hy.threads = threads;
             hy.set_chroma_444(true);
             hy.set_intrabc(abc);
+            hy.set_palette(pal);
             hy.closed_loop(&y, &u, &v, w as u32, h as u32, &blocks, None, flags, 90, cl, rl)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             hy
@@ -823,7 +830,13 @@ fn chroma444_key_frames() {
         let rec = hy.record().clone();
         assert_eq!(rec.fp.chroma_format, CHROMA_444, "{what}");
         // (seed 7's repeats straddle its tiles, which copies can't: it searches and doesn't copy)
-        assert_eq!(seed == 6, rec.fp.allow_intrabc == 1, "{what}: copies");
+        assert_eq!(seed == 6 || seed == 11, rec.fp.allow_intrabc == 1, "{what}: copies");
+        if pal {
+            palettes[0] += rec.palette.iter().filter(|p| p.size_y != 0).count();
+            palettes[1] += rec.palette.iter().filter(|p| p.size_uv != 0).count();
+        } else {
+            assert!(rec.palette.is_empty(), "{what}: palettes without set_palette");
+        }
         let (mc4, mr4) = (mi_cols(w as i32) as usize * 4, mi_rows(h as i32) as usize * 4);
         for k in 0..3 {
             assert_eq!(hy.recon(k).unwrap().len(), mc4 * mr4, "{what}: plane {k}");
@@ -903,10 +916,12 @@ fn chroma444_key_frames() {
             "{what}: the writer's reconstruction isn't the closed loop's post-filtered"
         );
         eprintln!(
-            "{what}: {} blocks, {} copy, {} CfL, {} bytes",
+            "{what}: {} blocks, {} copy, {} CfL, {} / {} luma / chroma palettes, {} bytes",
             fin.blocks.len(),
             fin.inter.iter().filter(|i| i.is_inter != 0).count(),
             fin.blocks.iter().filter(|b| b.uv_mode as i32 == UV_CFL_PRED).count(),
+            fin.palette.iter().filter(|p| p.size_y != 0).count(),
+            fin.palette.iter().filter(|p| p.size_uv != 0).count(),
             obu.len()
         );
         let dir = std::env::temp_dir().join(format!("glassact-444-{}-{seed}", std::process::id()));
@@ -974,6 +989,7 @@ fn chroma444_key_frames() {
             let mut fresh = Hybrid::new();
             fresh.set_chroma_444(true);
             fresh.set_intrabc(abc);
+            fresh.set_palette(pal);
             fresh
                 .closed_loop(&y, &u2, &v, w as u32, h as u32, &blocks, None, 0, 90, cl, rl)
                 .unwrap();
@@ -985,8 +1001,12 @@ fn chroma444_key_frames() {
             stale_checks += 1;
         }
     }
-    eprintln!("{decoded} decodes exact, {stale_checks} pictures partly kept");
+    eprintln!(
+        "{decoded} decodes exact, {stale_checks} pictures partly kept, {} luma and {} chroma palettes",
+        palettes[0], palettes[1]
+    );
     assert!(stale_checks >= 2);
+    assert!(palettes[0] > 0 && palettes[1] > 0, "palettes {palettes:?}");
     // inter frames are 4:2:0 only
     let pic = screen_pic(64, 64, 9, false);
     let (u, v) = to_444(&pic);

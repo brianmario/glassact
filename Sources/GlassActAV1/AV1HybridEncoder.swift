@@ -154,6 +154,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.preset = newValue }
     }
 
+    /// Research: the shapes the analysis tries (GpParams.shapeMask bits), in place of the preset's
+    /// (set after `preset`, which resets it).
+    public var shapeMask: Int32 {
+        get { metal.params.shapeMask }
+        set { metal.params.shapeMask = newValue }
+    }
+
     /// Uniform tiles, as log2 of the columns and rows (-1: the fewest legal).
     /// The CPU codes tiles on parallel threads, so pictures want many.
     public var tiling: (columnsLog2: Int, rowsLog2: Int) {

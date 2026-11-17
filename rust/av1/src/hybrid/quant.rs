@@ -786,6 +786,50 @@ impl QuantHook<'_> {
     }
 }
 
+impl QuantHook<'_> {
+    /// An intra chroma tx block's cost (4:4:4 palette decisions, [`super::palette`]), open loop: the
+    /// residual `s - pred` (`tx_sz`'s whole block) at type `ty` (the chroma's, from its mode) and
+    /// plane `plane`'s quantizers, its J as the trials compare them.
+    pub(crate) fn intra_chroma_j(
+        &self,
+        sc: &mut Scratch,
+        tx_sz: i32,
+        ty: i32,
+        pred: &[u8],
+        ps: usize,
+        s: &[u8],
+        ss: usize,
+        dc_q: i32,
+        ac_q: i32,
+        plane: i32,
+    ) -> f64 {
+        let Scratch { w, cur, .. } = sc;
+        let (tw, th) = (tx_w(tx_sz) as usize, tx_h(tx_sz) as usize);
+        if self.o.double_fwd {
+            for i in 0..th {
+                let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resi[i * tw..][..tw]);
+                for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
+                    *d = s as i32 - p as i32;
+                }
+            }
+        } else {
+            let mut e = 0u64;
+            for i in 0..th {
+                let (sr, p, d) = (&s[i * ss..][..tw], &pred[i * ps..][..tw], &mut w.resf[i * tw..][..tw]);
+                for ((d, &s), &p) in d.iter_mut().zip(sr).zip(p) {
+                    let v = s as i32 - p as i32;
+                    e += (v * v) as u64;
+                    *d = v as f32;
+                }
+            }
+            w.energy = e;
+            w.s1.reset();
+        }
+        w.rdoq_here = 1;
+        self.trial(w, tx_sz, ty, dc_q, ac_q, cur, pred, ps, s, ss, plane, 15, true)
+    }
+}
+
 impl TxbHook for QuantHook<'_> {
     type Scratch = Option<Box<Scratch>>;
     // a given type outside its set becomes DCT_DCT; searched ones are in it
