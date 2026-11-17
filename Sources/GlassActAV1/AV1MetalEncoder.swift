@@ -465,7 +465,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// the entries that do; a slot nothing points into is free (`users` 0, arrays empty).
         var generations: [(blocks: [av1g_block], types: [UInt8], inter: [av1g_block_inter])] = []
         var users: [Int] = []
-
         init(key: [UInt8], device: any MTLDevice, blocks: Int, superblocks nSb: Int) throws {
             self.key = key
             func make(_ n: Int) throws -> any MTLBuffer {
@@ -549,18 +548,30 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                     }
                 }
             }
-            // the rest of the previous source equals this one already
+            // the rest of the previous source equals this one already. A row of SBs at a time on
+            // every core, each run of neighbouring SBs to copy as one span a line (on the critical
+            // path of a lone picture: a new 5K picture's 22 MB were 230,000 copies of 64 bytes)
+            let copies = changed.indices.map { i in changed[i] && (skip.map { $0[i] == 0 } ?? true) }
             for (p, (pixels, w, h)) in planes.enumerated() {
                 let side = p == 0 ? 64 : 32
                 previous![p].withUnsafeMutableBufferPointer { old in
-                    for sr in 0..<sbRows {
-                        for sc in 0..<sbCols where changed[sr * sbCols + sc] && skip.map({ $0[sr * sbCols + sc] == 0 }) ?? true {
-                            let x0 = sc * side, y0 = sr * side
-                            guard x0 < w, y0 < h else { continue }
-                            let n = min(side, w - x0)
-                            for row in y0..<min(y0 + side, h) {
-                                (old.baseAddress! + row * w + x0).update(from: pixels + row * w + x0, count: n)
+                    let planes = AV1MetalEncoder.Lines(to: old.baseAddress!, from: pixels)
+                    DispatchQueue.concurrentPerform(iterations: sbRows) { sr in
+                        let (base, pixels) = (planes.to, planes.from)
+                        let y0 = sr * side
+                        guard y0 < h else { return }
+                        var sc = 0
+                        while sc < sbCols {
+                            guard copies[sr * sbCols + sc] else { sc += 1; continue }
+                            var end = sc + 1
+                            while end < sbCols && copies[sr * sbCols + end] { end += 1 }
+                            let x0 = sc * side, n = min(end * side, w) - x0
+                            if n > 0 {
+                                for row in y0..<min(y0 + side, h) {
+                                    (base + row * w + x0).update(from: pixels + row * w + x0, count: n)
+                                }
                             }
+                            sc = end
                         }
                     }
                 }
@@ -835,8 +846,24 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let descriptor = MTLComputePipelineDescriptor()
         descriptor.computeFunction = function
         descriptor.maxTotalThreadsPerThreadgroup = threads
-        return try device.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
+        let pipeline = try device.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
+        if reportsPipelines {
+            FileHandle.standardError.write(("pipeline \(function.name) threads \(threads) max \(pipeline.maxTotalThreadsPerThreadgroup)"
+                + " width \(pipeline.threadExecutionWidth) threadgroup \(pipeline.staticThreadgroupMemoryLength) B\n").data(using: .utf8)!)
+        }
+        return pipeline
     }
+
+    /// A plane's destination and source for a copy in bands on several threads: each band writes
+    /// lines of its own, so they don't race.
+    struct Lines: @unchecked Sendable {
+        let to: UnsafeMutablePointer<UInt8>, from: UnsafePointer<UInt8>
+    }
+
+    /// GA_PIPELINES (diagnostics): each pipeline's threads and static threadgroup memory on
+    /// stderr as it's made (BENCHMARKS "where a new 5K picture's period goes, kernel by kernel").
+    /// Metal reports no registers or spills; Instruments' spill events give the spills.
+    static let reportsPipelines = ProcessInfo.processInfo.environment["GA_PIPELINES"] != nil
 
     /// AV1's block sizes in pixels, by `bsize` (128-pixel sizes unused: 0).
     static let blockSizes: [(w: Int, h: Int)] = [
@@ -1139,11 +1166,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 let pw = p == 0 ? aw : aw / 2, ph = p == 0 ? ah : ah / 2
                 let b = src[p]
                 let d = b.contents().assumingMemoryBound(to: UInt8.self)
-                for row in 0..<ph {
-                    let sr = min(row, h - 1)
-                    let line = d + row * pw
-                    line.update(from: pixels + sr * w, count: w)
-                    (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
+                // in bands of 64 lines on every core (a lone picture waits for this copy)
+                let lines = AV1MetalEncoder.Lines(to: d, from: pixels)
+                DispatchQueue.concurrentPerform(iterations: (ph + 63) / 64) { band in
+                    let (d, pixels) = (lines.to, lines.from)
+                    for row in band * 64..<min(ph, band * 64 + 64) {
+                        let sr = min(row, h - 1)
+                        let line = d + row * pw
+                        line.update(from: pixels + sr * w, count: w)
+                        (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
+                    }
                 }
                 recPlanes.append(try make(closedLoop ? pw * ph : 16))
             }
