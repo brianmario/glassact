@@ -43,11 +43,14 @@ import GlassActWire
         #expect(ours.av1 == .glassAct)
         if !HybridRegionEncoder.isReady { #expect(ours.encoder(forCodec: VideoCodec.av1) == nil) }
         let t0 = Date()
-        HostVideoEncoders.prepare(.glassAct)
-        while !HybridRegionEncoder.isReady && Date().timeIntervalSince(t0) < 120 {
-            try await Task.sleep(for: .milliseconds(20))
+        let ready = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            HostVideoEncoders.prepare(.glassAct) { c.resume(returning: $0) }
         }
-        #expect(HybridRegionEncoder.isReady)
+        #expect(ready && HybridRegionEncoder.isReady)
+        let again = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            HybridRegionEncoder.prepare { c.resume(returning: $0) }
+        }
+        #expect(again, "a later prepare hears at once")
         #expect(ours.encoder(forCodec: VideoCodec.av1) is HybridRegionEncoder)
         print("HostVideoEncoders: kernels ready \(Int(Date().timeIntervalSince(t0) * 1000)) ms after prepare")
     }

@@ -665,7 +665,14 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
         isListening = true
         // (Glass Act's AV1 encoder compiles its kernels once; before they have, regions use HEVC)
-        if Self.videoEnabled { HostVideoEncoders.prepare(Self.av1Encoder) }
+        if Self.videoEnabled {
+            HostVideoEncoders.prepare(Self.av1Encoder) { [weak self] ready in
+                DispatchQueue.main.async {
+                    self?.onStatus(ready ? "AV1: Glass Act's encoder ready"
+                                   : "AV1: Glass Act's encoder didn't start (its kernels didn't compile) — video is HEVC only")
+                }
+            }
+        }
         phase = .starting
         ensureServer()
     }

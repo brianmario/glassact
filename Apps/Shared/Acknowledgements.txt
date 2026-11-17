@@ -171,8 +171,10 @@ Alliance for Open Media Patent License 1.0
       the Alliance for Open Media as a Final Deliverable for which this
       License was issued.
 
-# av1gpu (a30b4e8), as ported to Rust and Metal in Glass Act's AV1 encoder and decoder
+# av1gpu (a30b4e8)
 https://github.com/maddog107/av1gpu
+
+Glass Act's AV1 encoder and decoder are ported from it.
 
 Copyright (c) 2026, maddog107 and the av1gpu contributors
 

@@ -508,7 +508,11 @@ struct FixedAccount: PasswordVerifier {
 
 setvbuf(stdout, nil, _IOLBF, 0) // a line at a time, even into a pipe or a file
 let options = Options.parse(CommandLine.arguments)
-if options.video { HostVideoEncoders.prepare(options.av1) }
+if options.video {
+    HostVideoEncoders.prepare(options.av1) { ready in
+        print("glassact-testhost: AV1 " + (ready ? "(Glass Act's encoder) ready" : "unavailable: Glass Act's encoder didn't start"))
+    }
+}
 let host = TestHost(options: options)
 do {
     try host.start()

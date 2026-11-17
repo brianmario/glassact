@@ -49,9 +49,14 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     public static var isAvailable: Bool { AV1ShaderSource.hasCapableGPU }
 
     /// Compiles the encoder's kernels (makes the process's encoder) on a queue of its own, once;
-    /// `isReady` says when it's done. Nothing where the encoder isn't available.
-    public static func prepare() {
-        guard isAvailable, Shared.preparation.begin() else { return }
+    /// `isReady` says when it's done, and `done` (on that queue) how it went: false where the
+    /// encoder isn't available or its kernels didn't compile.
+    public static func prepare(done: (@Sendable (_ ready: Bool) -> Void)? = nil) {
+        guard isAvailable else {
+            done?(false)
+            return
+        }
+        guard Shared.preparation.begin(done) else { return }
         DispatchQueue.global(qos: .utility).async {
             Shared.preparation.end(ready: Shared.instance != nil)
         }
@@ -337,24 +342,33 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         final class Preparation: @unchecked Sendable {
             private let lock = NSLock()
             private var started = false
-            private var ready = false
+            private var outcome: Bool?
+            private var waiting: [@Sendable (Bool) -> Void] = []
 
-            /// True for the first caller: it makes the encoder.
-            func begin() -> Bool {
-                lock.withLock {
+            /// True for the first caller: it makes the encoder. `done` hears how it went, at once
+            /// if it's known.
+            func begin(_ done: (@Sendable (Bool) -> Void)?) -> Bool {
+                let (first, known): (Bool, Bool?) = lock.withLock {
+                    if outcome == nil, let done { waiting.append(done) }
                     defer { started = true }
-                    return !started
+                    return (!started, outcome)
                 }
+                if let known { done?(known) }
+                return first && known == nil
             }
 
+            /// The encoder exists (`ready`), or can't.
             func end(ready: Bool) {
-                lock.withLock {
+                let waiters: [@Sendable (Bool) -> Void] = lock.withLock {
                     started = true
-                    self.ready = ready
+                    outcome = ready
+                    defer { waiting = [] }
+                    return waiting
                 }
+                for w in waiters { w(ready) }
             }
 
-            var isReady: Bool { lock.withLock { ready } }
+            var isReady: Bool { lock.withLock { outcome == true } }
         }
 
         let encoder: AV1HybridEncoder

@@ -59,11 +59,12 @@ public struct HostVideoEncoders {
         return false
     }
 
-    /// Starts compiling Glass Act's encoder's kernels, at launch, when it's the choice: until
-    /// they have, its regions start on HEVC instead of waiting for them.
-    public static func prepare(_ choice: AV1) {
+    /// Starts compiling Glass Act's encoder's kernels, at launch, when it's the choice and it
+    /// runs here: until they have, its regions start on HEVC instead of waiting for them. `done`
+    /// (on another queue) hears whether they compiled; without them, video is HEVC only.
+    public static func prepare(_ choice: AV1, done: (@Sendable (_ ready: Bool) -> Void)? = nil) {
         guard choice == .glassAct, glassActAvailable else { return }
-        if #available(macOS 27, iOS 27, *) { HybridRegionEncoder.prepare() }
+        if #available(macOS 27, iOS 27, *) { HybridRegionEncoder.prepare(done: done) }
     }
 
     /// A region's encoder for a negotiated codec (the engine's `videoEncoderFactory`). Nil for a

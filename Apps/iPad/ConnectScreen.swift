@@ -471,7 +471,10 @@ struct SettingsSheet: View {
                     Text("On a Slow Network")
                 } footer: {
                     Text("Balanced keeps text crisp at fewer frames per second. Sharp Text also keeps moving content sharper when the network has room. Smooth Motion lets moving content soften so more frames get through. "
-                         + "AV1 keeps text sharper than HEVC on less bandwidth, and needs an up-to-date Mac with Apple silicon and macOS 27.")
+                         // (with AV1 hardware, older Macs' AV1 decodes here too; without, only an up-to-date Mac's)
+                         + (VTRegionDecoder.canDecodeAV1
+                            ? "AV1 keeps text sharper than HEVC and needs a Mac with Apple silicon; from an up-to-date one on macOS 27, it also uses less bandwidth."
+                            : "AV1 keeps text sharper than HEVC on less bandwidth, and needs an up-to-date Mac with Apple silicon and macOS 27."))
                 }
                 Section {
                     LabeledContent("This iPad’s key") {
