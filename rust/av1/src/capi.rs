@@ -472,6 +472,116 @@ pub unsafe extern "C" fn av1g_exif_orientation_to_irot_imir(orientation: c_int, 
     }
 }
 
+// ---- av1g/decoder.h ----
+
+/// av1g_decoder: the decoder behind the C API.
+pub struct DecoderHandle {
+    d: crate::decoder::Decoder,
+}
+
+/// A decoded picture as av1g_dec_picture.
+fn dec_picture(p: &crate::decoder::Picture) -> DecPicture {
+    let n = if p.monochrome { 1 } else { 3 };
+    DecPicture {
+        planes: core::array::from_fn(|k| if k < n { p.planes[k].as_ptr() } else { ptr::null() }),
+        stride: p.stride.map(|s| s as u32),
+        plane_w: p.plane_w,
+        plane_h: p.plane_h,
+        width: p.width,
+        height: p.height,
+        render_width: p.render_width,
+        render_height: p.render_height,
+        chroma_format: p.chroma_format,
+        monochrome: p.monochrome as u8,
+        key: p.key as u8,
+        reserved: 0,
+        color_primaries: p.colour[0],
+        transfer_characteristics: p.colour[1],
+        matrix_coefficients: p.colour[2],
+        color_range: p.colour[3],
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1g_decoder_create(threads: c_int) -> *mut DecoderHandle {
+    Box::into_raw(Box::new(DecoderHandle {
+        d: crate::decoder::Decoder::new(threads.max(0) as usize),
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_decoder_decode(
+    d: *mut DecoderHandle,
+    data: *const u8,
+    size: usize,
+    out: *mut DecPicture,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    // SAFETY: out, if not null, is the caller's av1g_dec_picture.
+    if !out.is_null() {
+        unsafe { *out = DecPicture::default() };
+    }
+    if d.is_null() || (data.is_null() && size != 0) {
+        // SAFETY: the caller's error buffer.
+        unsafe { set_error_raw(err, errlen, "null decoder or data") };
+        return ERR_INVALID;
+    }
+    // SAFETY: d is a decoder from av1g_decoder_create, used from one thread; data holds size bytes.
+    let (h, tu) = unsafe { (&mut *d, opt_slice(data, size)) };
+    match h.d.decode(tu) {
+        Ok(p) => {
+            if !out.is_null() {
+                // SAFETY: as above.
+                unsafe { *out = dec_picture(&p) };
+            }
+            // SAFETY: the caller's error buffer.
+            unsafe { set_error_raw(err, errlen, "") };
+            OK
+        }
+        Err(e) => {
+            // SAFETY: the caller's error buffer.
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_decoder_picture(d: *const DecoderHandle, out: *mut DecPicture) -> c_int {
+    if out.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: out is the caller's av1g_dec_picture; d, if not null, a decoder from
+    // av1g_decoder_create.
+    unsafe {
+        *out = DecPicture::default();
+        match d.as_ref().and_then(|h| h.d.picture()) {
+            Some(p) => {
+                *out = dec_picture(&p);
+                OK
+            }
+            None => ERR_INVALID,
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_decoder_reset(d: *mut DecoderHandle) {
+    // SAFETY: d, if not null, is a decoder from av1g_decoder_create.
+    if let Some(h) = unsafe { d.as_mut() } {
+        h.d.reset();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_decoder_destroy(d: *mut DecoderHandle) {
+    if !d.is_null() {
+        // SAFETY: d is a decoder from av1g_decoder_create, not used after this.
+        drop(unsafe { Box::from_raw(d) });
+    }
+}
+
 // ---- av1enc.h (the hybrid encoder's part is in capi_hybrid) ----
 
 #[unsafe(no_mangle)]

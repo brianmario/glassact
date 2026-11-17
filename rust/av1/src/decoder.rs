@@ -259,22 +259,21 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
-/// `f(k, items[k])` for every item, on at most `threads` threads of the pool.
-fn par<T: Send>(threads: usize, items: &mut [T], f: impl Fn(usize, &mut T) + Sync) {
-    let n = items.len();
+/// `f(k, item k)` for each of the `n` items of `items`, on at most `threads` threads of the pool,
+/// which take them from one queue (no list of them, no lock each).
+fn par<T: Send>(threads: usize, n: usize, items: impl Iterator<Item = T> + Send, f: impl Fn(usize, T) + Sync) {
     if threads <= 1 || n <= 1 {
-        for (k, it) in items.iter_mut().enumerate() {
+        for (k, it) in items.enumerate() {
             f(k, it);
         }
         return;
     }
-    let cells: Vec<Mutex<&mut T>> = items.iter_mut().map(Mutex::new).collect();
-    let next = AtomicUsize::new(0);
+    let q = Mutex::new(items.enumerate());
     crate::pool::run(threads.min(n), |_| {
         loop {
-            let k = next.fetch_add(1, Ordering::Relaxed);
-            let Some(c) = cells.get(k) else { break };
-            f(k, &mut c.lock().unwrap_or_else(|e| e.into_inner()));
+            let next = q.lock().unwrap_or_else(|e| e.into_inner()).next();
+            let Some((k, it)) = next else { break };
+            f(k, it);
         }
     });
 }
@@ -704,21 +703,19 @@ impl Decoder {
             self.tiles.resize_with(ntiles, TileBufs::default);
         }
         {
-            let cells: Vec<Mutex<&mut TileBufs>> = self.tiles[..ntiles].iter_mut().map(Mutex::new).collect();
-            let next = AtomicUsize::new(0);
+            // the tiles in one queue, the workers' states in another (a task takes one)
+            let tiles_q = Mutex::new(self.tiles[..ntiles].iter_mut().enumerate());
+            let workers_q = Mutex::new(self.workers[..nw].iter_mut());
             let stop = AtomicBool::new(false);
             let first_err: Mutex<Option<(usize, Box<Error>)>> = Mutex::new(None);
             let spans = &self.spans;
             let cols = tiles.cols as usize;
             let work = |w: &mut TileDecoder| {
-                loop {
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    if k >= ntiles || stop.load(Ordering::Relaxed) {
-                        break;
-                    }
+                while !stop.load(Ordering::Relaxed) {
+                    let next = tiles_q.lock().unwrap_or_else(|e| e.into_inner()).next();
+                    let Some((k, bufs)) = next else { break };
                     let (at, len) = spans[k];
-                    let mut bufs = cells[k].lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e) = w.decode(&f, &mut bufs, &p[at..at + len], k / cols, k % cols) {
+                    if let Err(e) = w.decode(&f, bufs, &p[at..at + len], k / cols, k % cols) {
                         stop.store(true, Ordering::Relaxed);
                         let mut g = first_err.lock().unwrap_or_else(|e| e.into_inner());
                         if g.as_ref().is_none_or(|(j, _)| k < *j) {
@@ -728,9 +725,15 @@ impl Decoder {
                 }
             };
             if nw == 1 {
-                work(&mut self.workers[0]);
+                let w = workers_q.lock().unwrap_or_else(|e| e.into_inner()).next();
+                work(w.expect("a worker"));
             } else {
-                crate::pool::each(&mut self.workers[..nw], work);
+                crate::pool::run(nw, |_| {
+                    let w = workers_q.lock().unwrap_or_else(|e| e.into_inner()).next();
+                    if let Some(w) = w {
+                        work(w);
+                    }
+                });
             }
             if let Some((_, e)) = first_err.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 return Err(*e);
@@ -765,12 +768,11 @@ impl Decoder {
             let tbufs = &self.tiles[..ntiles];
             let (unit_tc, band_tr) = (&self.unit_tc, &self.band_tr);
             let [y_m, u_m, v_m] = &mut self.lf_tx;
-            let mut items: Vec<_> = bands(&mut self.pf_skip, mc, 16)
+            let items = bands(&mut self.pf_skip, mc, 16)
                 .zip(bands(y_m, mc, 16))
                 .zip(bands(u_m, mc >> ss, 16 >> ss).zip(bands(v_m, mc >> ss, 16 >> ss)))
-                .zip(bands(&mut self.cdef_idx, uc, 1).zip(bands(&mut self.summ, uc, 1)))
-                .collect();
-            par(threads, &mut items, |k, (((skip, tx), (u, v)), (cdef, summ))| {
+                .zip(bands(&mut self.cdef_idx, uc, 1).zip(bands(&mut self.summ, uc, 1)));
+            par(threads, ur, items, |k, (((skip, tx), (u, v)), (cdef, summ))| {
                 let tr = band_tr[k] as usize;
                 let (r0, r1) = (16 * k, (16 * k + 16).min(mr));
                 for x in 0..uc {
@@ -835,11 +837,9 @@ impl Decoder {
                 let cols = c0.saturating_sub(1)..(c1 + 2).min(mc);
                 rows.clone().all(|y| (c0..c1).all(|x| z(y, x))) && (r0..r1).all(|y| cols.clone().all(|x| z(y, x)))
             };
-            let mut items: Vec<_> = bands(&mut self.kind, uc, 1)
-                .zip(bands(&mut self.t_ids, uc, 1).zip(bands(&mut d.ids, uc, 1)))
-                .collect();
-            let counts = Mutex::new((0u32, 0u32, 0u32));
-            par(threads, &mut items, |uy, (kind, (tids, dids))| {
+            let items = bands(&mut self.kind, uc, 1).zip(bands(&mut self.t_ids, uc, 1).zip(bands(&mut d.ids, uc, 1)));
+            let counts: [AtomicUsize; 3] = Default::default();
+            par(threads, ur, items, |uy, (kind, (tids, dids))| {
                 let (mut a, mut b, mut c) = (0, 0, 0);
                 for ux in 0..uc {
                     let u = uy * uc + ux;
@@ -878,12 +878,12 @@ impl Decoder {
                     kind[ux] = k | if dids[ux] != d_new || k == K_FILTER { K_DIRTY } else { 0 };
                     dids[ux] = d_new;
                 }
-                let mut g = counts.lock().unwrap_or_else(|e| e.into_inner());
-                g.0 += a;
-                g.1 += b;
-                g.2 += c;
+                for (n, v) in counts.iter().zip([a, b, c]) {
+                    n.fetch_add(v, Ordering::Relaxed);
+                }
             });
-            counts.into_inner().unwrap_or_else(|e| e.into_inner())
+            let [a, b, c] = counts.map(|n| n.into_inner() as u32);
+            (a, b, c)
         };
         let ms_maps = ms(t2);
 
@@ -918,12 +918,11 @@ impl Decoder {
             {
                 let [s0, s1, s2] = &mut self.s;
                 let rows: [usize; 3] = core::array::from_fn(|p| 64 >> geo.sub(p));
-                let mut items: Vec<_> = bands(s0, stride[0], rows[0])
+                let items = bands(s0, stride[0], rows[0])
                     .zip(bands(s1, stride[1].max(1), rows[1]).chain(std::iter::repeat_with(|| &mut [][..])))
                     .zip(bands(s2, stride[2].max(1), rows[2]).chain(std::iter::repeat_with(|| &mut [][..])))
-                    .zip(bands(&mut self.s_ids, uc, 1))
-                    .collect();
-                par(threads, &mut items, |uy, (((a, b), c), sids)| {
+                    .zip(bands(&mut self.s_ids, uc, 1));
+                par(threads, ur, items, |uy, (((a, b), c), sids)| {
                     let band: [&mut [u8]; 3] = [a, b, c];
                     let t_row = band_tr[uy] as usize;
                     for ux in 0..uc {
@@ -958,10 +957,12 @@ impl Decoder {
                 for pass in 0..2 {
                     for phase in 0..1 + pass {
                         let [s0, s1, s2] = &mut self.s;
-                        let mut items: Vec<(usize, [(&mut [u8], usize); 3])> = Vec::new();
+                        // the bands of this phase, each split off the rest as it's taken
                         let mut rest: [&mut [u8]; 3] = [s0, s1, s2];
                         let mut at = [0usize; 3];
-                        for uy in (phase..ur).step_by(1 + pass) {
+                        let mut uys = (phase..ur).step_by(1 + pass);
+                        let items = std::iter::from_fn(move || {
+                            let uy = uys.next()?;
                             let mut e: [(&mut [u8], usize); 3] = Default::default();
                             for pl in 0..nplanes {
                                 let rows = 64 >> geo.sub(pl);
@@ -974,10 +975,10 @@ impl Decoder {
                                 at[pl] = y1;
                                 e[pl] = (band, y0);
                             }
-                            items.push((uy, e));
-                        }
-                        par(threads, &mut items, |_, (uy, e)| {
-                            let uy = *uy;
+                            Some((uy, e))
+                        });
+                        let n = (ur - phase).div_ceil(1 + pass);
+                        par(threads, n, items, |_, (uy, mut e)| {
                             for ux in 0..uc {
                                 if k_of(ux as isize, uy as isize) != K_FILTER {
                                     continue;
@@ -1002,12 +1003,11 @@ impl Decoder {
             let src: [&[u8]; 3] = [&self.s[0], &self.s[1], &self.s[2]];
             let [d0, d1, d2] = &mut d.planes;
             let rows: [usize; 3] = core::array::from_fn(|p| 64 >> geo.sub(p));
-            let mut items: Vec<_> = bands(d0, stride[0], rows[0])
+            let items = bands(d0, stride[0], rows[0])
                 .zip(bands(d1, stride[1].max(1), rows[1]).chain(std::iter::repeat_with(|| &mut [][..])))
-                .zip(bands(d2, stride[2].max(1), rows[2]).chain(std::iter::repeat_with(|| &mut [][..])))
-                .collect();
+                .zip(bands(d2, stride[2].max(1), rows[2]).chain(std::iter::repeat_with(|| &mut [][..])));
             let written = AtomicUsize::new(0);
-            par(threads, &mut items, |uy, ((a, b), c)| {
+            par(threads, ur, items, |uy, ((a, b), c)| {
                 let mut band: [&mut [u8]; 3] = [a, b, c];
                 let t_row = band_tr[uy] as usize;
                 let mut nw = 0;

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstring>
 #include "av1g/av1g.h"
+#include "av1g/decoder.h"
 #include "av1enc.h"
 
 #define S(name, T) if (!strcmp(what, name)) return (long long)sizeof(T);
@@ -35,6 +36,11 @@ extern "C" long long oracle_layout(const char *what) {
     S("Tiles", av1g_tiles) O("Tiles", av1g_tiles, cols) O("Tiles", av1g_tiles, mi_col_starts) O("Tiles", av1g_tiles, mi_row_starts)
     S("Parsed", av1g_parsed) O("Parsed", av1g_parsed, seq_level_idx) O("Parsed", av1g_parsed, tile_bytes)
     O("Parsed", av1g_parsed, error) O("Parsed", av1g_parsed, priv)
+    S("DecPicture", av1g_dec_picture) O("DecPicture", av1g_dec_picture, planes) O("DecPicture", av1g_dec_picture, stride)
+    O("DecPicture", av1g_dec_picture, plane_w) O("DecPicture", av1g_dec_picture, plane_h)
+    O("DecPicture", av1g_dec_picture, width) O("DecPicture", av1g_dec_picture, render_width)
+    O("DecPicture", av1g_dec_picture, chroma_format) O("DecPicture", av1g_dec_picture, key)
+    O("DecPicture", av1g_dec_picture, color_primaries) O("DecPicture", av1g_dec_picture, color_range)
     S("AvifMeta", av1g_avif_meta) O("AvifMeta", av1g_avif_meta, icc_size) O("AvifMeta", av1g_avif_meta, imir)
     S("GaPfAddrs", GaPfAddrs) O("GaPfAddrs", GaPfAddrs, stride) O("GaPfAddrs", GaPfAddrs, skip) O("GaPfAddrs", GaPfAddrs, lfTx)
     O("GaPfAddrs", GaPfAddrs, cdefDirVar)

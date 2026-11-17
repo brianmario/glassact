@@ -354,7 +354,53 @@ pub struct GaEntTile {
     pub sb_cols: i32,
 }
 
+/// av1g_dec_picture (av1g/decoder.h): a decoded frame's planes and format, for the C API.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DecPicture {
+    pub planes: [*const u8; 3],
+    pub stride: [u32; 3],
+    pub plane_w: [u32; 3],
+    pub plane_h: [u32; 3],
+    pub width: u32,
+    pub height: u32,
+    pub render_width: u32,
+    pub render_height: u32,
+    pub chroma_format: u8,
+    pub monochrome: u8,
+    pub key: u8,
+    pub reserved: u8,
+    pub color_primaries: u32,
+    pub transfer_characteristics: u32,
+    pub matrix_coefficients: u32,
+    pub color_range: u32,
+}
+
+impl Default for DecPicture {
+    fn default() -> Self {
+        DecPicture {
+            planes: [core::ptr::null(); 3],
+            stride: [0; 3],
+            plane_w: [0; 3],
+            plane_h: [0; 3],
+            width: 0,
+            height: 0,
+            render_width: 0,
+            render_height: 0,
+            chroma_format: 0,
+            monochrome: 0,
+            key: 0,
+            reserved: 0,
+            color_primaries: 0,
+            transfer_characteristics: 0,
+            matrix_coefficients: 0,
+            color_range: 0,
+        }
+    }
+}
+
 const _: () = {
+    assert!(size_of::<DecPicture>() == 96);
     assert!(size_of::<FrameParams>() == 88);
     assert!(core::mem::offset_of!(FrameParams, chroma_format) == 87);
     assert!(size_of::<Block>() == 16);
@@ -411,5 +457,8 @@ mod tests {
         check!(GaCdefCand, "GaCdefCand", sec: "sec", nsec: "nsec");
         check!(GaEntFrame, "GaEntFrame", cdef_bits: "cdefBits", ctx_base: "ctxBase", ctx_total: "ctxTotal", tile_hsb: "tileHsb", sym_cap: "symCap");
         check!(GaEntTile, "GaEntTile", first_block: "firstBlock", sb_cols: "sbCols");
+        check!(DecPicture, "DecPicture", planes: "planes", stride: "stride", plane_w: "plane_w", plane_h: "plane_h",
+               width: "width", render_width: "render_width", chroma_format: "chroma_format", key: "key");
+        check!(DecPicture, "DecPicture", color_primaries: "color_primaries", color_range: "color_range");
     }
 }

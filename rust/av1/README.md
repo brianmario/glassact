@@ -8,6 +8,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 | Module | What |
 |---|---|
 | `writer` | the DecisionRecord writer: decisions and quantized coefficients in, OBUs and the decoder's exact reconstruction out; still pictures, and key and inter frames of video streams (the MV candidate stack, inter modes derived from the MVs); 64x64 or 128x128 superblocks; palette blocks; intra block copy; tiles on threads, and with a reconstruction its blocks on every thread apart from their coding (`writer::recon`); the closed-loop hook; the parser |
+| `decoder` | the decoder for the writer's streams (the Viewer's AV1 where VideoToolbox has none: 4:4:4, M1 / M2, Intel): a temporal unit in, the shown frame's planes out; tiles parsed and reconstructed in one walk each on the pool (`writer::decode`), then per 64x64 a copy of a reference, the tile's samples, or deblocking and CDEF (`postfilter::deblock_rect`, `cdef_rect`); hostile input refused with errors |
 | `dsp`, `blockinfo` | the decoder-mirroring DSP: intra and inter prediction (motion compensation), inverse transforms, dequantization, block geometry |
 | `postfilter` | deblocking and CDEF, exactly as the decoder applies them |
 | `entropy` | the range encoder, CDF contexts, symbol streams |
@@ -17,7 +18,7 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 | `motion` | inter frames' exact copies: 64x64s that equal the previous source, unchanged or shifted, as skip inter blocks (with 128x128 superblocks, a 128x128 of one shift as one block) |
 | `pool` | the worker threads every parallel loop shares, started once and parked between loops |
 | `testsupport` | random legal records and inter sequences, the reference engine, the GPU's DSP cases (tests only) |
-| `capi` | the C API Swift links (`Sources/AV1Core/include/av1g/av1g.h`, `Sources/AV1Encoder/include/av1enc.h`, `Sources/AV1CoreTestSupport/include/av1core_test.h`) |
+| `capi` | the C API Swift links (`Sources/AV1Core/include/av1g/av1g.h`, `av1g/decoder.h`, `Sources/AV1Encoder/include/av1enc.h`, `Sources/AV1CoreTestSupport/include/av1core_test.h`) |
 
 The Metal kernels keep their own copy of the DSP. MSL is a C++ dialect, so they compile the C
 headers in `Sources/AV1Core/include/av1g`. The Swift tests hold the GPU and this crate to the same
@@ -41,6 +42,13 @@ level model and a luma mode model) on pictures `glassact-bench av1seq --dump-par
 exports `Sources/GlassActAV1/AV1PrunerWeights.swift`. `scripts/train-pruner` runs it end to end
 from the traces listed in `scripts/pruner-traces.txt`: add a trace there and run
 `scripts/train-pruner all`, then `install`. BENCHMARKS has the data the shipped weights came from.
+
+`examples/own_decode.rs` decodes an IVF stream with `decoder` and times it (`--writer`: the
+parser and the writer's reconstruction instead); with libaom's decode beside it, it compares every
+frame. The decoder's tests hold it to the writer's reconstructions, to dav1d and aomdec
+(`cargo test --release -- --ignored --nocapture decoders`), to hostile input (`hostile_input`, and
+`hostile_input_long` at length), and with `OWNDEC_DIR` to a directory of streams and libaom's I420
+decodes (`streams_match_libaom`).
 
 `src/tables` is generated from the C table headers (`scripts/gen-av1-rust-tables`) so that the CPU
 and the GPU use the same values. Never edit it by hand. The inter frames' tables

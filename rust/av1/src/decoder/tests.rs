@@ -449,6 +449,72 @@ fn refusals() {
     }
 }
 
+/// The C API (av1g/decoder.h) over the decoder: a stream's frames, the picture again, errors with
+/// their messages, reset.
+#[cfg(feature = "capi")]
+#[test]
+fn c_api() {
+    use crate::capi::*;
+    use crate::types::DecPicture;
+    let mut seq = InterSeq::make(11, 150, 4).unwrap();
+    let outs = encode_seq(&mut Writer::with_threads(1), &mut seq, ENC_FIX_RANGE | ENC_TD).unwrap();
+    let d = av1g_decoder_create(3);
+    let mut err = [0 as core::ffi::c_char; 128];
+    let msg = |e: &[core::ffi::c_char]| {
+        unsafe { core::ffi::CStr::from_ptr(e.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    for (k, o) in outs.iter().enumerate() {
+        let mut p = DecPicture::default();
+        let r = unsafe { av1g_decoder_decode(d, o.obu.as_ptr(), o.obu.len(), &mut p, err.as_mut_ptr(), err.len()) };
+        assert_eq!(r, crate::types::OK, "frame {k}: {}", msg(&err));
+        let n = if p.monochrome != 0 { 1 } else { 3 };
+        for pl in 0..n {
+            assert_eq!((p.plane_w[pl], p.plane_h[pl]), (o.recon_w[pl], o.recon_h[pl]));
+            for y in 0..p.plane_h[pl] as usize {
+                let row = unsafe {
+                    core::slice::from_raw_parts(p.planes[pl].add(y * p.stride[pl] as usize), p.plane_w[pl] as usize)
+                };
+                assert!(
+                    row == &o.recon[pl][y * o.recon_w[pl] as usize..][..o.recon_w[pl] as usize],
+                    "frame {k} plane {pl}"
+                );
+            }
+        }
+        assert!(n == 3 || p.planes[1].is_null());
+        assert_eq!(p.key != 0, seq.frames[k].fp.frame_type == FRAME_KEY);
+        let mut again = DecPicture::default();
+        assert_eq!(unsafe { av1g_decoder_picture(d, &mut again) }, crate::types::OK);
+        assert_eq!((again.planes, again.width, again.key), (p.planes, p.width, p.key));
+    }
+    let mut p = DecPicture::default();
+    let r = unsafe { av1g_decoder_decode(d, [0x12u8, 0].as_ptr(), 2, &mut p, err.as_mut_ptr(), err.len()) };
+    assert_eq!(r, crate::types::ERR_INVALID);
+    assert!(msg(&err).contains("no frame"), "{}", msg(&err));
+    assert!(p.planes[0].is_null());
+    assert_eq!(unsafe { av1g_decoder_picture(d, &mut p) }, crate::types::ERR_INVALID);
+    unsafe { av1g_decoder_reset(d) };
+    assert_eq!(
+        unsafe { av1g_decoder_decode(d, core::ptr::null(), 0, &mut p, core::ptr::null_mut(), 0) },
+        crate::types::ERR_INVALID
+    );
+    assert_eq!(
+        unsafe {
+            av1g_decoder_decode(
+                core::ptr::null_mut(),
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+            )
+        },
+        crate::types::ERR_INVALID
+    );
+    unsafe { av1g_decoder_destroy(d) };
+}
+
 // ---- hostile input ----
 
 /// A stream: its temporal units and what they decode to.

@@ -981,8 +981,9 @@ fn decoders() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Each installed decoder of `tools` decodes the frames `outs` (of a stream with the first frame's
-/// `fp`) to exactly their reconstructions. `kinds`: what each frame is, for the messages.
+/// Each installed decoder of `tools`, and the crate's own (`crate::decoder`), decodes the frames
+/// `outs` (of a stream with the first frame's `fp`) to exactly their reconstructions. `kinds`: what
+/// each frame is, for the messages.
 pub(super) fn decode_check(
     dir: &std::path::Path,
     tools: &[(&str, Vec<&str>)],
@@ -991,6 +992,27 @@ pub(super) fn decode_check(
     fp: &FrameParams,
     kinds: &[&str],
 ) {
+    let mut own = crate::decoder::Decoder::new(2);
+    for (k, o) in outs.iter().enumerate() {
+        let p = own
+            .decode(&o.obu)
+            .unwrap_or_else(|e| panic!("{name} frame {k} ({}): the crate's decoder: {e}", kinds[k]));
+        for pl in 0..if p.monochrome { 1 } else { 3 } {
+            let w = o.recon_w[pl] as usize;
+            assert_eq!(
+                (p.plane_w[pl], p.plane_h[pl]),
+                (o.recon_w[pl], o.recon_h[pl]),
+                "{name} frame {k}"
+            );
+            for y in 0..o.recon_h[pl] as usize {
+                assert!(
+                    p.planes[pl][y * p.stride[pl]..][..w] == o.recon[pl][y * w..][..w],
+                    "{name} frame {k} ({}): the crate's decoder differs in plane {pl} row {y}",
+                    kinds[k]
+                );
+            }
+        }
+    }
     let src = dir.join(format!("{name}.ivf"));
     std::fs::write(&src, ivf(outs, fp.width, fp.height)).unwrap();
     for (tool, args) in tools {
