@@ -161,6 +161,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.params.shapeMask = newValue }
     }
 
+    /// A 4:4:4 picture's palettes (luma and chroma, by cost; rust/av1 hybrid::palette) and, with
+    /// them, analysis shapes of 8×8 and up: on (BENCHMARKS "the hybrid's 4:4:4 tiles against
+    /// libaom's"). Its text and UI become palette blocks as libaom codes them, 8×8 and larger.
+    /// Off: as 4:2:0 pictures are coded (`palette`'s setting, every shape).
+    public var chroma444Palettes = true
+
+    /// The shapes a 4:4:4 picture's analysis tries with `chroma444Palettes`: the preset's less
+    /// 4×4, 4×8 and 8×4 (GpParams.shapeMask bits 0–2), which a palette can't be.
+    var chroma444Shapes: Int32 { metal.params.shapeMask & ~0x7 }
+
     /// Uniform tiles, as log2 of the columns and rows (-1: the fewest legal).
     /// The CPU codes tiles on parallel threads, so pictures want many.
     public var tiling: (columnsLog2: Int, rowsLog2: Int) {
@@ -1476,7 +1486,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 try (analysisChroma?.v ?? p.v).withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
-                                             motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort)
+                                             motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort,
+                                             shapes: p.chroma444 && chroma444Palettes ? chroma444Shapes : nil)
                 }
             }
         }
@@ -1610,6 +1621,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
         Self.trace("closed loop start")
         av1enc_hybrid_set_chroma_444(cpu, p.chroma444 ? 1 : 0)
+        // (palettes per picture: a 4:4:4 one's, or the stream's setting)
+        av1enc_hybrid_set_palette(cpu, palette || (p.chroma444 && chroma444Palettes) ? 1 : 0)
         let rc = p.y.withUnsafeBufferPointer { y in
             p.u.withUnsafeBufferPointer { u in
                 p.v.withUnsafeBufferPointer { v in

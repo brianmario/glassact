@@ -651,7 +651,6 @@ fn best_palette(
     let mut colors = [0u8; 8];
     let mut lut = [0u8; 256];
     let mut last_n = 0;
-    let mut prev_j = f64::MAX;
     for kk in 2..=8usize.min(g.n) {
         let n = cluster(g, kk, &mut colors);
         if n < 2 || n == last_n {
@@ -690,11 +689,7 @@ fn best_palette(
             best_j = jp;
             best = Some((jp, n, colors));
             sc.best_map[..w * h].copy_from_slice(&sc.map[..w * h]);
-        } else if jp > prev_j {
-            // worse than with fewer colours: J rises from here on
-            break;
         }
-        prev_j = jp;
     }
     best
 }
@@ -1147,7 +1142,7 @@ fn decide_uv(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: u32
     let mut best: Option<(usize, [(u8, u8); 8])> = None;
     let mut best_j = j_cur;
     let mut cols = [(0u8, 0u8); 8];
-    let (mut last_n, mut prev_j) = (0, f64::MAX);
+    let mut last_n = 0;
     for kk in 2..=8usize.min(m) {
         let n = cluster_uv(&sc.pairs, &sc.pair_n, kk, &mut cols);
         if n < 2 || n == last_n {
@@ -1206,10 +1201,7 @@ fn decide_uv(cx: &Ctx, sc: &mut PalScratch, u: &mut Unit, k: usize, map_off: u32
             best_j = jp;
             best = Some((n, cols));
             sc.best_map[..w * h].copy_from_slice(&sc.map[..w * h]);
-        } else if jp > prev_j {
-            break;
         }
-        prev_j = jp;
     }
     let Some((n, cols)) = best else { return };
     let bm = &mut u.blocks[k];

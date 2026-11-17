@@ -370,8 +370,13 @@ fn same_palettes(a: &Record, a0: usize, b: &Record, b0: usize, n: usize) -> bool
         if pa.size_y == 0 && pa.size_uv == 0 {
             return true;
         }
-        let bs = a.blocks[a0 + k].bsize as i32;
-        let len = (bw4(bs) * bh4(bs) * 16) as usize * (1 + (pa.size_uv != 0) as usize);
+        let blk = &a.blocks[a0 + k];
+        let bs = blk.bsize as i32;
+        // the maps it has: luma's, then chroma's (4:4:4: luma's size; 4:2:0: map_dims')
+        let ss = (a.fp.chroma_format == CHROMA_420) as i32;
+        let (mc, mr) = (mi_cols(a.fp.width as i32), mi_rows(a.fp.height as i32));
+        let uv = crate::writer::map_dims(bs, blk.mi_row as i32, blk.mi_col as i32, mr, mc, true, ss);
+        let len = (pa.size_y != 0) as usize * (bw4(bs) * bh4(bs) * 16) as usize + (pa.size_uv != 0) as usize * uv.w * uv.h;
         let (ma, mb) = (pa.map_off as usize, pb.map_off as usize);
         match (a.palette_map.get(ma..ma + len), b.palette_map.get(mb..mb + len)) {
             (Some(x), Some(y)) => x == y,
