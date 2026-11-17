@@ -5,7 +5,6 @@
 // Order (spec 7.14 / 7.15): p_mark fills the maps; p_deblock pass 0 (vertical edges), then
 // pass 1 (horizontal), every plane at once; then CDEF reads the deblocked planes and writes
 // separate output planes.
-#include "cuda_compat.h"
 #include "av1g/hd.h"
 #include "av1g/enums_gen.h"
 #include "av1g/spec_tables.h"

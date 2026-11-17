@@ -61,7 +61,7 @@ static inline threadgroup uint8_t *plOf(threadgroup ASmem<W, H> &S) {
 }
 
 // Glass Act: the sum of absolute coefficients, a whole number (hadamard4_abs: a quarter of it)
-__device__ __forceinline__ int hadamard4_sum(int *d) {
+__attribute__((always_inline)) int hadamard4_sum(int *d) {
     // rows
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -77,14 +77,14 @@ __device__ __forceinline__ int hadamard4_sum(int *d) {
     }
     return sum;
 }
-__device__ __forceinline__ float hadamard4_abs(int *d) { return (float)hadamard4_sum(d) * 0.25f; }
+__attribute__((always_inline)) float hadamard4_abs(int *d) { return (float)hadamard4_sum(d) * 0.25f; }
 
-__device__ __forceinline__ int pangle_of(int mode, int delta) {
+__attribute__((always_inline)) int pangle_of(int mode, int delta) {
     return av1g_is_directional(mode) ? AV1G_T(Mode_To_Angle)[mode] + delta * AV1G_ANGLE_STEP : 0;
 }
 
 // prediction of pixel (i, j) for candidate c, edges A/L, dc value dcv
-__device__ __forceinline__ int pred_px(int c, int i, int j, int lw, int lh, const uint8_t *A, const uint8_t *L, int dcv) {
+__attribute__((always_inline)) int pred_px(int c, int i, int j, int lw, int lh, const uint8_t *A, const uint8_t *L, int dcv) {
     const int m = cand_mode(c);
     if (m == AV1G_DC_PRED) return dcv;
     return av1g_pred_pixel(m, pangle_of(m, cand_delta(c)), i, j, lw, lh, A, L);
@@ -98,7 +98,7 @@ struct PredCand {
     int mode, zone, dx, dy, w, h;  // zone: 0 DC, 1 <90, 2 90..180, 3 >180, 4 90, 5 180, 6 non-directional
     AV1G_CONST const uint8_t *wx, *wy;
 };
-__device__ __forceinline__ PredCand pred_cand(int c, int lw, int lh) {
+__attribute__((always_inline)) PredCand pred_cand(int c, int lw, int lh) {
     PredCand p;
     p.mode = cand_mode(c);
     p.w = 1 << lw; p.h = 1 << lh;
@@ -114,7 +114,7 @@ __device__ __forceinline__ PredCand pred_cand(int c, int lw, int lh) {
     else { p.zone = 3; p.dy = AV1G_T(Dr_Intra_Derivative)[270 - a]; }
     return p;
 }
-__device__ __forceinline__ int pred_fast(thread const PredCand &p, int i, int j, const uint8_t *A, const uint8_t *L, int dcv) {
+__attribute__((always_inline)) int pred_fast(thread const PredCand &p, int i, int j, const uint8_t *A, const uint8_t *L, int dcv) {
     switch (p.zone) {
     case 0: return dcv;
     case 4: return A[j];
@@ -150,7 +150,7 @@ __device__ __forceinline__ int pred_fast(thread const PredCand &p, int i, int j,
 
 // pred_cand of mode m at delta 0, from literals (Mode_To_Angle, Dr_Intra_Derivative), so that a
 // constant m leaves a constant
-__device__ __forceinline__ PredCand pred_cand0(int m, int lw, int lh) {
+__attribute__((always_inline)) PredCand pred_cand0(int m, int lw, int lh) {
     PredCand p;
     p.mode = m;
     p.w = 1 << lw; p.h = 1 << lh;
@@ -173,7 +173,7 @@ __device__ __forceinline__ PredCand pred_cand0(int m, int lw, int lh) {
 
 // SATD of candidates cands[c0..c1) (all 4x4 sub-blocks), accumulated into satd[]
 template <int W, int H, int NT = 32>
-__device__ __forceinline__ void warp_screen(const uint8_t *src, int sp, const int *cands, int c0, int c1, threadgroup float *satd,
+__attribute__((always_inline)) void warp_screen(const uint8_t *src, int sp, const int *cands, int c0, int c1, threadgroup float *satd,
                                             const uint8_t *A, const uint8_t *L, int dcv, int lane, int sub = 1) {
     typedef TxD<W, H> T;
     constexpr int nsx = W / 4, nsub0 = (W / 4) * (H / 4);
@@ -285,7 +285,7 @@ static inline int ga_abs4(int4 v) { return abs(v.x) + abs(v.y) + abs(v.z) + abs(
 // order (warp_screen), so a lane's whole-number partials, summed over a SIMD-group and added once
 // a SIMD-group, give the same totals. Shapes with fewer than 32 items a mode keep warp_screen.
 template <int W, int H, int NT>
-__device__ __forceinline__ void warp_screen_modes(const uint8_t *src, int sp, uint mm, threadgroup float *satd, const uint8_t *A,
+__attribute__((always_inline)) void warp_screen_modes(const uint8_t *src, int sp, uint mm, threadgroup float *satd, const uint8_t *A,
                                                   const uint8_t *L, int dcv, int tsc, int sub, const int *cands) {
     typedef TxD<W, H> T;
     constexpr int nsx = W / 4, nsub0 = (W / 4) * (H / 4);
@@ -413,7 +413,7 @@ __device__ __forceinline__ void warp_screen_modes(const uint8_t *src, int sp, ui
 // constant (pred_cand0), so its predictor is compiled for itself: the same samples p0, p0 + step,
 // ..., the same residuals, and (sq) the same float sum of their squares in the same order
 template <int W, int H, int M>
-__device__ __forceinline__ float ga_res_mode(const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L, int dcv,
+__attribute__((always_inline)) float ga_res_mode(const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L, int dcv,
                                              int p0, int step, bool sq) {
     typedef TxD<W, H> T;
     const PredCand pc = pred_cand0(M, T::lw, T::lh);
@@ -427,7 +427,7 @@ __device__ __forceinline__ float ga_res_mode(const uint8_t *src, int sp, int16_t
     return e;
 }
 template <int W, int H>
-__device__ __forceinline__ float ga_res_modes(int m, const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L,
+__attribute__((always_inline)) float ga_res_modes(int m, const uint8_t *src, int sp, int16_t *res, const uint8_t *A, const uint8_t *L,
                                               int dcv, int p0, int step, bool sq) {
     switch (m) {
     case 0: return ga_res_mode<W, H, 0>(src, sp, res, A, L, dcv, p0, step, sq);
@@ -452,7 +452,7 @@ __device__ __forceinline__ float ga_res_modes(int m, const uint8_t *src, int sp,
 // the sum of squares read back from res by the first NT, each over the samples and in the order
 // it would have computed them (p = lane, lane + NT, ...): the same float sum.
 template <int W, int H, int NT = 32, int NTS = NT>
-__device__ __forceinline__ float warp_residual(const uint8_t *src, int sp, int c, int16_t *res, const uint8_t *A,
+__attribute__((always_inline)) float warp_residual(const uint8_t *src, int sp, int c, int16_t *res, const uint8_t *A,
                                                const uint8_t *L, int dcv, int lane, uint8_t *pa = nullptr, uint8_t *pl = nullptr,
                                                int *up = nullptr, int edgeFilter = 0, int haveL = 0, int haveA = 0, int x = 0,
                                                int y = 0, int maxX = 0, int maxY = 0, float *red = nullptr, int tsc = 0) {
@@ -586,7 +586,7 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         device const uint8_t *src = I.src[0] + (size_t)y * I.spitch[0] + x;
         const int sp = I.spitch[0];
         const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
-        const float lamS = P.satdLambda * sqrtf(lambda);
+        const float lamS = P.satdLambda * sqrt(lambda);
         AV1G_CONST const float *C = g_cost[I.qctx];
         if (P.pruneVar > 0.f && W * H >= P.pruneMinArea) {
             float s1 = 0.f, s2 = 0.f;

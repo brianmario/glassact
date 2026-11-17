@@ -22,7 +22,6 @@
 // - __match_any_sync is a ballot loop over the window's distinct CDFs.
 // - The CDF defaults (4 coefficient q contexts) are made once per encoder, not per batch.
 #pragma once
-#include "cuda_compat.h"
 #include "av1g/hd.h"
 #include "av1g/enums_gen.h"
 #include "av1g/spec_tables.h"

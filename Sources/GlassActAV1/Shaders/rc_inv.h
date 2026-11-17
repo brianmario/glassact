@@ -1,5 +1,5 @@
-// Glass Act: av1gpu encoder/src/rc_inv.cuh (BSD-2, Sources/AV1Core/LICENSE), for Metal through
-// cuda_compat.h; only `qm` gained AV1G_CONST. RcInvTests checks it against av1core's av1g_inv_txfm2d.
+// Glass Act: av1gpu encoder/src/rc_inv.cuh (BSD-2, Sources/AV1Core/LICENSE), for Metal: CUDA's
+// spellings are Metal's; only `qm` gained AV1G_CONST. RcInvTests checks it against av1core's av1g_inv_txfm2d.
 // W4: register-resident exact inverse transforms for k_recon.
 //
 // Templated copies of av1core dsp.h av1g_idct / av1g_iadst4/8/16 / av1g_iidentity / av1g_inv_1d with the
@@ -10,22 +10,21 @@
 #pragma once
 #include <stdint.h>
 #include "av1g/dsp.h"
-#include "cuda_compat.h"
 
 namespace rci {
 
-__host__ __device__ constexpr int brev(int numBits, int x) {
+constexpr int brev(int numBits, int x) {
     int t = 0;
     for (int i = 0; i < numBits; i++) t |= ((x >> i) & 1) << (numBits - 1 - i);
     return t;
 }
-__device__ __forceinline__ int cos128(int angle) { return av1g_cos128(angle); }
-__device__ __forceinline__ int sin128(int angle) { return av1g_cos128(angle - 64); }
-__device__ __forceinline__ void chk(int64_t v, int bits, uint32_t &err, uint32_t flag) {
+__attribute__((always_inline)) int cos128(int angle) { return av1g_cos128(angle); }
+__attribute__((always_inline)) int sin128(int angle) { return av1g_cos128(angle - 64); }
+__attribute__((always_inline)) void chk(int64_t v, int bits, uint32_t &err, uint32_t flag) {
     if (v < -((int64_t)1 << (bits - 1)) || v > ((int64_t)1 << (bits - 1)) - 1) err |= flag;
 }
 template <int L>
-__device__ __forceinline__ void B(int32_t (&T)[L], int a, int b, int angle, int flip, int r, uint32_t &err) {
+__attribute__((always_inline)) void B(int32_t (&T)[L], int a, int b, int angle, int flip, int r, uint32_t &err) {
     const int64_t c = cos128(angle), s = sin128(angle);
     const int64_t x = (int64_t)T[a] * c - (int64_t)T[b] * s;
     const int64_t y = (int64_t)T[a] * s + (int64_t)T[b] * c;
@@ -36,7 +35,7 @@ __device__ __forceinline__ void B(int32_t (&T)[L], int a, int b, int angle, int 
     else      { T[a] = (int32_t)xa; T[b] = (int32_t)yb; }
 }
 template <int L>
-__device__ __forceinline__ void H(int32_t (&T)[L], int a, int b, int flip, int r) {
+__attribute__((always_inline)) void H(int32_t (&T)[L], int a, int b, int flip, int r) {
     if (flip) { const int t = a; a = b; b = t; }
     const int64_t x = T[a], y = T[b];
     const int64_t lo = -((int64_t)1 << (r - 1)), hi = ((int64_t)1 << (r - 1)) - 1;
@@ -46,7 +45,7 @@ __device__ __forceinline__ void H(int32_t (&T)[L], int a, int b, int flip, int r
 }
 
 template <int n>
-__device__ __forceinline__ void idct(int32_t (&T)[1 << n], int r, uint32_t &err) {
+__attribute__((always_inline)) void idct(int32_t (&T)[1 << n], int r, uint32_t &err) {
     constexpr int n0 = 1 << n;
     int32_t copyT[n0];
 #pragma unroll
@@ -185,7 +184,7 @@ __device__ __forceinline__ void idct(int32_t (&T)[1 << n], int r, uint32_t &err)
 }
 
 template <int n>
-__device__ __forceinline__ void iadst_in_perm(int32_t (&T)[1 << n]) {
+__attribute__((always_inline)) void iadst_in_perm(int32_t (&T)[1 << n]) {
     constexpr int n0 = 1 << n;
     int32_t copyT[n0];
 #pragma unroll
@@ -194,7 +193,7 @@ __device__ __forceinline__ void iadst_in_perm(int32_t (&T)[1 << n]) {
     for (int i = 0; i < n0; i++) T[i] = copyT[(i & 1) ? (i - 1) : (n0 - i - 1)];
 }
 template <int n>
-__device__ __forceinline__ void iadst_out_perm(int32_t (&T)[1 << n]) {
+__attribute__((always_inline)) void iadst_out_perm(int32_t (&T)[1 << n]) {
     constexpr int n0 = 1 << n;
     int32_t copyT[n0];
 #pragma unroll
@@ -210,7 +209,7 @@ __device__ __forceinline__ void iadst_out_perm(int32_t (&T)[1 << n]) {
     }
 }
 
-__device__ __forceinline__ void iadst4(int32_t (&T)[4], int r, uint32_t &err) {
+__attribute__((always_inline)) void iadst4(int32_t (&T)[4], int r, uint32_t &err) {
     const int64_t SINPI_1_9 = 1321, SINPI_2_9 = 2482, SINPI_3_9 = 3344, SINPI_4_9 = 3803;
     int64_t s[7], x[4];
     s[0] = SINPI_1_9 * T[0];
@@ -248,7 +247,7 @@ __device__ __forceinline__ void iadst4(int32_t (&T)[4], int r, uint32_t &err) {
 #pragma unroll
     for (int i = 0; i < 4; i++) T[i] = (int32_t)av1g_round2_64(x[i], 12);
 }
-__device__ __forceinline__ void iadst8(int32_t (&T)[8], int r, uint32_t &err) {
+__attribute__((always_inline)) void iadst8(int32_t (&T)[8], int r, uint32_t &err) {
     iadst_in_perm<3>(T);
 #pragma unroll
     for (int i = 0; i < 4; i++) B(T, 2 * i, 2 * i + 1, 60 - 16 * i, 1, r, err);
@@ -264,7 +263,7 @@ __device__ __forceinline__ void iadst8(int32_t (&T)[8], int r, uint32_t &err) {
     for (int i = 0; i < 2; i++) B(T, 2 + 4 * i, 3 + 4 * i, 32, 1, r, err);
     iadst_out_perm<3>(T);
 }
-__device__ __forceinline__ void iadst16(int32_t (&T)[16], int r, uint32_t &err) {
+__attribute__((always_inline)) void iadst16(int32_t (&T)[16], int r, uint32_t &err) {
     iadst_in_perm<4>(T);
 #pragma unroll
     for (int i = 0; i < 8; i++) B(T, 2 * i, 2 * i + 1, 62 - 8 * i, 1, r, err);
@@ -292,7 +291,7 @@ __device__ __forceinline__ void iadst16(int32_t (&T)[16], int r, uint32_t &err) 
     iadst_out_perm<4>(T);
 }
 template <int n>
-__device__ __forceinline__ void iidentity(int32_t (&T)[1 << n]) {
+__attribute__((always_inline)) void iidentity(int32_t (&T)[1 << n]) {
 #pragma unroll
     for (int i = 0; i < (1 << n); i++) {
         if constexpr (n == 2) T[i] = (int32_t)av1g_round2_64((int64_t)T[i] * 5793, 12);
@@ -303,7 +302,7 @@ __device__ __forceinline__ void iidentity(int32_t (&T)[1 << n]) {
 }
 // av1g_inv_1d for a compile-time size (kinds that do not exist at a size are never requested)
 template <int n>
-__device__ __forceinline__ void inv_1d(int32_t (&T)[1 << n], int kind, int r, uint32_t &err) {
+__attribute__((always_inline)) void inv_1d(int32_t (&T)[1 << n], int kind, int r, uint32_t &err) {
     if (kind == AV1G_K_DCT) idct<n>(T, r, err);
     else if (kind == AV1G_K_ADST) {
         if constexpr (n == 2) iadst4(T, r, err);
@@ -316,7 +315,7 @@ __device__ __forceinline__ void inv_1d(int32_t (&T)[1 << n], int kind, int r, ui
 
 // one row of the 2-D inverse (dequantization + optional rect scaling + 1-D + row shift + clip); returns err
 template <int LW>
-__device__ __forceinline__ uint32_t row(int i, int th, int tw, const int16_t *q, int dcQ, int acQ, AV1G_CONST const uint8_t *qm, int den, bool rect,
+__attribute__((always_inline)) uint32_t row(int i, int th, int tw, const int16_t *q, int dcQ, int acQ, AV1G_CONST const uint8_t *qm, int den, bool rect,
                                         int rk, int rowShift, int16_t *res) {
     constexpr int W = 1 << LW;
     int32_t Tv[W];
@@ -349,7 +348,7 @@ __device__ __forceinline__ uint32_t row(int i, int th, int tw, const int16_t *q,
 }
 // one column of the 2-D inverse (1-D + round + range flag 0x100); returns err
 template <int LH>
-__device__ __forceinline__ uint32_t col(int j, int W, int ck, int16_t *res) {
+__attribute__((always_inline)) uint32_t col(int j, int W, int ck, int16_t *res) {
     constexpr int H = 1 << LH;
     int32_t Tv[H];
 #pragma unroll

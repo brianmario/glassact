@@ -6,13 +6,13 @@
 #pragma once
 #include "dev_common.h"
 
-__device__ __forceinline__ int sq_bsize(int n) {
+__attribute__((always_inline)) int sq_bsize(int n) {
     return n == 4 ? AV1G_BLOCK_4X4 : n == 8 ? AV1G_BLOCK_8X8 : n == 16 ? AV1G_BLOCK_16X16 : n == 32 ? AV1G_BLOCK_32X32 : AV1G_BLOCK_64X64;
 }
 // block size of partition p's main sub-block for a node of size n (Partition_Subsize)
-__device__ __forceinline__ int sub_bsize(int p, int n) { return AV1G_T(Partition_Subsize)[p][sq_bsize(n)]; }
+__attribute__((always_inline)) int sub_bsize(int p, int n) { return AV1G_T(Partition_Subsize)[p][sq_bsize(n)]; }
 
-__device__ __forceinline__ float dp_blockJ(constant GpBatch &B, device const GpImage &I, int bs, int x, int y) {
+__attribute__((always_inline)) float dp_blockJ(constant GpBatch &B, device const GpImage &I, int bs, int x, int y) {
     if (bs >= AV1G_BLOCK_INVALID || I.shNbx[bs] == 0) return GP_INF;
     const int w = bw_px(bs), h = bh_px(bs);
     return B.blk[I.shOff[bs] + (uint32_t)(y / h) * I.shNbx[bs] + x / w].J;

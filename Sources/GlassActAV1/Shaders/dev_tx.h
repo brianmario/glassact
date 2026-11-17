@@ -21,12 +21,12 @@
 template <int NT>
 static inline int ga_idle_lane(int t) { return t < NT ? t : GA_IDLE_LANE + t; }
 template <int NT>
-__device__ __forceinline__ void ga_sync() {
+__attribute__((always_inline)) void ga_sync() {
     if (NT > 32) threadgroup_barrier(mem_flags::mem_threadgroup);
-    else __syncwarp();
+    else simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 template <int NT>
-__device__ __forceinline__ float ga_sum(float v, int tid, float *red) {
+__attribute__((always_inline)) float ga_sum(float v, int tid, float *red) {
     v = warp_sum(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);  // (red free)
@@ -37,7 +37,7 @@ __device__ __forceinline__ float ga_sum(float v, int tid, float *red) {
     return t;
 }
 template <int NT>
-__device__ __forceinline__ uint ga_sumu(uint v, int tid, int *redi) {
+__attribute__((always_inline)) uint ga_sumu(uint v, int tid, int *redi) {
     v = simd_sum(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -48,7 +48,7 @@ __device__ __forceinline__ uint ga_sumu(uint v, int tid, int *redi) {
     return t;
 }
 template <int NT>
-__device__ __forceinline__ int ga_max(int v, int tid, int *redi) {
+__attribute__((always_inline)) int ga_max(int v, int tid, int *redi) {
     v = warp_max(v);
     if (NT == 32) return v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -90,7 +90,7 @@ struct EvalOut {
     int eob;
 };
 
-__device__ __forceinline__ int tx_type_index_in_set(int set, int t) {
+__attribute__((always_inline)) int tx_type_index_in_set(int set, int t) {
     if (set == AV1G_TX_SET_INTRA_1) {
         for (int i = 0; i < 7; i++) if (AV1G_T(Tx_Type_Intra_Inv_Set1)[i] == t) return i;
     } else {
@@ -100,7 +100,7 @@ __device__ __forceinline__ int tx_type_index_in_set(int set, int t) {
 }
 
 // fixed part of the coefficient rate: txb_skip, tx type (luma), eob position
-static __device__ float base_bits(thread const EvalIn &e, int eob) {
+static float base_bits(thread const EvalIn &e, int eob) {
     const int txSz = e.txSz;
     const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
     AV1G_CONST const float *C = e.C;
@@ -142,7 +142,7 @@ static __device__ float base_bits(thread const EvalIn &e, int eob) {
 }
 
 // rate of the coefficient at scan position c (< eob), given all quantized levels q (natural order)
-static __device__ float coeff_bits(int c, int eob, const int16_t *q, AV1G_CONST const uint16_t *scan, int txSz, int txClass, int ptype,
+static float coeff_bits(int c, int eob, const int16_t *q, AV1G_CONST const uint16_t *scan, int txSz, int txClass, int ptype,
                             int dcCtx, AV1G_CONST const float *C) {
     const int txSzCtx = (AV1G_T(Tx_Size_Sqr)[txSz] + AV1G_T(Tx_Size_Sqr_Up)[txSz] + 1) >> 1;
     const int adj = AV1G_T(Adjusted_Tx_Size)[txSz];
@@ -212,7 +212,7 @@ static __device__ float coeff_bits(int c, int eob, const int16_t *q, AV1G_CONST 
         else b += 1.0f;
         if (v > 14) {
             const int xg = v - 14;
-            const int len = 31 - __clz(xg);
+            const int len = 31 - (int)clz((uint)(xg));
             b += (float)(2 * len + 1);
         }
     }
@@ -223,14 +223,14 @@ static __device__ float coeff_bits(int c, int eob, const int16_t *q, AV1G_CONST 
 // Runtime sizes; the passes are templated on the number of outputs per lane (TH / TW in 4..32) so
 // the accumulators stay in registers.
 template <int TH, int NT = 32>
-__device__ __forceinline__ void fwd_col_pass(const int16_t *res, float *tmp, int W, int H, int ck, int fud, int flr,
+__attribute__((always_inline)) void fwd_col_pass(const int16_t *res, float *tmp, int W, int H, int ck, int fud, int flr,
                                              AV1G_CONST const float *Fc, AV1G_CONST const float *FcT, int lane) {
     const int TS = W + 1;
     for (int j = lane; j < W; j += NT) {
         const int jj = flr ? W - 1 - j : j;
         if (ck == AV1G_K_IDT) {   // diagonal (identity transforms are never 64 long, so TH == H)
 #pragma unroll
-            for (int i = 0; i < TH; i++) tmp[i * TS + j] = __ldg(&Fc[i * H + i]) * (float)res[(fud ? H - 1 - i : i) * W + jj];
+            for (int i = 0; i < TH; i++) tmp[i * TS + j] = Fc[i * H + i] * (float)res[(fud ? H - 1 - i : i) * W + jj];
             continue;
         }
         float acc[TH];
@@ -241,11 +241,11 @@ __device__ __forceinline__ void fwd_col_pass(const int16_t *res, float *tmp, int
             AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FcT + k * H);   // FcT[k][i] = Fc[i][k], 16-byte aligned
 #pragma unroll
             for (int i4 = 0; i4 < TH / 4; i4++) {
-                const float4 f = __ldg(&f4[i4]);
-                acc[4 * i4 + 0] = fmaf(f.x, x, acc[4 * i4 + 0]);
-                acc[4 * i4 + 1] = fmaf(f.y, x, acc[4 * i4 + 1]);
-                acc[4 * i4 + 2] = fmaf(f.z, x, acc[4 * i4 + 2]);
-                acc[4 * i4 + 3] = fmaf(f.w, x, acc[4 * i4 + 3]);
+                const float4 f = f4[i4];
+                acc[4 * i4 + 0] = fma(f.x, x, acc[4 * i4 + 0]);
+                acc[4 * i4 + 1] = fma(f.y, x, acc[4 * i4 + 1]);
+                acc[4 * i4 + 2] = fma(f.z, x, acc[4 * i4 + 2]);
+                acc[4 * i4 + 3] = fma(f.w, x, acc[4 * i4 + 3]);
             }
         }
 #pragma unroll
@@ -253,7 +253,7 @@ __device__ __forceinline__ void fwd_col_pass(const int16_t *res, float *tmp, int
     }
 }
 template <int TW, int NT = 32>
-__device__ __forceinline__ void fwd_row_pass(float *tmp, int W, int th, int rk, AV1G_CONST const float *Fr, AV1G_CONST const float *FrT,
+__attribute__((always_inline)) void fwd_row_pass(float *tmp, int W, int th, int rk, AV1G_CONST const float *Fr, AV1G_CONST const float *FrT,
                                              float scale, int lane) {
     const int TS = W + 1;
     for (int i = lane; i < th; i += NT) {
@@ -262,18 +262,18 @@ __device__ __forceinline__ void fwd_row_pass(float *tmp, int W, int th, int rk, 
         for (int jj = 0; jj < TW; jj++) acc[jj] = 0.f;
         if (rk == AV1G_K_IDT) {
 #pragma unroll
-            for (int jj = 0; jj < TW; jj++) acc[jj] = __ldg(&Fr[jj * W + jj]) * tmp[i * TS + jj];
+            for (int jj = 0; jj < TW; jj++) acc[jj] = Fr[jj * W + jj] * tmp[i * TS + jj];
         } else {
             for (int k = 0; k < W; k++) {
                 const float x = tmp[i * TS + k];
                 AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FrT + k * W);   // FrT[k][jj] = Fr[jj][k]
 #pragma unroll
                 for (int j4 = 0; j4 < TW / 4; j4++) {
-                    const float4 f = __ldg(&f4[j4]);
-                    acc[4 * j4 + 0] = fmaf(f.x, x, acc[4 * j4 + 0]);
-                    acc[4 * j4 + 1] = fmaf(f.y, x, acc[4 * j4 + 1]);
-                    acc[4 * j4 + 2] = fmaf(f.z, x, acc[4 * j4 + 2]);
-                    acc[4 * j4 + 3] = fmaf(f.w, x, acc[4 * j4 + 3]);
+                    const float4 f = f4[j4];
+                    acc[4 * j4 + 0] = fma(f.x, x, acc[4 * j4 + 0]);
+                    acc[4 * j4 + 1] = fma(f.y, x, acc[4 * j4 + 1]);
+                    acc[4 * j4 + 2] = fma(f.z, x, acc[4 * j4 + 2]);
+                    acc[4 * j4 + 3] = fma(f.w, x, acc[4 * j4 + 3]);
                 }
             }
         }
@@ -282,10 +282,10 @@ __device__ __forceinline__ void fwd_row_pass(float *tmp, int W, int th, int rk, 
     }
 }
 
-__device__ __forceinline__ int log2i(int v) { return 31 - __clz(v); }
+__attribute__((always_inline)) int log2i(int v) { return 31 - (int)clz((uint)(v)); }
 
 template <int NT = 32>
-__device__ __forceinline__ void warp_fwd_rt(const int16_t *res, float *tmp, int W, int H, int txSz, int txType, int lane) {
+__attribute__((always_inline)) void warp_fwd_rt(const int16_t *res, float *tmp, int W, int H, int txSz, int txType, int lane) {
     const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W;
     const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
     const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
@@ -317,7 +317,7 @@ __device__ __forceinline__ void warp_fwd_rt(const int16_t *res, float *tmp, int 
 // sizes) the kept energy cross the SIMD-groups in one exchange instead of three. (red: 2 NT / 32
 // floats then.)
 template <int NT = 32>
-__device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o, int W, int H,
+__attribute__((always_inline)) void warp_quant_rate_rt(const float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o, int W, int H,
                                                    int lane, float *red = nullptr, int *redi = nullptr,
                                                    device const uint16_t *iscan = nullptr) {
     const int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1, n = tw * th;
@@ -329,7 +329,7 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
         const int i = idx >> lt, j = idx & (tw - 1);
         const float v = tmp[i * TS + j];
         const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
-        const float a = fabsf(v) * (float)den / (float)step;
+        const float a = fabs(v) * (float)den / (float)step;
         const float wr = e.qm ? 32.f / (float)e.qm[idx] : 1.f;
         int l = a < e.zbin ? 0 : (int)(a + (e.qmRnd ? e.rnd * wr : e.rnd));
         l = min(l, 16383);
@@ -338,8 +338,8 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
         if (iscan && l) last = max(last, (int)iscan[idx] + 1);
         const float dq = l ? (float)av1g_dequant_coef(qv, step, den) : 0.f;
         const float d = v - dq;
-        dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
-        kept = fmaf(v, v, kept);
+        dist = fma(d * d, e.qmDist ? wr * wr : 1.f, dist);
+        kept = fma(v, v, kept);
     }
     const bool k64 = W == 64 || H == 64;
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
@@ -390,7 +390,7 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
     float D = g * dist;
     if (k64) {
         if (!iscan) kept = ga_sum<NT>(kept, lane, red);
-        D += fmaxf(0.f, e.resEnergy - g * kept);
+        D += fmax(0.f, e.resEnergy - g * kept);
     }
     o.D = D;
     o.R = bits;
@@ -398,7 +398,7 @@ __device__ __forceinline__ void warp_quant_rate_rt(const float *tmp, int16_t *q,
 }
 
 template <int NT = 32>
-__device__ __forceinline__ void warp_eval_rt(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
+__attribute__((always_inline)) void warp_eval_rt(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
                                              int W, int H, int lane, float *red = nullptr, int *redi = nullptr) {
     warp_fwd_rt<NT>(res, tmp, W, H, e.txSz, e.txType, lane);
     warp_quant_rate_rt<NT>(tmp, q, e, o, W, H, lane, red, redi);
@@ -410,7 +410,7 @@ __device__ __forceinline__ void warp_eval_rt(const int16_t *res, float *tmp, int
 // a whole row of tmp before any lane writes into it. Only the rectangles and 64x64 (warp_eval):
 // 16x16 and 32x32 measured slower so (BENCHMARKS, "the analysis's forward transform").
 template <int W, int H, int NT>
-__device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int txSz, int txType, int lane) {
+__attribute__((always_inline)) void warp_fwd_ct(const int16_t *res, float *tmp, int txSz, int txType, int lane) {
     constexpr int th = H > 32 ? 32 : H, tw = W > 32 ? 32 : W, TS = W + 1;
     constexpr int SC = NT >= 2 * W ? (NT / W < th / 4 ? NT / W : th / 4) : 1, CC = th / SC;  // column pass: parts a column
     constexpr int SR = NT / th < tw / 4 ? NT / th : tw / 4, CR = tw / SR;                    // row pass: parts a row
@@ -425,7 +425,7 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
         const int jj = flr ? W - 1 - j : j;
         if (ck == AV1G_K_IDT) {
 #pragma unroll
-            for (int i = i0; i < i0 + CC; i++) tmp[i * TS + j] = __ldg(&Fc[i * H + i]) * (float)res[(fud ? H - 1 - i : i) * W + jj];
+            for (int i = i0; i < i0 + CC; i++) tmp[i * TS + j] = Fc[i * H + i] * (float)res[(fud ? H - 1 - i : i) * W + jj];
             continue;
         }
         float acc[CC];
@@ -436,11 +436,11 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
             AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FcT + k * H + i0);
 #pragma unroll
             for (int i4 = 0; i4 < CC / 4; i4++) {
-                const float4 f = __ldg(&f4[i4]);
-                acc[4 * i4 + 0] = fmaf(f.x, x, acc[4 * i4 + 0]);
-                acc[4 * i4 + 1] = fmaf(f.y, x, acc[4 * i4 + 1]);
-                acc[4 * i4 + 2] = fmaf(f.z, x, acc[4 * i4 + 2]);
-                acc[4 * i4 + 3] = fmaf(f.w, x, acc[4 * i4 + 3]);
+                const float4 f = f4[i4];
+                acc[4 * i4 + 0] = fma(f.x, x, acc[4 * i4 + 0]);
+                acc[4 * i4 + 1] = fma(f.y, x, acc[4 * i4 + 1]);
+                acc[4 * i4 + 2] = fma(f.z, x, acc[4 * i4 + 2]);
+                acc[4 * i4 + 3] = fma(f.w, x, acc[4 * i4 + 3]);
             }
         }
 #pragma unroll
@@ -457,18 +457,18 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
     if (on) {
         if (rk == AV1G_K_IDT) {
 #pragma unroll
-            for (int jj = 0; jj < CR; jj++) acc[jj] = __ldg(&Fr[(j0 + jj) * W + j0 + jj]) * tmp[i * TS + j0 + jj];
+            for (int jj = 0; jj < CR; jj++) acc[jj] = Fr[(j0 + jj) * W + j0 + jj] * tmp[i * TS + j0 + jj];
         } else {
             for (int k = 0; k < W; k++) {
                 const float x = tmp[i * TS + k];
                 AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FrT + k * W + j0);
 #pragma unroll
                 for (int j4 = 0; j4 < CR / 4; j4++) {
-                    const float4 f = __ldg(&f4[j4]);
-                    acc[4 * j4 + 0] = fmaf(f.x, x, acc[4 * j4 + 0]);
-                    acc[4 * j4 + 1] = fmaf(f.y, x, acc[4 * j4 + 1]);
-                    acc[4 * j4 + 2] = fmaf(f.z, x, acc[4 * j4 + 2]);
-                    acc[4 * j4 + 3] = fmaf(f.w, x, acc[4 * j4 + 3]);
+                    const float4 f = f4[j4];
+                    acc[4 * j4 + 0] = fma(f.x, x, acc[4 * j4 + 0]);
+                    acc[4 * j4 + 1] = fma(f.y, x, acc[4 * j4 + 1]);
+                    acc[4 * j4 + 2] = fma(f.z, x, acc[4 * j4 + 2]);
+                    acc[4 * j4 + 3] = fma(f.w, x, acc[4 * j4 + 3]);
                 }
             }
         }
@@ -496,7 +496,7 @@ __device__ __forceinline__ void warp_fwd_ct(const int16_t *res, float *tmp, int 
 #if defined(__HAVE_SIMDGROUP_MATRIX__)
 #define GA_FWD_MMA 1
 template <int W, int NT, typename FPtr>
-__device__ __forceinline__ void warp_fwd_mma(const threadgroup int16_t *res, threadgroup float *tmp, FPtr F,
+__attribute__((always_inline)) void warp_fwd_mma(const threadgroup int16_t *res, threadgroup float *tmp, FPtr F,
                                              float scale, int lane) {
     constexpr int th = W > 32 ? 32 : W, TS = W + 1, NS = NT / 32;
     constexpr int RT = th / 8, CT = W / 8;               // output tiles of the column pass: RT x CT
@@ -575,7 +575,7 @@ static inline device const uint16_t *ga_iscan(device const float *fwdM, int txSz
 
 // compile-time-size wrapper (analysis kernels): constants propagate through the inlined runtime code
 template <int W, int H, int NT = 32>
-__device__ __forceinline__ void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
+__attribute__((always_inline)) void warp_eval(const int16_t *res, float *tmp, int16_t *q, thread const EvalIn &e, thread EvalOut &o,
                                           int lane, float *red = nullptr, int *redi = nullptr,
                                           device const uint16_t *iscan = nullptr) {
     if (W != H || W == 64) {

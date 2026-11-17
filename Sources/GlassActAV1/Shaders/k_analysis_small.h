@@ -19,7 +19,7 @@ struct SmallTx {
 // needed for these sizes). Glass Act: each coefficient goes to `emit` as it's made, so no thread holds
 // the whole output block (its registers spilled).
 template <int W, int H, typename Emit>
-__device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txType, Emit emit) {
+__attribute__((always_inline)) void fwd_scalar(const int16_t *res, int txSz, int txType, Emit emit) {
     const int rk = av1g_row_kind(txType), ck = av1g_col_kind(txType);
     const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
     AV1G_CONST const float *Fc = g_fwd + g_fwdOff[ck][SmallTx<W, H>::lh];
@@ -32,10 +32,10 @@ __device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txT
 #pragma unroll
         for (int i = 0; i < H; i++) {
             float s = 0.f;
-            if (ck == AV1G_K_IDT) s = __ldg(&Fc[i * H + i]) * (float)res[(fud ? H - 1 - i : i) * W + jj];
+            if (ck == AV1G_K_IDT) s = Fc[i * H + i] * (float)res[(fud ? H - 1 - i : i) * W + jj];
             else {
 #pragma unroll
-                for (int k = 0; k < H; k++) s = fmaf(__ldg(&Fc[i * H + k]), (float)res[(fud ? H - 1 - k : k) * W + jj], s);
+                for (int k = 0; k < H; k++) s = fma(Fc[i * H + k], (float)res[(fud ? H - 1 - k : k) * W + jj], s);
             }
             tmp[i * W + j] = s;
         }
@@ -46,10 +46,10 @@ __device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txT
 #pragma unroll
         for (int j = 0; j < W; j++) {
             float s = 0.f;
-            if (rk == AV1G_K_IDT) s = __ldg(&Fr[j * W + j]) * tmp[i * W + j];
+            if (rk == AV1G_K_IDT) s = Fr[j * W + j] * tmp[i * W + j];
             else {
 #pragma unroll
-                for (int k = 0; k < W; k++) s = fmaf(__ldg(&Fr[j * W + k]), tmp[i * W + k], s);
+                for (int k = 0; k < W; k++) s = fma(Fr[j * W + k], tmp[i * W + k], s);
             }
             emit(i * W + j, s * scale);
         }
@@ -63,7 +63,7 @@ __device__ __forceinline__ void fwd_scalar(const int16_t *res, int txSz, int txT
 // 0, as coeff_bits skips it. The same whole-number contexts, so the same table entries in the same
 // order of adds.
 template <int W, int H>
-__device__ __forceinline__ void rate_2d_small(thread float &bits, int eob, const thread int16_t *q, AV1G_CONST const uint16_t *scan,
+__attribute__((always_inline)) void rate_2d_small(thread float &bits, int eob, const thread int16_t *q, AV1G_CONST const uint16_t *scan,
                                               int txSz, int dcCtx, AV1G_CONST const float *C) {
     constexpr int PW = W + 2, lw = TxD<W, H>::lw;
     uint8_t lv[PW * (H + 2)];
@@ -118,7 +118,7 @@ __device__ __forceinline__ void rate_2d_small(thread float &bits, int eob, const
             else b += 1.0f;
             if (v > 14) {
                 const int xg = v - 14;
-                const int len = 31 - __clz(xg);
+                const int len = 31 - (int)clz((uint)(xg));
                 b += (float)(2 * len + 1);
             }
         }
@@ -127,14 +127,14 @@ __device__ __forceinline__ void rate_2d_small(thread float &bits, int eob, const
 }
 
 template <int W, int H>
-__device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const EvalIn &e) {
+__attribute__((always_inline)) EvalOut eval_scalar(const int16_t *res, thread const EvalIn &e) {
     constexpr int n = W * H;
     int16_t q[n];
     const int den = av1g_dq_denom(e.txSz);
     float dist = 0.f;
     fwd_scalar<W, H>(res, e.txSz, e.txType, [&](int idx, float v) {
         const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
-        const float a = fabsf(v) * (float)den / (float)step;
+        const float a = fabs(v) * (float)den / (float)step;
         const float wr = e.qm ? 32.f / (float)e.qm[idx] : 1.f;
         int l = a < e.zbin ? 0 : (int)(a + (e.qmRnd ? e.rnd * wr : e.rnd));
         l = min(l, 16383);
@@ -142,7 +142,7 @@ __device__ __forceinline__ EvalOut eval_scalar(const int16_t *res, thread const 
         q[idx] = (int16_t)qv;
         const float dq = l ? (float)av1g_dequant_coef(qv, step, den) : 0.f;
         const float d = v - dq;
-        dist = fmaf(d * d, e.qmDist ? wr * wr : 1.f, dist);
+        dist = fma(d * d, e.qmDist ? wr * wr : 1.f, dist);
     });
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
     int eob = 0;
@@ -211,7 +211,7 @@ kernel void k_analysis_small(constant GpBatch &B [[buffer(0)]], constant GpParam
     const int sp = I.spitch[0];
     const int qidx = sb_qindex(I, x, y);
     const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
-    const float lamS = P.satdLambda * sqrtf(lambda);
+    const float lamS = P.satdLambda * sqrt(lambda);
     AV1G_CONST const float *C = g_cost[I.qctx];
     if (prune_flat(I, P, x, y, W, H, qidx)) { ga_merge_inter(out, ir, GP_INF); out.ncand = 0; return; }
     constexpr int EL = AV1G_EDGE_OFF + 2 * (W + H) + 8;

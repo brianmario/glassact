@@ -29,7 +29,7 @@
 
 struct TxR {
     int w, h, tw, th, n, lw, lh;
-    __device__ TxR(int W, int H) : w(W), h(H), tw(W > 32 ? 32 : W), th(H > 32 ? 32 : H), n(0), lw(log2i(W)), lh(log2i(H)) { n = tw * th; }
+    TxR(int W, int H) : w(W), h(H), tw(W > 32 ? 32 : W), th(H > 32 ? 32 : H), n(0), lw(log2i(W)), lh(log2i(H)) { n = tw * th; }
 };
 
 // Per-warp evaluation scratch for tx blocks up to 16x16 (all sizes with a tx-type search); larger
@@ -62,17 +62,17 @@ static_assert(sizeof(RcBigScr) <= GP_RC_BIG_BYTES, "GP_RC_BIG_BYTES too small");
 // levels of up to RC_BIGQ_MAX big chroma RD tasks (the final reuses them instead of re-quantizing)
 #define RC_BIGQ_MAX 8
 #define RC_CTA_BIG_BYTES ((size_t)RC_NW * sizeof(RcBigScr) + (size_t)RC_BIGQ_MAX * 32 * 32 * 2)
-__device__ __forceinline__ bool rc_big(int W, int H) { return W > 16 || H > 16; }
+__attribute__((always_inline)) bool rc_big(int W, int H) { return W > 16 || H > 16; }
 // chroma RD task levels (tx <= 16x16) are kept in the union after the warp scratches: above the inverse
 // transform's int16 buffer (8192 B) and below the union's end
 #define RC_TASKQ_OFF (sizeof(RcWarpScr) * RC_NW)
 #define RC_TASKQ_MAX ((int)((RC_TAIL_OFF - RC_TASKQ_OFF) / 512))
-__device__ __forceinline__ threadgroup int16_t *rc_taskq(threadgroup RcUnion &u, int t) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TASKQ_OFF) + t * 256; }
+__attribute__((always_inline)) threadgroup int16_t *rc_taskq(threadgroup RcUnion &u, int t) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TASKQ_OFF) + t * 256; }
 // [16384, 18432) of the union: luma per-warp best levels (luma passes, tx <= 16x16) or CfL luma values
 // (chroma of CfL-capable blocks: chroma tx <= 16x16, so never the big scratch).  Phase-disjoint uses.
-__device__ __forceinline__ threadgroup int16_t *rc_bestq(threadgroup RcUnion &u, int w) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TAIL_OFF) + w * 256; }
-__device__ __forceinline__ threadgroup const int16_t *rc_cflL(threadgroup const RcUnion &u) { return (threadgroup const int16_t *)((threadgroup const char *)&u + RC_TAIL_OFF); }
-__device__ __forceinline__ threadgroup int16_t *rc_cflLw(threadgroup RcUnion &u) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TAIL_OFF); }
+__attribute__((always_inline)) threadgroup int16_t *rc_bestq(threadgroup RcUnion &u, int w) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TAIL_OFF) + w * 256; }
+__attribute__((always_inline)) threadgroup const int16_t *rc_cflL(threadgroup const RcUnion &u) { return (threadgroup const int16_t *)((threadgroup const char *)&u + RC_TAIL_OFF); }
+__attribute__((always_inline)) threadgroup int16_t *rc_cflLw(threadgroup RcUnion &u) { return (threadgroup int16_t *)((threadgroup char *)&u + RC_TAIL_OFF); }
 
 struct RcShared {
     RcUnion u;
@@ -111,7 +111,7 @@ struct RcShared {
 // exact inverse transform + reconstruction (CTA-wide), mirrors av1g_inv_txfm2d / av1g_add_residual.
 // q may be modified (halved) when the coefficients violate the conformance ranges
 // (= AV1G_ENC_FIX_RANGE).  Returns the number of halvings (all threads).
-__device__ int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, int16_t *q, int txSz, int txType, int dcQ, int acQ, AV1G_CONST const uint8_t *qm,
+int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, int16_t *q, int txSz, int txType, int dcQ, int acQ, AV1G_CONST const uint8_t *qm,
                                uint8_t *dst, int pitch) {
     const TxR T(W, H);
     const int tid = tid_;
@@ -123,7 +123,7 @@ __device__ int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, 
     int fixes = 0;
     for (;;) {
         if (tid == 0) { S.errFlag = 0; S.nzFlag = 0; }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         // W4: register-resident templated 1-D transforms (rc_inv.cuh), same arithmetic as av1g_inv_1d
         uint32_t err = 0;
         switch (T.lw) {
@@ -135,8 +135,8 @@ __device__ int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, 
         default: RC_ROWS(6); break;
 #undef RC_ROWS
         }
-        if (err) atomicOr(&S.errFlag, (int)err);
-        __syncthreads();
+        if (err) atomic_fetch_or_explicit((threadgroup atomic_int *)&S.errFlag, (int)err, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         err = 0;
         switch (T.lh) {
 #define RC_COLS(LH) for (int j = tid; j < W; j += RC_NT) err |= rci::col<LH>(j, W, ck, res)
@@ -147,15 +147,15 @@ __device__ int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, 
         default: RC_COLS(6); break;
 #undef RC_COLS
         }
-        if (err) atomicOr(&S.errFlag, (int)err);
-        __syncthreads();
+        if (err) atomic_fetch_or_explicit((threadgroup atomic_int *)&S.errFlag, (int)err, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (!S.errFlag) break;
         fixes++;
         for (int idx = tid; idx < T.n; idx += RC_NT) {
             q[idx] = (int16_t)(q[idx] / 2);
             if (q[idx]) S.nzFlag = 1;
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (!S.nzFlag) return fixes;  // all zero now: no residual
     }
     const int fud = av1g_flip_ud(txType), flr = av1g_flip_lr(txType);
@@ -165,13 +165,13 @@ __device__ int cta_inverse_add(int W, int H, threadgroup RcShared &S, int tid_, 
         uint8_t *d = dst + yy * pitch + xx;
         *d = (uint8_t)av1g_clip1((int)*d + res[i * W + j]);
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     return fixes;
 }
 
 // ---------------------------------------------------------------------------
 // coefficient contexts from the 4x4 maps (mirror of av1core k_txsym)
-__device__ __forceinline__ void txb_ctx(device const GpImage &I, int plane, int txSz, int x4, int y4, int bsize, const TileBox &tb,
+__attribute__((always_inline)) void txb_ctx(device const GpImage &I, int plane, int txSz, int x4, int y4, int bsize, const TileBox &tb,
                                         int *skipCtx, int *dcCtx) {
     const int sub = plane ? 1 : 0;
     const int stride = I.MiCols >> sub;
@@ -213,7 +213,7 @@ __device__ __forceinline__ void txb_ctx(device const GpImage &I, int plane, int 
 
 // prediction of one pixel: mode candidate c (or CfL with alpha when cfl), plane edges.  slot >= 0:
 // directional modes use the edges prepared (intra edge filter) by warp `slot`.
-__device__ __forceinline__ int rc_pred(threadgroup const RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, int i, int j, int lw, int lh,
+__attribute__((always_inline)) int rc_pred(threadgroup const RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, int i, int j, int lw, int lh,
                                        int cw, int slot = -1) {
     if (cfl) {
         const int v = rc_cflL(S.u)[i * cw + j];
@@ -228,12 +228,12 @@ __device__ __forceinline__ int rc_pred(threadgroup const RcShared &S, int tid_, 
 }
 
 // filter-intra candidates are coded as 128 + filter_intra_mode (y_mode DC_PRED)
-__device__ __forceinline__ bool is_fi(int c) { return c >= 128; }
-__device__ __forceinline__ int luma_mode(int c) { return c >= 128 ? AV1G_DC_PRED : cand_mode(c); }
-__device__ __forceinline__ int intra_dir(int c) { return c >= 128 ? AV1G_T(Filter_Intra_Mode_To_Intra_Dir)[c - 128] : cand_mode(c); }
+__attribute__((always_inline)) bool is_fi(int c) { return c >= 128; }
+__attribute__((always_inline)) int luma_mode(int c) { return c >= 128 ? AV1G_DC_PRED : cand_mode(c); }
+__attribute__((always_inline)) int intra_dir(int c) { return c >= 128 ? AV1G_T(Filter_Intra_Mode_To_Intra_Dir)[c - 128] : cand_mode(c); }
 
 // warp: prepare the edge-filtered edges of (plane, candidate) into this warp's slot (lane 0)
-__device__ __forceinline__ void rc_prepare_edges(threadgroup RcShared &S, int tid_, int plane, int c, bool cfl, int lw, int lh) {
+__attribute__((always_inline)) void rc_prepare_edges(threadgroup RcShared &S, int tid_, int plane, int c, bool cfl, int lw, int lh) {
     const int warp = tid_ >> 5;
     const int m = cand_mode(c);
     if (cfl || !S.edgeFilter || !av1g_is_directional(m)) return;
@@ -245,11 +245,11 @@ __device__ __forceinline__ void rc_prepare_edges(threadgroup RcShared &S, int ti
         S.wup[warp][0] = ua;
         S.wup[warp][1] = ul;
     }
-    __syncwarp();
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // warp: residual of (plane, cand/cfl) for a W x H tx block into res; returns sum r^2
-__device__ float rc_residual(int W, int H, threadgroup RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp,
+float rc_residual(int W, int H, threadgroup RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp,
                              int16_t *res, uint8_t *fiBuf = nullptr) {
     const TxR T(W, H);
     const int lane = tid_ & 31;
@@ -259,14 +259,14 @@ __device__ float rc_residual(int W, int H, threadgroup RcShared &S, int tid_, in
         // recursive filter-intra prediction (spec 7.11.2.3), lane 0, into fiBuf (stride W)
         if (lane == 0)
             av1g_predict_filter_intra(c - 128, T.lw, T.lh, S.ea[0] + AV1G_EDGE_OFF, S.el[0] + AV1G_EDGE_OFF, fiBuf, W);
-        __syncwarp();
+        simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int p = lane; p < W * H; p += 32) {
             const int i = p / W, j = p % W;
             const int r = (int)src[i * sp + j] - (int)fiBuf[p];
             res[p] = (int16_t)r;
             e += (float)(r * r);
         }
-        __syncwarp();
+        simdgroup_barrier(mem_flags::mem_threadgroup);
         return warp_sum(e);
     }
     rc_prepare_edges(S, tid_, plane, c, cfl, T.lw, T.lh);
@@ -276,13 +276,13 @@ __device__ float rc_residual(int W, int H, threadgroup RcShared &S, int tid_, in
         res[p] = (int16_t)r;
         e += (float)(r * r);
     }
-    __syncwarp();
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     return warp_sum(e);
 }
 
 // final quantization of (plane, cand, txType) into S.qfin by warp 0 with distortion and rate (S.finEob, S.finD, S.finR):
 // the tx-size search compares J; everything else uses the CTA-wide rc_final_quant below (levels only)
-__device__ void rc_final_quant_rd(int W, int H, threadgroup RcShared &S, int tid_, thread const EvalIn &e, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp) {
+void rc_final_quant_rd(int W, int H, threadgroup RcShared &S, int tid_, thread const EvalIn &e, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp) {
     const int warp = tid_ >> 5;
     const bool big = rc_big(W, H);
     if (warp == 0) {
@@ -295,17 +295,17 @@ __device__ void rc_final_quant_rd(int W, int H, threadgroup RcShared &S, int tid
         warp_eval_rt(res, tmp, S.qfin, ee, o, W, H, tid_ & 31);
         if ((tid_ & 31) == 0) { S.finEob = o.eob; S.finD = o.D; S.finR = o.R; }
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 }
 
 // ---------------------------------------------------------------------------
 // W1: CTA-wide final quantization (levels + eob only).  warp_eval_rt also computes D and R,
 // which the final quantization never uses, and it runs on warp 0 alone; here the forward transform and
 // the quantizer run on all 128 threads and the rate pass is skipped.  Every output keeps the arithmetic
-// of fwd_col_pass / fwd_row_pass / warp_quant_rate_rt (same fmaf order per output, same quantizer
+// of fwd_col_pass / fwd_row_pass / warp_quant_rate_rt (same fma order per output, same quantizer
 // expression), so the levels are bit-identical.
 template <int TC>
-__device__ __forceinline__ void cta_fwd_col(const int16_t *res, float *tmp, int W, int H, int TH, int ck, int fud, int flr,
+__attribute__((always_inline)) void cta_fwd_col(const int16_t *res, float *tmp, int W, int H, int TH, int ck, int fud, int flr,
                                             AV1G_CONST const float *Fc, AV1G_CONST const float *FcT, int nChunk, int tid_) {
     const int TS = W + 1;
     const int it = tid_;
@@ -313,7 +313,7 @@ __device__ __forceinline__ void cta_fwd_col(const int16_t *res, float *tmp, int 
     const int j = it % W, i0 = (it / W) * TC;
     const int jj = flr ? W - 1 - j : j;
     if (ck == AV1G_K_IDT) {   // identity: TH == H
-        for (int i = i0; i < i0 + TC && i < TH; i++) tmp[i * TS + j] = __ldg(&Fc[i * H + i]) * (float)res[(fud ? H - 1 - i : i) * W + jj];
+        for (int i = i0; i < i0 + TC && i < TH; i++) tmp[i * TS + j] = Fc[i * H + i] * (float)res[(fud ? H - 1 - i : i) * W + jj];
         return;
     }
     float acc[TC];
@@ -324,11 +324,11 @@ __device__ __forceinline__ void cta_fwd_col(const int16_t *res, float *tmp, int 
         AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FcT + k * H + i0);
 #pragma unroll
         for (int i4 = 0; i4 < TC / 4; i4++) {
-            const float4 f = __ldg(&f4[i4]);
-            acc[4 * i4 + 0] = fmaf(f.x, x, acc[4 * i4 + 0]);
-            acc[4 * i4 + 1] = fmaf(f.y, x, acc[4 * i4 + 1]);
-            acc[4 * i4 + 2] = fmaf(f.z, x, acc[4 * i4 + 2]);
-            acc[4 * i4 + 3] = fmaf(f.w, x, acc[4 * i4 + 3]);
+            const float4 f = f4[i4];
+            acc[4 * i4 + 0] = fma(f.x, x, acc[4 * i4 + 0]);
+            acc[4 * i4 + 1] = fma(f.y, x, acc[4 * i4 + 1]);
+            acc[4 * i4 + 2] = fma(f.z, x, acc[4 * i4 + 2]);
+            acc[4 * i4 + 3] = fma(f.w, x, acc[4 * i4 + 3]);
         }
     }
 #pragma unroll
@@ -336,7 +336,7 @@ __device__ __forceinline__ void cta_fwd_col(const int16_t *res, float *tmp, int 
 }
 // row pass in place: all items read their row first, CTA barrier, then write (callers: every thread)
 template <int TC>
-__device__ __forceinline__ void cta_fwd_row(float *tmp, int W, int th, int rk, AV1G_CONST const float *Fr, AV1G_CONST const float *FrT, float scale, int nChunk, int tid_) {
+__attribute__((always_inline)) void cta_fwd_row(float *tmp, int W, int th, int rk, AV1G_CONST const float *Fr, AV1G_CONST const float *FrT, float scale, int nChunk, int tid_) {
     const int TS = W + 1;
     const int it = tid_;
     const bool act = it < th * nChunk;
@@ -347,33 +347,33 @@ __device__ __forceinline__ void cta_fwd_row(float *tmp, int W, int th, int rk, A
     if (act) {
         if (rk == AV1G_K_IDT) {
 #pragma unroll
-            for (int jj = 0; jj < TC; jj++) acc[jj] = __ldg(&Fr[(j0 + jj) * W + j0 + jj]) * tmp[i * TS + j0 + jj];
+            for (int jj = 0; jj < TC; jj++) acc[jj] = Fr[(j0 + jj) * W + j0 + jj] * tmp[i * TS + j0 + jj];
         } else {
             for (int k = 0; k < W; k++) {
                 const float x = tmp[i * TS + k];
                 AV1G_CONST const float4 *f4 = (AV1G_CONST const float4 *)(FrT + k * W + j0);
 #pragma unroll
                 for (int j4 = 0; j4 < TC / 4; j4++) {
-                    const float4 f = __ldg(&f4[j4]);
-                    acc[4 * j4 + 0] = fmaf(f.x, x, acc[4 * j4 + 0]);
-                    acc[4 * j4 + 1] = fmaf(f.y, x, acc[4 * j4 + 1]);
-                    acc[4 * j4 + 2] = fmaf(f.z, x, acc[4 * j4 + 2]);
-                    acc[4 * j4 + 3] = fmaf(f.w, x, acc[4 * j4 + 3]);
+                    const float4 f = f4[j4];
+                    acc[4 * j4 + 0] = fma(f.x, x, acc[4 * j4 + 0]);
+                    acc[4 * j4 + 1] = fma(f.y, x, acc[4 * j4 + 1]);
+                    acc[4 * j4 + 2] = fma(f.z, x, acc[4 * j4 + 2]);
+                    acc[4 * j4 + 3] = fma(f.w, x, acc[4 * j4 + 3]);
                 }
             }
         }
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     if (act) {
 #pragma unroll
         for (int jj = 0; jj < TC; jj++) tmp[i * TS + j0 + jj] = acc[jj] * scale;
     }
 }
-__device__ __forceinline__ int rc_chunks(int outs, int lanesPerChunk) { return max(1, min(outs / 4, RC_NT / lanesPerChunk)); }
+__attribute__((always_inline)) int rc_chunks(int outs, int lanesPerChunk) { return max(1, min(outs / 4, RC_NT / lanesPerChunk)); }
 
 // residual (whole CTA, edges prepared by warp 0 into slot 0) -> forward transform -> levels into S.qfin, S.finEob.
 // res (and the prepared slot-0 edges) stay valid for rc_write_from_res / rc_write_pred.
-__device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, thread const EvalIn &e, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp) {
+void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, thread const EvalIn &e, int plane, int c, bool cfl, int alpha, const uint8_t *src, int sp) {
     const TxR T(W, H);
     const int tid = tid_;
     const bool big = rc_big(W, H);
@@ -384,13 +384,13 @@ __device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, 
         if (tid < 32) rc_residual(W, H, S, tid_, plane, c, cfl, alpha, src, sp, res, (uint8_t *)tmp);
     } else {
         if (tid < 32) rc_prepare_edges(S, tid_, plane, c, cfl, T.lw, T.lh);
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         for (int p = tid; p < W * H; p += RC_NT) {
             const int i = p / W, j = p % W;
             res[p] = (int16_t)((int)src[i * sp + j] - rc_pred(S, tid_, plane, c, cfl, alpha, i, j, T.lw, T.lh, W, 0));
         }
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     // forward transform (mirrors warp_fwd_rt)
     const int th = T.th, tw = T.tw;
     const int rk = av1g_row_kind(e.txType), ck = av1g_col_kind(e.txType);
@@ -403,7 +403,7 @@ __device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, 
         else if (TC == 8) cta_fwd_col<8>(res, tmp, W, H, th, ck, fud, flr, Fc, FcT, nc, tid_);
         else cta_fwd_col<16>(res, tmp, W, H, th, ck, fud, flr, Fc, FcT, nc, tid_);
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     {
         AV1G_CONST const float *Fr = g_fwd + g_fwdOff[rk][T.lw];
         AV1G_CONST const float *FrT = g_fwdT + g_fwdOff[rk][T.lw];
@@ -413,7 +413,7 @@ __device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, 
         else if (TC == 8) cta_fwd_row<8>(tmp, W, th, rk, Fr, FrT, scale, nc, tid_);
         else cta_fwd_row<16>(tmp, W, th, rk, Fr, FrT, scale, nc, tid_);
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     // quantization (mirrors warp_quant_rate_rt's level computation)
     const int TS = W + 1, n = tw * th, lt = log2i(tw);
     const int den = av1g_dq_denom(e.txSz);
@@ -422,7 +422,7 @@ __device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, 
         const int i = idx >> lt, j = idx & (tw - 1);
         const float v = tmp[i * TS + j];
         const int step = av1g_qm_step(idx == 0 ? e.dcQ : e.acQ, e.qm, idx);
-        const float a = fabsf(v) * (float)den / (float)step;
+        const float a = fabs(v) * (float)den / (float)step;
         const float wr = e.qm ? 32.f / (float)e.qm[idx] : 1.f;
         int l = a < e.zbin ? 0 : (int)(a + (e.qmRnd ? e.rnd * wr : e.rnd));
         l = min(l, 16383);
@@ -430,44 +430,44 @@ __device__ void rc_final_quant(int W, int H, threadgroup RcShared &S, int tid_, 
         q[idx] = (int16_t)qv;
     }
     if (tid == 0) S.finEob = 0;
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     AV1G_CONST const uint16_t *scan = av1g_get_scan(e.txSz, e.txType);
     int last = 0;
     for (int cc = tid; cc < n; cc += RC_NT)
         if (q[scan[cc]]) last = cc + 1;
     last = warp_max(last);
-    if ((tid & 31) == 0 && last) atomicMax(&S.finEob, last);
-    __syncthreads();
+    if ((tid & 31) == 0 && last) atomic_fetch_max_explicit((threadgroup atomic_int *)&S.finEob, last, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 }
 
 // reconstruction base = prediction = src - residual (the residual of the final candidate is exact:
 // res = src - pred in integers), instead of evaluating the prediction again (CTA)
-__device__ void rc_write_from_res(int W, int H, const uint8_t *src, int sp, const int16_t *res, uint8_t *dst, int pitch, int tid_) {
+void rc_write_from_res(int W, int H, const uint8_t *src, int sp, const int16_t *res, uint8_t *dst, int pitch, int tid_) {
     for (int p = tid_; p < W * H; p += RC_NT) {
         const int i = p / W, j = p % W;
         dst[i * pitch + j] = (uint8_t)((int)src[i * sp + j] - (int)res[p]);
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 }
 
 // write prediction into the reconstruction (CTA)
-__device__ void rc_write_pred(int W, int H, threadgroup const RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, uint8_t *dst, int pitch) {
+void rc_write_pred(int W, int H, threadgroup const RcShared &S, int tid_, int plane, int c, bool cfl, int alpha, uint8_t *dst, int pitch) {
     const TxR T(W, H);
     if (plane == 0 && is_fi(c)) {
         if (tid_ == 0)
             av1g_predict_filter_intra(c - 128, T.lw, T.lh, S.ea[0] + AV1G_EDGE_OFF, S.el[0] + AV1G_EDGE_OFF, dst, pitch);
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         return;
     }
     for (int p = tid_; p < W * H; p += RC_NT) {
         const int i = p / W, j = p % W;
         dst[i * pitch + j] = (uint8_t)rc_pred(S, tid_, plane, c, cfl, alpha, i, j, T.lw, T.lh, W, 0);
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 }
 
 // record a finished tx block: txb entry, coefficients, context maps, BlockDecoded.  Returns eob.
-__device__ int rc_record_txb(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, uint32_t sb, device const GpImage &I, int plane, int txSz, int txType,
+int rc_record_txb(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, uint32_t sb, device const GpImage &I, int plane, int txSz, int txType,
                              int x4, int y4, int sbr4, int sbc4) {
     const TxR T(W, H);
     const int tid = tid_;
@@ -486,7 +486,7 @@ __device__ int rc_record_txb(int W, int H, threadgroup RcShared &S, int tid_, co
         cul = warp_sumi(cul);
         if (tid == 0) { S.sEob = eob; S.sCul = min(cul, 63); }
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     const int eob = S.sEob, cul = S.sCul;
     const int dcCat = S.qfin[0] < 0 ? 1 : S.qfin[0] > 0 ? 2 : 0;
     int16_t *oc = B.oCoeffs + (size_t)sb * GP_SB_COEFFS + cOff;
@@ -503,7 +503,7 @@ __device__ int rc_record_txb(int W, int H, threadgroup RcShared &S, int tid_, co
         }
     }
     // BlockDecoded (full tx block area, also beyond the frame edge)
-    for (int k = tid; k < w4 * h4; k += RC_NT) atomicOr(&S.bdm[plane][sbr4 + k / w4 + 1], 1u << (sbc4 + k % w4 + 1));
+    for (int k = tid; k < w4 * h4; k += RC_NT) atomic_fetch_or_explicit((threadgroup atomic_uint *)&S.bdm[plane][sbr4 + k / w4 + 1], 1u << (sbc4 + k % w4 + 1), memory_order_relaxed);
     if (tid == 0) {
         av1g_txb t;
         t.coeff_off = cOff;
@@ -515,13 +515,13 @@ __device__ int rc_record_txb(int W, int H, threadgroup RcShared &S, int tid_, co
         S.nTxb++;
         S.nCoef += T.n;
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     return eob;
 }
 
 // edges of a tx block from the reconstruction, built by threads tid0 .. tid0+nt-1; then one thread
-// records the edge-filter inputs and the DC value.  Callers __syncthreads() afterwards.
-__device__ __forceinline__ void rc_edges(threadgroup RcShared &S, int tid_, device const GpImage &I, int plane, int px, int py, int lw, int lh, int haveL,
+// records the edge-filter inputs and the DC value.  Callers threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device) afterwards.
+__attribute__((always_inline)) void rc_edges(threadgroup RcShared &S, int tid_, device const GpImage &I, int plane, int px, int py, int lw, int lh, int haveL,
                                          int haveA, int haveAR, int haveBL, int mi_row, int mi_col, int tid0, int nt,
                                          int blkA = -1, int blkL = -1) {
     const int sub = plane ? 1 : 0;
@@ -533,7 +533,7 @@ __device__ __forceinline__ void rc_edges(threadgroup RcShared &S, int tid_, devi
         build_edges_par(I.rec[plane], I.rpitch[plane], px, py, lw, lh, haveL, haveA, haveAR, haveBL, maxX, maxY, A, L, t, nt);
     // CUDA syncs only the group's warps (a named barrier); Metal has no named barriers, so every
     // thread of the threadgroup reaches this one (every caller is uniform across it)
-    if (nt <= 32) { if (inGroup) __syncwarp(); }
+    if (nt <= 32) { if (inGroup) simdgroup_barrier(mem_flags::mem_threadgroup); }
     else threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!inGroup) return;
     if (t == 0) {
@@ -546,7 +546,7 @@ __device__ __forceinline__ void rc_edges(threadgroup RcShared &S, int tid_, devi
 
 // ---------------------------------------------------------------------------
 // luma of one block (tx size = block size, tx_depth 0)
-__device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, constant GpParams &P, uint32_t sb, device const GpImage &I, int bsize, int x,
+void rc_luma(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, constant GpParams &P, uint32_t sb, device const GpImage &I, int bsize, int x,
                         int y, int availU, int availL, const TileBox &tb, const BlockQ &bq, float lambda, AV1G_CONST const float *C,
                         int *outMode, int *outDelta, int *outEob, int *outFi, int *outTxDepth) {
     const TxR T(W, H);
@@ -586,7 +586,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
     const int nc = max(1, min((int)br.ncand, P.Krecheck));
     const int set = av1g_get_tx_set_intra(txSz, 0);
     int bestC = br.cand[0], bestT = br.tx;
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     const bool big = rc_big(W, H);
     const bool pass2 = P.txSearchCL && set != AV1G_TX_SET_DCTONLY;
     bool evaluated = false;
@@ -616,15 +616,15 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
             if ((tid & 31) == 0) S.taskJ[t] = J;
             if (!big) {
                 const bool better = J < S.bestJw[warp];   // identical in all lanes (warp-reduced values)
-                __syncwarp();
+                simdgroup_barrier(mem_flags::mem_threadgroup);
                 if (better) {
                     for (int i = tid & 31; i < W * H; i += 32) rc_bestq(S.u, warp)[i] = q[i];
                     if ((tid & 31) == 0) { S.bestJw[warp] = J; S.bestCw[warp] = c; S.bestTw[warp] = ee.txType; S.bestEw[warp] = o.eob; }
                 }
-                __syncwarp();
+                simdgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     };
     if (P.txAllCL && set != AV1G_TX_SET_DCTONLY) {
         // every re-checked candidate (+ filter-intra modes) x every intra tx type of the set (libaom s3's
@@ -645,11 +645,11 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                 }
                 S.nTask = n;
             }
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             runTasks(false);
             for (int t = 0; t < S.nTask; t++)
                 if (S.taskJ[t] < bJ) { bJ = S.taskJ[t]; bestC = S.taskC[t]; bestT = S.taskT[t]; }
-            __syncthreads();   // all threads read the chunk before thread 0 writes the next one
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);   // all threads read the chunk before thread 0 writes the next one
         }
         evaluated = true;
     } else if (nc > 1 || pass2 || fiOk) {
@@ -662,7 +662,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                 for (int f = 0; f < 5; f++) { S.taskC[n] = 128 + f; S.taskT[n] = AV1G_DCT_DCT; S.taskP[n] = 0; n++; }
             S.nTask = n;
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         const bool skip1 = S.nTask == 1;   // nothing to compare: bestC = that candidate
         if (!skip1) {
             runTasks(false);
@@ -670,16 +670,16 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
             float bJ = GP_INF;
             for (int t = 0; t < S.nTask; t++)
                 if (S.taskJ[t] < bJ) { bJ = S.taskJ[t]; bestC = S.taskC[t]; bestT = S.taskT[t]; }
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         } else {
             bestC = S.taskC[0];
             bestT = S.taskT[0];
         }
         // every thread must have read S.nTask / taskC / taskT before thread 0 rewrites them for pass 2:
         // without this barrier a late warp saw pass 2's nTask, took the !skip1 branch (runTasks and its
-        // __syncthreads) and misaligned the CTA's barriers - rare, timing-dependent corrupt records
+        // barriers) and misaligned the CTA's barriers - rare, timing-dependent corrupt records
         // (racecheck 2026-10-02; seen as V-plane decoder mismatches in 2-encoder batch runs)
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         // pass 2: tx-type search for the winner with the real residual (all types if pass 1 was skipped)
         if (pass2) {
             if (tid == 0) {
@@ -691,19 +691,19 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                 }
                 S.nTask = n;
             }
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             if (S.nTask > 0) {
                 if (!big && !is_fi(bestC)) {
                     // shared residual of bestC: edges by warp 0 (slot 0), residual by the CTA; energy with the
                     // lane order of rc_residual (warp 0) so EvalIn.resEnergy is bit-identical
                     if (tid < 32) rc_prepare_edges(S, tid_, 0, bestC, false, T.lw, T.lh);
-                    __syncthreads();
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                     int16_t *res = S.u.w[0].res;
                     for (int p = tid; p < W * H; p += RC_NT) {
                         const int i = p / W, j = p % W;
                         res[p] = (int16_t)((int)src[i * I.spitch[0] + j] - rc_pred(S, tid_, 0, bestC, false, 0, i, j, T.lw, T.lh, W, 0));
                     }
-                    __syncthreads();
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                     if (W == 64 || H == 64) {   // only the 64-point distortion uses the energy (never in pass 2)
                         float en = 0.f;
                         for (int p = tid & 31; p < W * H; p += 32) en += (float)((int)res[p] * (int)res[p]);
@@ -721,7 +721,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                         if (S.taskJ[t] < bJ) { bJ = S.taskJ[t]; bestT = S.taskT[t]; }
                 }
             }
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         }
     }
     int bestW = -1;
@@ -747,7 +747,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
         if (tid == 0) S.finEob = S.bestEw[bestW];
         if (!trySplit && sharedResC == bestC) predRes = S.u.w[0].res;
         else if (tid < 32) rc_prepare_edges(S, tid_, 0, bestC, false, T.lw, T.lh);
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         J0 = S.bestJw[bestW];
     } else if (trySplit) {
         rc_final_quant_rd(W, H, S, tid_, e, 0, bestC, false, 0, src, I.spitch[0]);
@@ -768,7 +768,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
         if (bestW < 0)
             for (int i = tid; i < nLv; i += RC_NT) keep0[i] = S.qfin[i];
         const int nTxb0 = S.nTxb, nCoef0 = S.nCoef;
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         const int txSub = AV1G_T(Split_Tx_Size)[txSz];
         const int Ws = AV1G_T(Tx_Width)[txSub], Hs = AV1G_T(Tx_Height)[txSub];
         const TxR Ts(Ws, Hs);
@@ -804,7 +804,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                 const int hBL = (S.bdm[0][sr4 + (Hs >> 2) + 1] >> (sc4 - 1 + 1)) & 1;
                 rc_edges(S, tid_, I, 0, xs, ys, Ts.lw, Ts.lh, availL || ix > 0, availU || iy > 0, hAR, hBL, y >> 2, x >> 2, 0, 64, availU,
                          availL);
-                __syncthreads();
+                threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                 int sCtx, dCtx;
                 txb_ctx(I, 0, txSub, xs >> 2, ys >> 2, bsize, tb, &sCtx, &dCtx);
                 EvalIn es = e;
@@ -832,14 +832,14 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                         warp_eval_rt(res, tmp, q, ee, o, Ws, Hs, tid_ & 31);
                         const float J = o.D + lambda * o.R;
                         if (J < myJ) {   // warp-uniform
-                            __syncwarp();
+                            simdgroup_barrier(mem_flags::mem_threadgroup);
                             for (int i = tid & 31; i < Ws * Hs; i += 32) rc_taskq(S.u, warp)[i] = q[i];
                             myJ = J; myT = ee.txType; myE = o.eob;
                         }
-                        __syncwarp();
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
                     }
                     if ((tid & 31) == 0) { S.taskJ[warp] = myJ; S.taskT[warp] = myT; S.taskE[warp] = myE; }
-                    __syncthreads();
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                     int bw = 0;
                     for (int w = 1; w < RC_NW; w++)
                         if (S.taskJ[w] < S.taskJ[bw]) bw = w;
@@ -848,7 +848,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                     tSel = S.taskT[bw];
                     Jk = S.taskJ[bw];
                     if (tid < 32) rc_prepare_edges(S, tid_, 0, bestC, false, Ts.lw, Ts.lh);
-                    __syncthreads();
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
                 }
                 J1 += Jk;
                 uint8_t *dstS = I.rec[0] + (size_t)ys * I.rpitch[0] + xs;
@@ -856,24 +856,24 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
                 if (S.finEob > 0) {
                     const int fixes = cta_inverse_add(Ws, Hs, S, tid_, S.qfin, txSub, tSel, e.dcQ, e.acQ,
                                                       av1g_qm(I.usingQm, I.qm[0], 0, txSub, tSel), dstS, I.rpitch[0]);
-                    if (fixes && tid == 0) atomicAdd(&B.stats[3], 1u);
+                    if (fixes && tid == 0) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[3], 1u, memory_order_relaxed);
                 }
                 eobAny |= rc_record_txb(Ws, Hs, S, tid_, B, sb, I, 0, txSub, tSel, xs >> 2, ys >> 2, sr4, sc4);
             }
         if (J1 < limit) {
             txDepth = 1;
             *outEob = eobAny;
-            if (tid == 0) atomicAdd(&B.stats[4], 1u);
+            if (tid == 0) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[4], 1u, memory_order_relaxed);
         } else {
             // depth 0 wins: drop the trial's tx records, rebuild the block's edges and levels
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             if (tid == 0) { S.nTxb = nTxb0; S.nCoef = nCoef0; }
             rc_edges(S, tid_, I, 0, x, y, T.lw, T.lh, availL, availU, haveAR0, haveBL0, y >> 2, x >> 2, 0, 64);
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             for (int i = tid; i < nLv; i += RC_NT) S.qfin[i] = keep0[i];
             if (tid == 0) S.finEob = eob0;
             if (tid < 32) rc_prepare_edges(S, tid_, 0, bestC, false, T.lw, T.lh);
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         }
     }
     *outTxDepth = txDepth;
@@ -883,7 +883,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
         else rc_write_pred(W, H, S, tid_, 0, bestC, false, 0, dst, I.rpitch[0]);
         if (S.finEob > 0) {
             const int fixes = cta_inverse_add(W, H, S, tid_, S.qfin, txSz, bestT, e.dcQ, e.acQ, e.qm, dst, I.rpitch[0]);
-            if (fixes && tid == 0) atomicAdd(&B.stats[3], 1u);
+            if (fixes && tid == 0) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[3], 1u, memory_order_relaxed);
         }
         *outEob = rc_record_txb(W, H, S, tid_, B, sb, I, 0, txSz, bestT, x >> 2, y >> 2, sbr4, sbc4);
     }
@@ -894,7 +894,7 @@ __device__ __noinline__ void rc_luma(int W, int H, threadgroup RcShared &S, int 
 
 // ---------------------------------------------------------------------------
 // chroma of one block: U and V tx blocks (one each, W x H = chroma tx size)
-__device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, constant GpParams &P, uint32_t sb, device const GpImage &I, int bsize,
+void rc_chroma(int W, int H, threadgroup RcShared &S, int tid_, constant GpBatch &B, constant GpParams &P, uint32_t sb, device const GpImage &I, int bsize,
                           int mi_row, int mi_col, int yMode, int availUC, int availLC, const TileBox &tb, const BlockQ &bq,
                           float lambda, AV1G_CONST const float *C, int *outUv, int *outDuv, int *outAu, int *outAv, int *outEobU, int *outEobV) {
     const TxR T(W, H);
@@ -914,7 +914,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
     const uint8_t *srcU = I.src[1] + (size_t)cy * I.spitch[1] + cx;
     const uint8_t *srcV = I.src[2] + (size_t)cy * I.spitch[2] + cx;
     const bool cflOk = P.cfl && av1g_cfl_allowed(bsize);
-    const float lamS = P.satdLambda * sqrtf(lambda);
+    const float lamS = P.satdLambda * sqrt(lambda);
     auto uvbits = [&](int m) -> float {
         if (av1g_cfl_allowed(bsize)) return C[CID(uv_mode_cfl_allowed[yMode]) + m];
         return C[CID(uv_mode_cfl_not_allowed[yMode]) + m];
@@ -926,7 +926,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
         if (bsize >= AV1G_BLOCK_8X8 && av1g_is_directional(m)) b += C[CID(angle_delta[m - AV1G_V_PRED]) + cand_delta(c) + 3];
         return b;
     };
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     // ---- CfL luma values (reconstructed luma, spec 7.11.5) ----
     if (cflOk) {
         const int lumaTx = AV1G_T(Max_Tx_Size_Rect)[bsize];
@@ -947,12 +947,12 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
         }
         sum = warp_sumi(sum);
         if (tid == 0) S.cflAvg = 0;
-        __syncthreads();
-        if ((tid & 31) == 0) atomicAdd(&S.cflAvg, sum);
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        if ((tid & 31) == 0) atomic_fetch_add_explicit((threadgroup atomic_int *)&S.cflAvg, sum, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (tid == 0) S.cflAvg = av1g_round2(S.cflAvg, T.lw + T.lh);
         if (tid < 2) { S.cflNum[tid] = 0.f; S.cflDen[tid] = 0.f; }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         // least-squares alpha per plane: r = src - DC, l = v - avg; alpha ~ 64 * sum(r l) / sum(l^2)
         float num[2] = {0.f, 0.f}, den = 0.f;
         for (int p = tid; p < W * H; p += RC_NT) {
@@ -964,17 +964,17 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
         }
         num[0] = warp_sum(num[0]); num[1] = warp_sum(num[1]); den = warp_sum(den);
         if ((tid & 31) == 0) { S.cflPart[tid >> 5][0] = num[0]; S.cflPart[tid >> 5][1] = num[1]; S.cflPart[tid >> 5][2] = den; }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (tid == 0)   // in warp order, so the sums don't depend on scheduling
             for (int w = 0; w < RC_NW; w++) { S.cflNum[0] += S.cflPart[w][0]; S.cflNum[1] += S.cflPart[w][1]; S.cflDen[0] += S.cflPart[w][2]; }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (tid < 2) {
             const float d = S.cflDen[0];
-            int a = d > 0.f ? (int)rintf(64.f * S.cflNum[tid] / d) : 0;
+            int a = d > 0.f ? (int)rint(64.f * S.cflNum[tid] / d) : 0;
             S.cflAlpha[tid] = max(-16, min(16, a));
         }
         if (tid < 6) S.alphaSse[tid / 3][tid % 3] = 0.f;
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         // refine alpha +-1 by pixel SSE
         {
             float sse[2][3] = {{0.f, 0.f, 0.f}, {0.f, 0.f, 0.f}};
@@ -997,10 +997,10 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
                     if ((tid & 31) == 0) S.ssePart[tid >> 5][pl * 3 + k] = v;
                 }
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (tid < 6)   // in warp order
             for (int w = 0; w < RC_NW; w++) S.alphaSse[tid / 3][tid % 3] += S.ssePart[w][tid];
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         if (tid == 0) {
             for (int pl = 0; pl < 2; pl++) {
                 int bk = 1;
@@ -1008,12 +1008,12 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
                 S.cflAlpha[pl] = max(-16, min(16, S.cflAlpha[pl] + bk - 1));
             }
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     // ---- SATD screening of the 13 UV modes (real edges), then angle deltas +-1..3 around the best
     //      directional UV mode ----
     if (tid < 13) S.uvc[tid] = cand_pack(tid, 0);
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     int nuv = 13;
     for (int pass = 0; pass < 2; pass++) {
         const int c0 = pass ? 13 : 0, c1 = pass ? 19 : 13;
@@ -1028,7 +1028,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
                 }
                 for (int k = 0; k < 6; k++) S.uvc[13 + k] = cand_pack(bm, k < 3 ? -(k + 1) : (k - 2));
             }
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             nuv = 19;
         }
         const int nsx = W / 4, nsub = (W / 4) * (H / 4);
@@ -1045,9 +1045,9 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++)
                     d[i * 4 + j] = (int)s[(sy + i) * sp + sx + j] - rc_pred(S, tid_, pl, S.uvc[ci], false, 0, sy + i, sx + j, T.lw, T.lh, W);
-            atomicAdd(&S.satd[ci], hadamard4_abs(d));
+            atomic_fetch_add_explicit((threadgroup atomic_float *)&S.satd[ci], hadamard4_abs(d), memory_order_relaxed);
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     // ---- exact RD: top uvK modes (+ CfL) for U and V ----
     if (tid == 0) {
@@ -1083,7 +1083,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
         }
         S.nTask = n;
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     int skipCtxU, dcCtxU, skipCtxV, dcCtxV;
     txb_ctx(I, 1, txSz, x4, y4, bsize, tb, &skipCtxU, &dcCtxU);
     txb_ctx(I, 2, txSz, x4, y4, bsize, tb, &skipCtxV, &dcCtxV);
@@ -1129,7 +1129,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
             }
             if ((tid & 31) == 0) S.taskJ[t] = o.D + lambda * o.R;
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     // pick the best mode (sum over U and V + mode bits)
     int bestUv = AV1G_DC_PRED, bestUvC = cand_pack(AV1G_DC_PRED, 0);
@@ -1154,7 +1154,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
             if (J < bJ) { bJ = J; bestUv = uv; bestUvC = c; }
         }
     }
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     const bool cfl = bestUv == AV1G_UV_CFL_PRED;
     const int uvTxType = av1g_chroma_tx_type(txSz, bestUv, 0);
     int eobs[2];
@@ -1178,7 +1178,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
             else for (int i = tid; i < W * H; i += RC_NT) S.qfin[i] = rc_taskq(S.u, kept)[i];
             if (tid == 0) S.finEob = S.taskE[kept];
             if (tid < 32) rc_prepare_edges(S, tid_, pl, c, cfl, T.lw, T.lh);
-            __syncthreads();
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
             uint8_t *dst = I.rec[pl] + (size_t)cy * I.rpitch[pl] + cx;
             rc_write_pred(W, H, S, tid_, pl, c, cfl, alpha, dst, I.rpitch[pl]);
         } else {
@@ -1189,7 +1189,7 @@ __device__ __noinline__ void rc_chroma(int W, int H, threadgroup RcShared &S, in
         uint8_t *dst = I.rec[pl] + (size_t)cy * I.rpitch[pl] + cx;
         if (S.finEob > 0) {
             const int fixes = cta_inverse_add(W, H, S, tid_, S.qfin, txSz, uvTxType, ee.dcQ, ee.acQ, ee.qm, dst, I.rpitch[pl]);
-            if (fixes && tid == 0) atomicAdd(&B.stats[3], 1u);
+            if (fixes && tid == 0) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[3], 1u, memory_order_relaxed);
         }
         eobs[pl - 1] = rc_record_txb(W, H, S, tid_, B, sb, I, pl, txSz, uvTxType, x4, y4, sbr4, sbc4);
     }
@@ -1217,7 +1217,7 @@ kernel void k_recon(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
     const int miRowEnd = tb.y1 >> 2, miColEnd = tb.x1 >> 2;
     if (P.poisonSmem) {   // debug: uninitialised shared-memory reads become a fixed pattern (0x7F7F levels)
         for (int i = tid; i < (int)(sizeof(RcShared) / 4); i += RC_NT) ((threadgroup uint32_t *)&S)[i] = 0x7F7F7F7Fu;
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     // clear_block_decoded_flags (spec): one thread per (plane, row) word
     if (tid < 3 * 18) {
@@ -1241,7 +1241,7 @@ kernel void k_recon(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
     const BlockQ bq = block_q(I, qidx);
     const float lambda = gp_lambda(qidx, P.lambdaMul);
     AV1G_CONST const float *C = g_cost[I.qctx];
-    __syncthreads();
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     for (int li = 0; li < nLeaves; li++) {
         const GpLeaf lf = B.leaves[(size_t)sb * GP_MAX_LEAVES + li];
         const int bsize = lf.bsize;
@@ -1287,11 +1287,11 @@ rc_chroma(AV1G_T(Tx_Width)[uvTx], AV1G_T(Tx_Height)[uvTx], S, tid_, B, P, sb, I,
             b.sb_qindex = (uint8_t)(I.sbQ ? qidx : 0);
             B.oBlocks[(size_t)sb * GP_MAX_LEAVES + li] = b;
             B.oBlockTxb[(size_t)sb * GP_MAX_LEAVES + li] = (uint16_t)firstTxb;
-            if (skip) atomicAdd(&B.stats[1], 1u);
-            if (hasChroma && uv == AV1G_UV_CFL_PRED) atomicAdd(&B.stats[2], 1u);
-            atomicAdd(&B.stats[0], 1u);
+            if (skip) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[1], 1u, memory_order_relaxed);
+            if (hasChroma && uv == AV1G_UV_CFL_PRED) atomic_fetch_add_explicit((device atomic_uint *)&B.stats[2], 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit((device atomic_uint *)&B.stats[0], 1u, memory_order_relaxed);
         }
-        __syncthreads();
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     if (tid == 0) {
         GpSbOut o;

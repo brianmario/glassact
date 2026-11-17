@@ -556,7 +556,7 @@ struct GaInterSmem {
 // the passes warp_eval runs, at the thread counts k_inter runs them on), so the same coefficients;
 // the end of block from the quantization loop (ga_iscan)
 template <int W, int H, int NT>
-__device__ __forceinline__ void ga_inter_eval(threadgroup GaInterSmem<W, H> &S, device const float *fwdM, thread const EvalIn &e,
+__attribute__((always_inline)) void ga_inter_eval(threadgroup GaInterSmem<W, H> &S, device const float *fwdM, thread const EvalIn &e,
                                               thread EvalOut &o, int lane) {
 #ifdef GA_FWD_MMA
     if (ga_mma && W == H && W >= 16) {
@@ -599,7 +599,7 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
         const int qidx = sb_qindex(I, x, y);
         const float lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
-        const float lamS = P.satdLambda * sqrtf(lambda);
+        const float lamS = P.satdLambda * sqrt(lambda);
         // candidates: no motion, and k_me's vectors of the 16x16s covered, each once; their SADs the
         // sums of k_inter_sad's 8x8s (the same values as measuring the block)
         const int c0x = x >> 4, c0y = y >> 4, c1x = (x + W - 1) >> 4, c1y = (y + H - 1) >> 4;
@@ -790,7 +790,7 @@ kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
         if (live) {
             const int qidx = sb_qindex(I, x, y);
             lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
-            const float lamS = P.satdLambda * sqrtf(lambda);
+            const float lamS = P.satdLambda * sqrt(lambda);
             // candidates 0..2 (no motion, its 16x16's k_me vectors), CG of the block's lanes each summing
             // its 8x8s' SADs (as k_inter's G)
             const int sbi = (y >> 6) * I.sbCols + (x >> 6);
@@ -954,7 +954,7 @@ kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
         if (live) {
             const int qidx = sb_qindex(I, x, y);
             lambda = gp_lambda(qidx, P.lambdaMul) * ssim_scale(I, x, y, W, H);
-            const float lamS = P.satdLambda * sqrtf(lambda);
+            const float lamS = P.satdLambda * sqrt(lambda);
             const int c0x = x >> 4, c0y = y >> 4, c1x = (x + W - 1) >> 4, c1y = (y + H - 1) >> 4;
             const int nc = 1 + (c1x - c0x + 1) * (c1y - c0y + 1) * GP_ME_KEEP;
             const int sbi = (y >> 6) * I.sbCols + (x >> 6);

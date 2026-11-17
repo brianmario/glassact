@@ -1,13 +1,16 @@
 // Glass Act: av1gpu's encoder/src/dev_common.cuh (BSD-2, Sources/AV1Core/LICENSE), for Metal:
 // - the derived tables come from the generated include (AV1Encoder/src/tables.cpp) instead of
-//   __device__ globals filled with cudaMemcpyToSymbol;
+//   globals filled with cudaMemcpyToSymbol;
 // - CID is integer offsetof arithmetic, not pointer differences inside a dummy struct (see hd.h
 //   on Metal's multi-dimensional constant arrays);
 // - lambda is computed in float (Metal has no double);
-// - warp shuffles are SIMD-group shuffles; pointers into tables say AV1G_CONST.
+// - warp shuffles are SIMD-group shuffles; pointers into tables say AV1G_CONST;
+// - CUDA's spellings are Metal's, in this header and the kernels that include it: no
+//   __device__, __forceinline__ as always_inline, __syncthreads / __syncwarp as threadgroup /
+//   SIMD-group barriers, the float math functions Metal's overloads, the atomics Metal's
+//   relaxed atomic_fetch_*_explicit (from cuda_compat.h, removed 2026-11-17).
 // device-side tables and helpers (included once, by kernels.cu).
 #pragma once
-#include "cuda_compat.h"
 #include "av1g/hd.h"
 #include "av1g/enums_gen.h"
 #include "av1g/spec_tables.h"
@@ -33,26 +36,26 @@
 // cdf ids: uint16 offsets into av1g_cdfs (same convention as av1core gpu_entropy)
 #define CID(expr) ((uint32_t)(__builtin_offsetof(av1g_cdfs, expr) / 2))
 
-__device__ __forceinline__ float cost_of(AV1G_CONST const float *C, uint32_t cid, int s) { return C[cid + s]; }
+__attribute__((always_inline)) float cost_of(AV1G_CONST const float *C, uint32_t cid, int s) { return C[cid + s]; }
 
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ float warp_sum(float v) {
+__attribute__((always_inline)) float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += simd_shuffle_xor(v, (ushort)o);
     return v;
 }
-__device__ __forceinline__ int warp_max(int v) {
+__attribute__((always_inline)) int warp_max(int v) {
     for (int o = 16; o > 0; o >>= 1) v = max(v, simd_shuffle_xor(v, (ushort)o));
     return v;
 }
-__device__ __forceinline__ int warp_sumi(int v) {
+__attribute__((always_inline)) int warp_sumi(int v) {
     for (int o = 16; o > 0; o >>= 1) v += simd_shuffle_xor(v, (ushort)o);
     return v;
 }
 
-__device__ __forceinline__ int bw_px(int bs) { return 4 * av1g_bw4(bs); }
-__device__ __forceinline__ int bh_px(int bs) { return 4 * av1g_bh4(bs); }
+__attribute__((always_inline)) int bw_px(int bs) { return 4 * av1g_bw4(bs); }
+__attribute__((always_inline)) int bh_px(int bs) { return 4 * av1g_bh4(bs); }
 
 // libaom-style lambda (per bit, in 8-bit SSE units): rdmult = dc_q^2 * (3.3 + 0.0015 dc_q) * w/128 (tune=iq
 // key frame), lambda = rdmult / 2048 (RDCOST: R in 1/512 bit units * rdmult >> 9, D = SSE * 16 << 7).
@@ -65,7 +68,7 @@ inline float gp_lambda(int qindex, float mul) {
     return rd / 2048.0f * mul;
 }
 
-__device__ __forceinline__ int sb_qindex(const GpImage &I, int x, int y) {
+__attribute__((always_inline)) int sb_qindex(const GpImage &I, int x, int y) {
     if (!I.sbQ) return I.baseQ;
     return I.sbQ[(y >> 6) * I.sbCols + (x >> 6)];
 }
@@ -74,7 +77,7 @@ __device__ __forceinline__ int sb_qindex(const GpImage &I, int x, int y) {
 struct BlockQ {
     int dcQ[3], acQ[3];
 };
-__device__ __forceinline__ BlockQ block_q(const GpImage &I, int qidx) {
+__attribute__((always_inline)) BlockQ block_q(const GpImage &I, int qidx) {
     BlockQ q;
     q.dcQ[0] = av1g_dc_q(qidx); q.acQ[0] = av1g_ac_q(qidx);
     q.dcQ[1] = av1g_dc_q(qidx + I.dqUDc); q.acQ[1] = av1g_ac_q(qidx + I.dqUAc);
@@ -84,7 +87,7 @@ __device__ __forceinline__ BlockQ block_q(const GpImage &I, int qidx) {
 
 // tile containing luma pixel (x, y): bounds in pixels
 struct TileBox { int x0, y0, x1, y1; };
-__device__ __forceinline__ TileBox tile_of(const GpImage &I, int x, int y) {
+__attribute__((always_inline)) TileBox tile_of(const GpImage &I, int x, int y) {
     TileBox t;
     int c = 0, r = 0;
     while (c + 1 < I.tileCols && x >= I.tileColStart[c + 1] * 4) c++;
@@ -94,7 +97,7 @@ __device__ __forceinline__ TileBox tile_of(const GpImage &I, int x, int y) {
     return t;
 }
 
-__device__ __forceinline__ int zorder16(int x, int y) {  // x, y in 0..15
+__attribute__((always_inline)) int zorder16(int x, int y) {  // x, y in 0..15
     int z = 0;
     for (int b = 0; b < 4; b++) z |= (((x >> b) & 1) << (2 * b)) | (((y >> b) & 1) << (2 * b + 1));
     return z;
@@ -102,7 +105,7 @@ __device__ __forceinline__ int zorder16(int x, int y) {  // x, y in 0..15
 
 // Open-loop guess of "pixel (px,py) (plane units, sub = chroma shift) is decoded before the block at
 // (x,y)": previous SB row and left SB as the spec's BlockDecoded init, Z-order inside the SB.
-__device__ __forceinline__ bool ol_decoded(int px, int py, int x, int y, int sub, const TileBox &t) {
+__attribute__((always_inline)) bool ol_decoded(int px, int py, int x, int y, int sub, const TileBox &t) {
     const int tx0 = t.x0 >> sub, ty0 = t.y0 >> sub, tx1 = t.x1 >> sub, ty1 = t.y1 >> sub;
     if (px < tx0 || py < ty0 || px >= tx1 || py >= ty1) return false;
     const int S = 64 >> sub;
@@ -115,13 +118,13 @@ __device__ __forceinline__ bool ol_decoded(int px, int py, int x, int y, int sub
 }
 
 // candidate packing: mode << 3 | (delta + 3)
-__device__ __forceinline__ int cand_mode(int c) { return c >> 3; }
-__device__ __forceinline__ int cand_delta(int c) { return (c & 7) - 3; }
-__device__ __forceinline__ int cand_pack(int m, int d) { return (m << 3) | (d + 3); }
+__attribute__((always_inline)) int cand_mode(int c) { return c >> 3; }
+__attribute__((always_inline)) int cand_delta(int c) { return (c & 7) - 3; }
+__attribute__((always_inline)) int cand_pack(int m, int d) { return (m << 3) | (d + 3); }
 
 // Parallel replica of av1g_build_edges (spec 7.11.2 edge preparation): threads tid = 0..nt-1 of a group
 // fill AboveRow[-1 .. w+h-1] / LeftCol[-1 .. w+h-1].  Identical output (checked against the serial one).
-__device__ __forceinline__ void build_edges_par(const uint8_t *plane, int stride, int x, int y, int lw, int lh, int haveL,
+__attribute__((always_inline)) void build_edges_par(const uint8_t *plane, int stride, int x, int y, int lw, int lh, int haveL,
                                                 int haveA, int haveAR, int haveBL, int maxX, int maxY, uint8_t *above,
                                                 uint8_t *left, int tid, int nt) {
     const int w = 1 << lw, h = 1 << lh, n = w + h;
@@ -153,7 +156,7 @@ __device__ __forceinline__ void build_edges_par(const uint8_t *plane, int stride
 
 // tune=iq per-block rdmult scale: geometric mean of the per-16x16 SSIM factors the block covers
 // (libaom av1_set_ssim_rdmult)
-__device__ __forceinline__ float ssim_scale(const GpImage &I, int x, int y, int w, int h) {
+__attribute__((always_inline)) float ssim_scale(const GpImage &I, int x, int y, int w, int h) {
     if (!I.ssimLog) return 1.f;
     const int c0 = x >> 4, r0 = y >> 4;
     const int nc = (w + 15) >> 4, nr = (h + 15) >> 4;
@@ -161,12 +164,12 @@ __device__ __forceinline__ float ssim_scale(const GpImage &I, int x, int y, int 
     int n = 0;
     for (int r = r0; r < r0 + nr && r < I.rows16; r++)
         for (int c = c0; c < c0 + nc && c < I.cols16; c++) { s += I.ssimLog[r * I.cols16 + c]; n++; }
-    return n ? __expf(s / n) : 1.f;
+    return n ? exp(s / n) : 1.f;
 }
 
 // Glass Act: the luma modes learned mode pruning leaves a block (its node's, k_ml.h); all 13 off
 // the grid of whole nodes or without it
-__device__ __forceinline__ uint ml_mode_mask(const GpImage &I, int x, int y, int W, int H) {
+__attribute__((always_inline)) uint ml_mode_mask(const GpImage &I, int x, int y, int W, int H) {
     if (!I.mlModes) return 0x1FFFu;
     const int m = max(W, H), level = m <= 8 ? 0 : m <= 16 ? 1 : m <= 32 ? 2 : 3, n = 8 << level;
     const int cols = I.W / n, nx = x / n, ny = y / n;
@@ -175,7 +178,7 @@ __device__ __forceinline__ uint ml_mode_mask(const GpImage &I, int x, int y, int
 }
 
 // flat-area pruning of shapes below 16x16 (GpParams::pruneFlat)
-__device__ __forceinline__ bool prune_flat(const GpImage &I, constant GpParams &P, int x, int y, int W, int H, int qidx) {
+__attribute__((always_inline)) bool prune_flat(const GpImage &I, constant GpParams &P, int x, int y, int W, int H, int qidx) {
     if (I.mlSkip) {  // Glass Act: learned pruning (k_ml.h): the node this shape belongs to
         const int m = max(W, H), level = m <= 8 ? 0 : m <= 16 ? 1 : m <= 32 ? 2 : 3;
         if (I.mlSkip[((y >> 3) * I.cols8 + (x >> 3)) * 4 + level]) return true;
