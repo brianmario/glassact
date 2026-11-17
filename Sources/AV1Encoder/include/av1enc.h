@@ -218,6 +218,9 @@ const uint8_t *av1enc_hybrid_source(const av1enc_hybrid *h, int plane, int *stri
 // was its caller's.
 int av1enc_hybrid_postfilter_cpu(av1enc_hybrid *h, uint8_t *const out[3], const int out_stride[3], const size_t out_len[3],
                                  av1g_frame_params *fp, int8_t *sb_cdef, size_t sb_count, char *err, size_t errlen);
+// Whether av1enc_hybrid_postfilter_cpu searches CDEF (on, the default) or deblocks alone, CDEF
+// signalled inactive (off).
+void av1enc_hybrid_set_postfilter_cpu_cdef(av1enc_hybrid *h, int on);
 // the last call's seconds: 0 chroma decisions, 1 closed loop
 double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 

@@ -58,6 +58,7 @@ impl Hybrid {
             cur,
             src,
             pf,
+            pf_cdef,
             ..
         } = self;
         let (rec, o) = (&recs[*cur], &outs[*cur]);
@@ -75,8 +76,9 @@ impl Hybrid {
             return Err(error(ERR_INVALID, "postfilter_cpu: output planes too small"));
         }
         let mut t = tuneiq_frame_init(rec.fp.base_q_idx as i32, ss, ss, false);
-        if deblock_only() {
-            t.cdef_mode = 0; // (research: GA_PF444_DEBLOCK_ONLY, deblocking's worth alone)
+        if deblock_only() || !*pf_cdef {
+            // (research: GA_PF444_DEBLOCK_ONLY, deblocking's worth alone; or the caller's rule)
+            t.cdef_mode = 0;
         }
         let mut fp = rec.fp;
         let lvl = t.lf_level as u8;

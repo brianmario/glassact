@@ -159,7 +159,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// A 4:4:4 picture's chroma modes decided by the closed loop on the CPU, on the real planes
     /// (the reference engine's rule), not by the GPU's leaf kernel on the analysis's 4:2:0 copy
     /// (off). Against the GPU's decisions the CPU rule takes 2.1 % fewer bytes at equal quality on
-    /// new screen pictures (the 5K rotation), 4.9 % more on video and 0.0–0.5 % more on the other
+    /// new screen pictures (the 5K rotation), about 5.2 % more on video and 0.0–0.5 % more on the other
     /// screens, for 1.7–35 ms of CPU a 5K picture (BENCHMARKS "the hybrid's 4:4:4 work on the GPU").
     public var chroma444CPUChroma = false
 
@@ -624,8 +624,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public var postfilters = true
 
     /// CDEF where the GPU's filters run (on): off, every picture is deblocked alone (CDEF signalled
-    /// but inactive, as libaom does at qindex 32 and under), as `newPictureEffort`'s are. (Not with
-    /// `chroma444CPUFilters`, which refuses it.)
+    /// but inactive, as libaom does at qindex 32 and under), as `newPictureEffort`'s are (the
+    /// CPU's research filters, `chroma444CPUFilters`, too).
     public var usesCDEF = true
 
     /// Time the GPU's stages one by one (`AV1MetalEncoder.profilesStages`):
@@ -1723,8 +1723,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
             filtered()  // (none on the GPU)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
-            // (the CPU's filters, research, always search CDEF: `usesCDEF` is the GPU's)
-            guard !cpuFilters || usesCDEF else { throw Failure.encode("chroma444CPUFilters with usesCDEF off") }
+            // (the CPU's filters take the GPU's CDEF rule: off with `usesCDEF`, and in a fast picture
+            // with `newPictureEffort`'s)
+            av1enc_hybrid_set_postfilter_cpu_cdef(cpu, usesCDEF && (!fast || newPictureEffort?.cdef != false) ? 1 : 0)
             let filtered = cpuFilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
             // (a 4:4:4 stream's reference without its planes copied out: the closed loop's own)
             let inPlace = p.chroma444 && interFrames && !returnsPlanes && filtered == nil && !copies && store.isEmpty
@@ -1755,7 +1756,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             known = reusesAnalysis && filteredLast
                 && av1enc_hybrid_changed_superblocks(cpu, &changed, Int32(sbCols0), Int32(sbRows0)) != 0
         }
-        filteredLast = true
+        // (true again once the search has filtered this picture: one that throws leaves the filters'
+        // buffers no picture's the next can take regions of)
+        filteredLast = false
         Self.trace("filters start")
         // (the analyses ordered behind these filters start as their GPU work ends: `filtered`
         // raises the gate the same, once they're done on the CPU too)
@@ -1769,6 +1772,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                            changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
                                            cropsOutput: returnsPlanes, cdef: usesCDEF && (!fast || newPictureEffort?.cdef != false))
+        filteredLast = true
         let sbCols = sbCols0
         let t2 = CACurrentMediaTime()
         Self.trace("filters end")

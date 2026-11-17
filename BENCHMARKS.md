@@ -378,7 +378,7 @@ replay knob), `52ccaf4` (the CPU chroma rule as a switch), `6ed0b23` (review fix
   158 (157 at the start, the snapshot constants untouched: `pf_frame_snapshot` holds because the
   frame's new `chroma444` field sits in `av1g_pf_frame`'s padding and is 0 for 4:2:0; the new
   `pf_frame_marks_444` checks it); the 4:2:0 movie replay at 6 Mbit/s reproduces the last entry's
-  run exactly (371 frames, 16.29 MB, RGB PSNR 40.80, SSIMULACRA2 52.0). 4:2:0's speed: `av1seq` at 5K (below, n 3) 54.6 → 54.6 frames a second on the movie and 56.6 → 56.1 on the rotation, the filters' GPU 6.3 → 6.5 and 1.8 → 1.8 ms: the same within the noise.
+  run (371 frames, 16.29 MB against its 16.30, RGB PSNR 40.80, SSIMULACRA2 52.0: the same frames and scores, the bytes within its rounding). 4:2:0's speed: `av1seq` at 5K (below, n 3) 54.6 → 54.6 frames a second on the movie and 56.6 → 56.1 on the rotation, the filters' GPU 6.3 → 6.5 and 1.8 → 1.8 ms: the same within the noise.
 - *4:4:4 exact:* every `av1seq --inter --chroma 444` frame equals the encoder's picture in libaom:
   movie, app switching, tabs and the four-trace rotation at 1280, 2900 and 5120, q8/20/36 (36 runs,
   468 frames), and the BD sweeps below (102 runs of 24 or 30 frames at 5K). The replay's
@@ -499,7 +499,7 @@ reproduces; "before" is the last entry's 4:4:4). Video MB, frames shown, RGB PSN
 | tabs · 6 | 571 / 571 / 571 | 1.25 / 1.19 / 1.16 | 39.95 / 41.51 / 41.60 | 74.1 · 72.4 / 74.7 · 73.3 / 75.1 · 73.8 |
 | tabs · 2 | 487 / 493 / 493 | 1.03 / 1.00 / 0.99 | 37.09 / 38.09 / 38.13 | 60.2 · 55.8 / 60.5 · 54.2 / 60.7 · 54.2 |
 | movie · 20 | 600 / 600 / 600 | 27.70 / 34.96 / 34.01 | 40.27 / 40.86 / 41.51 | 50.0 · 41.5 / 50.3 · 45.1 / 53.6 · 48.3 |
-| movie · 6 | 371 / 263 / 298 | 16.30 / 14.92 / 16.29 | 40.80 / 41.18 / 42.13 | 52.0 · 45.0 / 52.1 · 44.1 / 56.4 · 48.5 |
+| movie · 6 | 371 / 263 / 298 | 16.30 (16.29 rerun) / 14.92 / 16.29 | 40.80 / 41.18 / 42.13 | 52.0 · 45.0 / 52.1 · 44.1 / 56.4 · 48.5 |
 | movie · 2 | 99 / 88 / 100 | 4.78 / 5.19 / 5.68 | 41.54 / 41.74 / 42.91 | 58.1 · 43.2 / 54.4 · 45.9 / 60.7 · 53.0 |
 
 With CDEF in the fast pictures too (`--hybrid-fast-cdef`): movie · 20 600 frames, 33.78 MB, 42.00 dB,
@@ -515,7 +515,7 @@ With CDEF in the fast pictures too (`--hybrid-fast-cdef`): movie · 20 600 frame
 - **Screens** keep their place: the same frames, 1–3 % fewer bytes than before, the colour scores a
   little higher.
 - **CDEF in the fast pictures** buys quality at the ceiling (+0.1–0.5 dB, +0.8–2.2 SSIMULACRA2), no
-  frames (298 → 300 at 6, 100 → 98 at 2), at a third of the throughput and 12 ms of latency
+  frames (298 → 300 at 6, 100 → 98 at 2), for 35 % of the throughput (46.4 → 30.1 frames a second) and 12 ms of latency
   (46.4 → 30.1 frames a second on the movie in `av1seq`, lone encode latency p50 43.3 → 55.6 ms): not on, as in 4:2:0.
 
 **Timing in the replay** (the same replays at 20 Mbit/s without the picture check or scoring, the live
@@ -541,7 +541,9 @@ gone, and no time measurable); regional reuse only after a picture the GPU filte
 source pool drops sets of another format or size on a change (it would otherwise have made 51.6 MB
 of new buffers every later 5K 4:4:4 picture); the search refuses coded blocks larger than 64×64
 (one cdef_idx for four 64×64s); 4:4:4 block geometry checked with given chroma; `--cpu-filters` with
-`--no-cdef` and two-step 4:4:4 refused.
+`--no-cdef` and two-step 4:4:4 refused. A second pass (`5145871..` the next commit): `filteredLast` set only after a
+search succeeds; the pool's check without allocating; the large-block refusal only where CDEF is searched; the CPU's
+research filters take the GPU's CDEF rule (none with `usesCDEF` off or in a fast picture) instead of refusing.
 
 **What's next.**
 - *The Viewer's decode of 4:4:4 video* is now the cost to cut: deblocking doubles it (the movie's inter frames 9.7 → 20.6 ms in our decoder, key frames 12.0 → 23.7: every coded 64×64 of a 5K 4:4:4 picture deblocked in three full planes).

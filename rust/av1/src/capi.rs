@@ -1249,6 +1249,12 @@ pub unsafe extern "C" fn av1enc_hybrid_set_intrabc(h: *mut HybridHandle, on: c_i
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_set_postfilter_cpu_cdef(h: *mut HybridHandle, on: c_int) {
+    // SAFETY: the handle
+    unsafe { (*h).h.set_postfilter_cpu_cdef(on != 0) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_set_chroma_444(h: *mut HybridHandle, on: c_int) {
     // SAFETY: the handle
     unsafe { (*h).h.set_chroma_444(on != 0) }

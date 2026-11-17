@@ -237,6 +237,9 @@ pub struct Hybrid {
     cl_cdfs: Box<FrameCdfs>,
     /// [`Hybrid::postfilter_cpu`]'s buffers
     pf: pf444::PfBufs,
+    /// [`Hybrid::postfilter_cpu`] searches CDEF (on; off: deblocking alone, as at qindex 32 and
+    /// under): [`Hybrid::set_postfilter_cpu_cdef`]
+    pf_cdef: bool,
 }
 
 /// What a picture's write needs besides its record: the writer, its output, and each reference
@@ -477,6 +480,7 @@ impl Hybrid {
             slot_known: 0,
             cl_cdfs: Box::new(FrameCdfs::new(0)),
             pf: pf444::PfBufs::default(),
+            pf_cdef: true,
         }
     }
 
@@ -1451,6 +1455,13 @@ impl Hybrid {
     /// frame where blocks copy has no post-filters (the record's fp.allow_intrabc says so).
     pub fn set_intrabc(&mut self, on: bool) {
         self.intrabc = on;
+    }
+
+    /// av1enc_hybrid_set_postfilter_cpu_cdef: whether [`Hybrid::postfilter_cpu`] searches CDEF
+    /// (on, the default) or deblocks alone, signalling CDEF inactive (off: a fast picture's rule,
+    /// as the GPU's filters take it).
+    pub fn set_postfilter_cpu_cdef(&mut self, on: bool) {
+        self.pf_cdef = on;
     }
 
     /// av1enc_hybrid_set_chroma_444: the next pictures are 4:4:4 (the High profile; off by

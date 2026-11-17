@@ -150,8 +150,9 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
     /// inter frame's copies: every block skipped and at level 0, and no intra
     /// block in the 64×64s around them). They're copied, not filtered.
     ///
-    /// Every block larger than 64×64 (128×128 superblocks) must be skipped: CDEF's preset is
-    /// chosen per 64×64, and a coded one would signal one for all of its 64×64s.
+    /// Where CDEF is searched (`cdef`, qindex over 32), every block larger than 64×64 (128×128
+    /// superblocks) must be skipped: CDEF's preset is chosen per 64×64, and a coded one would
+    /// signal one for all of its 64×64s.
     ///
     /// `planes` may be `reconstructionBuffers`' contents: then they're deblocked in place (and
     /// hold the reconstruction no more), and with `direct` (whose 64×64s and the unchanged ones
@@ -162,17 +163,17 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
                        sourceStrides: [Int]? = nil, sourceBuffers: [any MTLBuffer]? = nil, changed: [UInt8]? = nil,
                        direct: [UInt8]? = nil, lfZero: [UInt8]? = nil, cropsOutput: Bool = true,
                        cdef: Bool = true) throws -> Search {
-        // (the search chooses a CDEF preset per 64×64, but a coded block larger than 64×64 codes one
-        // for all of its 64×64s: refused. The hybrid's are skipped copies.)
-        let large = Int32(AV1G_BLOCK_64X128)...Int32(AV1G_BLOCK_128X128)
-        if params.sb128 != 0, blocks.contains(where: { $0.skip == 0 && large.contains(Int32($0.bsize)) }) {
-            throw Failure.metal("search: a coded block larger than 64×64")
-        }
         var fp = params
         var tf = GaTuneiqFrame()
         av1enc_tuneiq_frame(Int32(fp.base_q_idx), Int32(fp.monochrome), &tf)
         // (`cdef` false: as libaom at qindex 32 and under, one all-zero preset, signalled but inactive)
         if !cdef { tf.cdef_mode = 0 }
+        // (a searched CDEF preset is a 64×64's, but a coded block larger than 64×64 codes one for all
+        // of its 64×64s: refused where CDEF is searched. The hybrid's large blocks are skipped copies.)
+        let large = Int32(AV1G_BLOCK_64X128)...Int32(AV1G_BLOCK_128X128)
+        if tf.cdef_mode != 0, params.sb128 != 0, blocks.contains(where: { $0.skip == 0 && large.contains(Int32($0.bsize)) }) {
+            throw Failure.metal("search: a coded block larger than 64×64 with CDEF searched")
+        }
         let level = UInt8(tf.lf_level), mono = fp.monochrome != 0
         fp.loop_filter_level = (level, level, mono ? 0 : level, mono ? 0 : level)
         fp.loop_filter_sharpness = UInt8(tf.lf_sharpness)

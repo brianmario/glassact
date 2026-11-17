@@ -386,11 +386,20 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         if let old = lastSource {
             // (sets of another geometry or chroma format, from before a change, give way: they'd
             // otherwise hold the pool's places and every later picture make its own)
-            let lengths = old.map(\.length)
-            sourcePool.removeAll { $0.map(\.length) != lengths }
+            var i = 0
+            while i < sourcePool.count {
+                if Self.sameLengths(sourcePool[i], old) { i += 1 } else { sourcePool.remove(at: i) }
+            }
             if sourcePool.count < 2 { sourcePool.append(old) }
         }
         lastSource = planes
+    }
+
+    /// Whether two source sets have the same buffers' lengths (without allocating: on every picture).
+    static func sameLengths(_ a: [any MTLBuffer], _ b: [any MTLBuffer]) -> Bool {
+        guard a.count == b.count else { return false }
+        for k in a.indices where a[k].length != b[k].length { return false }
+        return true
     }
 
     /// The padded source of the last analysis set up: the next inter frame's motion search
