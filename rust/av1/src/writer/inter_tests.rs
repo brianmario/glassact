@@ -981,9 +981,9 @@ fn decoders() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Each installed decoder of `tools`, and the crate's own (`crate::decoder`), decodes the frames
-/// `outs` (of a stream with the first frame's `fp`) to exactly their reconstructions. `kinds`: what
-/// each frame is, for the messages.
+/// Each installed decoder of `tools`, and the crate's own (`crate::decoder`: if they're within its
+/// size limit), decodes the frames `outs` (of a stream with the first frame's `fp`) to exactly
+/// their reconstructions. `kinds`: what each frame is, for the messages.
 pub(super) fn decode_check(
     dir: &std::path::Path,
     tools: &[(&str, Vec<&str>)],
@@ -993,7 +993,17 @@ pub(super) fn decode_check(
     kinds: &[&str],
 ) {
     let mut own = crate::decoder::Decoder::new(2);
+    let max = crate::decoder::MAX_DIM;
     for (k, o) in outs.iter().enumerate() {
+        if fp.width.max(fp.stream_width as u32) > max || fp.height.max(fp.stream_height as u32) > max {
+            // past the decoder's limit (the writer's is 65535): refused
+            let e = own
+                .decode(&o.obu)
+                .map(|_| ())
+                .expect_err("a frame past the decoder's limit");
+            assert!(e.msg.contains("a side"), "{name}: {e}");
+            continue;
+        }
         let p = own
             .decode(&o.obu)
             .unwrap_or_else(|e| panic!("{name} frame {k} ({}): the crate's decoder: {e}", kinds[k]));

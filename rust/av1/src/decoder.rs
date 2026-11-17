@@ -417,7 +417,8 @@ impl Decoder {
     fn decode_tu(&mut self, tu: &[u8]) -> Result<(), Error> {
         let t0 = Instant::now();
         let n = tu.len();
-        let (mut pos, mut seq_obu, mut frame) = (0usize, None, None);
+        let (mut pos, mut frame) = (0usize, None);
+        let mut seq: Option<Seq> = None;
         while pos < n {
             let h = tu[pos];
             pos += 1;
@@ -458,7 +459,12 @@ impl Decoder {
             let span = (pos, sz as usize);
             match ty {
                 1 if frame.is_some() => return Err(err(ERR_INVALID, "a sequence header after the frame")),
-                1 => seq_obu = Some(span),
+                1 => {
+                    // every one must parse; the last one counts
+                    let mut sq = Seq::new();
+                    parse_seq_obu(&tu[pos..pos + span.1], &mut sq).map_err(|e| *e)?;
+                    seq = Some(sq);
+                }
                 6 if frame.is_some() => return Err(err(ERR_INVALID, "more than one frame in a temporal unit")),
                 6 => frame = Some(span),
                 3 | 4 | 7 | 8 => {
@@ -475,9 +481,7 @@ impl Decoder {
         let Some((fpos, fsz)) = frame else {
             return Err(err(ERR_INVALID, "no frame in the temporal unit"));
         };
-        if let Some((spos, ssz)) = seq_obu {
-            let mut sq = Seq::new();
-            parse_seq_obu(&tu[spos..spos + ssz], &mut sq).map_err(|e| *e)?;
+        if let Some(sq) = seq {
             if sq.op_idc {
                 return Err(err(ERR_INVALID, "operating points (operating_point_idc) not supported"));
             }

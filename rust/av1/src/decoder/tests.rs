@@ -784,8 +784,11 @@ fn fuzz_case(s: &Stream, seed: u64, d: &mut Decoder, count: &FuzzCount, progress
                         "fuzz seed {seed} (kind {kind}) tu {i}: decoded, but the parser and writer refuse it: {e}"
                     ),
                 }
-                // an undamaged key frame decodes as written
-                if damaged && !mutated && pic.key {
+                // an undamaged key frame with its sequence header (the writer's: after the temporal
+                // delimiter) decodes as written; one without decodes by the header the decoder has,
+                // which damage may have changed
+                let own_header = tu.len() > 2 && (tu[2] >> 3) & 15 == 1;
+                if damaged && !mutated && pic.key && own_header {
                     same(&pic, &s.outs[i])
                         .unwrap_or_else(|e| panic!("fuzz seed {seed} (kind {kind}) tu {i}: after damage: {e}"));
                     count.resynced.fetch_add(1, Relaxed);
