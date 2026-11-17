@@ -175,8 +175,15 @@ pub(super) fn intrabc_coverage() -> String {
 /// At least `n` of each kind of intra block copy block (but a prediction from the stack's second
 /// entry, which needs a zero first one: no DV is zero, so the stack is empty then).
 pub(super) fn assert_intrabc_coverage(n: u64) {
+    assert_intrabc_coverage_except(n, &[]);
+}
+
+/// [`assert_intrabc_coverage`] but for the kinds in `except`, for a test whose records don't make
+/// them. The counters are the process's: a test that leaves a kind to another test passes alone
+/// only if it doesn't count on that test having run.
+pub(super) fn assert_intrabc_coverage_except(n: u64, except: &[usize]) {
     let s = &super::walk::INTRABC_STAT;
-    for (i, a) in s.iter().enumerate().filter(|&(i, _)| i != 2) {
+    for (i, a) in s.iter().enumerate().filter(|&(i, _)| i != 2 && !except.contains(&i)) {
         assert!(
             a.load(std::sync::atomic::Ordering::Relaxed) >= n,
             "intra block copy coverage {i}: {}",
@@ -1021,7 +1028,9 @@ fn decoders_run(c444: bool) {
         assert_phase_coverage_ex(1, false);
     } else {
         assert_phase_coverage(1);
-        assert_intrabc_coverage(1);
+        // (no zero-difference DVs in these sequences' key frames: inter_sequences_round_trip
+        // covers those, 20 of each kind)
+        assert_intrabc_coverage_except(1, &[4]);
     }
     assert_sb128_coverage(1);
     let _ = std::fs::remove_dir_all(&dir);
