@@ -284,6 +284,10 @@ the numbers and the reasoning.
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
+| A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line; with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 
 **Rate control and transport**
 
@@ -348,6 +352,188 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: a lone new 5K picture, stage by stage and kernel by kernel; its serial set-up, copies and a new cache's analysis cut (2026-11-17)
+
+The hybrid as the Host's live encoder holds one picture in flight, so a new 5K picture's latency
+is the sum of every stage: none of the pipelining the earlier period entries measured hides any of
+it. Measured with `av1seq --push lone` (each picture submitted as the one before comes out) on the
+all-new stream (the rotation at 5K q20, `--no-golden`, 24 pictures, `--tiles 3x0`, the defaults:
+every inter picture fast at qindex 87), and on the app-switching trace
+(`glassact-1793737268.scap`, 300 pictures) at q20 and at 6 Mbit/s (`--push-kbit 6000`).
+`GA_TIMELINE` stage medians over the 23 inter pictures; timed runs one at a time under the lock,
+each started at a 1-minute load under 3 (a photo-analysis daemon kept the Mac at 2.5–4). The
+Instruments recordings (Metal System Trace with Metal GPU Counters, for the shader timeline,
+spills and Time Profiler samples) ran at load 3.6–4.5: read their shares, not their levels.
+
+**Where a lone new picture's 41 ms go** (base `f41defe`, medians of 3 runs; by rotation position
+the photos picture is the long one):
+
+| stage | ms | photos picture |
+|---|---|---|
+| copies decided (frame before out → begin) | 3.08 | 3.2 |
+| set-up (begin → motion commit: source copy, buffers, cache) | 2.86 | 3.0 |
+| commit → GPU start | 0.55 | |
+| GPU: motion search and inter candidates | 4.13 | 4.2 |
+| GPU: analysis | 10.2 | 14.7 |
+| GPU end → partition read, applied | 1.1 | |
+| closed loop (CPU) | 10.4 | 14.0 |
+| closed loop end → filters on the GPU | 0.91 | |
+| filters (GPU) | 0.70 | |
+| filters → writer start | 0.28 | |
+| writer (CPU) | 7.8 (mean 9.1) | 16.3 |
+| submit to frame, p50 / p95 | 41.2–41.7 / 60–62 | |
+
+So the critical path is everything, in series: GPU 14.9 (36 %), closed loop 10.4 (25 %), writer
+7.8–16 (19–28 %), the CPU's set-up and copies 5.9 (14 %), hand-offs and launches 3.3 (8 %).
+Pipelined (`--push burst`) the period is 18.0 ms (55.7 pictures a second), bound by the closed
+loop + filters chain as the 2026-11-12 entry found; `--push every=16.7` (the Host's submission)
+came out at 40.2 a second with p50 50 ms: two pictures in flight, so latency-bound (below).
+
+**The GPU, kernel by kernel** (Instruments' shader timeline, a lone picture's kernels summed, means
+over the 23 inter pictures; 13.97 ms in all, the `GA_TIMELINE` figure's 14.3 less launch gaps).
+Spills are Instruments' `graphics-compiler-spill-events`, mapped to kernels through `--profile`'s
+one-stage command buffers (bytes a thread); threadgroup memory from `GA_PIPELINES`:
+
+| kernel | ms | share | threads a threadgroup | threadgroup memory (B) | spilled (B a thread) |
+|---|---|---|---|---|---|
+| `k_analysis_small_8x8` (thread a block) | 1.95 | 13.9 % | 128 | 0 | 1008 |
+| `k_me` | 1.57 | 11.3 % | 128 | 2320 | (112: one of the motion search's four) |
+| `k_analysis_16x16_w2` | 1.39 | 9.9 % | 64 | 5248 | 0 |
+| `k_analysis_32x32_w1t128` | 1.32 | 9.5 % | 128 | 6912 | 32 |
+| `k_analysis_small_4x4` (thread a block) | 1.04 | 7.4 % | 128 | 0 | 208 |
+| `k_analysis_64x64_w1t256` | 1.03 | 7.4 % | 256 | 17168 | 768 |
+| `k_ml_stats` | 0.73 | 5.2 % | 64 | 8656 | (16–336: four of learned pruning's five) |
+| `k_leaf` | 0.73 | 5.2 % | 32 | 3072 | 240 |
+| `k_proj` | 0.53 | 3.8 % | 256 | 5760 | |
+| `k_leaf_small` | 0.49 | 3.5 % | 32 | 0 | 352 |
+| `k_inter_64x64` · `32x32` · `8x8` · `16x16` | 0.44 · 0.40 · 0.37 · 0.31 | 9.9 % | 128 · 128 · 64 · 64 | 18720 · 8480 · 1216 · 4352 | 0 |
+| `k_ml_mode` · `k_ml_cell` · `k_ml_list` · `k_ml_tree` | 0.34 · 0.24 · 0.15 · 0.06 | 5.6 % | 64 | 0 | |
+| `k_proj_sums` · `k_inter_sad` | 0.24 · 0.21 | 3.2 % | 128 | 0 · 304 | |
+| `k_dp` | 0.18 | 1.3 % | 128 | 2720 | 784 |
+| the filters (`p_deblock`, `p_mark`, …; CDEF is off on fast pictures) | 0.24 | 1.7 % | | | |
+
+**What bounds them.** Instruments' command line records no GPU counters here: the Metal GPU
+Counters instrument, alone or in the Game Performance template, records only "RT Unit Active", the
+counter set isn't among `xctrace`'s recording options, `MTLDevice.counterSets` offers only GPU
+timestamps (at stage boundaries), and Xcode 27 has no command-line replayer for a `.gputrace`. Metal reports no register counts
+either. So occupancy, limiters and registers per kernel are not measured; what is:
+- The thread-per-block kernels (`k_analysis_small_*`, 4x4 and 8x8 on a new picture: 21 % of the GPU)
+  spill 208–1008 B a thread (8x16 / 16x8, used by key frames, 1.6–1.9 KB): register-bound, as on
+  2026-10-31, and their lanes wait on each other's mode masks (2026-11-09).
+- The SIMD-group kernels mostly don't spill (16x16 none, 32x32 32 B, the 16x32 / 32x16 shapes
+  190–240 B) except 64x64 (768 B) and `k_dp` (784 B).
+- The motion search spills once (112 B, one of `k_proj_sums` / `k_proj` / `k_me` / `k_inter_sad`);
+  the inter candidates don't. `k_me` (1.57 ms, the second kernel) was measured window-search-bound
+  on 2026-11-12.
+- Learned pruning's passes spill 16–336 B (four of five).
+The previous rounds left a few percent a kernel (2026-11-09, -11, -12); nothing here is out of line
+with them, and the GPU is 36 % of the latency: the CPU's serial stages were the untouched ones.
+
+**The CPU, by component** (Time Profiler, 1 kHz, core-ms a picture): closed loop 105.5, writer
+44.3, copy finder 18.1, Metal and driver 3.8, the Swift encoder 2.0. The closed loop by stage (as
+2026-11-12's buckets; RDOQ is off on fast pictures): forward transform 19.6, reconstruction 12.4,
+plan and walk 11.6, intra prediction 11.1, `on_txb` 9.3, quantizer 8.4, `trial` 6.8, copies 6.2,
+spin and yield 4.9, bookkeeping 3.4, inter prediction 2.5, rate 2.4.
+**The writer is its slowest tile:** each tile is coded on its own thread (8 tile columns), and the
+write is the slowest one's time plus ≈ 0.3 ms. On the photos picture one tile takes 15.4 ms against
+9–11.5 for the others; on typing one 5.0 against 1–4.5. Its hot spot is `coeffs` (coefficient
+coding with the range coder inlined: 32 of its 44 core-ms).
+
+**The live path's other slow pictures: an analysis cache made anew.** The cache's key holds the
+qindex and the picture's effort, so every qindex the rate controller picks, and every fast↔normal
+step, made a new cache: ≈ 100 MB allocated and zeroed on the begin thread (set-up 4.3–4.6 ms
+against 1), and an analysis of every SB, the copied ones too (6–9 ms of motion search on a picture
+that copies 95 % of itself). On the app-switching trace at 6 Mbit/s the qindex moves on ten
+pictures around the switch (40 47 … 168), and those took 26–39 ms each against 5 for the rest.
+At a fixed q20 the picture after the switch's new picture (fast, q 87, then 80) took 39–47 ms.
+
+**Kept, the same streams** (each: the five reference digests; the cache's changes also the
+app-switching trace at q20 and 6 Mbit/s, the rotation at 20 Mbit/s decoded exactly, 60 pictures
+with GOLDEN_FRAME pipelined and in a burst, decoded exactly; Rust tests 153, the AV1 Swift suites):
+
+| change | commit | before → after (medians of 3 interleaved runs each) |
+|---|---|---|
+| A picture's set-up copies (the padded source; the cache's remembered source, each run of changed SBs one span a line) in bands on every core | `4589d9f` | a lone new picture's set-up 2.86 → 1.22 ms |
+| The copy finder's shift vote by an open-addressing table of the previous lines, not a sort and two binary searches a line (the sorted vote kept as the test's reference) | `f48adb4` | copies 3.08 → 1.72 ms |
+| A cache made anew takes its predecessor's buffers when they are large enough, cleared by a blit in its first command buffer (behind the read waits and the queue's order), the other keep and stale pair | `1569ecb`, `b06de48` | the ten rebuilt pictures' set-up 4.65–4.96 → 1.19–1.25 ms; the clear ≈ 0.3 ms of GPU |
+| A new cache's first inter frame analyzes only the SBs it codes, its choices by size (a shape's kernel, the projections' table) made as for every SB; SBs it skipped are marked unanalyzed for a picture without copies | `297d631` | the rebuilt pictures' motion search 7.4–9.0 → 2.0–4.0 ms of GPU, submit to frame 27.6–28.1 → 21.5–25.0 ms |
+
+All of it against `f41defe`, interleaved:
+
+| workload | before | after |
+|---|---|---|
+| the rotation, lone: submit to frame p50 (3 runs) | 40.7 / 40.8 / 40.8 ms | 37.2 / 37.4 / 37.7 ms |
+| … begin → frame, median; copies; set-up | 37.5; 3.04; 2.67 ms | 35.5; 1.66; 1.20 ms |
+| the rotation, `--push every=16.7` (two pictures in flight, as the Host): pictures a second, p50 | 39.9 / 40.0, 51.2 / 50.9 ms | 43.3 / 42.5, 49.5 / 48.2 ms |
+| the rotation, `--push burst`: pictures a second (3 runs) | 55.1–55.6 | 56.0–56.6 |
+| the app-switching trace at 6 Mbit/s, lone (3 runs): the ten rebuilt pictures' submit to frame, median | 31.7–32.6 ms | 20.4–20.6 ms |
+| … the switch's new picture (284) and the one after it | 41.5–41.9, 38.9–39.1 ms | 35.8–36.1, 27.1–27.7 ms |
+| … the run's p50 / p95 | 4.9–5.0 / 17.9–19.0 ms | 4.9–5.0 / 11.9–12.0 ms |
+
+**Measured, not kept:**
+- The copy finder's bands on every core (14 threads, not 8; the same votes): copies 1.72 → 1.49
+  ms, submit to frame p50 38.9 / 38.9 / 38.1 → 37.7 / 38.4 / 38.4, inside the noise, and more of
+  the closed loop's cores taken when pipelined.
+- The writer's coefficient levels all set before the first is coded, and each coefficient's five
+  neighbours read once as flat offsets for both its contexts (the same bytes: the crate's snapshot
+  tests and the five digests): writer 7.78 → 7.77 ms (medians of 3), photos picture 16.2 → 16.0.
+  The loads aren't where the walk's 62 % goes.
+- A new cache's first picture analyzing only its coded SBs *with* the kernel choices following
+  the analyzed count: the streams move from the fifth picture of the rotation (a shape analyzing
+  fewer than 4,096 blocks takes the SIMD-group kernel, whose float sums order differently). Kept
+  instead with the choices made as for every SB (above).
+
+**A caution for byte checks of rate-controlled streams:** with `--push every=…` the rate controller
+decides a picture's qindex with up to one earlier picture's size unknown, so a faster build can
+decide differently and code different (valid) bytes; every such run here that decided the same
+qindex sequence as the base coded the same bytes. Lone pictures and `--push burst` at a fixed q
+are deterministic.
+
+**Why `every=16.7` ran at 40 a second:** the bench, as the Host's engine, keeps at most two
+pictures in flight, so on new content its rate is two over a lone picture's latency (2 / 50 ms).
+60 a second at 5K on a full-screen change therefore needs a lone picture's latency under ≈ 33 ms
+(it is 37.5 now), or a third picture in flight.
+
+**The writer, by parts** (timing builds, the streams invalid: `Ec::symbol` and `Ec::bool` compiled
+to nothing, then also without the CDF update; writer median, photos picture):
+
+| writer | median (ms) | photos picture |
+|---|---|---|
+| as it is | 7.78 | 16.1 |
+| without the range coder | 5.39 | 10.9 |
+| without the range coder and the adaptation | 4.85 | 9.6 |
+
+So the range coder is 31 %, the CDF adaptation 7 %, and the walk and the contexts 62 % of the
+writer. Reading the contexts' neighbours once, from levels all set up front, gained nothing
+(above): what is left is the walk's control flow a coefficient and a block, not its loads.
+
+**What's next, with estimates:**
+- **The writer's coefficient loop, by its control flow:** a loop specialised by tx class and by
+  whether a block is dense (libaom computes a whole block's base contexts in one SIMD pass, then
+  codes); uncertain, ≤ 25 % of the writer (≈ 2 ms; 4 on photos), a day's work with the snapshot
+  tests holding the bytes.
+- **The writer beside the closed loop's last tiles:** a fast picture signals no CDEF, so its tiles'
+  bytes may not need the filters' choices (to check: nothing else the filters decide is coded in a
+  tile); tile coding could then start per tile as the closed loop finishes it (the 1.9 ms from closed loop end to writer start, and the writer's overlap with the
+  closed loop's tail: ≈ 2–4 ms of latency). Structural: the record's per-tile hand-off.
+- **The analysis's set-up beside the copy finder:** the source copy and buffers don't need the
+  copies (≈ 0.7 of the 1.2 ms).
+- **Launch and completion latency:** commit → GPU start 0.55 ms twice a picture, GPU end → read
+  0.65; a command buffer committed ahead and released by a shared event, and a reader spinning on
+  the event's value, could take ≈ 1 ms.
+- The GPU kernels: a few percent each, as the earlier rounds found; the register-bound thread
+  kernel (8x8, 1 KB spilled a thread) is the one place left that might pay, through fewer live
+  values (its mode loop's per-mode state), unmeasured.
+
+**Byte-changing options, for the owner** (not taken):
+- More tile columns (`--tiles 4x0`, 16 columns): the writer and closed loop are bound by their
+  slowest tile. At q20 on the all-new rotation (2 runs each, interleaved): +1.5 % bytes (546.2 →
+  554.5 KB a picture) at the same PSNR (46.01 / 46.02), writer 7.84 / 7.89 → 5.61 / 5.30 ms (photos
+  16.5 / 16.7 → 14.8 / 13.9: one tile still holds most of the photo), closed loop unchanged,
+  submit to frame p50 37.8 / 38.1 → 36.0 / 36.9 ms. Not BD-measured.
+- The fast picture's levers already measured on 2026-11-12 (no motion search: −5.3 ms of GPU for
+  +3.3 %; no 4x4s, no tx-type search), and level 2/3 of `newPictureEffort`.
 
 ### Room under VP8L for lossless tiles: per tile, or across tiles? (2026-11-17)
 
