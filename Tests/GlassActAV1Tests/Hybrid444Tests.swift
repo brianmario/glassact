@@ -205,6 +205,13 @@ struct Hybrid444Tests {
                 #expect(Double(sse) / Double(width * height) < 150, "\(label): frame \(i) plane \(p) is far from its source (MSE \(Double(sse) / Double(width * height)))")
             }
         }
+        // without its planes (`returnsPlanes` off: the reference is the closed loop's own, in
+        // place), the same stream
+        let inPlace = try make()
+        inPlace.returnsPlanes = false
+        var again: [[UInt8]] = []
+        try inPlace.encode(count: pictures.count, qindex: 72, picture: { pictures[$0] }, output: { _, f in again.append(f.obu) })
+        #expect(again == frames.map(\.obu), "\(label): the stream without its planes codes differently")
         // a 4:2:0 stream after it codes as on a fresh encoder
         let after420 = (0..<3).map { i -> AV1HybridEncoder.Picture in
             var y = p420.y

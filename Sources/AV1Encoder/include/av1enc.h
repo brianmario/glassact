@@ -207,6 +207,15 @@ const uint8_t *av1enc_hybrid_recon(const av1enc_hybrid *h, int plane);
 // the source the last call coded, padded by edge replication to whole superblocks (at least the
 // post-filters' MiCols*4 x MiRows*4, chroma half): rows *stride apart
 const uint8_t *av1enc_hybrid_source(const av1enc_hybrid *h, int plane, int *stride);
+// The last closed loop's picture post-filtered on the CPU (rust/av1 hybrid::pf444: deblocking at
+// tune=iq's level, CDEF by the GPU search's rule on the crate's filters), for pictures the GPU's
+// filters don't take (4:4:4): out (3 planes of out_len bytes, cropped to the picture, rows
+// out_stride apart) gets it, *fp the frame's filter parameters for av1enc_hybrid_write_ex, sb_cdef
+// each 64x64's cdef_idx (sb_count of them, raster; -1: none). The closed loop's own reconstruction
+// is unchanged. Not for a frame with intra block copies, nor one whose reconstruction or source
+// was its caller's.
+int av1enc_hybrid_postfilter_cpu(av1enc_hybrid *h, uint8_t *const out[3], const int out_stride[3], const size_t out_len[3],
+                                 av1g_frame_params *fp, int8_t *sb_cdef, size_t sb_count, char *err, size_t errlen);
 // the last call's seconds: 0 chroma decisions, 1 closed loop
 double av1enc_hybrid_seconds(const av1enc_hybrid *h, int which);
 

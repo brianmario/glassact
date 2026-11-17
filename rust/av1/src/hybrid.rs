@@ -35,6 +35,7 @@ mod fwd;
 mod fwd_neon;
 mod intrabc;
 mod palette;
+mod pf444;
 mod quant;
 mod rdoq;
 
@@ -233,6 +234,8 @@ pub struct Hybrid {
     /// what the closed loop's inter frames take for a reference's saved CDFs: it codes nothing, so
     /// their values don't enter its reconstruction
     cl_cdfs: Box<FrameCdfs>,
+    /// [`Hybrid::postfilter_cpu`]'s buffers
+    pf: pf444::PfBufs,
 }
 
 /// What a picture's write needs besides its record: the writer, its output, and each reference
@@ -472,6 +475,7 @@ impl Hybrid {
             recon_given: false,
             slot_known: 0,
             cl_cdfs: Box::new(FrameCdfs::new(0)),
+            pf: pf444::PfBufs::default(),
         }
     }
 

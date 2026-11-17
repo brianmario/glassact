@@ -1287,6 +1287,55 @@ pub unsafe extern "C" fn av1enc_hybrid_recon(h: *const HybridHandle, plane: c_in
     }
 }
 
+/// av1enc_hybrid_postfilter_cpu: [`crate::hybrid::Hybrid::postfilter_cpu`] into the caller's
+/// planes; the frame's filter parameters into `*fp`, `sb_count` cdef_idx values into `sb_cdef`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_hybrid_postfilter_cpu(
+    h: *mut HybridHandle,
+    out: *const *mut u8,
+    out_stride: *const c_int,
+    out_len: *const usize,
+    fp: *mut FrameParams,
+    sb_cdef: *mut i8,
+    sb_count: usize,
+    err: *mut c_char,
+    errlen: usize,
+) -> c_int {
+    if h.is_null() || out.is_null() || out_stride.is_null() || out_len.is_null() || fp.is_null() || sb_cdef.is_null() {
+        return ERR_INVALID;
+    }
+    // SAFETY: the caller's three planes of out_len bytes each, at their strides; the handle
+    let (planes, strides) = unsafe {
+        (
+            [0, 1, 2].map(|p| slice::from_raw_parts_mut(*out.add(p), *out_len.add(p))),
+            [0, 1, 2].map(|p| (*out_stride.add(p)).max(0) as usize),
+        )
+    };
+    let mut sb = Vec::new();
+    // SAFETY: the handle
+    let r = unsafe { (*h).h.postfilter_cpu(planes, strides, &mut sb) };
+    match r {
+        Ok(f) if sb.len() == sb_count => {
+            // SAFETY: the caller's fp and sb_count bytes
+            unsafe {
+                *fp = f;
+                slice::from_raw_parts_mut(sb_cdef, sb_count).copy_from_slice(&sb);
+            }
+            OK
+        }
+        Ok(_) => {
+            // SAFETY: the caller's buffer of errlen bytes
+            unsafe { set_error_raw(err, errlen, "sb_count isn't the picture's 64x64s") };
+            ERR_INVALID
+        }
+        Err(e) => {
+            // SAFETY: the caller's buffer of errlen bytes
+            unsafe { set_error_raw(err, errlen, &e.msg) };
+            e.code
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_hybrid_source(h: *const HybridHandle, plane: c_int, stride: *mut c_int) -> *const u8 {
     if plane < 0 {

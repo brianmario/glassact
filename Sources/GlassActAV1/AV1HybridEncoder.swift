@@ -66,25 +66,38 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
 
         /// A 4:4:4 picture's chroma as 4:2:0's: each 2×2's mean, rounded (edge samples repeated
-        /// past an odd width or height).
+        /// past an odd width or height). Both planes in bands of rows on every core (a 5K
+        /// picture's chroma is 2 × 14.7 MB, and this is on its analysis's critical path).
         func chroma420() -> (u: [UInt8], v: [UInt8]) {
             let (cw, ch) = ((width + 1) / 2, (height + 1) / 2)
-            func half(_ plane: [UInt8]) -> [UInt8] {
-                [UInt8](unsafeUninitializedCapacity: cw * ch) { out, count in
-                    plane.withUnsafeBufferPointer { s in
-                        for r in 0..<ch {
-                            let r0 = 2 * r * width, r1 = min(2 * r + 1, height - 1) * width
-                            for c in 0..<cw {
-                                let c0 = 2 * c, c1 = min(2 * c + 1, width - 1)
-                                let sum = Int(s[r0 + c0]) + Int(s[r0 + c1]) + Int(s[r1 + c0]) + Int(s[r1 + c1])
-                                out[r * cw + c] = UInt8((sum + 2) >> 2)
+            let width = width, height = height
+            var u2 = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
+            var v2 = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
+            let bands = min(16, max(1, ch / 32))
+            u.withUnsafeBufferPointer { su in
+                v.withUnsafeBufferPointer { sv in
+                    u2.withUnsafeMutableBufferPointer { du in
+                        v2.withUnsafeMutableBufferPointer { dv in
+                            let src = [su.baseAddress!, sv.baseAddress!], dst = [du.baseAddress!, dv.baseAddress!]
+                            DispatchQueue.concurrentPerform(iterations: 2 * bands) { job in
+                                let (s, d, b) = (src[job & 1], dst[job & 1], job >> 1)
+                                for r in (b * ch / bands)..<((b + 1) * ch / bands) {
+                                    let r0 = s + 2 * r * width, r1 = s + min(2 * r + 1, height - 1) * width, o = d + r * cw
+                                    for c in 0..<(width / 2) {
+                                        let sum = UInt16(r0[2 * c]) + UInt16(r0[2 * c + 1]) + UInt16(r1[2 * c]) + UInt16(r1[2 * c + 1])
+                                        o[c] = UInt8((sum + 2) >> 2)
+                                    }
+                                    if width & 1 != 0 {
+                                        let c = cw - 1
+                                        o[c] = UInt8((2 * UInt16(r0[2 * c]) + 2 * UInt16(r1[2 * c]) + 2) >> 2)
+                                    }
+                                }
                             }
                         }
                     }
-                    count = cw * ch
                 }
             }
-            return (half(u), half(v))
+            return (u2, v2)
         }
     }
 
@@ -169,6 +182,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// libaom's"). Its text and UI become palette blocks as libaom codes them, 8×8 and larger.
     /// Off: as 4:2:0 pictures are coded (`palette`'s setting, every shape).
     public var chroma444Palettes = true
+
+    /// Research: a 4:4:4 picture of a stream is deblocked and CDEF-filtered on the CPU
+    /// (`av1enc_hybrid_postfilter_cpu`; the GPU's filters are 4:2:0's), as `postfilters` says;
+    /// off: none (BENCHMARKS "4:4:4 inter frames" has what they were worth).
+    public var chroma444CPUFilters = false
 
     /// The shapes a 4:4:4 picture's analysis tries with `chroma444Palettes`: the preset's less
     /// 4×4, 4×8 and 8×4 (GpParams.shapeMask bits 0–2), which a palette can't be.
@@ -532,6 +550,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The previous picture's decoded planes are the post-filter's buffers (not `previous.planes`).
     private var previousOnGPU = false
 
+    /// The previous picture's decoded planes are the closed loop's own reconstruction (pointers and
+    /// strides; not `previous.planes`): a 4:4:4 picture written without its planes (`returnsPlanes`
+    /// off) and without filters. They stay where they are until the closed loop after the next
+    /// one (the CPU state's reconstructions alternate), so the next picture's closed loop reads
+    /// them in place, and its long-term copies are taken from them before that.
+    private var previousInCPU: (planes: [UnsafePointer<UInt8>], strides: [Int])?
+
     /// Tests: in a stream, the picture with this index fails once its analysis is read, as one
     /// whose closed loop threw would (the stream's failure path: it and every picture after it
     /// fail, in order). Read as the stream starts.
@@ -853,6 +878,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public func startStream(output: @escaping @Sendable (Int, Result<Frame, any Error>) -> Void) {
         precondition(stream == nil, "a stream is under way")
         previous = nil
+        previousInCPU = nil
         slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = interFrames && goldenFrames
         copyFinder.limit = longTermReferences
@@ -1036,6 +1062,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                output: (Int, Int, Frame) throws -> Void) throws {
         guard count > 0, interFrames else { return }
         previous = nil
+        previousInCPU = nil
         slotPlanes = Array(repeating: [], count: 8)
         copyFinder.golden = goldenFrames
         copyFinder.limit = longTermReferences
@@ -1482,7 +1509,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             guard p.y.count == p.width * p.height, p.u.count == p.y.count, p.v.count == p.y.count else {
                 throw Failure.encode("4:4:4 picture \(p.width)×\(p.height): planes of \(p.y.count), \(p.u.count), \(p.v.count) samples")
             }
+            Self.trace("chroma420 start")
             analysisChroma = p.chroma420()
+            Self.trace("chroma420 end")
         }
         let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
@@ -1613,12 +1642,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let ownReference = aliased ? previousDecoded(width: p.width, height: p.height) : []
         let refPlanes = ownReference.count == 3 ? ownReference : reference?.planes ?? []
         let gpuRef = reference != nil && previousOnGPU && ownReference.count != 3
-            ? (postfilter.outputPlanes, postfilter.outputStrides) : nil
+            ? (postfilter.outputPlanes, postfilter.outputStrides) : reference != nil ? previousInCPU.map { ($0.planes, $0.strides) } : nil
         // a frame that swaps the slots keeps the previous picture as a long-term one (below): its
         // decoded planes, copied out of the filters' buffers beside the closed loop, which only
         // reads them (or the copy above)
         let swapsOut = refs.map { $0.swaps } == true && reference != nil
-        let keeping: Later<[[UInt8]]>? = swapsOut && previousOnGPU && !aliased
+        let keeping: Later<[[UInt8]]>? = swapsOut && (previousOnGPU || previousInCPU != nil) && !aliased
             ? Later { [width = p.width, height = p.height] in self.previousDecoded(width: width, height: height) } : nil
         // `newPictureEffort`'s closed-loop levers, for this picture's closed loop only
         let effort = fast ? newPictureEffort : nil
@@ -1704,13 +1733,22 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         // (a 4:4:4 picture has none either: the GPU's filters and their search are 4:2:0's)
         guard postfilters, !copies, !p.chroma444 else {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames;
-            // a 4:4:4 one has none, in any frame)
-            filtered()  // (none)
+            // a 4:4:4 one has none, in any frame, unless the CPU filters it)
+            filtered()  // (none on the GPU)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
-            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames && !p.chroma444,
-                                  timing: timing, t0: t0, t1: t1)
+            let cpuFilters = p.chroma444 && postfilters && chroma444CPUFilters
+            let filtered = cpuFilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
+            // (a 4:4:4 stream's reference without its planes copied out: the closed loop's own)
+            let inPlace = p.chroma444 && interFrames && !returnsPlanes && filtered == nil && !copies && store.isEmpty
+            let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames && (!p.chroma444 || cpuFilters),
+                                  filtered: filtered, cropsPlanes: !inPlace, timing: timing, t0: t0, t1: t1)
             filteredLast = false
-            remember(p, frame.planes, sbMotion)
+            if inPlace {
+                let paddedWidth = 2 * ((p.width + 7) >> 3) * 4
+                remember(p, [], sbMotion, inCPU: (recon, [paddedWidth, paddedWidth, paddedWidth]))
+            } else {
+                remember(p, frame.planes, sbMotion)
+            }
             written?(.success(frame))
             return (Writing(frame), ended)
         }
@@ -1763,9 +1801,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     }
 
     /// The picture the next inter frame references.
-    private func remember(_ p: Picture, _ planes: [[UInt8]], _ sbMotion: [Int32]) {
+    private func remember(_ p: Picture, _ planes: [[UInt8]], _ sbMotion: [Int32],
+                          inCPU: ([UnsafePointer<UInt8>], [Int])? = nil) {
         previous = interFrames ? (p, planes, sbMotion) : nil
-        previousOnGPU = interFrames && planes.isEmpty
+        previousInCPU = interFrames ? inCPU.map { (planes: $0.0, strides: $0.1) } : nil
+        previousOnGPU = interFrames && planes.isEmpty && inCPU == nil
     }
 
     /// Per 64×64 of an inter frame, how the post-filters treat it. `changed`: the coded ones
@@ -1850,11 +1890,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The previous picture's decoded planes, tight (a copy of the filters' buffers when they
     /// hold them).
     private func previousDecoded(width: Int, height: Int) -> [[UInt8]] {
-        guard previousOnGPU else { return previous?.planes ?? [] }
-        let p = postfilter.outputPlanes, s = postfilter.outputStrides
+        let inCPU = previousInCPU
+        guard previousOnGPU || inCPU != nil else { return previous?.planes ?? [] }
+        let p = inCPU?.planes ?? postfilter.outputPlanes, s = inCPU?.strides ?? postfilter.outputStrides
         guard p.count == 3, s.count == 3 else { return [] }
+        let full = inCPU != nil  // (4:4:4's: the GPU's are 4:2:0's)
         return (0..<3).map { k in
-            let (w, h) = k == 0 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+            let (w, h) = k == 0 || full ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
             var out = [UInt8](repeating: 0, count: w * h)
             out.withUnsafeMutableBufferPointer { o in
                 for row in 0..<h { (o.baseAddress! + row * w).update(from: p[k] + row * s[k], count: w) }
@@ -1863,37 +1905,79 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         }
     }
 
+    /// A picture post-filtered on the CPU (`chroma444CPUFilters`): its parameters, each 64×64's
+    /// cdef_idx and the filtered planes (cropped).
+    private struct CPUFiltered {
+        var params: av1g_frame_params
+        var superblockCDEF: [Int8]
+        var planes: [[UInt8]]
+        var seconds: Double
+    }
+
+    /// The last closed loop's picture post-filtered on the CPU (`av1enc_hybrid_postfilter_cpu`).
+    private func cpuFiltered(_ p: Picture, sbCols: Int, sbRows: Int) throws -> CPUFiltered {
+        let t0 = CACurrentMediaTime()
+        let (cw, ch) = p.chromaSize
+        var (py, pu, pv) = ([UInt8](repeating: 0, count: p.width * p.height), [UInt8](repeating: 0, count: cw * ch),
+                            [UInt8](repeating: 0, count: cw * ch))
+        var params = av1g_frame_params()
+        var sb = [Int8](repeating: -1, count: sbCols * sbRows)
+        var message = [CChar](repeating: 0, count: 256)
+        let strides: [Int32] = [Int32(p.width), Int32(cw), Int32(cw)]
+        let lens = [py.count, pu.count, pv.count]
+        let rc = py.withUnsafeMutableBufferPointer { y in
+            pu.withUnsafeMutableBufferPointer { u in
+                pv.withUnsafeMutableBufferPointer { v in
+                    [y.baseAddress, u.baseAddress, v.baseAddress].withUnsafeBufferPointer { out in
+                        av1enc_hybrid_postfilter_cpu(cpu, out.baseAddress, strides, lens, &params, &sb, sb.count, &message, 256)
+                    }
+                }
+            }
+        }
+        guard rc == AV1G_OK else {
+            throw Failure.encode("CPU filters (\(rc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
+        }
+        return CPUFiltered(params: params, superblockCDEF: sb, planes: [py, pu, pv], seconds: CACurrentMediaTime() - t0)
+    }
+
     /// The picture without post-filters: the record's parameters (no deblocking, no CDEF) and the
     /// reconstruction, cropped. `sequenceCDEF`: the sequence header enables CDEF all the same (a
     /// frame with intra block copies, which codes none, of a stream whose other frames filter).
+    /// Or `filtered`'s, filtered on the CPU.
     private func write(_ p: Picture, record: UnsafeMutablePointer<av1g_decision_record>, recon: [UnsafePointer<UInt8>],
-                       sequenceCDEF: Bool, timing: Timing, t0: Double, t1: Double) throws -> Frame {
+                       sequenceCDEF: Bool, filtered: CPUFiltered? = nil, cropsPlanes: Bool = true, timing: Timing,
+                       t0: Double, t1: Double) throws -> Frame {
         var timing = timing
         var params = record.pointee.fp
         params.loop_filter_level = (0, 0, 0, 0)
         params.enable_cdef = sequenceCDEF && params.allow_intrabc != 0 ? 1 : 0
         params.cdef_bits = 0
+        if let filtered { params = filtered.params }
         var message = [CChar](repeating: 0, count: 256)
         var bytes: UnsafeMutablePointer<UInt8>?
         var size = 0
-        let wrc = av1enc_hybrid_write_ex(cpu, &params, nil, 0, headerFlags(params), &bytes, &size, &message, 256)
+        let sbCols = (2 * ((p.width + 7) >> 3) + 15) >> 4
+        let wrc = (filtered?.superblockCDEF ?? []).withUnsafeBufferPointer { sb in
+            av1enc_hybrid_write_ex(cpu, &params, filtered == nil ? nil : sb.baseAddress, filtered == nil ? 0 : Int32(sbCols),
+                                   headerFlags(params), &bytes, &size, &message, 256)
+        }
         guard wrc == AV1G_OK, let bytes else {
             throw Failure.encode("writer (\(wrc)): \(String(decoding: message.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))")
         }
         defer { free(bytes) }
         let obu = Array(UnsafeBufferPointer(start: bytes, count: size))
         let paddedWidth = 2 * ((p.width + 7) >> 3) * 4
-        let planes = (0..<3).map { plane -> [UInt8] in
+        let planes = filtered?.planes ?? (!cropsPlanes ? [] : (0..<3).map { plane -> [UInt8] in
             let w = plane == 0 ? p.width : p.chromaSize.width, h = plane == 0 ? p.height : p.chromaSize.height
             let stride = plane == 0 || p.chroma444 ? paddedWidth : paddedWidth / 2
             return [UInt8](unsafeUninitializedCapacity: w * h) { d, count in
                 for row in 0..<h { (d.baseAddress! + row * w).update(from: recon[plane] + row * stride, count: w) }
                 count = w * h
             }
-        }
+        })
         let t3 = CACurrentMediaTime()
-        timing.filters = 0
-        timing.writer = t3 - t1
+        timing.filters = filtered?.seconds ?? 0
+        timing.writer = t3 - t1 - timing.filters
         timing.wall = t3 - t0
         return Frame(obu: obu, planes: planes, params: params, timing: timing)
     }
