@@ -9,7 +9,7 @@ use super::{Error, Hybrid, error};
 use crate::blockinfo::chroma_ss;
 use crate::enc::lfsearch::{cdef_bits, cdef_presets, cdef_select_cpu};
 use crate::enc::tuneiq::tuneiq_frame_init;
-use crate::postfilter::{PF_BLK_INTER, PF_BLK_LF_ZERO, PfFrame, PfMapsBuf, cdef_frame, deblock_frame};
+use crate::postfilter::{PF_BLK_INTER, PF_BLK_LF_ZERO, PfFrame, PfMaps, PfMapsBuf, cdef_rect, deblock_rect};
 use crate::types::{ERR_INVALID, FRAME_INTER, FrameParams, GaCdefCand};
 
 /// libaom's fast CDEF candidates (CDEF_FAST_SEARCH_LVL4), the GPU search's
@@ -107,12 +107,37 @@ impl Hybrid {
             pf.deblocked[p].extend_from_slice(&o.recon[p]);
             pf.cdef[p].resize(o.recon[p].len(), 0);
         }
-        {
-            let [a, b, c] = &mut pf.deblocked;
-            deblock_frame(&f, &maps.maps(), &mut [a, b, c], &stride);
-        }
         let nsb = (f.sb_cols * f.sb_rows) as usize;
-        let sbc = f.sb_cols as usize;
+        let (sbc, ur) = (f.sb_cols as usize, f.sb_rows as usize);
+        let sub = |p: usize| if p == 0 { 0 } else { ss as usize };
+        let rows: [usize; 3] = core::array::from_fn(|p| 64 >> sub(p));
+        let ph: [usize; 3] = core::array::from_fn(|p| o.recon[p].len() / stride[p]);
+        // deblocking by bands of 64x64 rows on the pool, as the decoder runs it: pass 0 by bands,
+        // pass 1 by every other band with the 8 rows above it
+        let m = maps.maps();
+        for pass in 0..2 {
+            for phase in 0..1 + pass {
+                let spans: Vec<(usize, [(usize, usize); 3])> = (phase..ur)
+                    .step_by(1 + pass)
+                    .map(|uy| {
+                        let span = core::array::from_fn(|p| {
+                            ((uy * rows[p]).saturating_sub(8 * pass), ((uy + 1) * rows[p]).min(ph[p]))
+                        });
+                        (uy, span)
+                    })
+                    .collect();
+                let mut items = split(&mut pf.deblocked, &stride, &spans);
+                crate::pool::each(&mut items, |(uy, e)| {
+                    let r = 16 * *uy as i32;
+                    for ux in 0..sbc {
+                        let c = 16 * ux as i32;
+                        for (p, (band, y0)) in e.iter_mut().enumerate() {
+                            deblock_rect(&f, &m, p, pass, band, *y0, stride[p], (r, r + 16), (c, c + 16));
+                        }
+                    }
+                });
+            }
+        }
         let src = src.view();
         let crop = |data: &[Vec<u8>; 3], out: &mut [&mut [u8]; 3]| {
             for p in 0..3 {
@@ -128,50 +153,96 @@ impl Hybrid {
             sb_cdef.extend_from_slice(&maps.cdef_idx);
             return Ok(fp);
         }
-        // each candidate's SSE per 64x64, luma and chroma (U and V)
+        // CDEF of the deblocked picture with `fc`'s presets into pf.cdef, by bands on the pool;
+        // with `sse`, each 64x64's SSE against the source, luma and chroma (U and V)
+        let deb: [&[u8]; 3] = [&pf.deblocked[0], &pf.deblocked[1], &pf.deblocked[2]];
+        let spans: Vec<(usize, [(usize, usize); 3])> = (0..ur)
+            .map(|uy| {
+                (
+                    uy,
+                    core::array::from_fn(|p| (uy * rows[p], ((uy + 1) * rows[p]).min(ph[p]))),
+                )
+            })
+            .collect();
+        let cdef = |fc: &FrameParams,
+                    m: &PfMaps,
+                    out: &mut [Vec<u8>; 3],
+                    sse: Option<(&mut [u32], &mut [u32], usize, usize)>| {
+            let pfc = PfFrame::new(fc);
+            let mut items: Vec<_> = split(out, &stride, &spans)
+                .into_iter()
+                .map(|(uy, e)| (uy, e, vec![0u32; sbc], vec![0u32; sbc]))
+                .collect();
+            let want = sse.is_some();
+            crate::pool::each(&mut items, |(uy, e, sy, suv)| {
+                let r = 16 * *uy as i32;
+                let mut band: [&mut [u8]; 3] = [&mut [], &mut [], &mut []];
+                for (b, (s, _)) in band.iter_mut().zip(e.iter_mut()) {
+                    *b = &mut **s;
+                }
+                for ux in 0..sbc {
+                    let c = 16 * ux as i32;
+                    cdef_rect(&pfc, m, &deb, &stride, &mut band, &stride, r, (r, r + 16), (c, c + 16));
+                }
+                if !want {
+                    return;
+                }
+                for p in 0..3 {
+                    let side = rows[p];
+                    let y0 = *uy * side;
+                    for ux in 0..sbc {
+                        let x0 = ux * side;
+                        if x0 >= cw[p] || y0 >= ch[p] {
+                            continue;
+                        }
+                        let mut acc = 0u32;
+                        for y in y0..(y0 + side).min(ch[p]) {
+                            let (a, q) = (
+                                &band[p][(y - y0) * stride[p] + x0..],
+                                &src.p[p][y * src.stride[p] + x0..],
+                            );
+                            for x in 0..side.min(cw[p] - x0) {
+                                let d = a[x] as i32 - q[x] as i32;
+                                acc += (d * d) as u32;
+                            }
+                        }
+                        if p == 0 {
+                            sy[ux] = acc;
+                        } else {
+                            suv[ux] += acc;
+                        }
+                    }
+                }
+            });
+            if let Some((my, muv, nc, c)) = sse {
+                for (uy, _, sy, suv) in &items {
+                    for ux in 0..sbc {
+                        my[(uy * sbc + ux) * nc + c] = sy[ux];
+                        muv[(uy * sbc + ux) * nc + c] = suv[ux];
+                    }
+                }
+            }
+        };
+        // each candidate's SSE per 64x64
         let cand = CDEF_CANDIDATES;
         let nc = (cand.npri * cand.nsec) as usize;
-        pf.my.clear();
-        pf.my.resize(nsb * nc, 0);
-        pf.muv.clear();
-        pf.muv.resize(nsb * nc, 0);
-        let deb: [&[u8]; 3] = [&pf.deblocked[0], &pf.deblocked[1], &pf.deblocked[2]];
-        let sub = |p: usize| if p == 0 { 0 } else { ss as usize };
+        let (mut my, mut muv) = (core::mem::take(&mut pf.my), core::mem::take(&mut pf.muv));
+        my.clear();
+        my.resize(nsb * nc, 0);
+        muv.clear();
+        muv.resize(nsb * nc, 0);
         for c in 0..nc {
             let mut fc = fp;
             let mut lev = [0i32; 16];
             (lev[0], lev[8]) = (c as i32, c as i32);
             cdef_presets(&lev, 0, t.cdef_mode, &cand, &mut fc);
-            let [a, b, d] = &mut pf.cdef;
-            cdef_frame(&PfFrame::new(&fc), &maps.maps(), &deb, &stride, &mut [a, b, d], &stride);
-            for p in 0..3 {
-                let side = 64 >> sub(p);
-                for s in 0..nsb {
-                    let (x0, y0) = ((s % sbc) * side, (s / sbc) * side);
-                    if x0 >= cw[p] || y0 >= ch[p] {
-                        continue;
-                    }
-                    let mut e = 0u32;
-                    for y in y0..(y0 + side).min(ch[p]) {
-                        let (r, q) = (&pf.cdef[p][y * stride[p] + x0..], &src.p[p][y * src.stride[p] + x0..]);
-                        for x in 0..side.min(cw[p] - x0) {
-                            let d = r[x] as i32 - q[x] as i32;
-                            e += (d * d) as u32;
-                        }
-                    }
-                    if p == 0 {
-                        pf.my[s * nc + c] = e;
-                    } else {
-                        pf.muv[s * nc + c] += e;
-                    }
-                }
-            }
+            cdef(&fc, &maps.maps(), &mut pf.cdef, Some((&mut my, &mut muv, nc, c)));
         }
         let mut levels = [0i32; 16 * (MAX_CDEF_BITS + 1)];
         let mut totals = [0u64; MAX_CDEF_BITS + 1];
         cdef_select_cpu(
-            &pf.my,
-            &pf.muv,
+            &my,
+            &muv,
             nc,
             nsb,
             false,
@@ -190,14 +261,42 @@ impl Hybrid {
             if *c < 0 {
                 continue;
             }
-            let cost = |g: usize| pf.my[s * nc + lev[g] as usize] as u64 + pf.muv[s * nc + lev[8 + g] as usize] as u64;
+            let cost = |g: usize| my[s * nc + lev[g] as usize] as u64 + muv[s * nc + lev[8 + g] as usize] as u64;
             *c = (0..1usize << bits).min_by_key(|&g| (cost(g), g)).unwrap_or(0) as i8;
         }
-        let [a, b, d] = &mut pf.cdef;
-        cdef_frame(&PfFrame::new(&fp), &maps.maps(), &deb, &stride, &mut [a, b, d], &stride);
+        cdef(&fp, &maps.maps(), &mut pf.cdef, None);
         crop(&pf.cdef, &mut out);
+        (pf.my, pf.muv) = (my, muv);
         sb_cdef.clear();
         sb_cdef.extend_from_slice(&maps.cdef_idx);
         Ok(fp)
     }
+}
+
+/// The planes' rows `spans` gives (per band: its index and each plane's [y0, y1), bands in order,
+/// apart), split off as bands: each with its planes' rows from y0 and y0.
+#[allow(clippy::type_complexity)]
+fn split<'a>(
+    planes: &'a mut [Vec<u8>; 3],
+    stride: &[usize; 3],
+    spans: &[(usize, [(usize, usize); 3])],
+) -> Vec<(usize, [(&'a mut [u8], usize); 3])> {
+    let [a, b, c] = planes;
+    let mut rest: [&mut [u8]; 3] = [a, b, c];
+    let mut at = [0usize; 3];
+    let mut out = Vec::with_capacity(spans.len());
+    for &(uy, sp) in spans {
+        let mut e: [(&mut [u8], usize); 3] = Default::default();
+        for p in 0..3 {
+            let (y0, y1) = sp[p];
+            let r = core::mem::take(&mut rest[p]);
+            let (_, r) = r.split_at_mut((y0 - at[p]) * stride[p]);
+            let (band, r) = r.split_at_mut((y1 - y0) * stride[p]);
+            rest[p] = r;
+            at[p] = y1;
+            e[p] = (band, y0);
+        }
+        out.push((uy, e));
+    }
+    out
 }

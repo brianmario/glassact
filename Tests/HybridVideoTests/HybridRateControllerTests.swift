@@ -179,6 +179,30 @@ struct HybridRateControllerTests {
         #expect(linked.bits <= 2e6 * Double(d.keyLinkUS) / 1e6 * 1.1, "the key frame on the link: \(linked.bits) bits")
     }
 
+    /// 4:4:4's models (`HybridRegionEncoder.chroma444`) price a coded 64×64 above 4:2:0's at every
+    /// qindex, by the measured ratio, on the same slope; a 4:4:4 stream whose content costs what
+    /// they seed settles on its aim, and its first all-new picture is priced near its share.
+    @Test func the444ModelsPriceTheFullChroma() {
+        for (m444, m420) in [(HybridRateController.defaultInter444, HybridRateController.defaultInter),
+                             (HybridRateController.defaultKey444, HybridRateController.defaultKey)] {
+            #expect(m444.slope == m420.slope && m444.overheadBits == m420.overheadBits)
+            for q in [40, 80, 168] {
+                let r = (m444.bits(coded: 1000, qindex: q) - m444.overheadBits) / (m420.bits(coded: 1000, qindex: q) - m420.overheadBits)
+                #expect(r > 1.1 && r < 1.4, "qindex \(q): \(r)")
+            }
+        }
+        let e = Encoder(a: HybridRateController.defaultInter444.logBitsPerSuperblock)
+        var c = HybridRateController(bitsPerSecond: 12_000_000, inter: HybridRateController.defaultInter444,
+                                     key: HybridRateController.defaultKey444)
+        c.minQindex = 1
+        c.maxQindex = 255
+        var pictures = Self.stream(120, coded: 20)
+        for i in 120..<180 { pictures.append(Picture(coded: 1200, timeUS: 1_000_000 + UInt64(i) * 16_667)) }
+        let frames = Self.run(&c, e, pictures, lag: 2)
+        #expect(frames[120].bits < 1.5 * 12e6 / 60, "the first all-new picture: \(frames[120].bits / (12e6 / 60))× its share")
+        #expect(abs(Self.rate(frames.suffix(40), everyUS: 16_667) / 12e6 - 1) < 0.10)
+    }
+
     /// A failed picture's charge comes back; a restart leaves nothing in flight.
     @Test func aFailureRefundsItsCharge() {
         var c = HybridRateController(bitsPerSecond: 6_000_000)

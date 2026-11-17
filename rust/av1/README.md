@@ -14,8 +14,8 @@ with Glass Act's additions. It used to be C++ in `Sources/AV1Core`, `Sources/AV1
 | `entropy` | the range encoder, CDF contexts, symbol streams |
 | `avif` | the AVIF muxer |
 | `enc` | the Metal encoder's host half: derived tables as MSL, the GPU entropy plan, the post-filter frame, tune=iq and the CDEF search's host half |
-| `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided (and inter blocks); key frames' intra block copies (`hybrid::intrabc`); palette blocks by cost, luma and in 4:4:4 chroma (`hybrid::palette`) |
-| `motion` | inter frames' exact copies: 64x64s that equal the previous source, unchanged or shifted, as skip inter blocks (with 128x128 superblocks, a 128x128 of one shift as one block) |
+| `hybrid` | the hybrid encoder's CPU closed loop, on blocks the Metal analysis decided (and inter blocks), 4:2:0 or 4:4:4; key frames' intra block copies (`hybrid::intrabc`); palette blocks by cost, luma and in 4:4:4 chroma (`hybrid::palette`); a 4:4:4 picture's post-filters on the CPU (`hybrid::pf444`, research) |
+| `motion` | inter frames' exact copies: 64x64s that equal the previous source, unchanged or shifted (4:4:4: at odd shifts too), as skip inter blocks (with 128x128 superblocks, a 128x128 of one shift as one block) |
 | `pool` | the worker threads every parallel loop shares, started once and parked between loops |
 | `testsupport` | random legal records and inter sequences, the reference engine, the GPU's DSP cases (tests only); the snapshot tests' hashes (`testsupport::snapshot`) |
 | `capi` | the C API Swift links (`Sources/AV1Core/include/av1g/av1g.h`, `av1g/decoder.h`, `Sources/AV1Encoder/include/av1enc.h`, `Sources/AV1CoreTestSupport/include/av1core_test.h`) |
@@ -73,8 +73,9 @@ Inter frames are checked against real decoders: the Swift `InterDecoderGateTests
 libaom), and `cargo test --release -- --ignored --nocapture decoders` (dav1d and aomdec in
 /opt/homebrew/bin, when installed). So are 4:4:4 key frames, inter frames and still pictures
 (fp.chroma_format, the High profile: `decoders_444`, `decoders_444_inter`, the decoder's
-`decoders_agree`, and the hybrid's `chroma444_key_frames`), which av1gpu's C++ never had. The subsampling is a parameter of the frame
-(`ss`, 1 for 4:2:0 and 0 for 4:4:4; `blockinfo::chroma_ss`), not a second copy of the code.
+`decoders_agree`, and the hybrid's `chroma444_key_frames` and `chroma444_inter_frames`), which
+av1gpu's C++ never had. The subsampling is a parameter of the frame (`ss`, 1 for 4:2:0 and 0 for
+4:4:4; `blockinfo::chroma_ss`), not a second copy of the code.
 
 ## Rules
 

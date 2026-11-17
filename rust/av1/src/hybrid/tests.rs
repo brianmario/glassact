@@ -1320,6 +1320,111 @@ fn chroma444_inter_frames() {
     assert!(odd_copies > 10 && golden_copies > 10 && coded_inter > 20 && cfl > 0 && pal > 0);
 }
 
+/// A 4:4:4 stream post-filtered on the CPU ([`Hybrid::postfilter_cpu`]): a key frame and inter
+/// frames (an odd-shift scroll, new content), each deblocked and CDEF-filtered at several qindexes
+/// (CDEF off at 32 and under), written with the filters chosen and referenced filtered: our
+/// decoder decodes every frame to the filtered planes, and CDEF's presets are used. (av1seq
+/// --chroma 444 --cpu-filters holds them to libaom's decode.)
+#[test]
+fn chroma444_cpu_filters_decode_exactly() {
+    let (w, h) = (333usize, 270usize);
+    let base = screen_pic(w, h, 21, true);
+    let (u0, v0) = to_444(&base);
+    let f0 = [base.y.clone(), u0, v0];
+    let mut f1 = f0.clone();
+    for p in 0..3 {
+        for y in 0..h {
+            for x in 0..w {
+                f1[p][y * w + x] = f0[p][((y + 7) % h) * w + x] ^ if x > w / 2 && y < 60 { 0x30 } else { 0 };
+            }
+        }
+    }
+    let frames = [f0.clone(), f1.clone(), f0];
+    for q in [20, 90, 200] {
+        let tiles = tile_layout(w as u32, h as u32, 0, 0).unwrap();
+        let mut rng = Rng(q as u64);
+        let mut hy = Hybrid::new();
+        hy.set_chroma_444(true);
+        let mut d = crate::decoder::Decoder::new(2);
+        let mut prev: Option<[Vec<u8>; 3]> = None;
+        let mut cdef_used = false;
+        for (k, f) in frames.iter().enumerate() {
+            let pic = Pic {
+                w,
+                h,
+                y: f[0].clone(),
+                u: vec![128; w.div_ceil(2) * h.div_ceil(2)],
+                v: vec![128; w.div_ceil(2) * h.div_ceil(2)],
+            };
+            let mut blocks = partition(&pic, &tiles, &mut rng, Style::Variance, true);
+            let mut inter = Vec::new();
+            let mut fp = FrameParams {
+                video: 1,
+                ..Default::default()
+            };
+            if k > 0 {
+                // every 3rd block copies the reference 7 rows down, the rest intra
+                inter = blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| BlockInter {
+                        is_inter: (i % 3 == 0) as u8,
+                        mv_row: if i % 3 == 0 { 56 } else { 0 },
+                        mv_col: 0,
+                        ..Default::default()
+                    })
+                    .collect();
+                for (b, bi) in blocks.iter_mut().zip(&inter) {
+                    if bi.is_inter != 0 {
+                        *b = Block {
+                            mi_row: b.mi_row,
+                            mi_col: b.mi_col,
+                            bsize: b.bsize,
+                            ..Block::default()
+                        };
+                    }
+                }
+                (fp.frame_type, fp.refresh_frame_flags, fp.allow_screen_content_tools, fp.lf_inter_off) =
+                    (FRAME_INTER, 1, 1, (k == 2) as u8);
+            }
+            let p = prev.as_ref();
+            let video = Video {
+                fp,
+                inter: &inter,
+                reference: p.map(|r| RefPicture {
+                    plane: [&r[0], &r[1], &r[2]],
+                    stride: [w, w, w],
+                    cdfs: None,
+                }),
+                golden: None,
+                padded: None,
+            };
+            hy.closed_loop_ex(&f[0], &f[1], &f[2], w as u32, h as u32, &blocks, None, 0, q, 0, 0, Some(&video), None)
+                .unwrap_or_else(|e| panic!("q{q} frame {k}: {e}"));
+            let mut out = [vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]];
+            let mut sb = Vec::new();
+            let pfp = {
+                let [a, b, c] = &mut out;
+                hy.postfilter_cpu([a, b, c], [w, w, w], &mut sb).unwrap()
+            };
+            assert!(q < 90 || pfp.loop_filter_level[0] != 0, "q{q}: no deblocking");
+            cdef_used |= pfp.cdef_y_pri.iter().chain(&pfp.cdef_uv_pri).any(|&v| v != 0);
+            let obu = hy.write(&pfp, Some(&sb), w.div_ceil(64)).unwrap().to_vec();
+            let pic = d.decode(&obu).unwrap_or_else(|e| panic!("q{q} frame {k}: {e}"));
+            for p in 0..3 {
+                for y in 0..h {
+                    assert!(
+                        pic.planes[p][y * pic.stride[p]..][..w] == out[p][y * w..][..w],
+                        "q{q} frame {k}: plane {p} row {y} isn't the filtered picture"
+                    );
+                }
+            }
+            prev = Some(out);
+        }
+        assert!(q <= 32 || cdef_used, "q{q}: no CDEF preset");
+    }
+}
+
 /// The C API's 4:4:4 (av1enc_hybrid_set_chroma_444): full-size chroma planes read, the record
 /// the Rust closed loop's.
 #[cfg(feature = "capi")]

@@ -93,9 +93,14 @@ public struct HybridRateController: Sendable {
     /// 950 on text, 2,600 on images), and a frame's header (a frame that copies everything: 440).
     public static let defaultInter = Model(logBitsPerSuperblock: log(500), slope: defaultSlope, overheadBits: 440)
     public static let defaultKey = Model(logBitsPerSuperblock: log(1000), slope: defaultSlope, overheadBits: 440)
-    /// 4:4:4 streams' (`HybridRegionEncoder.chroma444`): PLACEHOLDER, fitted below.
-    public static let defaultInter444 = Model(logBitsPerSuperblock: log(500), slope: defaultSlope, overheadBits: 440)
-    public static let defaultKey444 = Model(logBitsPerSuperblock: log(1000), slope: defaultSlope, overheadBits: 440)
+    /// 4:4:4 streams' (`HybridRegionEncoder.chroma444`), fitted as 4:2:0's were (5K, q 14/20/28/36,
+    /// 30 frames each; av1seq --chroma 444 --frame-bytes): a coded 64×64 costs 1.11 (scrolling),
+    /// 1.17 (dragging), 1.43 (video), 1.28 (scrolling images) × 4:2:0's in inter frames, 1.13–1.43
+    /// in key frames (seven traces), on the same slopes (inter 0.008–0.013, key 0.008–0.012
+    /// against 4:2:0's 0.006–0.012 and 0.007–0.012): chroma is three times the samples and a
+    /// quarter more bits. The geometric means, 1.24 and 1.22, scale the 4:2:0 seeds.
+    public static let defaultInter444 = Model(logBitsPerSuperblock: log(620), slope: defaultSlope, overheadBits: 440)
+    public static let defaultKey444 = Model(logBitsPerSuperblock: log(1220), slope: defaultSlope, overheadBits: 440)
 
     /// What it aims at, bits a second.
     public var bitsPerSecond: Int

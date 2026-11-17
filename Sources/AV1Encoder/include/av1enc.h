@@ -185,9 +185,10 @@ void av1enc_hybrid_set_intrabc(av1enc_hybrid *h, int on);
 // The next pictures are 4:4:4 (on; the High profile, seq_profile 1) or 4:2:0 (off, the default).
 // In 4:4:4 every plane given, padded, reconstructed and referenced is w x h (MiCols*4 x MiRows*4
 // padded), the record has fp.chroma_format AV1G_CHROMA_444 (av1enc_hybrid_write_ex keeps it,
-// whatever fp it's given), the closed loop makes its own chroma decisions (it ignores
-// AV1ENC_HYBRID_GIVEN_CHROMA: the analysis's are 4:2:0's), and inter frames are refused (4:2:0
-// only). Tiles aren't kept across a change.
+// whatever fp it's given), and the closed loop makes its own chroma decisions (it ignores
+// AV1ENC_HYBRID_GIVEN_CHROMA: the analysis's are 4:2:0's). Inter frames too: their references
+// (av1g_ref_planes) are w x h in every plane, and their inter blocks' chroma predicts at the luma
+// motion vector. Tiles aren't kept across a change.
 void av1enc_hybrid_set_chroma_444(av1enc_hybrid *h, int on);
 // A picture's intra block copy hashes, taken ahead of its closed loop on any thread (each handle
 // on one at a time): av1enc_ibc_hashes_compute of its luma (rows width apart), then

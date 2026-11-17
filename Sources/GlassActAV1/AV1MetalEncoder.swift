@@ -1091,9 +1091,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
                                motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0,
-                               newPicture: NewPictureAnalysis? = nil, shapes: Int32? = nil) throws -> PendingPartition {
+                               newPicture: NewPictureAnalysis? = nil, shapes: Int32? = nil,
+                               removesShapes: Int32 = 0) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
-                          skip: skip, motion: motion, sbQindex: sbQindex, newPicture: newPicture, shapes: shapes)
+                          skip: skip, motion: motion, sbQindex: sbQindex, newPicture: newPicture, shapes: shapes,
+                          removesShapes: removesShapes)
         run.gateValue = gateValue
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
@@ -1149,6 +1151,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The shapes this picture's analysis tries in place of every other rule's
         /// (`beginPartition(shapes:)`), or nil.
         let shapesOverride: Int32?
+        /// The shapes this picture's analysis leaves out of whichever it would try
+        /// (`beginPartition(removesShapes:)`): GpParams.shapeMask bits.
+        let shapesRemoved: Int32
         /// Learned pruning's buffers, when this picture uses it: per-8x8 skip flags (4 levels),
         /// node statistics (per level from `mlBases`), the cells' kept levels, the small shapes'
         /// lists and their counts.
@@ -1184,9 +1189,10 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
              motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, newPicture: NewPictureAnalysis? = nil,
-             shapes: Int32? = nil) throws {
+             shapes: Int32? = nil, removesShapes: Int32 = 0) throws {
             self.encoder = encoder
             shapesOverride = shapes
+            shapesRemoved = removesShapes
             encoder.runCount += 1
             seq = encoder.runCount
             self.width = width
@@ -1329,9 +1335,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let newPictureMask = newPictureAnalysis?.shapeMask ?? encoder.newPictureShapeMask
             let newPicture = skipped != nil && newPictureMask != nil
                 && Double(skipped?.count(where: { $0 == 0 }) ?? 1) > encoder.interGateOverShare * Double(max(1, skipped?.count ?? 1))
-            let shapeMask = shapesOverride ?? (newPicture ? newPictureMask!
+            let shapeMask = (shapesOverride ?? (newPicture ? newPictureMask!
                 : last != nil ? encoder.interPreset.map { AV1MetalEncoder.params(for: $0).shapeMask } ?? encoder.params.shapeMask
-                : encoder.params.shapeMask)
+                : encoder.params.shapeMask)) & ~shapesRemoved
             var nbx = [Int32](repeating: 0, count: Int(GP_NSHAPES)), nby = nbx
             var shOff = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
             var blkTotal: UInt32 = 0
@@ -1510,6 +1516,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 params.shapeMask = m
             }
             if let m = shapesOverride { params.shapeMask = m }
+            params.shapeMask &= ~shapesRemoved
             // the inter gate where most of the picture is new (a switch of Spaces, apps or windows)
             params.interGate = codedShare > encoder.interGateOverShare ? encoder.interGate : 0
             params.leafTxSearch = Int32(encoder.leafTxSearchPixels)

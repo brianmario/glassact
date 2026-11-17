@@ -1456,8 +1456,8 @@ impl Hybrid {
     /// default: 4:2:0). Their planes are all width x height, as are the reconstruction's
     /// ([`Hybrid::recon`]: MiCols * 4 x MiRows * 4) and the padded source's; the record says
     /// fp.chroma_format 1, which the write keeps whatever its `fp` says. The closed loop decides
-    /// chroma itself (GIVEN_CHROMA is ignored), and refuses inter frames (4:2:0 only). Tiles aren't
-    /// kept across a change.
+    /// chroma itself (GIVEN_CHROMA is ignored). Inter frames' references ([`Video::reference`],
+    /// [`Video::golden`]) are full size in every plane too. Tiles aren't kept across a change.
     pub fn set_chroma_444(&mut self, on: bool) {
         self.chroma444 = on;
     }
