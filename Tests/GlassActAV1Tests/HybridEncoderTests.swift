@@ -393,6 +393,7 @@ extension HybridEncoderTests {
     }
 }
 
+extension HybridEncoderTests {
     /// A picture's analysis waits on the GPU for the filters of the picture two before it, and is
     /// read on a thread of its own: a stream that stops early (here its fifth picture can't be
     /// had) must release the analyses already committed behind filters that won't come, and the
@@ -436,6 +437,7 @@ extension HybridEncoderTests {
         #expect(again.count == pictures.count)
         #expect(again == fresh, "a stream after one that stopped codes differently")
     }
+}
 
 extension HybridEncoderTests {
     /// Learned pruning (on in pictures of 2,000 superblocks and up) changes the
