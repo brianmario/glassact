@@ -510,6 +510,13 @@ pub extern "C" fn av1g_decoder_create(threads: c_int) -> *mut DecoderHandle {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn av1g_decoder_create_capped(threads: c_int, max_width: u32, max_height: u32) -> *mut DecoderHandle {
+    Box::into_raw(Box::new(DecoderHandle {
+        d: crate::decoder::Decoder::with_max_size(threads.max(0) as usize, max_width, max_height),
+    }))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1g_decoder_decode(
     d: *mut DecoderHandle,
     data: *const u8,

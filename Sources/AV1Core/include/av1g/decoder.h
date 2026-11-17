@@ -1,18 +1,20 @@
 /* av1g/decoder.h - Glass Act's AV1 decoder (rust/av1/src/decoder.rs), for the streams the
  * DecisionRecord writer (the hybrid encoder's) produces.
  *
- *   av1g_decoder_create()    a decoder: its reference pictures, CDFs and buffers
- *   av1g_decoder_decode()    one temporal unit in, the frame it shows out
- *   av1g_decoder_picture()   the last frame shown again
- *   av1g_decoder_reset()     forget the stream (the next frame must be a key frame)
+ *   av1g_decoder_create()         a decoder: its reference pictures, CDFs and buffers
+ *   av1g_decoder_create_capped()  one for frames up to a size (a Viewer's region)
+ *   av1g_decoder_decode()         one temporal unit in, the frame it shows out
+ *   av1g_decoder_picture()        the last frame shown again
+ *   av1g_decoder_reset()          forget the stream (the next frame must be a key frame)
  *   av1g_decoder_destroy()
  *
  * The toolset: still pictures, key and inter frames, 8-bit 4:2:0, 4:4:4 key frames, monochrome,
  * 64x64 or 128x128 superblocks, uniform tiles, palettes, intra block copy, deblocking and CDEF,
- * LAST_FRAME and GOLDEN_FRAME references, frames up to AV1G_DEC_MAX_DIM a side.  Anything else is
- * refused with an error (AV1G_ERR_INVALID), never decoded approximately.  Input may be hostile: no
- * input crashes, hangs or reads outside its buffer.  After an error the reference pictures are
- * dropped, so inter frames fail with AV1G_ERR_NO_REFERENCE until the next key frame.
+ * LAST_FRAME and GOLDEN_FRAME references, frames up to AV1G_DEC_MAX_DIM a side (or the caller's
+ * cap).  Anything else is refused with an error (AV1G_ERR_INVALID), never decoded approximately.
+ * Input may be hostile: no input crashes, hangs or reads outside its buffer.  After an error the
+ * reference pictures are dropped, so inter frames fail with AV1G_ERR_NO_REFERENCE until the next
+ * key frame.
  *
  * A decoder is used from one thread at a time; it decodes on the crate's worker threads.
  */
@@ -57,6 +59,13 @@ typedef struct av1g_dec_picture {
 /* A decoder decoding on at most `threads` threads (<= 0: the available parallelism).  NULL only
  * when out of memory. */
 av1g_decoder *av1g_decoder_create(int threads);
+
+/* As av1g_decoder_create, for frames up to `max_width` x `max_height` (each at most
+ * AV1G_DEC_MAX_DIM; 0: AV1G_DEC_MAX_DIM): a Viewer's decoder, capped at its region's size.  A
+ * sequence header for larger frames, or a larger frame, is AV1G_ERR_INVALID before anything is
+ * allocated for it, so the decoder never holds more than its (at most nine) pictures of that size
+ * and the buffers one such frame needs. */
+av1g_decoder *av1g_decoder_create_capped(int threads, uint32_t max_width, uint32_t max_height);
 
 /* Decodes one temporal unit (`size` bytes of OBUs: a temporal delimiter, a sequence header, one
  * OBU_FRAME; metadata and padding are ignored) and fills `out` (if not NULL) with the frame it

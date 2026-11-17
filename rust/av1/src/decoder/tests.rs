@@ -514,6 +514,25 @@ fn c_api() {
         crate::types::ERR_INVALID
     );
     unsafe { av1g_decoder_destroy(d) };
+    // capped: the stream at its size decodes; a sample under it, refused
+    let (w, h) = (outs[0].recon_w[0], outs[0].recon_h[0]);
+    for (cw, ch, ok) in [(w, h, true), (w - 1, h, false), (w, h - 1, false)] {
+        let d = av1g_decoder_create_capped(2, cw, ch);
+        let mut p = DecPicture::default();
+        let r = unsafe {
+            av1g_decoder_decode(
+                d,
+                outs[0].obu.as_ptr(),
+                outs[0].obu.len(),
+                &mut p,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        assert_eq!(r == crate::types::OK, ok, "{cw}x{ch}: {}", msg(&err));
+        assert!(ok || msg(&err).contains("larger than the decoder's"), "{}", msg(&err));
+        unsafe { av1g_decoder_destroy(d) };
+    }
 }
 
 // ---- hostile input ----

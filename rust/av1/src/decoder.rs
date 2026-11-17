@@ -6,7 +6,8 @@
 //! segmentation, compound, warped and OBMC motion, switchable filters, scaled references, a
 //! feature the parser doesn't model. Frames come off the network, so every input is checked
 //! (DESIGN §8, INV-6): no input panics, loops without end, allocates without bound (frames are at
-//! most [`MAX_DIM`] a side) or reads outside a buffer.
+//! most [`MAX_DIM`] a side, or the caller's cap: [`Decoder::with_max_size`]) or reads outside a
+//! buffer.
 //!
 //! [`Decoder::decode`] takes one temporal unit at a time, in stream order, and returns the frame
 //! it shows ([`Picture`]: cropped planes at a stride, valid until the next call). The reference
@@ -209,6 +210,8 @@ pub struct Stats {
 /// The AV1 decoder: see the module.
 pub struct Decoder {
     threads: usize,
+    /// the largest frame it takes, width and height ([`Decoder::with_max_size`])
+    max: (u32, u32),
     seq: Option<Box<Seq>>,
     pics: Vec<Pic>,
     /// the reference slots' pictures
@@ -292,8 +295,18 @@ fn copy_rect(src: &[u8], ss: usize, dst: &mut [u8], ds: usize, x: usize, y: usiz
 }
 
 impl Decoder {
-    /// A decoder using at most `threads` threads (0: the available parallelism).
+    /// A decoder using at most `threads` threads (0: the available parallelism), for frames up
+    /// to [`MAX_DIM`] a side.
     pub fn new(threads: usize) -> Decoder {
+        Self::with_max_size(threads, MAX_DIM, MAX_DIM)
+    }
+
+    /// A decoder for frames up to `max_width` x `max_height` (each at most [`MAX_DIM`]; 0:
+    /// [`MAX_DIM`]), as [`Decoder::new`]: a Viewer's, sized by its region. A sequence header for
+    /// larger frames, or a frame larger than that, is an error before anything is allocated for
+    /// it, so its pictures and buffers never take more than a frame of that size implies.
+    pub fn with_max_size(threads: usize, max_width: u32, max_height: u32) -> Decoder {
+        let cap = |v: u32| if v == 0 { MAX_DIM } else { v.min(MAX_DIM) };
         let threads = if threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -301,6 +314,7 @@ impl Decoder {
         };
         Decoder {
             threads,
+            max: (cap(max_width), cap(max_height)),
             seq: None,
             pics: Vec::new(),
             slot: [None; 8],
@@ -332,6 +346,11 @@ impl Decoder {
     /// The threads it decodes on.
     pub fn threads(&self) -> usize {
         self.threads
+    }
+
+    /// The largest frame it takes, width and height.
+    pub fn max_size(&self) -> (u32, u32) {
+        self.max
     }
 
     /// Forgets the stream: the reference pictures, their CDFs, the sequence header. The next
@@ -491,6 +510,15 @@ impl Decoder {
                     format!("frames up to {}x{}: more than {MAX_DIM} a side", sq.max_w, sq.max_h),
                 ));
             }
+            if sq.max_w > self.max.0 || sq.max_h > self.max.1 {
+                return Err(err(
+                    ERR_INVALID,
+                    format!(
+                        "frames up to {}x{}: larger than the decoder's {}x{}",
+                        sq.max_w, sq.max_h, self.max.0, self.max.1
+                    ),
+                ));
+            }
             if self.seq.as_deref() != Some(&sq) {
                 // a new coded video sequence: it starts at a key frame
                 self.drop_refs();
@@ -515,6 +543,16 @@ impl Decoder {
             e
         })?;
         let fp = hdr.fp;
+        // (the frame header holds it to the sequence header's size, which is within the cap)
+        if fp.width > self.max.0 || fp.height > self.max.1 {
+            return Err(err(
+                ERR_INVALID,
+                format!(
+                    "a {}x{} frame: larger than the decoder's {}x{}",
+                    fp.width, fp.height, self.max.0, self.max.1
+                ),
+            ));
+        }
         let geo = Geo {
             w: fp.width,
             h: fp.height,
