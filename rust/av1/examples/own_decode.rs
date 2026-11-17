@@ -3,10 +3,10 @@
 //! `writer::parse_with` into its record, then reconstructed by `Writer::encode_ex`, which re-codes
 //! the symbols too, from the slots its earlier frames refreshed).
 //!
-//!   cargo run --release --example own_decode -- [--writer] [--threads N] [--repeat K] <stream.ivf> [<aomdec.i420>]
+//!   cargo run --release --example own_decode -- [--writer] [--444] [--threads N] [--repeat K] <stream.ivf> [<aomdec.i420>]
 //!
 //! With an I420 file (`aomdec --rawvideo -o <file> <stream.ivf>`), every frame is compared with
-//! libaom's. `--repeat` decodes the stream K times (after a reset) and keeps each frame's fastest
+//! libaom's; with `--444`, a 4:4:4 stream's planar 4:4:4 file (aomdec's raw output of it). `--repeat` decodes the stream K times (after a reset) and keeps each frame's fastest
 //! time.
 use glassact_av1::decoder::Decoder;
 use glassact_av1::types::EncodeOpts;
@@ -19,16 +19,17 @@ fn main() {
     let mut take = |flag: &str| -> Option<String> {
         let i = args.iter().position(|a| a == flag)?;
         args.remove(i);
-        (flag != "--writer").then(|| args.remove(i)).or(Some(String::new()))
+        (flag != "--writer" && flag != "--444").then(|| args.remove(i)).or(Some(String::new()))
     };
     let writer_path = take("--writer").is_some();
+    let full_chroma = take("--444").is_some();
     let threads: usize = take("--threads").map_or(0, |v| v.parse().unwrap());
     let repeat: usize = take("--repeat").map_or(1, |v| v.parse().unwrap());
     let ivf = std::fs::read(&args[0]).expect("read ivf");
     let reference = args.get(1).map(|p| std::fs::read(p).expect("read i420"));
     assert_eq!(&ivf[0..4], b"DKIF");
     let (w, h) = (u16::from_le_bytes([ivf[12], ivf[13]]) as usize, u16::from_le_bytes([ivf[14], ivf[15]]) as usize);
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (cw, ch) = if full_chroma { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
     let frame_bytes = w * h + 2 * cw * ch;
     let mut tus = Vec::new();
     let mut at = u16::from_le_bytes([ivf[6], ivf[7]]) as usize;

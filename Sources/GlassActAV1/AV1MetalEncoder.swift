@@ -54,6 +54,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// next reuses it), so the caller may read it until then.
         public var source: [any MTLBuffer] = []
         public var sourceStrides: [Int] = []
+        /// A 4:4:4 picture's (`beginPartition(chroma444:)`): its U and V at full size, padded as Y is
+        /// (rows `sourceStrides[0]` apart), from which the GPU made `source`'s, their 2×2 means.
+        /// They go back to the pool with `source` (`pooledSource`); empty for a 4:2:0 picture.
+        public var sourceChroma: [any MTLBuffer] = []
+        /// Every buffer of the source, for `keepSource`.
+        public var pooledSource: [any MTLBuffer] { source + sourceChroma }
         /// The analysis's GPU time (`PendingPartition.wait`'s; 0 without GPU work).
         public var gpuSeconds = 0.0
     }
@@ -253,6 +259,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     }
     /// k_inter_sad: an SB's distinct inter candidates and its 8x8s' SAD at each, which k_inter sums.
     let candidateSAD: any MTLComputePipelineState
+    /// k_chroma420: a 4:4:4 picture's analysis chroma, from its full-size planes (`beginPartition(chroma444:)`).
+    let chroma420: any MTLComputePipelineState
     /// k_inter_sad's tables (GpMeU and the SADs, per SB of the picture), kept across pictures: the
     /// kernel writes every entry k_inter reads, so they're neither cleared nor reallocated.
     private var interTables: (candidates: any MTLBuffer, sad: any MTLBuffer)?
@@ -300,7 +308,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// the last one's is read on another.
     private let poolLock = NSLock()
 
-    func takeSource(_ lengths: [Int]) throws -> [any MTLBuffer] {
+    func takeSource(_ lengths: [Int], gpuWrites: Set<Int> = []) throws -> [any MTLBuffer] {
         poolLock.lock()
         defer { poolLock.unlock() }
         if let i = sourcePool.firstIndex(where: { $0.map(\.length) == lengths.map { max(16, $0) } }) {
@@ -308,10 +316,13 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         }
         // Untracked: the CPU writes a source before the analysis that reads it is committed, and
         // every GPU use only reads it (the next picture's motion search, the hybrid's filters),
-        // so Metal needn't order those command buffers behind one another.
-        return try lengths.map {
-            guard let b = device.makeBuffer(length: max(16, $0), options: [.storageModeShared, .hazardTrackingModeUntracked])
-            else { throw Failure.metal("no buffer of \($0) bytes") }
+        // so Metal needn't order those command buffers behind one another. Those the GPU writes
+        // (`gpuWrites`: a 4:4:4 picture's analysis chroma, k_chroma420's, which an analysis split
+        // in two writes in its first command buffer and reads in its second) are tracked.
+        return try lengths.enumerated().map { i, length in
+            let options: MTLResourceOptions = gpuWrites.contains(i) ? .storageModeShared : [.storageModeShared, .hazardTrackingModeUntracked]
+            guard let b = device.makeBuffer(length: max(16, length), options: options)
+            else { throw Failure.metal("no buffer of \(length) bytes") }
             return b
         }
     }
@@ -526,13 +537,16 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// copies), kept without analysis; one whose source changed keeps the source its analysis
         /// is of, so that a later picture analyzes it.
         func markUnchanged(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
-                           width: Int, height: Int, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil, sbQindex: [UInt8]? = nil) {
+                           width: Int, height: Int, chroma444: Bool = false, sbCols: Int, sbRows: Int, skip: [UInt8]? = nil,
+                           sbQindex: [UInt8]? = nil) {
             // a 64x64 whose qindex changed is analyzed again, as one whose source did
             let qmap = sbQindex?.count == sbCols * sbRows ? sbQindex : nil
             defer { previousQ = qmap }
             let qChanged: (Int) -> Bool = { [previousQ] i in (qmap?[i] ?? 0) != (previousQ?[i] ?? 0) }
             flip ^= 1
-            let cw = (width + 1) / 2, ch = (height + 1) / 2
+            // (a 4:4:4 picture's chroma is full size: an SB whose chroma changed is analyzed again, as
+            // its 2×2 means, which the analysis reads, may have)
+            let (cw, ch) = chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
             let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
             let k = keep.contents().assumingMemoryBound(to: UInt8.self)
             let list = stale.contents().assumingMemoryBound(to: UInt32.self)
@@ -571,7 +585,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 for i in changed.indices where !analyzed[i] { changed[i] = true }
             }
             for (p, (pixels, w, h)) in planes.enumerated() where skip == nil {
-                let side = p == 0 ? 64 : 32
+                let side = p == 0 || chroma444 ? 64 : 32
                 prev[p].withUnsafeBufferPointer { old in
                     for sr in 0..<sbRows {
                         for sc in 0..<sbCols where !changed[sr * sbCols + sc] {
@@ -612,7 +626,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             // path of a lone picture: a new 5K picture's 22 MB were 230,000 copies of 64 bytes)
             let copies = changed.indices.map { i in changed[i] && (skip.map { $0[i] == 0 } ?? true) }
             for (p, (pixels, w, h)) in planes.enumerated() {
-                let side = p == 0 ? 64 : 32
+                let side = p == 0 || chroma444 ? 64 : 32
                 previous![p].withUnsafeMutableBufferPointer { old in
                     let planes = AV1MetalEncoder.Lines(to: old.baseAddress!, from: pixels)
                     DispatchQueue.concurrentPerform(iterations: sbRows) { sr in
@@ -640,9 +654,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
 
     /// The cache for a picture of this geometry and these settings (made anew
     /// when they change, so its first picture keeps nothing); nil unless
-    /// `reusesAnalysis`.
+    /// `reusesAnalysis`. (`chroma444`: the source it compares has full-size chroma.)
     func analysisCache(width: Int, height: Int, qindex: Int, shapeMask: Int32, blocks: Int, superblocks: Int,
-                       newPicture: NewPictureAnalysis? = nil) throws -> AnalysisCache? {
+                       newPicture: NewPictureAnalysis? = nil, chroma444: Bool = false) throws -> AnalysisCache? {
         guard reusesAnalysis else { cache = nil; return nil }
         var p = params
         var key = withUnsafeBytes(of: &p) { Array($0) }
@@ -651,7 +665,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                   leafChromaAngledModes ? 1 : 0, Int(shapeMask),
                   Int(newPicture?.eps?.bitPattern ?? 0xFFFF_FFFF), Int(newPicture?.modeEps?.bitPattern ?? 0xFFFF_FFFF),
                   (newPicture?.preset).map { Int(AV1MetalEncoder.params(for: $0).txSearchCL) * 16 + Int(AV1MetalEncoder.params(for: $0).uvK) } ?? -1,
-                  (newPicture?.subpel).map { $0 ? 1 : 0 } ?? -1] {
+                  (newPicture?.subpel).map { $0 ? 1 : 0 } ?? -1, chroma444 ? 1 : 0] {
             withUnsafeBytes(of: v) { key += $0 }
         }
         if let cache, cache.key == key { return cache }
@@ -849,6 +863,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
               let leafOutFunction = library.makeFunction(name: "k_leaf_out")
         else { throw Failure.metal("no k_leaf") }
         leafOut = try Self.pipeline(leafOutFunction, threads: 256, device: device)
+        guard let chroma420Function = library.makeFunction(name: "k_chroma420") else { throw Failure.metal("no k_chroma420") }
+        chroma420 = try Self.pipeline(chroma420Function, threads: 256, device: device)
         leafScan = try Self.pipeline(leafScanFunction, threads: 1024, device: device)
         leafSmall = try Self.pipeline(leafSmallFunction, threads: Self.leafSmallThreads, device: device)
         leaf = try Self.pipeline(leafFunction, threads: Self.leafThreads, device: device)
@@ -1076,7 +1092,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 run.source = []
             }
             return Partition(blocks: blocks, lumaTxTypes: types, hasChroma: run.decidesLeaves, tiles: run.tiles, inter: inter,
-                             source: source, sourceStrides: [run.aw, run.aw / 2, run.aw / 2], gpuSeconds: gpuSeconds)
+                             source: Array(source.prefix(3)), sourceStrides: [run.aw, run.aw / 2, run.aw / 2],
+                             sourceChroma: Array(source.dropFirst(3)), gpuSeconds: gpuSeconds)
         }
     }
 
@@ -1088,14 +1105,18 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// from the last picture waited on, of the same size (its source); the partition
     /// then mixes inter blocks with intra ones (`Partition.inter`).
     /// `after` (nonzero): the analysis's GPU work also waits until `gate` reaches it.
+    /// `chroma444`: `u` and `v` are a 4:4:4 picture's, `width` × `height`; the analysis decides
+    /// from their 2×2 means, rounded (the picture's last chroma column and row repeated past an odd
+    /// width or height), which the GPU makes (k_chroma420), and the partition carries the full
+    /// planes padded (`Partition.sourceChroma`).
     public func beginPartition(y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
                                motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0,
                                newPicture: NewPictureAnalysis? = nil, shapes: Int32? = nil,
-                               removesShapes: Int32 = 0) throws -> PendingPartition {
+                               removesShapes: Int32 = 0, chroma444: Bool = false) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
                           skip: skip, motion: motion, sbQindex: sbQindex, newPicture: newPicture, shapes: shapes,
-                          removesShapes: removesShapes)
+                          removesShapes: removesShapes, chroma444: chroma444)
         run.gateValue = gateValue
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
@@ -1120,8 +1141,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         var imageIsFixed = false
         var shTotal = [UInt32](repeating: 0, count: Int(GP_NSHAPES))
         let rec: [any MTLBuffer]
-        /// The padded source planes (the encoder's pool's, returned once a partition is read).
+        /// The padded source planes (the encoder's pool's, returned once a partition is read): Y, U
+        /// and V as the analysis reads them, then a 4:4:4 picture's full-size U and V.
         var source: [any MTLBuffer] = []
+        /// `u` and `v` are full size (`beginPartition(chroma444:)`).
+        let chroma444: Bool
         let leaves: any MTLBuffer, leafCount: any MTLBuffer
         let sbOut: any MTLBuffer, oBlocks: any MTLBuffer, oBlockTxb: any MTLBuffer, oTxb: any MTLBuffer
         let oCoeffs: any MTLBuffer
@@ -1189,8 +1213,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
              motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, newPicture: NewPictureAnalysis? = nil,
-             shapes: Int32? = nil, removesShapes: Int32 = 0) throws {
+             shapes: Int32? = nil, removesShapes: Int32 = 0, chroma444: Bool = false) throws {
+            // (the GPU's closed loop codes 4:2:0)
+            guard !(chroma444 && closedLoop) else { throw Failure.metal("the GPU's closed loop is 4:2:0 only") }
             self.encoder = encoder
+            self.chroma444 = chroma444
             shapesOverride = shapes
             shapesRemoved = removesShapes
             encoder.runCount += 1
@@ -1225,15 +1252,19 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 made.append(b)
                 return b
             }
-            // source planes, padded to whole superblocks by edge replication
-            let planes = [(y, width, height), (u, (width + 1) / 2, (height + 1) / 2), (v, (width + 1) / 2, (height + 1) / 2)]
-            let src = try encoder.takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)])
+            // source planes, padded to whole superblocks by edge replication (a 4:4:4 picture's
+            // chroma at full size, after the analysis's, which k_chroma420 makes from it)
+            let (cw, ch) = chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+            let planes = [(y, width, height), (u, cw, ch), (v, cw, ch)]
+            let src = try encoder.takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)] + (chroma444 ? [aw * ah, aw * ah] : []),
+                                             gpuWrites: chroma444 ? [1, 2] : [])
             made += src
             source = src
             var recPlanes: [any MTLBuffer] = []
             for (p, (pixels, w, h)) in planes.enumerated() {
-                let pw = p == 0 ? aw : aw / 2, ph = p == 0 ? ah : ah / 2
-                let b = src[p]
+                let full = p == 0 || chroma444
+                let pw = full ? aw : aw / 2, ph = full ? ah : ah / 2
+                let b = p == 0 || !chroma444 ? src[p] : src[2 + p]
                 let d = b.contents().assumingMemoryBound(to: UInt8.self)
                 // in bands of 64 lines on every core (a lone picture waits for this copy)
                 let lines = AV1MetalEncoder.Lines(to: d, from: pixels)
@@ -1246,7 +1277,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                         (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
                     }
                 }
-                recPlanes.append(try make(closedLoop ? pw * ph : 16))
+                recPlanes.append(try make(closedLoop ? (p == 0 ? aw * ah : aw / 2 * (ah / 2)) : 16))
             }
             rec = recPlanes
             var tl = av1g_tiles()
@@ -1380,7 +1411,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             imageIsFixed = image.edgeFilter == 0 && (image.usingQm == 0 || image.qm.0 >= 15)
             // the analysis's results: the previous picture's, kept where its source is unchanged
             let cache = try encoder.analysisCache(width: width, height: height, qindex: qindex, shapeMask: shapeMask, blocks: Int(blkTotal),
-                                                  superblocks: sbCols * sbRows, newPicture: newPictureAnalysis)
+                                                  superblocks: sbCols * sbRows, newPicture: newPictureAnalysis, chroma444: chroma444)
             func keep(_ b: any MTLBuffer) -> any MTLBuffer { made.append(b); return b }
             let blk = try cache.map { keep($0.blockResults) } ?? make(Int(blkTotal) * MemoryLayout<GpBlockRes>.stride)
             blockResults = blk
@@ -1403,7 +1434,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let sbJ = try cache.map { keep($0.sbJ) } ?? make(nSb * 4)
             var sbKeep: (any MTLBuffer)?, sbList: (any MTLBuffer)?
             if let cache {
-                cache.markUnchanged(y: y, u: u, v: v, width: width, height: height,
+                cache.markUnchanged(y: y, u: u, v: v, width: width, height: height, chroma444: chroma444,
                                     sbCols: (miCols + 15) >> 4, sbRows: (miRows + 15) >> 4,
                                     skip: skip?.count == ((miCols + 15) >> 4) * ((miRows + 15) >> 4) ? skip : nil,
                                     sbQindex: sbQindex)
@@ -1579,6 +1610,14 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             let kernels = try encoder.analysisKernels(fixed: analysisIsFixed(params))  // (compiled the first time)
             let t0 = CACurrentMediaTime()
             var e = try open()
+            if chroma444 {  // the analysis's chroma, from the full-size planes, before anything reads it
+                var dims = SIMD4<UInt32>(UInt32(aw), UInt32(ah), UInt32(width), UInt32(height))
+                e.setComputePipelineState(encoder.chroma420)
+                for k in 0..<4 { e.setBuffer(source[[3, 4, 1, 2][k]], offset: 0, index: 2 + k) }
+                e.setBytes(&dims, length: MemoryLayout.size(ofValue: dims), index: 6)
+                e.dispatchThreads(MTLSize(width: aw / 2, height: ah / 2, depth: 2), threadsPerThreadgroup: MTLSize(width: 64, height: 4, depth: 1))
+                e.memoryBarrier(scope: .buffers)
+            }
             // the shapes the thread-per-block kernel takes (the analysis loop below decides the same):
             // in an inter frame, not those of 64 samples and up (below), but those up to 128 (8x8, 8x16,
             // 16x8) where most of the picture is new, which few blocks skip the intra search of (5K:

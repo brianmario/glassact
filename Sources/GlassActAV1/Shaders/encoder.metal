@@ -203,3 +203,21 @@ GA_SMALL(16, 8, AV1G_BLOCK_16X8)
 
 // Closed loop: one threadgroup of RC_NT (128) threads per 64x64, in wavefront steps.
 #include "k_recon.h"
+
+// Glass Act: a 4:4:4 picture's chroma as the analysis reads it (AV1MetalEncoder.beginPartition's
+// chroma444): each 2x2's mean, rounded, of the full-size plane (fullU / fullV, padded by edge
+// replication to dims.x x dims.y, rows dims.x apart) into the 4:2:0 one (halfU / halfV, dims.x / 2 x
+// dims.y / 2, tight), past the picture's 4:2:0 chroma (the picture is dims.z x dims.w; its chroma
+// half that, rounded up) its last column and row repeated. z: U, V.
+kernel void k_chroma420(device const uint8_t *fullU [[buffer(2)]], device const uint8_t *fullV [[buffer(3)]],
+                        device uint8_t *halfU [[buffer(4)]], device uint8_t *halfV [[buffer(5)]],
+                        constant uint4 &dims [[buffer(6)]], uint3 g [[thread_position_in_grid]]) {
+    const uint fw = dims.x, hw = fw / 2;
+    if (g.x >= hw || g.y >= dims.y / 2) return;
+    // the 2x2 at (c, r), inside the picture's chroma; its right column and lower row are the
+    // padding's (the picture's last) past an odd width or height
+    const uint c = min(g.x, (dims.z + 1) / 2 - 1), r = min(g.y, (dims.w + 1) / 2 - 1);
+    device const uint8_t *s = (g.z ? fullV : fullU) + 2 * r * fw + 2 * c;
+    const uint sum = (uint)s[0] + s[1] + s[fw] + s[fw + 1];
+    (g.z ? halfV : halfU)[g.y * hw + g.x] = (uint8_t)((sum + 2) >> 2);
+}

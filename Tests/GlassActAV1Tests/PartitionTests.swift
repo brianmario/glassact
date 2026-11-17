@@ -96,6 +96,53 @@ struct PartitionTests {
         #expect(overlapped.lastKeptSuperblocks > 0, "the third picture keeps some of the second's analysis")
     }
 
+    /// A 4:4:4 picture (`beginPartition(chroma444:)`): the analysis decides from its chroma's 2×2
+    /// means, rounded, which the GPU makes (k_chroma420), past an odd width or height from the
+    /// last column and row: the partition and the analysis's padded chroma are those of the same
+    /// picture given as 4:2:0 with those means, and the partition carries the full chroma, padded.
+    @available(macOS 27, *)
+    @Test(arguments: [(333, 201), (640, 360), (65, 33)])
+    func a444PictureIsAnalyzedOnItsChromasMeans(width: Int, height: Int) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let base = Picture(width: width, height: height)
+        var rng = SplitMix64(seed: UInt64(width * 7 + height))
+        // full-size chroma with detail 4:2:0 can't keep: one-sample stripes, noise, a gradient
+        let u = (0..<(width * height)).map { k in UInt8(truncatingIfNeeded: (k % width) & 1 == 0 ? 60 + rng.int(0..<40) : 180 + k / width % 50) }
+        let v = (0..<(width * height)).map { k in UInt8(truncatingIfNeeded: (k / width) & 1 == 0 ? 90 : 160 + rng.int(0..<60)) }
+        let (cw, ch) = ((width + 1) / 2, (height + 1) / 2)
+        func means(_ p: [UInt8]) -> [UInt8] {
+            (0..<(cw * ch)).map { k in
+                let (c, r) = (k % cw, k / cw)
+                let (x0, x1, y0, y1) = (2 * c, min(2 * c + 1, width - 1), 2 * r, min(2 * r + 1, height - 1))
+                let sum = Int(p[y0 * width + x0]) + Int(p[y0 * width + x1]) + Int(p[y1 * width + x0]) + Int(p[y1 * width + x1])
+                return UInt8((sum + 2) >> 2)
+            }
+        }
+        let (u2, v2) = (means(u), means(v))
+        func partition(_ u: [UInt8], _ v: [UInt8], chroma444: Bool) throws -> (blocks: [UInt8], source: [[UInt8]], chroma: [[UInt8]]) {
+            let e = try AV1MetalEncoder(device: device)
+            let p = try base.y.withUnsafeBufferPointer { y in
+                try u.withUnsafeBufferPointer { u in
+                    try v.withUnsafeBufferPointer { v in
+                        try e.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
+                                             width: width, height: height, qindex: 120, chroma444: chroma444).wait()
+                    }
+                }
+            }
+            func contents(_ b: any MTLBuffer) -> [UInt8] { Array(UnsafeBufferPointer(start: b.contents().assumingMemoryBound(to: UInt8.self), count: b.length)) }
+            return (p.blocks.withUnsafeBytes { Array($0) } + p.lumaTxTypes, p.source.map(contents), p.sourceChroma.map(contents))
+        }
+        let full = try partition(u, v, chroma444: true), half = try partition(u2, v2, chroma444: false)
+        #expect(full.blocks == half.blocks, "\(width)×\(height): the partition isn't the 4:2:0 picture's")
+        #expect(full.source == half.source, "\(width)×\(height): the analysis's padded planes aren't the 4:2:0 picture's")
+        try #require(full.chroma.count == 2 && half.chroma.isEmpty)
+        let aw = ((2 * ((width + 7) >> 3) + 15) >> 4) * 64
+        for (plane, src) in [(full.chroma[0], u), (full.chroma[1], v)] {
+            let padded = (0..<plane.count).map { k in src[min(k / aw, height - 1) * width + min(k % aw, width - 1)] }
+            #expect(plane == padded, "\(width)×\(height): the full chroma isn't the picture's, padded")
+        }
+    }
+
     @available(macOS 27, *)
     @Test(arguments: [(333, 201), (1280, 720)])
     func partitionIsLegalAndSensible(width: Int, height: Int) throws {

@@ -65,41 +65,6 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var chromaSize: (width: Int, height: Int) {
             chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
         }
-
-        /// A 4:4:4 picture's chroma as 4:2:0's: each 2×2's mean, rounded (edge samples repeated
-        /// past an odd width or height). Both planes in bands of rows on every core (a 5K
-        /// picture's chroma is 2 × 14.7 MB, and this is on its analysis's critical path).
-        func chroma420() -> (u: [UInt8], v: [UInt8]) {
-            let (cw, ch) = ((width + 1) / 2, (height + 1) / 2)
-            let width = width, height = height
-            var u2 = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
-            var v2 = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
-            let bands = min(16, max(1, ch / 32))
-            u.withUnsafeBufferPointer { su in
-                v.withUnsafeBufferPointer { sv in
-                    u2.withUnsafeMutableBufferPointer { du in
-                        v2.withUnsafeMutableBufferPointer { dv in
-                            let src = [su.baseAddress!, sv.baseAddress!], dst = [du.baseAddress!, dv.baseAddress!]
-                            DispatchQueue.concurrentPerform(iterations: 2 * bands) { job in
-                                let (s, d, b) = (src[job & 1], dst[job & 1], job >> 1)
-                                for r in (b * ch / bands)..<((b + 1) * ch / bands) {
-                                    let r0 = s + 2 * r * width, r1 = s + min(2 * r + 1, height - 1) * width, o = d + r * cw
-                                    for c in 0..<(width / 2) {
-                                        let sum = UInt16(r0[2 * c]) + UInt16(r0[2 * c + 1]) + UInt16(r1[2 * c]) + UInt16(r1[2 * c + 1])
-                                        o[c] = UInt8((sum + 2) >> 2)
-                                    }
-                                    if width & 1 != 0 {
-                                        let c = cw - 1
-                                        o[c] = UInt8((2 * UInt16(r0[2 * c]) + 2 * UInt16(r1[2 * c]) + 2) >> 2)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return (u2, v2)
-        }
     }
 
     /// Where a picture's time went: GPU time for the analysis and wall time
@@ -1009,7 +974,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     private func finishStep(_ s: Stream, _ index: Int, _ p: Picture, _ pending: Pending) {
         if s.broken(at: index) != nil {
             // (its analysis runs on: wait for it, so that nothing after it waits on what it holds)
-            if let got = try? pending.read?.wait() { metal.keepSource(got.partition.source) }
+            if let got = try? pending.read?.wait() { metal.keepSource(got.partition.pooledSource) }
             failStep(s, index, nil)
             return
         }
@@ -1019,7 +984,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 let partition = got.partition
                 // the picture before's source back to the pool: its closed loop and filters, and
                 // this picture's analysis (whose motion search read it), are done
-                if pending.read != nil { metal.keepSource(partition.source) }
+                if pending.read != nil { metal.keepSource(partition.pooledSource) }
                 if index == s.failing { throw Failure.encode("picture \(index) fails (failingPicture)") }
                 Self.trace("partition \(index)")
                 let t0 = CACurrentMediaTime()
@@ -1511,26 +1476,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
     private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
         Self.trace("begin")
-        // a 4:4:4 picture: its analysis on a 4:2:0 copy of its chroma
-        var analysisChroma: (u: [UInt8], v: [UInt8])?
+        // (a 4:4:4 picture's analysis decides on a 4:2:0 copy of its chroma, which the GPU makes)
         if p.chroma444 {
             guard p.y.count == p.width * p.height, p.u.count == p.y.count, p.v.count == p.y.count else {
                 throw Failure.encode("4:4:4 picture \(p.width)×\(p.height): planes of \(p.y.count), \(p.u.count), \(p.v.count) samples")
             }
-            Self.trace("chroma420 start")
-            analysisChroma = p.chroma420()
-            Self.trace("chroma420 end")
         }
         let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         let partition = try p.y.withUnsafeBufferPointer { y in
-            try (analysisChroma?.u ?? p.u).withUnsafeBufferPointer { u in
-                try (analysisChroma?.v ?? p.v).withUnsafeBufferPointer { v in
+            try p.u.withUnsafeBufferPointer { u in
+                try p.v.withUnsafeBufferPointer { v in
                     try metal.beginPartition(y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!,
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
                                              motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort,
-                                             removesShapes: p.chroma444 && chroma444Palettes && !fast ? Self.chroma444RemovedShapes : 0)
+                                             removesShapes: p.chroma444 && chroma444Palettes && !fast ? Self.chroma444RemovedShapes : 0,
+                                             chroma444: p.chroma444)
                 }
             }
         }
@@ -1619,18 +1581,20 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
         }
         // the filters read the analysis's padded source, and so does an inter frame's closed loop
-        // (a key frame's pads its own, which the next picture's compares tiles with)
-        let analysisSource: [UnsafePointer<UInt8>?] = partition.source.count == 3
-            ? partition.source.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) } : []
-        // (4:4:4: not the analysis's, whose chroma is a 4:2:0 copy; the closed loop pads its own)
-        let padded = reference != nil && sbMotionIn != nil && !p.chroma444 ? analysisSource : []
+        // (a key frame's pads its own, which the next picture's compares tiles with); a 4:4:4
+        // picture's chroma not as the analysis read it (2×2 means) but at full size
+        let sourceBuffers = p.chroma444 ? (partition.sourceChroma.count == 2 ? [partition.source[0]] + partition.sourceChroma : [])
+            : (partition.source.count == 3 ? partition.source : [])
+        let sourceStrides = p.chroma444 ? [Int](repeating: partition.sourceStrides.first ?? 0, count: 3) : partition.sourceStrides
+        let analysisSource: [UnsafePointer<UInt8>?] = sourceBuffers.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) }
+        // (the CPU's filters, research, read the closed loop's own reconstruction and source)
+        let cpuFilters = postfilters && p.chroma444 && chroma444CPUFilters, gpuFilters = postfilters && !cpuFilters
+        let padded = reference != nil && sbMotionIn != nil && !cpuFilters ? analysisSource : []
         // a stream's reconstruction goes into the filters' buffers, which deblock it in place (an
         // inter frame's straight there, a key frame's copied)
         var geometry = av1g_frame_params()
         (geometry.width, geometry.height) = (UInt32(p.width), UInt32(p.height))
         if p.chroma444 { (geometry.version, geometry.chroma_format) = (UInt32(AV1G_DECISIONS_VERSION), UInt8(AV1G_CHROMA_444)) }
-        // (the CPU's filters, research, read the closed loop's own)
-        let gpuFilters = postfilters && !(p.chroma444 && chroma444CPUFilters)
         var store = interFrames && gpuFilters ? try postfilter.reconstructionBuffers(params: geometry) : []
         var into: [UnsafeMutablePointer<UInt8>?] = store.map { $0.contents().assumingMemoryBound(to: UInt8.self) }
         // The previous picture where the filters left it is the closed loop's reference. Without
@@ -1728,8 +1692,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             timing.intraCopied = Double(area) / Double(p.width * p.height)
         }
         var recon: [UnsafePointer<UInt8>] = [], source: [UnsafePointer<UInt8>] = [], strides: [Int] = []
-        // (a 4:4:4 picture's source is the closed loop's: the analysis's chroma is a 4:2:0 copy)
-        let ownSource = analysisSource.isEmpty || p.chroma444
+        let ownSource = analysisSource.isEmpty
         for plane in 0..<3 {
             var stride: Int32 = 0
             guard let r = store.isEmpty || copies ? av1enc_hybrid_recon(cpu, Int32(plane)) : UnsafePointer(into[plane]),
@@ -1737,7 +1700,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             else { throw Failure.encode("no reconstruction") }
             recon.append(r)
             source.append(s)
-            strides.append(ownSource ? Int(stride) : partition.sourceStrides[plane])
+            strides.append(ownSource ? Int(stride) : sourceStrides[plane])
         }
         let n = Int(record.pointee.n_blocks)
         guard gpuFilters, !copies else {
@@ -1778,12 +1741,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         postfilter.signalsWhenDone = (metal.gate, filtersDone + 1)
         Self.trace("filters signal \(filtersDone + 1)")
         defer { postfilter.signalsWhenDone = nil }
-        // (a 4:4:4 picture's search targets the closed loop's source: the analysis's chroma is a
-        // 4:2:0 copy)
         let search = try postfilter.search(params: record.pointee.fp,
                                            blocks: UnsafeBufferPointer(start: record.pointee.blocks, count: n),
                                            planes: recon, source: source, sourceStrides: strides,
-                                           sourceBuffers: ownSource ? nil : partition.source,
+                                           sourceBuffers: ownSource ? nil : sourceBuffers,
                                            changed: known ? changed : nil, direct: known ? direct : nil,
                                            lfZero: inter.isEmpty ? nil : (0..<n).map { record.pointee.inter[$0].is_inter != 0 ? 3 : 0 },
                                            cropsOutput: returnsPlanes, cdef: usesCDEF && (!fast || newPictureEffort?.cdef != false))
