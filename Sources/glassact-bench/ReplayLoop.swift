@@ -125,6 +125,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         let qmax = opts.has("av1-qmax") ? opts.int("av1-qmax", 42) : nil
         let keyBudgetMS = opts.int("hybrid-key-ms", 0), minQ = opts.int("hybrid-min-qindex", -1)
         let keyLinkMS = opts.int("hybrid-key-link-ms", 0)
+        let fastCDEF = opts.has("hybrid-fast-cdef")
         encoderFactory = {
             guard $0 == VideoCodec.av1 else { return nil }
             let h = HybridRegionEncoder(callbackQueue: .main, colour: colour, chroma444: c444)
@@ -134,7 +135,13 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             if keyBudgetMS > 0 { h.keyBudgetUS = UInt64(keyBudgetMS) * 1000 }
             if minQ >= 0 { h.minQindex = minQ }
             if keyLinkMS > 0 { h.keyLinkUS = UInt64(keyLinkMS) * 1000 }
-            if videoFaults.checksPictures { h.configure = { $0.returnsPlanes = true } }  // (the reconstruction too)
+            let planes = videoFaults.checksPictures  // (the reconstruction too)
+            if planes || fastCDEF {
+                h.configure = { e in
+                    if planes { e.returnsPlanes = true }
+                    if fastCDEF { e.newPictureEffort?.cdef = true }
+                }
+            }
             h.onWritten = { frame, key, seconds in
                 videoFaults.written(frame, key: key, seconds: seconds)
                 let q = frame.timing.qindex

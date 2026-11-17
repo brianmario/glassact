@@ -6,9 +6,8 @@ import Metal
 import Testing
 import libaom
 
-/// The hybrid encoder's 4:4:4 key frames (`Picture.chroma444`, the High profile), post-filtered
-/// on the GPU: every one decodes in libaom to exactly the picture the encoder reports, at sizes
-/// down to a few samples,
+/// The hybrid encoder's 4:4:4 key frames (`Picture.chroma444`, the High profile): every one
+/// decodes in libaom to exactly the picture the encoder reports, at sizes down to a few samples,
 /// with intra block copy on (and copying) and off; streams of 4:4:4 inter frames decode to theirs
 /// too; and a 4:4:4 picture leaves nothing behind that changes the 4:2:0 pictures coded after it.
 @Suite(.enabled(if: AV1ShaderSource.hasCapableGPU && glassact_aom_available() != 0,
@@ -96,13 +95,8 @@ struct Hybrid444Tests {
         for (i, picture) in pictures.enumerated() {
             let frame = try encoder.encode(picture, qindex: qindex)
             #expect(frame.params.chroma_format == UInt8(AV1G_CHROMA_444), "\(label): picture \(i) isn't 4:4:4")
-            // filtered as 4:2:0's (deblocking at tune=iq's level for the q, every plane, and CDEF), but
-            // where it copies (the format leaves a picture with intra block copies unfiltered)
-            let lf = frame.params.loop_filter_level
-            if frame.params.allow_intrabc == 0 {
-                #expect(frame.params.enable_cdef == 1 && lf.0 == lf.2 && lf.0 == lf.3 && (qindex < 40 || lf.0 > 0),
-                        "\(label): picture \(i) isn't filtered: levels \(lf), CDEF \(frame.params.enable_cdef)")
-            }
+            // (a 4:4:4 picture coded alone has no post-filters; a stream's are filtered: below)
+            #expect(frame.params.loop_filter_level == (0, 0, 0, 0) && frame.params.enable_cdef == 0, "\(label): picture \(i) filters")
             #expect(frame.planes.map(\.count) == [Int](repeating: width * height, count: 3), "\(label): picture \(i)'s planes")
             if frame.timing.intraCopied > 0 {
                 copied += 1

@@ -48,8 +48,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// and chroma modes and motion from a 4:2:0 copy of the chroma (2×2 means; inter frames'
         /// against the picture before's copy); the closed loop codes every plane from the real
         /// ones, its inter blocks predicting from full-size references (with `gpuDecides` off it
-        /// decides chroma itself, on the real planes). The GPU's post-filters and their search
-        /// filter it as 4:2:0's, on its full-size planes.
+        /// decides chroma itself, on the real planes). In a stream the GPU's post-filters and their
+        /// search filter it as 4:2:0's, on its full-size planes; coded alone (a tile) it has none.
         public var chroma444: Bool
 
         public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {
@@ -1588,7 +1588,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let sourceStrides = p.chroma444 ? [Int](repeating: partition.sourceStrides.first ?? 0, count: 3) : partition.sourceStrides
         let analysisSource: [UnsafePointer<UInt8>?] = sourceBuffers.map { UnsafePointer($0.contents().assumingMemoryBound(to: UInt8.self)) }
         // (the CPU's filters, research, read the closed loop's own reconstruction and source)
-        let cpuFilters = postfilters && p.chroma444 && chroma444CPUFilters, gpuFilters = postfilters && !cpuFilters
+        // (a 4:4:4 picture coded alone, a tile, has none: libaom's filters were worth −1 to +3 % on
+        // the 4:4:4 tiles, BENCHMARKS "the hybrid's 4:4:4 tiles against libaom's", and ours aren't
+        // measured there)
+        let cpuFilters = postfilters && p.chroma444 && chroma444CPUFilters
+        let gpuFilters = postfilters && !cpuFilters && (interFrames || !p.chroma444)
         let padded = reference != nil && sbMotionIn != nil && !cpuFilters ? analysisSource : []
         // a stream's reconstruction goes into the filters' buffers, which deblock it in place (an
         // inter frame's straight there, a key frame's copied)
@@ -1707,7 +1711,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             // (a stream with post-filters keeps CDEF on in its sequence header, for its inter frames)
             filtered()  // (none on the GPU)
             let ended = try writingBefore?.end()  // (the writer's state, back for this write)
-            let filtered = postfilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
+            let filtered = cpuFilters && !copies ? try cpuFiltered(p, sbCols: sbCols0, sbRows: sbRows0) : nil
             // (a 4:4:4 stream's reference without its planes copied out: the closed loop's own)
             let inPlace = p.chroma444 && interFrames && !returnsPlanes && filtered == nil && !copies && store.isEmpty
             let frame = try write(p, record: record, recon: recon, sequenceCDEF: postfilters && interFrames,

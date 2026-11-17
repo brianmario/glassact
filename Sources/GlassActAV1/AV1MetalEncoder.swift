@@ -55,7 +55,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         public var source: [any MTLBuffer] = []
         public var sourceStrides: [Int] = []
         /// A 4:4:4 picture's (`beginPartition(chroma444:)`): its U and V at full size, padded as Y is
-        /// (rows `sourceStrides[0]` apart), from which the GPU made `source`'s, their 2×2 means.
+        /// (rows `sourceStrides[0]` apart), from which the GPU made `source`'s, their 2×2 means
+        /// (where the analysis ran: one that kept every SB's left `source`'s U and V as they were).
         /// They go back to the pool with `source` (`pooledSource`); empty for a 4:2:0 picture.
         public var sourceChroma: [any MTLBuffer] = []
         /// Every buffer of the source, for `keepSource`.
