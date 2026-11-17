@@ -139,7 +139,12 @@ the numbers and the reasoning.
 | Palette + rANS (v1 roadmap P2) | not built | palette + left prediction wins zero bytes over the best-of (VP8L already does both) | [entry](#p2--hash-pinned-delta-records-2026-08-06) |
 | JPEG XL lossless tiles | rejected | 449 vs VP8L's 379 B/tile, at a quarter of the speed | [entry](#codec-frontier-survey--cache-measurement-2026-08-05) |
 | AVIF lossless (settle, keyframes) | rejected | VP8L 20 % smaller on text, 33 % on photos | [entry](#vp8l-vs-avif-lossless--vp8l-wins-both-content-types-2026-08-07) |
-| The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
+| The hybrid's 4:4:4 key frames (High profile; `metal-av1`) | kept, research | at the same bytes, 1.4–5.4 SSIMULACRA2 above its 4:2:0 on every tile corpus; even with libaom's AVIF 4:4:4 on photos and graphics, 10–45 % more bytes on UI and text (before the palettes below) | [entry](#the-hybrids-444-key-frames-as-tiles-2026-11-16) |
+| 4:4:4 tiles: palettes, luma and chroma, by cost, with analysis shapes 8×8 and up and a bias toward palettes on exact few-value blocks (`av1-444-text`, on for 4:4:4 pictures) | kept | at libaom AVIF q90's SSIMULACRA2: typing +45.6 → −0.8 % of libaom's bytes, scroll +21.7 → −11.2 %, ide +17.1 → −7.8 %, tabs +9.9 → −10.8 %, photos −8.9 → −10.8 %, drag −4.9 → −12.7 %; 4:2:0 unchanged | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
+| 4:4:4 luma palettes at the analysis's own partition | rejected | ≤ 1.5 %: the analysis puts text in 4×4s, which can't be palettes | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
+| 4:4:4 chroma AC delta-q as libaom's tune=iq sets it | rejected | 4–8 % more bytes at equal SSIMULACRA2 | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
+| The palette bias on every 4:4:4 block | rejected (gated instead) | photos −10.5 → −7.0 % against libaom | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
+| 4:4:4 post-filters on the CPU; a merge pass of sub-8×8 blocks into palettes | not built | libaom's CDEF and deblocking are worth −1 to +3 % on these tiles; it keeps sub-8×8 blocks on 1.4–3.5 % of the area | [entry](#the-hybrids-444-tiles-against-libaoms-palettes-and-88-shapes-and-up-2026-11-16) |
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
 | The own decoder's 4:2:0 chroma scaled up with vImage's Lanczos before converting, instead of vImage's 4:2:0 conversion (`av1-viewer-decoder`) | rejected | +0.03 dB (47.92 → 47.95, VideoToolbox 48.19), conversion 0.60 → 14.9 ms a 5K frame | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
@@ -338,6 +343,132 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### The hybrid's 4:4:4 tiles against libaom's: palettes, and 8×8 shapes and up (2026-11-16)
+
+The entry below left the hybrid's 4:4:4 tiles needing ~45 % more bytes than libaom's AVIF 4:4:4
+q90 on text and 10–22 % on UI at equal SSIMULACRA2. Its suspects were the missing post-filters,
+chroma decided on a block's first 32×32, the analysis's 2×2-mean chroma, no intra block copy, and
+palettes. Branch `av1-444-text` (off `metal-av1`, `de44409`…`c8b04f3`). Corpora and scoring as
+there: the six `dumptiles` corpora, `av1tiles --chroma 444` at q2–q20, `scripts/tile-codec-probe`,
+which now prints scores to two decimals. Bytes a tile (the stream; libaom's AV1 data) at libaom
+q90's mean score, our curve interpolated in log bytes. Times are provisional (load 6–20).
+
+**What libaom's tools are worth here.** avifenc 1.4.2 (libaom 3.15.3, all-intra, speed 6, its
+default tune=iq), one tool off at a time (`-a <key>=0`), each at q84–96, its bytes at the
+default's q90 score:
+
+| tool off | typing | scroll | ide | tabs |
+|---|---|---|---|---|
+| palette | +76 % | +43 % | +35 % | +27 % |
+| CfL | 0 | +9.4 % | +8.8 % | +6.4 % |
+| rectangular partitions | +4.8 % | +5.2 % | +8.5 % | +1.6 % |
+| quantization matrices | +3.0 % | +2.4 % | −0.3 % | −2.3 % |
+| deblocking (`loopfilter-control=0`) | −0.8 % | +1.0 % | +2.8 % | +1.3 % |
+| CDEF | −0.5 % | −0.7 % | −0.7 % | −0.8 % |
+| sharpness 0 (tune=iq sets 7) | −1.0 % | −1.3 % | −2.2 % | −0.1 % |
+| delta-q (variance boost) | +0.2 % | −0.9 % | +1.4 % | 0 |
+| paeth, smooth, angle deltas, flip/identity tx types, edge filter | ≤ 1.0 % | ≤ 0.9 % | ≤ 0.4 % | ≤ 1.6 % |
+| filter intra, intra block copy, loop restoration, AB and 1:4 partitions | ≤ 0.1 % | ≤ 0.4 % | ≤ 0.3 % | ≤ 0.3 % |
+| all we lacked at once (palette, filter intra, CDEF, deblocking, restoration, delta-q, QM, rect/AB/1:4) | +65 % | +43 % | +37 % | +28 % |
+| (tune=ssim in place of tune=iq) | −2.5 % | −8.9 % | −15.4 % | −12.0 % |
+
+libaom without its palettes needs more bytes than the hybrid did (typing 668 against 552, scroll
+385 against 329): palettes were the whole gap. The post-filters are worth nothing here (CDEF
+negative, deblocking ≤ 3 %; tune=iq turns CDEF off at qindex ≤ 32 and deblocks at level 2), and
+so is intra block copy at tile size. avifenc's default isn't libaom's best on UI: tune=ssim beats
+it by 9–15 %.
+
+**Where the bytes go.** `rust/av1/examples/tile_stats` (new) parses each tile's stream with the
+crate's parser, which reads libaom's stills too, and re-codes it with `ENC_BLOCK_BITS`, so both
+encoders' blocks are counted the same way (`av1tiles --obus` writes the hybrid's). Typing, libaom
+q90 (qindex 32) against the hybrid at q8 (32) and q2:
+
+| | libaom q90 | hybrid q8 | hybrid q2 |
+|---|---|---|---|
+| bytes a tile | 379 | 436 | 574 |
+| sub-8×8 blocks a tile (their bytes) | 5.9 (46 B) | 56 (343 B) | 58 (506 B) |
+| 8×8 blocks (their bytes) | 16.4 (230 B) | 15.1 (31 B) | 15.3 (30 B) |
+| palette blocks a tile: luma and chroma / luma only | 9.4 / 2.9 | 0 | 0 |
+| coefficients up to eob a tile: Y / U / V | 293 / 8 / 5 | 429 / 347 / 280 | 424 / 274 / 226 |
+
+libaom codes text as 8×8 palette blocks, luma and chroma (2-colour chroma palettes), with almost
+no chroma residual. The hybrid's analysis splits text into 4×4s, which can't be palettes, and its
+chroma goes into the residual. Scroll and ide look the same: libaom 7.6 and 10.3 palette blocks a
+tile and 36 and 57 chroma coefficients; the hybrid at q4 no palettes and 283 and 259.
+
+**What changed:**
+- `de44409`, `fc1af68`: branch `palette-residual`'s palette decision (`bf5437e`, `a583dec`: luma
+  palettes by cost before the closed loop, open loop, the residual through the closed loop's tx
+  search) ported, with the chroma subsampling. Off by default; 4:2:0 unchanged.
+- `0a571af`: 4:4:4 chroma palettes by cost (`hybrid::palette::decide_uv`). Blocks up to 32×32
+  get (U, V) pairs by 2-D k-means and one index map, the colours and map priced as the writer
+  codes them, against the chroma as decided (its mode or CfL from the source, each plane through
+  the closed loop's quantizer, `QuantHook::intra_chroma_j`).
+- `ec9dd59`: a 4:4:4 picture codes palettes and analyzes shapes of 8×8 and up by default
+  (`AV1HybridEncoder.chroma444Palettes`; the shapes a per-call override of the analysis,
+  `beginPartition(shapes:)`), so its text becomes palette blocks. Every palette size 2–8 is priced:
+  the search stopped when J rose, and J isn't monotone in the size (2.6–3.7 % of a text tile).
+- `209578e`: in 4:4:4, a block ≥ 80 % of whose samples (pairs) are exactly its gate's 8 values
+  keeps its decided luma only under 1/1.4 of the best luma palette's J, and its chroma only under
+  1/1.6 of the best chroma palette's (`SCREEN_BIAS_Y`, `_UV`). The decided side is priced open
+  loop, predicted from the source's edges with the trials' rate proxy, which is optimistic against
+  a palette: it needs no edges, and its side bits are exact. Measured at 1.3/1.2 and 1.6/1.4 on
+  every block, then gated.
+
+**Before and after**, bytes a tile at libaom q90's mean score (against libaom's bytes), each
+step's own run:
+
+| | typing | scroll | ide | tabs | photos | drag |
+|---|---|---|---|---|---|---|
+| libaom AVIF 4:4:4 q90: bytes · score | 379 · 94.07 | 270 · 95.58 | 298 · 93.48 | 260 · 95.99 | 1026 · 90.96 | 526 · 91.49 |
+| before (`c7844c4`) | 552 (+45.6 %) | 329 (+21.7 %) | 349 (+17.1 %) | 286 (+9.9 %) | 935 (−8.9 %) | 500 (−4.9 %) |
+| luma palettes at the analysis's partition | 552 (+45.6 %) | 326 (+20.6 %) | 344 (+15.6 %) | 284 (+9.3 %) | 935 (−8.9 %) | 499 (−5.1 %) |
+| + shapes 8×8 and up | 586 (+55 %, extrapolated) | 306 (+13.4 %) | 318 (+6.7 %) | 272 (+4.4 %) | | |
+| + chroma palettes | 437 (+15.2 %) | 264 (−2.1 %) | 302 (+1.5 %) | 251 (−3.5 %) | 921 (−10.2 %) | 497 (−5.4 %) |
+| + every palette size | 422 (+11.3 %) | 252 (−6.7 %) | 290 (−2.5 %) | 242 (−6.9 %) | 918 (−10.5 %) | 477 (−9.3 %) |
+| **after: + the gated bias** | **376 (−0.8 %)** | **240 (−11.2 %)** | **275 (−7.8 %)** | **232 (−10.8 %)** | **916 (−10.8 %)** | **459 (−12.7 %)** |
+| after against before | −31.9 % | −27.0 % | −21.3 % | −18.8 % | −2.0 % | −8.2 % |
+
+After, bytes a tile · SSIMULACRA2 mean / p10 (the entry below's table, for comparison):
+
+| Tiles | q2 | q4 | q8 | q14 | q20 |
+|---|---|---|---|---|---|
+| typing-cc | 463 · 95.79 / 94.66 | 419 · 94.59 / 93.70 | 364 · 93.92 / 91.82 | 314 · 90.69 / 87.78 | 278 · 89.18 / 86.68 |
+| scroll-win | 342 · 96.99 / 94.99 | 293 · 96.57 / 94.12 | 249 · 95.81 / 92.83 | 211 · 94.80 / 90.22 | 189 · 93.58 / 87.82 |
+| photos | 1862 · 94.34 / 92.57 | 1416 · 93.34 / 91.03 | 1007 · 91.64 / 87.95 | 724 · 89.27 / 83.50 | 567 · 87.26 / 79.81 |
+| cursor-drag | 898 · 93.91 / 92.83 | 651 · 93.29 / 91.79 | 480 · 91.85 / 89.40 | 368 · 89.69 / 86.06 | 308 · 87.67 / 82.52 |
+| tabs | 334 · 97.29 / 95.15 | 287 · 96.96 / 94.41 | 239 · 96.09 / 92.71 | 202 · 95.50 / 90.65 | 180 · 94.66 / 88.42 |
+| ide | 412 · 95.58 / 93.70 | 353 · 94.99 / 92.68 | 282 · 93.65 / 90.16 | 233 · 92.49 / 87.21 | 205 · 91.61 / 85.71 |
+
+At q8, typing's palettes cover 26 % of the eligible area (799 luma, 504 chroma), scroll's 19 %
+(3,461, 724), photos' 6 % (1,062, 362). Every tile decodes in the vendored libaom to the encoder's
+picture (`av1tiles` checks each). The 4:2:0 output is unchanged: the five reference digests,
+`av1tiles` without `--chroma 444` (typing q8 369.0, q20 287.9, q32 237.0 B). Gates:
+`cargo test --release` 81, `--ignored decoders_444 decoders_agree`, the oracle build 149,
+`swift test --filter "GlassActAV1Tests|AV1DecodeTests"` (43 + 7). `chroma444_key_frames` gains four
+palette pictures (one tile and several, past the edges, with intra block copies): dav1d and aomdec
+decode all 22 exactly, and kept tiles stay fresh.
+
+**Encode time**, `av1tiles` one tile at a time, before (`--no-444-palettes`, the same binary) and
+after, medians of two rounds at q4 and q8, GPU round trips included: typing 4.0 → 4.1 ms, scroll
+3.2 → 3.7, ide 2.8 → 3.0, tabs 3.3 → 3.6, drag 4.0 → 4.3, photos 4.0 → 4.5 (its quiet round; the
+other ran at load 20). So +0.1–0.5 ms a tile for the palette decisions, provisional.
+
+**Rejected or not built:**
+- Luma palettes at the analysis's partition, the branch as it was: ≤ 1.5 % (palettes on 0.2–4.8 %
+  of the eligible area: the text is in 4×4s).
+- tune=iq's 4:4:4 chroma AC delta-q (+clamp(qindex / 2, 0, 24)): 4–8 % more bytes at equal score
+  (scroll +26 % against +22 %, ide +25 % against +17 %). SSIMULACRA2 wants the chroma.
+- The palette bias on every block: photos −7.0 % against −10.5 % (at 1.3 / 1.2), so it's gated.
+- 4:4:4 post-filters on the CPU: not built. libaom's are worth −1 to +3 % here.
+- A merge pass (the analysis's sub-8×8 children against one 8×8 palette, to keep 4×4s where they
+  pay): not built. libaom keeps sub-8×8 blocks on 1.4–3.5 % of the area (18–46 B a tile).
+- The analysis on real 4:4:4 chroma, a whole-block chroma decision, CfL changes: not measured
+  separately. Palettes route most text chroma around them, but what's left is still residual:
+  U+V coefficients a tile at q4 are 100–380, against libaom's 13–57 at q90, and luma's 392–572
+  against 264–305.
+- The shapes and the bias were measured on 64×64 tiles only, not on whole 4:4:4 pictures.
 
 ### Our own AV1 decoder in the Viewer's place, stage 2 (2026-11-16)
 
