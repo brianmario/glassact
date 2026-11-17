@@ -494,6 +494,21 @@ public enum AV1Config {
         ] + obu
     }
 
+    /// The av1C record of a 4:4:4 stream (seq_profile 1, the High profile: chroma not subsampled,
+    /// 8-bit) from its sequence header; nil unless the header is profile 1's. `build` writes
+    /// 4:2:0's subsampling whatever the header says, and is what the wire carries; this one is the
+    /// hybrid's 4:4:4 streams' (`HybridRegionEncoder` with `chroma444`), which no Viewer is
+    /// offered yet.
+    public static func build444(sequenceHeaderOBU obu: [UInt8]) -> [UInt8]? {
+        guard let (profile, level, tier) = parse(obu), profile == 1 else { return nil }
+        return [
+            0x81, // marker 1, version 1
+            UInt8(profile << 5 | level & 0x1F), // seq_profile 1, seq_level_idx_0
+            UInt8(tier << 7), // seq_tier_0; 8-bit, not monochrome, no subsampling, sample position 0
+            0x00, // no initial presentation delay
+        ] + obu
+    }
+
     /// (seq_profile, seq_level_idx[0], seq_tier[0]) from a sequence header
     /// OBU. Checked reads; nil for any shape this doesn't handle.
     static func parse(_ obu: [UInt8]) -> (Int, Int, Int)? {

@@ -231,6 +231,51 @@ struct OwnAV1RegionDecoderTests {
         }
     }
 
+    /// A 4:4:4 stream (the hybrid's 4:4:4 inter frames): every key and inter frame (copies at odd
+    /// shifts, coded changes, one-sample colour stripes) is the encoder's picture, shown in the
+    /// colours the stream signals; damage fails until the next stream's key frame.
+    @available(macOS 27, *)
+    @Test(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (the hybrid encoder)"),
+          arguments: [(640, 360), (333, 201)])
+    func chroma444InterFramesDecodeExactly(width: Int, height: Int) throws {
+        let e = try Self.encoder(interFrames: true)
+        let base = Self.picture444(width: width, height: height, seed: 0x444)
+        var rng = SplitMix64(seed: 0x1E7)
+        let pictures = (0..<10).map { i -> AV1HybridEncoder.Picture in
+            var p = base
+            let dy = (i * 3) % height  // (odd shifts: copies 4:2:0 couldn't make)
+            for k in 0..<(width * height) {
+                let from = (k + dy * width) % (width * height)
+                (p.y[k], p.u[k], p.v[k]) = (base.y[from], base.u[from], base.v[from])
+            }
+            for _ in 0..<(i % 4 == 3 ? width * height / 4 : 100) {
+                let k = rng.int(0..<(width * height))
+                (p.y[k], p.u[k], p.v[k]) = (UInt8(rng.int(0..<256)), UInt8(rng.int(0..<256)), UInt8(rng.int(0..<256)))
+            }
+            return p
+        }
+        let first = try Self.frames(e, Array(pictures[0..<7]), qindex: 60)
+        let second = try Self.frames(e, Array(pictures[7...]), qindex: 60)  // (a new stream: a key frame)
+        try #require(first.filter(Self.isKey).count == 1 && Self.isKey(second[0]))
+        let d = OwnAV1RegionDecoder(threads: 3)
+        try #require(d.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
+        for (i, f) in first[0..<4].enumerated() {
+            let (ok, bgra) = Self.decode(d, f, width: width, height: height)
+            #expect(ok, "frame \(i) (\(Self.isKey(f) ? "key" : "inter"))")
+            #expect(d.withShownPicture { $0.chroma_format } == UInt8(AV1G_CHROMA_444))
+            #expect(Self.shownPlanes(d) == f.planes, "frame \(i): not the encoder's picture")
+            if ok { try Self.checkConversion(d, bgra, width: width, height: height) }
+        }
+        // an inter frame cut short: it and the inter frames after it fail, until the next key frame
+        #expect(!Self.decode(d, first[4], width: width, height: height, obu: Array(first[4].obu.prefix(first[4].obu.count / 2))).0)
+        for f in first[5...] { #expect(!Self.decode(d, f, width: width, height: height).0, "an inter frame after the damage") }
+        for (i, f) in second.enumerated() {
+            #expect(Self.decode(d, f, width: width, height: height).0, "frame \(i) of the next stream")
+            #expect(Self.shownPlanes(d) == f.planes, "frame \(i) of the next stream: not the encoder's picture")
+        }
+        #expect(d.stats.framesShown == 4 + second.count && d.stats.failures >= 1, "\(d.stats)")
+    }
+
     /// The BGRA against the decoded Y, U, V converted by the matrix and range the picture signals,
     /// sample by sample (4:2:0: where the 3x3 chroma around a sample is flat, so the chroma
     /// upsampling doesn't matter); alpha opaque.

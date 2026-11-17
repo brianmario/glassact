@@ -191,7 +191,7 @@ let package = Package(
         .testTarget(name: "AV1DecodeTests", dependencies: ["GlassActAV1Decode", "GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire", "GlassActTestSupport",
                                                          "GlassActHybridVideo", "GlassActTransport", "GlassActCodec"],
                     swiftSettings: strict),
-        .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire"],
+        .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire", "AV1Core"],
                     swiftSettings: strict),
         .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
     ]

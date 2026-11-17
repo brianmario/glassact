@@ -4,6 +4,7 @@ import GlassActCore
 import GlassActHybridVideo
 import GlassActWire
 import Testing
+import AV1Core
 
 /// The hybrid behind the VideoRegionEncoder contract, as the Host's engine drives it: one delivery
 /// per submit on the engine's queue, the config with the first frame, key frames on demand, and
@@ -63,6 +64,70 @@ struct HybridRegionEncoderTests {
             #expect(frames.dropFirst().allSatisfy { $0.config == nil })
             // (the key frame on demand carries the region's sequence header again, unchanged)
             #expect(AV1Config.sequenceHeaderOBU(inTemporalUnit: frames[n - 1].data) == header)
+        }
+    }
+
+    /// A 4:4:4 region (`chroma444`): one delivery per submit, an av1C saying High profile with
+    /// no chroma subsampling (`AV1Config.build444`), 4:4:4 key and inter frames our decoder decodes
+    /// (AV1Core's) with the colours the converter made: luma and chroma near the source's
+    /// conversion (`YCbCr444Converter`, BT.709 full range).
+    @available(macOS 27, *)
+    @Test func a444RegionIsHighProfileAndKeepsItsChroma() throws {
+        let engine = Engine()
+        let encoder = HybridRegionEncoder(callbackQueue: engine.queue, chroma444: true)
+        encoder.fixedQindex = 40
+        let (width, height, n) = (640, 360, 6)
+        let started = engine.queue.sync {
+            encoder.start(width: width, height: height) { data, sync, config in
+                engine.frames.append((data, sync, config))
+                engine.delivered.signal()
+            }
+        }
+        try #require(started)
+        let pictures = (0..<n).map { Self.picture($0, width: width, height: height) }
+        for i in 0..<n {
+            engine.queue.sync { pictures[i].withUnsafeBytes { encoder.encode(bgra: $0, forceSync: false, timeUS: UInt64(i) * 16_667) } }
+            #expect(engine.delivered.wait(timeout: .now() + 20) == .success, "picture \(i) didn't come out")
+        }
+        engine.queue.sync { encoder.stop() }
+        let frames = engine.queue.sync { engine.frames }
+        try #require(frames.count == n && frames.allSatisfy { !$0.data.isEmpty })
+        #expect(frames.map(\.sync) == (0..<n).map { $0 == 0 })
+        let config = try #require(frames[0].config)
+        let header = try #require(AV1Config.sequenceHeaderOBU(inTemporalUnit: frames[0].data))
+        #expect(config == AV1Config.build444(sequenceHeaderOBU: header))
+        #expect(config[1] >> 5 == 1 && config[2] & 0x7F == 0, "av1C \(config.prefix(4)): not High profile 8-bit 4:4:4")
+        // (the wire's builder is untouched: it says 4:2:0 whatever the header is; stage 2's to decide)
+        #expect(AV1Config.build(sequenceHeaderOBU: header)?[2] == 0x0C)
+        let converter = try #require(YCbCr444Converter())
+        let decoder = try #require(av1g_decoder_create(2))
+        defer { av1g_decoder_destroy(decoder) }
+        for (i, f) in frames.enumerated() {
+            var p = av1g_dec_picture()
+            try #require(f.data.withUnsafeBufferPointer { av1g_decoder_decode(decoder, $0.baseAddress, $0.count, &p, nil, 0) } == AV1G_OK,
+                         "frame \(i) doesn't decode")
+            #expect(p.chroma_format == UInt8(AV1G_CHROMA_444) && p.matrix_coefficients == 1 && p.color_range == 1)
+            var (sy, su, sv) = ([UInt8](repeating: 0, count: width * height), [UInt8](repeating: 0, count: width * height),
+                                [UInt8](repeating: 0, count: width * height))
+            let ok = pictures[i].withUnsafeBytes { b in
+                sy.withUnsafeMutableBytes { y in
+                    su.withUnsafeMutableBytes { u in
+                        sv.withUnsafeMutableBytes { v in
+                            converter.convert(bgra: b, width: width, height: height, y: y.baseAddress!, u: u.baseAddress!, v: v.baseAddress!)
+                        }
+                    }
+                }
+            }
+            try #require(ok)
+            let src = [sy, su, sv]
+            let planes = [p.planes.0, p.planes.1, p.planes.2], strides = [p.stride.0, p.stride.1, p.stride.2]
+            for k in 0..<3 {
+                let base = try #require(planes[k])
+                var sse = 0
+                for r in 0..<height { for c in 0..<width { let d = Int(base[r * Int(strides[k]) + c]) - Int(src[k][r * width + c]); sse += d * d } }
+                let mse = Double(sse) / Double(width * height)
+                #expect(mse < 30, "frame \(i) plane \(k): MSE \(mse) against the conversion")
+            }
         }
     }
 

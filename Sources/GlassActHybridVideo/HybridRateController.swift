@@ -93,6 +93,9 @@ public struct HybridRateController: Sendable {
     /// 950 on text, 2,600 on images), and a frame's header (a frame that copies everything: 440).
     public static let defaultInter = Model(logBitsPerSuperblock: log(500), slope: defaultSlope, overheadBits: 440)
     public static let defaultKey = Model(logBitsPerSuperblock: log(1000), slope: defaultSlope, overheadBits: 440)
+    /// 4:4:4 streams' (`HybridRegionEncoder.chroma444`): PLACEHOLDER, fitted below.
+    public static let defaultInter444 = Model(logBitsPerSuperblock: log(500), slope: defaultSlope, overheadBits: 440)
+    public static let defaultKey444 = Model(logBitsPerSuperblock: log(1000), slope: defaultSlope, overheadBits: 440)
 
     /// What it aims at, bits a second.
     public var bitsPerSecond: Int

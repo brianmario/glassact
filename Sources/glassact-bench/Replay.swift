@@ -8,7 +8,7 @@ import GlassActCodec
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
                              "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "frames", "score-every",
                              "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
-                             "no-check-pictures", "fault-reset-untold", "decoder"]
+                             "no-check-pictures", "fault-reset-untold", "decoder", "chroma", "score-rgb-every"]
 
 let replayCommand = Command(
     name: "replay",
@@ -38,6 +38,8 @@ let replayCommand = Command(
         .bool("check-pictures", "loop, --video hybrid: check every frame the Viewer shows against the encoder's reconstruction (on with any --fault-*)"),
         .choice("decoder", ["vt", "aom", "own"], "loop, --video hybrid: the Viewer's AV1 decoder — vt (VideoToolbox, hardware), aom (libaom) or own (Glass Act's own, GlassActAV1Decode); default vt where this Mac decodes AV1 in hardware, else aom. With own, the picture check compares its own planes"),
         .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
+        .string("chroma", "<420|444>", "loop, --video hybrid: the stream's chroma, 420 (default) or 444 (the High profile, BT.709 full range; --decoder own, the default then: VideoToolbox decodes no 4:4:4)"),
+        .int("score-rgb-every", "<n>", 1...10_000, "loop, real codecs: also score every nth submitted frame as shown, in colour: RGB PSNR, and SSIMULACRA2 (the ssimulacra2 binary on PATH, after the run; its PNGs in $TMPDIR)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
         .bool("no-fresh-queue", "loop: before 'Link estimate from the viewer': the video gate cuts on the smoothed RTT's queue alone"),

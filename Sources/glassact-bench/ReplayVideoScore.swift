@@ -14,10 +14,18 @@ final class ReplayVideoScore {
     var now: () -> UInt64 = { 0 }
     /// Score every nth submitted frame (0: none).
     var scoreEvery = 4
+    /// `--score-rgb-every`: score every nth submitted frame in colour too (0: none): RGB PSNR, and
+    /// with `ssimu2` SSIMULACRA2 (after the run).
+    var rgbEvery = 0
+    var ssimu2: SSIMULACRA2Scorer?
+    private(set) var rgbPSNRs: [Double] = []
+    private var ssimu2Pairs = 0
     private struct Submitted {
         var virtualUS: UInt64
         var luma: [UInt8]?
         var w = 0, h = 0
+        /// `rgbEvery`'s: the submitted picture (tight BGRA)
+        var bgra: [UInt8]?
     }
     /// Frames delivered by the encoder and not yet decoded, by their bytes' hash.
     private var byHash: [UInt64: Submitted] = [:]
@@ -41,6 +49,9 @@ final class ReplayVideoScore {
         var s = Submitted(virtualUS: now())
         if scoreEvery > 0 && submits % scoreEvery == 0 {
             (s.luma, s.w, s.h) = (Self.halfLuma(bgra, width: width, height: height, bytesPerRow: width * 4), width / 2, height / 2)
+        }
+        if rgbEvery > 0 && submits % rgbEvery == 0 {
+            (s.bgra, s.w, s.h) = (Array(bgra.prefix(width * height * 4)), width / 2, height / 2)
         }
         submits += 1
         pendingSubmits.append(s)
@@ -88,11 +99,63 @@ final class ReplayVideoScore {
         let h = Self.hash(data)
         guard let s = byHash.removeValue(forKey: h) else { return }
         g2g.append(Double(now() &- s.virtualUS) / 1000)
+        if var ref = s.bgra, let pixels { rgbScore(&ref, pixels, width: 2 * s.w, height: 2 * s.h, bytesPerRow: bytesPerRow) }
         guard let luma = s.luma, let pixels else { return }
         let got = Self.halfLuma(pixels, width: s.w * 2, height: s.h * 2, bytesPerRow: bytesPerRow)
         let (p, q) = Self.psnrSSIM(luma, got, width: s.w, height: s.h)
         psnrs.append(p)
         ssims.append(q)
+    }
+
+    /// A shown picture (`pixels`, BGRA at `bytesPerRow`) against the submitted one (`ref`, tight):
+    /// PSNR over R, G and B, and the pair for SSIMULACRA2.
+    private func rgbScore(_ ref: inout [UInt8], _ pixels: UnsafeRawBufferPointer, width: Int, height: Int, bytesPerRow: Int) {
+        var shown = [UInt8](repeating: 0, count: width * height * 4)
+        var sse = 0
+        let src = pixels.bindMemory(to: UInt8.self)
+        ref.withUnsafeBufferPointer { r in
+            shown.withUnsafeMutableBufferPointer { d in
+                for y in 0..<height {
+                    var row = 0
+                    for x in 0..<width {
+                        let (o, t) = (y * bytesPerRow + 4 * x, (y * width + x) * 4)
+                        for c in 0..<3 {
+                            let diff = Int(src[o + c]) - Int(r[t + c])
+                            row += diff * diff
+                            d[t + c] = src[o + c]
+                        }
+                        d[t + 3] = 255
+                    }
+                    sse += row
+                }
+            }
+        }
+        let mse = Double(sse) / Double(3 * width * height)
+        rgbPSNRs.append(mse == 0 ? 100 : 10 * log10(255 * 255 / mse))
+        if let ssimu2 {
+            ref.withUnsafeMutableBytes { r in
+                shown.withUnsafeMutableBytes { d in
+                    if (try? ssimu2.add(reference: r, distorted: d, width: width, height: height)) != nil { ssimu2Pairs += 1 }
+                }
+            }
+        }
+    }
+
+    /// The colour scores (`rgbEvery`): RGB PSNR, and SSIMULACRA2 of the same frames (scored now).
+    func rgbSummary() -> String {
+        let fin = rgbPSNRs.filter(\.isFinite)
+        var line = String(format: "  colour score: %d frames shown scored (every %dth submitted) · RGB PSNR mean %.2f dB p10 %.2f",
+                          rgbPSNRs.count, rgbEvery, fin.isEmpty ? .nan : fin.reduce(0, +) / Double(fin.count), Self.percentile(fin, 0.1))
+        if let ssimu2 {
+            do {
+                let s = try ssimu2.scoreAll().filter(\.isFinite)
+                line += String(format: " · SSIMULACRA2 mean %.2f p10 %.2f min %.2f (n %d)", s.isEmpty ? .nan : s.reduce(0, +) / Double(s.count),
+                               Self.percentile(s, 0.1), s.min() ?? .nan, s.count)
+            } catch {
+                line += " · SSIMULACRA2 failed: \(error)"
+            }
+        }
+        return line
     }
 
     static func hash(_ data: [UInt8]) -> UInt64 {

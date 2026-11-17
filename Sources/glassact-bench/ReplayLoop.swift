@@ -67,6 +67,16 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     let score = ReplayVideoScore()
     score.now = { link.nowUS }
     score.scoreEvery = opts.int("score-every", 4)
+    if opts.has("score-rgb-every") {
+        score.rgbEvery = opts.int("score-rgb-every", 30)
+        score.ssimu2 = try SSIMULACRA2Scorer.make(setting: nil)
+    }
+    // --chroma 444: the hybrid's 4:4:4 streams (our decoder shows them)
+    let chroma = opts.string("chroma") ?? "420"
+    guard chroma == "420" || chroma == "444" else { throw BenchError("--chroma \(chroma): 420 or 444") }
+    let c444 = chroma == "444"
+    if c444 && videoMode != "hybrid" { throw BenchError("--chroma 444: with --video hybrid") }
+    if c444 && (opts.string("decoder") ?? "own") != "own" { throw BenchError("--chroma 444: --decoder own (VideoToolbox decodes no 4:4:4)") }
     vtPipeline.score = score
     // the Viewer's decoder, scored (real codecs)
     func scored(_ d: any VideoRegionDecoder) -> any VideoRegionDecoder { ScoringDecoder(d, score) }
@@ -117,7 +127,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         let keyLinkMS = opts.int("hybrid-key-link-ms", 0)
         encoderFactory = {
             guard $0 == VideoCodec.av1 else { return nil }
-            let h = HybridRegionEncoder(callbackQueue: .main, colour: colour)
+            let h = HybridRegionEncoder(callbackQueue: .main, colour: colour, chroma444: c444)
             h.fixedQindex = fixed.map { $0 == 63 ? 255 : 4 * $0 }
             h.targetPercent = targetPct
             h.quantizerCeiling = qmax
@@ -138,7 +148,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             }
             return BenchPipelinedEncoder(h, vtPipeline)
         }
-        switch viewerDecoder ?? (VTRegionDecoder.canDecodeAV1 ? "vt" : "aom") {
+        switch viewerDecoder ?? (c444 ? "own" : VTRegionDecoder.canDecodeAV1 ? "vt" : "aom") {
         case "vt":
             guard VTRegionDecoder.canDecodeAV1 else { throw BenchError("--decoder vt: this Mac has no hardware AV1 decode") }
             decoderFactory = { scored(VTRegionDecoder()) }
@@ -181,7 +191,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     }
     if videoFaults.active, let real = decoderFactory {
         // (real() made the own decoder last, when it's ours)
-        decoderFactory = { FaultingDecoder(real(), videoFaults, checking: viewerDecoder == "own" ? ownDecoders.last : nil) }
+        let own = viewerDecoder == "own" || c444
+        decoderFactory = { FaultingDecoder(real(), videoFaults, checking: own ? ownDecoders.last : nil) }
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -523,6 +534,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     """)
     if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
+        if score.rgbEvery > 0 { print(score.rgbSummary()) }
         print(score.decodeTimeSummary)
         if !ownDecoders.isEmpty {
             let st = ownDecoders.map(\.stats)

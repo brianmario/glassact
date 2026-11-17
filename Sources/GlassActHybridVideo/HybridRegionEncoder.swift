@@ -17,7 +17,8 @@ import QuartzCore
 ///   ceiling quantizer 60 (qindex 240). `HybridRateController` turns that into each picture's
 ///   qindex, budgeting by the pictures' capture times.
 /// - **Pipeline**: BGRA → I420 on the caller's queue (`I420Converter`, full range BT.709: what the
-///   Viewer's decoder makes of the encoder's sequence header), then
+///   Viewer's decoder makes of the encoder's sequence header), or with `chroma444` → planar 4:4:4
+///   (`YCbCr444Converter`, full range BT.709, as the High-profile stream's header signals), then
 ///   the picture is pushed into the encoder's stream (`AV1HybridEncoder.submit`), which returns at
 ///   once: its copies, analysis, closed loop, filters and write run on the encoder's own queues and
 ///   threads, and the frame comes back on `callbackQueue` as soon as its bitstream exists. A
@@ -93,6 +94,12 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// 50.8 dB luma PSNR against the capture this way, 38.6 converted BT.601 full, 31.4 as libaom
     /// converts (BT.709 video range); photos 55.8 against 44.6 (replay, `--hybrid-colour`).
     private let converter: I420Converter?
+    /// A 4:4:4 stream (AV1's High profile, the hybrid's 4:4:4 inter frames): pictures converted
+    /// with the full chroma (`YCbCr444Converter`), an av1C saying so (`AV1Config.build444`), and
+    /// the rate controller's 4:4:4 models. Our decoder (`OwnAV1RegionDecoder`) shows it;
+    /// VideoToolbox can't. No Viewer is offered it yet: the bench's (`replay --chroma 444`).
+    public let chroma444: Bool
+    private let converter444: YCbCr444Converter?
     // the caller's queue
     private var width = 0
     private var height = 0
@@ -117,14 +124,17 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
 
     /// `callbackQueue` must be the host engine's confining queue (the VideoRegionEncoder threading
     /// contract).
-    public init(callbackQueue: DispatchQueue, colour: I420Converter.Colour = .bt709Full) {
+    public init(callbackQueue: DispatchQueue, colour: I420Converter.Colour = .bt709Full, chroma444: Bool = false) {
         self.callbackQueue = callbackQueue
-        converter = I420Converter(colour)
+        self.chroma444 = chroma444
+        converter = chroma444 ? nil : I420Converter(colour)
+        converter444 = chroma444 ? YCbCr444Converter() : nil
+        if chroma444 { rate = HybridRateController(bitsPerSecond: 8_000_000, inter: HybridRateController.defaultInter444, key: HybridRateController.defaultKey444) }
     }
 
     public func start(width: Int, height: Int,
                       onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
-        guard Self.isAvailable, converter != nil, width > 0, height > 0, width & 1 == 0, height & 1 == 0,
+        guard Self.isAvailable, converter != nil || converter444 != nil, width > 0, height > 0, width & 1 == 0, height & 1 == 0,
               let shared = Shared.instance else { return false }
         self.width = width
         self.height = height
@@ -144,9 +154,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     public func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
-        guard let shared, let converter, onFrame != nil else { return }
+        guard let shared, converter != nil || converter444 != nil, onFrame != nil else { return }
         let (w, h) = (width, height)
-        let cw = w / 2, ch = h / 2
+        let (cw, ch) = chroma444 ? (w, h) : (w / 2, h / 2)
         // (every sample is the conversion's)
         var y = [UInt8](unsafeUninitializedCapacity: w * h) { _, n in n = w * h }
         var u = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
@@ -154,7 +164,11 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         let ok = y.withUnsafeMutableBytes { yp in
             u.withUnsafeMutableBytes { up in
                 v.withUnsafeMutableBytes { vp in
-                    converter.convert(bgra: bgra, width: w, height: h, y: yp.baseAddress!, u: up.baseAddress!, v: vp.baseAddress!)
+                    if let converter444 {
+                        converter444.convert(bgra: bgra, width: w, height: h, y: yp.baseAddress!, u: up.baseAddress!, v: vp.baseAddress!)
+                    } else {
+                        converter!.convert(bgra: bgra, width: w, height: h, y: yp.baseAddress!, u: up.baseAddress!, v: vp.baseAddress!)
+                    }
                 }
             }
         }
@@ -167,7 +181,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             rateLock.withLock { rate.restart() }
             startStream()  // (a key frame: the stream's first)
         }
-        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: w, height: h)
+        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: w, height: h, chroma444: chroma444)
         let token = token, fixed = fixedQindex
         let chooser = fixed != nil ? nil : rateChooser(timeUS: timeUS)
         rateLock.withLock { submitted.append(CACurrentMediaTime()) }
@@ -293,7 +307,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 let t0 = submitted.isEmpty ? now : submitted.removeFirst()
                 // the av1C record with the region's first frame (a key frame: its sequence header)
                 guard !configSent, key else { return (nil, now - t0) }
-                let config = AV1Config.sequenceHeaderOBU(inTemporalUnit: frame.obu).flatMap { AV1Config.build(sequenceHeaderOBU: $0) }
+                let header = AV1Config.sequenceHeaderOBU(inTemporalUnit: frame.obu)
+                let config = header.flatMap { chroma444 ? AV1Config.build444(sequenceHeaderOBU: $0) : AV1Config.build(sequenceHeaderOBU: $0) }
                 configSent = config != nil
                 return (config, now - t0)
             }
