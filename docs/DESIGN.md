@@ -413,6 +413,24 @@ A viewer the host hasn't approved can sign in with the host Mac's account
   treated as hints.
 - **`bytesPerRow` is padded, so every tile address is stride-aware.**
 
+**When the Host captures.** The listener runs from launch (once the identity
+and Screen Recording are there) until the Host quits; there is no sharing
+switch, and quitting the Host is how the person at the Mac stops sharing.
+Capture runs only while something needs frames:
+- A viewer's transport is adopted: capture starts on the chosen display
+  (Choose Display…) or the main one, and the session's engine is made at the
+  size of the first frame, its HELLO then. With no frame within 10 s (under
+  the viewer's 15 s handshake deadline, §4.10) the session resets.
+- The session ends: capture stops a second after a viewer that left on
+  purpose, or after the lock grace (`lockGraceSeconds`, 30 s) after a dropped
+  one, whose reconnect meanwhile resumes without restarting capture. Stopping
+  puts back what the session changed (the display's mode, a shared window's
+  frame).
+- A trace being recorded (Developer › Record Trace) keeps capture running with
+  or without a viewer.
+- Disconnect Viewer in the Host's menu ends the session from the Mac, with no
+  lock afterwards: someone is there.
+
 **Lifecycle and recovery** (`GlassActShare.ScreenCapture`, over a
 `CaptureBackend`: ScreenCaptureKit in the Host, a scripted fake in
 `ShareTests`):
@@ -437,9 +455,10 @@ A viewer the host hasn't approved can sign in with the host Mac's account
   all, after 6 attempts capture waits for one: the screens waking, a display
   change or a viewer connecting retries at once, and a 60 s poll is the
   safety net.
-- Recovery ends on the menu-bar screen-recording control (the Host stops
-  sharing), a revoked Screen Recording grant, or the shared window closing
-  (§4.10: the session ends rather than show the whole display).
+- Recovery ends on the menu-bar screen-recording control (the Host ends the
+  session and stops capturing; it keeps listening), a revoked Screen
+  Recording grant, or the shared window closing (§4.10: the session ends
+  rather than show the whole display).
 
 ### 4.2 Tile bookkeeping (`TileLedger`)
 

@@ -280,6 +280,7 @@ the numbers and the reasoning.
 | Palette blocks with a residual, chosen by real cost before the closed loop (`metal-av1`, branch `palette-residual`, `av1seq --palette`) | measured, not adopted for 4:2:0; the owner's choice (ported to `av1-444-text`, where 4:4:4 pictures use it, off for 4:2:0) | −0.1 to −0.9 % BD-rate (2900 and 5K) for 4–7 ms more CPU a 2900 picture (inter frames a second 64–81 → 45–60 on new content); libaom's lead at q26–40 on new pictures is untouched (q40: 109.1 KB, 33.95 dB against its 124.4 KB, 35.55 dB) and so isn't its palette | [entry](#metal-av1-palette-with-a-residual-by-real-cost-measured-not-adopted-2026-11-11) |
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
+| After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
 
 **Rate control and transport**
 
@@ -343,6 +344,25 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video: frames that predict from lost ones after a stream reset (2026-11-16)
+
+Found on `metal-av1` while checking every way a Viewer loses video state with the AV1 hybrid
+encoder (its BENCHMARKS there has the whole recovery matrix). Both gaps are in the shared engine,
+so HEVC and libaom regions take the same path. Correctness only; no byte or time cost.
+
+- **A video stream reset.** Frames the Host sent before it heard of the loss went out on the
+  replacement stream under the same generation, after the frames lost with the old one, and
+  could predict from them (HEVC's DPB, AV1's reference slots); a decoder can't tell. In the
+  `metal-av1` replay with four stream resets on a whole trace, where every frame the Viewer shows
+  is checked against the encoder's reconstruction (an AV1 decoder mirrors the Viewer's, so the
+  check runs for AV1 streams), 3 of 549 frames shown were not the encoder's pictures. Now the
+  Viewer's live regions take only a sync frame after a reset (`VideoRegionTable.awaitSyncAll`):
+  0 of 549. Test: `videoStreamResetWaitsForASyncFrame`.
+- **A frame before START without its config** (the region's first frame, which carries it,
+  failed) was dropped silently with its claims, and so was every frame after it: the region
+  streamed nothing while motion lasted. It now counts as a failed delivery, so 30 of them dissolve
+  the region (DESIGN §4.6). Test: `framesThatCantStartTheRegionDissolveIt`.
 
 ### The hybrid's 4:4:4 tiles against libaom's: palettes, and 8×8 shapes and up (2026-11-16)
 
@@ -2743,7 +2763,6 @@ video in a window.
 
 Still wanted: switching Spaces and back, video in a window, and captures at other display sizes
 (a MacBook's, a 4K display).
-
 ### The trace recorder: raw to disk, compressed afterwards (2026-11-03)
 
 A full-screen movie recorded by the Host (`glassact-1793733277.scap`, VLC, window then full screen,

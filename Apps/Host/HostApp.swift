@@ -87,9 +87,6 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         controller.onPermissionProblem = { [weak self] in
             MainActor.assumeIsolated { self?.showSetup(recheck: true) }
         }
-        header.onToggle = { [weak self] on in
-            MainActor.assumeIsolated { on ? self?.startSharing() : self?.stopSharing() }
-        }
         controller.agentAccess.onChange = { [weak self] in
             MainActor.assumeIsolated {
                 self?.controller.agentPolicyChanged()
@@ -116,7 +113,8 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         do {
             try controller.loadIdentity()
-            controller.startDefaultDisplay() // auto-share the main display
+            // Listening from launch; the screen is captured only while a viewer is connected.
+            controller.startListening()
         } catch {
             identityError = error.localizedDescription
             statusLine = "identity error: \(error)"
@@ -278,7 +276,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         case (_, .stopped):
             (symbol, description) = ("rectangle.on.rectangle.slash", "Glass Act Host — sharing is off")
         case (_, .starting), (_, .listening):
-            (symbol, description) = ("rectangle.on.rectangle", "Glass Act Host — ready to share")
+            (symbol, description) = ("rectangle.on.rectangle", "Glass Act Host — ready; not capturing until a viewer connects")
         }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
         image?.isTemplate = true
@@ -305,14 +303,15 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             switch controller.phase {
             case .starting:
                 (tint, symbol, title, subtitle) = (.systemGray, "ellipsis", "Starting…",
-                                                   "Getting this screen ready to share")
+                                                   "Getting ready for viewers")
             case .needsScreenRecording:
                 (tint, symbol, title, subtitle) = (.systemOrange, "exclamationmark", "Screen Recording Is Off",
                                                    "Allow Glass Act Host in Privacy & Security")
             case .listening:
                 let reach = HostPresence.visibleNearby ? "Viewers nearby can connect to “\(HostPresence.computerName)”"
                                                        : "Viewers can connect to \(HostPresence.localAddress)"
-                (tint, symbol, title, subtitle) = (.controlAccentColor, "rectangle.on.rectangle", "Ready to Share", reach)
+                (tint, symbol, title, subtitle) = (.controlAccentColor, "rectangle.on.rectangle", "Ready to Share",
+                                                   reach + " · nothing is recorded until one does")
             case .viewerConnected where controller.agentAccess.snapshot.agentActive:
                 let agent = controller.agentAccess.snapshot
                 let name = agent.label.isEmpty || agent.label == "agent" ? "An agent" : "“\(agent.label)”"
@@ -333,13 +332,11 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
                 (tint, symbol, title, subtitle) = (.systemGreen, "rectangle.fill.on.rectangle.fill",
                                                    "Sharing This Screen", "A viewer connected \(since)")
             case .stopped:
-                (tint, symbol, title, subtitle) = (.systemGray, "pause.fill", "Sharing Is Off",
-                                                   "Turn it on to let viewers connect")
+                (tint, symbol, title, subtitle) = (.systemGray, "pause.fill", "Not Listening",
+                                                   "Quit and reopen Glass Act Host to let viewers connect")
             }
         }
-        header.update(symbol: symbol, tint: tint, title: title, subtitle: subtitle,
-                      sharing: controller.isRunning || controller.phase == .needsScreenRecording,
-                      switchEnabled: identityError == nil)
+        header.update(symbol: symbol, tint: tint, title: title, subtitle: subtitle)
         chooseDisplayItem?.isHidden = controller.isRunning
     }
 
@@ -395,10 +392,15 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
                                   subtitle: Self.abbreviated(controller.fingerprint)))
             }
             menu.addItem(.separator())
-            // Sharing itself is the header's switch. While it's off, pick what
-            // to share first (shown or hidden in place as the switch flips).
+            // No on/off switch: the Host listens while it runs (quitting it stops sharing),
+            // and captures only while a viewer is connected.
+            if controller.hasViewer {
+                menu.addItem(item("Disconnect Viewer", symbol: "xmark.circle", action: #selector(disconnectViewer),
+                                  subtitle: "Ends the session; the viewer can connect again"))
+            }
+            // What the next session shares (not while capture runs).
             let choose = item("Choose Display…", symbol: "display", action: #selector(chooseDisplay),
-                              subtitle: "Pick a display, then share it")
+                              subtitle: "The display a viewer sees when it connects")
             choose.isHidden = controller.isRunning
             chooseDisplayItem = choose
             menu.addItem(choose)
@@ -618,24 +620,12 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     // MARK: - Actions
 
-    @objc private func startSharing() {
-        // Screen Recording off: sharing can't start — say how to fix it.
-        permissions.refresh()
-        guard permissions.screenRecording || CGPreflightScreenCaptureAccess() else {
-            phaseChanged()
-            showSetup(recheck: false)
-            return
-        }
-        controller.startDefaultDisplay()
-        phaseChanged()
-    }
-
     @objc private func chooseDisplay() {
         controller.presentPicker()
     }
 
-    @objc private func stopSharing() {
-        controller.stop()
+    @objc private func disconnectViewer() {
+        controller.disconnectViewer()
         phaseChanged()
     }
 
@@ -726,9 +716,6 @@ final class StatusHeaderView: NSView {
     private let glyph = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let subtitleLabel = NSTextField(labelWithString: "")
-    private let toggle = NSSwitch()
-    /// The person flipped the switch (on = share).
-    var onToggle: ((Bool) -> Void)?
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 62))
@@ -741,19 +728,14 @@ final class StatusHeaderView: NSView {
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byWordWrapping
         subtitleLabel.maximumNumberOfLines = 2
-        subtitleLabel.preferredMaxLayoutWidth = 182
-        toggle.controlSize = .small
-        toggle.target = self
-        toggle.action = #selector(flipped)
-        toggle.setAccessibilityLabel("Share This Screen")
-        for v in [badge, glyph, titleLabel, subtitleLabel, toggle] as [NSView] {
+        subtitleLabel.preferredMaxLayoutWidth = 230
+        for v in [badge, glyph, titleLabel, subtitleLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
         }
         addSubview(badge)
         badge.addSubview(glyph)
         addSubview(titleLabel)
         addSubview(subtitleLabel)
-        addSubview(toggle)
         NSLayoutConstraint.activate([
             badge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             badge.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -762,33 +744,25 @@ final class StatusHeaderView: NSView {
             glyph.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
             glyph.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
             titleLabel.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 10),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: toggle.leadingAnchor, constant: -10),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            subtitleLabel.widthAnchor.constraint(equalToConstant: 182),
+            subtitleLabel.widthAnchor.constraint(equalToConstant: 230),
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1),
-            toggle.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            toggle.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
-    func update(symbol: String, tint: NSColor, title: String, subtitle: String,
-                sharing: Bool, switchEnabled: Bool) {
+    func update(symbol: String, tint: NSColor, title: String, subtitle: String) {
         badge.layer?.backgroundColor = tint.cgColor
         glyph.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         titleLabel.stringValue = title
         subtitleLabel.stringValue = subtitle
         subtitleLabel.toolTip = subtitle
-        toggle.state = sharing ? .on : .off
-        toggle.isEnabled = switchEnabled
-        toggle.setAccessibilityValueDescription(sharing ? "on" : "off")
-        toggle.toolTip = sharing ? "Stop sharing — anyone connected is disconnected" : "Share this screen with viewers"
-    }
-
-    @objc private func flipped() {
-        onToggle?(toggle.state == .on)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel("\(title). \(subtitle)")
     }
 
     override func viewDidChangeEffectiveAppearance() {
