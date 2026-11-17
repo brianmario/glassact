@@ -1146,9 +1146,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         /// The cache it keeps results in, and its SBs' kept flags (the cache's `keep` then).
         let cacheRef: AnalysisCache?
         let keptFlags: (any MTLBuffer)?
-        /// A recycled cache's buffers, cleared on the GPU ahead of this picture's analysis
-        /// (`AnalysisCache.takeClears`).
-        var clears: [(buffer: any MTLBuffer, length: Int)] = []
 
         /// With `closedLoop` false the closed loop's buffers (reconstruction,
         /// maps, contexts, outputs, scratch) are left out: a partition needs none.
@@ -1385,7 +1382,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             keptSuperblocks = cache?.keptCount ?? 0
             cacheRef = cache
             keptFlags = sbKeep
-            clears = cache?.takeClears() ?? []
             encoder.referenceSource = src
             encoder.lastKeptSuperblocks = keptSuperblocks
             let out = closedLoop ? nSb : 0
@@ -1502,11 +1498,12 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 // a recycled cache's buffers, zero as new ones are, before this analysis writes
                 // them and after the analyses and reads before it (the waits above, and the
                 // queue's order: the buffers are tracked)
-                if !clears.isEmpty {
+                // (taken here, not as the run is set up, so that a run that fails before its GPU
+                // work leaves them to the next)
+                if let clears = cacheRef?.takeClears(), !clears.isEmpty {
                     guard let blit = c.makeBlitCommandEncoder() else { throw Failure.metal("no blit encoder") }
                     for (b, length) in clears where length > 0 { blit.fill(buffer: b, range: 0..<length, value: 0) }
                     blit.endEncoding()
-                    clears = []
                 }
                 guard let e = c.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw Failure.metal("no command encoder") }
                 c.label = "AV1 analysis"  // for Instruments
@@ -1530,7 +1527,6 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             }
             // every SB keeps the previous picture's analysis, and its results are in the cache
             if !closedLoop, !profiling, staleSuperblocks == 0 {
-                assert(clears.isEmpty, "a recycled cache's first picture analyzes every SB")
                 if wait { encoder.lastGPUSeconds = 0 }
                 return nil
             }
