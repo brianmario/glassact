@@ -229,6 +229,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             guard shared.owner == token else { return }
             shared.encoder.endStream()
             shared.streaming = false
+            shared.trimWhenIdle()
         }
     }
 
@@ -292,6 +293,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             configure?(e)
             e.startStream { [weak self] _, result in self?.written(result, token: token, epoch: epoch) }
             shared.streaming = true
+            shared.streams += 1
         }
     }
 
@@ -348,8 +350,13 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 return nil
             }
             preparation.end(ready: true)
-            return Shared(encoder: e)
+            return Shared(encoder: e, device: device)
         }()
+
+        /// How long the encoder stays as its last stream left it, with nothing streaming, before
+        /// `trimWhenIdle` swaps it for a fresh one. A video region ends whenever its motion does,
+        /// so this outlasts the gaps inside a session; tests shorten it.
+        nonisolated(unsafe) static var idleTrimAfter: TimeInterval = 60
 
         static let preparation = Preparation()
 
@@ -386,16 +393,49 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             var isReady: Bool { lock.withLock { outcome == true } }
         }
 
-        let encoder: AV1HybridEncoder
+        /// The control queue's. Replaced by a fresh one once the Host has been idle a while
+        /// (`trimWhenIdle`): a stream leaves its pictures' buffers in it (the analysis cache, the
+        /// source pools, the filters' planes: about a gigabyte at 5K), which a Host between
+        /// sessions shouldn't keep.
+        private(set) var encoder: AV1HybridEncoder
+        let device: any MTLDevice
         let control = DispatchQueue(label: "glassact.hybrid.control", qos: .userInteractive)
         /// The control queue's: whether a stream is under way, and whose.
         var streaming = false
+        /// The control queue's: streams started, so a trim that outlived a new one is dropped.
+        var streams = 0
+        /// The control queue's: encoders swapped for fresh ones (tests).
+        private(set) var trims = 0
+        private var trimming = false
         private(set) var owner = 0
         private var tokens = 0
         private let lock = NSLock()
 
-        init(encoder: AV1HybridEncoder) {
+        init(encoder: AV1HybridEncoder, device: any MTLDevice) {
             self.encoder = encoder
+            self.device = device
+        }
+
+        /// On the control queue, as a stream ends: if no stream starts within `idleTrimAfter`, a
+        /// fresh encoder (no pictures' buffers; its kernels come from Metal's cache by now) is
+        /// made on another queue and takes the old one's place, unless a stream started
+        /// meanwhile. The old one is released on the control queue, where nothing else holds it.
+        func trimWhenIdle() {
+            let started = streams
+            control.asyncAfter(deadline: .now() + Self.idleTrimAfter) { [self] in
+                guard !streaming, streams == started, !trimming else { return }
+                trimming = true
+                let device = device
+                DispatchQueue.global(qos: .utility).async { [self] in
+                    let fresh = try? AV1HybridEncoder(device: device)
+                    control.async { [self] in
+                        trimming = false
+                        guard let fresh, !streaming, streams == started else { return }
+                        encoder = fresh
+                        trims += 1
+                    }
+                }
+            }
         }
 
         /// A new region's token; it owns the encoder from its first call on the control queue.

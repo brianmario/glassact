@@ -327,6 +327,7 @@ the numbers and the reasoning.
 
 | idea | verdict | key number | entry |
 |---|---|---|---|
+| The Host's hybrid encoder swapped for a fresh one after 60 s with no AV1 stream (`HybridRegionEncoder.Shared.trimWhenIdle`) | kept | a stream leaves its pictures' buffers in the process's one encoder: `av1seq --push` peaks at 1.55 GB footprint at 5K, 0.75 GB at 2900 (the bench's frames included), which an idle Host would otherwise keep until it quits; the fresh encoder's kernels come from Metal's cache; `anIdleEncoderIsReplacedAndReleased` checks the old one is freed | — |
 | `-Ounchecked` on GlassActCodec | removed | within run-to-run noise (≤ 1 % p50) | [entry](#-ounchecked-on-glassactcodec--measured-dropped-2026-09-26) |
 | In-place scroll, ACK walk, xxh64 fast path | kept | viewer scroll CPU 3224 → 1922 ms | [entry](#review-pass-section-5-performance-2026-09-26) |
 | Present blit off the main thread | kept | Viewer main blocked 89–92 % → 0 % | [blit](#present-blit-off-the-main-thread-2026-09-27), [A/B](#live-ab-viewer-main-thread-same-machine-loopback-2026-09-27) |
