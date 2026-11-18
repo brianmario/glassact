@@ -659,14 +659,26 @@ first negotiated codec whose encoder starts; START carries its id.
   - A Viewer that prefers smooth motion gets AV1 with or without room.
     Under smooth motion's trade (below) AV1 delivers more frames on a thin
     link than HEVC does under its own.
-- A change applies when the next region forms; a live region keeps its
-  codec. Switching mid-motion would cost a whole-screen sync frame on the
-  new encoder, which on a link near the threshold costs more than either
-  codec alone.
+- A change applies when the next region forms, with one exception: a live
+  region moves *up* to a codec the link comes to allow ahead of its own
+  (`upgradeRegionCodec`, judged once a second): AV1 once the link has room,
+  or once AV1's encoder is ready (the Host offers it only after its kernels
+  compile). A screen that never stops moving never dissolves, so without
+  this the first region's HEVC would last as long as the motion. Live
+  (26.11.2, 2026-11-18) a lock screen's video ran HEVC at 19 Mbit/s for
+  as long as it was shown. The move is in place: a new generation's
+  VIDEO_START (every Viewer rebuilds the region's decoder on one) and a
+  sync frame, with no STOP and no repaint. A live region never moves down:
+  a whole-screen sync frame mid-motion on a link near the threshold costs
+  more than either codec alone, so a region on AV1 keeps it until it
+  dissolves.
 
 **Lifecycle:**
-- Each region is a *generation*. The viewer drops stragglers from older
-  generations.
+- Each region's stream is a *generation*: a region gets a new one when it
+  forms and when it moves to another codec (above). The viewer drops
+  stragglers from older generations. A region that dissolves right after
+  a move, before the new stream's VIDEO_START went, stops the generation
+  the Viewer still shows (`regionShownGeneration`).
 - **A stalled encoder ends its codec for the session.** VideoToolbox's calls
   are XPC to the system's encoder service, so `VTHEVCRegionEncoder` makes all
   of them on its own queue: one that never answers can't hold the engine's

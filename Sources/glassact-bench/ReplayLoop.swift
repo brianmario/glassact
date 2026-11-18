@@ -193,8 +193,29 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         decoderFactory = { scored(VTRegionDecoder()) }
         hostCodecs = [VideoCodec.av1, VideoCodec.hevc]
         viewerCodecs = [VideoCodec.av1, VideoCodec.hevc]
+    case "hybrid-hevc":
+        // The shipping pair: the Host prefers Glass Act's AV1 (the hybrid) and falls back to
+        // HEVC on a thin link (LinkRoomPolicy); the Viewer decodes both in hardware. The hybrid's
+        // kernels compile before the replay (the Host offers it only once they have).
+        guard #available(macOS 27, *), HybridRegionEncoder.isAvailable, VTRegionDecoder.canDecodeAV1 else {
+            throw BenchError("--video hybrid-hevc needs macOS 27, an Apple-silicon GPU and hardware AV1 decode")
+        }
+        let prepared = DispatchSemaphore(value: 0)
+        HybridRegionEncoder.prepare { _ in prepared.signal() }
+        prepared.wait()
+        guard HybridRegionEncoder.isReady else { throw BenchError("--video hybrid-hevc: the hybrid's kernels didn't compile") }
+        encoderFactory = {
+            switch $0 {
+            case VideoCodec.av1: BenchPipelinedEncoder(HybridRegionEncoder(callbackQueue: .main), vtPipeline)
+            case VideoCodec.hevc: BenchPipelinedEncoder(VTHEVCRegionEncoder(callbackQueue: .main), vtPipeline)
+            default: nil
+            }
+        }
+        decoderFactory = { scored(VTRegionDecoder()) }
+        hostCodecs = [VideoCodec.av1, VideoCodec.hevc]
+        viewerCodecs = [VideoCodec.av1, VideoCodec.hevc]
     default:
-        throw BenchError("--video expects mock, vt, av1, hybrid or av1-hevc")
+        throw BenchError("--video expects mock, vt, av1, hybrid, av1-hevc or hybrid-hevc")
     }
     if videoFaults.active, let real = decoderFactory {
         // (real() made the own decoder last, when it's ours)
@@ -205,6 +226,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                           videoEncoderFactory: encoderFactory,
                           videoCodecPreference: hostCodecs)
     if opts.has("no-handoff") { host.overlayHandoff = false }
+    if opts.has("no-codec-upgrade") { host.upgradesLiveRegions = false }
     // The resolution rung (§4.9): the app would halve the capture here; the
     // loop only reports when it would have.
     nonisolated(unsafe) var autoScaleUS: UInt64?
@@ -244,7 +266,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // onto the main queue (this rig's engine queue). Every submitted frame is
     // delivered before virtual time moves on (BenchVTPipeline).
     func drainVTOutput() {
-        if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" { vtPipeline.drain() }
+        if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" || videoMode == "hybrid-hevc" { vtPipeline.drain() }
     }
 
     // Video coverage: how much of the replay's screen-time the viewer
@@ -497,7 +519,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     sync requests \(viewer.stats.videoSyncRequests) (answered \(host.stats.videoSyncRequestSyncs))  \
     gate skips: backlog \(host.stats.videoBacklogSkips) encoder-full \(host.stats.videoEncoderFullSkips)  \
     link: \(host.linkReports) reports, capacity \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6)) Mbit/s  \
-    regions without AV1 (thin link) \(host.stats.videoRegionsWithoutAV1)  \
+    regions without AV1 (thin link) \(host.stats.videoRegionsWithoutAV1)  codec upgrades \(host.stats.videoCodecUpgrades)  \
     auto-scale \(autoScaleUS.map { String(format: "at %.1f s", Double($0) / 1e6) } ?? "never")  \
     gate at end: rate \(String(format: "%.2f", Double(host.videoRate.rate * 8) / 1e6)) Mbit/s, \
     \(host.videoRate.linkMeasurements) link measurements, \(host.videoRate.backoffs) backoffs, \
@@ -539,7 +561,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       cpu viewer: datagrams \(ms(timings.viewerDatagram))  video \(ms(timings.viewerVideo))  \
     control \(ms(timings.viewerControl))  tick \(ms(timings.viewerTick))
     """)
-    if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
+    if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" || videoMode == "hybrid-hevc" {
         print(score.summary(videoBytes: host.stats.videoBytesSent))
         if score.rgbEvery > 0 { print(score.rgbSummary()) }
         print(score.decodeTimeSummary)

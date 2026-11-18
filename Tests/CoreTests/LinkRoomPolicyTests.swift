@@ -83,9 +83,10 @@ import GlassActTestSupport
     }
 
     /// A session asking for the AV1 stand-in starts on the other codec. Once
-    /// the link has delivered room, the next region forms on AV1; once a
-    /// bottleneck makes it thin, the region after that is back on the other
-    /// codec. A live region keeps its codec (no mid-motion switch), and the
+    /// the link has delivered room, the live region moves to AV1 in place
+    /// (`upgradeRegionCodec`) and the next region forms on it; once a
+    /// bottleneck makes it thin, the live region keeps AV1 (no switch down
+    /// mid-motion) and the region after that is back on the other codec. The
     /// canvas still settles byte-identical.
     @Test(.tags(.slow), .notInFastLane) func theNextRegionFollowsTheLink() {
         var rng = SplitMix64(seed: 909)
@@ -109,8 +110,10 @@ import GlassActTestSupport
             }
         }
         move(seconds: 3)
-        #expect(h.host.activeVideoCodec == MockVideoEncoder.mockCodecID, "starts off AV1, and a live region keeps its codec")
         #expect(h.host.linkRoom.hasRoom, "the link has delivered room")
+        #expect(h.host.activeVideoCodec == MockVideoEncoder.mockAltCodecID, "the live region moved up to AV1")
+        #expect(h.host.stats.videoRegionsFormed == 1 && h.host.stats.videoCodecUpgrades == 1, "in place")
+        #expect(h.viewer.activeVideoCodec == MockVideoEncoder.mockAltCodecID)
         rest(seconds: 4)
         #expect(h.host.activeVideoRegionCount == 0)
         move(seconds: 1)

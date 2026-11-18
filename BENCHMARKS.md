@@ -213,7 +213,8 @@ the numbers and the reasoning.
 | Frame-QP ceiling 42 on thin links | rejected | photos frames 4–8× but SSIMULACRA2 near zero | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | A minimum encoder cap (2–3 Mbit/s) for sharper text on thin links | rejected | 1M scroll-win 98 → 51 frames; 2M cursor-drag 326 → 286 | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | AV1 only while the link has room (delivered ≥ 6 Mbit/s on, queued < 4 off; at the next region) | kept | 2–3 Mbit/s: HEVC's frames and latency (2M cursor-drag 326 · 641 ms vs AV1 alone 283 · 1183 ms); 10 Mbit/s: AV1 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
-| Switch a live region's codec in place | rejected | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
+| Switch a live region's codec in place | rejected (both ways, libaom's AV1); up only, kept 2026-11-18 (below) | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
+| Move a live region up to AV1 once the link has room or AV1 is ready (in place, never down) | kept (26.11.3) | movie on a fast link: video 65.4 → 35.2 MB, 720 → 721 frames; 6M photos 76 → 219 frames; 3M unchanged; 6M cursor-drag 408 → 393 frames; PSNR −1.6 to −2.0 dB where AV1 takes over (AV1's aim, not the move) | [entry](#a-live-region-moves-up-to-av1-2026-11-18) |
 | The Host's AV1 kernels as metallibs built with the app (front end compiled offline) | not shipped (owner, 2026-11-18): the build compiles them as a check only | a cold front end 5.49 s → 0.000 s (encoder, M4 Pro); the encoder's bytes identical; the Host's download +8.5 MB compressed (13.5 MB of metallibs: each of 64 kernels with its own inlined code) | [entry](#the-av1-kernels-compiled-with-the-app-2026-11-18) |
 | Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
 | Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
@@ -404,6 +405,66 @@ on both (8 pictures, key and inter frames, at 640×360 and 1000×562).
 - The offline compile shows 41 warnings the runtime compile hides; they're off in the build
   (missing braces in av1core's tables, divisions in `dev_tx.h` loops that run 0 times, a
   threadgroup count in `k_inter.h` set before a barrier).
+
+### A live region moves up to AV1 (2026-11-18)
+
+The owner tested 26.11.2 from this Mac mini (Viewer, AV1 on) to their Mac Studio (Host): a
+locked screen's moving background ran HEVC for the whole session, about 19 Mbit/s. The Viewer's
+log: one region, formed 1.3 s after connecting, 2,759 HEVC frames in 65 s, no dissolve, no stall.
+
+**Why.** A session starts without room (`LinkRoomPolicy`), so its first region forms on HEVC,
+and a codec change applied only when the next region formed. A screen that never stops moving
+never dissolves, so the first region's HEVC lasted as long as the motion. A Host whose AV1 isn't
+ready when the region forms (its kernels compiling, up to ~30 s on a cold Metal cache) has the
+same problem.
+
+**The change.** Once a second, a live region moves to the codec the link allows first when it
+ranks ahead of the region's (`HostEngine.upgradeRegionCodec`): a new encoder under a new
+generation, a VIDEO_START (every Viewer since 26.10.0 rebuilds the region's decoder on one and
+keeps its overlay) and a sync frame, with no STOP and no repaint. Never down: a region on AV1
+keeps it when the link loses room, as before. The first version of this, in both directions with
+libaom's AV1, was rejected on 2026-10-25 ("AV1 only while the link has room": 6M photos 68
+frames against HEVC's 165), mostly for the move down mid-motion on a thin link.
+
+`replay --mode loop --video hybrid-hevc` (new: the shipping pair, Glass Act's AV1 with HEVC;
+`--no-codec-upgrade` is before), M4 Pro Mac mini. Thin links as the 2026-10-25 entry:
+`--link-mbit n --link-buffer-ms 500 --latency 30-40`; the fast link is `--latency 2-4` with no
+bottleneck. Video frames · video bytes · queue p95 · PSNR (scored frames), and after, in
+parentheses, how many times the region moved up. Every run settled byte-identical.
+
+| link | trace | before | after (moves up) |
+|---|---|---|---|
+| fast | movie | 720 · 65.41 MB · – · 46.56 dB | 721 · 35.19 MB · – · 44.59 dB (1) |
+| 10M | movie | 594 · 29.89 MB · 265 ms · 44.19 dB | 596 · 28.06 MB · 266 ms · 44.79 dB (1) |
+| 10M | photos | 251 · 22.26 MB · 436 ms · 40.01 dB | 325 · 15.04 MB · 499 ms · 38.25 dB (1) |
+| 10M | cursor-drag | 436 · 4.41 MB · 247 ms · 46.86 dB | identical (0) |
+| 6M | movie | 427 · 20.28 MB · 307 ms · 44.18 dB | 446 · 21.26 MB · 312 ms · 45.07 dB (1) |
+| 6M | photos | 76 · 11.40 MB · 499 ms · 40.48 dB | 219 · 10.40 MB · 499 ms · 38.58 dB (1) |
+| 6M | cursor-drag | 408 · 4.24 MB · 276 ms · 46.40 dB | 393 · 3.67 MB · 283 ms · 44.75 dB (1) |
+| 3M | movie, photos, cursor-drag | | identical: no room, no move (0) |
+
+- On the fast link the movie trace, the closest to a lock screen's video, runs AV1 from about
+  a second in: 9.85 Mbit/s against HEVC's 18.32, at 52 % of the target (the hybrid aims at
+  40 %). Its 5K encode latency p50 is 43.4 ms against HEVC's 22.7: the hybrid's, now on
+  sustained motion too.
+- PSNR falls 1.6–2.0 dB where AV1 takes over (photos, cursor-drag, the fast movie): the
+  hybrid's aim at 40 % of the target, the trade AV1 already makes on every region that forms on
+  it. This change doesn't move it.
+- **Over 10 %, with reasons.** 10M photos queue p95 +14 % (436 → 499 ms): the buffer is
+  500 ms, and AV1 delivers 30 % more frames into it. 6M cursor-drag loses 4 % of its frames
+  (408 → 393), the threshold case the 2026-10-25 rejection was about; 6M photos, the other
+  threshold case, gains 188 %.
+- The move's sync frame: 298.1 KB of sync frames on the fast movie against 42.8 KB before.
+
+**A dissolve in the move's window.** After the move and before the new stream's VIDEO_START
+goes (its first delivery), the Viewer still shows the old generation. A dissolve then (the new
+encoder stalls, delivers nothing, or its START is too big) stops that generation
+(`regionShownGeneration`); otherwise the Viewer kept a live region the Host had ended.
+`CodecUpgradeTests` checks it with explicit dirty rects (`settle()` would full-scan and hide a
+stranded tile).
+
+**Left as is.** The new stream's first frame claims every tile, so tiles that had gone back to
+exact under the old stream go lossy again for about a second, once per move.
 
 ### Glass Act's AV1 stalled its first live picture on a cold Metal cache (2026-11-17)
 
