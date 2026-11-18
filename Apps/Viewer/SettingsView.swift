@@ -42,7 +42,7 @@ struct SettingsView: View {
                      + "connect. Filling the screen asks the host to take this screen's shape while you're in "
                      + "full screen with Scale Down or Match This Mac, instead of showing bars beside a "
                      + "differently shaped picture; it goes back when you leave full screen. "
-                     + "AV1 video keeps text sharper than HEVC, but works the host harder. On a slow network "
+                     + "AV1 video is experimental. It keeps text sharper than HEVC, but works the host harder. On a slow network "
                      + "the host uses HEVC instead, unless you prefer smooth motion. "
                      // (with AV1 hardware, older hosts' AV1 decodes here too; without, only an up-to-date host's)
                      + (VTRegionDecoder.canDecodeAV1
