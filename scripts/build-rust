@@ -7,9 +7,12 @@
 #                                   from an app target's run-script phase: Xcode's PLATFORM_NAME
 #                                   and ARCHS. macOS → .build/rust/libglassact_av1.a, as above;
 #                                   iPadOS and its Simulator → .build/rust/<platform>/ (AV1Core's
-#                                   -L for iOS). --shaders also copies the AV1 encoder's kernel
-#                                   sources into the app's Resources/AV1Shaders (AV1ShaderSource).
-#   scripts/build-rust --copy-shaders <dir>   only that copy, into <dir> (a test checks it)
+#                                   -L for iOS). --shaders also puts the AV1 encoder's kernels in
+#                                   the app's Resources/AV1Shaders (AV1ShaderSource): their sources,
+#                                   and compiled into metallibs where the Metal toolchain is
+#                                   installed (a Release build requires it).
+#   scripts/build-rust --copy-shaders <dir>   only the sources' copy, into <dir> (a test checks it)
+#   scripts/build-rust --metallib <dir>       only the metallibs, into <dir> (tests, the bench)
 # `just` runs it before every build and test; run it yourself before a bare `swift build`. Xcode
 # runs it in each app target (Apps/GlassActApps.xcodeproj), so the apps need nothing else.
 set -eu
@@ -91,6 +94,61 @@ copy_shaders() {
     done
 }
 
+# Whether this Mac has the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`).
+has_metal() {
+    xcrun -sdk macosx metal --version >/dev/null 2>&1
+}
+
+# The AV1 encoder's kernels as metallibs in `$1` (encoder, entropy, postfilter.metallib), compiled
+# as AV1ShaderSource.library compiles them at run time: MSL 4.1, safe math, the quoted includes
+# from the three source directories and the encoder's derived tables (rust/av1's tables_msl
+# example writes the av1enc_tables.h the runtime makes), system includes empty (the runtime drops
+# them: metal_stdlib has the fixed-width types). Skipped when no input changed.
+build_metallibs() {
+    dest=$1
+    work="$out/metallib"
+    mkdir -p "$work/sys" "$work/gen" "$dest"
+    : > "$work/sys/stdint.h"
+    : > "$work/sys/stddef.h"
+    printf '#include <metal_stdlib>\nusing namespace metal;\n#define NULL nullptr\n' > "$work/prelude.h"
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    cargo_clean run --quiet --release --manifest-path "$manifest" --target "$host" --example tables_msl \
+        -- "$work/gen/av1enc_tables.h.$$"
+    install_lib "$work/gen/av1enc_tables.h.$$" "$work/gen/av1enc_tables.h"
+    rm -f "$work/gen/av1enc_tables.h.$$"
+    # (macOS 27.0: MSL 4.1's first, so one build loads on every macOS the encoder runs on. The
+    # warnings off are the runtime compile's too, which shows none: av1core's tables' braces,
+    # dev_tx.h's divisions in loops of 0 tiles, k_inter.h's threadgroup count set before a barrier)
+    flags="-std=metal4.1 -fmetal-math-mode=safe -mmacosx-version-min=27.0 -Wno-missing-braces -Wno-division-by-zero -Wno-sometimes-uninitialized"
+    stamp=$({
+        echo "$flags"
+        xcrun -sdk macosx metal --version
+        cat "$work/prelude.h" "$work/gen/av1enc_tables.h"
+        for d in AV1Core/include AV1Encoder/include GlassActAV1/Shaders; do
+            find "$root/Sources/$d" \( -name '*.h' -o -name '*.metal' \) | LC_ALL=C sort | while read -r f; do
+                echo "$f"
+                cat "$f"
+            done
+        done
+    } | shasum -a 256 | cut -c1-64)
+    stampfile="$work/inputs-$(printf '%s' "$dest" | shasum -a 256 | cut -c1-16)"
+    if [ "$(cat "$stampfile" 2>/dev/null)" = "$stamp" ] && [ -f "$dest/encoder.metallib" ] \
+        && [ -f "$dest/entropy.metallib" ] && [ -f "$dest/postfilter.metallib" ]; then
+        return 0
+    fi
+    for m in encoder entropy postfilter; do
+        # shellcheck disable=SC2086
+        xcrun -sdk macosx metal $flags -isystem "$work/sys" -include "$work/prelude.h" \
+            -I "$root/Sources/AV1Core/include" -I "$root/Sources/AV1Encoder/include" \
+            -I "$root/Sources/GlassActAV1/Shaders" -I "$work/gen" \
+            -c "$root/Sources/GlassActAV1/Shaders/$m.metal" -o "$work/$m.air"
+        xcrun -sdk macosx metallib "$work/$m.air" -o "$dest/$m.metallib.tmp.$$"
+        mv -f "$dest/$m.metallib.tmp.$$" "$dest/$m.metallib"
+        rm -f "$work/$m.air"
+    done
+    echo "$stamp" > "$stampfile"
+}
+
 case "${1:-}" in
     --universal)
         build_for macosx "arm64 x86_64" "$out/libglassact_av1.a"
@@ -103,8 +161,22 @@ case "${1:-}" in
         esac
         if [ "${2:-}" = "--shaders" ]; then
             : "${TARGET_BUILD_DIR:?} ${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}"
-            copy_shaders "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AV1Shaders"
+            shaders="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AV1Shaders"
+            copy_shaders "$shaders"
+            if has_metal; then
+                build_metallibs "$shaders"
+            elif [ "${CONFIGURATION:-}" = Release ]; then
+                echo "error: build-rust: a Release build needs the Metal toolchain for the AV1 kernels' metallibs (xcodebuild -downloadComponent MetalToolchain)" >&2
+                exit 1
+            else
+                echo "warning: build-rust: no Metal toolchain: the Host compiles the AV1 kernels when it starts (xcodebuild -downloadComponent MetalToolchain)"
+                rm -f "$shaders"/*.metallib
+            fi
         fi
+        ;;
+    --metallib)
+        has_metal || { echo "build-rust: no Metal toolchain (xcodebuild -downloadComponent MetalToolchain)" >&2; exit 1; }
+        build_metallibs "${2:?usage: scripts/build-rust --metallib <dir>}"
         ;;
     --copy-shaders)
         # (what --shaders copies, into a directory of your choosing: a test checks it)
@@ -115,7 +187,7 @@ case "${1:-}" in
         install_lib "$root/rust/av1/target/release/libglassact_av1.a" "$out/libglassact_av1.a"
         ;;
     *)
-        echo "usage: scripts/build-rust [--universal | --xcode [--shaders] | --copy-shaders <dir>]" >&2
+        echo "usage: scripts/build-rust [--universal | --xcode [--shaders] | --copy-shaders <dir> | --metallib <dir>]" >&2
         exit 2
         ;;
 esac

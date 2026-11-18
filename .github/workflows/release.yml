@@ -91,6 +91,11 @@ jobs:
         # The apps' Xcode targets build the Rust AV1 library (scripts/build-rust --xcode), universal.
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Metal toolchain
+        # The Host's AV1 kernels are compiled into metallibs (scripts/build-rust --xcode --shaders),
+        # which a Release build requires; a runner without the toolchain downloads it.
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+
       - name: Build, sign, notarize
         run: Apps/ci-release.sh
 

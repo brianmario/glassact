@@ -89,12 +89,11 @@ public final class AV1MetalPostfilter: @unchecked Sendable {
         return crop ? job.cropped(planes) : []
     }
 
-    public init(device: any MTLDevice) throws {
+    public init(device: any MTLDevice, kernels: AV1Kernels = .shipped) throws {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no command queue") }
         self.queue = queue
-        let library = try AV1ShaderSource.library(
-            AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/postfilter.metal"), device: device)
+        let library = try kernels.library("postfilter", device: device)
         var pipelines: [String: any MTLComputePipelineState] = [:]
         for name in ["p_mark", "p_deblock", "p_cdef_dir", "p_cdef", "l_cdef_idx_norm", "l_cdef_sse", "l_select", "l_choose", "l_assign",
                      "l_finish", "p_deblock_r", "p_cdef_dir_r", "p_cdef_r", "p_copy_r", "l_cdef_sse_r", "l_assign_c"] {

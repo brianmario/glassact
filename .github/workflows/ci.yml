@@ -72,6 +72,11 @@ jobs:
         # universal, the iPad app for iPadOS (and the Simulator). The script adds a missing
         # target itself; adding them here keeps that out of the build's time and log.
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+      - name: Metal toolchain
+        # The Host's build compiles the AV1 kernels into metallibs (scripts/build-rust --xcode
+        # --shaders), so a kernel that doesn't compile fails here; without the toolchain it only
+        # warns (the GPU tests, which compile them at run time, don't run on CI's VMs).
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
       - name: Build Host
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host

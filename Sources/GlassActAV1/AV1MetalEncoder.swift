@@ -832,7 +832,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     public var tiling: (columnsLog2: Int, rowsLog2: Int) = (-1, -1)
     public private(set) var lastStages = StageTimes()
 
-    public init(device: any MTLDevice) throws {
+    public init(device: any MTLDevice, kernels: AV1Kernels = .shipped) throws {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no command queue") }
         self.queue = queue
@@ -840,8 +840,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         self.readEvent = readEvent
         guard let gate = device.makeSharedEvent() else { throw Failure.metal("no shared event") }
         self.gate = gate
-        let library = try AV1ShaderSource.library(
-            AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/encoder.metal"), device: device)
+        let library = try kernels.library("encoder", device: device)
         self.library = library
         self.analysisUsesMatrixUnits = try Self.forwardMMAIsExact(device: device, library: library)
         self.forwardMatrices = try Self.makeForwardMatrices(device: device, library: library)

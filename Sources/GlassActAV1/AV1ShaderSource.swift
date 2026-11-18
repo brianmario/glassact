@@ -19,21 +19,26 @@ public import Metal
 /// pointer of the shared headers. The GPU encoder is therefore macOS 27+;
 /// older Hosts keep HEVC (DESIGN §4.6).
 ///
+/// The Host app carries the kernels compiled (`AV1Kernels.compiled`): `scripts/build-rust
+/// --xcode --shaders` builds them into metallibs with the same text, language version and math
+/// mode, where the Metal toolchain is installed (`xcodebuild -downloadComponent MetalToolchain`;
+/// a Release build requires it). That saves the front end's compile on a cold Metal cache (5 s
+/// of the encoder's on an M4 Pro) and moves compile errors to build time.
+///
 /// ## Deviations
-/// Compiled at run time from source, not from a metallib built with the
-/// package: this Mac has no Metal toolchain (`xcodebuild -downloadComponent
-/// MetalToolchain`). The source is the app's copy where there is one (the
-/// Host: `scripts/build-rust --xcode --shaders` copies the three directories
-/// into its Resources/AV1Shaders as they are under `Sources/`), else the
-/// source tree (`#filePath`: tests, the bench). A metallib would move compile
-/// errors to build time.
+/// SwiftPM builds (tests, the bench) compile from source at run time (`AV1Kernels.source`): a
+/// package can't run the offline compiler, which is a separate toolchain download. The app
+/// carries the sources too (its Resources/AV1Shaders, laid out as under `Sources/`), for a
+/// Debug build on a Mac without the toolchain.
 public enum AV1ShaderSource {
     /// Where quoted includes are looked up, in order.
-    public static let defaultIncludeDirectories: [URL] = [
-        sourceRoot.appending(path: "AV1Core/include"),
-        sourceRoot.appending(path: "AV1Encoder/include"),
-        sourceRoot.appending(path: "GlassActAV1/Shaders"),
-    ]
+    public static let defaultIncludeDirectories: [URL] = includeDirectories(in: sourceRoot)
+
+    /// The include directories of a tree laid out as `Sources/` (`root`).
+    public static func includeDirectories(in root: URL) -> [URL] {
+        [root.appending(path: "AV1Core/include"), root.appending(path: "AV1Encoder/include"),
+         root.appending(path: "GlassActAV1/Shaders")]
+    }
 
     /// Includes that are made, not read: `#include "av1enc_tables.h"` is the
     /// encoder's derived tables (av1enc_tables_msl).
@@ -142,5 +147,41 @@ public enum AV1ShaderSource {
               let close = directive[directive.index(after: open)...].firstIndex(of: "\"")
         else { return nil }
         return String(directive[directive.index(after: open)..<close])
+    }
+}
+
+/// Where the AV1 kernels come from: metallibs built with the Host app, or their sources,
+/// compiled when the encoder starts (`AV1ShaderSource`).
+public enum AV1Kernels: Sendable, Equatable {
+    /// `<name>.metallib` in this directory (`scripts/build-rust --metallib`).
+    case compiled(URL)
+    /// Sources laid out as under `Sources/`, compiled at run time.
+    case source(URL)
+
+    /// The app's metallibs where it has them, else the sources (the app's copy, or the tree's).
+    public static let shipped: AV1Kernels = bundled(in: .main) ?? .source(AV1ShaderSource.sourceRoot)
+
+    /// The metallibs `bundle` carries (Resources/AV1Shaders), nil for none.
+    public static func bundled(in bundle: Bundle) -> AV1Kernels? {
+        guard let directory = bundle.resourceURL?.appending(path: "AV1Shaders", directoryHint: .isDirectory),
+              FileManager.default.fileExists(atPath: directory.appending(path: "encoder.metallib").path)
+        else { return nil }
+        return .compiled(directory)
+    }
+
+    /// The library of `name`'s kernels (encoder, entropy, postfilter) for `device`.
+    @available(macOS 27, iOS 27, *)
+    public func library(_ name: String, device: any MTLDevice) throws -> any MTLLibrary {
+        switch self {
+        case let .compiled(directory):
+            do {
+                return try device.makeLibrary(URL: directory.appending(path: "\(name).metallib"))
+            } catch {
+                throw AV1ShaderSource.Failure.compile("\(name).metallib: \(error)")
+            }
+        case let .source(root):
+            return try AV1ShaderSource.library(root.appending(path: "GlassActAV1/Shaders/\(name).metal"), device: device,
+                                               includeDirectories: AV1ShaderSource.includeDirectories(in: root))
+        }
     }
 }

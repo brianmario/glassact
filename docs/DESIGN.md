@@ -608,7 +608,11 @@ first negotiated codec whose encoder starts; START carries its id.
     1 s. Until they have, the factory has no AV1 encoder and regions
     start on HEVC, not on a stalled queue. (26.11.1 left the analysis
     kernels to the first picture: 10 s cold on the M5 Ultra, past the
-    stall limit below.)
+    stall limit below.) The app carries them compiled into metallibs
+    (`AV1Kernels`, built by its build phase with the Metal toolchain),
+    which skips the front end's share of a cold compile (5.5 s of the
+    encoder's on an M4 Pro); the GPU back end's still runs once per
+    install. Tests and the bench compile the sources at run time.
   - libaom's encoder (`AOMRegionEncoder`, below) stays in the package,
     unused: `HostController.av1Encoder = .libaom` switches back to it. It's
     no fallback where Glass Act's can't run, nor the other way round.
