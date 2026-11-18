@@ -752,6 +752,19 @@ impl Hybrid {
                 src.view()
             }
         };
+        // every given block is a block size, inside the coded area, before anything reads its
+        // geometry: the search below (a size's width and height, the tile's hashes at its position),
+        // the qindex map, the chroma decisions. The record's layout refuses the same blocks
+        // (layout_counts_ex), but only after those, so this refuses no picture that was coded.
+        if given
+            .iter()
+            .any(|b| b.bsize as i32 >= BLOCK_SIZES || b.mi_row as i32 >= mr || b.mi_col as i32 >= mc)
+        {
+            // (no search of this picture: the last one's answer and hashes given for this one go)
+            ibc.forget();
+            ibc.clear_hashes();
+            return Err(error(ERR_INVALID, "layout"));
+        }
         // a key frame's intra block copies: from here on its blocks, inter entries and luma tx
         // types are the search's (a copy reads only its tile, so a tile is kept as before, when its
         // inter entries are the same too)
@@ -791,12 +804,11 @@ impl Hybrid {
             // the chroma decisions read the blocks' areas: no block outside the padded source (an
             // inter block, which has none, may be larger than 64x64 with 128x128 superblocks). A
             // 4:4:4 picture's are checked with given chroma too, as before the GPU decided them.
+            // (Sizes and positions in the coded area were checked above; a copy the search made is
+            // a legal size inside it.)
             for (i, b) in rec.blocks.iter().enumerate() {
                 let bs = b.bsize as i32;
-                if bs >= BLOCK_SIZES
-                    || ((bw4(bs) > 16 || bh4(bs) > 16) && !(sb128 && is_inter(i)))
-                    || b.mi_row as i32 >= mr
-                    || b.mi_col as i32 >= mc
+                if ((bw4(bs) > 16 || bh4(bs) > 16) && !(sb128 && is_inter(i)))
                     || b.mi_row as usize + bh4(bs) as usize > sb_rows * 16
                     || b.mi_col as usize + bw4(bs) as usize > sb_cols * 16
                 {

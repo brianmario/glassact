@@ -1804,6 +1804,127 @@ fn sb128_frames_from_motion() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// invalid blocks
+// ---------------------------------------------------------------------------------------------
+
+/// The size of the pictures the invalid blocks are given with: a partial 64x64 at the bottom and
+/// the right.
+const BAD_W: usize = 200;
+const BAD_H: usize = 120;
+
+/// `b` moved outside the coded area: just past it (still inside the padded source and the 64x64s'
+/// qindex map), past the padded source, and far out.
+fn outside_the_picture(b: Block) -> Vec<(&'static str, Block)> {
+    let (mr, mc) = (mi_rows(BAD_H as i32) as u16, mi_cols(BAD_W as i32) as u16);
+    vec![
+        ("the row below the coded area", Block { mi_row: mr, ..b }),
+        (
+            "the row below the padded source",
+            Block {
+                mi_row: (mr + 15) & !15,
+                ..b
+            },
+        ),
+        ("a row far below", Block { mi_row: u16::MAX, ..b }),
+        ("the column right of the coded area", Block { mi_col: mc, ..b }),
+        (
+            "the column right of the padded source",
+            Block {
+                mi_col: (mc + 15) & !15,
+                ..b
+            },
+        ),
+        ("a column far right", Block { mi_col: u16::MAX, ..b }),
+    ]
+}
+
+/// `b` with a bsize that is no block size.
+fn not_a_size(b: Block) -> Vec<(&'static str, Block)> {
+    vec![
+        (
+            "the first bsize past the sizes",
+            Block {
+                bsize: BLOCK_SIZES as u8,
+                ..b
+            },
+        ),
+        ("bsize 255", Block { bsize: 255, ..b }),
+    ]
+}
+
+/// A legal partition's last block replaced by each of `bad`'s (which is given it) is ERR_INVALID,
+/// not a panic, for a Hybrid `setup` configured: in 4:2:0 and 4:4:4, with the closed loop's chroma
+/// decisions and with the given ones kept. The Hybrid then codes the legal blocks as a fresh one
+/// does.
+fn refuses_invalid_blocks(setup: impl Fn(&mut Hybrid), bad: impl Fn(Block) -> Vec<(&'static str, Block)>) {
+    let (w, h) = (BAD_W, BAD_H);
+    let p = screen_pic(w, h, 5, false);
+    let tiles = tile_layout(w as u32, h as u32, 0, 0).unwrap();
+    let blocks = partition(&p, &tiles, &mut Rng(99), Style::Random, true);
+    // (4:4:4: the chroma samples repeated)
+    let full = |c: &[u8]| -> Vec<u8> { (0..w * h).map(|i| c[(i / w / 2) * p.cw() + (i % w) / 2]).collect() };
+    for chroma444 in [false, true] {
+        let (u, v) = if chroma444 {
+            (full(&p.u), full(&p.v))
+        } else {
+            (p.u.clone(), p.v.clone())
+        };
+        for flags in [0, GIVEN_CHROMA] {
+            let new = || {
+                let mut hy = Hybrid::new();
+                hy.set_chroma_444(chroma444);
+                setup(&mut hy);
+                hy
+            };
+            let code = |hy: &mut Hybrid, blocks: &[Block]| {
+                hy.closed_loop(&p.y, &u, &v, w as u32, h as u32, blocks, None, flags, 90, 0, 0)
+            };
+            let mut hy = new();
+            for (what, b) in bad(*blocks.last().unwrap()) {
+                let mut given = blocks.clone();
+                *given.last_mut().unwrap() = b;
+                let what = format!("{what} (4:4:4 {chroma444}, flags {flags})");
+                assert_eq!(code(&mut hy, &given).expect_err(&what).code, ERR_INVALID, "{what}");
+            }
+            let mut fresh = new();
+            code(&mut hy, &blocks).unwrap();
+            code(&mut fresh, &blocks).unwrap();
+            assert!(
+                hy.record() == fresh.record() && (0..3).all(|pl| hy.recon(pl) == fresh.recon(pl)),
+                "4:4:4 {chroma444}, flags {flags}: the legal blocks after the refused ones"
+            );
+        }
+    }
+}
+
+/// A block outside the picture is refused before its 64x64's qindex is looked up in the map
+/// ([`Hybrid::set_sb_qindex`]). With AV1ENC_HYBRID_GIVEN_CHROMA a 4:2:0 picture's blocks went
+/// unchecked until the record's layout, after the lookup: a panic past the map's end.
+#[test]
+fn blocks_outside_the_picture_are_refused() {
+    let both = |b: Block| [outside_the_picture(b), not_a_size(b)].concat();
+    refuses_invalid_blocks(|_| (), both);
+    // (the picture's 4 x 2 64x64s)
+    refuses_invalid_blocks(|hy| hy.set_sb_qindex(&[60, 70, 80, 90, 100, 110, 120, 130]), both);
+}
+
+/// A key frame's intra block copy search is given only checked blocks. It ran before every check
+/// of them, in either chroma format, and reads a block's width and height from the tables by its
+/// bsize: a panic past their end.
+#[test]
+fn intrabc_search_refuses_invalid_blocks() {
+    let both = |b: Block| [not_a_size(b), outside_the_picture(b)].concat();
+    refuses_invalid_blocks(|hy| hy.set_intrabc(true), both);
+    refuses_invalid_blocks(
+        |hy| {
+            hy.set_intrabc(true);
+            hy.set_sb_qindex(&[60, 70, 80, 90, 100, 110, 120, 130]);
+        },
+        both,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // snapshots
 // ---------------------------------------------------------------------------------------------
 
