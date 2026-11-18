@@ -655,8 +655,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         _ = try metal.analysisKernels(fixed: true)
     }
 
-    public init(device: any MTLDevice) throws {
-        metal = try AV1MetalEncoder(device: device)
+    public init(device: any MTLDevice, kernels: AV1Kernels = .shipped) throws {
+        metal = try AV1MetalEncoder(device: device, kernels: kernels)
         metal.preset = .turbo
         metal.decidesLeaves = true
         metal.reusesAnalysis = true
@@ -667,7 +667,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.searchesSubpelMotion = true
         metal.interGate = 2
         metal.newPictureShapeMask = Self.defaultNewPictureShapeMask
-        postfilter = try AV1MetalPostfilter(device: device)
+        postfilter = try AV1MetalPostfilter(device: device, kernels: kernels)
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create(), let readerMotion = av1enc_motion_create()
         else { throw Failure.encode("no CPU state") }
         self.cpu = cpu

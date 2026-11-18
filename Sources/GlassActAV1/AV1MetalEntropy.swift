@@ -44,12 +44,11 @@ public final class AV1MetalEntropy: @unchecked Sendable {
     static let cdfBytes = 11_440  // sizeof(av1g_cdfs)
     static let scanThreads = 1024
 
-    public init(device: any MTLDevice) throws {
+    public init(device: any MTLDevice, kernels: AV1Kernels = .shipped) throws {
         self.device = device
         guard let queue = device.makeCommandQueue() else { throw Failure.metal("no command queue") }
         self.queue = queue
-        let library = try AV1ShaderSource.library(
-            AV1ShaderSource.sourceRoot.appending(path: "GlassActAV1/Shaders/entropy.metal"), device: device)
+        let library = try kernels.library("entropy", device: device)
         var pipelines: [String: any MTLComputePipelineState] = [:]
         for name in Self.kernels {
             guard let function = library.makeFunction(name: name) else { throw Failure.metal("no \(name)") }

@@ -608,7 +608,11 @@ first negotiated codec whose encoder starts; START carries its id.
     1 s. Until they have, the factory has no AV1 encoder and regions
     start on HEVC, not on a stalled queue. (26.11.1 left the analysis
     kernels to the first picture: 10 s cold on the M5 Ultra, past the
-    stall limit below.)
+    stall limit below.) The app's build also compiles them offline
+    (`scripts/build-rust --xcode --shaders`, with the Metal toolchain), as
+    a check that they compile; it doesn't carry those metallibs, which
+    would add 8.5 MB to the Host's download for 5.5 s of a cold start
+    (BENCHMARKS, 2026-11-18).
   - libaom's encoder (`AOMRegionEncoder`, below) stays in the package,
     unused: `HostController.av1Encoder = .libaom` switches back to it. It's
     no fallback where Glass Act's can't run, nor the other way round.

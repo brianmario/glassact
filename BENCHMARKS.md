@@ -215,6 +215,7 @@ the numbers and the reasoning.
 | AV1 only while the link has room (delivered ≥ 6 Mbit/s on, queued < 4 off; at the next region) | kept | 2–3 Mbit/s: HEVC's frames and latency (2M cursor-drag 326 · 641 ms vs AV1 alone 283 · 1183 ms); 10 Mbit/s: AV1 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Switch a live region's codec in place | rejected (both ways, libaom's AV1); up only, kept 2026-11-18 (below) | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Move a live region up to AV1 once the link has room or AV1 is ready (in place, never down) | kept (26.11.3) | movie on a fast link: video 65.4 → 35.2 MB, 720 → 721 frames; 6M photos 76 → 219 frames; 3M unchanged; 6M cursor-drag 408 → 393 frames; PSNR −1.6 to −2.0 dB where AV1 takes over (AV1's aim, not the move) | [entry](#a-live-region-moves-up-to-av1-2026-11-18) |
+| The Host's AV1 kernels as metallibs built with the app (front end compiled offline) | not shipped (owner, 2026-11-18): the build compiles them as a check only | a cold front end 5.49 s → 0.000 s (encoder, M4 Pro); the encoder's bytes identical; the Host's download +8.5 MB compressed (13.5 MB of metallibs: each of 64 kernels with its own inlined code) | [entry](#the-av1-kernels-compiled-with-the-app-2026-11-18) |
 | Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
 | Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | VP9 (libvpx real-time) instead of AV1 | rejected | ~2 dB worse on text at equal bytes, 2.5× the bytes on scrolling, frame sizes no steadier; no Apple hardware decode | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
@@ -364,6 +365,46 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### The AV1 kernels compiled with the app (2026-11-18)
+
+The Host compiled Glass Act's AV1 kernels from source when it started: the front end (MSL to
+AIR) and then the GPU back end per pipeline. On a cold Metal cache, after an install or update,
+that was 6–36 s (the 2026-11-17 entry below). The front end can be done at build time.
+
+**Decision (owner).** Not shipped: 8.5 MB on every Host download for 5.5 s once per install.
+The Host's build compiles them as a check, so a kernel that doesn't compile fails the build and
+CI's app builds; the Host still compiles the sources when it starts. What follows is what was
+built and measured; `AV1Kernels.compiled` keeps loading them possible (tests, the bench).
+
+**How.** `scripts/build-rust --xcode --shaders` (the Host's build phase) also compiles the three
+kernel sets into `{encoder,entropy,postfilter}.metallib` (under `.build/rust/metallib/check`; the
+measurements below were with them in the app's Resources/AV1Shaders), from the text the runtime
+compiles: the same quoted includes, the encoder's derived tables (rust/av1's new
+`tables_msl` example writes the `av1enc_tables.h` the runtime makes), system includes empty,
+MSL 4.1, safe math, macOS 27.0 as the minimum. Without the toolchain the build warns and skips
+the check; CI's app job downloads it. Skipped when no input changed (0.25 s); a full compile is
+5.6 s.
+
+`CompiledKernelsTests` (M4 Pro): every kernel the source has, and the encoder's bytes identical
+on both (8 pictures, key and inter frames, at 640×360 and 1000×562).
+
+| | from source, cold front end | from the metallib |
+|---|---|---|
+| encoder library | 5.49 s | 0.000 s |
+
+- The back end isn't saved. The metallib's AIR comes from the toolchain's compiler, not the OS's,
+  so its pipelines don't share the source's cache entries. The first run on the metallibs paid the
+  back end in full (the bytes test took 86 s that first time). Per install it's the same
+  back-end cost as before. Binary archives (`MTLBinaryArchive`, per GPU family) are what would
+  save it.
+- **The size.** The metallibs are 13.5 MB (encoder 13.2 MB against a 1.7 MB AIR file:
+  a metallib keeps each of its 64 kernels with its own inlined code; `--split-module` and `-Os`
+  change nothing), 8.5 MB compressed in the app's zip. The sources the app also carries are about
+  0.3 MB compressed. The Host's download goes from about 10 MB to about 18 MB.
+- The offline compile shows 41 warnings the runtime compile hides; they're off in the build
+  (missing braces in av1core's tables, divisions in `dev_tx.h` loops that run 0 times, a
+  threadgroup count in `k_inter.h` set before a barrier).
 
 ### A live region moves up to AV1 (2026-11-18)
 
