@@ -117,6 +117,7 @@ extension HostEngine {
             stats.videoRegionsWithoutAV1 += 1
         }
         regionEncoder = encoder
+        regionCodec = startedCodec
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
         if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
@@ -791,18 +792,24 @@ extension HostEngine {
     /// answering (a hardware encode takes ~15 ms; libaom at 5K under 50).
     static let videoEncoderStallUS: UInt64 = 3_000_000
 
-    /// The encoder stopped answering: give video up for this session and let
-    /// lossless tiles carry the screen. Live (2026-10-26) the system's
-    /// encoder service went silent for minutes right after a virtual display
-    /// came up; with VideoToolbox's calls off the engine's queue the session
-    /// keeps running, and this keeps it from waiting on frames that never
-    /// come (`VTHEVCRegionEncoder`'s concurrency note).
+    /// The encoder stopped answering: give its codec up for this session.
+    /// Regions form on the next negotiated codec (AV1's stall leaves HEVC);
+    /// with none left, lossless tiles carry the screen. Live (2026-10-26) the
+    /// system's encoder service went silent for minutes right after a virtual
+    /// display came up; with VideoToolbox's calls off the engine's queue the
+    /// session keeps running, and this keeps it from waiting on frames that
+    /// never come (`VTHEVCRegionEncoder`'s concurrency note). Live
+    /// (2026-11-17, 26.11.1) Glass Act's AV1 never delivered its first frame
+    /// on an M5 Max, and the session lost HEVC with it.
     func checkEncoderStall(nowUS: UInt64) {
         guard regionActive, regionFramesPending > 0, regionPendingSinceUS != 0,
               nowUS &- regionPendingSinceUS > Self.videoEncoderStallUS else { return }
-        videoStalled = true
+        let codec = regionCodec
+        if !stalledVideoCodecs.contains(codec) { stalledVideoCodecs.append(codec) }
+        negotiatedVideoCodecs.removeAll { $0 == codec }
+        videoStalled = negotiatedVideoCodecs.isEmpty
         stats.videoEncoderStalls += 1
-        onVideoEncoderStalled?()
+        onVideoEncoderStalled?(codec, !videoStalled)
         dissolveRegion(revealUnchanged: false)
     }
 

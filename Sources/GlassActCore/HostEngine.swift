@@ -329,11 +329,18 @@ public final class HostEngine: @unchecked Sendable {
     /// When the oldest frame still in the encoder went in (engine time); 0
     /// with none pending.
     var regionPendingSinceUS: UInt64 = 0
-    /// The encoder stopped answering this session (`checkEncoderStall`):
-    /// no more regions form; lossless tiles carry everything.
+    /// Every negotiated codec's encoder stopped answering this session
+    /// (`checkEncoderStall`): no more regions form; lossless tiles carry
+    /// everything.
     var videoStalled = false
-    /// Video was given up for the session (engine queue).
-    public var onVideoEncoderStalled: (() -> Void)?
+    /// Codecs whose encoder stopped answering this session, dropped from
+    /// `negotiatedVideoCodecs`: regions form on the next codec instead.
+    var stalledVideoCodecs: [UInt8] = []
+    /// The codec the live region started on (VIDEO_START's).
+    var regionCodec: UInt8 = 0
+    /// An encoder stopped answering (engine queue): its codec, and whether
+    /// video goes on with another (false: lossless tiles from now on).
+    public var onVideoEncoderStalled: ((_ codec: UInt8, _ videoContinues: Bool) -> Void)?
     /// Submit times of the frames in flight, oldest at `regionSubmitHead`
     /// (deliveries come back in order). Fixed size: no allocation per frame.
     var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
@@ -861,6 +868,7 @@ public final class HostEngine: @unchecked Sendable {
                     negotiatedVideoCodecs = videoEncoderFactory == nil ? []
                         : videoCodecPreference.filter {
                             caps & WireCaps.viewerBits(forVideoCodec: $0, glassActAV1: videoAV1FromGlassAct) != 0
+                                && !stalledVideoCodecs.contains($0)
                         }
                     videoNegotiated = !negotiatedVideoCodecs.isEmpty
                     cursorNegotiated = caps & WireCaps.cursor != 0
@@ -968,6 +976,9 @@ public final class HostEngine: @unchecked Sendable {
     /// default ceiling, on a 0.3–0.8 Mbit/s link.
     public func continueSession(from previous: HostEngine) {
         sessionOpen = previous.sessionOpen
+        // (an encoder that stopped answering stays given up: a resize doesn't revive it)
+        stalledVideoCodecs = previous.stalledVideoCodecs
+        videoStalled = previous.videoStalled
         if let q = previous.clientQuality {
             applyQualityPolicy(scalePct: q.scalePct, floor: q.floor, preferSharpness: q.preferSharpness,
                                preferSmoothness: q.preferSmoothness)
