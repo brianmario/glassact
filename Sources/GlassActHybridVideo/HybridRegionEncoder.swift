@@ -345,7 +345,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// The process's hybrid encoder and the queue its calls run on.
     final class Shared: @unchecked Sendable {
         static let instance: Shared? = {
-            guard let device = MTLCreateSystemDefaultDevice(), let e = try? AV1HybridEncoder(device: device) else {
+            // (every kernel, including those a picture would otherwise compile on first use)
+            guard let device = MTLCreateSystemDefaultDevice(), let e = try? Shared.compiledEncoder(device: device) else {
                 preparation.end(ready: false)
                 return nil
             }
@@ -359,6 +360,14 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         nonisolated(unsafe) static var idleTrimAfter: TimeInterval = 60
 
         static let preparation = Preparation()
+
+        /// An encoder with every kernel compiled (`AV1HybridEncoder.compileKernels`), so no
+        /// picture waits on the compiler.
+        static func compiledEncoder(device: any MTLDevice) throws -> AV1HybridEncoder {
+            let e = try AV1HybridEncoder(device: device)
+            try e.compileKernels()
+            return e
+        }
 
         /// Whether the encoder is being made, or was, and how that went.
         final class Preparation: @unchecked Sendable {
@@ -427,7 +436,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                 trimming = true
                 let device = device
                 DispatchQueue.global(qos: .utility).async { [self] in
-                    let fresh = try? AV1HybridEncoder(device: device)
+                    let fresh = try? Self.compiledEncoder(device: device)
                     control.async { [self] in
                         trimming = false
                         guard let fresh, !streaming, streams == started else { return }

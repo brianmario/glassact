@@ -328,6 +328,7 @@ the numbers and the reasoning.
 | idea | verdict | key number | entry |
 |---|---|---|---|
 | The Host's hybrid encoder swapped for a fresh one after 60 s with no AV1 stream (`HybridRegionEncoder.Shared.trimWhenIdle`) | kept | a stream leaves its pictures' buffers in the process's one encoder: `av1seq --push` peaks at 1.55 GB footprint at 5K, 0.75 GB at 2900 (the bench's frames included), which an idle Host would otherwise keep until it quits; the fresh encoder's kernels come from Metal's cache; `anIdleEncoderIsReplacedAndReleased` checks the old one is freed | — |
+| Every hybrid kernel compiled before the Host offers AV1 (`AV1HybridEncoder.compileKernels`), and a stalled encoder gives up its codec, not video | kept (26.11.2) | 26.11.1 live on an M5 Ultra with a cold Metal cache: `prepare` 26 s, then the first picture 10 s compiling the analysis kernels, past the 3 s stall limit, and the session lost HEVC too (a moving lock screen as lossless tiles at 22 Mbit/s). With the fix the first picture waits on no compiler; a stall now re-forms on HEVC (`aStalledAV1EncoderLeavesHEVC`) | [entry](#glass-acts-av1-stalled-its-first-live-picture-on-a-cold-metal-cache-2026-11-17) |
 | `-Ounchecked` on GlassActCodec | removed | within run-to-run noise (≤ 1 % p50) | [entry](#-ounchecked-on-glassactcodec--measured-dropped-2026-09-26) |
 | In-place scroll, ACK walk, xxh64 fast path | kept | viewer scroll CPU 3224 → 1922 ms | [entry](#review-pass-section-5-performance-2026-09-26) |
 | Present blit off the main thread | kept | Viewer main blocked 89–92 % → 0 % | [blit](#present-blit-off-the-main-thread-2026-09-27), [A/B](#live-ab-viewer-main-thread-same-machine-loopback-2026-09-27) |
@@ -362,6 +363,49 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Glass Act's AV1 stalled its first live picture on a cold Metal cache (2026-11-17)
+
+The owner tested 26.11.1 from this Mac mini (Viewer) to their Mac Studio (Host, M5 Ultra, 36
+cores), both just updated through Sparkle. Window drags ran HEVC, and a locked screen's moving
+wallpaper cost 22 Mbit/s with no codec named in the title bar.
+
+**What the logs showed.** The Host compiled the hybrid's kernels for 30 s after it relaunched
+(21:50:32 → "AV1: Glass Act's encoder ready" at 21:51:02), so the regions before that started on
+HEVC, as DESIGN §4.6 says they should. The first AV1 region (21:51:05) took two pictures and
+delivered none (`vfull 34` → `100`, `venc 0.0 ms`); after 3 s `checkEncoderStall` gave video up
+for the session, and the lock screen went as lossless tiles at the governor's 22.4 Mbit/s with
+the Host's tile encoding at 90–146 % CPU.
+
+**Reproduced there** with a throwaway probe (`HybridRegionEncoder` as the Host drives it, 5080×2502,
+the session's region; synthetic pictures), its GPU 85–93 % busy with other work:
+
+| run | `prepare` | picture 0 | pictures 1–3 |
+|---|---|---|---|
+| first (cold Metal cache) | 26.1 s | 10.03 s | 17–28 ms |
+| again (warm) | 0.05 s | 0.09 s | 18–25 ms |
+| this Mac mini (M4 Pro, warm) | — | 0.14–0.15 s | 80–98 ms |
+
+The GPU's other load wasn't it: the pictures after the first were fast under it. The first
+picture compiled `AV1MetalEncoder.analysisKernels(fixed:)`, the one kernel set `init` leaves to
+first use (two sets, general and fixed settings, ~20 pipelines each). Metal's cache is shared and
+keyed by content: a probe whose `.metal` text differed by a comment recompiled the front end only
+(`prepare` 5.15 s) and its first picture took 0.09 s, so the 10 s was the GPU's back end, per
+pipeline. On this Mac mini the cache has been warm all along, which is why no test saw it.
+
+**Fix.** `AV1HybridEncoder.compileKernels()` compiles both sets; `HybridRegionEncoder.Shared`
+calls it before the encoder counts as ready, and before the idle trim swaps a fresh encoder in.
+Until then the factory has no AV1 encoder and regions start on HEVC. And a stalled encoder now
+gives up its codec only (`HostEngine.stalledVideoCodecs`, carried across an in-session resize):
+the next region forms on HEVC, and only with no codec left do tiles carry the screen.
+`aStalledAV1EncoderLeavesHEVC` runs it on the mocks; `aLive5KRegionDeliversInsideTheStallLimit`
+codes the live size. Not re-measured cold on the M5 Ultra: its cache can't be made cold again
+without clearing every app's, and the owner's work on it took priority; the change moves
+exactly the compile the cold run waited on into `prepare`.
+
+**Next** (not built): a `.metallib` built with the apps would save the front end (~5 s cold);
+Metal binary archives per GPU family could save most of the back end. The Metal toolchain is
+installed on this Mac now (component 27B47).
 
 ### The hybrid's 4:4:4 work on the GPU: its post-filters, its chroma decisions, its analysis chroma (2026-11-17)
 

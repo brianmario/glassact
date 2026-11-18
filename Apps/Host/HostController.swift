@@ -2807,9 +2807,12 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         if let recovery = autoScaleRecovery {
             engine.armScaleRecovery(fullPixels: recovery.pixels, holdUS: recovery.holdUS)
         }
-        engine.onVideoEncoderStalled = { [weak self] in
+        engine.onVideoEncoderStalled = { [weak self] codec, continues in
+            let name = VideoCodec.name(codec)
             DispatchQueue.main.async {
-                self?.onStatus("video encoder stopped answering — lossless tiles for the rest of this session")
+                self?.onStatus(continues
+                    ? "\(name) encoder stopped answering — other video codecs for the rest of this session"
+                    : "\(name) encoder stopped answering — lossless tiles for the rest of this session")
             }
         }
         // Terminal engine failure: end the transport; its terminal state

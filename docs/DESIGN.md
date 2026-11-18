@@ -600,10 +600,15 @@ first negotiated codec whose encoder starts; START carries its id.
   - The Host's AV1 is Glass Act's own encoder (`HybridRegionEncoder`, the
     hybrid), on macOS 27 with an Apple-silicon GPU. Elsewhere (macOS
     15.5–26, Intel, a VM's GPU) the Host offers HEVC only. Its kernels
-    compile once a process (6 s cold, well under 1 s once Metal has
-    cached them), started at launch
-    (`HybridRegionEncoder.prepare`); until they have, the factory has no
-    AV1 encoder and regions start on HEVC, not on a stalled queue.
+    compile once a process, every one of them, started at launch
+    (`HybridRegionEncoder.prepare`; `AV1HybridEncoder.compileKernels`
+    covers the analysis kernels the encoder would otherwise compile on a
+    picture's first use). Cold, after an install or update, that's
+    6–36 s (36 on an M5 Ultra); once Metal has cached them, well under
+    1 s. Until they have, the factory has no AV1 encoder and regions
+    start on HEVC, not on a stalled queue. (26.11.1 left the analysis
+    kernels to the first picture: 10 s cold on the M5 Ultra, past the
+    stall limit below.)
   - libaom's encoder (`AOMRegionEncoder`, below) stays in the package,
     unused: `HostController.av1Encoder = .libaom` switches back to it. It's
     no fallback where Glass Act's can't run, nor the other way round.
@@ -658,15 +663,19 @@ first negotiated codec whose encoder starts; START carries its id.
 **Lifecycle:**
 - Each region is a *generation*. The viewer drops stragglers from older
   generations.
-- **A stalled encoder ends video for the session.** VideoToolbox's calls are
-  XPC to the system's encoder service, so `VTHEVCRegionEncoder` makes all of
-  them on its own queue: one that never answers can't hold the engine's
+- **A stalled encoder ends its codec for the session.** VideoToolbox's calls
+  are XPC to the system's encoder service, so `VTHEVCRegionEncoder` makes all
+  of them on its own queue: one that never answers can't hold the engine's
   queue. `start` waits for the service at most 2 s. A frame still in the
   encoder after `videoEncoderStallUS` (3 s) means it stopped answering: the
-  region dissolves with a full repaint, no region forms again in that
-  session, and lossless tiles carry the screen. (Live, 2026-10-26: the
-  service went silent for minutes right after a virtual display came up,
-  and the session went black, then stopped answering PINGs.)
+  region dissolves with a full repaint and its codec leaves the negotiated
+  list (`stalledVideoCodecs`, kept across an in-session resize). The next
+  region forms on the next codec, so a stalled AV1 leaves HEVC; with none
+  left, no region forms again in that session and lossless tiles carry the
+  screen. (Live, 2026-10-26: the service went silent for minutes right after
+  a virtual display came up, and the session went black, then stopped
+  answering PINGs. Live, 2026-11-17: Glass Act's AV1 didn't deliver its
+  first picture in time, and before this the session lost HEVC with it.)
 - A region dissolves:
   - after `regionQuietLimit` quiet ticks: 90, or 270 when it re-formed within
     120 ticks of the last dissolve (paging workloads). The wall-time limit

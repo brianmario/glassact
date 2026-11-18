@@ -645,6 +645,16 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.splitsMotion = newValue }
     }
 
+    /// Compiles the kernels `init` leaves for a picture's first use (the analysis, at the general
+    /// and at the fixed settings: `AV1MetalEncoder.analysisKernels`). On a cold Metal cache they
+    /// take seconds: 10 s on an M5 Ultra (2026-11-17, a newly installed Host), which a live
+    /// session's first picture can't wait for (the Host gives a silent encoder 3 s). Warm, it's
+    /// milliseconds.
+    public func compileKernels() throws {
+        _ = try metal.analysisKernels(fixed: false)
+        _ = try metal.analysisKernels(fixed: true)
+    }
+
     public init(device: any MTLDevice) throws {
         metal = try AV1MetalEncoder(device: device)
         metal.preset = .turbo
