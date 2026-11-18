@@ -5,7 +5,7 @@ import Compression
 import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
-private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
+private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness", "no-codec-upgrade",
                              "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "hybrid-fast-cdef", "frames", "score-every",
                              "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
                              "no-check-pictures", "fault-reset-untold", "decoder", "chroma", "score-rgb-every"]
@@ -23,7 +23,7 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
-        .choice("video", ["mock", "vt", "av1", "hybrid", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none; hybrid: the Metal/CPU hybrid AV1 encoder in libaom's place, research)"),
+        .choice("video", ["mock", "vt", "av1", "hybrid", "av1-hevc", "hybrid-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none; hybrid: the Metal/CPU hybrid AV1 encoder in libaom's place, research; hybrid-hevc: the shipping pair, Glass Act's AV1 with HEVC on a thin link)"),
         .int("hybrid-q", "<0-63>", 0...63, "loop experiment, --video hybrid: every frame at this quantizer (libaom's scale; qindex 4q), no rate control"),
         .string("hybrid-colour", "<c>", "loop experiment, --video hybrid: the BGRA → 4:2:0 conversion (bt709Full, the default: how VideoToolbox shows the encoder's streams; bt601Full, as its header says; bt601Video; bt709Video, libaom's)"),
         .int("hybrid-key-ms", "<ms>", 1...60_000, "loop experiment, --video hybrid: what a key frame may spend, as time at the aimed rate (default the controller's)"),
@@ -52,6 +52,7 @@ let replayCommand = Command(
         .int("av1-target-pct", "<n>", 10...100, "loop experiment, --video av1: aim at n % of the target and the link cap (default 40, as in the product)"),
         .bool("prefer-smoothness", "loop: the Viewer prefers smooth motion (QUALITY preference 2), as its Moving content setting sends it"),
         .bool("no-handoff", "loop experiment: video frames claim the whole region (no per-tile handoff)"),
+        .bool("no-codec-upgrade", "loop experiment: a live region keeps its codec until it dissolves (before 26.11.3: no move up to AV1 once the link has room)"),
         .bool("timeline", "loop: print engine state once per virtual second (video coverage, handoffs, tiles, repaint debt)"),
         .int("handoff-ms", "<n>", 50...60_000, "loop experiment: how long a region tile must be still before it goes back to exact (default 1000)"),
         .int("limit-mbit", "<n>", 1...100_000, "cap the tile send rate at n Mbit/s (default: auto)"),

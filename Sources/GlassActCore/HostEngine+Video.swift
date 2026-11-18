@@ -116,38 +116,14 @@ extension HostEngine {
            negotiatedVideoCodecs.first.map(LinkRoomPolicy.governs) == true {
             stats.videoRegionsWithoutAV1 += 1
         }
-        regionEncoder = encoder
-        regionCodec = startedCodec
-        if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
-        encoder.setBitrateCap(videoRate.bitrateCap)
-        if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
-        if smoothFloor { encoder.setSmoothMotion(true) }
         regionActive = true
         regionTileBox = (c0, r0, c1, r1)
         regionPixelRect = (x, y, w, h)
-        regionStartSent = false
-        regionFrameSeq = 0
-        regionFramesPending = 0
-        regionPendingSinceUS = 0
-        regionSubmitHead = 0
-        regionEmptyDeliveries = 0
         regionQuietTicks = 0
         regionLastChangeUS = nowUS
-        syncRequestPending = false // the new generation starts on a sync frame
-        resetClaimsInFlight()
-        for row in r0...r1 {
-            for col in c0...c1 {
-                let idx = row * grid.cols + col
-                regionTileChangedUS[idx] = nowUS // still only after the first frame has shown
-                stillHash[idx] = 0
-                recordHandoffUS[idx] = 0
-                handoffBackoffUS[idx] = 0
-                handoffDue[idx] = false
-                videoShown[idx] = false
-            }
-        }
-        for t in claimPendingTiles { claimPending[Int(t)] = false }
-        claimPendingTiles.removeAll(keepingCapacity: true)
+        regionUpgradeFailed = false
+        regionShownGeneration = nil
+        beginRegionStream(encoder, codec: startedCodec, nowUS: nowUS)
         regionPixels?.deallocate()
         regionScratch?.deallocate()
         regionPixels = .allocate(byteCount: w * h * 4, alignment: 64)
@@ -164,6 +140,77 @@ extension HostEngine {
         traceDrag("region form tick=\(videoTickCounter) box=(\(c0),\(r0))-(\(c1),\(r1)) bytesOut=\(stats.bytesOut)")
         extractRegion(frame: frame, bytesPerRow: bytesPerRow, into: regionPixels!)
         refreshQuietSinceUS = 0
+        submitRegionFrame(forceSync: true)
+    }
+
+    /// A new stream for the region (`regionTileBox`, `regionPixelRect`): `encoder`, already
+    /// started under `regionGeneration`, with the policy's settings; its first frame, a sync
+    /// frame, goes with a VIDEO_START and claims every tile.
+    func beginRegionStream(_ encoder: any VideoRegionEncoder, codec: UInt8, nowUS: UInt64) {
+        regionEncoder = encoder
+        regionCodec = codec
+        if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
+        encoder.setBitrateCap(videoRate.bitrateCap)
+        if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
+        if smoothFloor { encoder.setSmoothMotion(true) }
+        regionStartSent = false
+        regionFrameSeq = 0
+        regionFramesPending = 0
+        regionPendingSinceUS = 0
+        regionSubmitHead = 0
+        regionEmptyDeliveries = 0
+        syncRequestPending = false // the new generation starts on a sync frame
+        resetClaimsInFlight()
+        let (c0, r0, c1, r1) = regionTileBox
+        for row in r0...r1 {
+            for col in c0...c1 {
+                let idx = row * grid.cols + col
+                regionTileChangedUS[idx] = nowUS // still only after the first frame has shown
+                stillHash[idx] = 0
+                recordHandoffUS[idx] = 0
+                handoffBackoffUS[idx] = 0
+                handoffDue[idx] = false
+                videoShown[idx] = false
+            }
+        }
+        for t in claimPendingTiles { claimPending[Int(t)] = false }
+        claimPendingTiles.removeAll(keepingCapacity: true)
+    }
+
+    /// Moves the live region to the codec the link allows first (`allowedVideoCodecs`) when it
+    /// ranks ahead of the region's: AV1 once the link has room, or once its encoder is ready (the
+    /// factory has none until then). A region keeps its codec until it dissolves otherwise, and a
+    /// moving screen (a lock screen's video, a full-screen movie) never does: live (26.11.2,
+    /// 2026-11-18) a lock screen ran HEVC for as long as it was shown, at 19 Mbit/s.
+    ///
+    /// In place, without a STOP: a new generation's VIDEO_START (the Viewer rebuilds the
+    /// region's decoder, as every release has) and a sync frame over the overlay, so the screen
+    /// keeps showing video and nothing is repainted. Only upward: on a link that lost its room
+    /// the region keeps AV1 until it dissolves, since a whole-screen sync frame mid-motion costs
+    /// most there (BENCHMARKS "AV1 only while the link has room"). Judged once a second.
+    func upgradeRegionCodec(nowUS: UInt64) {
+        guard upgradesLiveRegions, regionActive, !regionUpgradeFailed, let factory = videoEncoderFactory,
+              let best = allowedVideoCodecs.first, best != regionCodec,
+              let rank = negotiatedVideoCodecs.firstIndex(of: best),
+              rank < negotiatedVideoCodecs.firstIndex(of: regionCodec) ?? Int.max,
+              let encoder = factory(best) else { return }
+        let generation = regionGeneration &+ 1
+        let r = regionPixelRect
+        guard encoder.start(width: r.w, height: r.h, onFrame: { [weak self] data, sync, config in
+            self?.videoEncoderDelivered(generation: generation, data: data, sync: sync, config: config)
+        }) else {
+            regionUpgradeFailed = true
+            return
+        }
+        // The old stream's frames still in its encoder come back under the old generation and
+        // are dropped (`videoEncoderDelivered`); its frames in flight are older than the START.
+        regionEncoder?.stop()
+        if regionStartSent { regionShownGeneration = regionGeneration }  // (else still the one before)
+        regionGeneration = generation
+        beginRegionStream(encoder, codec: best, nowUS: nowUS)
+        stats.videoCodecUpgrades += 1
+        onVideoCodecChanged?(best)
+        traceDrag("region codec upgrade tick=\(videoTickCounter) codec=\(best) bytesOut=\(stats.bytesOut)")
         submitRegionFrame(forceSync: true)
     }
 
@@ -734,6 +781,7 @@ extension HostEngine {
                 return
             }
             regionStartSent = true
+            regionShownGeneration = nil  // (the START replaced it on the Viewer)
         }
         regionEmptyDeliveries = 0
         // The LWW stamp: any record sent from now on carries a seq ≥ this, so
@@ -778,10 +826,11 @@ extension HostEngine {
     /// to HEVC, but under smooth motion's ceiling and aim it delivers more
     /// than HEVC under its smooth ceiling (BENCHMARKS "AV1 at ceiling 60: a
     /// higher rate aim"). Never empty while any is negotiated.
-    /// Read when a region forms, so a change waits for the next one: switching
-    /// a live region costs a whole-screen sync frame on the new encoder,
-    /// mid-motion (6 Mbit/s photos: 68 frames against HEVC's 165; BENCHMARKS
-    /// "AV1 only while the link has room").
+    /// Read when a region forms, so a loss of room waits for the next one:
+    /// switching a live region costs a whole-screen sync frame on the new
+    /// encoder, mid-motion (6 Mbit/s photos: 68 frames against HEVC's 165;
+    /// BENCHMARKS "AV1 only while the link has room"). A gain moves the live
+    /// region up (`upgradeRegionCodec`), where the link has room for that frame.
     var allowedVideoCodecs: [UInt8] {
         guard !linkRoom.hasRoom && !policyPreferSmoothness else { return negotiatedVideoCodecs }
         let others = negotiatedVideoCodecs.filter { !LinkRoomPolicy.governs($0) }
@@ -824,10 +873,14 @@ extension HostEngine {
         // region frame) equals it is revealed for free; every other tile
         // gets a fresh send, stamped newer than all video — which is what
         // drops the overlay there. Only changed tiles cost bytes.
-        let reveal = revealUnchanged && regionStartSent && regionPixels != nil
+        // The generation the Viewer shows: this one once its START went, else, right after an
+        // upgrade, the one before (`regionShownGeneration`); none before a region's first START.
+        let shown = regionStartSent ? regionGeneration : regionShownGeneration
+        regionShownGeneration = nil
+        let reveal = revealUnchanged && shown != nil && regionPixels != nil
         var revealBits = reveal ? [UInt8](repeating: 0, count: (grid.count + 7) / 8) : []
         var revealed = 0
-        if regionStartSent {
+        if let shown {
             if reveal, let pixels = regionPixels {
                 let r = regionPixelRect
                 for row in r0...r1 {
@@ -845,7 +898,7 @@ extension HostEngine {
                     }
                 }
             }
-            sendVideoMessage(.stop(region: 0, generation: regionGeneration, reveal: revealBits))
+            sendVideoMessage(.stop(region: 0, generation: shown, reveal: revealBits))
         }
         stats.overlayTilesRevealed += revealed
         regionEncoder?.stop()

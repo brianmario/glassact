@@ -51,6 +51,9 @@ public struct HostStats: Sendable {
     /// Regions formed on another codec because the link had no room for the
     /// preferred AV1 (`LinkRoomPolicy`).
     public var videoRegionsWithoutAV1 = 0
+    /// Live regions moved to a codec the link came to allow ahead of theirs
+    /// (`upgradeRegionCodec`: AV1 once the link has room or its encoder is ready).
+    public var videoCodecUpgrades = 0
     /// Submit → delivery time of encoded frames, summed (with `clock`;
     /// virtual-time rigs record 0), and how many.
     public var videoEncodeUSSum: UInt64 = 0
@@ -336,8 +339,17 @@ public final class HostEngine: @unchecked Sendable {
     /// Codecs whose encoder stopped answering this session, dropped from
     /// `negotiatedVideoCodecs`: regions form on the next codec instead.
     var stalledVideoCodecs: [UInt8] = []
-    /// The codec the live region started on (VIDEO_START's).
+    /// The codec the live region's stream runs (its last VIDEO_START's).
     var regionCodec: UInt8 = 0
+    /// The live region tried to move to a better codec and its encoder wouldn't start
+    /// (`upgradeRegionCodec`): no more tries until the next region.
+    var regionUpgradeFailed = false
+    /// After an upgrade, until the new stream's VIDEO_START goes: the generation the Viewer
+    /// still shows (its last START), which a dissolve in that window stops.
+    var regionShownGeneration: UInt32?
+    /// Experiment (the bench's `--no-codec-upgrade`): false keeps a live region's codec until it
+    /// dissolves, as before 26.11.3.
+    public var upgradesLiveRegions = true
     /// An encoder stopped answering (engine queue): its codec, and whether
     /// video goes on with another (false: lossless tiles from now on).
     public var onVideoEncoderStalled: ((_ codec: UInt8, _ videoContinues: Bool) -> Void)?
@@ -1058,6 +1070,9 @@ public final class HostEngine: @unchecked Sendable {
                                    reports: linkReports) {
                 updateSmoothFloor()
             }
+            // A region that formed before AV1 was allowed (a session starts without room) or
+            // ready (its kernels compiling) moves to it: a moving screen never dissolves.
+            upgradeRegionCodec(nowUS: nowUS)
         }
     }
 
