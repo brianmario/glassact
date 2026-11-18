@@ -214,7 +214,7 @@ the numbers and the reasoning.
 | A minimum encoder cap (2–3 Mbit/s) for sharper text on thin links | rejected | 1M scroll-win 98 → 51 frames; 2M cursor-drag 326 → 286 | [entry](#how-low-can-video-go-ratequality-knees-looser-floors-prefer-smooth-motion-2026-10-25) |
 | AV1 only while the link has room (delivered ≥ 6 Mbit/s on, queued < 4 off; at the next region) | kept | 2–3 Mbit/s: HEVC's frames and latency (2M cursor-drag 326 · 641 ms vs AV1 alone 283 · 1183 ms); 10 Mbit/s: AV1 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
 | Switch a live region's codec in place | rejected | 6 Mbit/s photos 68 frames vs HEVC 165 | [entry](#av1-only-while-the-link-has-room-2026-10-25) |
-| The Host's AV1 kernels as metallibs built with the app (front end compiled offline) | built; shipping them is the owner's call | a cold front end 5.49 s → 0.000 s (encoder, M4 Pro); the encoder's bytes identical; the Host's download +8.5 MB compressed (13.5 MB of metallibs: each of 64 kernels with its own inlined code) | [entry](#the-av1-kernels-compiled-with-the-app-2026-11-18) |
+| The Host's AV1 kernels as metallibs built with the app (front end compiled offline) | not shipped (owner, 2026-11-18): the build compiles them as a check only | a cold front end 5.49 s → 0.000 s (encoder, M4 Pro); the encoder's bytes identical; the Host's download +8.5 MB compressed (13.5 MB of metallibs: each of 64 kernels with its own inlined code) | [entry](#the-av1-kernels-compiled-with-the-app-2026-11-18) |
 | Fixed grid of video cells (an encoder per cell) instead of one full-screen region | rejected | 4×4 HEVC: 48–69 % of the bytes on typing but 110–145 % on drag, scroll and photos; motion crossing cell edges loses prediction | [entry](#video-cells-instead-of-one-full-screen-region-rejected-2026-10-25) |
 | Slower libaom speeds (8 and below) | rejected | ≤ +0.7 SSIMULACRA2 for 38–57 % more encode time; 7, 6 and 5 identical | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
 | VP9 (libvpx real-time) instead of AV1 | rejected | ~2 dB worse on text at equal bytes, 2.5× the bytes on scrolling, frame sizes no steadier; no Apple hardware decode | [entry](#real-time-av1-slower-libaom-speeds-and-svt-av1-at-session-size-2026-10-25) |
@@ -371,14 +371,19 @@ The Host compiled Glass Act's AV1 kernels from source when it started: the front
 AIR) and then the GPU back end per pipeline. On a cold Metal cache, after an install or update,
 that was 6–36 s (the 2026-11-17 entry below). The front end can be done at build time.
 
+**Decision (owner).** Not shipped: 8.5 MB on every Host download for 5.5 s once per install.
+The Host's build compiles them as a check, so a kernel that doesn't compile fails the build and
+CI's app builds; the Host still compiles the sources when it starts. What follows is what was
+built and measured; `AV1Kernels.compiled` keeps loading them possible (tests, the bench).
+
 **How.** `scripts/build-rust --xcode --shaders` (the Host's build phase) also compiles the three
-kernel sets into `Resources/AV1Shaders/{encoder,entropy,postfilter}.metallib`, from the text the
-runtime compiles: the same quoted includes, the encoder's derived tables (rust/av1's new
+kernel sets into `{encoder,entropy,postfilter}.metallib` (under `.build/rust/metallib/check`; the
+measurements below were with them in the app's Resources/AV1Shaders), from the text the runtime
+compiles: the same quoted includes, the encoder's derived tables (rust/av1's new
 `tables_msl` example writes the `av1enc_tables.h` the runtime makes), system includes empty,
-MSL 4.1, safe math, macOS 27.0 as the minimum. `AV1Kernels.shipped` loads them where the app has
-them, else compiles the sources as before (tests, the bench, a Debug build on a Mac without the
-toolchain). A Release build fails without the toolchain, and the release workflow downloads it.
-Skipped when no input changed (0.25 s); a full compile is 5.6 s.
+MSL 4.1, safe math, macOS 27.0 as the minimum. Without the toolchain the build warns and skips
+the check; CI's app job downloads it. Skipped when no input changed (0.25 s); a full compile is
+5.6 s.
 
 `CompiledKernelsTests` (M4 Pro): every kernel the source has, and the encoder's bytes identical
 on both (8 pictures, key and inter frames, at 640×360 and 1000×562).

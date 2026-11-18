@@ -19,17 +19,18 @@ public import Metal
 /// pointer of the shared headers. The GPU encoder is therefore macOS 27+;
 /// older Hosts keep HEVC (DESIGN §4.6).
 ///
-/// The Host app carries the kernels compiled (`AV1Kernels.compiled`): `scripts/build-rust
-/// --xcode --shaders` builds them into metallibs with the same text, language version and math
-/// mode, where the Metal toolchain is installed (`xcodebuild -downloadComponent MetalToolchain`;
-/// a Release build requires it). That saves the front end's compile on a cold Metal cache (5 s
-/// of the encoder's on an M4 Pro) and moves compile errors to build time.
+/// The app's build also compiles them offline into metallibs, as a check: `scripts/build-rust
+/// --xcode --shaders`, with the same text, language version and math mode, where the Metal
+/// toolchain is installed (`xcodebuild -downloadComponent MetalToolchain`; CI's app builds have
+/// it), so a kernel that doesn't compile fails the build. `CompiledKernelsTests` holds the
+/// metallibs to the source (`AV1Kernels.compiled`).
 ///
 /// ## Deviations
-/// SwiftPM builds (tests, the bench) compile from source at run time (`AV1Kernels.source`): a
-/// package can't run the offline compiler, which is a separate toolchain download. The app
-/// carries the sources too (its Resources/AV1Shaders, laid out as under `Sources/`), for a
-/// Debug build on a Mac without the toolchain.
+/// Compiled at run time from source, not from the metallibs: they're 13.5 MB (8.5 MB in the
+/// Host's download, against ~10 MB for the rest) for 5.5 s of a cold start once per install
+/// (BENCHMARKS "The AV1 kernels compiled with the app", 2026-11-18). The source is the app's
+/// copy where there is one (Resources/AV1Shaders, laid out as under `Sources/`), else the source
+/// tree (`#filePath`: tests, the bench).
 public enum AV1ShaderSource {
     /// Where quoted includes are looked up, in order.
     public static let defaultIncludeDirectories: [URL] = includeDirectories(in: sourceRoot)
@@ -150,24 +151,16 @@ public enum AV1ShaderSource {
     }
 }
 
-/// Where the AV1 kernels come from: metallibs built with the Host app, or their sources,
-/// compiled when the encoder starts (`AV1ShaderSource`).
+/// Where the AV1 kernels come from: their sources, compiled when the encoder starts
+/// (`AV1ShaderSource`), or metallibs (`scripts/build-rust --metallib`: tests, the bench).
 public enum AV1Kernels: Sendable, Equatable {
-    /// `<name>.metallib` in this directory (`scripts/build-rust --metallib`).
+    /// `<name>.metallib` in this directory.
     case compiled(URL)
     /// Sources laid out as under `Sources/`, compiled at run time.
     case source(URL)
 
-    /// The app's metallibs where it has them, else the sources (the app's copy, or the tree's).
-    public static let shipped: AV1Kernels = bundled(in: .main) ?? .source(AV1ShaderSource.sourceRoot)
-
-    /// The metallibs `bundle` carries (Resources/AV1Shaders), nil for none.
-    public static func bundled(in bundle: Bundle) -> AV1Kernels? {
-        guard let directory = bundle.resourceURL?.appending(path: "AV1Shaders", directoryHint: .isDirectory),
-              FileManager.default.fileExists(atPath: directory.appending(path: "encoder.metallib").path)
-        else { return nil }
-        return .compiled(directory)
-    }
+    /// What the Host runs: the sources, the app's copy or the tree's.
+    public static let shipped: AV1Kernels = .source(AV1ShaderSource.sourceRoot)
 
     /// The library of `name`'s kernels (encoder, entropy, postfilter) for `device`.
     @available(macOS 27, iOS 27, *)

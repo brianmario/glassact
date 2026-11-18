@@ -20,10 +20,11 @@ enum MetalToolchain {
     }
 }
 
-/// The Host app's kernels are metallibs (`scripts/build-rust --xcode --shaders`, `AV1Kernels`),
-/// compiled offline from the text the runtime compiles. They must be the same kernels: every
-/// function the source has, and the same bytes out of the encoder. Needs the Metal toolchain
-/// (`xcodebuild -downloadComponent MetalToolchain`), which CI's runners may not have.
+/// The Host's build compiles the kernels offline as a check (`scripts/build-rust --xcode
+/// --shaders`), from the text the runtime compiles. That check is only worth something if what it
+/// compiles is the kernels the Host runs: every function the source has, and the same bytes out
+/// of the encoder on them (`AV1Kernels.compiled`). Needs the Metal toolchain (`xcodebuild
+/// -downloadComponent MetalToolchain`) and a real GPU, which CI's VMs don't have.
 @Suite(.serialized, .enabled(if: AV1ShaderSource.hasCapableGPU && MetalToolchain.isInstalled
                                  && glassact_aom_available() != 0,
                              "needs an Apple-silicon GPU, the Metal toolchain and libaom (arm64)"))

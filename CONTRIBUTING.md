@@ -21,9 +21,9 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
   `aarch64-apple-ios` and `aarch64-apple-ios-sim` (and `x86_64-apple-ios` for
   a generic Simulator build) for the iPad Viewer.
 - The Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`, once):
-  the Host's build compiles the AV1 encoder's kernels into metallibs with it.
-  A Debug build without it warns, and that Host compiles them when it
-  starts; a Release build needs it.
+  the Host's build compiles the AV1 encoder's kernels with it, to check that
+  they compile (the Host still compiles them when it starts). Without it the
+  build warns and skips the check.
 
 The package uses system frameworks only, plus the vendored libwebp and
 libaom in `ThirdParty/`; the apps also use Sparkle for updates. Don't add

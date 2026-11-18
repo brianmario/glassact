@@ -67,7 +67,7 @@ and tool, each block's bits as the writer codes it (`ENC_BLOCK_BITS`).
 
 `examples/tables_msl.rs` writes the encoder's derived tables as Metal source (`enc::tables_msl`,
 the `av1enc_tables.h` the kernels include) to a file, for the Host's build to compile the kernels
-into metallibs (`scripts/build-rust --metallib`).
+offline as a check (`scripts/build-rust --metallib`).
 
 `src/tables` is generated from the C table headers (`scripts/gen-av1-rust-tables`) so that the CPU
 and the GPU use the same values. Never edit it by hand. The inter frames' tables

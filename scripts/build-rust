@@ -7,10 +7,12 @@
 #                                   from an app target's run-script phase: Xcode's PLATFORM_NAME
 #                                   and ARCHS. macOS → .build/rust/libglassact_av1.a, as above;
 #                                   iPadOS and its Simulator → .build/rust/<platform>/ (AV1Core's
-#                                   -L for iOS). --shaders also puts the AV1 encoder's kernels in
-#                                   the app's Resources/AV1Shaders (AV1ShaderSource): their sources,
-#                                   and compiled into metallibs where the Metal toolchain is
-#                                   installed (a Release build requires it).
+#                                   -L for iOS). --shaders also copies the AV1 encoder's kernel
+#                                   sources into the app's Resources/AV1Shaders (AV1ShaderSource),
+#                                   and, where the Metal toolchain is installed, compiles them into
+#                                   metallibs under .build/rust/metallib/check: a check that they
+#                                   compile, so an error fails the build (the app doesn't carry
+#                                   them: BENCHMARKS "The AV1 kernels compiled with the app").
 #   scripts/build-rust --copy-shaders <dir>   only the sources' copy, into <dir> (a test checks it)
 #   scripts/build-rust --metallib <dir>       only the metallibs, into <dir> (tests, the bench)
 # `just` runs it before every build and test; run it yourself before a bare `swift build`. Xcode
@@ -161,16 +163,11 @@ case "${1:-}" in
         esac
         if [ "${2:-}" = "--shaders" ]; then
             : "${TARGET_BUILD_DIR:?} ${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}"
-            shaders="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AV1Shaders"
-            copy_shaders "$shaders"
+            copy_shaders "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AV1Shaders"
             if has_metal; then
-                build_metallibs "$shaders"
-            elif [ "${CONFIGURATION:-}" = Release ]; then
-                echo "error: build-rust: a Release build needs the Metal toolchain for the AV1 kernels' metallibs (xcodebuild -downloadComponent MetalToolchain)" >&2
-                exit 1
+                build_metallibs "$out/metallib/check"
             else
-                echo "warning: build-rust: no Metal toolchain: the Host compiles the AV1 kernels when it starts (xcodebuild -downloadComponent MetalToolchain)"
-                rm -f "$shaders"/*.metallib
+                echo "warning: build-rust: no Metal toolchain, so the AV1 kernels weren't checked; they compile when the Host starts (xcodebuild -downloadComponent MetalToolchain)"
             fi
         fi
         ;;
