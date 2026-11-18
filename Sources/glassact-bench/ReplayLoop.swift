@@ -1,8 +1,11 @@
 // replay --mode loop: host engine -> seeded faults -> viewer engine over
 // virtual time, then the §7 settle and the golden canvas check.
 import Foundation
+import GlassActAV1
+import GlassActAV1Decode
 import GlassActCodec
 import GlassActCore
+import GlassActHybridVideo
 import GlassActTransport
 import GlassActWire
 
@@ -34,8 +37,49 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var encoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
     var decoderFactory: (() -> any VideoRegionDecoder)?
     var hostCodecs: [UInt8] = []
+    // --video hybrid: each frame's qindex and whether it's a key frame (the encoder's threads)
+    final class HybridLog: @unchecked Sendable {
+        let lock = NSLock()
+        var qindex: [Int] = [], keys = 0, keyQindex: [Int] = []
+    }
+    let hybridLog = HybridLog()
+    // --fault-decode / --fault-reset / --fault-dissolve (ReplayVideoFaults), and with the hybrid
+    // the check that every frame shown is the encoder's picture (also --check-pictures)
+    let videoFaults = ReplayVideoFaults()
+    func counts(_ name: String) -> [Int] {
+        (opts.string(name) ?? "").split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+    videoFaults.decodeAt = Set(counts("fault-decode"))
+    videoFaults.resetAt = counts("fault-reset").sorted()
+    videoFaults.dissolveAt = counts("fault-dissolve").sorted()
+    videoFaults.armed()
+    videoFaults.checksPictures = videoMode == "hybrid" && (videoFaults.active || opts.has("check-pictures"))
+        && !opts.has("no-check-pictures")
+    let resetUntold = opts.has("fault-reset-untold")
+    videoFaults.armed()
+    videoFaults.now = { link.nowUS }
     var viewerCodecs: [UInt8] = []
+    // --decoder: the Viewer's AV1 decoder (--video hybrid); the own decoders made, for their stats
+    let viewerDecoder = opts.string("decoder")
+    if viewerDecoder != nil && videoMode != "hybrid" { throw BenchError("--decoder: with --video hybrid") }
+    var ownDecoders: [OwnAV1RegionDecoder] = []
     let vtPipeline = BenchVTPipeline()
+    let score = ReplayVideoScore()
+    score.now = { link.nowUS }
+    score.scoreEvery = opts.int("score-every", 4)
+    if opts.has("score-rgb-every") {
+        score.rgbEvery = opts.int("score-rgb-every", 30)
+        score.ssimu2 = try SSIMULACRA2Scorer.make(setting: nil)
+    }
+    // --chroma 444: the hybrid's 4:4:4 streams (our decoder shows them)
+    let chroma = opts.string("chroma") ?? "420"
+    guard chroma == "420" || chroma == "444" else { throw BenchError("--chroma \(chroma): 420 or 444") }
+    let c444 = chroma == "444"
+    if c444 && videoMode != "hybrid" { throw BenchError("--chroma 444: with --video hybrid") }
+    if c444 && (opts.string("decoder") ?? "own") != "own" { throw BenchError("--chroma 444: --decoder own (VideoToolbox decodes no 4:4:4)") }
+    vtPipeline.score = score
+    // the Viewer's decoder, scored (real codecs)
+    func scored(_ d: any VideoRegionDecoder) -> any VideoRegionDecoder { ScoringDecoder(d, score) }
     if opts.has("max-qp") { vtPipeline.defaultMaxFrameQP = opts.int("max-qp", 34) }
     if opts.has("min-encoder-cap") { vtPipeline.minEncoderCap = opts.int("min-encoder-cap", 2000) * 1000 }
     switch videoMode {
@@ -50,7 +94,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         encoderFactory = {
             $0 == VideoCodec.hevc ? BenchPipelinedEncoder(VTHEVCRegionEncoder(callbackQueue: .main), vtPipeline) : nil
         }
-        decoderFactory = { VTRegionDecoder() }
+        decoderFactory = { scored(VTRegionDecoder()) }
         hostCodecs = [VideoCodec.hevc]
         viewerCodecs = [VideoCodec.hevc]
     case "av1":
@@ -64,7 +108,67 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
             return BenchPipelinedEncoder(aom, vtPipeline)
         }
         // The Viewer's path, hardware decode, where this Mac has it.
-        decoderFactory = { VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder() }
+        decoderFactory = { scored(VTRegionDecoder.canDecodeAV1 ? VTRegionDecoder() as any VideoRegionDecoder : AOMRegionDecoder()) }
+        hostCodecs = [VideoCodec.av1]
+        viewerCodecs = [VideoCodec.av1]
+    case "hybrid":
+        // The Metal/CPU hybrid AV1 encoder (GlassActHybridVideo) in libaom's place, at libaom's
+        // aim; decoded as the Viewer decodes AV1.
+        guard #available(macOS 27, *), HybridRegionEncoder.isAvailable else {
+            throw BenchError("--video hybrid needs macOS 27 and an Apple-silicon GPU")
+        }
+        let fixed = opts.has("hybrid-q") ? opts.int("hybrid-q", 20) : nil
+        guard let colour = I420Converter.Colour(rawValue: opts.string("hybrid-colour") ?? "bt709Full") else {
+            throw BenchError("--hybrid-colour: \(I420Converter.Colour.allCases.map(\.rawValue).joined(separator: ", "))")
+        }
+        let targetPct = opts.int("av1-target-pct", 40)
+        let qmax = opts.has("av1-qmax") ? opts.int("av1-qmax", 42) : nil
+        let keyBudgetMS = opts.int("hybrid-key-ms", 0), minQ = opts.int("hybrid-min-qindex", -1)
+        let keyLinkMS = opts.int("hybrid-key-link-ms", 0)
+        let fastCDEF = opts.has("hybrid-fast-cdef")
+        encoderFactory = {
+            guard $0 == VideoCodec.av1 else { return nil }
+            let h = HybridRegionEncoder(callbackQueue: .main, colour: colour, chroma444: c444)
+            h.fixedQindex = fixed.map { $0 == 63 ? 255 : 4 * $0 }
+            h.targetPercent = targetPct
+            h.quantizerCeiling = qmax
+            if keyBudgetMS > 0 { h.keyBudgetUS = UInt64(keyBudgetMS) * 1000 }
+            if minQ >= 0 { h.minQindex = minQ }
+            if keyLinkMS > 0 { h.keyLinkUS = UInt64(keyLinkMS) * 1000 }
+            let planes = videoFaults.checksPictures  // (the reconstruction too)
+            if planes || fastCDEF {
+                h.configure = { e in
+                    if planes { e.returnsPlanes = true }
+                    if fastCDEF { e.newPictureEffort?.cdef = true }
+                }
+            }
+            h.onWritten = { frame, key, seconds in
+                videoFaults.written(frame, key: key, seconds: seconds)
+                let q = frame.timing.qindex
+                hybridLog.lock.withLock {
+                    hybridLog.qindex.append(q)
+                    if key {
+                        hybridLog.keys += 1
+                        hybridLog.keyQindex.append(q)
+                    }
+                }
+            }
+            return BenchPipelinedEncoder(h, vtPipeline)
+        }
+        switch viewerDecoder ?? (c444 ? "own" : VTRegionDecoder.canDecodeAV1 ? "vt" : "aom") {
+        case "vt":
+            guard VTRegionDecoder.canDecodeAV1 else { throw BenchError("--decoder vt: this Mac has no hardware AV1 decode") }
+            decoderFactory = { scored(VTRegionDecoder()) }
+        case "aom":
+            guard AOMRegionEncoder.isAvailable else { throw BenchError("--decoder aom needs Apple silicon (libaom is arm64 only)") }
+            decoderFactory = { scored(AOMRegionDecoder()) }
+        default:
+            decoderFactory = {
+                let d = OwnAV1RegionDecoder()
+                ownDecoders.append(d)
+                return scored(d)
+            }
+        }
         hostCodecs = [VideoCodec.av1]
         viewerCodecs = [VideoCodec.av1]
     case "av1-hevc":
@@ -86,11 +190,16 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                 return nil
             }
         }
-        decoderFactory = { VTRegionDecoder() }
+        decoderFactory = { scored(VTRegionDecoder()) }
         hostCodecs = [VideoCodec.av1, VideoCodec.hevc]
         viewerCodecs = [VideoCodec.av1, VideoCodec.hevc]
     default:
-        throw BenchError("--video expects mock, vt, av1 or av1-hevc")
+        throw BenchError("--video expects mock, vt, av1, hybrid or av1-hevc")
+    }
+    if videoFaults.active, let real = decoderFactory {
+        // (real() made the own decoder last, when it's ours)
+        let own = viewerDecoder == "own" || c444
+        decoderFactory = { FaultingDecoder(real(), videoFaults, checking: own ? ownDecoders.last : nil) }
     }
     let host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: encoderFactory,
@@ -135,7 +244,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // onto the main queue (this rig's engine queue). Every submitted frame is
     // delivered before virtual time moves on (BenchVTPipeline).
     func drainVTOutput() {
-        if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" { vtPipeline.drain() }
+        if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" { vtPipeline.drain() }
     }
 
     // Video coverage: how much of the replay's screen-time the viewer
@@ -148,12 +257,40 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var nextBacklogSampleUS: UInt64 = 0
     let timeline = opts.has("timeline")
     var nextTimelineUS: UInt64 = 0
+    // the video faults that come by the Host's frame count
+    var hostResetDueUS: UInt64?
+    func videoFaultsTick() {
+        let sent = host.stats.videoFramesSent
+        if let n = videoFaults.resetAt.first, sent >= n {
+            videoFaults.resetAt.removeFirst()
+            // the stream fails: what's in flight is lost, the Viewer hears of it now, the Host
+            // (its encode queue) later; what it sends meanwhile goes on the replacement stream
+            videoFaults.noteReset(lost: link.dropVideoInFlight())
+            viewer.resetVideoStream()
+            // (--fault-reset-untold: never; the region recovers in place from a sync request)
+            hostResetDueUS = resetUntold ? nil : link.nowUS + 20_000
+        }
+        if let due = hostResetDueUS, link.nowUS >= due {
+            hostResetDueUS = nil
+            host.videoChannelReset()
+        }
+        if let n = videoFaults.dissolveAt.first, sent >= n {
+            videoFaults.dissolveAt.removeFirst()
+            if host.activeVideoRegionCount > 0 {
+                videoFaults.noteDissolve()
+                // (the Host's dissolve on a lost stream, with the stream kept: a full repaint, and
+                // the region re-forms on the next churn)
+                host.videoChannelReset()
+            }
+        }
+    }
     func drive(untilUS: UInt64) {
         var t = link.nowUS
         while t < untilUS {
             t = min(t + 1_000, untilUS)
             link.advance(toUS: t)
             drainVTOutput()
+            if videoFaults.active { videoFaultsTick() }
             timed(&timings.viewerTick) { viewer.tick(nowUS: link.nowUS) }
             timed(&timings.hostTick) { host.tick(nowUS: link.nowUS) }
             if timeline && t >= nextTimelineUS {
@@ -237,7 +374,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     }
     var lastFeedUS = link.nowUS
 
-    while let meta = try reader.readFrame(rects: &rects, into: frameBuf) {
+    let frameLimit = opts.has("frames") ? opts.int("frames", 0) : Int.max
+    while frames < frameLimit, let meta = try reader.readFrame(rects: &rects, into: frameBuf) {
         let base = baseTS ?? meta.timestampUS
         baseTS = base
         driveStill(since: lastFeedUS, untilUS: replayStartUS + (meta.timestampUS &- base))
@@ -401,7 +539,28 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
       cpu viewer: datagrams \(ms(timings.viewerDatagram))  video \(ms(timings.viewerVideo))  \
     control \(ms(timings.viewerControl))  tick \(ms(timings.viewerTick))
     """)
-    if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" {
+    if videoMode == "vt" || videoMode == "av1" || videoMode == "av1-hevc" || videoMode == "hybrid" {
+        print(score.summary(videoBytes: host.stats.videoBytesSent))
+        if score.rgbEvery > 0 { print(score.rgbSummary()) }
+        print(score.decodeTimeSummary)
+        if !ownDecoders.isEmpty {
+            let st = ownDecoders.map(\.stats)
+            func sum(_ f: (OwnAV1RegionDecoder.Stats) -> UInt64) -> Double { Double(st.map(f).reduce(0, +)) / 1e6 }
+            let (n, k) = (st.map(\.framesShown).reduce(0, +), st.map(\.keyFramesShown).reduce(0, +))
+            func each(_ total: Double, _ count: Int) -> String { count == 0 ? "-" : String(format: "%.2f", total / Double(count)) }
+            print("  own decoder: \(ownDecoders.count) started, \(n) frames shown (\(k) key), \(st.map(\.failures).reduce(0, +)) failed · "
+                  + "ms a frame: key decode \(each(sum(\.keyDecodeNS), k)) + conversion \(each(sum(\.keyConvertNS), k)) · "
+                  + "inter decode \(each(sum(\.decodeNS) - sum(\.keyDecodeNS), n - k)) + conversion \(each(sum(\.convertNS) - sum(\.keyConvertNS), n - k))")
+        }
+        if videoFaults.active {
+            print(videoFaults.summary + " · sync requests ignored by the Host \(host.stats.videoSyncRequestsIgnored)"
+                  + " · stream resets the Host saw \(host.stats.videoChannelResets)")
+        }
+        if videoMode == "hybrid" {
+            let (qs, keys, keyQ) = hybridLog.lock.withLock { (hybridLog.qindex.sorted(), hybridLog.keys, hybridLog.keyQindex) }
+            func at(_ p: Double) -> Int { qs.isEmpty ? -1 : qs[min(qs.count - 1, Int(Double(qs.count) * p))] }
+            print("  hybrid: \(qs.count) frames, \(keys) key frames at qindex \(keyQ) · qindex p10 \(at(0.1)) p50 \(at(0.5)) p90 \(at(0.9)) max \(qs.last ?? -1)")
+        }
         print("  \(videoMode!): \(vtPipeline.submits) submits took \(ms(vtPipeline.submitNS)) of host encode  "
               + "waited \(ms(vtPipeline.waitNS)) for output (max \(ms(vtPipeline.maxWaitNS)) at one step)  "
               + "stalls \(vtPipeline.stalls)")
@@ -442,6 +601,8 @@ final class BenchVTPipeline {
     /// part of the host's encode time.
     fileprivate(set) var submitNS: UInt64 = 0
     fileprivate(set) var submits = 0
+    /// What the Viewer was given (`ReplayVideoScore`).
+    var score: ReplayVideoScore?
     static let stallLimitNS: UInt64 = 5_000_000_000
 
     func drain() {
@@ -472,6 +633,10 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     private let inner: any VideoRegionEncoder
     private let pipeline: BenchVTPipeline
     private var pending = 0
+    /// The submits' real times, and what the target was (`ReplayVideoScore`).
+    private var submittedNS: [UInt64] = []
+    private var width = 0, height = 0, level = 0
+    private var cap: Int?
 
     init(_ inner: any VideoRegionEncoder, _ pipeline: BenchVTPipeline) {
         self.inner = inner
@@ -483,10 +648,13 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
 
     func start(width: Int, height: Int,
                onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
-        inner.start(width: width, height: height) { [weak self] data, sync, config in
+        (self.width, self.height) = (width, height)
+        return inner.start(width: width, height: height) { [weak self] data, sync, config in
             if let self, self.pending > 0 {
                 self.pending -= 1
                 self.pipeline.outstanding = max(0, self.pipeline.outstanding - 1)
+                let t0 = self.submittedNS.isEmpty ? DispatchTime.now().uptimeNanoseconds : self.submittedNS.removeFirst()
+                self.pipeline.score?.delivered(data, latency: Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1e9)
             }
             onFrame(data, sync, config)
         }
@@ -495,15 +663,23 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
         pending += 1
         pipeline.outstanding += 1
+        pipeline.score?.submitted(bgra: bgra, width: width, height: height, timeUS: timeUS,
+                                  target: AOMRegionEncoder.target(base: AOMRegionEncoder.baseBitrate(width: width, height: height),
+                                                                  level: level, cap: cap))
         let t0 = DispatchTime.now().uptimeNanoseconds
+        submittedNS.append(t0)
         inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
         pipeline.submitNS &+= DispatchTime.now().uptimeNanoseconds &- t0
         pipeline.submits += 1
     }
 
-    func setQualityLevel(_ level: Int) { inner.setQualityLevel(level) }
+    func setQualityLevel(_ level: Int) {
+        self.level = level
+        inner.setQualityLevel(level)
+    }
     func setBitrateCap(_ bitsPerSecond: Int?) {
-        inner.setBitrateCap(bitsPerSecond.map { max($0, pipeline.minEncoderCap ?? 0) })
+        cap = bitsPerSecond.map { max($0, pipeline.minEncoderCap ?? 0) }
+        inner.setBitrateCap(cap)
     }
     func setMaxFrameQP(_ qp: Int?) { inner.setMaxFrameQP(qp ?? pipeline.defaultMaxFrameQP) }
     func setSmoothMotion(_ on: Bool) { inner.setSmoothMotion(on) }
@@ -511,6 +687,8 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     /// The stopped encoder drops deliveries still queued.
     func stop() {
         pipeline.outstanding = max(0, pipeline.outstanding - pending)
+        for _ in 0..<pending { pipeline.score?.dropped() }
+        submittedNS = []
         pending = 0
         inner.stop()
     }

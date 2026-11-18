@@ -202,10 +202,12 @@ final class ViewerSettings {
     }
 
     private static let av1Key = "glassact.viewer.videoAV1"
-    /// Ask for AV1 video instead of hardware HEVC: sharper moving text and
-    /// lower encode latency, for more bandwidth and Host CPU; on a thin link
-    /// HEVC looks better (BENCHMARKS "AV1 back, as a Viewer opt-in"). Off by
-    /// default; needs hardware AV1 decode here.
+    /// Ask for AV1 video instead of hardware HEVC: Glass Act's own encoder on
+    /// an up-to-date Host (macOS 27, Apple silicon), sharper text on fewer
+    /// bytes (BENCHMARKS "the hybrid as a live video encoder"). Decoded by
+    /// VideoToolbox where this Mac has AV1 hardware, else by Glass Act's own
+    /// decoder (`ViewerVideoDecoders.glassAct`), so any Mac can opt in. Off
+    /// by default.
     var videoAV1: Bool = UserDefaults.standard.bool(forKey: ViewerSettings.av1Key) {
         didSet { UserDefaults.standard.set(videoAV1, forKey: Self.av1Key) }
     }

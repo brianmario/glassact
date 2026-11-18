@@ -33,8 +33,13 @@ final class SSIMULACRA2Scorer {
             }) else { return nil }
             binary = URL(fileURLWithPath: "\(dir)/ssimulacra2")
         }
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("glassact-vquality-\(ProcessInfo.processInfo.processIdentifier)")
+        // $TMPDIR when it's set (a caller's scratch directory: the frames it writes are trace
+        // content), else the user's temporary directory; a directory a scorer (av1seq --two-steps
+        // has two at once)
+        let base = ProcessInfo.processInfo.environment["TMPDIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.temporaryDirectory
+        let dir = base
+            .appendingPathComponent("glassact-vquality-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return SSIMULACRA2Scorer(binary: binary, dir: dir)
     }
@@ -114,7 +119,7 @@ final class SSIMULACRA2Scorer {
 }
 
 /// An opaque BGRA buffer as an sRGB PNG.
-private func writePNG(_ pixels: UnsafeMutableRawBufferPointer, _ width: Int, _ height: Int, to url: URL) throws {
+func writePNG(_ pixels: UnsafeMutableRawBufferPointer, _ width: Int, _ height: Int, to url: URL) throws {
     guard let ctx = CGContext(data: pixels.baseAddress, width: width, height: height,
                               bitsPerComponent: 8, bytesPerRow: width * 4,
                               space: CGColorSpace(name: CGColorSpace.sRGB)!,

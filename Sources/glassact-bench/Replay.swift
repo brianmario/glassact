@@ -6,7 +6,9 @@ import GlassActCodec
 
 /// Flags that only mean something in `--mode loop`.
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness",
-                             "link-mbit", "link-buffer-ms"]
+                             "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "hybrid-fast-cdef", "frames", "score-every",
+                             "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
+                             "no-check-pictures", "fault-reset-untold", "decoder", "chroma", "score-rgb-every"]
 
 let replayCommand = Command(
     name: "replay",
@@ -21,7 +23,24 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
-        .choice("video", ["mock", "vt", "av1", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none)"),
+        .choice("video", ["mock", "vt", "av1", "hybrid", "av1-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none; hybrid: the Metal/CPU hybrid AV1 encoder in libaom's place, research)"),
+        .int("hybrid-q", "<0-63>", 0...63, "loop experiment, --video hybrid: every frame at this quantizer (libaom's scale; qindex 4q), no rate control"),
+        .string("hybrid-colour", "<c>", "loop experiment, --video hybrid: the BGRA → 4:2:0 conversion (bt709Full, the default: how VideoToolbox shows the encoder's streams; bt601Full, as its header says; bt601Video; bt709Video, libaom's)"),
+        .int("hybrid-key-ms", "<ms>", 1...60_000, "loop experiment, --video hybrid: what a key frame may spend, as time at the aimed rate (default the controller's)"),
+        .int("hybrid-key-link-ms", "<ms>", 1...60_000, "loop experiment, --video hybrid: what a key frame may spend as time at the link's cap (default the controller's)"),
+        .int("hybrid-min-qindex", "<n>", 1...255, "loop experiment, --video hybrid: the rate controller's qindex floor (default the controller's)"),
+        .bool("hybrid-fast-cdef", "loop experiment, --video hybrid: the encoder's fast (mostly-new) pictures keep CDEF (AV1HybridEncoder.NewPictureEffort.cdef)"),
+        .int("frames", "<n>", 1...1_000_000, "loop: feed only the trace's first n frames"),
+        .string("fault-decode", "<n,…>", "loop, real codecs: the Viewer's nth frames (from 1, over the session) reach its decoder corrupted, which fails and is rebuilt (deterministic)"),
+        .string("fault-reset", "<n,…>", "loop, real codecs: the video stream fails once the Host has sent n frames (what's in flight is lost; the Viewer hears at once, the Host 20 ms later)"),
+        .string("fault-dissolve", "<n,…>", "loop, real codecs: the Host's region dissolves once it has sent n frames (it re-forms as the screen changes)"),
+        .bool("no-check-pictures", "loop, --video hybrid: no picture check with --fault-* (the encoder as the product runs it, without its reconstruction)"),
+        .bool("fault-reset-untold", "loop: with --fault-reset, the Host is never told (the Viewer's sync requests recover the region in place)"),
+        .bool("check-pictures", "loop, --video hybrid: check every frame the Viewer shows against the encoder's reconstruction (on with any --fault-*)"),
+        .choice("decoder", ["vt", "aom", "own"], "loop, --video hybrid: the Viewer's AV1 decoder — vt (VideoToolbox, hardware), aom (libaom) or own (Glass Act's own, GlassActAV1Decode); default vt where this Mac decodes AV1 in hardware, else aom. With own, the picture check compares its own planes"),
+        .int("score-every", "<n>", 0...1000, "loop, real codecs: score every nth submitted video frame's decoded picture (PSNR, SSIM; default 4; 0: none)"),
+        .string("chroma", "<420|444>", "loop, --video hybrid: the stream's chroma, 420 (default) or 444 (the High profile, BT.709 full range; --decoder own, the default then: VideoToolbox decodes no 4:4:4)"),
+        .int("score-rgb-every", "<n>", 1...10_000, "loop, real codecs: also score every nth submitted frame as shown, in colour: RGB PSNR, and SSIMULACRA2 (the ssimulacra2 binary on PATH, after the run; its PNGs in $TMPDIR)"),
         .bool("golden", "loop: exit non-zero unless settled with a byte-identical canvas"),
         .bool("av1-vbr", "loop experiment, --video av1: libaom VBR instead of CBR"),
         .bool("no-fresh-queue", "loop: before 'Link estimate from the viewer': the video gate cuts on the smoothed RTT's queue alone"),

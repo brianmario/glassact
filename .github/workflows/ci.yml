@@ -25,13 +25,21 @@ jobs:
       # heavy engine tests a hosted VM starves them (a burst arriving 94 %
       # whole, a session not converging in 25 s), so they get a step of
       # their own. A new real-network suite belongs here too.
-      QUIC_SUITES: AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
+      # (AV1SessionQUICTests needs Glass Act's AV1 encoder, a real Apple-silicon GPU: it skips
+      # itself on a hosted runner's paravirtual one.)
+      QUIC_SUITES: AV1SessionQUICTests|AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
         run: xcodebuild -version && swift --version
       - name: Version
         run: scripts/check-version
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
+      - name: Rust tests
+        run: cargo test --release --manifest-path rust/av1/Cargo.toml
       - name: Build
         run: swift build --build-tests
       - name: Test
@@ -40,6 +48,10 @@ jobs:
         # of lag. Hosted VMs can't drive the relay hard enough for that
         # (byte-gate p95 ~400 ms instead of > 1 s), so it only runs locally
         # (`just test`).
+        # The AV1 encoder's GPU suites (GlassActAV1Tests) skip themselves here: a hosted runner is a
+        # VM whose paravirtual GPU doesn't compile or run the kernels exactly
+        # (AV1ShaderSource.hasCapableGPU). Their CPU half runs: the Rust tests above and the libaom
+        # decode gates (AV1CoreTests).
         run: swift test --skip "VideoSendGateTests|$QUIC_SUITES"
       - name: Real-QUIC tests
         # One suite at a time: run side by side, the suites still starved each
@@ -54,6 +66,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust targets
+        # Each app target runs scripts/build-rust --xcode, which builds the Rust AV1 library
+        # (rust/av1) for the platform and architectures Xcode asks for: the Mac apps link it
+        # universal, the iPad app for iPadOS (and the Simulator). The script adds a missing
+        # target itself; adding them here keeps that out of the build's time and log.
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
       - name: Build Host
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host
@@ -72,7 +90,7 @@ jobs:
       - name: Build the viewer package for iPadOS
         # The package targets iPadOS 27 too (the iPad Viewer), so
         # availability mistakes and Mac-only APIs outside `#if os(macOS)`
-        # fail here.
+        # fail here. (A library product: nothing links the Rust library.)
         run: >
           xcodebuild -scheme GlassActViewer -destination 'generic/platform=iOS'
           CODE_SIGNING_ALLOWED=NO build
@@ -86,8 +104,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
       - name: Build package and tests (x86_64)
         run: swift build --arch x86_64 --build-tests
+      # (The apps' Xcode targets build the Rust library universal themselves.)
       - name: Build Host (universal Release)
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host
@@ -109,5 +132,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Rust
+        # The AV1 CPU code is Rust (rust/av1); the package links its static
+        # library, arm64 + x86_64.
+        run: scripts/build-rust --universal
       - name: Allocation-count tests (release)
         run: swift test -c release --filter ScrollAllocationTests

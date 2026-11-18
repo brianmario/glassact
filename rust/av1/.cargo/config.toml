@@ -1,0 +1,8 @@
+# Every Apple-silicon Mac has at least the M1's features (NEON, dot products, FP16, crypto).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
+[env]
+# The package's deployment target (Package.swift), so the linker doesn't warn about objects
+# built for a newer macOS.
+MACOSX_DEPLOYMENT_TARGET = "15.5"

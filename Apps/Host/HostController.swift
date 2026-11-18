@@ -7,6 +7,7 @@ import IOKit.pwr_mgt
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 import GlassActCore
+import GlassActHybridVideo
 import GlassActShare
 import GlassActTransport
 import GlassActWire
@@ -38,6 +39,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     static var videoEnabled: Bool {
         ProcessInfo.processInfo.environment["GLASSACT_TILE_ONLY"] == nil
     }
+
+    /// The Host's AV1 encoder (§4.6): Glass Act's own (`HybridRegionEncoder`), on macOS 27 with
+    /// an Apple-silicon GPU; elsewhere HEVC only. To switch back to libaom's (`AOMRegionEncoder`,
+    /// kept in the package), make this `.libaom`.
+    static let av1Encoder: HostVideoEncoders.AV1 = .glassAct
 
     var onStatus: (String) -> Void = { _ in }
 
@@ -658,6 +664,15 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             return
         }
         isListening = true
+        // (Glass Act's AV1 encoder compiles its kernels once; before they have, regions use HEVC)
+        if Self.videoEnabled {
+            HostVideoEncoders.prepare(Self.av1Encoder) { [weak self] ready in
+                DispatchQueue.main.async {
+                    self?.onStatus(ready ? "AV1: Glass Act's encoder ready"
+                                   : "AV1: Glass Act's encoder didn't start (its kernels didn't compile) — video is HEVC only")
+                }
+            }
+        }
         phase = .starting
         ensureServer()
     }
@@ -2579,21 +2594,17 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private func makeEngine(on transport: QUICTransport, width: Int, height: Int,
                             startFrameSeq: UInt32) -> HostEngine {
         let encodeQueue = self.encodeQueue
-        // Video (§4.6): pinned full-screen hardware HEVC, or software AV1
-        // when the Viewer opted in (it advertises AV1 only then). AV1 comes
-        // first, so a Viewer that asks for it gets it; on Intel libaom isn't
-        // compiled in and only HEVC is offered.
+        // Video (§4.6): pinned full-screen hardware HEVC, or AV1 when the
+        // Viewer opted in (it advertises AV1 only then). AV1 comes first, so a
+        // Viewer that asks for it gets it; where `av1Encoder` can't run, only
+        // HEVC is offered.
         let video = Self.videoEnabled
+        let encoders = HostVideoEncoders(choice: Self.av1Encoder, callbackQueue: encodeQueue)
         let engine = HostEngine(
             width: width, height: height, transport: transport,
-            videoEncoderFactory: video ? { codec in
-                switch codec {
-                case VideoCodec.hevc: VTHEVCRegionEncoder(callbackQueue: encodeQueue)
-                case VideoCodec.av1: AOMRegionEncoder(callbackQueue: encodeQueue)
-                default: nil
-                }
-            } : nil,
-            videoCodecPreference: AOMRegionEncoder.isAvailable ? [VideoCodec.av1, VideoCodec.hevc] : [VideoCodec.hevc],
+            videoEncoderFactory: video ? { encoders.encoder(forCodec: $0) } : nil,
+            videoCodecPreference: encoders.preference,
+            videoAV1FromGlassAct: encoders.av1FromGlassAct,
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
         if sessionOffScreen { engine.setHostNotice(HostNotice.sessionOffScreen) }
@@ -2616,6 +2627,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         engine.rateLimit = Self.rateLimit(forMbit: bandwidthLimitMbit)
         if !video {
             onStatus("GLASSACT_TILE_ONLY: video off — lossless tiles only")
+        } else {
+            onStatus("video encoders: \(encoders.summary)")
         }
         // First-picture timing, host half (the viewer logs `first_picture`):
         // the first video frame's size and encode time, and how long after

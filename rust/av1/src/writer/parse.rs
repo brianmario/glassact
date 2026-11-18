@@ -1,0 +1,863 @@
+//! Parsing: OBUs -> DecisionRecord (the toolset the writer produces: a still picture, or a key or
+//! inter frame of a video stream, 64x64 or 128x128 superblocks, uniform tiles), the walk with the
+//! spec's symbol decoder. Inter frames parse without their reference pictures; a later frame of a
+//! stream without its own sequence header parses with the stream's ([`ParseState`]).
+use super::sink::DecSink;
+use super::walk::{Frame, ParseRec, Rec, TileBufs, TileState, walk_tile};
+use super::*;
+use crate::blockinfo::{mi_cols, mi_rows};
+use crate::dsp::clip3;
+use crate::entropy::FrameCdfs;
+use crate::tables::{
+    ALTREF_FRAME, EIGHTTAP, GOLDEN_FRAME, INTER_FRAME, KEY_FRAME, LAST_FRAME, NUM_REF_FRAMES, PRIMARY_REF_NONE,
+    REFS_PER_FRAME,
+};
+
+/// av1g_parsed: the record with all decisions and quantized coefficients, and where the tiles were.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parsed {
+    pub rec: Record,
+    pub seq_level_idx: u32,
+    /// The sequence header's colour description: color_primaries, transfer_characteristics,
+    /// matrix_coefficients (2, 2, 2 without one: unspecified) and color_range (0 for monochrome).
+    pub colour: [u32; 4],
+    /// per tile: payload size in the parsed stream
+    pub tile_bytes: Vec<u32>,
+    /// per tile: payload offset in the parsed buffer
+    pub tile_offsets: Vec<u64>,
+}
+
+struct BitReader<'a> {
+    d: &'a [u8],
+    pos: usize,
+}
+
+macro_rules! need {
+    ($c:expr, $($a:tt)*) => {
+        if !($c) {
+            fail!(ERR_INVALID, $($a)*);
+        }
+    };
+}
+
+impl BitReader<'_> {
+    fn f(&mut self, k: i32) -> Res<u32> {
+        let mut v = 0u32;
+        for _ in 0..k {
+            if self.pos >> 3 >= self.d.len() {
+                fail!(ERR_INVALID, "header truncated");
+            }
+            v = (v << 1) | ((self.d[self.pos >> 3] >> (7 - (self.pos & 7))) & 1) as u32;
+            self.pos += 1;
+        }
+        Ok(v)
+    }
+    fn b(&mut self) -> Res<bool> {
+        Ok(self.f(1)? != 0)
+    }
+    fn su(&mut self, k: i32) -> Res<i32> {
+        let v = self.f(k)? as i32;
+        let m = 1 << (k - 1);
+        Ok(if v & m != 0 { v - 2 * m } else { v })
+    }
+    fn byte_align(&mut self) {
+        self.pos = (self.pos + 7) & !7;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Seq {
+    pub(crate) seen: bool,
+    /// `Parsed::colour`
+    pub(crate) colour: [u32; 4],
+    /// use_128x128_superblock
+    pub(crate) sb128: bool,
+    pub(crate) still: bool,
+    pub(crate) reduced: bool,
+    pub(crate) interintra: bool,
+    pub(crate) warped: bool,
+    pub(crate) ref_frame_mvs: bool,
+    pub(crate) level: i32,
+    pub(crate) wbits: i32,
+    pub(crate) hbits: i32,
+    pub(crate) max_w: u32,
+    pub(crate) max_h: u32,
+    pub(crate) filter_intra: u8,
+    pub(crate) edge_filter: u8,
+    pub(crate) superres: bool,
+    pub(crate) cdef: bool,
+    pub(crate) restoration: bool,
+    pub(crate) mono: bool,
+    /// seq_profile 1 (High): 4:4:4
+    pub(crate) chroma444: bool,
+    pub(crate) separate_uv: bool,
+    pub(crate) force_sct: u32,
+    pub(crate) force_int_mv: u32,
+    pub(crate) order_hint_bits: i32,
+    pub(crate) film_grain: bool,
+    /// an operating_point_idc isn't 0 (OBUs of some layers would be dropped)
+    pub(crate) op_idc: bool,
+}
+
+impl Seq {
+    /// Before a sequence header is parsed into it.
+    pub(crate) fn new() -> Seq {
+        Seq {
+            force_sct: 2,
+            force_int_mv: 2,
+            ..Default::default()
+        }
+    }
+}
+
+/// av1g_parse: an AV1 OBU stream (sequence header + one OBU_FRAME) back into a DecisionRecord. A
+/// frame that starts from a reference's saved CDFs (`fp.cdf_from_ref`), or that has no sequence
+/// header of its own ([`ENC_NO_SEQ_HEADER`]), needs [`parse_with`].
+pub fn parse(obus: &[u8]) -> Result<Parsed, Error> {
+    parse_with(obus, None)
+}
+
+/// A stream's state over its frames, for [`parse_with`]: the reference slots' saved CDFs, which
+/// frames update as a decoder does (refresh_frame_flags; a key frame every slot), and the last
+/// sequence header (frames without one use it).
+#[derive(Clone, Debug, Default)]
+pub struct ParseState {
+    pub slots: [Option<Box<FrameCdfs>>; 8],
+    seq: Option<Box<Seq>>,
+    /// the slots' loop filter deltas
+    deltas: [Option<LfDeltas>; 8],
+}
+
+impl ParseState {
+    /// The stream's sequence header so far (tests: in step with another parser's).
+    #[cfg(test)]
+    pub(crate) fn set_seq(&mut self, sq: Option<&Seq>) {
+        self.seq = sq.map(|s| Box::new(s.clone()));
+    }
+}
+
+/// [`parse`] of one frame of a stream, its frames in order through the same `state`.
+pub fn parse_with(obus: &[u8], state: Option<&mut ParseState>) -> Result<Parsed, Error> {
+    let mut out = Parsed::default();
+    parse_into(obus, &mut out, state).map_err(|e| *e)?;
+    Ok(out)
+}
+
+/// sequence_header_obu's payload `p` into `sq`.
+pub(crate) fn parse_seq_obu(p: &[u8], sq: &mut Seq) -> Res<()> {
+    parse_seq(&mut BitReader { d: p, pos: 0 }, sq)
+}
+
+fn parse_seq(br: &mut BitReader, sq: &mut Seq) -> Res<()> {
+    let profile = br.f(3)?;
+    sq.still = br.b()?;
+    sq.reduced = br.b()?;
+    need!(profile <= 1, "only the Main and High profiles (got {profile})");
+    sq.chroma444 = profile == 1;
+    if sq.reduced {
+        sq.level = br.f(5)? as i32;
+    } else {
+        if br.b()? {
+            // timing_info
+            br.f(32)?;
+            br.f(32)?;
+            if br.b()? {
+                // equal_picture_interval: uvlc
+                let mut lz = 0;
+                while !br.b()? {
+                    lz += 1;
+                }
+                if lz < 32 {
+                    br.f(lz)?;
+                }
+            }
+            let decoder_model = br.b()?;
+            need!(!decoder_model, "decoder model info not supported");
+        }
+        let idd = br.b()?;
+        let nops = br.f(5)? + 1;
+        for i in 0..nops {
+            // operating_point_idc: the writer's is 0 (one operating point of every layer)
+            sq.op_idc |= br.f(12)? != 0;
+            let lv = br.f(5)? as i32;
+            if i == 0 {
+                sq.level = lv;
+            }
+            if lv > 7 {
+                br.f(1)?;
+            }
+            if idd && br.b()? {
+                br.f(4)?;
+            }
+        }
+    }
+    sq.wbits = br.f(4)? as i32 + 1;
+    sq.hbits = br.f(4)? as i32 + 1;
+    sq.max_w = br.f(sq.wbits)? + 1;
+    sq.max_h = br.f(sq.hbits)? + 1;
+    if !sq.reduced {
+        let frame_ids = br.b()?;
+        need!(!frame_ids, "frame ids not supported");
+    }
+    sq.sb128 = br.b()?;
+    sq.filter_intra = br.f(1)? as u8;
+    sq.edge_filter = br.f(1)? as u8;
+    if !sq.reduced {
+        sq.interintra = br.b()?;
+        br.f(1)?; // enable_masked_compound (compound prediction is never selected)
+        sq.warped = br.b()?;
+        br.f(1)?; // enable_dual_filter (the filter is never switchable)
+        let oh = br.b()?;
+        if oh {
+            br.f(1)?; // enable_jnt_comp
+            sq.ref_frame_mvs = br.b()?;
+        }
+        sq.force_sct = if br.b()? { 2 } else { br.f(1)? };
+        sq.force_int_mv = if sq.force_sct > 0 {
+            if br.b()? { 2 } else { br.f(1)? }
+        } else {
+            2
+        };
+        if oh {
+            sq.order_hint_bits = br.f(3)? as i32 + 1;
+        }
+    }
+    sq.superres = br.b()?;
+    sq.cdef = br.b()?;
+    sq.restoration = br.b()?;
+    need!(br.f(1)? == 0, "only 8-bit supported");
+    // color_config: the High profile has no mono_chrome (0), and its subsampling is 0, 0
+    sq.mono = !sq.chroma444 && br.b()?;
+    let (mut cp, mut tc, mut mc) = (2, 2, 2);
+    if br.b()? {
+        cp = br.f(8)?;
+        tc = br.f(8)?;
+        mc = br.f(8)?;
+    }
+    sq.colour = [cp, tc, mc, 0];
+    if sq.mono {
+        br.f(1)?;
+    } else {
+        need!(!(cp == 1 && tc == 13 && mc == 0), "4:4:4 identity matrix not supported");
+        sq.colour[3] = br.f(1)?; // color_range
+        if !sq.chroma444 {
+            br.f(2)?; // chroma_sample_position (subsampling_x && subsampling_y)
+        }
+        sq.separate_uv = br.b()?;
+    }
+    sq.film_grain = br.b()?;
+    sq.seen = true;
+    Ok(())
+}
+
+fn parse_into(obus: &[u8], out: &mut Parsed, mut state: Option<&mut ParseState>) -> Res<()> {
+    let n = obus.len();
+    let mut sq = Seq::new();
+    let mut fp = FrameParams {
+        version: DECISIONS_VERSION,
+        ..Default::default()
+    };
+    let mut pos = 0usize;
+    let mut done = false;
+    while pos < n && !done {
+        let h = obus[pos];
+        pos += 1;
+        let (ty, ext, has_size) = ((h >> 3) & 15, (h >> 2) & 1, (h >> 1) & 1);
+        if ext != 0 {
+            pos += 1;
+        }
+        let mut sz = n.saturating_sub(pos) as u64;
+        if has_size != 0 {
+            sz = 0;
+            for i in 0..8 {
+                need!(pos < n, "OBU truncated");
+                let b = obus[pos];
+                pos += 1;
+                sz |= ((b & 0x7f) as u64) << (7 * i);
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+        need!(pos as u64 + sz <= n as u64, "OBU size beyond buffer");
+        let p = &obus[pos..pos + sz as usize];
+        if ty == 1 {
+            parse_seq(&mut BitReader { d: p, pos: 0 }, &mut sq)?;
+            if let Some(s) = state.as_deref_mut() {
+                s.seq = Some(Box::new(sq.clone()));
+            }
+        } else if ty == 6 || ty == 3 {
+            if !sq.seen
+                && let Some(s) = state.as_deref().and_then(|s| s.seq.as_deref())
+            {
+                sq = s.clone(); // a later frame of the stream: the stream's sequence header
+            }
+            need!(
+                sq.seen,
+                "frame before sequence header (a stream's later frame without one: parse_with the stream's ParseState)"
+            );
+            need!(ty == 6, "separate frame header + tile group OBUs not supported");
+            parse_frame(
+                &sq,
+                p,
+                (p.as_ptr() as usize - obus.as_ptr() as usize) as u64,
+                &mut fp,
+                out,
+                state.as_deref_mut(),
+            )?;
+            done = true;
+        }
+        pos += sz as usize;
+    }
+    need!(done, "no frame found");
+    out.seq_level_idx = sq.level as u32;
+    out.colour = sq.colour;
+    Ok(())
+}
+
+/// The loop filter's reference and mode deltas (loop_filter_ref_deltas, loop_filter_mode_deltas)
+/// as a frame leaves them: what a later frame with this one as its primary_ref_frame starts from
+/// (load_previous), or setup_past_independence's defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LfDeltas {
+    pub refs: [i32; 8],
+    pub modes: [i32; 2],
+}
+
+impl Default for LfDeltas {
+    fn default() -> Self {
+        LfDeltas {
+            refs: [1, 0, 0, 0, -1, 0, -1, -1],
+            modes: [0, 0],
+        }
+    }
+}
+
+/// An OBU_FRAME's uncompressed header as the record and the tile walk need it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FrameHdr {
+    pub fp: FrameParams,
+    /// frame_type INTER_FRAME
+    pub inter: bool,
+    /// !disable_frame_end_update_cdf: the frame saves its context tile's CDFs
+    pub end_update: bool,
+    /// context_update_tile_id
+    pub context_tile: usize,
+    /// the tiling, with tile_size_bytes
+    pub tiles: TileInfo,
+    /// where the tile group's first tile size (or tile) starts in the OBU's payload
+    pub tile_start: usize,
+    /// the loop filter deltas as this frame leaves them
+    pub deltas: LfDeltas,
+    /// the render size (the frame's own size without render_and_frame_size_different)
+    pub render: (u32, u32),
+}
+
+/// The uncompressed header of an OBU_FRAME payload `p` of a stream with sequence header `sq`.
+/// `slot_deltas`: the loop filter deltas each reference slot holds, which a frame whose
+/// primary_ref_frame is LAST_FRAME (fp.cdf_from_ref) starts from (None: the slot has none).
+/// `strict` (decoding): also refuses what's legal but never the writer's (a frame larger than the
+/// sequence header's, a still picture's inter frame, GOLDEN_FRAME blocks whose loop filter level
+/// this frame doesn't code) or out of the frame (context_update_tile_id).
+pub(crate) fn parse_frame_header(
+    sq: &Seq,
+    p: &[u8],
+    slot_deltas: &[Option<LfDeltas>; 8],
+    strict: bool,
+) -> Res<FrameHdr> {
+    let mut fp = FrameParams {
+        version: DECISIONS_VERSION,
+        ..Default::default()
+    };
+    fp.enable_intra_edge_filter = sq.edge_filter;
+    fp.enable_filter_intra = sq.filter_intra;
+    fp.sb128 = sq.sb128 as u8;
+    need!(!sq.superres && !sq.film_grain, "superres / film grain not supported");
+    let mut br = BitReader { d: p, pos: 0 };
+    let mut inter = false;
+    let mut err_res = false;
+    if !sq.reduced {
+        need!(br.f(1)? == 0, "show_existing_frame");
+        let ft = br.f(2)?;
+        need!(
+            ft == KEY_FRAME as u32 || ft == INTER_FRAME as u32,
+            "only KEY_FRAME and INTER_FRAME supported"
+        );
+        inter = ft == INTER_FRAME as u32;
+        need!(br.f(1)? == 1, "show_frame must be 1");
+        if inter {
+            err_res = br.b()?;
+        }
+    }
+    need!(
+        !(strict && inter && sq.still),
+        "an inter frame in a still picture's sequence"
+    );
+    if !sq.still {
+        fp.video = 1;
+    }
+    if inter {
+        fp.frame_type = FRAME_INTER;
+        fp.error_resilient_mode = err_res as u8;
+    }
+    need!(br.f(1)? == 0, "disable_cdf_update=1 not supported");
+    let sct = if sq.force_sct == 2 { br.f(1)? } else { sq.force_sct };
+    fp.allow_screen_content_tools = (sct != 0) as u8;
+    let mut force_integer_mv = 0;
+    if sct != 0 {
+        force_integer_mv = if sq.force_int_mv == 2 {
+            br.f(1)?
+        } else {
+            sq.force_int_mv
+        };
+    }
+    let override_ = if !sq.reduced { br.b()? } else { false };
+    if sq.order_hint_bits != 0 {
+        br.f(sq.order_hint_bits)?;
+    }
+    if inter {
+        if !err_res {
+            let prf = br.f(3)?;
+            need!(
+                prf == PRIMARY_REF_NONE as u32 || prf == 0,
+                "primary_ref_frame other than NONE or LAST_FRAME not supported"
+            );
+            fp.cdf_from_ref = (prf == 0) as u8;
+        }
+        fp.refresh_frame_flags = br.f(8)? as u8;
+        if err_res && sq.order_hint_bits != 0 {
+            for _ in 0..NUM_REF_FRAMES {
+                br.f(sq.order_hint_bits)?; // ref_order_hint
+            }
+        }
+        if sq.order_hint_bits != 0 {
+            need!(br.f(1)? == 0, "frame_refs_short_signaling not supported");
+        }
+        for i in 0..REFS_PER_FRAME {
+            let idx = br.f(3)? as u8;
+            if i == 0 {
+                fp.ref_slot = idx; // LAST_FRAME's
+            } else if i == GOLDEN_FRAME - LAST_FRAME && idx != fp.ref_slot {
+                fp.golden_slot = idx + 1; // GOLDEN_FRAME's own (the other references blocks don't use)
+            }
+        }
+        if override_ && !err_res {
+            for _ in 0..REFS_PER_FRAME {
+                need!(br.f(1)? == 0, "found_ref (a size taken from a reference) not supported");
+            }
+        }
+    }
+    let (mut fw, mut fh) = (sq.max_w, sq.max_h);
+    if override_ {
+        fw = br.f(sq.wbits)? + 1;
+        fh = br.f(sq.hbits)? + 1;
+        need!(
+            !strict || (fw <= sq.max_w && fh <= sq.max_h),
+            "frame size {fw}x{fh} beyond the sequence header's {}x{}",
+            sq.max_w,
+            sq.max_h
+        );
+    }
+    let (mut rw, mut rh) = (fw, fh);
+    if br.b()? {
+        // render size
+        rw = br.f(16)? + 1;
+        rh = br.f(16)? + 1;
+    }
+    if (fw, fh) != (sq.max_w, sq.max_h) && (rw, rh) == (sq.max_w, sq.max_h) && !sq.still {
+        // a reduced frame (decisions.h "Reduced frames"): shown at the stream's size. Other
+        // render sizes are only a display hint, which the record doesn't carry.
+        fp.stream_width = rw as u16;
+        fp.stream_height = rh as u16;
+    }
+    if inter {
+        // fp.mv_precision: force_integer_mv (intra frames: 1), else allow_high_precision_mv
+        fp.mv_precision = if force_integer_mv != 0 { 0 } else { 1 + br.f(1)? as u8 };
+        need!(br.f(1)? == 0, "switchable interpolation filters not supported");
+        need!(
+            br.f(2)? == EIGHTTAP as u32,
+            "interpolation filters other than EIGHTTAP not supported"
+        );
+        need!(br.f(1)? == 0, "motion modes (is_motion_mode_switchable) not supported");
+        if !err_res && sq.ref_frame_mvs {
+            need!(br.f(1)? == 0, "use_ref_frame_mvs not supported");
+        }
+        need!(
+            !sq.interintra,
+            "inter-intra prediction (enable_interintra_compound) not supported"
+        );
+    } else if sct != 0 {
+        fp.allow_intrabc = br.f(1)? as u8;
+    }
+    let abc = fp.allow_intrabc != 0;
+    let end_update = !sq.reduced && br.f(1)? == 0; // !disable_frame_end_update_cdf
+    fp.width = fw;
+    fp.height = fh;
+    fp.monochrome = sq.mono as u8;
+    fp.chroma_format = if sq.chroma444 { CHROMA_444 } else { CHROMA_420 };
+    let mut tile_size_bytes = 4;
+    let mut context_tile = 0usize;
+    // tile_info
+    {
+        let mut t = TileInfo::default();
+        compute_tiles(fw, fh, -1, -1, sq.sb128, &mut t);
+        need!(br.f(1)? == 1, "non-uniform tile spacing not supported");
+        let mut cl = t.min_log2_tile_cols;
+        while cl < t.max_log2_tile_cols {
+            if br.b()? {
+                cl += 1;
+            } else {
+                break;
+            }
+        }
+        let mut t2 = TileInfo::default();
+        compute_tiles(fw, fh, cl, -1, sq.sb128, &mut t2);
+        let mut rl = t2.min_log2_tile_rows;
+        while rl < t2.max_log2_tile_rows {
+            if br.b()? {
+                rl += 1;
+            } else {
+                break;
+            }
+        }
+        fp.tile_cols_log2 = cl as i8;
+        fp.tile_rows_log2 = rl as i8;
+        if cl > 0 || rl > 0 {
+            context_tile = br.f(cl + rl)? as usize;
+            tile_size_bytes = br.f(2)? as i32 + 1;
+        }
+    }
+    // quantization_params
+    fp.base_q_idx = br.f(8)? as u8;
+    let rdq = |br: &mut BitReader| -> Res<i8> { Ok(if br.b()? { br.su(7)? as i8 } else { 0 }) };
+    fp.delta_q_y_dc = rdq(&mut br)?;
+    if !sq.mono {
+        let diff = if sq.separate_uv { br.b()? } else { false };
+        fp.delta_q_u_dc = rdq(&mut br)?;
+        fp.delta_q_u_ac = rdq(&mut br)?;
+        if diff {
+            fp.delta_q_v_dc = rdq(&mut br)?;
+            fp.delta_q_v_ac = rdq(&mut br)?;
+        } else {
+            fp.delta_q_v_dc = fp.delta_q_u_dc;
+            fp.delta_q_v_ac = fp.delta_q_u_ac;
+        }
+    }
+    fp.using_qmatrix = br.f(1)? as u8;
+    if fp.using_qmatrix != 0 {
+        fp.qm_y = br.f(4)? as u8;
+        fp.qm_u = br.f(4)? as u8;
+        fp.qm_v = if sq.separate_uv { br.f(4)? as u8 } else { fp.qm_u };
+    }
+    need!(br.f(1)? == 0, "segmentation not supported");
+    need!(fp.base_q_idx > 0, "lossless not supported");
+    fp.delta_q_present = br.f(1)? as u8;
+    if fp.delta_q_present != 0 {
+        fp.delta_q_res = br.f(2)? as u8;
+        need!(abc || br.f(1)? == 0, "delta_lf_present (M5) not supported");
+    }
+    // loop_filter_params -> effective levels (intra frame: only the INTRA ref delta applies); none
+    // with allow_intrabc. The deltas start from the primary reference's (load_previous), or
+    // setup_past_independence's.
+    let mut deltas = if fp.cdf_from_ref != 0 {
+        match slot_deltas[fp.ref_slot as usize] {
+            Some(d) => d,
+            None => fail!(
+                ERR_INVALID,
+                "the frame starts from slot {}'s saved state: parse the stream's earlier frames first (parse_with)",
+                fp.ref_slot
+            ),
+        }
+    } else {
+        LfDeltas::default()
+    };
+    let mut lvl = [0i32; 4];
+    if !abc {
+        lvl[0] = br.f(6)? as i32;
+        lvl[1] = br.f(6)? as i32;
+        if !sq.mono && (lvl[0] != 0 || lvl[1] != 0) {
+            lvl[2] = br.f(6)? as i32;
+            lvl[3] = br.f(6)? as i32;
+        }
+        fp.loop_filter_sharpness = br.f(3)? as u8;
+        let delta_enabled = br.b()?;
+        let mut golden_set = false;
+        if delta_enabled && br.b()? {
+            for (i, d) in deltas.refs.iter_mut().enumerate() {
+                if br.b()? {
+                    *d = br.su(7)?;
+                    golden_set |= i == GOLDEN as usize;
+                }
+            }
+            for d in &mut deltas.modes {
+                if br.b()? {
+                    *d = br.su(7)?;
+                }
+            }
+        }
+        let (ref_deltas, mode_deltas) = (deltas.refs, deltas.modes);
+        let ref_delta_intra = if delta_enabled { ref_deltas[0] } else { 0 };
+        if inter && delta_enabled {
+            // only lf_inter_off's deltas: the levels as given for intra blocks, 0 for inter ones
+            // (GOLDEN_FRAME's too, coded in this frame, when it has its own slot)
+            need!(
+                ref_deltas[0] == 0
+                    && ref_deltas[1] == -63
+                    && (ref_deltas[4] == -1 || ref_deltas[4] == -63)
+                    && (!strict || fp.golden_slot == 0 || (golden_set && ref_deltas[4] == -63))
+                    && mode_deltas == [0, 0],
+                "loop filter deltas in inter frames other than lf_inter_off's not supported"
+            );
+            fp.lf_inter_off = 1;
+        }
+        if lvl[0] != 0 || lvl[1] != 0 {
+            for i in 0..4 {
+                if i >= 2 && lvl[i] == 0 {
+                    continue; // chroma plane not filtered at all
+                }
+                let mut e = lvl[i];
+                if delta_enabled {
+                    e = clip3(0, 63, e + ref_delta_intra * (1 << (e >> 5)));
+                }
+                fp.loop_filter_level[i] = e as u8;
+            }
+            let l = fp.loop_filter_level;
+            need!(
+                l[0] != 0 || l[1] != 0 || (l[2] == 0 && l[3] == 0),
+                "loop filter delta combination not representable"
+            );
+        }
+    }
+    if sq.cdef {
+        fp.enable_cdef = 1;
+    }
+    if sq.cdef && !abc {
+        fp.cdef_damping_minus_3 = br.f(2)? as u8;
+        fp.cdef_bits = br.f(2)? as u8;
+        let sec = |v: u32| if v == 3 { 4 } else { v as u8 };
+        for i in 0..(1usize << fp.cdef_bits) {
+            fp.cdef_y_pri[i] = br.f(4)? as u8;
+            fp.cdef_y_sec[i] = sec(br.f(2)?);
+            if !sq.mono {
+                fp.cdef_uv_pri[i] = br.f(4)? as u8;
+                fp.cdef_uv_sec[i] = sec(br.f(2)?);
+            }
+        }
+    }
+    if sq.restoration {
+        for _ in 0..if sq.mono { 1 } else { 3 } {
+            need!(br.f(2)? == 0, "loop restoration not supported");
+        }
+    }
+    fp.tx_mode_select = br.f(1)? as u8;
+    if inter {
+        need!(br.f(1)? == 0, "reference_select (compound prediction) not supported");
+        if !err_res && sq.warped {
+            need!(br.f(1)? == 0, "warped motion not supported");
+        }
+    }
+    fp.reduced_tx_set = br.f(1)? as u8;
+    if inter {
+        for _ in LAST_FRAME..=ALTREF_FRAME {
+            need!(br.f(1)? == 0, "global motion not supported");
+        }
+    }
+    br.byte_align();
+
+    // setup_frame
+    let mut tiles = TileInfo::default();
+    if !compute_tiles(
+        fw,
+        fh,
+        fp.tile_cols_log2 as i32,
+        fp.tile_rows_log2 as i32,
+        sq.sb128,
+        &mut tiles,
+    ) {
+        fail!(
+            ERR_INVALID,
+            "illegal tiling {}/{} for {fw}x{fh}",
+            fp.tile_cols_log2,
+            fp.tile_rows_log2
+        );
+    }
+    tiles.tile_size_bytes = tile_size_bytes;
+    let ntiles = (tiles.cols * tiles.rows) as usize;
+    need!(
+        !strict || context_tile < ntiles,
+        "context_update_tile_id {context_tile} is not a tile of the frame"
+    );
+    // tile group
+    if ntiles > 1 {
+        need!(br.f(1)? == 0, "tile_start_and_end_present_flag not supported");
+        br.byte_align();
+    }
+    Ok(FrameHdr {
+        fp,
+        inter,
+        end_update,
+        context_tile,
+        tiles,
+        tile_start: br.pos >> 3,
+        deltas,
+        render: (rw, rh),
+    })
+}
+
+/// The tiles of an OBU_FRAME payload `p` with header `hdr`: (offset, size) of each in raster
+/// order, into `out`.
+pub(crate) fn tile_spans(hdr: &FrameHdr, p: &[u8], out: &mut Vec<(usize, usize)>) -> Res<()> {
+    out.clear();
+    let sz = p.len();
+    let ntiles = (hdr.tiles.cols * hdr.tiles.rows) as usize;
+    let tsb = hdr.tiles.tile_size_bytes as usize;
+    let mut tpos = hdr.tile_start;
+    for tn in 0..ntiles {
+        let tsz = if tn == ntiles - 1 {
+            sz.wrapping_sub(tpos)
+        } else {
+            need!(tpos + tsb <= sz, "tile beyond OBU");
+            let mut v = 0usize;
+            for k in 0..tsb {
+                v |= (p[tpos + k] as usize) << (8 * k);
+            }
+            tpos += tsb;
+            v + 1
+        };
+        need!(tpos <= sz && tsz <= sz - tpos, "tile beyond OBU");
+        out.push((tpos, tsz));
+        tpos += tsz;
+    }
+    Ok(())
+}
+
+fn parse_frame(
+    sq: &Seq,
+    p: &[u8],
+    p_off: u64,
+    fp: &mut FrameParams,
+    out: &mut Parsed,
+    state: Option<&mut ParseState>,
+) -> Res<()> {
+    let no_deltas = [None; 8];
+    let hdr = parse_frame_header(sq, p, state.as_deref().map_or(&no_deltas, |s| &s.deltas), false)?;
+    *fp = hdr.fp;
+    let (inter, end_update, context_tile, tiles) = (hdr.inter, hdr.end_update, hdr.context_tile, hdr.tiles);
+    let (fw, fh) = (fp.width, fp.height);
+    let (mi_cols, mi_rows) = (mi_cols(fw as i32), mi_rows(fh as i32));
+    let mono = fp.monochrome != 0;
+    let ordmap: [Vec<u32>; 3] = Default::default();
+    // the CDFs it starts from: primary_ref_frame's slot's, or the defaults
+    let cdfs_in: Option<Box<FrameCdfs>> = if fp.cdf_from_ref != 0 {
+        match state.as_deref().and_then(|s| s.slots[fp.ref_slot as usize].clone()) {
+            Some(c) => Some(c),
+            None => fail!(
+                ERR_INVALID,
+                "the frame starts from slot {}'s saved CDFs: parse the stream's earlier frames first (parse_with)",
+                fp.ref_slot
+            ),
+        }
+    } else {
+        None
+    };
+    let saved = std::sync::Mutex::new((false, Box::new(FrameCdfs::new(0))));
+    let f = Frame {
+        fp: *fp,
+        mi_cols,
+        mi_rows,
+        mono,
+        ss: crate::blockinfo::chroma_ss(fp),
+        sb_cols: (mi_cols + 15) >> 4,
+        sb_rows: (mi_rows + 15) >> 4,
+        tiles,
+        qm_level: [
+            fp.qm_y as i32,
+            fp.qm_u as i32,
+            if !mono && fp.using_qmatrix != 0 {
+                fp.qm_v
+            } else {
+                fp.qm_u
+            } as i32,
+        ],
+        do_recon: false,
+        fix_range: false,
+        check_edges: false,
+        ordmap: &ordmap,
+        inter,
+        intrabc: fp.allow_intrabc != 0,
+        refs: None,
+        refs_golden: None,
+        cdfs_in: cdfs_in.as_deref(),
+        cdfs_out: (state.is_some() && end_update).then_some(&saved),
+        context_tile,
+        sb128: sq.sb128,
+        palettes: fp.allow_screen_content_tools != 0,
+        block_bits: None,
+        elide: None,
+    };
+    let mut st = Box::<TileState>::default();
+    st.setup(mi_cols, mi_rows);
+    let mut bufs = TileBufs::default();
+    let mut pr = ParseRec::default();
+    let mut spans = Vec::new();
+    tile_spans(&hdr, p, &mut spans)?;
+    for (tn, &(tpos, tsz)) in spans.iter().enumerate() {
+        let (tr, tc) = (tn / tiles.cols as usize, tn % tiles.cols as usize);
+        bufs.setup(&f, tr, tc, false);
+        let mut hs = ();
+        let sk = DecSink::new(&p[tpos..tpos + tsz]);
+        walk_tile::<DecSink, NoHook>(
+            &mut st,
+            sk,
+            &f,
+            &mut bufs,
+            None,
+            &mut hs,
+            None,
+            &mut Rec::Parse(&mut pr),
+            tr,
+            tc,
+        )?;
+        out.tile_bytes.push(tsz as u32);
+        out.tile_offsets.push(p_off + tpos as u64);
+    }
+    pr.block_txb.push(pr.txb.len() as u32);
+    if let Some(state) = state
+        && fp.video != 0
+    {
+        // the slots it refreshes keep its saved CDFs: the context tile's, or (no frame-end update)
+        // the ones it started from
+        let (captured, end) = saved.into_inner().unwrap();
+        let kept = if end_update {
+            need!(
+                captured,
+                "context_update_tile_id {context_tile} is not a tile of the frame"
+            );
+            end
+        } else {
+            cdfs_in.unwrap_or_else(|| Box::new(FrameCdfs::new(fp.base_q_idx as i32)))
+        };
+        let refresh = if inter { fp.refresh_frame_flags } else { 0xFF };
+        for (i, s) in state.slots.iter_mut().enumerate() {
+            if refresh >> i & 1 != 0 {
+                *s = Some(kept.clone());
+                state.deltas[i] = Some(hdr.deltas);
+            }
+        }
+    }
+    out.rec = Record {
+        fp: *fp,
+        blocks: pr.blocks,
+        block_txb: pr.block_txb,
+        txb: pr.txb,
+        coeffs: pr.coeffs,
+        inter: pr.inter,
+        palette: if pr.palette.iter().any(|p| p.size_y != 0 || p.size_uv != 0) {
+            pr.palette
+        } else {
+            Vec::new()
+        },
+        palette_map: pr.palette_map,
+    };
+    Ok(())
+}

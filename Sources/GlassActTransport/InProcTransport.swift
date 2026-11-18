@@ -174,6 +174,22 @@ public final class InProcLink: @unchecked Sendable {
         (cancelledByA ? b : a).emit(.failed)
     }
 
+    /// The video stream fails, as QUICTransport's can mid-session: host →
+    /// viewer video still in flight or waiting for the bottleneck is lost;
+    /// later sends go out on its replacement. Neither side is told: the
+    /// caller tells each one (`ViewerEngine.resetVideoStream`,
+    /// `HostEngine.videoChannelReset`), as QUICTransport's `onVideoReset`
+    /// would, when it chooses. Returns the messages lost.
+    @discardableResult
+    public func dropVideoInFlight() -> Int {
+        let before = pending.count
+        pending.removeAll { $0.channel == .video && !$0.toA }
+        let lost = before - pending.count + videoSendQueue.count
+        videoSendQueue.removeAll()
+        videoSendBufferBytes = 0
+        return lost
+    }
+
     /// True if a send from this side must be dropped (severed or silenced).
     private func blocked(fromA: Bool) -> Bool {
         severed || (fromA ? silenceAToB : silenceBToA)

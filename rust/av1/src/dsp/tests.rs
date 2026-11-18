@@ -1,0 +1,863 @@
+use super::*;
+
+const ALL_TX: core::ops::Range<i32> = 0..TX_SIZES_ALL;
+
+fn random_edge(r: &mut Rng, smooth: bool) -> Edge {
+    let mut e = [0u8; EDGE_LEN];
+    let mut v = r.below(256) as i32;
+    for x in e.iter_mut() {
+        if smooth {
+            v = clip1(v + r.range(-6, 6));
+            *x = v as u8;
+        } else {
+            *x = r.next() as u8;
+        }
+    }
+    e
+}
+
+/// Dequantized-coefficient patterns: sparse low-frequency, dense, near the 16-bit limits, and (with
+/// `wild`) beyond them.
+fn random_dq(r: &mut Rng, n: usize, wild: bool) -> Vec<i32> {
+    let mut dq = vec![0i32; n];
+    match r.below(if wild { 5 } else { 4 }) {
+        0 => {
+            for _ in 0..1 + r.below(12) {
+                let pos = if r.below(3) == 0 {
+                    r.below(n as u32)
+                } else {
+                    r.below(n.min(16) as u32)
+                } as usize;
+                dq[pos] = r.range(-3000, 3000);
+            }
+        }
+        1 => {
+            for v in dq.iter_mut() {
+                *v = if r.below(4) == 0 { r.range(-400, 400) } else { 0 };
+            }
+        }
+        2 => {
+            for v in dq.iter_mut() {
+                *v = r.range(-32768, 32767);
+            }
+        }
+        3 => {
+            for _ in 0..1 + r.below(4) {
+                dq[r.below(n as u32) as usize] = if r.below(2) == 0 { -32768 } else { 32767 };
+            }
+        }
+        _ => {
+            for v in dq.iter_mut().take(1 + r.below(n as u32) as usize) {
+                *v = (r.next() as i32) >> r.below(16);
+            }
+        }
+    }
+    dq
+}
+
+#[test]
+fn inv_txfm2d_simd_matches_scalar() {
+    let mut r = Rng(0x1234_5678_9abc_def1);
+    let (mut res_a, mut res_b) = (vec![0i32; 4096], vec![0i32; 4096]);
+    let mut flagged = 0;
+    for _ in 0..40 {
+        for tx_sz in ALL_TX {
+            for tx_type in 0..TX_TYPES {
+                let dq = random_dq(&mut r, tx_coeffs(tx_sz), true);
+                let fa = inv_txfm2d(&dq, tx_sz, tx_type, &mut res_a);
+                let fb = inv_txfm2d_scalar(&dq, tx_sz, tx_type, &mut res_b);
+                let n = (tx_w(tx_sz) * tx_h(tx_sz)) as usize;
+                assert_eq!(fa, fb, "flags tx {tx_sz} type {tx_type}");
+                assert_eq!(res_a[..n], res_b[..n], "residual tx {tx_sz} type {tx_type}");
+                flagged += (fb != 0) as u32;
+            }
+        }
+    }
+    assert!(flagged > 100, "only {flagged} non-conformant cases");
+}
+
+#[test]
+fn dequant_matches_per_coefficient() {
+    let mut r = Rng(6);
+    let mut out = vec![0i32; 1024];
+    for _ in 0..200 {
+        for tx_sz in ALL_TX {
+            let n = tx_coeffs(tx_sz);
+            let q: Vec<i16> = (0..n)
+                .map(|_| match r.below(3) {
+                    0 => 0,
+                    1 => r.range(-32768, 32767) as i16,
+                    _ => r.range(-60, 60) as i16,
+                })
+                .collect();
+            let qi = r.range(0, 255);
+            let (dcq, acq) = (dc_q(qi), ac_q(qi));
+            let m = qm(r.below(2) == 0, r.range(0, 15), r.range(0, 2), tx_sz, DCT_DCT);
+            dequant(&q, &mut out, tx_sz, dcq, acq, m);
+            for i in 0..n {
+                let want = if q[i] != 0 {
+                    dequant_coef(
+                        q[i] as i32,
+                        qm_step(if i == 0 { dcq } else { acq }, m, i),
+                        dq_denom(tx_sz),
+                    )
+                } else {
+                    0
+                };
+                assert_eq!(out[i], want, "tx {tx_sz} coef {i}");
+            }
+        }
+    }
+}
+
+#[test]
+fn block_predictors_match_per_pixel() {
+    let mut r = Rng(77);
+    let mut d1 = vec![0u8; 64 * 80];
+    let mut d2 = vec![0u8; 64 * 80];
+    for tx_sz in ALL_TX {
+        let (lw, lh) = (
+            Tx_Width_Log2[tx_sz as usize] as i32,
+            Tx_Height_Log2[tx_sz as usize] as i32,
+        );
+        for mode in 0..INTRA_MODES {
+            for delta in -3..=3 {
+                if delta != 0 && !is_directional(mode) {
+                    continue;
+                }
+                for k in 0..4 {
+                    let (above, left) = (random_edge(&mut r, k & 2 != 0), random_edge(&mut r, k & 2 != 0));
+                    let (hl, ha) = (r.below(2) == 0, r.below(2) == 0);
+                    predict_intra(mode, delta, hl, ha, lw, lh, &above, &left, &mut d1, 80);
+                    predict_intra_ref(mode, delta, hl, ha, lw, lh, &above, &left, &mut d2, 80);
+                    assert_eq!(d1, d2, "tx {tx_sz} mode {mode} delta {delta}");
+                    // with the edge filter (and upsampling)
+                    let (ft, x, y) = (r.below(2) as i32, r.range(0, 8), r.range(0, 8));
+                    let (mx, my) = (x + (1 << lw) + r.range(-1, 40), y + (1 << lh) + r.range(-1, 40));
+                    let fi = if mode == DC_PRED && lw <= 5 && lh <= 5 && r.below(2) == 0 {
+                        r.range(0, 4)
+                    } else {
+                        -1
+                    };
+                    let (mut a1, mut l1, mut a2, mut l2) = (above, left, above, left);
+                    predict_intra_ex(
+                        mode, delta, fi, true, ft, hl, ha, lw, lh, x, y, mx, my, &mut a1, &mut l1, &mut d1, 80,
+                    );
+                    predict_intra_ex_ref(
+                        mode, delta, fi, true, ft, hl, ha, lw, lh, x, y, mx, my, &mut a2, &mut l2, &mut d2, 80,
+                    );
+                    assert_eq!(d1, d2, "ex tx {tx_sz} mode {mode} delta {delta}");
+                    assert!(a1 == a2 && l1 == l2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nondirectional_simd_matches_scalar() {
+    let mut r = Rng(5);
+    let (mut d1, mut d2) = (vec![0u8; 64 * 64], vec![0u8; 64 * 64]);
+    for _ in 0..50 {
+        for tx_sz in ALL_TX {
+            let (lw, lh) = (
+                Tx_Width_Log2[tx_sz as usize] as i32,
+                Tx_Height_Log2[tx_sz as usize] as i32,
+            );
+            for mode in [SMOOTH_PRED, SMOOTH_V_PRED, SMOOTH_H_PRED, PAETH_PRED] {
+                let (a, l) = (random_edge(&mut r, false), random_edge(&mut r, false));
+                nondirectional(mode, lw, lh, &a, &l, &mut d1, 64);
+                nondirectional_scalar(mode, lw, lh, &a, &l, &mut d2, 64);
+                assert_eq!(d1, d2, "tx {tx_sz} mode {mode}");
+            }
+        }
+    }
+}
+
+#[test]
+fn interp_row_simd_matches_scalar() {
+    let mut r = Rng(9);
+    for n in 0..70 {
+        for extra in [1, 9, 17] {
+            let e: Vec<u8> = (0..n + extra).map(|_| r.next() as u8).collect();
+            for shift in 0..32 {
+                let (mut a, mut b) = (vec![0u8; n], vec![0u8; n]);
+                interp_row(&mut a, &e, shift);
+                interp_row_scalar(&mut b, &e, shift);
+                assert_eq!(a, b);
+            }
+        }
+    }
+}
+
+// ---- micro-benchmarks: cargo test --release dsp::tests::bench -- --ignored --nocapture ----
+
+fn time_ns(iters: u32, mut f: impl FnMut()) -> f64 {
+    for _ in 0..iters / 10 + 1 {
+        f();
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        f();
+    }
+    t.elapsed().as_nanos() as f64 / iters as f64
+}
+
+#[test]
+#[ignore]
+fn bench_inv_txfm2d() {
+    let mut r = Rng(1);
+    let mut res = vec![0i32; 4096];
+    for (tx_sz, ty) in [
+        (TX_4X4, DCT_DCT),
+        (TX_4X4, ADST_ADST),
+        (TX_8X8, DCT_DCT),
+        (TX_8X8, ADST_DCT),
+        (TX_16X16, DCT_DCT),
+        (TX_16X16, ADST_ADST),
+        (TX_16X8, DCT_DCT),
+        (TX_32X32, DCT_DCT),
+        (TX_32X32, IDTX),
+        (TX_64X64, DCT_DCT),
+    ] {
+        // a typical quantized block: the low-frequency quarter populated
+        let (tw, th) = (tx_w(tx_sz).min(32) as usize, tx_h(tx_sz).min(32) as usize);
+        let mut dq = vec![0i32; tw * th];
+        for i in 0..th.div_ceil(2) {
+            for j in 0..tw.div_ceil(2) {
+                dq[i * tw + j] = r.range(-600, 600);
+            }
+        }
+        let s = time_ns(20000, || {
+            std::hint::black_box(inv_txfm2d_scalar(std::hint::black_box(&dq), tx_sz, ty, &mut res));
+        });
+        let v = time_ns(20000, || {
+            std::hint::black_box(inv_txfm2d(std::hint::black_box(&dq), tx_sz, ty, &mut res));
+        });
+        println!(
+            "inv_txfm2d {}x{} type {ty:2}: scalar {s:8.1} ns  simd {v:8.1} ns  ({:.1}x)",
+            tw.max(tx_w(tx_sz) as usize),
+            tx_h(tx_sz),
+            s / v
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_dequant_add_residual_edges() {
+    let mut r = Rng(4);
+    let mut out = vec![0i32; 1024];
+    let mut pl: Vec<u8> = (0..80 * 80).map(|_| r.next() as u8).collect();
+    for (tx_sz, name) in [
+        (TX_4X4, "4x4"),
+        (TX_8X8, "8x8"),
+        (TX_16X16, "16x16"),
+        (TX_32X32, "32x32"),
+    ] {
+        let n = tx_coeffs(tx_sz);
+        let q: Vec<i16> = (0..n)
+            .map(|i| if i < n / 4 { r.range(-20, 20) as i16 } else { 0 })
+            .collect();
+        let m = qm(true, 8, 0, tx_sz, DCT_DCT);
+        let a = time_ns(50000, || {
+            dequant(std::hint::black_box(&q), &mut out, tx_sz, 40, 48, None)
+        });
+        let b = time_ns(50000, || dequant(std::hint::black_box(&q), &mut out, tx_sz, 40, 48, m));
+        let res: Vec<i32> = (0..tx_w(tx_sz) * tx_h(tx_sz)).map(|_| r.range(-40, 40)).collect();
+        let c = time_ns(50000, || {
+            add_residual(&mut pl[81..], 80, std::hint::black_box(&res), tx_sz, DCT_DCT)
+        });
+        let d = time_ns(50000, || {
+            add_residual(&mut pl[81..], 80, std::hint::black_box(&res), tx_sz, FLIPADST_FLIPADST)
+        });
+        let (lw, lh) = (
+            Tx_Width_Log2[tx_sz as usize] as i32,
+            Tx_Height_Log2[tx_sz as usize] as i32,
+        );
+        let (mut ea, mut el) = ([0u8; EDGE_LEN], [0u8; EDGE_LEN]);
+        let e = time_ns(50000, || {
+            build_edges(
+                std::hint::black_box(&pl),
+                80,
+                8,
+                8,
+                lw,
+                lh,
+                true,
+                true,
+                true,
+                true,
+                79,
+                79,
+                &mut ea,
+                &mut el,
+            )
+        });
+        println!(
+            "{name:5}: dequant {a:6.1} ns (qm {b:6.1})  add_residual {c:6.1} ns (flipped {d:6.1})  build_edges {e:6.1} ns"
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_predict_intra() {
+    let mut r = Rng(2);
+    let (above, left) = (random_edge(&mut r, true), random_edge(&mut r, true));
+    let mut dst = vec![0u8; 64 * 64];
+    for (tx_sz, name) in [
+        (TX_4X4, "4x4"),
+        (TX_8X8, "8x8"),
+        (TX_16X16, "16x16"),
+        (TX_32X32, "32x32"),
+        (TX_64X64, "64x64"),
+    ] {
+        let (lw, lh) = (
+            Tx_Width_Log2[tx_sz as usize] as i32,
+            Tx_Height_Log2[tx_sz as usize] as i32,
+        );
+        for (mode, delta, mname) in [
+            (DC_PRED, 0, "DC"),
+            (V_PRED, 0, "V"),
+            (D45_PRED, 1, "D45+1"),
+            (D135_PRED, -2, "D135-2"),
+            (D203_PRED, 2, "D203+2"),
+            (SMOOTH_PRED, 0, "SMOOTH"),
+            (SMOOTH_V_PRED, 0, "SMOOTH_V"),
+            (PAETH_PRED, 0, "PAETH"),
+        ] {
+            let s = time_ns(20000, || {
+                predict_intra_ref(mode, delta, true, true, lw, lh, &above, &left, &mut dst, 64);
+                std::hint::black_box(&dst);
+            });
+            let v = time_ns(20000, || {
+                predict_intra(mode, delta, true, true, lw, lh, &above, &left, &mut dst, 64);
+                std::hint::black_box(&dst);
+            });
+            println!(
+                "predict {name:5} {mname:8}: per-pixel {s:8.1} ns  block {v:8.1} ns  ({:.1}x)",
+                s / v
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_nondirectional_scalar_vs_neon() {
+    let mut r = Rng(3);
+    let (above, left) = (random_edge(&mut r, true), random_edge(&mut r, true));
+    let mut dst = vec![0u8; 64 * 64];
+    for (tx_sz, name) in [(TX_8X8, "8x8"), (TX_16X16, "16x16"), (TX_32X32, "32x32")] {
+        let (lw, lh) = (
+            Tx_Width_Log2[tx_sz as usize] as i32,
+            Tx_Height_Log2[tx_sz as usize] as i32,
+        );
+        for (mode, mname) in [
+            (SMOOTH_PRED, "SMOOTH"),
+            (SMOOTH_H_PRED, "SMOOTH_H"),
+            (PAETH_PRED, "PAETH"),
+        ] {
+            let s = time_ns(50000, || {
+                nondirectional_scalar(mode, lw, lh, &above, &left, &mut dst, 64);
+                std::hint::black_box(&dst);
+            });
+            let v = time_ns(50000, || {
+                nondirectional(mode, lw, lh, &above, &left, &mut dst, 64);
+                std::hint::black_box(&dst);
+            });
+            println!(
+                "{mname:8} {name:5}: scalar {s:7.1} ns  simd {v:7.1} ns  ({:.1}x)",
+                s / v
+            );
+        }
+    }
+}
+
+// ---- snapshots (until 2026-11-17 against the C++, where they were recorded) ----
+
+mod snapshots {
+    use super::*;
+    use crate::testsupport::snapshot::Snapshot;
+
+    #[test]
+    fn helpers_snapshot() {
+        let mut s = Snapshot::new(&["tx_sets", "scan", "qm", "tx_class", "q", "dequant_coef", "edge"]);
+        for t in ALL_TX {
+            for red in 0..2 {
+                s.put("tx_sets", &(get_tx_set_intra(t, red != 0) as i64));
+                for m in 0..UV_INTRA_MODES_CFL_ALLOWED {
+                    s.put("tx_sets", &(chroma_tx_type(t, m, red != 0) as i64));
+                }
+            }
+            s.put("tx_sets", &(dq_denom(t) as i64));
+            for ty in 0..TX_TYPES {
+                let sc = get_scan(t, ty);
+                // illegal combinations (a V_* type on 32x32) get a shorter table, as in the C++
+                let n = sc.len().min(tx_coeffs(t));
+                s.put("scan", &(&sc[..n]));
+                for level in 0..17 {
+                    for plane in 0..3 {
+                        for using in 0..2 {
+                            let m = qm(using != 0, level, plane, t, ty);
+                            s.put("qm", &m);
+                        }
+                    }
+                }
+            }
+        }
+        for ty in 0..TX_TYPES {
+            s.put("tx_class", &(tx_class(ty) as i64));
+            s.put("tx_class", &(row_kind(ty) as i64));
+            s.put("tx_class", &(col_kind(ty) as i64));
+            s.put("tx_class", &(flip_ud(ty) as i64));
+            s.put("tx_class", &(flip_lr(ty) as i64));
+        }
+        for q in -20..300 {
+            s.put("q", &(dc_q(q) as i64));
+            s.put("q", &(ac_q(q) as i64));
+            s.put("q", &(qm_level_allintra(q) as i64));
+        }
+        let mut r = Rng(3);
+        for _ in 0..20000 {
+            let (qv, q, den) = (
+                r.range(-32768, 32767),
+                r.range(4, 20000),
+                [1, 2, 4][r.below(3) as usize],
+            );
+            s.put("dequant_coef", &(dequant_coef(qv, q, den) as i64));
+            let (x, n) = (r.next() as i32 >> r.below(20), r.range(0, 12));
+            s.put("dequant_coef", &(round2signed(x, n) as i64));
+        }
+        for w in [4, 8, 16, 32, 64] {
+            for h in [4, 8, 16, 32, 64] {
+                for ft in 0..2 {
+                    for d in -100..100 {
+                        s.put("edge", &(edge_strength(w, h, ft, d) as i64));
+                        s.put("edge", &(edge_use_upsample(w, h, ft, d) as i64));
+                    }
+                }
+            }
+        }
+        s.check(&[
+            ("tx_sets", 0x2a8e0677ea05c622),
+            ("scan", 0x2349f9e32813ff55),
+            ("qm", 0x48b87e5734ba761f),
+            ("tx_class", 0x606ebd040d3611a6),
+            ("q", 0x817aa7d0b4b1d299),
+            ("dequant_coef", 0xd0bbfe3612966380),
+            ("edge", 0x1d56f6d95c554c27),
+        ]);
+    }
+
+    #[test]
+    fn dequant_snapshot() {
+        let mut s = Snapshot::new(&["dequant"]);
+        let mut r = Rng(11);
+        let mut a = vec![0i32; 1024];
+        for _ in 0..30 {
+            for t in ALL_TX {
+                for ty in [DCT_DCT, ADST_ADST, FLIPADST_DCT, IDTX, V_DCT] {
+                    let n = tx_coeffs(t);
+                    let quant: Vec<i16> = (0..n)
+                        .map(|_| match r.below(4) {
+                            0 => 0,
+                            1 => r.range(-32768, 32767) as i16,
+                            _ => r.range(-50, 50) as i16,
+                        })
+                        .collect();
+                    let qi = r.range(0, 255);
+                    let (dcq, acq) = (dc_q(qi), ac_q(qi));
+                    let (using, level, plane) = (r.below(2) as i32, r.range(0, 15), r.range(0, 2));
+                    dequant(&quant, &mut a, t, dcq, acq, qm(using != 0, level, plane, t, ty));
+                    s.put("dequant", &a[..n]);
+                }
+            }
+        }
+        s.check(&[("dequant", 0xb1d4829dd9f67210)]);
+    }
+
+    #[test]
+    fn inv_1d_snapshot() {
+        let mut s = Snapshot::new(&["inv_1d", "range_errors"]);
+        let mut r = Rng(12);
+        for _ in 0..3000 {
+            let kind = r.range(0, 2);
+            let n = r.range(2, 6);
+            let rr = [16, 16, 31, r.range(8, 31)][r.below(4) as usize];
+            let mut t = [0i32; 64];
+            let lim = r.below(31);
+            for v in t.iter_mut().take(1 << n) {
+                *v = (r.next() as i32) >> lim;
+            }
+            let mut e1 = 0u32;
+            inv_1d(&mut t, kind, n, rr, &mut e1);
+            s.put("inv_1d", &t);
+            s.put("range_errors", &e1);
+        }
+        s.check(&[("inv_1d", 0xd403cd01e2509641), ("range_errors", 0x59bfc2689909dae5)]);
+    }
+
+    #[test]
+    fn inv_txfm2d_snapshot() {
+        let mut s = Snapshot::new(&["flags", "residual"]);
+        let mut r = Rng(13);
+        let mut a = vec![0i32; 4096];
+        let mut flagged = [0u32; 3];
+        for _ in 0..60 {
+            for t in ALL_TX {
+                for ty in 0..TX_TYPES {
+                    let dq = random_dq(&mut r, tx_coeffs(t), true);
+                    let n = (tx_w(t) * tx_h(t)) as usize;
+                    let fa = inv_txfm2d(&dq, t, ty, &mut a);
+                    s.put("flags", &fa);
+                    s.put("residual", &a[..n]);
+                    flagged[fa as usize & 1] += 1;
+                    flagged[2] += (fa & 2 != 0) as u32;
+                }
+            }
+        }
+        assert!(flagged[1] > 100 && flagged[2] > 10, "flag coverage {flagged:?}");
+        s.check(&[("flags", 0xaaf3913971514126), ("residual", 0x49db114c4b327a5c)]);
+    }
+
+    #[test]
+    fn add_residual_snapshot() {
+        let mut s = Snapshot::new(&["add_residual"]);
+        let mut r = Rng(14);
+        for t in ALL_TX {
+            for ty in 0..TX_TYPES {
+                let (w, h) = (tx_w(t) as usize, tx_h(t) as usize);
+                let res: Vec<i32> = (0..w * h).map(|_| r.range(-300, 300)).collect();
+                let mut p: Vec<u8> = (0..72 * 70).map(|_| r.next() as u8).collect();
+                add_residual(&mut p[72 + 3..], 72, &res, t, ty);
+                s.put("add_residual", &p);
+            }
+        }
+        s.check(&[("add_residual", 0xb7b60436eac135fb)]);
+    }
+
+    const PW: usize = 160;
+
+    /// A random av1t_pred_case-like setup: (x, y, maxX, maxY) within a PW x PW plane.
+    fn edge_case(r: &mut Rng, lw: i32, lh: i32, hl: bool, ha: bool) -> (i32, i32, i32, i32) {
+        let x = if hl { 1 + r.range(0, 7) } else { 0 };
+        let y = if ha { 1 + r.range(0, 7) } else { 0 };
+        let mx = (x + (1 << lw) + r.range(0, 63) - 1).min(PW as i32 - 1);
+        let my = (y + (1 << lh) + r.range(0, 63) - 1).min(PW as i32 - 1);
+        (x, y, mx, my)
+    }
+
+    #[test]
+    fn build_edges_and_dc_snapshot() {
+        let mut s = Snapshot::new(&["edges", "dc"]);
+        let mut r = Rng(15);
+        let plane: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
+        for _ in 0..20 {
+            for t in ALL_TX {
+                let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+                for k in 0..16 {
+                    let (hl, ha, har, hbl) = (k & 1 != 0, k & 2 != 0, k & 4 != 0, k & 8 != 0);
+                    let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
+                    let fill = r.next() as u8;
+                    let (mut a1, mut l1) = ([fill; EDGE_LEN], [fill; EDGE_LEN]);
+                    build_edges(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a1, &mut l1);
+                    s.put("edges", &(a1, l1));
+                    s.put("dc", &(dc_value(&a1, &l1, hl, ha, lw, lh)));
+                }
+            }
+        }
+        s.check(&[("edges", 0x6332e604a05b79c3), ("dc", 0x3045cf75c5ac2474)]);
+    }
+
+    #[test]
+    fn edge_filter_upsample_prepare_snapshot() {
+        let mut s = Snapshot::new(&["edge_filter", "edge_upsample", "edge_prepare", "pred_pixel_up"]);
+        let mut r = Rng(16);
+        for _ in 0..3000 {
+            let smooth = r.below(2) == 0;
+            let e = random_edge(&mut r, smooth);
+            let (sz, strength) = (r.range(1, 129), r.range(0, 3));
+            let mut a = e;
+            edge_filter(&mut a, sz, strength);
+            s.put("edge_filter", &a);
+            let n = r.range(1, 24);
+            let mut a = e;
+            edge_upsample(&mut a, n);
+            s.put("edge_upsample", &a);
+        }
+        for _ in 0..20 {
+            for t in ALL_TX {
+                let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+                for mode in V_PRED..=D67_PRED {
+                    for delta in -3..=3 {
+                        let p_angle = Mode_To_Angle[mode as usize] as i32 + delta * ANGLE_STEP;
+                        let (hl, ha, ft) = (r.below(2) == 0, r.below(2) == 0, r.below(2) as i32);
+                        let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
+                        let (mut a1, mut l1) = (random_edge(&mut r, true), random_edge(&mut r, true));
+                        let up = edge_prepare(p_angle, lw, lh, ft, hl, ha, x, y, mx, my, &mut a1, &mut l1);
+                        s.put("edge_prepare", &(up, a1, l1));
+                        let (ua, ul) = up;
+                        // the per-pixel predictor on the (possibly upsampled) edges
+                        for i in 0..1 << lh {
+                            for j in 0..1 << lw {
+                                s.put("pred_pixel_up", &(pred_pixel_up(mode, p_angle, i, j, lw, lh, &a1, &l1, ua, ul)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        s.check(&[
+            ("edge_filter", 0x5bc23b9d51f144c9),
+            ("edge_upsample", 0xaa5b966ab41bd61d),
+            ("edge_prepare", 0x8715859b24779719),
+            ("pred_pixel_up", 0xd92e93b942e86ba5),
+        ]);
+    }
+
+    #[test]
+    fn predict_intra_snapshot() {
+        let mut s = Snapshot::new(&["predict_intra", "predict_intra_ex", "filter_intra"]);
+        let mut r = Rng(17);
+        let mut d1 = vec![0u8; 80 * 70];
+        for rep in 0..4 {
+            for t in ALL_TX {
+                let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+                for mode in 0..INTRA_MODES {
+                    for delta in -3..=3 {
+                        for k in 0..4 {
+                            let (hl, ha) = (k & 1 != 0, k & 2 != 0);
+                            let (above, left) = (random_edge(&mut r, rep & 1 == 0), random_edge(&mut r, rep & 1 == 0));
+                            d1.fill(7);
+                            predict_intra(mode, delta, hl, ha, lw, lh, &above, &left, &mut d1[80 + 1..], 80);
+                            s.put("predict_intra", &d1);
+                            // with the edge filter / upsampling / filter intra
+                            let (x, y, mx, my) = edge_case(&mut r, lw, lh, hl, ha);
+                            let fi = if lw <= 5 && lh <= 5 && r.below(3) == 0 {
+                                r.range(0, 4)
+                            } else {
+                                -1
+                            };
+                            let (ef, ft) = (r.below(4) != 0, r.below(2) as i32);
+                            let (mut a1, mut l1) = (above, left);
+                            predict_intra_ex(
+                                mode,
+                                delta,
+                                fi,
+                                ef,
+                                ft,
+                                hl,
+                                ha,
+                                lw,
+                                lh,
+                                x,
+                                y,
+                                mx,
+                                my,
+                                &mut a1,
+                                &mut l1,
+                                &mut d1[80 + 1..],
+                                80,
+                            );
+                            s.put("predict_intra_ex", &(&d1, a1, l1));
+                        }
+                    }
+                }
+                if lw <= 5 && lh <= 5 {
+                    for mode in 0..5 {
+                        let (above, left) = (random_edge(&mut r, true), random_edge(&mut r, true));
+                        predict_filter_intra(mode, lw, lh, &above, &left, &mut d1, 80);
+                        s.put("filter_intra", &d1);
+                    }
+                }
+            }
+        }
+        s.check(&[
+            ("predict_intra", 0x133e8ae8216583d3),
+            ("predict_intra_ex", 0xbedea2d2d28f85bf),
+            ("filter_intra", 0x1e98a7b99a7e29c9),
+        ]);
+    }
+
+    #[test]
+    fn cfl_predict_snapshot() {
+        let mut s = Snapshot::new(&["cfl"]);
+        let mut r = Rng(18);
+        let luma: Vec<u8> = (0..2 * PW * 2 * PW).map(|_| r.next() as u8).collect();
+        for _ in 0..30 {
+            for t in ALL_TX {
+                let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+                if lw > 5 || lh > 5 {
+                    continue;
+                }
+                let (x, y) = (r.range(0, 60), r.range(0, 60));
+                let (subx, suby) = (r.range(0, 1), r.range(0, 1));
+                let mlw = ((x + (1 << lw)) << subx) - r.range(0, 3) * 4;
+                let mlh = ((y + (1 << lh)) << suby) - r.range(0, 3) * 4;
+                let (mlw, mlh) = (mlw.max(4), mlh.max(4));
+                let alpha = r.range(-16, 16);
+                let mut c1: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
+                cfl_predict(&mut c1, PW, &luma, 2 * PW, x, y, t, subx, suby, mlw, mlh, alpha);
+                s.put("cfl", &c1);
+            }
+        }
+        s.check(&[("cfl", 0x882cf7b61961c159)]);
+    }
+
+    // av1g_test/dsp_cases.h: the cases the GPU equivalence tests run, with the CPU's results
+
+    /// The cases of the set of `seed` (testsupport's `dsp_sets_snapshot` pins it) through the DSP: the inverse transforms' flags and residuals, the
+    /// predictions; each equal to the set's CPU results.
+    #[test]
+    fn dsp_cases_snapshot() {
+        let mut s = Snapshot::new(&["itx_flags", "itx_residual", "pred"]);
+        for seed in [1u64, 0xfeed] {
+            // the same cases from the Rust set, hashed
+            let set = crate::testsupport::DspSet::make(seed);
+            let mut dq = vec![0i32; 1024];
+            let mut res = vec![0i32; 4096];
+            for (i, c) in set.itx.iter().enumerate() {
+                let q = &set.itx_coeffs[i * crate::testsupport::ITX_COEFFS..][..1024];
+                let want = &set.itx_residual[i * crate::testsupport::ITX_RESIDUAL..][..4096];
+                dequant(
+                    q,
+                    &mut dq,
+                    c.tx_sz,
+                    c.dc_q,
+                    c.ac_q,
+                    qm(c.qm_level >= 0, c.qm_level, c.plane, c.tx_sz, c.tx_type),
+                );
+                let f = inv_txfm2d(&dq, c.tx_sz, c.tx_type, &mut res);
+                let n = (tx_w(c.tx_sz) * tx_h(c.tx_sz)) as usize;
+                assert_eq!(f, set.itx_flags[i], "itx case {i}");
+                assert_eq!(res[..n], want[..n], "itx case {i}");
+                s.put("itx_flags", &f);
+                s.put("itx_residual", &res[..n]);
+            }
+            let pw = PW;
+            let luma = &set.pred_luma[..];
+            for (i, c) in set.pred.iter().enumerate() {
+                let mut out = set.pred_planes[i * pw * pw..][..pw * pw].to_vec();
+                let want = &set.pred_out[i * pw * pw..][..pw * pw];
+                let (mut a, mut l) = ([0u8; EDGE_LEN], [0u8; EDGE_LEN]);
+                build_edges(
+                    &out,
+                    pw,
+                    c.x,
+                    c.y,
+                    c.log2w,
+                    c.log2h,
+                    c.have_left != 0,
+                    c.have_above != 0,
+                    c.have_ar != 0,
+                    c.have_bl != 0,
+                    c.max_x,
+                    c.max_y,
+                    &mut a,
+                    &mut l,
+                );
+                let o = c.y as usize * pw + c.x as usize;
+                predict_intra_ex(
+                    c.mode,
+                    c.delta,
+                    c.fi_mode,
+                    c.edge_filter != 0,
+                    c.filter_type,
+                    c.have_left != 0,
+                    c.have_above != 0,
+                    c.log2w,
+                    c.log2h,
+                    c.x,
+                    c.y,
+                    c.max_x,
+                    c.max_y,
+                    &mut a,
+                    &mut l,
+                    &mut out[o..],
+                    pw,
+                );
+                if c.cfl != 0 {
+                    let t = (0..TX_SIZES_ALL)
+                        .rfind(|&t| {
+                            Tx_Width_Log2[t as usize] as i32 == c.log2w && Tx_Height_Log2[t as usize] as i32 == c.log2h
+                        })
+                        .unwrap();
+                    cfl_predict(
+                        &mut out,
+                        pw,
+                        luma,
+                        2 * pw,
+                        c.x,
+                        c.y,
+                        t,
+                        1,
+                        1,
+                        2 * (c.x + (1 << c.log2w)),
+                        2 * (c.y + (1 << c.log2h)),
+                        c.alpha,
+                    );
+                }
+                assert_eq!(out, want, "pred case {i}");
+                s.put("pred", &out);
+            }
+        }
+        s.check(&[
+            ("itx_flags", 0x0e129b7864b44267),
+            ("itx_residual", 0x025c7a2eaff56908),
+            ("pred", 0xd737715e4be1d3d4),
+        ]);
+    }
+}
+
+/// build_edges' fixed-size copies and fills give its reference's edges: every tx size and edge
+/// flag, blocks anywhere in the plane, with limits from the block's own edge to far beyond it.
+#[test]
+fn build_edges_matches_the_reference() {
+    const PW: usize = 300;
+    let mut r = Rng(29);
+    let plane: Vec<u8> = (0..PW * PW).map(|_| r.next() as u8).collect();
+    for _ in 0..200 {
+        for t in ALL_TX {
+            let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+            for k in 0..16 {
+                let (hl, ha, har, hbl) = (k & 1 != 0, k & 2 != 0, k & 4 != 0, k & 8 != 0);
+                let x = if hl { 1 + r.range(0, 150) } else { 0 };
+                let y = if ha { 1 + r.range(0, 150) } else { 0 };
+                let mx = (x + r.range(0, 140) - 1).clamp(x, PW as i32 - 1);
+                let my = (y + r.range(0, 140) - 1).clamp(y, PW as i32 - 1);
+                let fill = r.next() as u8;
+                let (mut a1, mut l1) = ([fill; EDGE_LEN], [fill; EDGE_LEN]);
+                let (mut a2, mut l2) = (a1, l1);
+                build_edges(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a1, &mut l1);
+                build_edges_ref(&plane, PW, x, y, lw, lh, hl, ha, har, hbl, mx, my, &mut a2, &mut l2);
+                assert!(a1 == a2 && l1 == l2, "tx {t} flags {k} at ({x}, {y}) limits ({mx}, {my})");
+            }
+        }
+    }
+}
+
+/// build_edges against its reference per call, interior blocks (`--ignored`).
+#[test]
+#[ignore]
+fn bench_build_edges() {
+    type F = fn(&[u8], usize, i32, i32, i32, i32, bool, bool, bool, bool, i32, i32, &mut Edge, &mut Edge);
+    const PW: usize = 512;
+    let plane: Vec<u8> = (0..PW * PW).map(|i| (i * 31 % 251) as u8).collect();
+    for (name, t) in [("4x4", TX_4X4), ("8x8", TX_8X8), ("16x16", TX_16X16), ("32x32", TX_32X32), ("8x4", TX_8X4)] {
+        let (lw, lh) = (Tx_Width_Log2[t as usize] as i32, Tx_Height_Log2[t as usize] as i32);
+        let (mut a, mut l) = ([0u8; EDGE_LEN], [0u8; EDGE_LEN]);
+        let iters = 2_000_000;
+        for (which, f) in [("ref", build_edges_ref as F), ("new", build_edges as F)] {
+            let tm = std::time::Instant::now();
+            for i in 0..iters {
+                let (x, y) = (64 + (i % 5) as i32 * 64, 64 + (i % 3) as i32 * 64);
+                let f = std::hint::black_box(f);
+                f(&plane, PW, x, y, lw, lh, true, true, i % 2 == 0, i % 3 == 0, PW as i32 - 1, PW as i32 - 1, &mut a, &mut l);
+                std::hint::black_box((&a, &l));
+            }
+            println!("{name} {which}: {:.1} ns", tm.elapsed().as_nanos() as f64 / iters as f64);
+        }
+    }
+}

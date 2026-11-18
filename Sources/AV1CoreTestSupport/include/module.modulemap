@@ -1,0 +1,4 @@
+module AV1CoreTestSupport {
+    header "av1core_test.h"
+    export *
+}

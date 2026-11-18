@@ -48,8 +48,10 @@ the exception to the default no-dependencies posture.
 - **License:** BSD-2-Clause (`LICENSE`), plus the Alliance for Open Media
   Patent License 1.0 (`PATENTS`).
 - **Scope used:** the AV1 encoder in realtime mode, for video regions a
-  Viewer has opted in to (§4.6). The decoder is compiled too, for tests and
-  the bench. Swift calls only Glass Act's C API
+  Viewer has opted in to (§4.6): the Host's AV1 until 2026-11-17, now kept
+  unused behind one switch (`HostController.av1Encoder = .libaom`; the
+  Host's AV1 is Glass Act's own encoder). The decoder is compiled too, for
+  tests and the bench, whose AV1 measurements still run libaom. Swift calls only Glass Act's C API
   (`glassact/include/glassact_aom.h`, `glassact/shim/glassact_aom.c`).
 - **Build:** a SwiftPM C target of the files `scripts/vendor-libaom`
   copies: exactly the sources an arm64 build of `libaom.a` compiles
@@ -105,3 +107,36 @@ the exception to the default no-dependencies posture.
   `Package.resolved`. Replace the Sparkle section of
   `Apps/Shared/Acknowledgements.txt` with the new `LICENSE`. Build both apps
   and run the local update test in RELEASING.md before landing.
+
+## av1gpu at a30b4e8 (`Sources/AV1Core`, `Sources/AV1CoreTestSupport`, `Sources/AV1Encoder`, `Sources/GlassActAV1/Shaders`, `rust/av1`)
+
+- **Upstream:** https://github.com/maddog107/av1gpu, commit `a30b4e8`
+  (main, 2026-10-30). A CUDA AV1 still-image encoder; its CPU core is
+  plain C++.
+- **License:** BSD-2-Clause (`Sources/AV1Core/LICENSE`). Parts derive from
+  libaom (the range encoder in `entenc.h`, and the `tune=iq` decisions not
+  yet ported), under libaom's BSD-2-Clause; see
+  `Sources/AV1Core/THIRD_PARTY_NOTICES.md`.
+- **Scope used:** ported to Metal, owner's decision (2026-10-30): still
+  images first, then video. Since 2026-11-17 the apps' AV1 is built on it
+  (DESIGN §4.6): the Host's encoder (Metal kernels and the Rust CPU half,
+  `rust/av1`) and the Viewers' decoder (`rust/av1`); its license is in
+  `Apps/Shared/Acknowledgements.txt`. `AV1Core` is av1gpu's `av1core`: the DecisionRecord interface, the CPU
+  bitstream writer with the decoder's exact reconstruction, the AVIF muxer,
+  and the spec-mirroring DSP headers that the CPU and the GPU kernels share
+  (`include/av1g`). `AV1CoreTestSupport` is its fuzzer's record generator
+  and its CPU reference engine, for tests. Their tests ran dav1d and aomdec
+  through `system()`; ours decode in-process with the vendored libaom.
+  `AV1Encoder` and `Sources/GlassActAV1/Shaders` port its CUDA encoder
+  (`encoder/src`) and GPU entropy coder (`av1core/src/gpu_entropy.cu`,
+  `encoder/src/entropy_gpu.cpp`) to Metal and C++ hosts.
+- **Changes:** `internal.h` moved into `include/av1g`; module maps expose
+  only the C API to Swift; the tests' tool paths, file I/O and JPEG input
+  dropped. Files changed beyond include paths say so at the top. The CPU
+  C++ is ported to Rust (`rust/av1`, behind the same C API); the C++ itself
+  was kept frozen in `rust/av1/oracle/cpp` as the port's test reference
+  until 2026-11-17, when snapshot tests replaced it (BENCHMARKS). The C
+  headers in `Sources/*/include`, the Metal kernels and the Rust port stay
+  derived from av1gpu, under its license.
+- **Update procedure:** none while it's a fork in progress. Record here
+  which upstream commit a change was taken from.

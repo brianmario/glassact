@@ -247,6 +247,7 @@ final class Harness {
     private var hostVideo: Bool
     private var hostEncoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
     private var hostCodecPref: [UInt8]
+    private var hostAV1FromGlassAct: Bool
     private var hostClock: (@Sendable () -> UInt64)?
 
     var now: UInt64 { link.nowUS }
@@ -256,6 +257,8 @@ final class Harness {
          viewerCodecs: [UInt8] = [MockVideoEncoder.mockCodecID],
          encoderFactory: ((UInt8) -> any VideoRegionEncoder?)? = nil,
          decoderFactory: (() -> any VideoRegionDecoder)? = nil,
+         viewerDecoders: ViewerVideoDecoders? = nil,
+         hostAV1FromGlassAct: Bool = false,
          fastLink: Bool = false,
          sendClock: Bool = false,
          encodeTimer: (@Sendable () -> UInt64)? = nil,
@@ -273,15 +276,21 @@ final class Harness {
         hostVideo = video
         hostEncoderFactory = encoderFactory
         hostCodecPref = hostCodecs
+        self.hostAV1FromGlassAct = hostAV1FromGlassAct
         host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: video ? (encoderFactory ?? { MockVideoEncoder(codecID: $0) }) : nil,
                           videoCodecPreference: hostCodecs,
+                          videoAV1FromGlassAct: hostAV1FromGlassAct,
                           clock: hostClock,
                           encodeTimer: encodeTimer)
         if fastLink { host.assumeFastLinkForTests() }
-        viewer = ViewerEngine(transport: link.b,
-                              videoDecoderFactory: video ? (decoderFactory ?? { MockVideoDecoder() }) : nil,
-                              supportedVideoCodecs: viewerCodecs)
+        if let viewerDecoders {
+            viewer = ViewerEngine(transport: link.b, videoDecoders: video ? viewerDecoders : nil)
+        } else {
+            viewer = ViewerEngine(transport: link.b,
+                                  videoDecoderFactory: video ? (decoderFactory ?? { MockVideoDecoder() }) : nil,
+                                  supportedVideoCodecs: viewerCodecs)
+        }
         viewer.initialQualityPolicy = viewerQualityPolicy
         link.a.onControl = { [weak self] data in
             guard let self else { return }
@@ -314,6 +323,7 @@ final class Harness {
         host = HostEngine(width: width, height: height, transport: link.a,
                           videoEncoderFactory: hostVideo ? (hostEncoderFactory ?? { MockVideoEncoder(codecID: $0) }) : nil,
                           videoCodecPreference: hostCodecPref,
+                          videoAV1FromGlassAct: hostAV1FromGlassAct,
                           startFrameSeq: seed,
                           clock: hostClock)
         host.continueSession(from: previous)

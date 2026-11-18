@@ -1,0 +1,122 @@
+#!/bin/sh
+# Builds the Rust AV1 library (rust/av1) that the package's AV1 targets link, always optimized
+# (debug Swift builds link it too):
+#   scripts/build-rust              this Mac's architecture → .build/rust/libglassact_av1.a
+#   scripts/build-rust --universal  arm64 + x86_64 (CI, the Intel build) → the same file
+#   scripts/build-rust --xcode [--shaders]
+#                                   from an app target's run-script phase: Xcode's PLATFORM_NAME
+#                                   and ARCHS. macOS → .build/rust/libglassact_av1.a, as above;
+#                                   iPadOS and its Simulator → .build/rust/<platform>/ (AV1Core's
+#                                   -L for iOS). --shaders also copies the AV1 encoder's kernel
+#                                   sources into the app's Resources/AV1Shaders (AV1ShaderSource).
+#   scripts/build-rust --copy-shaders <dir>   only that copy, into <dir> (a test checks it)
+# `just` runs it before every build and test; run it yourself before a bare `swift build`. Xcode
+# runs it in each app target (Apps/GlassActApps.xcodeproj), so the apps need nothing else.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+manifest="$root/rust/av1/Cargo.toml"
+out="$root/.build/rust"
+# Xcode's run scripts get a minimal PATH, without rustup's.
+PATH="$PATH:${CARGO_HOME:-$HOME/.cargo}/bin"
+export PATH
+command -v cargo >/dev/null || { echo "build-rust: no cargo; install Rust with rustup (https://rustup.rs)" >&2; exit 1; }
+
+# The apps' deployment targets (Package.swift's platforms, the Xcode project's settings).
+macos_min=15.5
+ios_min=27.0
+
+# cargo with only what it needs from the environment: an Xcode script's SDKROOT, deployment
+# targets and the rest would reach the host build of build.rs and the fingerprint (a rebuild
+# whenever they differ). The same environment in every mode but the plain one, so --universal and
+# Xcode share one cache.
+cargo_clean() {
+    env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+        ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+        ${RUSTUP_TOOLCHAIN:+RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN"} ${DEVELOPER_DIR:+DEVELOPER_DIR="$DEVELOPER_DIR"} \
+        MACOSX_DEPLOYMENT_TARGET=$macos_min IPHONEOS_DEPLOYMENT_TARGET=$ios_min \
+        cargo "$@"
+}
+
+# The Rust target for an Xcode platform and architecture.
+rust_target() {
+    case "$1/$2" in
+        macosx/arm64) echo aarch64-apple-darwin ;;
+        macosx/x86_64) echo x86_64-apple-darwin ;;
+        iphoneos/arm64) echo aarch64-apple-ios ;;
+        iphonesimulator/arm64) echo aarch64-apple-ios-sim ;;
+        iphonesimulator/x86_64) echo x86_64-apple-ios ;;
+        *) echo "build-rust: no Rust target for $1 $2" >&2; exit 1 ;;
+    esac
+}
+
+# Replaces `$2` with `$1` only when they differ, so SwiftPM and Xcode don't relink for nothing;
+# by rename, so a reader never sees half a file.
+install_lib() {
+    mkdir -p "$(dirname "$2")"
+    if ! cmp -s "$1" "$2"; then
+        cp "$1" "$2.tmp.$$" && mv -f "$2.tmp.$$" "$2"
+    fi
+}
+
+# Builds `platform` for `archs` (space-separated) into `dest`, one slice or a universal library.
+build_for() {
+    platform=$1 archs=$2 dest=$3
+    libs=""
+    for arch in $archs; do
+        t=$(rust_target "$platform" "$arch")
+        rustup target list --installed 2>/dev/null | grep -qx "$t" || rustup target add "$t"
+        cargo_clean build --quiet --release --manifest-path "$manifest" --target "$t"
+        libs="$libs $root/rust/av1/target/$t/release/libglassact_av1.a"
+    done
+    # shellcheck disable=SC2086
+    set -- $libs
+    if [ $# -eq 1 ]; then
+        install_lib "$1" "$dest"
+    else
+        lipo_out="$out/libglassact_av1.lipo.$$"
+        mkdir -p "$out"
+        xcrun lipo -create -output "$lipo_out" "$@"
+        install_lib "$lipo_out" "$dest"
+        rm -f "$lipo_out"
+    fi
+}
+
+# The kernels' sources into `$1`, laid out as under Sources/ (AV1ShaderSource.sourceRoot).
+copy_shaders() {
+    dest=$1
+    for d in AV1Core/include AV1Encoder/include GlassActAV1/Shaders; do
+        mkdir -p "$dest/$d"
+        rsync -a --delete --include '*/' --include '*.h' --include '*.metal' --exclude '*' \
+            "$root/Sources/$d/" "$dest/$d/"
+    done
+}
+
+case "${1:-}" in
+    --universal)
+        build_for macosx "arm64 x86_64" "$out/libglassact_av1.a"
+        ;;
+    --xcode)
+        : "${PLATFORM_NAME:?build-rust --xcode: run from an Xcode build phase} ${ARCHS:?}"
+        case "$PLATFORM_NAME" in
+            macosx) build_for macosx "$ARCHS" "$out/libglassact_av1.a" ;;
+            *) build_for "$PLATFORM_NAME" "$ARCHS" "$out/$PLATFORM_NAME/libglassact_av1.a" ;;
+        esac
+        if [ "${2:-}" = "--shaders" ]; then
+            : "${TARGET_BUILD_DIR:?} ${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}"
+            copy_shaders "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/AV1Shaders"
+        fi
+        ;;
+    --copy-shaders)
+        # (what --shaders copies, into a directory of your choosing: a test checks it)
+        copy_shaders "${2:?usage: scripts/build-rust --copy-shaders <dir>}"
+        ;;
+    "")
+        cargo build --quiet --release --manifest-path "$manifest"
+        install_lib "$root/rust/av1/target/release/libglassact_av1.a" "$out/libglassact_av1.a"
+        ;;
+    *)
+        echo "usage: scripts/build-rust [--universal | --xcode [--shaders] | --copy-shaders <dir>]" >&2
+        exit 2
+        ;;
+esac
+exit 0

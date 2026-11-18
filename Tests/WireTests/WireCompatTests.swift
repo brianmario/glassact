@@ -97,6 +97,40 @@ import GlassActWire
         #expect(SignInResponse.parse(Self.bytes(Self.signInResponse)) == WireCompatSamples.signInResponse)
     }
 
+    /// Every caps bit keeps its value (§3.8): a released peer reads a bit by its number. Bit 7,
+    /// `videoAV1GlassAct`, is new in this release: released peers never send it (it was
+    /// `videoOverlay` only before wire version 4) and ignore it; its pairings are AV1PairingTests'.
+    @Test func capsBitsArePinned() {
+        #expect(WireCaps.videoHEVC == 1 << 0)
+        #expect(WireCaps.videoAV1 == 1 << 1)
+        #expect(WireCaps.deliveryReports == 1 << 2)
+        #expect(WireCaps.smoothnessPreference == 1 << 3)
+        #expect(WireCaps.cursor == 1 << 4)
+        #expect(WireCaps.geometryFinal == 1 << 5)
+        #expect(WireCaps.windowList == 1 << 6)
+        #expect(WireCaps.videoAV1GlassAct == 1 << 7)
+        #expect(WireCaps.logUpload == 1 << 9)
+        #expect(WireCaps.virtualDisplay == 1 << 10)
+        #expect(WireCaps.agentControl == 1 << 11)
+        // the released fixtures' caps are made of known bits only, and none of them is bit 7
+        #expect(0x0E71 & WireCaps.videoAV1GlassAct == 0 && 0x0011 & WireCaps.videoAV1GlassAct == 0)
+        // AV1 stays codec 3 under both AV1 bits; a codec's own bit is unchanged
+        #expect(WireCaps.bit(forVideoCodec: VideoCodec.av1) == WireCaps.videoAV1)
+        #expect(WireCaps.viewerBits(forVideoCodec: VideoCodec.av1, glassActAV1: true)
+                == WireCaps.videoAV1 | WireCaps.videoAV1GlassAct)
+        #expect(WireCaps.viewerBits(forVideoCodec: VideoCodec.av1, glassActAV1: false) == WireCaps.videoAV1)
+        #expect(WireCaps.viewerBits(forVideoCodec: VideoCodec.hevc, glassActAV1: true) == WireCaps.videoHEVC)
+    }
+
+    /// A HELLO_OK carrying the new bit parses as any caps do (a u32, unknown bits kept).
+    @Test func aHelloOKWithTheNewBitParses() {
+        let message = ControlMessage.helloOK(ver: 4, caps: 0x0011 | WireCaps.videoAV1GlassAct, geoMode: 0,
+                                             geoWidth: 0, geoHeight: 0, geoScale: 0)
+        var d = ControlDeframer()
+        d.append(message.encoded())
+        #expect(d.next() == .message(message))
+    }
+
     /// A newer peer's message types are skipped, and the stream carries on.
     @Test func unknownTypesAreSkipped() {
         var d = ControlDeframer()

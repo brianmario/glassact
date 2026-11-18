@@ -22,21 +22,26 @@ public final class ViewerSession: @unchecked Sendable {
         /// Advertise WireCaps.cursor: the host sends the pointer as metadata
         /// instead of burning it into pixels.
         public var cursorMetadata: Bool
-        /// Advertise hardware HEVC video regions. Off, the host sends only
-        /// lossless tiles — every settled pixel is exact (what an agent wants).
+        /// Advertise video regions. Off, the host sends only lossless tiles —
+        /// every settled pixel is exact (what an agent wants).
         public var video: Bool
-        /// Also advertise AV1 (when this Mac decodes it in hardware): the
-        /// Viewer's opt-in. The Host prefers it whenever it's offered.
-        public var av1: Bool
+        /// What video is decoded with and offered (§4.6): HEVC, and AV1 when
+        /// the user opted in. The Host prefers AV1 whenever it's offered. The
+        /// apps pass `ViewerVideoDecoders.glassAct(av1:)` (GlassActAV1Decode),
+        /// with Glass Act's own AV1 decoder where VideoToolbox has none; this
+        /// target doesn't link it.
+        public var videoDecoders: ViewerVideoDecoders
+
         /// Sent to the host (VIEWER_INFO) so its approved-viewers list can
         /// name this computer. Empty = say nothing.
         public var deviceName: String
 
-        public init(cursorMetadata: Bool = true, video: Bool = true, av1: Bool = false,
+        public init(cursorMetadata: Bool = true, video: Bool = true,
+                    videoDecoders: ViewerVideoDecoders = .videoToolbox(av1: false),
                     deviceName: String = ViewerSession.computerName) {
             self.cursorMetadata = cursorMetadata
             self.video = video
-            self.av1 = av1
+            self.videoDecoders = videoDecoders
             self.deviceName = deviceName
         }
     }
@@ -117,9 +122,7 @@ public final class ViewerSession: @unchecked Sendable {
         target = "host=\(host) port=\(port)"
         transport = QUICTransport.connect(host: host, port: port, fingerprint: fingerprint,
                                           datagramPort: datagramPort, identity: identity, queue: queue)
-        engine = ViewerEngine(transport: transport,
-                              videoDecoderFactory: options.video ? { VTRegionDecoder() } : nil,
-                              supportedVideoCodecs: options.video ? VTRegionDecoder.supportedCodecs(av1: options.av1) : [],
+        engine = ViewerEngine(transport: transport, videoDecoders: options.video ? options.videoDecoders : nil,
                               advertiseCursor: options.cursorMetadata)
         engine.deviceName = options.deviceName
     }

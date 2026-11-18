@@ -250,7 +250,9 @@ public final class ViewerEngine: @unchecked Sendable {
     private var keyframes = KeyframeApplier()
     private var video: VideoRegionTable
     private var acks = AckTracker()
-    private let supportedVideoCodecs: [UInt8]
+    /// Video caps for HELLO_OK: one bit per codec this viewer decodes (`ViewerVideoDecoders`),
+    /// none without decoders (headless agents run video-less).
+    private let videoCaps: UInt32
     /// Codec of the (first) active video region, nil when none is live.
     /// Engine-queue confined, like everything else here.
     public var activeVideoCodec: UInt8? {
@@ -287,14 +289,30 @@ public final class ViewerEngine: @unchecked Sendable {
     /// burning the pointer into pixels.
     private let advertiseCursor: Bool
 
-    public init(transport: any GlassActTransport,
-                videoDecoderFactory: (() -> any VideoRegionDecoder)? = nil,
-                supportedVideoCodecs: [UInt8] = [VideoCodec.hevc],
-                advertiseCursor: Bool = true) {
+    /// One decoder for every codec it offers: `supportedVideoCodecs`, one caps bit each
+    /// (`WireCaps.bit(forVideoCodec:)`; the rig's mock codecs, and VideoToolbox's).
+    public convenience init(transport: any GlassActTransport,
+                            videoDecoderFactory: (() -> any VideoRegionDecoder)? = nil,
+                            supportedVideoCodecs: [UInt8] = [VideoCodec.hevc],
+                            advertiseCursor: Bool = true) {
+        let caps = supportedVideoCodecs.reduce(UInt32(0)) { $0 | WireCaps.bit(forVideoCodec: $1) }
+        self.init(transport: transport, videoCaps: videoDecoderFactory == nil ? 0 : caps,
+                  decoders: videoDecoderFactory.map { f in { _ in f() } }, advertiseCursor: advertiseCursor)
+    }
+
+    /// A decoder a codec, and the caps `videoDecoders` offers (nil: no video).
+    public convenience init(transport: any GlassActTransport, videoDecoders: ViewerVideoDecoders?,
+                            advertiseCursor: Bool = true) {
+        self.init(transport: transport, videoCaps: videoDecoders?.caps ?? 0,
+                  decoders: videoDecoders.map { d in { d.decoder(forCodec: $0) } }, advertiseCursor: advertiseCursor)
+    }
+
+    private init(transport: any GlassActTransport, videoCaps: UInt32,
+                 decoders: ((UInt8) -> (any VideoRegionDecoder)?)?, advertiseCursor: Bool) {
         self.transport = transport
         self.advertiseCursor = advertiseCursor
-        self.video = VideoRegionTable(decoderFactory: videoDecoderFactory)
-        self.supportedVideoCodecs = supportedVideoCodecs
+        self.video = VideoRegionTable(decoders: decoders)
+        self.videoCaps = decoders == nil ? 0 : videoCaps
         // One spare byte: the Compression framework returns dst.count for a
         // stream that decodes to MORE than fits, so with an exactly-sized
         // buffer an oversize LZ4/LZBITMAP payload would pass the `== tightLen`
@@ -312,12 +330,6 @@ public final class ViewerEngine: @unchecked Sendable {
         decodeScratch.deallocate()
         canvas?.deallocate()
         overlay?.deallocate()
-    }
-
-    /// Video caps for HELLO_OK: one bit per supported codec, none without a
-    /// decoder factory (headless agents run video-less).
-    private var videoCaps: UInt32 {
-        video.decodesRegions ? supportedVideoCodecs.reduce(0) { $0 | WireCaps.bit(forVideoCodec: $1) } : 0
     }
 
     /// Tiles currently presenting video from the overlay (0 once a dissolve
@@ -571,8 +583,10 @@ public final class ViewerEngine: @unchecked Sendable {
                                  x: Int, y: Int, w: Int, h: Int,
                                  codec: UInt8, config: [UInt8]) {
         // Only a codec this viewer offered in HELLO_OK: a host can't wake a
-        // decoder (hardware AV1, say) the person never opted into.
-        guard let grid, videoCaps & WireCaps.bit(forVideoCodec: codec) != 0,
+        // decoder (hardware AV1, say) the person never opted into. AV1 under
+        // either AV1 bit (§3.8): the decoders pick VideoToolbox's or Glass
+        // Act's by what they offered.
+        guard let grid, videoCaps & WireCaps.viewerBits(forVideoCodec: codec, glassActAV1: true) != 0,
               video.start(region: region, generation: generation, x: x, y: y, w: w, h: h,
                           codec: codec, config: config, grid: grid) else {
             stats.videoDropped += 1

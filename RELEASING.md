@@ -159,6 +159,11 @@ TEAM=VJ4FHSCMNE HOST_PROFILE="Glass Act Host Developer ID" \
 The output lands in `Apps/build/ci-release/dist`. Add
 `SPARKLE_KEY_FILE=<private key file>` to also write the appcasts.
 
+Both apps link the Rust AV1 library, which their archive builds themselves
+(`scripts/build-rust --xcode`, universal), so either path needs rustup with
+`aarch64-apple-darwin` and `x86_64-apple-darwin` (the release workflow adds
+them).
+
 ## Trying an update locally
 
 To check an update end to end before a release, without publishing

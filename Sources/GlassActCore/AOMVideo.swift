@@ -91,7 +91,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
         self.onFrame = onFrame
         // The same budget as HEVC: at equal bytes AV1's screen tools buy
         // sharper text, not more bandwidth.
-        baseBitrate = min(20_000_000, max(2_000_000, width * height * 12))
+        baseBitrate = Self.baseBitrate(width: width, height: height)
         appliedBitrate = aimedBitrate
         var options = glassact_aom_enc_options(speed: Int32(speed), vbr: vbr ? 1 : 0)
         guard let raw = glassact_aom_enc_create_with(Int32(width), Int32(height), Int32(threads),
@@ -184,9 +184,14 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     // MARK: - Rate control
 
+    /// The base bitrate for a region of this size: the same budget as HEVC's.
+    public static func baseBitrate(width: Int, height: Int) -> Int {
+        min(20_000_000, max(2_000_000, width * height * 12))
+    }
+
     /// The quality level's share of the base, under the link cap: the HEVC
     /// encoder's ladder (~0.66× per step).
-    static func target(base: Int, level: Int, cap: Int?) -> Int {
+    public static func target(base: Int, level: Int, cap: Int?) -> Int {
         let factor = [1.0, 0.66, 0.45, 0.33][min(max(level, 0), 3)]
         var target = Int(Double(base) * factor)
         if let cap { target = max(300_000, min(target, cap)) }
@@ -195,7 +200,7 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
 
     /// HEVC frame QP (0–51) → libaom's quantizer (0–63): the same fraction
     /// of each scale. HEVC's 34 floor is 42, its sharp 28 is 35.
-    static func quantizer(forFrameQP qp: Int) -> Int {
+    public static func quantizer(forFrameQP qp: Int) -> Int {
         min(63, max(0, Int((Double(qp) * 63 / 51).rounded())))
     }
 
@@ -318,6 +323,54 @@ public final class AOMRegionEncoder: VideoRegionEncoder, @unchecked Sendable {
     }
 }
 
+/// BGRA → I420 (vImage) for another AV1 encoder of the same regions: as `AOMRegionEncoder`
+/// converts its pictures (BT.709 video range), or in another matrix and range, to match what the
+/// Viewer's decoder makes of that encoder's sequence header (the hybrid's: `.bt709Full`).
+/// Confined to its caller's queue.
+public final class I420Converter {
+    public enum Colour: String, Sendable, CaseIterable { case bt709Video, bt709Full, bt601Video, bt601Full }
+    private var conversion = vImage_ARGBToYpCbCr()
+    private var permuteMap: [UInt8] = [3, 2, 1, 0] // BGRA in memory → ARGB
+
+    public init?(_ colour: Colour = .bt709Video) {
+        if colour == .bt709Video {
+            guard AOMRegionEncoder.makeConversion(&conversion) else { return nil }
+            return
+        }
+        let full = colour == .bt709Full || colour == .bt601Full
+        var range = full
+            ? vImage_YpCbCrPixelRange(Yp_bias: 0, CbCr_bias: 128, YpRangeMax: 255, CbCrRangeMax: 255,
+                                      YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
+            : vImage_YpCbCrPixelRange(Yp_bias: 16, CbCr_bias: 128, YpRangeMax: 235, CbCrRangeMax: 240,
+                                      YpMax: 235, YpMin: 16, CbCrMax: 240, CbCrMin: 16)
+        let (kr, kb) = colour == .bt709Full ? (0.2126, 0.0722) : (0.299, 0.114)
+        let kg = 1 - kr - kb
+        var matrix = vImage_ARGBToYpCbCrMatrix(
+            R_Yp: Float(kr), G_Yp: Float(kg), B_Yp: Float(kb),
+            R_Cb: Float(-kr / (2 * (1 - kb))), G_Cb: Float(-kg / (2 * (1 - kb))),
+            B_Cb_R_Cr: 0.5, G_Cr: Float(-kg / (2 * (1 - kr))), B_Cr: Float(-kb / (2 * (1 - kr))))
+        guard vImageConvert_ARGBToYpCbCr_GenerateConversion(
+            &matrix, &range, &conversion, kvImageARGB8888, kvImage420Yp8_Cb8_Cr8,
+            vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+    }
+
+    /// A tightly packed BGRA picture (stride width × 4; even width and height) into tight
+    /// planes: Y width × height, U and V half that each way.
+    public func convert(bgra: UnsafeRawBufferPointer, width: Int, height: Int, y: UnsafeMutableRawPointer,
+                        u: UnsafeMutableRawPointer, v: UnsafeMutableRawPointer) -> Bool {
+        guard width > 0, height > 0, width & 1 == 0, height & 1 == 0, bgra.count >= width * height * 4 else { return false }
+        var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: bgra.baseAddress),
+                                height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
+        var yp = vImage_Buffer(data: y, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
+        var cb = vImage_Buffer(data: u, height: vImagePixelCount(height / 2), width: vImagePixelCount(width / 2),
+                               rowBytes: width / 2)
+        var cr = vImage_Buffer(data: v, height: vImagePixelCount(height / 2), width: vImagePixelCount(width / 2),
+                               rowBytes: width / 2)
+        return vImageConvert_ARGB8888To420Yp8_Cb8_Cr8(&src, &yp, &cb, &cr, &conversion, &permuteMap,
+                                                      vImage_Flags(kvImageNoFlags)) == kvImageNoError
+    }
+}
+
 /// An I420 picture's three planes.
 final class I420Buffer {
     let y: UnsafeMutableRawBufferPointer
@@ -408,12 +461,50 @@ public final class AOMRegionDecoder: VideoRegionDecoder {
 /// for AV1, and what VideoToolbox's AV1 decoder takes as its sample
 /// description extension. Built from the encoder's sequence header OBU.
 public enum AV1Config {
+    /// The first sequence header OBU in a temporal unit (OBUs with size fields, as libaom and
+    /// the hybrid encoder write them), nil if it has none.
+    public static func sequenceHeaderOBU(inTemporalUnit tu: [UInt8]) -> [UInt8]? {
+        var i = 0
+        while i < tu.count {
+            let header = tu[i]
+            guard header & 0x02 != 0 else { return nil } // no size field: can't walk on
+            var j = i + 1 + (header & 0x04 != 0 ? 1 : 0)
+            var size = 0, shift = 0
+            while j < tu.count, shift < 56 {
+                let b = tu[j]
+                size |= Int(b & 0x7F) << shift
+                j += 1
+                if b & 0x80 == 0 { break }
+                shift += 7
+            }
+            guard size <= tu.count - j else { return nil }
+            if (header >> 3) & 0x0F == 1 { return Array(tu[i..<(j + size)]) }
+            i = j + size
+        }
+        return nil
+    }
+
     public static func build(sequenceHeaderOBU obu: [UInt8]) -> [UInt8]? {
         guard let (profile, level, tier) = parse(obu) else { return nil }
         return [
             0x81, // marker 1, version 1
             UInt8(profile << 5 | level & 0x1F), // seq_profile, seq_level_idx_0
             UInt8(tier << 7) | 0x0C, // seq_tier_0; 8-bit, 4:2:0 (subsampling x and y)
+            0x00, // no initial presentation delay
+        ] + obu
+    }
+
+    /// The av1C record of a 4:4:4 stream (seq_profile 1, the High profile: chroma not subsampled,
+    /// 8-bit) from its sequence header; nil unless the header is profile 1's. `build` writes
+    /// 4:2:0's subsampling whatever the header says, and is what the wire carries; this one is the
+    /// hybrid's 4:4:4 streams' (`HybridRegionEncoder` with `chroma444`), which no Viewer is
+    /// offered yet.
+    public static func build444(sequenceHeaderOBU obu: [UInt8]) -> [UInt8]? {
+        guard let (profile, level, tier) = parse(obu), profile == 1 else { return nil }
+        return [
+            0x81, // marker 1, version 1
+            UInt8(profile << 5 | level & 0x1F), // seq_profile 1, seq_level_idx_0
+            UInt8(tier << 7), // seq_tier_0; 8-bit, not monochrome, no subsampling, sample position 0
             0x00, // no initial presentation delay
         ] + obu
     }

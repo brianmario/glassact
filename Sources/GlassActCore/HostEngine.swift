@@ -258,6 +258,10 @@ public final class HostEngine: @unchecked Sendable {
     // first of them whose encoder starts, and VIDEO_START carries its id.
     let videoEncoderFactory: ((UInt8) -> any VideoRegionEncoder?)?
     private let videoCodecPreference: [UInt8]
+    /// The factory's AV1 is Glass Act's encoder (the hybrid), not libaom's:
+    /// it goes to a viewer offering `videoAV1` or `videoAV1GlassAct`, and
+    /// HELLO says so (§3.8). libaom's only to `videoAV1`.
+    private let videoAV1FromGlassAct: Bool
     var negotiatedVideoCodecs: [UInt8] = []
     // Adaptive quality (bandwidth pressure): level 0 = best; raise on
     // bandwidth pressure (backlog high while the ENCODER keeps up —
@@ -718,6 +722,7 @@ public final class HostEngine: @unchecked Sendable {
     public init(width: Int, height: Int, transport: any GlassActTransport,
                 videoEncoderFactory: ((UInt8) -> any VideoRegionEncoder?)? = nil,
                 videoCodecPreference: [UInt8] = [VideoCodec.hevc],
+                videoAV1FromGlassAct: Bool = false,
                 startFrameSeq: UInt32 = 1,
                 maxBatchDatagrams: Int = HostEngine.wireMaxBatchDatagrams,
                 clock: (@Sendable () -> UInt64)? = nil,
@@ -731,6 +736,7 @@ public final class HostEngine: @unchecked Sendable {
         self.transport = transport
         self.videoEncoderFactory = videoEncoderFactory
         self.videoCodecPreference = videoCodecPreference
+        self.videoAV1FromGlassAct = videoAV1FromGlassAct
         ledger = TileLedger(count: grid.count)
         hashResults = ContiguousArray(repeating: 0, count: grid.count)
         candidateMark = ContiguousArray(repeating: 0, count: grid.count)
@@ -853,7 +859,9 @@ public final class HostEngine: @unchecked Sendable {
                     state = .running
                     sessionOpen = true
                     negotiatedVideoCodecs = videoEncoderFactory == nil ? []
-                        : videoCodecPreference.filter { caps & WireCaps.bit(forVideoCodec: $0) != 0 }
+                        : videoCodecPreference.filter {
+                            caps & WireCaps.viewerBits(forVideoCodec: $0, glassActAV1: videoAV1FromGlassAct) != 0
+                        }
                     videoNegotiated = !negotiatedVideoCodecs.isEmpty
                     cursorNegotiated = caps & WireCaps.cursor != 0
                     // The handshake round trip seeds SRTT so the first batch
@@ -1714,10 +1722,11 @@ public final class HostEngine: @unchecked Sendable {
     private var deliveryReportsCaps: UInt32 { requestDeliveryReports ? WireCaps.deliveryReports : 0 }
 
     /// Video caps for HELLO: one bit per codec the encoder factory may be
-    /// asked for (none without a factory — `GLASSACT_TILE_ONLY`, agents).
+    /// asked for (none without a factory — `GLASSACT_TILE_ONLY`, agents),
+    /// and `videoAV1GlassAct` beside `videoAV1` when the AV1 is Glass Act's.
     private var videoCaps: UInt32 {
         videoEncoderFactory == nil ? 0
-            : videoCodecPreference.reduce(0) { $0 | WireCaps.bit(forVideoCodec: $1) }
+            : videoCodecPreference.reduce(0) { $0 | WireCaps.viewerBits(forVideoCodec: $1, glassActAV1: videoAV1FromGlassAct) }
     }
     /// Cursor as metadata: the viewer composites the pointer from control messages; while
     /// negotiated the host should capture with showsCursor = false.
