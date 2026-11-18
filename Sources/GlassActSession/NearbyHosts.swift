@@ -2,6 +2,9 @@ import Foundation
 import Network
 public import Observation
 import dnssd
+#if os(macOS)
+import SystemConfiguration
+#endif
 
 /// A Glass Act Host announcing itself on the local network (see the host's
 /// HostPresence). Where to dial comes from its TXT record — the service name
@@ -68,11 +71,41 @@ public final class NearbyHosts {
     }
 
     private func update(_ found: [NearbyHost]) {
-        // One row per Mac, however many interfaces it answers on.
+        let listed = Self.listed(found, ownAddress: Self.ownAddress)
+        if listed != hosts { hosts = listed }
+    }
+
+    /// What Nearby lists of what the browse found: one row per Mac, however many interfaces it
+    /// answers on, sorted by name, and never this Mac's own Host. Sharing the screen you're
+    /// viewing it on is a feedback loop (the Viewer's window is in the capture). A Host's TXT
+    /// `host` is its local host name (HostPresence.localAddress), which mDNS keeps unique on the
+    /// network, so it identifies this Mac; the service name, the computer name, need not.
+    nonisolated static func listed(_ found: [NearbyHost], ownAddress: String?) -> [NearbyHost] {
+        let own = ownAddress.map(normalized)
         var seen = Set<String>()
-        let unique = found.filter { seen.insert($0.name).inserted }
-        let sorted = unique.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        if sorted != hosts { hosts = sorted }
+        let unique = found.filter { host in
+            if let own, normalized(host.host) == own { return false }
+            return seen.insert(host.name).inserted
+        }
+        return unique.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// "alexs-mac-mini.local": host names compare without case or a trailing dot.
+    private nonisolated static func normalized(_ host: String) -> String {
+        var h = host.lowercased()
+        while h.hasSuffix(".") { h.removeLast() }
+        return h
+    }
+
+    /// This Mac's address as its Host would advertise it (`<LocalHostName>.local`), read at each
+    /// update so a rename takes effect; nil where no Host can run (iPad).
+    private nonisolated static var ownAddress: String? {
+        #if os(macOS)
+        guard let name = SCDynamicStoreCopyLocalHostName(nil) as String?, !name.isEmpty else { return nil }
+        return "\(name).local"
+        #else
+        return nil
+        #endif
     }
 
     private nonisolated static func host(from result: NWBrowser.Result) -> NearbyHost? {
