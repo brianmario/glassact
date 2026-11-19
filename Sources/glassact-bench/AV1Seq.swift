@@ -39,6 +39,8 @@ let av1SeqCommand = Command(
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
+        .bool("changes", "with --inter: each picture carries its exact change map from the one before (Picture.changed, as the Host passes it), made before the timed run; the same bytes"),
+        .bool("whole-sources", "every picture's padded source copied whole (AV1HybridEncoder.updatesSourcesInPlace off; the same bytes)"),
         .bool("no-split-motion", "with --inter: the motion search waits behind the filters' gate with the rest of the analysis (AV1HybridEncoder.splitsMotion off; the same bytes)"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),
@@ -228,9 +230,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         }
         guard taken == t.frames else { throw BenchError("--then \(t.path): \(taken) frames after skip \(t.skip), not \(t.frames)") }
     }
+    // --changes: per picture, its 64×64s that differ from the picture before's (nil for the first)
+    let changeMaps: [[UInt8]?] = opts.has("changes") ? pictures.indices.map { i in
+        i == 0 ? nil : changeMap(pictures[i], from: pictures[i - 1])
+    } : []
     func picture(_ i: Int) -> AV1HybridEncoder.Picture {
         AV1HybridEncoder.Picture(y: pictures[i].planes[0], u: pictures[i].planes[1], v: pictures[i].planes[2],
-                                 width: width, height: height, chroma444: c444)
+                                 width: width, height: height, chroma444: c444,
+                                 changed: changeMaps.indices.contains(i) ? changeMaps[i] : nil)
     }
     let serial = opts.has("serial"), inter = opts.has("inter")
     if serial && inter { throw BenchError("--serial codes every picture alone: not with --inter") }
@@ -397,6 +404,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     encoder.searchesSubpelMotion = !opts.has("no-subpel")
     if opts.has("no-split-motion") { encoder.splitsMotion = false }
+    if opts.has("whole-sources") { encoder.updatesSourcesInPlace = false }
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 0) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
@@ -412,6 +420,37 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     let steps = coarseQindex == nil ? 1 : 2
     var frames: [AV1HybridEncoder.Frame] = []
     frames.reserveCapacity(pictures.count * steps)
+    // (experiment) GA_WARM_CPU=n: n threads spinning beside the run, so the CPU's clocks never
+    // drop between paced pictures (an upper bound for keeping them up; costs power)
+    final class Spin: @unchecked Sendable { var stop = false }
+    let spin = Spin()
+    for _ in 0..<(Int(ProcessInfo.processInfo.environment["GA_WARM_CPU"] ?? "") ?? 0) {
+        Thread.detachNewThread {
+            Thread.current.qualityOfService = .userInteractive
+            var x: UInt64 = 1
+            while !spin.stop { x = x &* 6364136223846793005 &+ 1 }
+            if x == 42 { print("") }
+        }
+    }
+    // (experiment) GA_WARM_GPU=ms: a 4 MB blit on a queue of its own every ms, so the GPU's clocks
+    // never drop between paced pictures (an upper bound; costs power)
+    if let ms = Double(ProcessInfo.processInfo.environment["GA_WARM_GPU"] ?? ""), ms > 0,
+       let warm = MTLCreateSystemDefaultDevice(), let queue = warm.makeCommandQueue(),
+       let buffer = warm.makeBuffer(length: 4 << 20, options: .storageModePrivate) {
+        final class Box: @unchecked Sendable { let q: any MTLCommandQueue, b: any MTLBuffer; init(_ q: any MTLCommandQueue, _ b: any MTLBuffer) { (self.q, self.b) = (q, b) } }
+        let box = Box(queue, buffer)
+        Thread.detachNewThread {
+            while !spin.stop {
+                guard let cb = box.q.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { break }
+                blit.fill(buffer: box.b, range: 0..<box.b.length, value: 1)
+                blit.endEncoding()
+                cb.commit()
+                cb.waitUntilCompleted()
+                usleep(useconds_t(ms * 1000))
+            }
+        }
+    }
+    defer { spin.stop = true }
     let repeats = opts.int("repeat", 1)
     var outputAt: [Double] = []  // when each frame came out (overlapped runs)
     var pushLatencies: [Double] = []  // --push: each picture's submit to its frame, seconds
@@ -660,6 +699,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
                      formatBytes(frames[0].obu.count), formatBytes(rest.map(\.obu.count).reduce(0, +) / rest.count), steady,
                      avg { $0.copied } * 100, avg { $0.shifted } * 100, avg { $0.copiedGolden } * 100, avg { $0.motion } * 1000,
                      avg { $0.searched } * 100))
+        let sources = encoder.sourcesCopied
+        print("             padded sources: \(sources.inPlace) updated in place, \(sources.whole) copied whole")
         if encoder.newPictureEffort != nil {
             let fast = frames.indices.filter { frames[$0].timing.fast }
             print("             fast pictures: \(fast.count) of \(rest.count) inter frames (\(fast.map { "\($0)@\(frames[$0].timing.qindex)\(frames[$0].timing.searchedMotion ? "" : "m")" }.joined(separator: " ")))")
@@ -1249,4 +1290,28 @@ func withoutSequenceHeaders(_ tu: [UInt8]) -> [UInt8] {
         i = end
     }
     return out
+}
+
+/// `--changes`: per 64×64 of `p` (raster), 1 where any sample of any plane differs from `before`'s
+/// (pictures of one size and format), as the Host's own frame comparison marks them.
+func changeMap(_ p: YUV420, from before: YUV420) -> [UInt8] {
+    let (cols, rows) = ((p.width + 63) / 64, (p.height + 63) / 64)
+    var map = [UInt8](repeating: 0, count: cols * rows)
+    for plane in 0..<3 {
+        let (w, h) = plane == 0 ? (p.width, p.height) : (p.chromaWidth, p.chromaHeight)
+        let side = plane == 0 || p.chroma444 ? 64 : 32
+        p.planes[plane].withUnsafeBufferPointer { a in
+            before.planes[plane].withUnsafeBufferPointer { b in
+                for y in 0..<h {
+                    for c in 0..<cols where map[(y / side) * cols + c] == 0 {
+                        let x0 = c * side, n = min(side, w - x0)
+                        if n > 0, memcmp(a.baseAddress! + y * w + x0, b.baseAddress! + y * w + x0, n) != 0 {
+                            map[(y / side) * cols + c] = 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return map
 }

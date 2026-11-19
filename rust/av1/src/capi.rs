@@ -1617,6 +1617,23 @@ pub unsafe extern "C" fn av1enc_motion_set_chroma_444(m: *mut crate::motion::Mot
     unsafe { (*m).set_chroma_444(on != 0) };
 }
 
+/// av1enc_motion_set_changed: [`crate::motion::Motion::set_changed`] (`changed` null or `count`
+/// 0: not known).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_set_changed(m: *mut crate::motion::Motion, changed: *const u8, count: c_int) {
+    if m.is_null() {
+        return;
+    }
+    let c: &[u8] = if changed.is_null() || count <= 0 {
+        &[]
+    } else {
+        // SAFETY: count bytes (av1enc.h)
+        unsafe { slice::from_raw_parts(changed, count as usize) }
+    };
+    // SAFETY: the handle
+    unsafe { (*m).set_changed(c) };
+}
+
 /// av1enc_motion_set_continues: [`crate::motion::Motion::set_continues`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_motion_set_continues(m: *mut crate::motion::Motion, on: c_int) {

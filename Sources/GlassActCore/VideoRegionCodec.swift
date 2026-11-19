@@ -25,6 +25,13 @@ public protocol VideoRegionEncoder: AnyObject {
     /// thin link) must not shrink each submitted frame's share. The mock
     /// rig is clock-free and ignores the time.
     func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64)
+    /// `encode(bgra:forceSync:timeUS:)` with what changed since the frame the engine passed
+    /// before it (to this encoder, since its `start`): per 64×64 of the frame, raster
+    /// (`(width + 63) / 64` a row), 0 where every pixel is the same as that frame's, nonzero where
+    /// any may differ; nil when it isn't known. Valid for the call. The engine knows it from its
+    /// own comparison of the region's frames (§4.6), not from capture's dirty rects. An encoder
+    /// may skip comparing what's marked 0. Default: ignores it.
+    func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64, changed: UnsafeBufferPointer<UInt8>?)
     /// Adaptive quality: 0 = best, higher = lower quality / fewer bytes.
     /// HEVC maps it to average bitrate. Runtime, no re-init.
     /// Default no-op (the mock rig is deterministic and ignores it).
@@ -46,6 +53,9 @@ public protocol VideoRegionEncoder: AnyObject {
 }
 
 public extension VideoRegionEncoder {
+    func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64, changed: UnsafeBufferPointer<UInt8>?) {
+        encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
+    }
     func setQualityLevel(_ level: Int) {}
     func setBitrateCap(_ bitsPerSecond: Int?) {}
     func setMaxFrameQP(_ qp: Int?) {}

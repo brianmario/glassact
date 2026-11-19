@@ -1,6 +1,7 @@
 public import AV1Core
 internal import AV1Encoder
 internal import Foundation
+internal import Synchronization
 public import Metal
 internal import QuartzCore
 
@@ -39,8 +40,17 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// half that each way, rounded up. Or, with `chroma444`, a 4:4:4 one: U and
     /// V width × height too.
     public struct Picture: Sendable {
-        public var y: [UInt8], u: [UInt8], v: [UInt8]
-        public var width: Int, height: Int
+        public var y: [UInt8] { didSet { id = Self.newID() } }
+        public var u: [UInt8] { didSet { id = Self.newID() } }
+        public var v: [UInt8] { didSet { id = Self.newID() } }
+        public var width: Int { didSet { id = Self.newID() } }
+        public var height: Int { didSet { id = Self.newID() } }
+        /// This picture's samples, among every picture's: a new one whenever its planes or size
+        /// change (copies share it). The padded source copy knows by it which picture a pooled
+        /// buffer holds (`AV1MetalEncoder.SourceChange`).
+        public private(set) var id: UInt64
+        private static let ids = Atomic<UInt64>(0)
+        private static func newID() -> UInt64 { ids.add(1, ordering: .relaxed).newValue }
         /// The chroma planes are full size: the picture is coded 4:4:4 (AV1's High profile), and its
         /// decoded planes (`Frame.planes`) are full size too. In a stream with `interFrames` every
         /// picture after the first of a chroma format is an inter frame as 4:2:0's are, and a change
@@ -50,15 +60,25 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// ones, its inter blocks predicting from full-size references (with `gpuDecides` off it
         /// decides chroma itself, on the real planes). In a stream the GPU's post-filters and their
         /// search filter it as 4:2:0's, on its full-size planes; coded alone (a tile) it has none.
-        public var chroma444: Bool
+        public var chroma444: Bool { didSet { id = Self.newID() } }
+        /// What changed since the picture submitted before it, as the caller knows it (the Host's
+        /// own comparison of the frames it converted): per 64×64, raster (`(width + 63) / 64` a
+        /// row), 0 where this picture equals that one in every sample of every plane, nonzero
+        /// where it may differ. The copy finder then compares only the 64×64s marked. nil, or
+        /// another count, isn't known: it compares them all. A 64×64 marked 0 that differs is
+        /// copied as unchanged (debug builds of the encoder check them all and stop).
+        public var changed: [UInt8]?
 
-        public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false) {
+        public init(y: [UInt8], u: [UInt8], v: [UInt8], width: Int, height: Int, chroma444: Bool = false,
+                    changed: [UInt8]? = nil) {
             self.y = y
             self.u = u
             self.v = v
             self.width = width
             self.height = height
             self.chroma444 = chroma444
+            self.changed = changed
+            id = Self.newID()
         }
 
         /// The chroma planes' width and height.
@@ -644,6 +664,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         get { metal.splitsMotion }
         set { metal.splitsMotion = newValue }
     }
+    /// A picture's padded source is copied into a pooled set only where it changed since the
+    /// picture the set holds (`AV1MetalEncoder.updatesSourcesInPlace`; on). The same bytes either way.
+    public var updatesSourcesInPlace: Bool {
+        get { metal.updatesSourcesInPlace }
+        set { metal.updatesSourcesInPlace = newValue }
+    }
+    /// Sources copied whole and in place so far (`updatesSourcesInPlace`).
+    public var sourcesCopied: (whole: Int, inPlace: Int) { (metal.sourcesCopiedWhole, metal.sourcesCopiedInPlace) }
 
     /// Compiles the kernels `init` leaves for a picture's first use (the analysis, at the general
     /// and at the fixed settings: `AV1MetalEncoder.analysisKernels`). On a cold Metal cache they
@@ -1376,6 +1404,11 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 (longTerm, sceneSlot, keepsKey) = ([LongTerm(slot: 1, source: prev)], 1, 1)
             }
             let nsb = ((p.width + 63) / 64) * ((p.height + 63) / 64)
+            // (the caller's map of what changed since prev, the picture submitted before it)
+            if let changed = p.changed, changed.count == nsb {
+                changed.withUnsafeBufferPointer { av1enc_motion_set_changed(motion, $0.baseAddress, Int32($0.count)) }
+                AV1HybridEncoder.trace("copies: change map, \(changed.count(where: { $0 != 0 })) of \(nsb) marked")
+            }
             var m = [Int32](repeating: 0, count: 3 * nsb)
             let cw = Int32(p.chromaSize.width)
             let strides: [Int32] = [Int32(p.width), cw, cw]
@@ -1426,7 +1459,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 candidates = c
             }
             return Copies(motion: m, skip: (0..<nsb).map { UInt8(m[3 * $0]) }, candidates: candidates,
-                          seconds: CACurrentMediaTime() - tm, refs: refs)
+                          seconds: CACurrentMediaTime() - tm, refs: refs, from: prev.id)
         }
     }
 
@@ -1441,6 +1474,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         var seconds = 0.0
         /// The frame's reference slots.
         var refs: Refs?
+        /// The picture its copies compare against (`Picture.id`; 0: none).
+        var from: UInt64 = 0
     }
 
     /// A partition as its reader leaves it: with an inter frame's motion applied (the blocks in
@@ -1524,6 +1559,12 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         let effort = fast ? newPictureEffort?.analysis : nil
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
+        // what changed since the picture its copies compare against: all but its 64×64s copied
+        // from it unchanged (LAST_FRAME's, at no shift)
+        let changes = copies.motion.flatMap { m -> [UInt8]? in
+            copies.from == 0 ? nil : (0..<m.count / 3).map { i in m[3 * i] == 1 && m[3 * i + 1] == 0 && m[3 * i + 2] == 0 ? 0 : 1 }
+        }
+        let source = AV1MetalEncoder.SourceChange(id: p.id, from: changes == nil ? 0 : copies.from, changed: changes)
         let partition = try p.y.withUnsafeBufferPointer { y in
             try p.u.withUnsafeBufferPointer { u in
                 try p.v.withUnsafeBufferPointer { v in
@@ -1531,7 +1572,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                                              width: p.width, height: p.height, qindex: qindex, skip: copies.skip,
                                              motion: copies.candidates, sbQindex: qmap, after: gateValue, newPicture: effort,
                                              removesShapes: p.chroma444 && chroma444Palettes && !fast ? Self.chroma444RemovedShapes : 0,
-                                             chroma444: p.chroma444)
+                                             chroma444: p.chroma444, source: source)
                 }
             }
         }

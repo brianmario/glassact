@@ -683,6 +683,11 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     }
 
     func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
+        encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS, changed: nil)
+    }
+
+    /// (the engine's change map goes on to the encoder, as the Host's does)
+    func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64, changed: UnsafeBufferPointer<UInt8>?) {
         pending += 1
         pipeline.outstanding += 1
         pipeline.score?.submitted(bgra: bgra, width: width, height: height, timeUS: timeUS,
@@ -690,7 +695,7 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
                                                                   level: level, cap: cap))
         let t0 = DispatchTime.now().uptimeNanoseconds
         submittedNS.append(t0)
-        inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS)
+        inner.encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS, changed: changed)
         pipeline.submitNS &+= DispatchTime.now().uptimeNanoseconds &- t0
         pipeline.submits += 1
     }

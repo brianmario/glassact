@@ -297,6 +297,9 @@ the numbers and the reasoning.
 | After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
 | A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line (they are since 2026-11-18, with a saved template); with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | Each kernel's GPU counters from the command line: a saved Instruments template (Performance Limiters, shader timeline) and `scripts/metal-trace` sharing each counter group's samples among the kernels that ran in them (`--kernel`, `--csv`) | measured (method) | 5K photos inter frames (a loaded Mac): `k_me` bound by its integer unit (84 %), 59 % of its L1 traffic the stack; the thread kernels 66–83 % stack with L1 evictions of 29–88 %; `l_select` at occupancy 8; the occupancy target follows occupancy and the last-level cache counts the CPU's traffic, so neither tells a kernel's bound | [entry](#metal-av1-each-kernels-gpu-counters-from-the-command-line-2026-11-18) |
+| The Host's change map (the region's own tile diff, per 64x64, OR-ed until a frame is passed) to the encoder's copy finder, which compares only what's marked (`encode(…changed:)`, `Picture.changed`) | kept | the same streams; av1seq typing-cc +13.4 %, scroll-win +12.4 % fps; a lone picture's latency −22 % / −21 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
+| Padded sources updated in place: a pooled set gets only the 64x64s changed since the picture it holds (`updatesSourcesInPlace`) | kept | the same streams; lone latency typing-cc −7.9 %, scroll-win −15 %; fps +3–5 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
+| Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured; the owner's call | paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core; the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -368,6 +371,91 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the Host's change map, padded sources updated in place, and paced pictures' clocks (2026-11-19)
+
+**The engine's change map goes to the encoder (kept).** The copy finder's classify step compared
+every 64x64 with the picture before to find the unchanged ones: on typing-cc 5.1 core-ms a frame
+(Time Profiler), most of them unchanged. The Host already knows which changed: the region's
+extraction diffs each frame against the last region frame, tile by tile, exactly (not dirty
+rects). The engine now ORs every tick's changed tiles into a map per 64x64 of the region's frame
+until it passes a frame, so frames it skips are covered, and passes the map with the frame
+(`VideoRegionEncoder.encode(…changed:)`). The hybrid's copy finder then compares only the 64x64s
+marked (`AV1HybridEncoder.Picture.changed`, `av1enc_motion_set_changed`). Debug builds still
+compare every one and assert.
+- **Exactness.**
+  - `RegionChangeMapTests` checks every map against the frames' pixels. It covers frames the
+    engine skipped (an encoder that delivers every third tick), dirty rects or none, and partial
+    64x64s at 1300×650.
+  - Two mutations of the engine fail it.
+  - `ConversionLocalityTests` checks that the 4:2:0 conversions (all four) and 4:4:4's are local:
+    an unchanged 64x64 of BGRA converts to the same samples.
+  - The adapter drops the map after a frame that didn't reach the stream.
+- **av1seq** (`--changes`: each picture's exact map, made before the timed run). A/B against the
+  same build without it, six rounds: typing-cc **+13.4 %** (291.6 → 330.6 fps), scroll-win
+  **+12.4 %** (272.8 → 306.6), photos +0.7 % (most of its 64x64s change). Every run on typing-cc
+  and scroll-win is above the other side's best. The streams are the same. Deciding the copies:
+  typing-cc 1.63 → 0.63 ms, scroll-win 1.72 → 0.78 ms.
+- **A lone picture's latency** (`--push lone`, four rounds): typing-cc 4.55 → 3.55 ms (−22 %),
+  scroll-win 4.30 → 3.40 ms (−21 %), photos 13.85 → 13.60 ms.
+- **The replay's own wrapper** (`BenchPipelinedEncoder`) forwarded only the three-argument
+  `encode`, so a first replay passed no maps (0 of 483 pictures by `GA_TIMELINE`'s new "copies:
+  change map" line). It now forwards them: 481 of 483, the other two key frames. The Host app
+  hands frames to `HybridRegionEncoder` directly. `replay --video hybrid`: the same video bytes
+  on every trace.
+
+**Padded sources updated in place (kept).** Each picture's source was copied whole into the
+analysis's padded buffers, 22 MB at 5K, which a lone picture waits for. The buffers are pooled, so
+the set a picture gets holds a picture from two or three before.
+- Each picture now has an id (`Picture.id`, new whenever its planes or size change), and the
+  Metal encoder remembers which picture each set holds.
+- It also keeps the last six pictures' maps of what changed since the picture their copies
+  compare against (from the copies: all but those copied from LAST_FRAME at no shift).
+- A set whose picture those maps reach back to gets only the changed 64x64s, OR-ed over the steps
+  (`AV1MetalEncoder.SourceChange`, `updatesSourcesInPlace`).
+- A row of 64x64s mostly changed is copied whole, line by line. Without that, photos' lone latency
+  was +2.6 %: many short copies cost more than whole lines.
+- A set holds no known picture while it's being written, and new buffers clear any entry under
+  their identity.
+- `sourcesUpdatedInPlaceGiveTheSameBytes` encodes scrolls, two screens in turn, a key frame on
+  demand, partial 64x64s and 4:4:4 both ways and compares the bytes.
+- av1seq updated 51–58 of 61 pictures in place.
+
+Numbers:
+- A/B (`--changes` on both, `--whole-sources` on one), six rounds: typing-cc +2.9 %, scroll-win
+  +4.8 %, photos −0.9 % (noise). The same streams.
+- Lone latency, four rounds: typing-cc 3.80 → 3.50 ms (−7.9 %), scroll-win 4.00 → 3.40 ms
+  (−15 %), photos 13.60 → 13.60 ms.
+
+**Paced pictures run on slow clocks (measured; the owner's call).** The Host sends a picture when
+the screen changes, not back to back, and `replay`'s encode latency was 13 ms on scroll-win against
+3.4 ms for a lone picture in av1seq. `av1seq --push every=<ms>` paces the same 60 pictures:
+| `--changes`, p50 latency | lone | every 8 ms | every 16 ms | every 33 ms |
+|---|---|---|---|---|
+| typing-cc | 3.7 ms | 5.2 | 9.3 | 13.6 |
+| scroll-win | 3.5 ms | 5.0 | 8.0 | 11.1 |
+| photos | 14.2 ms | 16.7 | 15.7 | 20.2 |
+- Every stage slows, CPU and GPU. typing-cc, lone against every 33 ms: the closed loop 1.16 →
+  5.21 ms, the writer 0.27 → 0.68, the motion search's GPU time 0.13 → 0.48, the analysis's 0.31
+  → 0.90, the filters' 0.40 → 1.55. The work is the same; the clocks drop in the gaps.
+- **Metal System Trace** (the "GlassAct GPU" template, its GPU performance state track, typing-cc):
+  - Back to back, our command buffers ran 66 % of their time at the Maximum performance state
+    (127 ms in all).
+  - Paced, 75 % at Minimum, and the same 196 command buffers took 233 ms.
+  - `mediaanalysisd` also used the GPU during the back-to-back recording (378 ms), which may have
+    held its clock up there.
+- Upper bounds, bench-only (`GA_WARM_CPU=<threads>`, `GA_WARM_GPU=<ms>` in av1seq):
+  - One thread spinning beside the run: paced typing-cc 13.5 → 6.9 ms and scroll-win 10.8 → 5.7
+    ms. The closed loop goes back to 1.2–1.5 ms; the GPU stages stay slow.
+  - A 4 MB blit every 2 or 5 ms doesn't raise the GPU's state.
+  - Four spinning threads are no better than one.
+- **Not tried:**
+  - Raising the Rust pool's QoS to user-interactive (`pthread_set_qos_class_self_np`) changed
+    nothing measurable (closed loop 5.28 → 4.73 ms, one run each), and was reverted.
+  - `AudioWorkIntervalCreate`, the public way to tell the performance controller about deadline
+    work, is for real-time audio threads (and unavailable from Swift).
+- **Keeping the CPU's clocks up costs power** (a core spinning while video is live). That's for an
+  opt-in setting if at all, the owner's call. Power is unmeasured (`powermetrics` needs root).
 
 ### Metal AV1: the copy finder keeps the last picture's hashes; #128 on the paced path (2026-11-19)
 

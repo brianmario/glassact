@@ -126,8 +126,11 @@ extension HostEngine {
         beginRegionStream(encoder, codec: startedCodec, nowUS: nowUS)
         regionPixels?.deallocate()
         regionScratch?.deallocate()
+        regionChanged?.deallocate()
         regionPixels = .allocate(byteCount: w * h * 4, alignment: 64)
         regionScratch = .allocate(byteCount: w * h * 4, alignment: 64)
+        regionChanged = .allocate(capacity: ((w + 63) / 64) * ((h + 63) / 64))
+        regionChanged!.initialize(repeating: 0)
         // Video never touches the viewer's canvas (it is an overlay), so the
         // ACKed belief stays true — late ACKs for pre-formation sends
         // describe the canvas correctly — and dissolve compares against it
@@ -148,6 +151,7 @@ extension HostEngine {
     /// frame, goes with a VIDEO_START and claims every tile.
     func beginRegionStream(_ encoder: any VideoRegionEncoder, codec: UInt8, nowUS: UInt64) {
         regionEncoder = encoder
+        regionChangesKnown = false  // (its first frame has no frame before it)
         regionCodec = codec
         if effectiveQualityLevel > 0 { encoder.setQualityLevel(effectiveQualityLevel) } // carry policy+level across form
         encoder.setBitrateCap(videoRate.bitrateCap)
@@ -458,6 +462,18 @@ extension HostEngine {
             }
             guard marked > 0 else { continue }
             count += marked
+            // the encoder's map of what changed since its last frame: the 64×64s of the region's
+            // frame these tiles overlap
+            if let map = regionChanged {
+                let sbCols = (r.w + 63) / 64
+                let sy0 = (bandTop - r.y) / 64, sy1 = (bandBottom - 1 - r.y) / 64
+                for i in 0..<cols where diffBandScratch[i] {
+                    let x0 = max((c0 + i) * ts, r.x) - r.x, x1 = min((c0 + i + 1) * ts, r.x + r.w) - r.x
+                    for sy in sy0...sy1 {
+                        for sx in x0 / 64...(x1 - 1) / 64 { map[sy * sbCols + sx] = 1 }
+                    }
+                }
+            }
             guard handoffActive else { continue }
             for i in 0..<cols where diffBandScratch[i] {
                 let idx = row * grid.cols + c0 + i
@@ -577,7 +593,13 @@ extension HostEngine {
             if answersRequest { reclaimShownTiles() }
             takePendingClaims()
         }
-        encoder.encode(bgra: UnsafeRawBufferPointer(pixels), forceSync: forceSync, timeUS: lastEncodeNowUS)
+        let changed = regionChangesKnown ? regionChanged.map { UnsafeBufferPointer($0) } : nil
+        encoder.encode(bgra: UnsafeRawBufferPointer(pixels), forceSync: forceSync, timeUS: lastEncodeNowUS, changed: changed)
+        // (what changes from here on is since this frame)
+        if let map = regionChanged {
+            map.update(repeating: 0)
+            regionChangesKnown = true
+        }
         if forceSync {
             // A keyframe re-codes everything at today's budget.
             refreshDamagePixels = 0

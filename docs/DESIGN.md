@@ -718,6 +718,18 @@ engine's queue; the encode runs on the encoder's own queues and threads,
 one delivery per submit, one encoder per process. It spends a third to a
 half of libaom's bytes at PSNR within 1–2 dB of it, and more frames get
 through a 6 Mbit/s link (BENCHMARKS "the hybrid as a live video encoder").
+- **The change map.** Each frame goes with a map of its 64×64s that changed
+  since the frame the engine passed before (`encode(…changed:)`; nil for a
+  stream's first). The engine builds it from the region's own tile
+  comparison (extraction's diff against the last region frame), not from
+  dirty rects, OR-ing every tick's changed tiles until a frame is passed, so
+  frames it skipped are covered. The AV1 encoder's copy finder then compares
+  only the 64×64s marked (`AV1HybridEncoder.Picture.changed`). That relies on
+  the conversion being local, which `ConversionLocalityTests` checks. The
+  adapter drops the map after a frame that didn't reach the stream. A 64×64
+  wrongly marked unchanged would be copied stale until it changes again or
+  its tile is handed off (debug builds of the encoder check every one).
+  HEVC ignores it.
 
 **libaom** (`AOMRegionEncoder`, vendored; the Host's AV1 before Glass Act's,
 kept unused): realtime speed 9 with screen tools, CBR with a one-second

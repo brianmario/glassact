@@ -312,19 +312,95 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     func takeSource(_ lengths: [Int], gpuWrites: Set<Int> = []) throws -> [any MTLBuffer] {
         poolLock.lock()
         defer { poolLock.unlock() }
+        var made: [any MTLBuffer] = []
         if let i = sourcePool.firstIndex(where: { $0.map(\.length) == lengths.map { max(16, $0) } }) {
             return sourcePool.remove(at: i)
         }
+        // (new buffers hold no picture, whatever a set that had their identity held)
+        defer { if let first = made.first { sourceHolds[ObjectIdentifier(first)] = nil } }
         // Untracked: the CPU writes a source before the analysis that reads it is committed, and
         // every GPU use only reads it (the next picture's motion search, the hybrid's filters),
         // so Metal needn't order those command buffers behind one another. Those the GPU writes
         // (`gpuWrites`: a 4:4:4 picture's analysis chroma, k_chroma420's, which an analysis split
         // in two writes in its first command buffer and reads in its second) are tracked.
-        return try lengths.enumerated().map { i, length in
+        made = try lengths.enumerated().map { i, length in
             let options: MTLResourceOptions = gpuWrites.contains(i) ? .storageModeShared : [.storageModeShared, .hazardTrackingModeUntracked]
             guard let b = device.makeBuffer(length: max(16, length), options: options)
             else { throw Failure.metal("no buffer of \(length) bytes") }
             return b
+        }
+        return made
+    }
+
+    /// A picture's source as the caller identifies it, for the padded copy (`beginPartition`'s
+    /// `source`): `id`, unique to its samples, and what changed since picture `from`'s (per 64×64,
+    /// raster, nonzero where it may differ; nil: not known). A pooled set that holds a picture the
+    /// changes reach back to is brought up to date by copying only the 64×64s that changed since.
+    public struct SourceChange: Sendable {
+        public var id: UInt64
+        public var from: UInt64
+        public var changed: [UInt8]?
+        public init(id: UInt64, from: UInt64, changed: [UInt8]?) {
+            (self.id, self.from, self.changed) = (id, from, changed)
+        }
+    }
+    /// The picture (`SourceChange.id`) each pooled source set holds, by its first buffer, set once
+    /// a source is copied into it (the CPU's planes; the GPU's, a 4:4:4 picture's analysis chroma,
+    /// are made from them anew). Guarded by `poolLock`.
+    private var sourceHolds: [ObjectIdentifier: UInt64] = [:]
+    /// The last pictures' `SourceChange`s with their maps, newest last (at most `sourceChangesKept`).
+    private var sourceChanges: [SourceChange] = []
+    static let sourceChangesKept = 6
+    /// A picture's padded source goes into a pooled set by copying only the 64×64s that changed
+    /// since the picture the set holds, when its `SourceChange`s reach back to it (on); off,
+    /// every picture's is copied whole. The same buffers either way.
+    public var updatesSourcesInPlace = true
+    /// Sources copied whole, and in place (`updatesSourcesInPlace`), so far.
+    public private(set) var sourcesCopiedWhole = 0, sourcesCopiedInPlace = 0
+
+    /// Records `source` and returns what to copy into `set` for it: nil, all of it; else per
+    /// 64×64 (`count`), nonzero where the set's picture differs from `source`'s (the changes from
+    /// the set's picture to it, OR-ed).
+    func sourcePlan(_ set: [any MTLBuffer], _ source: SourceChange?, count: Int) -> [UInt8]? {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        guard let first = set.first else { return nil }
+        // (it holds no known picture until its copy is done: `noteSource`)
+        let holds = sourceHolds.removeValue(forKey: ObjectIdentifier(first))
+        guard let source else {
+            sourcesCopiedWhole += 1
+            return nil
+        }
+        if source.from != 0, let c = source.changed, c.count == count {
+            sourceChanges.removeAll { $0.id == source.id }
+            sourceChanges.append(source)
+            if sourceChanges.count > Self.sourceChangesKept { sourceChanges.removeFirst() }
+        }
+        sourcesCopiedWhole += 1
+        guard updatesSourcesInPlace, let held = holds else { return nil }
+        var union = [UInt8](repeating: 0, count: count)
+        var at = source.id
+        for _ in 0...Self.sourceChangesKept {
+            if at == held {
+                (sourcesCopiedWhole, sourcesCopiedInPlace) = (sourcesCopiedWhole - 1, sourcesCopiedInPlace + 1)
+                return union
+            }
+            guard let step = sourceChanges.last(where: { $0.id == at }), let c = step.changed, c.count == count else { return nil }
+            for i in 0..<count where c[i] != 0 { union[i] = 1 }
+            at = step.from
+        }
+        return nil
+    }
+
+    /// `set` now holds picture `id` (nil: none known).
+    func noteSource(_ set: [any MTLBuffer], holds id: UInt64?) {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        guard let first = set.first else { return }
+        sourceHolds[ObjectIdentifier(first)] = id
+        if sourceHolds.count > 16 {
+            // (entries of sets long gone: a new set made under one of their identities clears it)
+            sourceHolds = sourceHolds.filter { $0.key == ObjectIdentifier(first) }
         }
     }
 
@@ -412,6 +488,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     func setReference(y: UnsafePointer<UInt8>, width: Int, height: Int) throws {
         let aw = ((2 * ((width + 7) >> 3) + 15) >> 4) * 64, ah = ((2 * ((height + 7) >> 3) + 15) >> 4) * 64
         let planes = try takeSource([aw * ah, aw / 2 * (ah / 2), aw / 2 * (ah / 2)])
+        noteSource(planes, holds: nil)  // (a decoded picture's luma, no source's)
         let d = planes[0].contents().assumingMemoryBound(to: UInt8.self)
         for row in 0..<ah {
             let line = d + row * aw, from = y + min(row, height - 1) * width
@@ -949,6 +1026,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     struct Lines: @unchecked Sendable {
         let to: UnsafeMutablePointer<UInt8>, from: UnsafePointer<UInt8>
     }
+    /// A source plan's marks (`sourcePlan`), across the copy's threads.
+    struct Marks: @unchecked Sendable {
+        let marks: UnsafeBufferPointer<UInt8>
+        init(_ marks: UnsafeBufferPointer<UInt8>) { self.marks = marks }
+    }
 
     /// GA_PIPELINES (diagnostics): each pipeline's threads and static threadgroup memory on
     /// stderr as it's made (BENCHMARKS "where a new 5K picture's period goes, kernel by kernel").
@@ -1128,10 +1210,11 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                width: Int, height: Int, qindex: Int, skip: [UInt8]? = nil,
                                motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, after gateValue: UInt64 = 0,
                                newPicture: NewPictureAnalysis? = nil, shapes: Int32? = nil,
-                               removesShapes: Int32 = 0, chroma444: Bool = false) throws -> PendingPartition {
+                               removesShapes: Int32 = 0, chroma444: Bool = false,
+                               source: SourceChange? = nil) throws -> PendingPartition {
         let run = try Run(encoder: self, y: y, u: u, v: v, width: width, height: height, qindex: qindex, closedLoop: false,
                           skip: skip, motion: motion, sbQindex: sbQindex, newPicture: newPicture, shapes: shapes,
-                          removesShapes: removesShapes, chroma444: chroma444)
+                          removesShapes: removesShapes, chroma444: chroma444, source: source)
         run.gateValue = gateValue
         return PendingPartition(run: run, commands: try run.execute(closedLoop: false, wait: false))
     }
@@ -1228,7 +1311,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         init(encoder: AV1MetalEncoder, y: UnsafePointer<UInt8>, u: UnsafePointer<UInt8>, v: UnsafePointer<UInt8>,
              width: Int, height: Int, qindex: Int, closedLoop: Bool = true, skip: [UInt8]? = nil,
              motion: [Int32]? = nil, sbQindex: [UInt8]? = nil, newPicture: NewPictureAnalysis? = nil,
-             shapes: Int32? = nil, removesShapes: Int32 = 0, chroma444: Bool = false) throws {
+             shapes: Int32? = nil, removesShapes: Int32 = 0, chroma444: Bool = false,
+             source sourceChange: SourceChange? = nil) throws {
             // (the GPU's closed loop codes 4:2:0)
             guard !(chroma444 && closedLoop) else { throw Failure.metal("the GPU's closed loop is 4:2:0 only") }
             self.encoder = encoder
@@ -1275,25 +1359,65 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                              gpuWrites: chroma444 ? [1, 2] : [])
             made += src
             source = src
+            // all of it, or (a set that holds a picture before this one) only the 64×64s that
+            // changed since
+            let plan = encoder.sourcePlan(src, sourceChange, count: sbCols * sbRows)
             var recPlanes: [any MTLBuffer] = []
             for (p, (pixels, w, h)) in planes.enumerated() {
                 let full = p == 0 || chroma444
                 let pw = full ? aw : aw / 2, ph = full ? ah : ah / 2
                 let b = p == 0 || !chroma444 ? src[p] : src[2 + p]
                 let d = b.contents().assumingMemoryBound(to: UInt8.self)
-                // in bands of 64 lines on every core (a lone picture waits for this copy)
                 let lines = AV1MetalEncoder.Lines(to: d, from: pixels)
-                DispatchQueue.concurrentPerform(iterations: (ph + 63) / 64) { band in
-                    let (d, pixels) = (lines.to, lines.from)
-                    for row in band * 64..<min(ph, band * 64 + 64) {
-                        let sr = min(row, h - 1)
-                        let line = d + row * pw
-                        line.update(from: pixels + sr * w, count: w)
-                        (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
+                if let plan {
+                    // per row of 64×64s, its runs of changed ones (the padding with the last)
+                    let side = full ? 64 : 32, cols = sbCols, rows = sbRows
+                    plan.withUnsafeBufferPointer { changed in
+                        let changed = AV1MetalEncoder.Marks(changed)
+                        DispatchQueue.concurrentPerform(iterations: rows) { band in
+                            let (d, pixels, marks) = (lines.to, lines.from, changed.marks)
+                            // (a row of 64×64s mostly changed: its lines whole, one copy a line)
+                            var n = 0
+                            for c in 0..<cols where marks[band * cols + c] != 0 { n += 1 }
+                            if 2 * n > cols {
+                                for row in band * side..<min(ph, band * side + side) {
+                                    let sr = min(row, h - 1)
+                                    let line = d + row * pw
+                                    line.update(from: pixels + sr * w, count: w)
+                                    (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
+                                }
+                                return
+                            }
+                            var c = 0
+                            while c < cols {
+                                guard marks[band * cols + c] != 0 else { c += 1; continue }
+                                let c0 = c
+                                while c < cols && marks[band * cols + c] != 0 { c += 1 }
+                                let x0 = c0 * side, x1 = min(c * side, pw), copied = min(x1, w) - x0
+                                for row in band * side..<min(ph, band * side + side) {
+                                    let sr = min(row, h - 1)
+                                    let line = d + row * pw
+                                    if copied > 0 { (line + x0).update(from: pixels + sr * w + x0, count: copied) }
+                                    if x1 > w { (line + max(w, x0)).update(repeating: pixels[sr * w + w - 1], count: x1 - max(w, x0)) }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // in bands of 64 lines on every core (a lone picture waits for this copy)
+                    DispatchQueue.concurrentPerform(iterations: (ph + 63) / 64) { band in
+                        let (d, pixels) = (lines.to, lines.from)
+                        for row in band * 64..<min(ph, band * 64 + 64) {
+                            let sr = min(row, h - 1)
+                            let line = d + row * pw
+                            line.update(from: pixels + sr * w, count: w)
+                            (line + w).update(repeating: pixels[sr * w + w - 1], count: pw - w)
+                        }
                     }
                 }
                 recPlanes.append(try make(closedLoop ? (p == 0 ? aw * ah : aw / 2 * (ah / 2)) : 16))
             }
+            encoder.noteSource(src, holds: sourceChange?.id)
             rec = recPlanes
             var tl = av1g_tiles()
             guard av1g_tile_layout_ex(UInt32(width), UInt32(height), Int32(encoder.tiling.columnsLog2),
