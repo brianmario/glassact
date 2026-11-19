@@ -295,7 +295,8 @@ the numbers and the reasoning.
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
-| A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line; with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line (they are since 2026-11-18, with a saved template); with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| Each kernel's GPU counters from the command line: a saved Instruments template (Performance Limiters, shader timeline) and `scripts/metal-trace` sharing each counter sample among the kernels that ran in it (`--kernel`, `--csv`) | measured (method) | 5K photos inter frames: no limiter at 60 %; most analysis kernels at their occupancy ceiling (10–16 %); the stack 66–83 % of the thread kernels' L1 traffic and 59 % of `k_me`'s; `l_select` at occupancy 4 against a target of 46 | [entry](#metal-av1-each-kernels-gpu-counters-from-the-command-line-2026-11-18) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -365,6 +366,63 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: each kernel's GPU counters from the command line (2026-11-18)
+
+The 2026-11-17 entry below found occupancy, limiters and registers per kernel "not obtainable
+from the command line": the stock templates' Metal GPU Counters instrument records only "RT Unit
+Active", and `xctrace` has no option for the counter set. A template saved from Instruments does
+have it, and `xctrace` records with it. `scripts/metal-trace` now reads its counters and gives
+them to each kernel.
+
+**The template (once a Mac, in Instruments).** Start from Metal System Trace. Add the Metal GPU
+Counters instrument if it isn't there, and set its counter set to Performance Limiters. Turn on
+the Metal Application instrument's shader timeline. Then File › Save as Template… as "GlassAct
+GPU", in the default place (`~/Library/Application Support/Instruments/Templates`). The M4 Pro
+offers no "Memory Bandwidth" set, but Performance Limiters has 84 counters, bandwidth among them:
+GPU, last-level cache and L1, the L1's by client (buffer, threadgroup, register, stack).
+
+**How the script shares them out.** The GPU samples every counter about every 21 µs. A sample is
+shared among the kernels that ran since the one before, by their time in it times their share of
+the shader profiler's samples. "alone" is the part of a kernel's weight from samples where it did
+90 % or more of the work: its own readings. The rest are blends with the kernels beside it in the
+analysis's concurrent encoder. For `k_me`, `k_analysis_small_4x4` and `l_select` (alone 85–93 %),
+the alone and blended occupancy and limiters are within two points of each other.
+`--kernel` prints every counter for a kernel, both ways; `--csv` writes them all. On this trace a
+run takes 41 s, mostly `xctrace export`.
+
+**5K photos, 40 inter frames** (`av1seq --width 5120 --tiles 3x0 --frames 40 --inter
+--no-planes`; M4 Pro). The Mac wasn't idle: `mediaanalysisd` used a core, and other processes had
+work on the GPU in 8 % of the window. Use the counters, not these times:
+
+| Kernel | Samples | Alone | Occupancy / target | ALU | Highest limiters | L1 evictions | Stack share of L1 | Hint |
+|---|---|---|---|---|---|---|---|---|
+| `k_me` | 17.8 % | 85 % | 15 / 18 | 24 | integer and conditional 47, launch 46 | 2 | 59 % | at its ceiling, stack |
+| `p_cdef_r` | 10.7 % | 69 % | 31 / 39 | 18 | instruction throughput 36, launch 34 | 4 | 19 % | latency |
+| `l_select` | 9.2 % | 92 % | **4** / 46 | 3 | instruction throughput 7 | 1 | 54 % | few SIMD-groups launched |
+| `k_analysis_8x8_w4` | 8.9 % | 61 % | 15 / 17 | 11 | launch 49, instruction throughput 31 | 8 | 20 % | at its ceiling |
+| `k_analysis_small_4x4` | 5.2 % | 93 % | 10 / 11 | 8 | launch 36, instruction throughput 21 | 11 | 79 % | at its ceiling, stack |
+| `l_cdef_sse` | 5.1 % | 99 % | 18 / 20 | 20 | launch 53, instruction throughput 38 | 0 | 0 % | at its ceiling |
+| `k_analysis_small_4x8` · `8x16` · `8x4` · `16x8` · `8x8` | 15.8 % | 24–74 % | 11–16 / 12–16 | 8–12 | launch 44–50 | 20–49 | 66–83 % | at its ceiling, stack |
+| the SIMD-group analysis shapes (`8x16_w4` … `32x32_w1t128`) | 11.4 % | 50–76 % | 14–15 / 15–18 | 13–14 | launch 48–55 | 3–30 | 10–28 % | at or near its ceiling |
+
+What it says:
+- **No unit is the limit.** No limiter reaches 60 % in the 30 busiest kernels. The highest are
+  the compute launcher's (up to 56 %) and `k_me`'s integer unit (47 %). ALU utilization is 3–24 %.
+- **Occupancy is at its ceiling:** 10–16 % for most analysis kernels, within 3 points of the
+  occupancy manager's target (`k_analysis_64x64_w1t256` and the inter candidates' 64x64 are well
+  under theirs: 12 / 32, 9 / 51). This agrees with Xcode's profiler on one frame (2026-10-31:
+  16 %, every analysis kernel at the full 192 registers).
+- **The stack is most of the L1 traffic** in the thread-per-block kernels (66–83 %), in `k_me`
+  (59 %: 174 of its 341 GB/s of L1 reads) and in `l_select` (54 %). That's spilled registers, or
+  private arrays indexed at run time. The thread kernels' L1 eviction rate (20–49 %) is what holds
+  their occupancy target down. The spill events show up to 1.9 KB a thread.
+- **`l_select` leaves the GPU nearly empty:** occupancy 4 against a target of 46, every limiter
+  under 7 %, 9 % of the samples. Its grid is too small or its dispatches wait on each other, so it
+  needs more parallel work, not cheaper work.
+- **Next:** `k_me`'s and the thread kernels' stack (which arrays, and whether they can live in
+  registers or threadgroup memory), and `l_select`'s grid. Line-level costs still need Xcode
+  (`av1seq --gpu-capture`).
 
 ### The AV1 kernels compiled with the app (2026-11-18)
 

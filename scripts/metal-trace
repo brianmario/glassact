@@ -1,33 +1,64 @@
 #!/usr/bin/env python3 -I
-"""The Metal AV1 encoder's GPU time from an Instruments Metal System Trace (BENCHMARKS, 2026-10-31).
+"""The Metal AV1 encoder's GPU time, and what bounds each kernel, from an Instruments trace
+(BENCHMARKS, 2026-10-31 and 2026-11-18).
 
-Record one (Instruments may ask for permission the first time), then read it:
+Record one with the "GlassAct GPU" template (Metal System Trace with the Metal GPU Counters
+instrument on its Performance Limiters counter set and the shader timeline on: made once in
+Instruments, see the BENCHMARKS entry), or with the stock 'Metal System Trace' for times without
+counters. Instruments may ask for permission the first time.
 
-  xcrun xctrace record --template 'Metal System Trace' --output photos.trace --launch -- \\
+  xcrun xctrace record --template 'GlassAct GPU' --output photos.trace --launch -- \\
       "$(swift build -c release --show-bin-path)/glassact-bench" av1seq --trace <scap> --width 5120 \\
       --tiles 3x0 --frames 40 --inter --no-planes
   scripts/metal-trace photos.trace 40
+  scripts/metal-trace photos.trace 40 --kernel k_me --kernel k_leaf   # every counter for these
+  scripts/metal-trace photos.trace 40 --csv photos.csv                # every kernel, every counter
 
 With the run's frame count, figures are per frame over the whole run (its key frame included);
 without it, per analysis command buffer after the first three (a picture with nothing changed has
-none). Prints the command buffers by label ("AV1 analysis", "AV1 filters"): GPU time, how much of
-it the two overlap, and how busy the GPU is; then each kernel's share of the shader profiler's
-samples (a relative measure) and how long it ran a frame (kernels in one concurrent encoder overlap).
+none).
+
+Prints:
+- the command buffers by label ("AV1 analysis", "AV1 filters"): GPU time, how much of it the two
+  overlap, how busy the GPU is, and how much of the window other processes had GPU work in (the
+  counters are the whole GPU's, so theirs mix in);
+- each kernel's share of the shader profiler's samples (a relative measure) and how long it ran a
+  frame (kernels in one concurrent encoder overlap);
+- with counters, each kernel's: occupancy and the occupancy manager's target, ALU utilization,
+  its two highest limiters, the L1 eviction rate, the stack's share of its L1 traffic (spilled
+  registers, or private arrays indexed at run time), and a hint at what bounds it.
+
+How a kernel gets its counters: the GPU samples every counter about every 20 µs. Each sample
+covers the time since the one before, and is shared among the kernels that ran in it by their
+time there times their share of the shader profiler's samples. A kernel's figure is the mean of
+its samples weighted by its part of each. "alone" is the share of its weight from samples where it
+did at least 90 % of the work: those readings are its own; the rest blend in the kernels that ran
+beside it in the same concurrent encoder.
+
+The hint (a limiter is how busy a unit was, counting its stalls; a utilization the same without
+them; the occupancy manager's target is the occupancy it lets a kernel reach):
+- a limiter other than the compute launcher's at 60 % or more: bound by that unit;
+- else occupancy under 30 % within 3 points of the target: at its ceiling, set by the L1 eviction
+  rate when that is 20 % or more (the manager lowers the target as evictions rise), else by the
+  registers or threadgroup memory a SIMD-group takes;
+- else occupancy under 30 % well below the target: few SIMD-groups launched (a small grid, or
+  dispatches waiting on each other);
+- else a compute launch limiter over 40 %: launch-bound (small threadgroups);
+- else latency: waiting on memory or barriers with nothing else to run.
+"stack" is added when the stack is 30 % or more of the kernel's L1 traffic. The hint is a
+starting point for a look at the kernel, not a measurement of the cause.
 """
-import collections, os, re, subprocess, sys, tempfile
+import argparse, bisect, collections, csv, re, subprocess, sys
 import xml.etree.ElementTree as ET
 
 
 def table(trace, schema):
-    """An exported table's rows as {mnemonic: (text, fmt)}, with xctrace's id/ref values resolved."""
+    """An exported table's rows as {mnemonic: (text, fmt)}, with xctrace's id/ref values resolved,
+    streamed (a counter table runs to millions of rows)."""
     xpath = f'/trace-toc/run[@number="1"]/data/table[@schema="{schema}"]'
-    out = subprocess.run(["xcrun", "xctrace", "export", "--input", trace, "--xpath", xpath],
-                         check=True, capture_output=True).stdout
-    node = ET.fromstring(out).find("node")
-    if node is None or node.find("schema") is None:
-        return []
-    cols = [c.find("mnemonic").text for c in node.find("schema").findall("col")]
-    seen = {}
+    proc = subprocess.Popen(["xcrun", "xctrace", "export", "--input", trace, "--xpath", xpath],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    cols, seen = None, {}
 
     def value(e):
         if "ref" in e.attrib:
@@ -39,7 +70,16 @@ def table(trace, schema):
             value(child)
         return v
 
-    return [{c: None if e.tag == "sentinel" else value(e) for c, e in zip(cols, row)} for row in node.findall("row")]
+    try:
+        for _, e in ET.iterparse(proc.stdout, events=("end",)):
+            if e.tag == "schema":
+                cols = [c.find("mnemonic").text for c in e.findall("col")]
+            elif e.tag == "row" and cols:
+                yield {c: None if v.tag == "sentinel" else value(v) for c, v in zip(cols, e)}
+                e.clear()
+    finally:
+        proc.stdout.close()
+        proc.wait()
 
 
 def union(intervals):
@@ -53,13 +93,69 @@ def union(intervals):
     return total + (cur[1] - cur[0] if cur else 0)
 
 
-def main(trace, frames=None, skip=3):
-    events = []
+def pid(process):
+    """The pid in a process column's text ("glassact-bench (46415)")."""
+    m = re.search(r"\((\d+)\)\s*$", process[1] if process else "")
+    return int(m.group(1)) if m else None
+
+
+def kernel_name(label):
+    return re.sub(r" \(\d+\)$", "", label)
+
+
+LIMITERS_SHOWN = 2
+HINT_LIMITER, HINT_OCCUPANCY, HINT_AT_TARGET, HINT_EVICTIONS, HINT_LAUNCH, HINT_STACK = 60, 30, 3, 20, 40, 0.3
+
+
+def stack_share(c):
+    """The stack's share of a kernel's L1 traffic."""
+    stack = c.get("Stack L1 Read Bandwidth", 0) + c.get("Stack L1 Write Bandwidth", 0)
+    l1 = c.get("L1 Read Bandwidth", 0) + c.get("L1 Write Bandwidth", 0)
+    return stack / l1 if l1 else 0
+
+
+def hint(c):
+    """What probably bounds a kernel, from its counters (see the module's doc)."""
+    limiters = {n: v for n, v in c.items() if n.endswith(" Limiter") and n != "Compute Shader Launch Limiter"}
+    unit, top = max(limiters.items(), key=lambda kv: kv[1], default=("", 0))
+    occupancy, target = c.get("Kernel Occupancy", 0), c.get("Occupancy Manager Target", 100)
+    if top >= HINT_LIMITER:
+        h = f"bound by {unit.removesuffix(' Limiter')}"
+    elif occupancy < HINT_OCCUPANCY and occupancy >= target - HINT_AT_TARGET:
+        h = ("at its ceiling: L1 evictions" if c.get("L1 Eviction Rate", 0) >= HINT_EVICTIONS
+             else "at its ceiling: registers or threadgroup memory")
+    elif occupancy < HINT_OCCUPANCY:
+        h = "few SIMD-groups launched"
+    elif c.get("Compute Shader Launch Limiter", 0) > HINT_LAUNCH:
+        h = "launch-bound"
+    else:
+        h = "latency (memory or barriers)"
+    return h + (", stack" if stack_share(c) >= HINT_STACK else "")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("trace")
+    ap.add_argument("frames", type=int, nargs="?", help="the run's frame count: figures a frame")
+    ap.add_argument("--kernel", action="append", default=[], metavar="NAME",
+                    help="every counter for the kernels whose names contain NAME (repeatable)")
+    ap.add_argument("--csv", metavar="FILE", help="write every kernel's every counter to FILE")
+    ap.add_argument("--top", type=int, default=25, help="kernels listed (default 25)")
+    args = ap.parse_args()
+    trace, frames, skip = args.trace, args.frames, 3
+
+    # The command buffers, ours and other processes'.
+    events, others, ours = [], [], collections.Counter()
     for r in table(trace, "metal-gpu-intervals"):
-        label = r["event-label"][1]
-        kind = "analysis" if "AV1 analysis" in label else "filters" if "AV1 filters" in label else "other"
         start, duration = int(r["start"][0]), int(r["duration"][0])
-        events.append((start, start + duration, kind))
+        label = r["event-label"][1] if r["event-label"] else ""
+        kind = "analysis" if "AV1 analysis" in label else "filters" if "AV1 filters" in label else "other"
+        if kind != "other":
+            ours[pid(r["process"])] += 1
+        events.append((start, start + duration, kind, pid(r["process"])))
+    me = ours.most_common(1)[0][0] if ours else None
+    others = [(s, e) for s, e, _, p in events if p != me]
+    events = [(s, e, k) for s, e, k, p in events if p == me]
     analyses = sorted(e for e in events if e[2] == "analysis")
     if len(analyses) <= skip + 1:
         sys.exit(f"{trace}: {len(analyses)} labelled analyses (built before the labels, or too few frames)")
@@ -71,34 +167,131 @@ def main(trace, frames=None, skip=3):
         n, unit = len(analyses) - skip, "an analysis"
     window = [e for e in events if e[0] >= t0 and e[1] <= t1]
     span = (t1 - t0) / 1e6
-    print(f"{len([e for e in window if e[2] == 'analysis'])} analyses over {span:.1f} ms; per {unit[3:] if unit.startswith('an ') else unit[2:]} ({n}): {span / n:.2f} ms")
+    print(f"{len([e for e in window if e[2] == 'analysis'])} analyses over {span:.1f} ms; per {unit.split(' ', 1)[1]} ({n}): {span / n:.2f} ms")
     by = {k: [(s, e) for s, e, kk in window if kk == k] for k in ("analysis", "filters", "other")}
     for k, iv in by.items():
         if iv:
             d = sorted(e - s for s, e in iv)
             print(f"  {k:9s} {len(iv):4d} command buffers · median {d[len(d) // 2] / 1e6:6.2f} ms · {union(iv) / 1e6 / n:6.2f} ms {unit}")
     a, f = by["analysis"], by["filters"]
+    clipped = [(max(s, t0), min(e, t1)) for s, e in others if e > t0 and s < t1]
     print(f"  both at once {(union(a) + union(f) - union(a + f)) / 1e6 / n:.2f} ms {unit} · "
-          f"GPU busy {100 * union(a + f + by['other']) / 1e6 / span:.0f} %")
+          f"GPU busy {100 * union(a + f + by['other']) / 1e6 / span:.0f} % · "
+          f"other processes on the GPU {100 * union(clipped) / 1e6 / span:.0f} % of the window")
 
-    weighted, active = collections.Counter(), collections.Counter()
+    # The shader timeline: each kernel's intervals and share of the samples.
+    intervals, weighted, active = [], collections.Counter(), collections.Counter()
     for r in table(trace, "metal-shader-profiler-intervals"):
         start = int(r["start"][0])
-        if not t0 <= start <= t1 or not r["name"]:
+        if not t0 <= start <= t1 or not r["name"] or (me is not None and pid(r["process"]) not in (me, None)):
             continue
-        name = re.sub(r" \(\d+\)$", "", r["name"][1])
+        name = kernel_name(r["name"][1])
         duration = int(r["duration"][0])
         share = float(r["percent-of-kick"][0]) / 100 if r["percent-of-kick"] else 0
         weighted[name] += duration * share
         active[name] += duration
-    if weighted:
-        total = sum(weighted.values())
-        print(f"kernels: share of the shader profiler's samples · running, ms {unit}")
-        for name, w in weighted.most_common(25):
-            print(f"  {100 * w / total:5.1f} %  {active[name] / 1e6 / n:6.3f}  {name}")
+        if share > 0:
+            intervals.append((start, start + duration, name, share))
+    if not weighted:
+        sys.exit("no shader timeline (record with the shader timeline on)")
+    total = sum(weighted.values())
+
+    # The counters, shared among the kernels that ran in each sample.
+    names = {int(r["counter-id"][0]): r["name"][1] for r in table(trace, "gpu-counter-info")}
+    counters = {}  # kernel → [weight, alone weight, {counter: Σ w·v}, {counter: Σ alone w·v}]
+    if "Kernel Occupancy" in names.values():  # (the stock template records "RT Unit Active" alone)
+        intervals.sort()
+        starts = [iv[0] for iv in intervals]
+        reach = max((e - s for s, e, _, _ in intervals), default=0)  # how far back an overlapping one can start
+
+        def sample(a, b, values):
+            lo = bisect.bisect_left(starts, a - reach)
+            hi = bisect.bisect_left(starts, b)
+            share = collections.Counter()
+            for s, e, name, w in intervals[lo:hi]:
+                overlap = min(e, b) - max(s, a)
+                if overlap > 0:
+                    share[name] += overlap * w
+            whole = sum(share.values())
+            for name, w in share.items():
+                k = counters.setdefault(name, [0.0, 0.0, collections.Counter(), collections.Counter()])
+                k[0] += w
+                alone = w >= 0.9 * whole
+                if alone:
+                    k[1] += w
+                for cid, v in values.items():
+                    k[2][cid] += w * v
+                    if alone:
+                        k[3][cid] += w * v
+
+        prev, cur, values = None, None, {}
+        for r in table(trace, "gpu-counter-value"):
+            ts = int(r["timestamp"][0])
+            if ts != cur:
+                if cur is not None and prev is not None and t0 <= cur <= t1:
+                    sample(prev, cur, values)
+                prev, cur, values = cur, ts, {}
+            values[int(r["counter-id"][0])] = float(r["value"][0])
+        if cur is not None and prev is not None and t0 <= cur <= t1:
+            sample(prev, cur, values)
+
+    def means(name, alone=False):
+        k = counters.get(name)
+        if not k or not k[1 if alone else 0]:
+            return {}
+        w, sums = (k[1], k[3]) if alone else (k[0], k[2])
+        return {names[cid]: s / w for cid, s in sums.items()}
+
+    print(f"kernels: share of the shader profiler's samples · running, ms {unit}"
+          + (" · counters (see the doc)" if counters else ""))
+    for name, w in weighted.most_common(args.top):
+        line = f"  {100 * w / total:5.1f} %  {active[name] / 1e6 / n:6.3f}  {name}"
+        c = means(name)
+        if c:
+            k = counters[name]
+            limiters = sorted(((v, n.removesuffix(" Limiter")) for n, v in c.items() if n.endswith(" Limiter")), reverse=True)
+            top = ", ".join(f"{u} {v:.0f}" for v, u in limiters[:LIMITERS_SHOWN])
+            line = (f"{line:58s} alone {100 * k[1] / k[0]:3.0f} % · occ {c.get('Kernel Occupancy', 0):3.0f} / {c.get('Occupancy Manager Target', 0):3.0f}"
+                    f" · ALU {c.get('ALU Utilization', 0):3.0f} · {top} · evict {c.get('L1 Eviction Rate', 0):3.0f}"
+                    f" · stack {100 * stack_share(c):3.0f} % · {hint(c)}")
+        print(line)
+
+    for pattern in args.kernel:
+        for name in [k for k in weighted if pattern in k]:
+            c, alone = means(name), means(name, alone=True)
+            if not c:
+                print(f"\n{name}: no counter samples")
+                continue
+            k = counters[name]
+            print(f"\n{name}: {100 * weighted[name] / total:.1f} % of the samples, {active[name] / 1e6 / n:.3f} ms {unit}, "
+                  f"alone in {100 * k[1] / k[0]:.0f} % of its weight · hint: {hint(c)}")
+            print(f"  {'counter':44s} {'all':>8s} {'alone':>8s}")
+            for cid in sorted(names):
+                cn = names[cid]
+                if cn in c:
+                    av = f"{alone[cn]:8.1f}" if cn in alone else "       -"
+                    print(f"  {cn:44s} {c[cn]:8.1f} {av}")
+
+    if args.csv and counters:
+        with open(args.csv, "w", newline="") as out:
+            cids = sorted(names)
+            w = csv.writer(out)
+            w.writerow(["kernel", "share", f"running ms {unit}", "alone", "stack share", "hint"] + [names[c] for c in cids])
+            for name, wt in weighted.most_common():
+                c = means(name)
+                if c:
+                    k = counters[name]
+                    w.writerow([name, f"{wt / total:.4f}", f"{active[name] / 1e6 / n:.4f}", f"{k[1] / k[0]:.3f}", f"{stack_share(c):.3f}", hint(c)]
+                               + [f"{c.get(names[x], 0):.3f}" for x in cids])
+        print(f"\nwrote {args.csv}")
+
+    # Shader compiles in the whole recording (a cold cache's cost is here, not in the window).
+    compiles = [int(r["duration"][0]) for r in table(trace, "graphics-compiler-activity-intervals")]
+    spills = [int(r["spilled-bytes"][0]) for r in table(trace, "graphics-compiler-spill-events")]
+    if compiles or spills:
+        print(f"\nshader compiles in the recording: {len(compiles)}, {sum(compiles) / 1e6:.1f} ms"
+              + (f" · spill events {len(spills)}, up to {max(spills)} B a thread" if spills else ""))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit(__doc__)
-    main(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
+    main()
