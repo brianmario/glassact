@@ -24,25 +24,34 @@ Prints:
   counters are the whole GPU's, so theirs mix in);
 - each kernel's share of the shader profiler's samples (a relative measure) and how long it ran a
   frame (kernels in one concurrent encoder overlap);
-- with counters, each kernel's: occupancy and the occupancy manager's target, ALU utilization,
-  its two highest limiters, the L1 eviction rate, the stack's share of its L1 traffic (spilled
-  registers, or private arrays indexed at run time), and a hint at what bounds it.
+- with counters, each kernel's: occupancy and SIMD-groups in flight, ALU utilization, its two
+  highest limiters, the L1 eviction rate, the stack's share of its L1 traffic (spilled registers,
+  or private arrays indexed at run time), and a hint at what bounds it.
 
-How a kernel gets its counters: the GPU samples every counter about every 20 µs. Each sample
-covers the time since the one before, and is shared among the kernels that ran in it by their
-time there times their share of the shader profiler's samples. A kernel's figure is the mean of
-its samples weighted by its part of each. "alone" is the share of its weight from samples where it
-did at least 90 % of the work: those readings are its own; the rest blend in the kernels that ran
-beside it in the same concurrent encoder.
+How a kernel gets its counters: the GPU samples its counters in groups, each at its own times (on
+the M4 Pro: occupancy, limiters and L1 every 35 µs; GPU bandwidth, MMU and last-level cache every
+50 µs). A group's sample covers the time since that group's last one, and is shared among the
+kernels that ran in it by their time there times their share of the shader profiler's samples. A
+kernel's figure is the mean of its group's samples weighted by its part of each. "alone" is the
+share of its weight from samples where it did at least 90 % of the work: those readings are its
+own; the rest blend in the kernels that ran beside it in the same concurrent encoder.
+
+The last-level cache's and the MMU's counters aren't in the limiters shown or the hint: the CPU
+shares them. A run with `av1seq --serial` (key frames) reads the last-level cache limiter at 100 % in
+a fifth of the samples while the GPU is idle and the CPU codes (2026-11-18), so they don't tell a
+kernel's own traffic
+(`--kernel` still prints them).
+
+The occupancy manager's target isn't shown: in steady state it equals the occupancy sample by
+sample, and it parts from it only as work starts or drains, so it says nothing about a ceiling
+(`--kernel` still prints it).
 
 The hint (a limiter is how busy a unit was, counting its stalls; a utilization the same without
-them; the occupancy manager's target is the occupancy it lets a kernel reach):
+them):
 - a limiter other than the compute launcher's at 60 % or more: bound by that unit;
-- else occupancy under 30 % within 3 points of the target: at its ceiling, set by the L1 eviction
-  rate when that is 20 % or more (the manager lowers the target as evictions rise), else by the
-  registers or threadgroup memory a SIMD-group takes;
-- else occupancy under 30 % well below the target: few SIMD-groups launched (a small grid, or
-  dispatches waiting on each other);
+- else occupancy under 30 %: low occupancy, from L1 evictions when their rate is 20 % or more
+  (the manager lowers occupancy as evictions rise), else from the registers or threadgroup memory
+  a SIMD-group takes, or too few threads (the counters can't tell those apart);
 - else a compute launch limiter over 40 %: launch-bound (small threadgroups);
 - else latency: waiting on memory or barriers with nothing else to run.
 "stack" is added when the stack is 30 % or more of the kernel's L1 traffic. The hint is a
@@ -104,7 +113,7 @@ def kernel_name(label):
 
 
 LIMITERS_SHOWN = 2
-HINT_LIMITER, HINT_OCCUPANCY, HINT_AT_TARGET, HINT_EVICTIONS, HINT_LAUNCH, HINT_STACK = 60, 30, 3, 20, 40, 0.3
+HINT_LIMITER, HINT_OCCUPANCY, HINT_EVICTIONS, HINT_LAUNCH, HINT_STACK = 60, 30, 20, 40, 0.3
 
 
 def stack_share(c):
@@ -114,23 +123,38 @@ def stack_share(c):
     return stack / l1 if l1 else 0
 
 
+SHARED = {"Last Level Cache Limiter", "MMU Limiter"}  # with the CPU (see the module's doc)
+
+
+def own_limiters(c):
+    """A kernel's limiters, less the ones the CPU shares."""
+    return {n: v for n, v in c.items() if n.endswith(" Limiter") and n not in SHARED}
+
+
 def hint(c):
     """What probably bounds a kernel, from its counters (see the module's doc)."""
-    limiters = {n: v for n, v in c.items() if n.endswith(" Limiter") and n != "Compute Shader Launch Limiter"}
+    limiters = {n: v for n, v in own_limiters(c).items() if n != "Compute Shader Launch Limiter"}
     unit, top = max(limiters.items(), key=lambda kv: kv[1], default=("", 0))
-    occupancy, target = c.get("Kernel Occupancy", 0), c.get("Occupancy Manager Target", 100)
     if top >= HINT_LIMITER:
         h = f"bound by {unit.removesuffix(' Limiter')}"
-    elif occupancy < HINT_OCCUPANCY and occupancy >= target - HINT_AT_TARGET:
-        h = ("at its ceiling: L1 evictions" if c.get("L1 Eviction Rate", 0) >= HINT_EVICTIONS
-             else "at its ceiling: registers or threadgroup memory")
-    elif occupancy < HINT_OCCUPANCY:
-        h = "few SIMD-groups launched"
+    elif c.get("Kernel Occupancy", 0) < HINT_OCCUPANCY:
+        h = ("low occupancy: L1 evictions" if c.get("L1 Eviction Rate", 0) >= HINT_EVICTIONS
+             else "low occupancy: registers, threadgroup memory or few threads")
     elif c.get("Compute Shader Launch Limiter", 0) > HINT_LAUNCH:
         h = "launch-bound"
     else:
         h = "latency (memory or barriers)"
     return h + (", stack" if stack_share(c) >= HINT_STACK else "")
+
+
+def compile_summary(trace):
+    """Shader compiles and spills in the whole recording (a cold cache's cost is here, not in the
+    window)."""
+    compiles = [int(r["duration"][0]) for r in table(trace, "graphics-compiler-activity-intervals")]
+    spills = [int(r["spilled-bytes"][0]) for r in table(trace, "graphics-compiler-spill-events")]
+    if compiles or spills:
+        print(f"\nshader compiles in the recording: {len(compiles)}, {sum(compiles) / 1e6:.1f} ms"
+              + (f" · spill events {len(spills)}, up to {max(spills)} B a thread" if spills else ""))
 
 
 def main():
@@ -193,13 +217,21 @@ def main():
         if share > 0:
             intervals.append((start, start + duration, name, share))
     if not weighted:
-        sys.exit("no shader timeline (record with the shader timeline on)")
+        print("no shader timeline: no kernels (record with the shader timeline on)")
+        compile_summary(trace)
+        return
     total = sum(weighted.values())
 
     # The counters, shared among the kernels that ran in each sample.
+    # The GPU samples its counters in groups, each at its own times (on the M4 Pro: occupancy,
+    # limiters and L1 every 35 µs; GPU bandwidth, MMU and last-level cache every 50 µs; texture
+    # now and then). A group's sample covers the time since that group's last one, and a
+    # counter's mean is over its own group's samples.
     names = {int(r["counter-id"][0]): r["name"][1] for r in table(trace, "gpu-counter-info")}
-    counters = {}  # kernel → [weight, alone weight, {counter: Σ w·v}, {counter: Σ alone w·v}]
-    if "Kernel Occupancy" in names.values():  # (the stock template records "RT Unit Active" alone)
+    counters = {}  # kernel → {group: [weight, alone weight]}, {counter: Σ w·v}, {counter: Σ alone w·v}
+    group_of = {}  # counter → its group (the lowest counter id in it)
+    main = next((cid for cid, n in names.items() if n == "Kernel Occupancy"), None)
+    if main is not None:  # (the stock template records "RT Unit Active" alone)
         intervals.sort()
         starts = [iv[0] for iv in intervals]
         reach = max((e - s for s, e, _, _ in intervals), default=0)  # how far back an overlapping one can start
@@ -213,34 +245,51 @@ def main():
                 if overlap > 0:
                     share[name] += overlap * w
             whole = sum(share.values())
+            group = min(values)
+            for cid in values:
+                group_of[cid] = group
             for name, w in share.items():
-                k = counters.setdefault(name, [0.0, 0.0, collections.Counter(), collections.Counter()])
-                k[0] += w
+                k = counters.setdefault(name, [collections.defaultdict(lambda: [0.0, 0.0]), collections.Counter(), collections.Counter()])
                 alone = w >= 0.9 * whole
+                k[0][group][0] += w
                 if alone:
-                    k[1] += w
+                    k[0][group][1] += w
                 for cid, v in values.items():
-                    k[2][cid] += w * v
+                    k[1][cid] += w * v
                     if alone:
-                        k[3][cid] += w * v
+                        k[2][cid] += w * v
 
-        prev, cur, values = None, None, {}
+        last = {}  # group → its previous sample's time
+
+        def close(ts, values):
+            group = min(values)
+            if group in last and t0 <= ts <= t1:
+                sample(last[group], ts, values)
+            last[group] = ts
+
+        cur, values = None, {}
         for r in table(trace, "gpu-counter-value"):
             ts = int(r["timestamp"][0])
             if ts != cur:
-                if cur is not None and prev is not None and t0 <= cur <= t1:
-                    sample(prev, cur, values)
-                prev, cur, values = cur, ts, {}
+                if values:
+                    close(cur, values)
+                cur, values = ts, {}
             values[int(r["counter-id"][0])] = float(r["value"][0])
-        if cur is not None and prev is not None and t0 <= cur <= t1:
-            sample(prev, cur, values)
+        if values:
+            close(cur, values)
+        main = group_of.get(main, main)
+
+    def weight(name, alone=False, group=None):
+        k = counters.get(name)
+        return k[0][main if group is None else group][1 if alone else 0] if k else 0
 
     def means(name, alone=False):
         k = counters.get(name)
-        if not k or not k[1 if alone else 0]:
+        if not k or not weight(name, alone):
             return {}
-        w, sums = (k[1], k[3]) if alone else (k[0], k[2])
-        return {names[cid]: s / w for cid, s in sums.items()}
+        sums = k[2] if alone else k[1]
+        return {names[cid]: s / weight(name, alone, group_of[cid]) for cid, s in sums.items()
+                if weight(name, alone, group_of[cid])}
 
     print(f"kernels: share of the shader profiler's samples · running, ms {unit}"
           + (" · counters (see the doc)" if counters else ""))
@@ -248,10 +297,9 @@ def main():
         line = f"  {100 * w / total:5.1f} %  {active[name] / 1e6 / n:6.3f}  {name}"
         c = means(name)
         if c:
-            k = counters[name]
-            limiters = sorted(((v, n.removesuffix(" Limiter")) for n, v in c.items() if n.endswith(" Limiter")), reverse=True)
+            limiters = sorted(((v, n.removesuffix(" Limiter")) for n, v in own_limiters(c).items()), reverse=True)
             top = ", ".join(f"{u} {v:.0f}" for v, u in limiters[:LIMITERS_SHOWN])
-            line = (f"{line:58s} alone {100 * k[1] / k[0]:3.0f} % · occ {c.get('Kernel Occupancy', 0):3.0f} / {c.get('Occupancy Manager Target', 0):3.0f}"
+            line = (f"{line:58s} alone {100 * weight(name, True) / weight(name):3.0f} % · occ {c.get('Kernel Occupancy', 0):3.0f} · SIMD {c.get('Compute SIMD Groups Inflight', 0):3.0f}"
                     f" · ALU {c.get('ALU Utilization', 0):3.0f} · {top} · evict {c.get('L1 Eviction Rate', 0):3.0f}"
                     f" · stack {100 * stack_share(c):3.0f} % · {hint(c)}")
         print(line)
@@ -262,9 +310,8 @@ def main():
             if not c:
                 print(f"\n{name}: no counter samples")
                 continue
-            k = counters[name]
             print(f"\n{name}: {100 * weighted[name] / total:.1f} % of the samples, {active[name] / 1e6 / n:.3f} ms {unit}, "
-                  f"alone in {100 * k[1] / k[0]:.0f} % of its weight · hint: {hint(c)}")
+                  f"alone in {100 * weight(name, True) / weight(name):.0f} % of its weight · hint: {hint(c)}")
             print(f"  {'counter':44s} {'all':>8s} {'alone':>8s}")
             for cid in sorted(names):
                 cn = names[cid]
@@ -280,17 +327,11 @@ def main():
             for name, wt in weighted.most_common():
                 c = means(name)
                 if c:
-                    k = counters[name]
-                    w.writerow([name, f"{wt / total:.4f}", f"{active[name] / 1e6 / n:.4f}", f"{k[1] / k[0]:.3f}", f"{stack_share(c):.3f}", hint(c)]
+                    w.writerow([name, f"{wt / total:.4f}", f"{active[name] / 1e6 / n:.4f}", f"{weight(name, True) / weight(name):.3f}", f"{stack_share(c):.3f}", hint(c)]
                                + [f"{c.get(names[x], 0):.3f}" for x in cids])
         print(f"\nwrote {args.csv}")
 
-    # Shader compiles in the whole recording (a cold cache's cost is here, not in the window).
-    compiles = [int(r["duration"][0]) for r in table(trace, "graphics-compiler-activity-intervals")]
-    spills = [int(r["spilled-bytes"][0]) for r in table(trace, "graphics-compiler-spill-events")]
-    if compiles or spills:
-        print(f"\nshader compiles in the recording: {len(compiles)}, {sum(compiles) / 1e6:.1f} ms"
-              + (f" · spill events {len(spills)}, up to {max(spills)} B a thread" if spills else ""))
+    compile_summary(trace)
 
 
 if __name__ == "__main__":
