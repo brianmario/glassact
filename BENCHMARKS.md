@@ -461,6 +461,10 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
 - **Together** (the prediction's row copies, the four-row hashes and the inline compare), against
   `main`, six rounds: photos +7.0 % (145.1 → 155.3 fps), typing-cc +0.6 %, scroll-win +1.4 %.
   The streams are the same.
+- **At 2560 wide** (`--tiles 2x0`), the whole branch against `main`: with 60 frames (runs under
+  0.2 s) −0.3 / −1.3 / +2.6 % (photos / typing-cc / scroll-win), within noise; with 300 frames,
+  four rounds, +1.3 / −0.2 / +3.8 %. No regression, and less to gain: the copy finder's and the
+  copies' work scales with the picture.
 - Not tried: reusing the previous picture's hashes (its "now" a frame before). Knowing that the
   picture passed is still the one hashed would take a check as costly as the hash.
 
