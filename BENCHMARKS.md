@@ -295,7 +295,9 @@ the numbers and the reasoning.
 | No motion search in inter frames that code more than a share of their 64x64s (`metal-av1`, branch `motion-rule`) | measured, not adopted | coded share doesn't tell new pictures from motion: at 0.5 the rotation saves ≈ 5.6 ms for +3.1 % (as with no motion search at all), but video codes > 97 % of its 64x64s every frame (+17 % / +21 %) and scrolling images ≈ 80 % (+426 %, 87 → 528 KB at q20); at 0.9 nothing is saved anywhere | [entry](#metal-av1-no-motion-search-on-mostly-new-pictures-by-coded-share-measured-not-adopted-2026-11-11) |
 | Bytes for GPU time on new 5K pictures: no motion search; the learned pruning's thresholds; no 4x4s (`metal-av1`) | measured; the owner's choice, open | no motion search +3.1 % for 23.0 → 16.1 ms; `--ml-mode-eps` 0.05 / 0.10 +0.13 / +0.36 % for −0.7 / −1.3 ms; `--ml-eps` 0.05 +1.85 % (shipped weights) or +0.24 % (retrained) for −1.2 ms; no 4x4s +7.7 % for −2.1 ms | [entry](#metal-av1-the-analysiss-thread-kernel-and-the-learned-prunings-statistics-by-parts-2026-11-09) |
 | After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
-| A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line; with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line (they are since 2026-11-18, with a saved template); with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| Each kernel's GPU counters from the command line: a saved Instruments template (Performance Limiters, shader timeline) and `scripts/metal-trace` sharing each counter group's samples among the kernels that ran in them (`--kernel`, `--csv`) | measured (method) | 5K photos inter frames (a loaded Mac): `k_me` bound by its integer unit (84 %), 59 % of its L1 traffic the stack; the thread kernels 66–83 % stack with L1 evictions of 29–88 %; `l_select` at occupancy 8; the occupancy target follows occupancy and the last-level cache counts the CPU's traffic, so neither tells a kernel's bound | [entry](#metal-av1-each-kernels-gpu-counters-from-the-command-line-2026-11-18) |
+| What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -365,6 +367,259 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: what limits an inter stream's frame rate; three levers measured (2026-11-19)
+
+The question: of `k_me`'s integer work, the thread kernels' spills and the CPU, which one moves
+an inter stream's frames a second. Each was measured as an interleaved A/B
+(`av1seq --width 5120 --tiles 3x0 --frames 60 --inter --no-planes`; four rounds, the order
+alternating each round; photos, typing-cc, scroll-win; M4 Pro, load average 4–6 with
+`mediaanalysisd` running). Identical builds read within ±1 % on the medians, and single runs
+within about ±3 %: a change under about 2 % doesn't show.
+
+| Lever | photos | typing-cc | scroll-win | Bytes |
+|---|---|---|---|---|
+| `k_me`'s whole-sample search on every 4th row, not every 2nd (`k_me` 0.52 → 0.40 ms a frame) | −1.3 % | +1.2 % | −1.7 % | photos 46.1 → 46.2 KB a frame |
+| no thread-kernel shapes (`shapeMask` 13C8 against the default 13FF: no 4x4, 4x8, 8x4, 8x16 or 16x8; a ceiling for rewriting those kernels) | +9.1 % | +9.5 % | +2.0 % | +1.7 %, +7.6 %, +11 %; PSNR −0.2 to −0.7 dB |
+| whole-sample prediction's rows copied as fixed-size arrays, not a `memmove` a row (`dsp::mc`) | +0.5 % | +1.5 % | +0.1 % | the same |
+| `splitsMotion` off (`--no-split-motion`, the same build on both sides) | +0.3 % | +1.0 % | +4.5 % | the same |
+
+- **`k_me`:** 0.12 ms off its GPU time is under what the A/B resolves. That says nothing either
+  way about whether `k_me` is on the critical path. The cut costs bytes, so it isn't kept.
+- **The thread kernels:** the ceiling is 2–10 % in frames a second, for 2–11 % more bytes. Part
+  of it isn't GPU time: without the small shapes, the CPU's closed loop also has fewer small
+  blocks to code. A rewrite that keeps the bytes would get some fraction of it.
+- **The row copies:** Time Profiler (photos, 120 frames) puts `walk::predict_inter_block` at 706
+  → 549 ms inclusive (−22 %), with the `memmove` under `predict_inter` gone (251 ms → none). That's
+  about 1.3 core-ms a frame across the tile threads, which the A/B can't resolve. The stream is
+  the same. Kept (a byte-neutral speedup; PR #128).
+
+**Where the frame goes** (`GA_TIMELINE`, 80 inter frames, photos at 5K). A picture's period is
+its closed loop on the CPU (3.5–3.6 ms, under the timeline's logging) and then its filters
+(2.5 ms of wall time): 6.0 ms. The writer runs beside the next closed loop, and the analysis
+beside the closed loop and filters (picture k's waits only for picture k − 2's filters; its motion
+search, with `splitsMotion`, for nothing). So the filters' wall time is on the critical path:
+- **GPU work beside the filters lengthens them.** The stream is deterministic, so a picture's
+  filters do the same work in every run. Paired by picture between two runs, a picture whose
+  filters had motion search or analysis beside them in one run and not in the other took
+  0.55–0.74 ms more GPU span and 0.46–0.52 ms more wall time when overlapped (15 and 12
+  pictures, in two pairings). Pictures alone in both runs differed by 0.003 ms. About 58 % of
+  pictures overlap, so it's about 0.3 ms a picture, 5 % of the period. (The plain split, 3.09 ms
+  of wall time for overlapped pictures against 1.70 alone, mixes this up with picture size.) With
+  `splitsMotion` off the analysis overlaps them instead. Metal has no public queue priority to
+  put the filters first.
+- **The filters' own overhead, with the GPU free:** 1.70 ms of wall time for 1.00 ms of GPU work.
+  Encoding the first command buffer after the closed loop ends: 169 µs (median). The GPU
+  starting it: 80–110 µs after the commit. `waitUntilCompleted` returning: 117–119 µs after the
+  GPU ends. The shared event that the last command buffer signals is visible on the CPU 27 µs
+  after the GPU ends (a spin on `signaledValue`), so waiting on it and checking the command
+  buffer's error afterwards would save about 90 µs a picture. A spin on the command buffer's
+  `status` saves nothing (117 µs).
+- **The CPU** (Time Profiler, photos, 120 frames): the copy finder's shift search
+  (`pool::each` over `motion::Shift`) is 0.9–1.2 s of self time, about 8–10 core-ms a frame
+  (av1seq reports 5.37 ms a frame for "deciding them"). It runs beside the closed loop. When it
+  finishes may decide when the next motion search is committed: in one period the GPU sat idle
+  for 1.7 ms during a closed loop, and then the motion search was committed just as the closed
+  loop ended, landing on its filters. Unmeasured.
+
+**The copy finder's row hashes four at a time (kept).** The closed loop is bound by throughput,
+not its dependency chain (`GA_CRIT`, photos: a picture's work is about 40 thread-ms on 14 threads,
+10.5–12.5 of them busy, its critical path 1.2–1.9 ms of a 3.3–4.1 ms wall). Threads also join it
+late: up to 12.5 of a picture's core-ms "absent", busy elsewhere with the copy finder and the
+previous picture's write. So CPU work beside it counts, and the copy finder's shift search was the
+largest: its row hashes (a chain of eight dependent multiplies a 64-sample row, a row at a time)
+were most of its closure's 0.9–1.2 s of self time over 120 photos frames. `motion::row_hashes`
+now hashes four rows at once, interleaved (`hash4`), with the same values (a test holds them to
+`hash` at every length):
+- Time Profiler (photos, 120 frames): the row hashes 899 → 640 ms, the shift search 1,639 →
+  1,369 ms inclusive (−16 %).
+- A/B against the build before it, six rounds: photos +3.1 % (149.6 → 154.2 fps), typing-cc
+  +2.8 %, scroll-win +1.7 %. On photos every run but one beat the other side's median. The streams
+  are the same (`--digest`).
+- Then `sb_matches_ss` (the copies' check, which most of the classify step is) compares whole
+  64- and 32-sample rows as fixed-size arrays, not by a `memcmp` call a row. Time Profiler: the
+  classify step 607 → 476 ms over 120 photos frames (−22 %, about 1.1 core-ms a frame). A/B
+  against the four-row hashing, six rounds: photos +1.7 %, typing-cc −1.1 %, scroll-win +8.6 % (a
+  noisy side): within noise. The same bytes. Kept as a byte-neutral speedup.
+- Tried, not kept: hashing the bands of columns row by row across the picture (four bands at a
+  time, the picture read along its rows instead of a 64-sample piece of every row a band at a
+  time). Time Profiler put the hashing at 619 → 194 ms, but every version was slower in frames a
+  second, the same bytes each time. As a second pass over the rows on every thread before the
+  votes: photos −2.7 %, typing-cc −2.8 %, scroll-win −2.5 %. In one pass, each thread its own bands
+  row by row: photos −4.0 %, typing-cc +1.8 %, scroll-win +1.0 %. The same with the threads'
+  buffers kept from call to call: photos −4.7 % (every run below the other side's), typing-cc
+  −0.1 %, scroll-win −1.2 %. Not understood: the copy decisions' wall time, which the next analysis
+  waits for, rather than their CPU time may be what counts here.
+- **The closed loop's inter prediction skips the someUseIntra scan for blocks of 8x8 and up**
+  (`writer::walk::predict_inter_block`). For 4:2:0 chroma it checked every 4x4 position of the
+  block's 8x8-aligned area for an intra block. In a block of 8x8 and up that area is the block's
+  own, already marked inter, so it can't find one (debug builds still scan and assert it). The
+  walk is the decoder's too (`Rec::Parse` with `decode`): our own AV1 decoder in the Viewer skips
+  the scan as well, and its gate tests pass. A
+  copied 64x64 scanned 256 positions a chroma plane. Time Profiler (photos, 120 frames):
+  `predict_inter_block`'s own time 250 → 88 ms, the closed loop 24.9 → 23.0 core-ms a frame. A/B
+  against the step before, six rounds: photos +2.1 %, typing-cc +6.2 %, scroll-win +6.0 %. The
+  streams are the same.
+- **Together** (the prediction's row copies, the four-row hashes and the inline compare), against
+  `main`, six rounds: photos +7.0 % (145.1 → 155.3 fps), typing-cc +0.6 %, scroll-win +1.4 %.
+  The streams are the same.
+- **All four together** (the row copies, the four-row hashes, the inline compare and the skipped
+  scan), against `main`, eight rounds (the figures to go by: each step's own A/B above is within
+  the harness's noise, and on scroll-win one step's exceeds this total): photos **+7.3 %** (146.1 → 156.7 fps), typing-cc **+5.8 %**
+  (278.0 → 294.0), scroll-win **+2.8 %** (266.9 → 274.2). The streams are the same.
+- **At 2560 wide** (`--tiles 2x0`), the whole branch against `main`: with 60 frames (runs under
+  0.2 s) −0.3 / −1.3 / +2.6 % (photos / typing-cc / scroll-win), within noise; with 300 frames,
+  four rounds, +1.3 / −0.2 / +3.8 %. No regression, and less to gain: the copy finder's and the
+  copies' work scales with the picture.
+- Not tried: reusing the previous picture's hashes (its "now" a frame before). Knowing that the
+  picture passed is still the one hashed would take a check as costly as the hash.
+
+**How busy the GPU is, and how long it takes to start** (`GA_TIMELINE`, 80 inter frames, the
+union of the motion search's, analysis's and filters' command buffers over the steady periods):
+- photos: busy 71–72 % of a 6.1 ms period (4.3–4.4 ms): motion 1.6, analysis 2.2, filters 1.7–1.9
+  (each its own union, overlaps counted in each). Not saturated: the overlaps are of timing, not load.
+- scroll-win: busy 37 % of a 3.1 ms period (1.2 ms). Its filters take 1.05 ms of wall time for
+  0.47 ms of GPU work, and most of the rest is the GPU starting them: 407–446 µs (median) from the
+  first commit to the GPU's start, against 81–100 µs on photos and 86 µs on typing-cc. On scroll-win
+  the latency follows how long the GPU had been idle before the commit: 88–90 µs after under
+  0.5 ms, 250–345 µs after 1–2 ms, 466–472 µs after more than 2 ms. The GPU powering down when
+  idle, it seems: about 0.35 ms of scroll-win's 3.1 ms period (11 %). Later the same night, with
+  the CPU changes below and the Mac quieter, it measured 136 µs (median; period 2.91 ms), so this
+  depends on the Mac's state and the timing.
+- The filters' phases (medians, photos / scroll-win): from "filters start" to the first commit
+  169 / 100 µs; commit to GPU start 96 / 407 µs; GPU 1,281 / 471 µs; GPU end to "filters end"
+  112 / 111 µs; two command buffers, no GPU gap between them.
+
+**Tried (overnight), none kept:**
+
+| Change | Measured |
+|---|---|
+| the filters' last command buffer waited on by a spin on the event it signals (seen 27 µs after the GPU ends) | A/B −0.9 / +3.7 / +2.1 % (photos / typing-cc / scroll-win), six rounds: within noise. Costs a spinning core while the filters run |
+| the same with an `MTLSharedEventListener` (no spinning) | +1.5 / −0.3 / +2.8 %: within noise |
+| a command buffer committed on the filters' queue as the closed loop starts, waiting on an event the CPU signals as it ends, the filters behind it (to have the GPU's next work queued) | worse: typing-cc's start latency 86 → 436 µs, its period 2.70 → 3.21 ms; scroll-win's 446 → 384 µs, period 3.00 → 3.28 ms. A GPU-side wait on a CPU signal resumes slower than a fresh commit starts |
+| a trivial command buffer (a 16-byte blit fill) committed on the filters' queue 0.3, 0.6 or 1.0 ms before the closed loop's end (timed from the last closed loop's), to have the GPU awake | scroll-win's start latency 136 µs without, 111 / 146 / 114 µs with; typing-cc 84 µs without, 78–83 with; periods within 0.2 ms either way: no effect |
+| the shift search's buffers kept from call to call (the table and lines not made anew each call) | A/B −0.8 / +0.5 / −3.0 %: no gain |
+| the closed loop's workers' idle policy (`GA_IDLE=spin,yield`, the 2026-11-12 entry's open item), against the default 64,96, same build: 64,64 (park after the spins) | four rounds: +0.3 / +1.5 / −0.8 % |
+| `GA_IDLE` 16,16 | four rounds +2.3 / +4.9 / −1.2 %; eight rounds +0.5 / +2.4 / +1.1 %. The whole run's CPU (user + sys, 120 frames, three runs each, mostly the bench's own work) 13.71 against 13.79 s on photos, 9.22 against 9.20 on typing-cc: no clear gain, the default kept |
+| `GA_IDLE` 256,320 | four rounds: −2.0 / +1.1 / +0.3 % |
+
+The full `swift test` passed on the branch's final commit (685 tests in 10 runs), and the Rust crate's tests in release and debug (in debug the someUseIntra assert below checked 452,760 blocks).
+
+**What could move the frame rate, none built:**
+- Ordering the next pictures' GPU work into the GPU's idle time during the closed loop, away from
+  the filters: about 0.3 ms of the 6.0 ms period on photos; little on scroll-win, where the
+  filters overlapped in 7 of 79 pictures.
+- Encoding the filters' command buffers during the closed loop and committing them when it ends
+  (about 0.17 ms). Not by having the GPU wait for the CPU (above).
+- Light pictures' filters away from the GPU's start-up: on scroll-win the GPU takes about 0.4 ms
+  to start the filters' 0.47 ms of work. The CPU's own filters (`av1enc_hybrid_postfilter_cpu`, a
+  research path) on small changed regions might beat that. Unmeasured.
+- The closed loop itself, 3.5 ms of the period.
+
+### Metal AV1: each kernel's GPU counters from the command line (2026-11-18)
+
+The 2026-11-17 entry below found occupancy, limiters and registers per kernel "not obtainable
+from the command line": the stock templates' Metal GPU Counters instrument records only "RT Unit
+Active", and `xctrace` has no option for the counter set. A template saved from Instruments does
+have it, and `xctrace` records with it. `scripts/metal-trace` now reads the counters and gives
+them to each kernel. Registers per kernel still aren't among them.
+
+**The template (once a Mac, in Instruments).** Start from Metal System Trace. Add the Metal GPU
+Counters instrument if it isn't there, and set its counter set to Performance Limiters. Turn on
+the Metal Application instrument's shader timeline. Then File › Save as Template… as "GlassAct
+GPU", in the default place (`~/Library/Application Support/Instruments/Templates`). The M4 Pro
+offers no "Memory Bandwidth" set, but Performance Limiters has 84 counters, bandwidth among them:
+GPU, last-level cache and L1, the L1's by client (buffer, threadgroup, register, stack).
+
+**What the counters are, found on the way:**
+- **They come in groups**, each sampled at its own times: occupancy, limiters and L1 every 35.5 µs;
+  GPU bandwidth, MMU and last-level cache every 50 µs; texture now and then. A first version of
+  the script took every timestamp as a sample of everything, which put most of the counters
+  about half too low. A group's sample now covers the time since that group's last one, and each
+  counter is averaged over its own group's samples.
+- **The occupancy manager's target follows the occupancy.** Across a `k_me` dispatch it equals
+  the occupancy sample by sample (27.1 and 27.1), and it parts from it only as work starts or
+  drains (up to 64–100 % then). So it doesn't mark a ceiling, and the script doesn't show it.
+  The 2026-10-31 Xcode capture's "target 88 %" was probably that profiler's figure for the whole
+  encoder, transitions included; it isn't comparable.
+- **The last-level cache's counters include the CPU's traffic.** With `av1seq --serial` (key
+  frames; `--serial` doesn't take `--inter`), the last-level cache limiter reads 100 % in a
+  fifth of the samples while the GPU is idle and the CPU codes. It reads 89–100 % (medians)
+  during our kernels in both modes. The script leaves it, and the MMU's, out of the limiters it
+  shows and out of its hint.
+
+**How the script shares them out.** A group's sample is shared among the kernels that ran in it,
+by their time in it times their share of the shader profiler's samples. "alone" is the part of a
+kernel's weight from samples where it did 90 % or more of the work: its own readings. The rest
+are blends with the kernels beside it in the analysis's concurrent encoder. `--kernel` prints
+every counter for a kernel, both ways; `--csv` writes them all. On this trace a run takes about
+40 s, mostly `xctrace export`.
+
+**5K photos, 40 inter frames** (`av1seq --width 5120 --tiles 3x0 --frames 40 --inter
+--no-planes`; M4 Pro). The Mac wasn't idle: `mediaanalysisd` used one to three cores, and other
+processes had work on the GPU in 8 % of the window. Use these as leads, and re-record on an idle
+Mac before acting on a number:
+
+| Kernel | Samples | Alone | Occupancy | ALU | Highest limiters | L1 evictions | Stack share of L1 | Hint |
+|---|---|---|---|---|---|---|---|---|
+| `k_me` | 17.8 % | 84 % | 27 | 42 | integer and conditional 84, launch 82 | 3 | 59 % | bound by integer and conditional, stack |
+| `p_cdef_r` | 10.7 % | 69 % | 54 | 31 | instruction throughput 62, launch 59 | 6 | 19 % | bound by instruction throughput |
+| `l_select` | 9.2 % | 92 % | **8** | 6 | instruction throughput 13, integer 10 | 2 | 56 % | low occupancy, stack |
+| `k_analysis_8x8_w4` | 8.9 % | 60 % | 27 | 20 | launch 89, instruction throughput 56 | 13 | 19 % | low occupancy |
+| `k_analysis_small_4x4` | 5.2 % | 93 % | 27 | 21 | launch 98, instruction throughput 57 | 29 | 80 % | low occupancy from L1 evictions, stack |
+| `l_cdef_sse` | 5.1 % | 99 % | 32 | 36 | launch 95, instruction throughput 68 | 0 | 0 % | bound by instruction throughput |
+| `k_analysis_small_4x8` · `8x16` · `8x4` · `16x8` · `8x8` | 15.8 % | 23–74 % | 20–28 | 14–21 | launch 81–90, instruction throughput 39–56 | 36–88 | 66–83 % | low occupancy from L1 evictions, stack |
+| the SIMD-group analysis shapes (`8x16_w4` … `32x32_w1t128`) | 11.4 % | 49–75 % | 25–27 | 23–25 | launch 87–99, instruction throughput 52–62 | 5–53 | 10–28 % | at or near instruction throughput |
+
+What it says:
+- **`k_me`, the largest, is bound by its integer and conditional unit** (84 %), and 59 % of its
+  L1 traffic is the stack (312 of its 614 GB/s of L1 reads). Integer work and spilled or
+  run-time-indexed private arrays are where its time goes.
+- **The thread-per-block kernels** (`k_analysis_small_*`, 21 % of the samples) do 66–83 % of their
+  L1 traffic on the stack, and their L1 eviction rate is 29–88 %: the spills (up to 1.9 KB a
+  thread in the spill events) push data out of L1, and the occupancy manager runs them at 20–28 %.
+  This agrees with 2026-10-31's register finding (every analysis kernel at the full 192
+  registers, the 4x4 / 4x8 / 8x4 kernels spilling 0.9–1.7 KB).
+- **The SIMD-group shapes and the CDEF kernels run near their instruction throughput**
+  (52–68 %), with the compute launcher at 59–99 %: they fill what occupancy they have.
+- **`l_select` leaves the GPU nearly empty:** occupancy 8, every limiter it doesn't share with the CPU under 15 %, 9 % of the
+  samples. Its grid is too small, or its dispatches wait on each other, so it needs more parallel
+  work, not cheaper work.
+- **Next:** `k_me`'s and the thread kernels' stack (which arrays, and whether they can live in
+  registers or threadgroup memory), and `l_select`'s grid. Line-level costs still need Xcode
+  (`av1seq --gpu-capture`).
+
+**Followed up the same day (not kept).** On an idle Mac (other processes on the GPU 0–2 % of the
+window), with the same run, each change kept the stream (`--digest`, photos, typing-cc and
+scroll-win at 5K, 40 inter frames):
+
+| Change | `k_me` ms a frame · stack | `l_select` ms a frame · stack |
+|---|---|---|
+| none (three runs) | 0.50–0.52 · 60 % | 0.24–0.26 · 66–72 % |
+| `k_me` without the sub-sample refinement (`--no-subpel`, a diagnosis: other bytes) | 0.39 · 2 % | |
+| `l_select`'s loops over the 16 pairs unrolled (`AV1G_UNROLL`) | | 0.26 · 66 % |
+| `k_me`'s refinement: every loop in a step unrolled | 0.50 · 60 % | |
+| `k_me`'s refinement a column at a time (its three rows' h as scalars, not `h[3][8]`) | 0.53 · **16 %** | |
+| `l_select` on 928 threads, every 64×64 kept in registers | | 0.33 · 27 %, L1 evictions 62 % |
+| `l_select` on 512 threads | | 0.26 · 76 % |
+
+- **The stack isn't what bounds `k_me`.** The sub-sample refinement is all of its stack traffic
+  (60 → 2 % without it) and about 0.13 ms of its 0.52. Taking its registers off the stack (16 %)
+  left the time where it was: L1 served the stack, and the integer unit (84 %) is the limit.
+  `k_me` gets faster only with fewer integer instructions, which is the window search's design
+  (2026-11-12).
+- **`l_select`'s time is its 40 dependent steps** (cdef_bits 3: 8 greedy and 32 refinement
+  steps), about 6 µs each. More threads give each step less work, but spill (928) or wait longer at
+  each step's barrier (512); 128 or 256 (2026-11-01) stay best.
+- **The AIR can't show the stack.** The offline compiler's AIR (`metal -S -emit-llvm`) keeps
+  these arrays as allocas, with `llvm.loop.unroll.full` still on the loops: unrolling and
+  promoting arrays to registers happen in the GPU compiler when the pipeline is built. The
+  counters are the only evidence of what ended up on the stack.
+- **Where GPU time counts.** The hybrid's thread, closed loop and filters, is what limits the
+  frame rate (2026-10-31). The analysis (`k_me`, `k_analysis_*`) runs beside it, but on the same
+  GPU as the filters, and work beside them slows them (2026-11-19: about 0.5 ms in the pictures it
+  overlaps). So the analysis's time counts too, through that overlap. The filters here are
+  1.5–1.6 ms of GPU a frame (of 11.3), the analysis 4.3–4.9 ms.
 
 ### The AV1 kernels compiled with the app (2026-11-18)
 

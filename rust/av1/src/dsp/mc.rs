@@ -178,11 +178,20 @@ pub fn predict_inter(
         (&s.patch[..], ww, 0)
     };
     match (fx != 0, fy != 0) {
-        (false, false) => {
-            for rr in 0..h {
-                dst[rr * dst_stride..rr * dst_stride + w].copy_from_slice(&src[base + rr * ss..base + rr * ss + w]);
+        (false, false) => match w {
+            // (rows of a block's width as fixed-size arrays: inline moves, not a memmove call a
+            // row, which a copied 64x64's 128 rows of 32 and 64 samples were mostly the cost of)
+            64 => copy_rows::<64>(src, ss, base, h, dst, dst_stride),
+            32 => copy_rows::<32>(src, ss, base, h, dst, dst_stride),
+            16 => copy_rows::<16>(src, ss, base, h, dst, dst_stride),
+            8 => copy_rows::<8>(src, ss, base, h, dst, dst_stride),
+            4 => copy_rows::<4>(src, ss, base, h, dst, dst_stride),
+            _ => {
+                for rr in 0..h {
+                    dst[rr * dst_stride..rr * dst_stride + w].copy_from_slice(&src[base + rr * ss..base + rr * ss + w]);
+                }
             }
-        }
+        },
         (true, false) => {
             let f = &Subpel_Filters[filters[0]][fx];
             h_only(&src[base..], ss, w, h, f, dst, dst_stride);
@@ -197,6 +206,16 @@ pub fn predict_inter(
             h_pass(&src[base..], ss, w, h + 7, f0, &mut s.inter);
             v_pass(&s.inter, w, h, f1, dst, dst_stride);
         }
+    }
+}
+
+/// A whole-sample prediction: `h` rows of `W` samples from `src` at `base` (stride `ss`) to `dst`.
+#[inline(always)]
+fn copy_rows<const W: usize>(src: &[u8], ss: usize, base: usize, h: usize, dst: &mut [u8], ds: usize) {
+    for rr in 0..h {
+        let s: &[u8; W] = src[base + rr * ss..][..W].try_into().unwrap();
+        let d: &mut [u8; W] = (&mut dst[rr * ds..][..W]).try_into().unwrap();
+        *d = *s;
     }
 }
 

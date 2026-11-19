@@ -536,7 +536,11 @@ pub(super) fn predict_inter_block(
         let (base_x, base_y) = ((c >> sub) * 4, (r >> sub) * 4);
         let (mut cand_r, mut cand_c) = ((r >> sub) << sub, (c >> sub) << sub);
         let (mut pw, mut ph) = ((4 * bw4(bsize)) >> sub, (4 * bh4(bsize)) >> sub);
-        if sub != 0 {
+        // (a block 8x8 and up's chroma covers its own luma area alone, which is this inter block's:
+        // the scan below can't find an intra position there, so it's done for the smaller ones only,
+        // and checked in debug builds. A copied 64x64 scanned 256 positions a chroma plane)
+        let whole = bw4(bsize) >= 2 && bh4(bsize) >= 2;
+        if sub != 0 && (!whole || cfg!(debug_assertions)) {
             // someUseIntra over the 8x8 unit (positions past the coded area are this block's)
             let mut some_intra = false;
             for y in cand_r..(cand_r + (n4h << sub)).min(f.mi_rows) {
@@ -544,6 +548,7 @@ pub(super) fn predict_inter_block(
                     some_intra |= maps.ref0[mi(y, x)] as i32 == INTRA_FRAME;
                 }
             }
+            debug_assert!(!(whole && some_intra), "an intra position inside an inter block of 8x8 and up");
             if !some_intra && (pw < 4 || ph < 4) {
                 inter_stat(8);
             }
