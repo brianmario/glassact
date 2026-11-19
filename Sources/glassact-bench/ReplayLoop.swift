@@ -667,6 +667,7 @@ final class BenchPipelinedEncoder: VideoRegionEncoder {
     }
 
     var codecID: UInt8 { inner.codecID }
+    var maxPendingFrames: Int { inner.maxPendingFrames }
 
     func start(width: Int, height: Int,
                onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {

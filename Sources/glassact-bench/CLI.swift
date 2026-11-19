@@ -21,6 +21,7 @@ let allCommands: [Command] = [
     y4mCommand,
     videoQualityCommand,
     videoCellsCommand,
+    paceCommand,
 ]
 
 // MARK: - Errors

@@ -301,7 +301,8 @@ the numbers and the reasoning.
 | Padded sources updated in place: a pooled set gets only the 64x64s changed since the picture it holds (`updatesSourcesInPlace`) | kept | the same streams; lone latency typing-cc −7.9 %, scroll-win −15 %; fps +3–5 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
-| How many frames may wait for the hybrid at 60 fps (`av1seq --push-pending`) | measured; a third slot for the hybrid is the owner's call | full-change 5K (movie) paced at 60: 45 fps with 2 waiting, 59 with 3 (p50 +2–4 ms); maps and images-scroll unchanged at 59–60 | [entry](#metal-av1-keeping-up-with-60-fps-of-changes-at-5k-how-many-frames-may-wait-2026-11-19) |
+| Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| How many frames may wait for the hybrid at 60 fps (`av1seq --push-pending`) | measured; superseded by the row above (three, kept) | full-change 5K (movie) paced at 60: 45 fps with 2 waiting, 59 with 3 (p50 +2–4 ms); maps and images-scroll unchanged at 59–60 | [entry](#metal-av1-keeping-up-with-60-fps-of-changes-at-5k-how-many-frames-may-wait-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -373,6 +374,53 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video: three frames waiting for Glass Act's AV1 and HEVC; the Host's rule in real time (2026-11-19)
+
+**`glassact-bench pace` (new)** plays a trace into a region's real encoder in real time, as the
+Host's engine submits frames.
+- A frame every `--every` ms (16.667: 60 fps of changes).
+- Each tick does the engine's work first: it extracts the frame and diffs it tile by tile into
+  the change map.
+- It skips the frame when `--pending` frames are already waiting (newest wins).
+- It reports frames delivered a second, skips, and each frame's encode latency.
+- No network and no Viewer. `replay` can't show this: it waits for each frame, so its encoder is
+  never full.
+
+5K, 180 frames from frame 300, two rounds (the depths in turn), means:
+
+| delivered of 60 fps · p50 latency | AV1, 2 | AV1, 3 | AV1, 4 | HEVC, 2 | HEVC, 3 | HEVC, 4 |
+|---|---|---|---|---|---|---|
+| movie | 40.9 · 33.5 ms | 56.6 · 36.9 | 58.3 · 36.9 | 35.7 · 42.0 | 47.9 · 47.2 | 51.4 · 55.4 |
+| maps | 44.9 · 30.0 | 57.0 · 33.7 | 58.1 · 33.5 | 37.3 · 35.7 | 48.4 · 45.3 | 52.0 · 53.8 |
+| images-scroll | 52.9 · 18.9 | 57.3 · 18.9 | 57.4 · 17.9 | 38.1 · 35.4 | 53.2 · 37.1 | 53.1 · 45.5 |
+| tabs | 57.4 · 7.6 | 57.9 · 7.5 | 58.3 · 7.5 | 38.4 · 34.7 | 51.6 · 37.8 | 54.6 · 47.6 |
+
+- **Under the Host's rule today (2 waiting), AV1 showed 41–57 frames a second of 60.** The engine's
+  tick (about 6 ms at 5K) costs some on top of av1seq's figure. With three it shows 57–58, p50
+  latency +0–4 ms, p95 +1–5 ms. Four adds about 1 fps more.
+- **HEVC at 5K showed only 36–38 frames a second of 60 on every content, tabs too.** VideoToolbox
+  takes 35–45 ms a 5K frame, so two waiting allow about two frames in that time. With three it
+  shows 48–53, p50 +2–10 ms and p95 +8–16 ms. Four gets 51–55 for another 8–10 ms p50 and about
+  20–30 ms p95.
+- At most 3 % of frames are skipped at 3 or 4 waiting on AV1, the jitter of a 6 ms tick in a
+  16.7 ms period.
+
+**Kept: three waiting for both** (`VideoRegionEncoder.maxPendingFrames`).
+- `HybridRegionEncoder` and `VTHEVCRegionEncoder` declare 3. libaom and the mock keep the
+  default 2. The engine's limit is the encoder's, capped at `HostEngine.videoPendingFramesCap`
+  (4).
+- A frame waiting is latency only while the encoder is behind. Content it keeps up with never
+  uses the third slot (tabs on AV1: the same latency).
+- `PendingFramesTests`: the engine leaves exactly the encoder's limit waiting (1–4, and the cap
+  past it), and the ring of submit times wraps at 3.
+- `replay --video hybrid-hevc` on photos and scroll-win, with no link, 6 Mbit/s and 2 Mbit/s
+  with 1 % loss: the same frames, video bytes, backlog skips, PSNR and glass-to-glass on every
+  one, against the build with 2. The replay never fills the encoder, so this checks only that
+  nothing else moved.
+- The replay's `BenchPipelinedEncoder` forwards the inner encoder's limit.
+- Not measured: a live Host, and Intel (whose HEVC encoder is slower, so it waits longer per
+  frame).
 
 ### Metal AV1: keeping up with 60 fps of changes at 5K; how many frames may wait (2026-11-19)
 

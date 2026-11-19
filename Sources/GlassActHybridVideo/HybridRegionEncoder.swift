@@ -235,6 +235,11 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         applyRate()
     }
 
+    /// Three frames may wait: with two the stream can't overlap enough new 5K pictures to keep up
+    /// with 60 fps of changes (movie 41 → 57 frames a second shown, maps 45 → 57, p50 latency
+    /// +0–4 ms; content it keeps up with never uses the third). BENCHMARKS "three frames waiting".
+    public var maxPendingFrames: Int { 3 }
+
     public func stop() {
         onFrame = nil
         guard let shared else { return }

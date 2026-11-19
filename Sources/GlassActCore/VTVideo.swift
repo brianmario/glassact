@@ -390,6 +390,11 @@ public final class VTHEVCRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         return out
     }
 
+    /// Three frames may wait: a 5K HEVC frame takes VideoToolbox 35–45 ms, so with two it shows
+    /// 36–38 frames a second of 60 fps content whatever the content; with three 48–53 (p50
+    /// latency +2–10 ms). BENCHMARKS "three frames waiting".
+    public var maxPendingFrames: Int { 3 }
+
     public func stop() {
         onFrame = nil
         teardown()

@@ -34,8 +34,8 @@ public struct HostStats: Sendable {
     /// re-sharpens, answered sync requests).
     public var videoSyncBytesSent = 0
     public var videoBacklogSkips = 0
-    /// Frames the gate skipped because the encoder still had
-    /// `videoMaxPendingFrames` in flight: the encoder, not the link, is
+    /// Frames the gate skipped because the encoder still had its
+    /// `maxPendingFrames` in flight: the encoder, not the link, is
     /// behind.
     public var videoEncoderFullSkips = 0
     /// Sessions' video given up because a frame stayed in the encoder past
@@ -360,7 +360,7 @@ public final class HostEngine: @unchecked Sendable {
     public var onVideoEncoderStalled: ((_ codec: UInt8, _ videoContinues: Bool) -> Void)?
     /// Submit times of the frames in flight, oldest at `regionSubmitHead`
     /// (deliveries come back in order). Fixed size: no allocation per frame.
-    var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoMaxPendingFrames)
+    var regionSubmitUS = [UInt64](repeating: 0, count: HostEngine.videoPendingFramesCap)
     var regionSubmitHead = 0
     /// Whether the link has room for AV1, judged once a second.
     var linkRoom = LinkRoomPolicy()
@@ -457,7 +457,10 @@ public final class HostEngine: @unchecked Sendable {
     /// Wall-time quiet limit at `videoQuietTicksLimit`, scaled with the
     /// adaptive limit (captures may stop entirely on a static screen).
     static let videoQuietUSLimit: UInt64 = 2_100_000
-    static let videoMaxPendingFrames = 2
+    /// Frames waiting in a region's encoder before the engine skips new ones, unless the encoder
+    /// says otherwise (`VideoRegionEncoder.maxPendingFrames`, at most `videoPendingFramesCap`).
+    public static let videoMaxPendingFrames = 2
+    public static let videoPendingFramesCap = 4
     /// Video send gate + encoder bitrate cap from the measured drain rate.
     public internal(set) var videoRate = VideoRateController()
 
