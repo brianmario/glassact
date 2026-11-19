@@ -39,6 +39,7 @@ let av1SeqCommand = Command(
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
+        .bool("no-split-motion", "with --inter: the motion search waits behind the filters' gate with the rest of the analysis (AV1HybridEncoder.splitsMotion off; the same bytes)"),
         .string("inter-preset", "<name>", "with --inter: the inter frames' analysis preset (default: --preset's)"),
         .string("new-shapes", "<hex>", "with --inter: inter frames coding most of their 64x64s analyze only these shapes (GpParams.shapeMask bits, e.g. 13CF: no 8x16 or 16x8; 124F: squares, 4x8 and 8x4; 1249: squares, the default; off: every shape)"),
         .bool("intra-everywhere", "with --inter: search intra modes even where the inter residual quantizes to nothing"),
@@ -395,6 +396,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.interPreset = p
     }
     encoder.searchesSubpelMotion = !opts.has("no-subpel")
+    if opts.has("no-split-motion") { encoder.splitsMotion = false }
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 0) }
     if opts.has("chroma-angles") { encoder.leafChromaAngledModes = true }
     if let v = opts.string("prune") {
