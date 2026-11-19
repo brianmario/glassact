@@ -422,12 +422,39 @@ search, with `splitsMotion`, for nothing). So the filters' wall time is on the c
   for 1.7 ms during a closed loop, and then the motion search was committed just as the closed
   loop ended, landing on its filters. Unmeasured.
 
+**How busy the GPU is, and how long it takes to start** (`GA_TIMELINE`, 80 inter frames, the
+union of the motion search's, analysis's and filters' command buffers over the steady periods):
+- photos: busy 71–72 % of a 6.1 ms period (4.3–4.4 ms): motion 1.6, analysis 2.2, filters 1.7–1.9
+  (each its own union, overlaps counted in each). Not saturated: the overlaps are of timing, not load.
+- scroll-win: busy 37 % of a 3.1 ms period (1.2 ms). Its filters take 1.05 ms of wall time for
+  0.47 ms of GPU work, and most of the rest is the GPU starting them: 407–446 µs (median) from the
+  first commit to the GPU's start, against 81–100 µs on photos and 86 µs on typing-cc. On scroll-win
+  the latency follows how long the GPU had been idle before the commit: 88–90 µs after under
+  0.5 ms, 250–345 µs after 1–2 ms, 466–472 µs after more than 2 ms. The GPU powering down when
+  idle, it seems: about 0.35 ms of scroll-win's 3.1 ms period (11 %).
+- The filters' phases (medians, photos / scroll-win): from "filters start" to the first commit
+  169 / 100 µs; commit to GPU start 96 / 407 µs; GPU 1,281 / 471 µs; GPU end to "filters end"
+  112 / 111 µs; two command buffers, no GPU gap between them.
+
+**Tried (overnight), none kept:**
+
+| Change | Measured |
+|---|---|
+| the filters' last command buffer waited on by a spin on the event it signals (seen 27 µs after the GPU ends) | A/B −0.9 / +3.7 / +2.1 % (photos / typing-cc / scroll-win), six rounds: within noise. Costs a spinning core while the filters run |
+| the same with an `MTLSharedEventListener` (no spinning) | +1.5 / −0.3 / +2.8 %: within noise |
+| a command buffer committed on the filters' queue as the closed loop starts, waiting on an event the CPU signals as it ends, the filters behind it (to have the GPU's next work queued) | worse: typing-cc's start latency 86 → 436 µs, its period 2.70 → 3.21 ms; scroll-win's 446 → 384 µs, period 3.00 → 3.28 ms. A GPU-side wait on a CPU signal resumes slower than a fresh commit starts |
+
+The full `swift test` passed on the branch with the row copies (685 tests in 10 runs).
+
 **What could move the frame rate, none built:**
 - Ordering the next pictures' GPU work into the GPU's idle time during the closed loop, away from
   the filters: about 0.3 ms of the 6.0 ms period on photos; little on scroll-win, where the
   filters overlapped in 7 of 79 pictures.
 - Encoding the filters' command buffers during the closed loop and committing them when it ends
-  (about 0.17 ms), and waiting on their event rather than on completion (about 0.09 ms).
+  (about 0.17 ms). Not by having the GPU wait for the CPU (above).
+- Light pictures' filters away from the GPU's start-up: on scroll-win the GPU takes about 0.4 ms
+  to start the filters' 0.47 ms of work. The CPU's own filters (`av1enc_hybrid_postfilter_cpu`, a
+  research path) on small changed regions might beat that. Unmeasured.
 - The closed loop itself, 3.5 ms of the period.
 
 ### Metal AV1: each kernel's GPU counters from the command line (2026-11-18)
