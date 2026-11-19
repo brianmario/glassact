@@ -436,6 +436,11 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
 - A/B against the build before it, six rounds: photos +3.1 % (149.6 → 154.2 fps), typing-cc
   +2.8 %, scroll-win +1.7 %. On photos every run but one beat the other side's median. The streams
   are the same (`--digest`).
+- Then `sb_matches_ss` (the copies' check, which most of the classify step is) compares whole
+  64- and 32-sample rows as fixed-size arrays, not by a `memcmp` call a row. Time Profiler: the
+  classify step 607 → 476 ms over 120 photos frames (−22 %, about 1.1 core-ms a frame). A/B
+  against the four-row hashing, six rounds: photos +1.7 %, typing-cc −1.1 %, scroll-win +8.6 % (a
+  noisy side): within noise. The same bytes. Kept as a byte-neutral speedup.
 - Not tried: reusing the previous picture's hashes (its "now" a frame before). Knowing that the
   picture passed is still the one hashed would take a check as costly as the hash.
 

@@ -71,12 +71,24 @@ pub fn sb_matches_ss(
             return false;
         }
         let (px, py) = (px as usize, py as usize);
-        for row in 0..h {
-            let a = &c.data[(y0 + row) * c.stride + x0..][..w];
-            let b = &q.data[(py + row) * q.stride + px..][..w];
-            if a != b {
-                return false;
-            }
+        let rows = |row: usize| (&c.data[(y0 + row) * c.stride + x0..], &q.data[(py + row) * q.stride + px..]);
+        // (whole rows as fixed-size arrays: compared inline, not by a memcmp call a row)
+        let same = match w {
+            64 => (0..h).all(|r| {
+                let (a, b) = rows(r);
+                <&[u8; 64]>::try_from(&a[..64]).unwrap() == <&[u8; 64]>::try_from(&b[..64]).unwrap()
+            }),
+            32 => (0..h).all(|r| {
+                let (a, b) = rows(r);
+                <&[u8; 32]>::try_from(&a[..32]).unwrap() == <&[u8; 32]>::try_from(&b[..32]).unwrap()
+            }),
+            _ => (0..h).all(|r| {
+                let (a, b) = rows(r);
+                a[..w] == b[..w]
+            }),
+        };
+        if !same {
+            return false;
         }
     }
     true
