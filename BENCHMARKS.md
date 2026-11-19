@@ -466,10 +466,11 @@ scroll-win at 5K, 40 inter frames):
   these arrays as allocas, with `llvm.loop.unroll.full` still on the loops: unrolling and
   promoting arrays to registers happen in the GPU compiler when the pipeline is built. The
   counters are the only evidence of what ended up on the stack.
-- **Where GPU time counts.** The analysis (`k_me`, `k_analysis_*`) overlaps the CPU's closed
-  loop. The hybrid's thread, closed loop and filters, is what limits the frame rate (2026-10-31).
-  The filters here are 1.5–1.6 ms of GPU a frame (of 11.3), the analysis 4.3–4.9 ms beside it. So
-  GPU time in the filters is the kind most likely to show in frames a second.
+- **Where GPU time counts.** The hybrid's thread, closed loop and filters, is what limits the
+  frame rate (2026-10-31). The analysis (`k_me`, `k_analysis_*`) runs beside it, but on the same
+  GPU as the filters, and work beside them slows them (2026-11-19: about 0.5 ms in the pictures it
+  overlaps). So the analysis's time counts too, through that overlap. The filters here are
+  1.5–1.6 ms of GPU a frame (of 11.3), the analysis 4.3–4.9 ms.
 
 ### The AV1 kernels compiled with the app (2026-11-18)
 
