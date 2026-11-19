@@ -562,7 +562,7 @@ extension HostEngine {
                              linkCapacity: linkCapacityBytesPerSecond) {
             regionEncoder?.setBitrateCap(videoRate.bitrateCap)
         }
-        let encoderFull = regionFramesPending >= Self.videoMaxPendingFrames
+        let encoderFull = regionFramesPending >= min(max(1, encoder.maxPendingFrames), Self.videoPendingFramesCap)
         guard videoRate.allowsFrame(backlogBytes: backlog) else {
             stats.videoBacklogSkips += 1
             // Bandwidth pressure: backlog is full. If the encoder is NOT also
@@ -582,7 +582,7 @@ extension HostEngine {
             stats.videoEncoderFullSkips += 1
             return false
         }
-        regionSubmitUS[(regionSubmitHead + regionFramesPending) % Self.videoMaxPendingFrames] = clock?() ?? 0
+        regionSubmitUS[(regionSubmitHead + regionFramesPending) % Self.videoPendingFramesCap] = clock?() ?? 0
         if regionFramesPending == 0 { regionPendingSinceUS = max(lastEncodeNowUS, 1) }
         regionFramesPending += 1
         if stats.videoFramesSent == 0 && firstVideoSubmitUS == 0 {
@@ -756,7 +756,7 @@ extension HostEngine {
                 stats.videoEncodeUSSum &+= clock() &- regionSubmitUS[regionSubmitHead]
                 stats.videoEncodeCount += 1
             }
-            regionSubmitHead = (regionSubmitHead + 1) % Self.videoMaxPendingFrames
+            regionSubmitHead = (regionSubmitHead + 1) % Self.videoPendingFramesCap
             regionPendingSinceUS = regionFramesPending == 0 ? 0 : max(lastEncodeNowUS, 1)
         }
         // This delivery's claims (one entry per submit, in order).

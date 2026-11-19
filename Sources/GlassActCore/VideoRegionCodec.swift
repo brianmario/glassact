@@ -49,6 +49,11 @@ public protocol VideoRegionEncoder: AnyObject {
     /// already set. Runtime. Default no-op: HEVC's trade is that ceiling
     /// alone (`smoothMaxFrameQP`); AV1 uses its own (`AOMRegionEncoder`).
     func setSmoothMotion(_ on: Bool)
+    /// Frames the engine may have waiting in this encoder before it skips new ones (newest
+    /// wins): enough to keep the encoder's own pipeline full at the screen's rate, and no more,
+    /// since each one waiting is a frame of latency. Default `HostEngine.videoMaxPendingFrames`
+    /// (2); at most `HostEngine.videoPendingFramesCap`.
+    var maxPendingFrames: Int { get }
     func stop()
 }
 
@@ -60,6 +65,7 @@ public extension VideoRegionEncoder {
     func setBitrateCap(_ bitsPerSecond: Int?) {}
     func setMaxFrameQP(_ qp: Int?) {}
     func setSmoothMotion(_ on: Bool) {}
+    var maxPendingFrames: Int { HostEngine.videoMaxPendingFrames }
 }
 
 /// Video regions — viewer-side per-region decoder session. Same threading contract:

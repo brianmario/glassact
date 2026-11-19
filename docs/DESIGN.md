@@ -747,7 +747,11 @@ saving (BENCHMARKS "AV1 back, as a Viewer opt-in").
   by about 0.66× each.
 
 **Submission** (newest-wins): a frame is submitted only while the encoder has
-fewer than 2 frames pending and the rate gate passes.
+fewer than its `maxPendingFrames` pending and the rate gate passes. The limit is
+2 unless the encoder says otherwise (at most `videoPendingFramesCap`, 4).
+Glass Act's AV1 and HEVC wait for 3: with 2, neither keeps its pipeline full at
+5K with 60 fps of changes (BENCHMARKS "three frames waiting"). A frame waiting is
+latency only while the encoder is behind.
 - A backlog skip with the encoder *not* full counts as bandwidth pressure. It
   steps the quality ladder: one level per 30-frame window if ≥ 1/3 of the
   window was pressured, and back after 4 healthy windows.
