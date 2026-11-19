@@ -473,7 +473,9 @@ union of the motion search's, analysis's and filters' command buffers over the s
   first commit to the GPU's start, against 81–100 µs on photos and 86 µs on typing-cc. On scroll-win
   the latency follows how long the GPU had been idle before the commit: 88–90 µs after under
   0.5 ms, 250–345 µs after 1–2 ms, 466–472 µs after more than 2 ms. The GPU powering down when
-  idle, it seems: about 0.35 ms of scroll-win's 3.1 ms period (11 %).
+  idle, it seems: about 0.35 ms of scroll-win's 3.1 ms period (11 %). Later the same night, with
+  the CPU changes below and the Mac quieter, it measured 136 µs (median; period 2.91 ms), so this
+  depends on the Mac's state and the timing.
 - The filters' phases (medians, photos / scroll-win): from "filters start" to the first commit
   169 / 100 µs; commit to GPU start 96 / 407 µs; GPU 1,281 / 471 µs; GPU end to "filters end"
   112 / 111 µs; two command buffers, no GPU gap between them.
@@ -485,6 +487,8 @@ union of the motion search's, analysis's and filters' command buffers over the s
 | the filters' last command buffer waited on by a spin on the event it signals (seen 27 µs after the GPU ends) | A/B −0.9 / +3.7 / +2.1 % (photos / typing-cc / scroll-win), six rounds: within noise. Costs a spinning core while the filters run |
 | the same with an `MTLSharedEventListener` (no spinning) | +1.5 / −0.3 / +2.8 %: within noise |
 | a command buffer committed on the filters' queue as the closed loop starts, waiting on an event the CPU signals as it ends, the filters behind it (to have the GPU's next work queued) | worse: typing-cc's start latency 86 → 436 µs, its period 2.70 → 3.21 ms; scroll-win's 446 → 384 µs, period 3.00 → 3.28 ms. A GPU-side wait on a CPU signal resumes slower than a fresh commit starts |
+| a trivial command buffer (a 16-byte blit fill) committed on the filters' queue 0.3, 0.6 or 1.0 ms before the closed loop's end (timed from the last closed loop's), to have the GPU awake | scroll-win's start latency 136 µs without, 111 / 146 / 114 µs with; typing-cc 84 µs without, 78–83 with; periods within 0.2 ms either way: no effect |
+| the shift search's buffers kept from call to call (the table and lines not made anew each call) | A/B −0.8 / +0.5 / −3.0 %: no gain |
 
 The full `swift test` passed on the branch with the row copies (685 tests in 10 runs).
 
