@@ -232,6 +232,11 @@ void av1enc_motion_destroy(av1enc_motion *m);
 // The pictures the handle classifies are 4:4:4 (on: their chroma planes w x h, copied at the luma
 // shift, odd ones too) or 4:2:0 (off, the default: chroma half, even shifts only).
 void av1enc_motion_set_chroma_444(av1enc_motion *m, int on);
+// The next classify's prev is the last classify's cur (on), or equals it in every sample: the
+// copy finder takes its row and column hashes of prev from those it kept then, instead of hashing
+// it again. The same candidates and copies. For that one classify only (off for each after it
+// unless set again).
+void av1enc_motion_set_continues(av1enc_motion *m, int on);
 // Per 64x64 (raster) of cur: whether it equals prev unchanged, or else at a candidate shift (the
 // left or upper neighbour's, or up to max_candidates from row and column hashes; even and at most
 // 1000 samples each way; odd ones too in 4:4:4). `planes` planes (1 or 3: Y w x h, chroma half
