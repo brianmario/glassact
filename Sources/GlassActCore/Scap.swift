@@ -236,52 +236,67 @@ public enum ScapRaw {
     /// at the end (a capture that was killed) is left out. `progress` gets the frames done so far.
     public static func compress(raw: URL, to output: URL, threads: Int = ProcessInfo.processInfo.activeProcessorCount,
                                 progress: (Int) -> Void = { _ in }) throws -> Int {
-        guard let input = try? FileHandle(forReadingFrom: raw) else { throw ScapError.ioError }
-        defer { try? input.close() }
-        func read(_ count: Int) throws -> Data? {
-            guard let d = try input.read(upToCount: count), d.count == count else { return nil }
-            return d
+        // Read with read(2) into buffers made once: `FileHandle.read(upToCount:)` hands back
+        // autoreleased data on Darwin, and with no pool drained in this loop every frame read stayed
+        // alive until the end (a 30 s 5K capture of video held 86 GB and was killed for memory).
+        let fd = open(raw.path, O_RDONLY)
+        guard fd >= 0 else { throw ScapError.ioError }
+        defer { close(fd) }
+        func read(_ into: UnsafeMutableRawPointer, _ count: Int) throws -> Bool {
+            var got = 0
+            while got < count {
+                let k = Foundation.read(fd, into + got, count - got)
+                if k < 0 && errno == EINTR { continue }
+                guard k >= 0 else { throw ScapError.ioError }
+                if k == 0 { return false }
+                got += k
+            }
+            return true
         }
-        guard let head = try read(ScapHeader.diskSize) else { throw ScapError.truncated }
-        guard [UInt8](head.prefix(4)) == ScapRawWriter.magic else { throw ScapError.badMagic }
-        let width = Int(head[5]) | Int(head[6]) << 8, height = Int(head[7]) | Int(head[8]) << 8
+        var small = [UInt8](repeating: 0, count: 65_535 * 8 + 4)
+        func readSmall(_ count: Int) throws -> Bool { try small.withUnsafeMutableBytes { try read($0.baseAddress!, count) } }
+        guard try readSmall(ScapHeader.diskSize) else { throw ScapError.truncated }
+        guard Array(small[0..<4]) == ScapRawWriter.magic else { throw ScapError.badMagic }
+        let width = Int(small[5]) | Int(small[6]) << 8, height = Int(small[7]) | Int(small[8]) << 8
         guard width >= 1, height >= 1, width <= 16_384, height <= 16_384 else { throw ScapError.badHeader }
 
         let writer = try ScapWriter(url: output, width: width, height: height)
         let n = writer.header.frameByteCount, bound = ScapWriter.compressBound(n), workers = max(1, threads)
         typealias Meta = (timestampUS: UInt64, rects: [DirtyRect])
+        let src = (0..<workers).map { _ in UnsafeMutableRawBufferPointer.allocate(byteCount: n, alignment: 64) }
         let dst = (0..<workers).map { _ in UnsafeMutableRawBufferPointer.allocate(byteCount: bound, alignment: 64) }
         let codecs = (0..<workers).map { _ in LZ4Codec() }
-        defer { dst.forEach { $0.deallocate() } }
+        defer { (src + dst).forEach { $0.deallocate() } }
         var done = 0, atEnd = false
+        var metas: [Meta] = []
+        metas.reserveCapacity(workers)
         while !atEnd {
-            var metas: [Meta] = [], frames: [Data] = []
+            metas.removeAll(keepingCapacity: true)
             while metas.count < workers {
-                guard let m = try read(10) else { atEnd = true; break }
-                let ts = (0..<8).reduce(UInt64(0)) { $0 | UInt64(m[m.startIndex + $1]) << UInt64(8 * $1) }
-                let count = Int(m[m.startIndex + 8]) | Int(m[m.startIndex + 9]) << 8
-                guard let r = try read(count * 8 + 4) else { atEnd = true; break }
-                let u16 = { (i: Int) in Int(r[r.startIndex + i]) | Int(r[r.startIndex + i + 1]) << 8 }
+                guard try readSmall(10) else { atEnd = true; break }
+                let ts = (0..<8).reduce(UInt64(0)) { $0 | UInt64(small[$1]) << UInt64(8 * $1) }
+                let count = Int(small[8]) | Int(small[9]) << 8
+                guard try readSmall(count * 8 + 4) else { atEnd = true; break }
+                let u16 = { (i: Int) in Int(small[i]) | Int(small[i + 1]) << 8 }
                 let rects = (0..<count).map { k in
                     DirtyRect(x: u16(k * 8), y: u16(k * 8 + 2), width: u16(k * 8 + 4), height: u16(k * 8 + 6))
                 }
-                let length = (0..<4).reduce(0) { $0 | Int(r[r.startIndex + count * 8 + $1]) << (8 * $1) }
+                let length = (0..<4).reduce(0) { $0 | Int(small[count * 8 + $1]) << (8 * $1) }
                 guard length == n else { throw ScapError.badFrame }
-                guard let f = try read(n) else { atEnd = true; break }
+                guard try read(src[metas.count].baseAddress!, n) else { atEnd = true; break }
                 metas.append((ts, rects))
-                frames.append(f)
             }
-            var lengths = [Int](repeating: 0, count: frames.count)
+            var lengths = [Int](repeating: 0, count: metas.count)
             lengths.withUnsafeMutableBufferPointer { out in
-                let batch = Batch(frames: frames, codecs: codecs, dst: dst, lengths: out.baseAddress)
-                DispatchQueue.concurrentPerform(iterations: batch.frames.count) { batch.compress($0) }
+                let batch = Batch(frames: src, n: n, codecs: codecs, dst: dst, lengths: out.baseAddress)
+                DispatchQueue.concurrentPerform(iterations: out.count) { batch.compress($0) }
             }
-            for i in frames.indices {
+            for i in metas.indices {
                 guard lengths[i] > 0 else { throw ScapError.badFrame }
                 try writer.appendCompressed(timestampUS: metas[i].timestampUS, dirtyRects: metas[i].rects,
                                             lz4: UnsafeRawBufferPointer(start: dst[i].baseAddress, count: lengths[i]))
             }
-            done += frames.count
+            done += metas.count
             progress(done)
         }
         try writer.finish()
@@ -291,13 +306,14 @@ public enum ScapRaw {
     /// Frames being compressed, each by its own worker: frame i touches only codecs[i], dst[i] and
     /// lengths[i].
     private struct Batch: @unchecked Sendable {
-        let frames: [Data]
+        let frames: [UnsafeMutableRawBufferPointer]
+        let n: Int
         let codecs: [LZ4Codec]
         let dst: [UnsafeMutableRawBufferPointer]
         let lengths: UnsafeMutablePointer<Int>?
 
         func compress(_ i: Int) {
-            frames[i].withUnsafeBytes { lengths?[i] = codecs[i].encodeUnbounded(src: $0, dst: dst[i]) }
+            lengths?[i] = codecs[i].encodeUnbounded(src: UnsafeRawBufferPointer(start: frames[i].baseAddress, count: n), dst: dst[i])
         }
     }
 }
