@@ -516,6 +516,9 @@ pub struct Motion {
     ss: usize,
     /// [`Motion::set_continues`]: the next classify's `prev` is the last one's `cur`
     continues: bool,
+    /// [`Motion::set_changed`]: per 64x64 of the next classify's `cur`, 0 where it equals `prev`
+    /// (empty: not known)
+    changed_hint: Vec<u8>,
 }
 
 impl Default for Motion {
@@ -539,7 +542,19 @@ impl Motion {
             runs: Vec::new(),
             ss: 1,
             continues: false,
+            changed_hint: Vec::new(),
         }
+    }
+
+    /// av1enc_motion_set_changed: what the next classify's `cur` changed from its `prev`, as the
+    /// caller knows it (the Host's own comparison of the frames they came from): per 64x64, raster,
+    /// 0 where `cur` equals `prev` in every sample of every plane, nonzero where it may differ.
+    /// The 64x64s marked 0 are then unchanged without being compared (debug builds still compare
+    /// them and assert it). One classify's: empty, or another count of 64x64s than the picture's,
+    /// compares every one, as without it.
+    pub fn set_changed(&mut self, changed: &[u8]) {
+        self.changed_hint.clear();
+        self.changed_hint.extend_from_slice(changed);
     }
 
     /// av1enc_motion_set_continues: the next classify's `prev` is the last classify's `cur` (or
@@ -710,18 +725,30 @@ impl Motion {
         self.sbs.resize(sb_cols * sb_rows, SbMotion::default());
         self.candidates.clear();
         let continues = std::mem::take(&mut self.continues);
+        let hint = std::mem::take(&mut self.changed_hint);
         let same = cur[0].width == prev[0].width && cur[0].height == prev[0].height;
         if !same {
             self.finder.forget();
             return 0;
         }
-        // unchanged, rows of superblocks on several threads
+        // unchanged, rows of superblocks on several threads; with the caller's hint, only those it
+        // marks are compared
+        let hint = (hint.len() == sb_cols * sb_rows).then_some(&hint[..]);
         let rows_per = sb_rows.div_ceil(self.threads.max(1)).max(1);
         let mut parts: Vec<_> = self.sbs.chunks_mut(rows_per * sb_cols).enumerate().collect();
         crate::pool::each(&mut parts, |(k, part)| {
             for (i, m) in part.iter_mut().enumerate() {
                 let s = *k * rows_per * sb_cols + i;
-                m.copy = sb_matches_ss(cur, prev, planes, ss, s % sb_cols, s / sb_cols, Shift::default());
+                let (x, y) = (s % sb_cols, s / sb_cols);
+                m.copy = if hint.is_some_and(|h| h[s] == 0) {
+                    debug_assert!(
+                        sb_matches_ss(cur, prev, planes, ss, x, y, Shift::default()),
+                        "64x64 ({x}, {y}) marked unchanged differs from the picture before"
+                    );
+                    true
+                } else {
+                    sb_matches_ss(cur, prev, planes, ss, x, y, Shift::default())
+                };
             }
         });
         let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
@@ -1411,6 +1438,70 @@ mod tests {
             }
         }
         assert!(checked > 40 && reused > 200, "{checked} pictures with changes, {reused} bands kept");
+    }
+
+    /// The caller's change map (`set_changed`) gives the copies of comparing every 64x64: exact,
+    /// or marking more than changed; one of another size is ignored; it lasts one classify.
+    #[test]
+    fn a_change_map_gives_the_same_copies() {
+        let (w, h) = (333usize, 261usize);
+        let mut s = 0x77u64;
+        let page: Vec<u8> = (0..w * (h + 200)).map(|_| (rng(&mut s) & 0xff) as u8).collect();
+        let prev = page[..w * h].to_vec();
+        let mut cur = prev.clone();
+        // a scroll in the left third, a few new samples elsewhere
+        for r in 0..h {
+            cur[r * w..r * w + 110].copy_from_slice(&page[(r + 40) * w..(r + 40) * w + 110]);
+        }
+        cur[200 * w + 300] ^= 0x55;
+        cur[10 * w + 200] ^= 0x55;
+        let (sb_cols, sb_rows) = (w.div_ceil(64), h.div_ceil(64));
+        let exact: Vec<u8> = (0..sb_cols * sb_rows)
+            .map(|i| {
+                let (x0, y0) = (i % sb_cols * 64, i / sb_cols * 64);
+                (y0..h.min(y0 + 64)).any(|r| (x0..w.min(x0 + 64)).any(|c| cur[r * w + c] != prev[r * w + c])) as u8
+            })
+            .collect();
+        assert!(exact.contains(&0) && exact.contains(&1));
+        let p = |d: &'static [u8]| -> [Plane<'static>; 3] {
+            let q = plane(d, w, h);
+            [q, q, q]
+        };
+        let (cur, prev): (&'static [u8], &'static [u8]) = (cur.leak(), prev.leak());
+        let mut want = Motion::new();
+        let n = want.classify(&p(&cur), &p(&prev), 1, 8);
+        let mut more = exact.clone();
+        more.iter_mut().step_by(3).for_each(|v| *v = 1);
+        for (label, map) in [("exact", exact.clone()), ("more", more), ("all", vec![1; exact.len()]), ("other size", vec![0; 5])] {
+            let mut m = Motion::new();
+            m.set_changed(&map);
+            assert_eq!((m.classify(&p(&cur), &p(&prev), 1, 8), &m.sbs, &m.candidates), (n, &want.sbs, &want.candidates), "{label}");
+        }
+        // one classify's: the next compares every 64x64 (here a map of nothing changed, then the
+        // same pictures without one)
+        let mut m = Motion::new();
+        m.set_changed(&exact);
+        m.classify(&p(&cur), &p(&prev), 1, 8);
+        assert_eq!(m.classify(&p(&cur), &p(&prev), 1, 8), n);
+        assert_eq!(m.sbs, want.sbs);
+    }
+
+    /// A 64x64 marked unchanged that differs fails a debug build's check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "marked unchanged differs")]
+    fn a_wrong_change_map_fails_the_debug_check() {
+        let (w, h) = (128usize, 64usize);
+        let prev = vec![7u8; w * h];
+        let mut cur = prev.clone();
+        cur[5 * w + 70] = 9;
+        fn q(d: &[u8], w: usize, h: usize) -> [Plane<'_>; 3] {
+            let p = plane(d, w, h);
+            [p, p, p]
+        }
+        let mut m = Motion::new();
+        m.set_changed(&[1, 0]);
+        m.classify(&q(&cur, w, h), &q(&prev, w, h), 1, 8);
     }
 
     #[test]

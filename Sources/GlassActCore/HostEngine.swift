@@ -325,6 +325,11 @@ public final class HostEngine: @unchecked Sendable {
     var regionFrameSeq: UInt32 = 0
     var regionPixels: UnsafeMutableRawBufferPointer?
     var regionScratch: UnsafeMutableRawBufferPointer?
+    /// Per 64×64 of the region's frame (raster, `(w + 63) / 64` a row): changed since the frame
+    /// last passed to `regionEncoder`, from `diffRegionTiles` (exact, not dirty rects). Passed
+    /// with each frame (`encode(…changed:)`) when `regionChangesKnown`: since that encoder's first.
+    var regionChanged: UnsafeMutableBufferPointer<UInt8>?
+    var regionChangesKnown = false
     var regionFramesPending = 0
     /// When the oldest input not yet followed by an update arrived; 0 none.
     var inputPendingSinceUS: UInt64 = 0
@@ -824,6 +829,7 @@ public final class HostEngine: @unchecked Sendable {
         encodeOut.deallocate()
         shadow.deallocate()
         for r in retention { r.deallocate() }
+        regionChanged?.deallocate()
         regionPixels?.deallocate()
         regionScratch?.deallocate()
         kfPixels?.deallocate()

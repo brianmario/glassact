@@ -154,6 +154,16 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     public func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64) {
+        encode(bgra: bgra, forceSync: forceSync, timeUS: timeUS, changed: nil)
+    }
+
+    /// A frame dropped before the stream got it: the next frame's change map (the engine's, since
+    /// the frame it passed before) isn't since the picture the stream had last, so it isn't passed.
+    private var changesBroken = false
+
+    public func encode(bgra: UnsafeRawBufferPointer, forceSync: Bool, timeUS: UInt64, changed: UnsafeBufferPointer<UInt8>?) {
+        let changes = changesBroken ? nil : changed.map { Array($0) }
+        changesBroken = true  // (until this frame reaches the stream)
         guard let shared, converter != nil || converter444 != nil, onFrame != nil else { return }
         let (w, h) = (width, height)
         let (cw, ch) = chroma444 ? (w, h) : (w / 2, h / 2)
@@ -181,7 +191,12 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             rateLock.withLock { rate.restart() }
             startStream()  // (a key frame: the stream's first)
         }
-        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: w, height: h, chroma444: chroma444)
+        // (the engine's frames are the picture's: 64×64s of the frame are the picture's 64×64s,
+        // and the conversion is per pixel, 2×2 for 4:2:0's chroma, so an unchanged one converts
+        // to the same samples)
+        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: w, height: h, chroma444: chroma444,
+                                               changed: changes)
+        changesBroken = false
         let token = token, fixed = fixedQindex
         let chooser = fixed != nil ? nil : rateChooser(timeUS: timeUS)
         rateLock.withLock { submitted.append(CACurrentMediaTime()) }

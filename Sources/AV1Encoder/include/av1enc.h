@@ -237,6 +237,11 @@ void av1enc_motion_set_chroma_444(av1enc_motion *m, int on);
 // it again. The same candidates and copies. For that one classify only (off for each after it
 // unless set again).
 void av1enc_motion_set_continues(av1enc_motion *m, int on);
+// What the next classify's cur changed from its prev, as the caller knows it: `count` bytes, per
+// 64x64 (raster), 0 where cur equals prev in every sample of every plane, nonzero where it may
+// differ. Those marked 0 are unchanged without being compared. For that one classify only; null,
+// or a count other than the picture's 64x64s, compares every one.
+void av1enc_motion_set_changed(av1enc_motion *m, const uint8_t *changed, int count);
 // Per 64x64 (raster) of cur: whether it equals prev unchanged, or else at a candidate shift (the
 // left or upper neighbour's, or up to max_candidates from row and column hashes; even and at most
 // 1000 samples each way; odd ones too in 4:4:4). `planes` planes (1 or 3: Y w x h, chroma half

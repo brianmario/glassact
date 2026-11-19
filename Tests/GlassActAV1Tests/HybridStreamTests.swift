@@ -66,6 +66,80 @@ struct HybridStreamTests {
         }
     }
 
+    /// The padded sources updated in place (only the 64×64s changed since the picture a pooled set
+    /// holds) give the bytes of copying them whole: scrolls and edits, sizes with partial 64×64s,
+    /// two screens in turn (GOLDEN_FRAME), a key frame on demand, 4:4:4, and pictures with the
+    /// Host's change maps.
+    @available(macOS 27, *)
+    @Test(.serialized, arguments: [(640, 360, false), (333, 201, false), (333, 201, true)])
+    func sourcesUpdatedInPlaceGiveTheSameBytes(width: Int, height: Int, chroma444: Bool) throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        var pictures = Self.pictures(10, width: width, height: height, seed: 0x9a1)
+            + Self.screensInTurn(8, width: width, height: height, salt: 1, seed: 0x9a2)
+        if chroma444 {
+            // one screen, a band of rows edited in every plane each picture, and a scroll
+            let base = Hybrid444Tests.picture(width: width, height: height, seed: 0x9a3, repeats: true)
+            var p = base
+            pictures = (0..<14).map { i in
+                let top = (i * 37) % (height - 20)
+                for r in top..<top + 12 {
+                    for x in 0..<width / 3 {
+                        let k = r * width + (x + i * 29) % width
+                        p.y[k] = UInt8(truncatingIfNeeded: k &* 31 &+ i)
+                        p.u[k] = UInt8(truncatingIfNeeded: k &* 7 &+ i)
+                        p.v[k] = UInt8(truncatingIfNeeded: k &* 13 &+ i)
+                    }
+                }
+                if i == 9 {  // the whole screen up by 64 rows
+                    for plane in 0..<3 {
+                        let src = plane == 0 ? p.y : plane == 1 ? p.u : p.v
+                        let cut = 64 * width
+                        let moved: [UInt8] = Array(src[cut...]) + Array(src[..<cut])
+                        if plane == 0 { p.y = moved } else if plane == 1 { p.u = moved } else { p.v = moved }
+                    }
+                }
+                return p
+            }
+        }
+        // the change map each picture's predecessor gives it (the Host's, here exact)
+        for i in pictures.indices.dropFirst() where i % 2 == 0 {
+            let (a, b) = (pictures[i], pictures[i - 1])
+            let cols = (width + 63) / 64, rows = (height + 63) / 64
+            let cw = chroma444 ? width : (width + 1) / 2, side = chroma444 ? 64 : 32
+            pictures[i].changed = (0..<cols * rows).map { s in
+                let (sx, sy) = (s % cols, s / cols)
+                let luma = (sy * 64..<min(height, sy * 64 + 64)).contains { r in
+                    a.y[r * width + sx * 64..<r * width + min(width, sx * 64 + 64)] != b.y[r * width + sx * 64..<r * width + min(width, sx * 64 + 64)]
+                }
+                let ch = a.u.count / cw
+                let chroma = (sy * side..<min(ch, sy * side + side)).contains { r in
+                    let x0 = r * cw + sx * side, x1 = r * cw + min(cw, sx * side + side)
+                    return a.u[x0..<x1] != b.u[x0..<x1] || a.v[x0..<x1] != b.v[x0..<x1]
+                }
+                return luma || chroma ? 1 : 0
+            }
+        }
+        func encode(inPlace: Bool) throws -> (bytes: [[UInt8]], copied: (whole: Int, inPlace: Int)) {
+            let encoder = try AV1HybridEncoder(device: device)
+            encoder.tiling = (1, 0)
+            encoder.interFrames = true
+            encoder.updatesSourcesInPlace = inPlace
+            let got = Collected()
+            encoder.startStream { i, r in
+                got.lock.withLock { got.frames.append((i, try? r.get())) }
+                got.ready.signal()
+            }
+            for (i, p) in pictures.enumerated() { encoder.submit(p, qindex: 100, forceKey: i == 13) }
+            encoder.endStream()
+            return (got.frames.sorted { $0.index < $1.index }.map { $0.frame?.obu ?? [] }, encoder.sourcesCopied)
+        }
+        let whole = try encode(inPlace: false), inPlace = try encode(inPlace: true)
+        #expect(whole.copied.inPlace == 0)
+        #expect(inPlace.copied.inPlace >= pictures.count / 2, "updated in place: \(inPlace.copied)")
+        #expect(inPlace.bytes.allSatisfy { !$0.isEmpty } && inPlace.bytes == whole.bytes,
+                "\(width)×\(height)\(chroma444 ? " 4:4:4" : ""): in place differs from whole")
+    }
+
     /// A key frame on demand mid-stream: the frame is a key frame at the key frames' qindex, the
     /// stream decodes exactly through it, its sequence header is the first key frame's (a
     /// Viewer gets that one only, with the stream's start), and the rate hook sees each picture
