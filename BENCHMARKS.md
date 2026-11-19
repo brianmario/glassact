@@ -440,6 +440,37 @@ What it says:
   registers or threadgroup memory), and `l_select`'s grid. Line-level costs still need Xcode
   (`av1seq --gpu-capture`).
 
+**Followed up the same day (not kept).** On an idle Mac (other processes on the GPU 0–2 % of the
+window), with the same run, each change kept the stream (`--digest`, photos, typing-cc and
+scroll-win at 5K, 40 inter frames):
+
+| Change | `k_me` ms a frame · stack | `l_select` ms a frame · stack |
+|---|---|---|
+| none (three runs) | 0.50–0.52 · 60 % | 0.24–0.26 · 66–72 % |
+| `k_me` without the sub-sample refinement (`--no-subpel`, a diagnosis: other bytes) | 0.39 · 2 % | |
+| `l_select`'s loops over the 16 pairs unrolled (`AV1G_UNROLL`) | | 0.26 · 66 % |
+| `k_me`'s refinement: every loop in a step unrolled | 0.50 · 60 % | |
+| `k_me`'s refinement a column at a time (its three rows' h as scalars, not `h[3][8]`) | 0.53 · **16 %** | |
+| `l_select` on 928 threads, every 64×64 kept in registers | | 0.33 · 27 %, L1 evictions 62 % |
+| `l_select` on 512 threads | | 0.26 · 76 % |
+
+- **The stack isn't what bounds `k_me`.** The sub-sample refinement is all of its stack traffic
+  (60 → 2 % without it) and about 0.13 ms of its 0.52. Taking its registers off the stack (16 %)
+  left the time where it was: L1 served the stack, and the integer unit (84 %) is the limit.
+  `k_me` gets faster only with fewer integer instructions, which is the window search's design
+  (2026-11-12).
+- **`l_select`'s time is its 40 dependent steps** (cdef_bits 3: 8 greedy and 32 refinement
+  steps), about 6 µs each. More threads give each step less work, but spill (928) or wait longer at
+  each step's barrier (512); 128 or 256 (2026-11-01) stay best.
+- **The AIR can't show the stack.** The offline compiler's AIR (`metal -S -emit-llvm`) keeps
+  these arrays as allocas, with `llvm.loop.unroll.full` still on the loops: unrolling and
+  promoting arrays to registers happen in the GPU compiler when the pipeline is built. The
+  counters are the only evidence of what ended up on the stack.
+- **Where GPU time counts.** The analysis (`k_me`, `k_analysis_*`) overlaps the CPU's closed
+  loop. The hybrid's thread, closed loop and filters, is what limits the frame rate (2026-10-31).
+  The filters here are 1.5–1.6 ms of GPU a frame (of 11.3), the analysis 4.3–4.9 ms beside it. So
+  GPU time in the filters is the kind most likely to show in frames a second.
+
 ### The AV1 kernels compiled with the app (2026-11-18)
 
 The Host compiled Glass Act's AV1 kernels from source when it started: the front end (MSL to
