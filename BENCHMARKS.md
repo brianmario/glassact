@@ -441,6 +441,15 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
   classify step 607 → 476 ms over 120 photos frames (−22 %, about 1.1 core-ms a frame). A/B
   against the four-row hashing, six rounds: photos +1.7 %, typing-cc −1.1 %, scroll-win +8.6 % (a
   noisy side): within noise. The same bytes. Kept as a byte-neutral speedup.
+- Tried, not kept: hashing the bands of columns row by row across the picture (four bands at a
+  time, the picture read along its rows instead of a 64-sample piece of every row a band at a
+  time). Time Profiler put the hashing at 619 → 194 ms, but every version was slower in frames a
+  second, the same bytes each time. As a second pass over the rows on every thread before the
+  votes: photos −2.7 %, typing-cc −2.8 %, scroll-win −2.5 %. In one pass, each thread its own bands
+  row by row: photos −4.0 %, typing-cc +1.8 %, scroll-win +1.0 %. The same with the threads'
+  buffers kept from call to call: photos −4.7 % (every run below the other side's), typing-cc
+  −0.1 %, scroll-win −1.2 %. Not understood: the copy decisions' wall time, which the next analysis
+  waits for, rather than their CPU time may be what counts here.
 - Not tried: reusing the previous picture's hashes (its "now" a frame before). Knowing that the
   picture passed is still the one hashed would take a check as costly as the hash.
 
