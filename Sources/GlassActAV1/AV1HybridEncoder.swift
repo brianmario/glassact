@@ -1294,8 +1294,14 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// key frame, becomes the first long-term picture (with `limit` > 1).
         private var keyPending = false
 
+        /// The last picture classified, whose row and column hashes the motion handle kept: the
+        /// next one's, when it's the picture before (`av1enc_motion_set_continues`). Held, so its
+        /// storage isn't another picture's while it's compared.
+        private var lastClassified: Picture?
+
         /// A stream starts (after its key frame every slot holds it; no GOLDEN_FRAME yet).
         func reset() {
+            lastClassified = nil
             longTerm = []
             lastSlot = 0
             sceneSlot = nil
@@ -1343,6 +1349,15 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                           refs: Refs(last: lastSlot, golden: g.map { $0.slot + 1 } ?? 0, refresh: 1 << lastSlot))
         }
 
+        /// Whether `a` and `b` are one picture: the same planes' storage (so the same samples).
+        private static func sameStorage(_ a: Picture, _ b: Picture) -> Bool {
+            func same(_ x: [UInt8], _ y: [UInt8]) -> Bool {
+                x.count == y.count && x.withUnsafeBufferPointer { px in y.withUnsafeBufferPointer { px.baseAddress == $0.baseAddress } }
+            }
+            return a.width == b.width && a.height == b.height && a.chroma444 == b.chroma444
+                && same(a.y, b.y) && same(a.u, b.u) && same(a.v, b.v)
+        }
+
         private func copies(of p: Picture, after prev: Picture, searchesMotion: Bool) -> Copies {
             guard prev.width == p.width, prev.height == p.height, prev.chroma444 == p.chroma444 else {
                 reset()  // (a key frame, which every slot then holds)
@@ -1352,6 +1367,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             // pictures are the stream's, so its format)
             av1enc_motion_set_chroma_444(motion, p.chroma444 ? 1 : 0)
             let tm = CACurrentMediaTime()
+            // (the hashes kept from the last picture classified are prev's when it's prev itself)
+            av1enc_motion_set_continues(motion, lastClassified.map { Self.sameStorage($0, prev) } == true ? 1 : 0)
+            lastClassified = p
             var keepsKey = -1
             if keyPending {
                 keyPending = false

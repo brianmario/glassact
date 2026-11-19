@@ -1617,6 +1617,16 @@ pub unsafe extern "C" fn av1enc_motion_set_chroma_444(m: *mut crate::motion::Mot
     unsafe { (*m).set_chroma_444(on != 0) };
 }
 
+/// av1enc_motion_set_continues: [`crate::motion::Motion::set_continues`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1enc_motion_set_continues(m: *mut crate::motion::Motion, on: c_int) {
+    if m.is_null() {
+        return;
+    }
+    // SAFETY: the handle
+    unsafe { (*m).set_continues(on != 0) };
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn av1enc_motion_classify(
     m: *mut crate::motion::Motion,

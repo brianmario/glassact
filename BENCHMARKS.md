@@ -297,6 +297,7 @@ the numbers and the reasoning.
 | After a video stream reset, live regions take only a sync frame; a frame before START without its config is a failed delivery | kept (correctness, no byte cost) | replay with 4 stream resets: 3 of 549 frames shown weren't the encoder's pictures → 0 | [entry](#video-frames-that-predict-from-lost-ones-after-a-stream-reset-2026-11-16) |
 | A lone new 5K picture, stage by stage and kernel by kernel (`--push lone`, `GA_TIMELINE`; Instruments' shader timeline, spill events and Time Profiler from `xctrace`) (`metal-av1`) | measured | 41 ms in series: GPU 14.9 (motion 4.1, analysis 10.2), closed loop 10.4, writer 7.8 (16 on photos: its slowest tile), set-up and copies 5.9, hand-offs 3.3; spills 0–1 KB a thread (the thread kernels most); occupancy, limiters and registers not obtainable from the command line (they are since 2026-11-18, with a saved template); with two pictures in flight (the Host) the rate is 2 / latency | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | Each kernel's GPU counters from the command line: a saved Instruments template (Performance Limiters, shader timeline) and `scripts/metal-trace` sharing each counter group's samples among the kernels that ran in them (`--kernel`, `--csv`) | measured (method) | 5K photos inter frames (a loaded Mac): `k_me` bound by its integer unit (84 %), 59 % of its L1 traffic the stack; the thread kernels 66–83 % stack with L1 evictions of 29–88 %; `l_select` at occupancy 8; the occupancy target follows occupancy and the last-level cache counts the CPU's traffic, so neither tells a kernel's bound | [entry](#metal-av1-each-kernels-gpu-counters-from-the-command-line-2026-11-18) |
+| The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -367,6 +368,45 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the copy finder keeps the last picture's hashes; #128 on the paced path (2026-11-19)
+
+**The copy finder keeps its hashes from picture to picture (kept).** Its shift search hashed every
+row (column) of each band with a changed 64x64, in both pictures. The picture before is the last
+picture it searched, so its hashes were made a picture ago. `ShiftFinder::candidates_next` now keeps
+the new picture's hashes, band by band, and the next search takes them as the picture before's.
+Within a band it hashes only the lines of the 64x64s that changed: the classify step's unchanged
+64x64s are exact copies, so their lines' hashes are the picture before's. Bands with no change keep
+their hashes, which stay right because the band didn't change.
+- The Swift copy finder says when it applies (`av1enc_motion_set_continues`): the picture before
+  is the last one classified, the same storage, which it holds so that the storage isn't reused.
+  After a key frame, a size change or a gap, everything is hashed again, as before.
+- GOLDEN_FRAME's search neither uses nor keeps them. A first build let it take the kept hashes as
+  the golden picture's. The copies changed (89.0 → 88.7 % on photos, a different digest); the
+  digest check caught it.
+- `kept_hashes_give_the_same_copies` runs sequences through a handle that keeps its hashes and
+  checks each picture's copies and candidates against a fresh handle's. It also checks the kept
+  hashes themselves against hashes made anew: the copies alone survive a few wrong hashes (a
+  deliberately corrupted cache still gave the same copies). It fails on a corrupted cache, on a
+  partial hash that reuses changed lines, and (by its count of reused bands) on the GOLDEN_FRAME
+  bug.
+- Time Profiler (120 frames, 5K): the shift search 1,620 → 1,286 ms on photos (−21 %, 2.8 core-ms
+  a frame), 59 → 29 ms on typing-cc. av1seq's "deciding them" on photos 4.78 → 4.32 ms.
+- A/B against `main`, six rounds (5K, 60 inter frames): photos **+3.5 %** (158.9 → 164.6 fps,
+  every run above the other side's best), typing-cc −2.4 %, scroll-win −0.8 %
+  (within the harness's ±2–3 %: their shift search was under 0.5 core-ms a frame). The streams
+  are the same (`--digest`).
+- What's left of the copy finder on typing-cc is the classify step: 5.1 core-ms a frame comparing
+  every 64x64 with the picture before, most of them unchanged.
+
+**#128 on the paced path.** `replay --mode loop --video hybrid-hevc`, 26.11.3 against `main` with
+#127 and #128, four rounds alternating: encode latency p50 photos 22.4 → 21.4 ms, scroll-win
+19.8 → 19.5 ms, typing-cc 36.5 → 37.0 ms; p95 within noise; the same video bytes on every run. photos starts on HEVC and moves up to AV1
+(one codec upgrade), so its figures mix the two. The
+paced path isn't bound by throughput, so a picture's latency gains less than av1seq's frames a
+second. typing-cc's region never reached AV1: it lasted 17 frames, all HEVC before the codec
+upgrade, so its ~36 ms is VideoToolbox's at 5K, not the hybrid's. The hybrid's paced latency is
+measured with `--video hybrid`.
 
 ### Metal AV1: what limits an inter stream's frame rate; three levers measured (2026-11-19)
 

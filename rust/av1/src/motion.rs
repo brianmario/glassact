@@ -182,6 +182,12 @@ fn cover_node(mi_rows: i32, mi_cols: i32, r: i32, c: i32, n: i32, t: &Block, out
 /// pictures, on up to `threads` threads.
 pub struct ShiftFinder {
     threads: usize,
+    /// [`ShiftFinder::candidates_next`]'s: the hashes of the last picture it was given as `cur`,
+    /// per band of columns (its row hashes) and per band of rows (its column hashes); empty where
+    /// they aren't known. A picture of another size than `cached_size` has none.
+    rows_cache: Vec<Vec<u64>>,
+    cols_cache: Vec<Vec<u64>>,
+    cached_size: (usize, usize),
 }
 
 impl Default for ShiftFinder {
@@ -207,6 +213,9 @@ impl ShiftFinder {
     pub fn new() -> ShiftFinder {
         ShiftFinder {
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
+            rows_cache: Vec::new(),
+            cols_cache: Vec::new(),
+            cached_size: (0, 0),
         }
     }
 
@@ -214,45 +223,129 @@ impl ShiftFinder {
     /// first, excluding no motion. Bands where `changed` (per 64x64, raster, `sb_cols` wide) is all
     /// zero are skipped.
     pub fn candidates(&mut self, cur: &Plane, prev: &Plane, changed: &[u8], sb_cols: usize, max: usize) -> Vec<Shift> {
+        self.search(cur, prev, changed, sb_cols, max, None)
+    }
+
+    /// [`ShiftFinder::candidates`] for the next picture of a sequence: the same shifts, from less
+    /// hashing. `changed` must be exact: a 64x64 marked 0 equals `prev`'s in every luma sample (as
+    /// [`Motion::classify`]'s unchanged ones do), so its lines' hashes are `prev`'s. With
+    /// `continues`, `prev` is the last picture given here as `cur` (or equals it), whose hashes
+    /// were kept: they're `prev`'s, and only the changed 64x64s' lines are hashed. `cur`'s are kept
+    /// for the next call (bands not searched are unchanged, so their kept hashes stay right).
+    pub fn candidates_next(
+        &mut self,
+        cur: &Plane,
+        prev: &Plane,
+        changed: &[u8],
+        sb_cols: usize,
+        max: usize,
+        continues: bool,
+    ) -> Vec<Shift> {
+        self.search(cur, prev, changed, sb_cols, max, Some(continues))
+    }
+
+    /// The kept hashes are no picture's: the next [`ShiftFinder::candidates_next`] hashes `prev`.
+    pub fn forget(&mut self) {
+        self.rows_cache.iter_mut().for_each(Vec::clear);
+        self.cols_cache.iter_mut().for_each(Vec::clear);
+    }
+
+    fn search(
+        &mut self,
+        cur: &Plane,
+        prev: &Plane,
+        changed: &[u8],
+        sb_cols: usize,
+        max: usize,
+        cache: Option<bool>,
+    ) -> Vec<Shift> {
         let (w, h) = (cur.width, cur.height);
         if prev.width != w || prev.height != h {
+            if cache.is_some() {
+                self.forget();
+            }
             return Vec::new();
         }
+        let (nv, nh) = (w.div_ceil(64), h.div_ceil(64));
+        if let Some(continues) = cache {
+            if !continues || self.cached_size != (w, h) {
+                self.forget();
+            }
+            self.cached_size = (w, h);
+            self.rows_cache.resize_with(nv, Vec::new);
+            self.cols_cache.resize_with(nh, Vec::new);
+        }
+        // (exact `changed`: an unchanged 64x64's lines are prev's)
+        let exact = cache.is_some();
         let sb_rows = changed.len() / sb_cols.max(1);
         let at = |r: usize, c: usize| changed.get(r * sb_cols + c).copied().unwrap_or(0) != 0;
-        // (vertical, band): bands of columns vote for vertical shifts, bands of rows horizontal ones
-        let mut bands: Vec<(bool, usize)> = (0..w.div_ceil(64))
+        // (vertical, band, its kept hashes: prev's or none): bands of columns vote for vertical
+        // shifts, bands of rows horizontal ones
+        let mut bands: Vec<(bool, usize, Vec<u64>)> = (0..nv)
             .filter(|&b| (0..sb_rows).any(|r| at(r, b)))
-            .map(|b| (true, b))
+            .map(|b| (true, b, if exact { std::mem::take(&mut self.rows_cache[b]) } else { Vec::new() }))
             .collect();
         bands.extend(
-            (0..h.div_ceil(64))
+            (0..nh)
                 .filter(|&b| (0..sb_cols).any(|c| at(b, c)))
-                .map(|b| (false, b)),
+                .map(|b| (false, b, if exact { std::mem::take(&mut self.cols_cache[b]) } else { Vec::new() })),
         );
         let per = bands.len().div_ceil(self.threads.max(1)).max(1);
-        let mut parts: Vec<_> = bands.chunks(per).map(|p| (p, Vec::<(Shift, u32)>::new())).collect();
+        let mut parts: Vec<_> = bands.chunks_mut(per).map(|p| (p, Vec::<(Shift, u32)>::new())).collect();
         crate::pool::each(&mut parts, |(part, out)| {
             let mut t = BandScratch::default();
-            for &(vertical, b) in part.iter() {
+            for (vertical, b, kept) in part.iter_mut() {
+                let (vertical, b) = (*vertical, *b);
+                let n = if vertical { h } else { w };
+                // prev's hashes: kept, or made
+                if kept.len() == n {
+                    std::mem::swap(&mut t.before, kept);
+                } else if vertical {
+                    row_hashes(prev, b * 64, w.min(b * 64 + 64), h, &mut t.before);
+                } else {
+                    t.col_hashes(prev, b * 64, h.min(b * 64 + 64), None);
+                    t.before.clear();
+                    t.before.extend(t.col_hash.iter().map(|&k| k as u64));
+                }
                 if vertical {
                     let (x0, x1) = (b * 64, w.min(b * 64 + 64));
-                    row_hashes(cur, x0, x1, h, &mut t.now);
-                    row_hashes(prev, x0, x1, h, &mut t.before);
+                    if exact {
+                        row_hashes_from(cur, x0, x1, h, &t.before, |j| !at(j, b), &mut t.now);
+                    } else {
+                        row_hashes(cur, x0, x1, h, &mut t.now);
+                    }
                     out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: 0, dy: s }, n)));
                 } else {
                     let (y0, y1) = (b * 64, h.min(b * 64 + 64));
-                    t.col_hashes(cur, y0, y1);
-                    t.now.clear();
-                    t.now.extend(t.col_hash.iter().map(|&k| k as u64));
-                    t.col_hashes(prev, y0, y1);
-                    t.before.clear();
-                    t.before.extend(t.col_hash.iter().map(|&k| k as u64));
+                    if exact {
+                        t.col_hashes(cur, y0, y1, Some(&|c| at(b, c)));
+                        t.now.clear();
+                        let (now, before, col) = (&mut t.now, &t.before, &t.col_hash);
+                        now.extend((0..w).map(|x| if at(b, x / 64) { col[x] as u64 } else { before[x] }));
+                    } else {
+                        t.col_hashes(cur, y0, y1, None);
+                        t.now.clear();
+                        t.now.extend(t.col_hash.iter().map(|&k| k as u64));
+                    }
                     out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: s, dy: 0 }, n)));
+                }
+                if exact {
+                    // cur's, for the next picture
+                    kept.clear();
+                    std::mem::swap(&mut t.now, kept);
                 }
             }
         });
         let mut found: Vec<(Shift, u32)> = parts.into_iter().flat_map(|(_, out)| out).collect();
+        if exact {
+            for (vertical, b, kept) in bands {
+                if vertical {
+                    self.rows_cache[b] = kept;
+                } else {
+                    self.cols_cache[b] = kept;
+                }
+            }
+        }
         // merge: total support per shift, best first
         found.sort_by_key(|&(s, _)| (s.dx, s.dy));
         let mut merged: Vec<(Shift, u32)> = Vec::new();
@@ -268,15 +361,40 @@ impl ShiftFinder {
 }
 
 impl BandScratch {
-    /// FNV-1a (32-bit) down each column of rows y0..y1, all columns at once (it vectorizes).
-    fn col_hashes(&mut self, y: &Plane, y0: usize, y1: usize) {
+    /// FNV-1a (32-bit) down each column of rows y0..y1, all columns at once (it vectorizes). With
+    /// `only`, just the columns of the 64-wide pieces it picks (the rest are left at the basis).
+    fn col_hashes(&mut self, y: &Plane, y0: usize, y1: usize, only: Option<&dyn Fn(usize) -> bool>) {
         let w = y.width;
         self.col_hash.clear();
         self.col_hash.resize(w, 0x811c_9dc5);
-        for row in y0..y1 {
-            let line = &y.data[row * y.stride..][..w];
-            for (k, &v) in self.col_hash.iter_mut().zip(line) {
-                *k = (*k ^ v as u32).wrapping_mul(0x0100_0193);
+        let Some(only) = only else {
+            for row in y0..y1 {
+                let line = &y.data[row * y.stride..][..w];
+                for (k, &v) in self.col_hash.iter_mut().zip(line) {
+                    *k = (*k ^ v as u32).wrapping_mul(0x0100_0193);
+                }
+            }
+            return;
+        };
+        // runs of picked pieces, each its rows in order (each column's hash as above)
+        let pieces = w.div_ceil(64);
+        let mut c = 0;
+        while c < pieces {
+            if !only(c) {
+                c += 1;
+                continue;
+            }
+            let start = c;
+            while c < pieces && only(c) {
+                c += 1;
+            }
+            let (x0, x1) = (start * 64, w.min(c * 64));
+            let ks = &mut self.col_hash[x0..x1];
+            for row in y0..y1 {
+                let line = &y.data[row * y.stride + x0..][..x1 - x0];
+                for (k, &v) in ks.iter_mut().zip(line) {
+                    *k = (*k ^ v as u32).wrapping_mul(0x0100_0193);
+                }
             }
         }
     }
@@ -396,6 +514,8 @@ pub struct Motion {
     /// the pictures' chroma subsampling: 1 (4:2:0, the default) or 0 (4:4:4:
     /// [`Motion::set_chroma_444`])
     ss: usize,
+    /// [`Motion::set_continues`]: the next classify's `prev` is the last one's `cur`
+    continues: bool,
 }
 
 impl Default for Motion {
@@ -418,7 +538,15 @@ impl Motion {
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(8),
             runs: Vec::new(),
             ss: 1,
+            continues: false,
         }
+    }
+
+    /// av1enc_motion_set_continues: the next classify's `prev` is the last classify's `cur` (or
+    /// equals it, every sample), so the copy finder's hashes of it, kept from then, are used
+    /// instead of made again. One classify's: each one after it is told again (off: hashed anew).
+    pub fn set_continues(&mut self, on: bool) {
+        self.continues = on;
     }
 
     /// av1enc_motion_set_chroma_444: the pictures [`Motion::classify`] and the rest compare are
@@ -581,8 +709,10 @@ impl Motion {
         self.sbs.clear();
         self.sbs.resize(sb_cols * sb_rows, SbMotion::default());
         self.candidates.clear();
+        let continues = std::mem::take(&mut self.continues);
         let same = cur[0].width == prev[0].width && cur[0].height == prev[0].height;
         if !same {
+            self.finder.forget();
             return 0;
         }
         // unchanged, rows of superblocks on several threads
@@ -596,6 +726,9 @@ impl Motion {
         });
         let changed: Vec<u8> = self.sbs.iter().map(|m| !m.copy as u8).collect();
         if changed.iter().all(|&c| c == 0) {
+            if !continues {
+                self.finder.forget(); // (what it kept isn't prev's, so isn't cur's)
+            }
             return self.sbs.len();
         }
         let usable = |s: &Shift| {
@@ -605,7 +738,7 @@ impl Motion {
         };
         let cands: Vec<Shift> = self
             .finder
-            .candidates(&cur[0], &prev[0], &changed, sb_cols, max_candidates)
+            .candidates_next(&cur[0], &prev[0], &changed, sb_cols, max_candidates, continues)
             .into_iter()
             .filter(usable)
             .collect();
@@ -857,13 +990,33 @@ impl Motion {
 fn row_hashes(p: &Plane, x0: usize, x1: usize, h: usize, out: &mut Vec<u64>) {
     out.clear();
     out.reserve(h);
+    push_row_hashes(p, x0, x1, 0, h, out);
+}
+
+/// [`row_hashes`], except the 64-row pieces j where `same(j)`: those lines' hashes are `from`'s
+/// (a picture's that equals `p` there).
+fn row_hashes_from(p: &Plane, x0: usize, x1: usize, h: usize, from: &[u64], same: impl Fn(usize) -> bool, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(h);
+    for j in 0..h.div_ceil(64) {
+        let (r0, r1) = (j * 64, h.min(j * 64 + 64));
+        if same(j) {
+            out.extend_from_slice(&from[r0..r1]);
+        } else {
+            push_row_hashes(p, x0, x1, r0, r1, out);
+        }
+    }
+}
+
+/// The hashes of rows r0..r1 of `p` (columns x0..x1), four at a time.
+fn push_row_hashes(p: &Plane, x0: usize, x1: usize, r0: usize, r1: usize, out: &mut Vec<u64>) {
     let row = |r: usize| &p.data[r * p.stride..][x0..x1];
-    let mut r = 0;
-    while r + 4 <= h {
+    let mut r = r0;
+    while r + 4 <= r1 {
         out.extend(hash4([row(r), row(r + 1), row(r + 2), row(r + 3)]));
         r += 4;
     }
-    out.extend((r..h).map(|r| hash(row(r))));
+    out.extend((r..r1).map(|r| hash(row(r))));
 }
 
 /// [`hash`] of four lines of one length, interleaved.
@@ -1176,6 +1329,88 @@ mod tests {
         assert!(!sb_matches(&y, &prev, 1, 2, 1, Shift { dx: 0, dy: 72 }));
         // the bottom superblocks read past the previous picture: no match
         assert!(!sb_matches(&y, &prev, 1, 2, 5, Shift { dx: 0, dy: 74 }));
+    }
+
+    /// A sequence classified with the hashes kept from picture to picture (`set_continues`) gives
+    /// each picture the copies and candidates of a handle that hashes both pictures anew: scrolls,
+    /// changed rectangles, unchanged pictures, pictures that don't continue, a change of size,
+    /// partial 64x64s at the edges.
+    #[test]
+    fn kept_hashes_give_the_same_copies() {
+        let mut s = 0x51u64;
+        let mut kept = Motion::new();
+        let mut last: Option<(usize, usize, Vec<u8>)> = None;
+        let (mut checked, mut reused) = (0, 0);
+        for (w, h) in [(333usize, 261usize), (256, 192), (333, 261)] {
+            let page: Vec<u8> = (0..w * (h + 400)).map(|_| (rng(&mut s) & 0xff) as u8).collect();
+            let mut top = 0usize;
+            let mut cur: Vec<u8> = page[..w * h].to_vec();
+            // an older state: half the page as it was, half new
+            let mut golden = page[37 * w..(37 + h) * w].to_vec();
+            golden[w * h / 2..].iter_mut().for_each(|v| *v = rng(&mut s) as u8);
+            for step in 0..40 {
+                let mut next = cur.clone();
+                match rng(&mut s) % 5 {
+                    0 => {} // unchanged
+                    1 => {
+                        // a scroll, part of the picture
+                        top = (top + 2 + (rng(&mut s) % 40) as usize * 2).min(400);
+                        let x1 = w.min(64 + (rng(&mut s) % w as u64) as usize);
+                        for r in 0..h {
+                            next[r * w..r * w + x1].copy_from_slice(&page[(top + r) * w..(top + r) * w + x1]);
+                        }
+                    }
+                    _ => {
+                        // rectangles of new samples
+                        for _ in 0..1 + rng(&mut s) % 4 {
+                            let (x0, y0) = ((rng(&mut s) % w as u64) as usize, (rng(&mut s) % h as u64) as usize);
+                            let (x1, y1) = (w.min(x0 + 1 + (rng(&mut s) % 90) as usize), h.min(y0 + 1 + (rng(&mut s) % 90) as usize));
+                            for r in y0..y1 {
+                                for c in x0..x1 {
+                                    next[r * w + c] = rng(&mut s) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+                fn p(d: &[u8], w: usize, h: usize) -> [Plane<'_>; 3] {
+                    let q = plane(d, w, h);
+                    [q, q, q]
+                }
+                // every 7th picture doesn't continue (another picture came between)
+                let continues = step % 7 != 3 && last.as_ref().is_some_and(|(lw, lh, l)| (*lw, *lh) == (w, h) && *l == cur);
+                kept.set_continues(continues);
+                // (with a GOLDEN_FRAME picture, whose search doesn't keep or use the hashes)
+                let goldens = [p(&golden, w, h)];
+                let n = kept.classify_multi(&p(&next, w, h), &p(&cur, w, h), &goldens, 1, 8);
+                let mut fresh = Motion::new();
+                let m = fresh.classify_multi(&p(&next, w, h), &p(&cur, w, h), &goldens, 1, 8);
+                assert_eq!((n, &kept.sbs, &kept.candidates), (m, &fresh.sbs, &fresh.candidates), "{w}x{h} step {step}");
+                checked += (n.0 < kept.sbs.len()) as usize;
+                // what it kept is the new picture's hashes, band by band (the copies are robust to
+                // a few wrong ones, so check them directly)
+                let q = plane(&next, w, h);
+                let mut want = Vec::new();
+                for (b, got) in kept.finder.rows_cache.iter().enumerate() {
+                    if !got.is_empty() {
+                        row_hashes(&q, b * 64, w.min(b * 64 + 64), h, &mut want);
+                        assert_eq!(got, &want, "{w}x{h} step {step} rows band {b}");
+                        reused += 1;
+                    }
+                }
+                let mut t = BandScratch::default();
+                for (b, got) in kept.finder.cols_cache.iter().enumerate() {
+                    if !got.is_empty() {
+                        t.col_hashes(&q, b * 64, h.min(b * 64 + 64), None);
+                        assert!(got.iter().zip(&t.col_hash).all(|(&g, &c)| g == c as u64) && got.len() == w, "{w}x{h} step {step} cols band {b}");
+                        reused += 1;
+                    }
+                }
+                last = Some((w, h, next.clone()));
+                cur = next;
+            }
+        }
+        assert!(checked > 40 && reused > 200, "{checked} pictures with changes, {reused} bands kept");
     }
 
     #[test]
