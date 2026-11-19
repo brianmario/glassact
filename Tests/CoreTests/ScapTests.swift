@@ -41,6 +41,34 @@ import GlassActTestSupport
         #expect(try Data(contentsOf: viaRaw) == Data(contentsOf: direct))
     }
 
+    /// Compressing holds a batch of frames, not the capture: memory doesn't grow with the frames
+    /// read (reads that were autoreleased and never drained once held a whole 5K capture, 86 GB,
+    /// until the Host was killed for memory).
+    @Test func compressingDoesNotHoldTheFramesItRead() throws {
+        let width = 1024, height = 1024, count = 64  // 256 MB of frames
+        let (raw, out) = (tempURL("mem"), tempURL("memout"))
+        defer { [raw, out].forEach { try? FileManager.default.removeItem(at: $0) } }
+        let writer = try ScapRawWriter(url: raw, width: width, height: height)
+        var rng = SplitMix64(seed: 81)
+        var frame = rng.bytes(width * height * 4)
+        for i in 0..<count {
+            frame[i] &+= 1
+            try frame.withUnsafeBytes { try writer.appendFrame(timestampUS: UInt64(i), dirtyRects: [], frame: $0, bytesPerRow: width * 4) }
+        }
+        func footprint() -> Int {
+            var info = task_vm_info_data_t()
+            var n = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let kr = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(n)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &n) }
+            }
+            return kr == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+        }
+        let before = footprint()
+        #expect(try ScapRaw.compress(raw: raw, to: out, threads: 2) == count)
+        let grew = footprint() - before
+        #expect(grew < 64 << 20, "footprint grew \(grew >> 20) MB compressing \((count * width * height * 4) >> 20) MB")
+    }
+
     /// `finish` leaves only the whole trace; a capture without a whole frame leaves nothing; both
     /// are found as leftovers until then.
     @Test func finishingLeavesOnlyAWholeTrace() throws {
