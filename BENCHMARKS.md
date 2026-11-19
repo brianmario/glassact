@@ -301,6 +301,7 @@ the numbers and the reasoning.
 | Padded sources updated in place: a pooled set gets only the 64x64s changed since the picture it holds (`updatesSourcesInPlace`) | kept | the same streams; lone latency typing-cc −7.9 %, scroll-win −15 %; fps +3–5 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
+| How many frames may wait for the hybrid at 60 fps (`av1seq --push-pending`) | measured; a third slot for the hybrid is the owner's call | full-change 5K (movie) paced at 60: 45 fps with 2 waiting, 59 with 3 (p50 +2–4 ms); maps and images-scroll unchanged at 59–60 | [entry](#metal-av1-keeping-up-with-60-fps-of-changes-at-5k-how-many-frames-may-wait-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -372,6 +373,50 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: keeping up with 60 fps of changes at 5K; how many frames may wait (2026-11-19)
+
+The goal is an encoder that keeps up with content changing at 60 fps or faster. The v3 reference
+traces were captured at about that rate: tabs 57.7 fps on average, maps 50.2, app-switch 49.8,
+images-scroll 49.3, window-open-close 46.1, ide 32.3, with 88–96 % of their frames under 20 ms
+apart. movie is 24 fps (no two frames under 20 ms apart). photos, scroll-win and typing-cc, the
+traces tuned on until now, are 8.5–20.5 fps.
+
+5K, 240 frames from frame 300 (frame 600 for some), `--changes`, this branch (#129 + #130):
+
+| trace | back to back | paced every 16.667 ms (2 waiting): delivered · p50 latency |
+|---|---|---|
+| tabs, app-switch, window-open-close, ide | 290–390 fps | 60 · 8–10.5 ms |
+| images-scroll | 137–143 fps | 59.9 fps · 18–19 ms |
+| maps | about 100 fps | 59.2 fps · 32–33 ms |
+| movie (every 64x64 new) | 59–61 fps | **45 fps** · 44 ms |
+
+UI content keeps up with room to spare. Full-change pictures (movie, played back to back: a
+stand-in for 60 fps video) are at the limit. Every movie picture takes `newPictureEffort`
+(qindex 87).
+
+**How many frames may wait** (`av1seq --push-pending`, new; the Host's engine allows 2,
+`videoMaxPendingFrames`). Paced at 60 fps, two rounds:
+
+| frames waiting | movie delivered · p50 · p95 | maps | images-scroll |
+|---|---|---|---|
+| 2 | 44.5–45.8 fps · 43–45 · 50–51 ms | 59.1–59.2 fps | 59.9–60.0 fps |
+| 3 | **58.5–58.9 fps** · 45–48 · 60–61 ms | 59.6–59.7 | 59.9 |
+| 4 | 58.7–58.8 fps · 47–58 · 74–78 ms | 59.6–59.7 | 59.9 |
+| 6 | 58.7–58.8 fps · 50–64 · 82–101 ms | 59.6 | 59.9 |
+
+- **Full-change pictures need a third slot.** With two, the stream API can't overlap enough
+  pictures. With three, movie gets 59 fps (the encoder's ceiling at 5K), its p50 latency up 2–4
+  ms and p95 about 10 ms. More slots add only latency.
+- **Content the encoder keeps up with doesn't use the third slot,** so its frames and latency
+  stay the same.
+- The streams are the same at every depth (`--digest`).
+- **The bench delays a picture where the Host skips one.** When two are waiting, the Host's
+  engine skips the frame and the newest wins. So the Host shows about 45 distinct frames a
+  second of 60 fps full-change 5K content today. That's inferred, not measured on the Host:
+  `replay` runs on virtual time and doesn't pace the encoder in real time.
+- **Not built:** a third slot for the hybrid (a per-encoder pending limit, HEVC staying at 2).
+  It changes DESIGN §4.6's submission rule, so it's the owner's call.
 
 ### Metal AV1: the Host's change map, padded sources updated in place, and paced pictures' clocks (2026-11-19)
 
