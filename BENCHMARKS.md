@@ -450,6 +450,14 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
   buffers kept from call to call: photos −4.7 % (every run below the other side's), typing-cc
   −0.1 %, scroll-win −1.2 %. Not understood: the copy decisions' wall time, which the next analysis
   waits for, rather than their CPU time may be what counts here.
+- **The closed loop's inter prediction skips the someUseIntra scan for blocks of 8x8 and up**
+  (`writer::walk::predict_inter_block`). For 4:2:0 chroma it checked every 4x4 position of the
+  block's 8x8-aligned area for an intra block. In a block of 8x8 and up that area is the block's
+  own, already marked inter, so it can't find one (debug builds still scan and assert it). A
+  copied 64x64 scanned 256 positions a chroma plane. Time Profiler (photos, 120 frames):
+  `predict_inter_block`'s own time 250 → 88 ms, the closed loop 24.9 → 23.0 core-ms a frame. A/B
+  against the step before, six rounds: photos +2.1 %, typing-cc +6.2 %, scroll-win +6.0 %. The
+  streams are the same.
 - **Together** (the prediction's row copies, the four-row hashes and the inline compare), against
   `main`, six rounds: photos +7.0 % (145.1 → 155.3 fps), typing-cc +0.6 %, scroll-win +1.4 %.
   The streams are the same.
