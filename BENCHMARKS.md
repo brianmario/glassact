@@ -392,7 +392,7 @@ within about ±3 %: a change under about 2 % doesn't show.
 - **The row copies:** Time Profiler (photos, 120 frames) puts `walk::predict_inter_block` at 706
   → 549 ms inclusive (−22 %), with the `memmove` under `predict_inter` gone (251 ms → none). That's
   about 1.3 core-ms a frame across the tile threads, which the A/B can't resolve. The stream is
-  the same. Kept as an option for the owner (a byte-neutral speedup).
+  the same. Kept (a byte-neutral speedup; PR #128).
 
 **Where the frame goes** (`GA_TIMELINE`, 80 inter frames, photos at 5K). A picture's period is
 its closed loop on the CPU (3.5–3.6 ms, under the timeline's logging) and then its filters
@@ -453,7 +453,9 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
 - **The closed loop's inter prediction skips the someUseIntra scan for blocks of 8x8 and up**
   (`writer::walk::predict_inter_block`). For 4:2:0 chroma it checked every 4x4 position of the
   block's 8x8-aligned area for an intra block. In a block of 8x8 and up that area is the block's
-  own, already marked inter, so it can't find one (debug builds still scan and assert it). A
+  own, already marked inter, so it can't find one (debug builds still scan and assert it). The
+  walk is the decoder's too (`Rec::Parse` with `decode`): our own AV1 decoder in the Viewer skips
+  the scan as well, and its gate tests pass. A
   copied 64x64 scanned 256 positions a chroma plane. Time Profiler (photos, 120 frames):
   `predict_inter_block`'s own time 250 → 88 ms, the closed loop 24.9 → 23.0 core-ms a frame. A/B
   against the step before, six rounds: photos +2.1 %, typing-cc +6.2 %, scroll-win +6.0 %. The
@@ -462,7 +464,8 @@ now hashes four rows at once, interleaved (`hash4`), with the same values (a tes
   `main`, six rounds: photos +7.0 % (145.1 → 155.3 fps), typing-cc +0.6 %, scroll-win +1.4 %.
   The streams are the same.
 - **All four together** (the row copies, the four-row hashes, the inline compare and the skipped
-  scan), against `main`, eight rounds: photos **+7.3 %** (146.1 → 156.7 fps), typing-cc **+5.8 %**
+  scan), against `main`, eight rounds (the figures to go by: each step's own A/B above is within
+  the harness's noise, and on scroll-win one step's exceeds this total): photos **+7.3 %** (146.1 → 156.7 fps), typing-cc **+5.8 %**
   (278.0 → 294.0), scroll-win **+2.8 %** (266.9 → 274.2). The streams are the same.
 - **At 2560 wide** (`--tiles 2x0`), the whole branch against `main`: with 60 frames (runs under
   0.2 s) −0.3 / −1.3 / +2.6 % (photos / typing-cc / scroll-win), within noise; with 300 frames,
@@ -500,7 +503,7 @@ union of the motion search's, analysis's and filters' command buffers over the s
 | `GA_IDLE` 16,16 | four rounds +2.3 / +4.9 / −1.2 %; eight rounds +0.5 / +2.4 / +1.1 %. The whole run's CPU (user + sys, 120 frames, three runs each, mostly the bench's own work) 13.71 against 13.79 s on photos, 9.22 against 9.20 on typing-cc: no clear gain, the default kept |
 | `GA_IDLE` 256,320 | four rounds: −2.0 / +1.1 / +0.3 % |
 
-The full `swift test` passed on the branch with the row copies (685 tests in 10 runs).
+The full `swift test` passed on the branch's final commit (685 tests in 10 runs), and the Rust crate's tests in release and debug (in debug the someUseIntra assert below checked 452,760 blocks).
 
 **What could move the frame rate, none built:**
 - Ordering the next pictures' GPU work into the GPU's idle time during the closed loop, away from
