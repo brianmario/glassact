@@ -225,11 +225,8 @@ impl ShiftFinder {
             for &(vertical, b) in part.iter() {
                 if vertical {
                     let (x0, x1) = (b * 64, w.min(b * 64 + 64));
-                    t.now.clear();
-                    t.now.extend((0..h).map(|r| hash(&cur.data[r * cur.stride..][x0..x1])));
-                    t.before.clear();
-                    t.before
-                        .extend((0..h).map(|r| hash(&prev.data[r * prev.stride..][x0..x1])));
+                    row_hashes(cur, x0, x1, h, &mut t.now);
+                    row_hashes(prev, x0, x1, h, &mut t.before);
                     out.extend(t.vote().into_iter().map(|(s, n)| (Shift { dx: 0, dy: s }, n)));
                 } else {
                     let (y0, y1) = (b * 64, h.min(b * 64 + 64));
@@ -843,6 +840,43 @@ impl Motion {
 }
 
 #[inline]
+/// [`hash`] of samples x0..x1 of each of rows 0..h, into `out`: four rows at a time
+/// ([`hash4`]), so that their chains of multiplies overlap. The same values as a row at a time.
+fn row_hashes(p: &Plane, x0: usize, x1: usize, h: usize, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(h);
+    let row = |r: usize| &p.data[r * p.stride..][x0..x1];
+    let mut r = 0;
+    while r + 4 <= h {
+        out.extend(hash4([row(r), row(r + 1), row(r + 2), row(r + 3)]));
+        r += 4;
+    }
+    out.extend((r..h).map(|r| hash(row(r))));
+}
+
+/// [`hash`] of four lines of one length, interleaved.
+#[inline(always)]
+fn hash4(b: [&[u8]; 4]) -> [u64; 4] {
+    let n = b[0].len();
+    debug_assert!(b.iter().all(|l| l.len() == n));
+    let mut k = [0x9e37_79b9_7f4a_7c15u64 ^ n as u64; 4];
+    let full = n / 8 * 8;
+    let mut c = 0;
+    while c < full {
+        for i in 0..4 {
+            let v = u64::from_le_bytes(b[i][c..c + 8].try_into().unwrap());
+            k[i] = (k[i] ^ v).wrapping_mul(0xff51_afd7_ed55_8ccd).rotate_left(29);
+        }
+        c += 8;
+    }
+    for (k, line) in k.iter_mut().zip(b) {
+        for &v in &line[full..] {
+            *k = (*k ^ v as u64).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        }
+    }
+    k.map(|k| k ^ (k >> 32))
+}
+
 fn hash(b: &[u8]) -> u64 {
     let mut k = 0x9e37_79b9_7f4a_7c15u64 ^ b.len() as u64;
     let (chunks, rest) = b.as_chunks::<8>();
@@ -866,6 +900,24 @@ mod tests {
         *s ^= *s >> 7;
         *s ^= *s << 17;
         *s
+    }
+
+    /// Four rows' hashes at once are each row's alone, at every length (whole 8-byte chunks and
+    /// a remainder).
+    #[test]
+    fn row_hashes_are_each_rows_hash() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for n in 0..80usize {
+            let (stride, h) = (n + 3, 1 + (rng(&mut s) % 11) as usize);
+            let data: Vec<u8> = (0..stride * h + 8).map(|_| rng(&mut s) as u8).collect();
+            let p = Plane { data: &data, stride, width: n + 1, height: h };
+            let x0 = (rng(&mut s) % 3) as usize;
+            let x1 = x0 + n.min(stride - x0);
+            let mut got = Vec::new();
+            row_hashes(&p, x0, x1, h, &mut got);
+            let want: Vec<u64> = (0..h).map(|r| hash(&data[r * stride..][x0..x1])).collect();
+            assert_eq!(got, want, "n {n} h {h}");
+        }
     }
 
     /// The table's vote equals the sorted one: lines shifted by several offsets, repeated lines
