@@ -493,6 +493,9 @@ union of the motion search's, analysis's and filters' command buffers over the s
 | a command buffer committed on the filters' queue as the closed loop starts, waiting on an event the CPU signals as it ends, the filters behind it (to have the GPU's next work queued) | worse: typing-cc's start latency 86 → 436 µs, its period 2.70 → 3.21 ms; scroll-win's 446 → 384 µs, period 3.00 → 3.28 ms. A GPU-side wait on a CPU signal resumes slower than a fresh commit starts |
 | a trivial command buffer (a 16-byte blit fill) committed on the filters' queue 0.3, 0.6 or 1.0 ms before the closed loop's end (timed from the last closed loop's), to have the GPU awake | scroll-win's start latency 136 µs without, 111 / 146 / 114 µs with; typing-cc 84 µs without, 78–83 with; periods within 0.2 ms either way: no effect |
 | the shift search's buffers kept from call to call (the table and lines not made anew each call) | A/B −0.8 / +0.5 / −3.0 %: no gain |
+| the closed loop's workers' idle policy (`GA_IDLE=spin,yield`, the 2026-11-12 entry's open item), against the default 64,96, same build: 64,64 (park after the spins) | four rounds: +0.3 / +1.5 / −0.8 % |
+| `GA_IDLE` 16,16 | four rounds +2.3 / +4.9 / −1.2 %; eight rounds +0.5 / +2.4 / +1.1 %. The whole run's CPU (user + sys, 120 frames, three runs each, mostly the bench's own work) 13.71 against 13.79 s on photos, 9.22 against 9.20 on typing-cc: no clear gain, the default kept |
+| `GA_IDLE` 256,320 | four rounds: −2.0 / +1.1 / +0.3 % |
 
 The full `swift test` passed on the branch with the row copies (685 tests in 10 runs).
 
