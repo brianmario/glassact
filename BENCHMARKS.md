@@ -299,6 +299,7 @@ the numbers and the reasoning.
 | Each kernel's GPU counters from the command line: a saved Instruments template (Performance Limiters, shader timeline) and `scripts/metal-trace` sharing each counter group's samples among the kernels that ran in them (`--kernel`, `--csv`) | measured (method) | 5K photos inter frames (a loaded Mac): `k_me` bound by its integer unit (84 %), 59 % of its L1 traffic the stack; the thread kernels 66–83 % stack with L1 evictions of 29–88 %; `l_select` at occupancy 8; the occupancy target follows occupancy and the last-level cache counts the CPU's traffic, so neither tells a kernel's bound | [entry](#metal-av1-each-kernels-gpu-counters-from-the-command-line-2026-11-18) |
 | The Host's change map (the region's own tile diff, per 64x64, OR-ed until a frame is passed) to the encoder's copy finder, which compares only what's marked (`encode(…changed:)`, `Picture.changed`) | kept | the same streams; av1seq typing-cc +13.4 %, scroll-win +12.4 % fps; a lone picture's latency −22 % / −21 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Padded sources updated in place: a pooled set gets only the 64x64s changed since the picture it holds (`updatesSourcesInPlace`) | kept | the same streams; lone latency typing-cc −7.9 %, scroll-win −15 %; fps +3–5 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
+| Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured; the owner's call | paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core; the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
@@ -449,13 +450,45 @@ the screen changes, not back to back, and `replay`'s encode latency was 13 ms on
     ms. The closed loop goes back to 1.2–1.5 ms; the GPU stages stay slow.
   - A 4 MB blit every 2 or 5 ms doesn't raise the GPU's state.
   - Four spinning threads are no better than one.
-- **Not tried:**
-  - Raising the Rust pool's QoS to user-interactive (`pthread_set_qos_class_self_np`) changed
-    nothing measurable (closed loop 5.28 → 4.73 ms, one run each), and was reverted.
-  - `AudioWorkIntervalCreate`, the public way to tell the performance controller about deadline
-    work, is for real-time audio threads (and unavailable from Swift).
+- **Tried, not kept:** raising the Rust pool's QoS to user-interactive
+  (`pthread_set_qos_class_self_np`) changed nothing measurable (closed loop 5.28 → 4.73 ms, one
+  run each). Reverted.
+- **Not tried:** `AudioWorkIntervalCreate`, the public way to tell the performance controller
+  about deadline work. It's for real-time audio threads (and unavailable from Swift).
 - **Keeping the CPU's clocks up costs power** (a core spinning while video is live). That's for an
   opt-in setting if at all, the owner's call. Power is unmeasured (`powermetrics` needs root).
+
+**The branch on the paced path.** `replay --mode loop`, `main` before #129 against this branch
+(#129's hash cache, the change map, sources in place), four rounds alternating:
+
+| p50 encode latency | `--video hybrid` | `--video hybrid-hevc` |
+|---|---|---|
+| photos | 20.2 → 19.8 ms | 21.3 → 21.4 ms |
+| scroll-win | 13.3 → 12.9 ms | 19.1 → 18.2 ms |
+| typing-cc | 8.8 → 7.5 ms (17 frames) | 37.2 → 38.0 ms (HEVC: never upgraded) |
+
+- The video bytes are the same on every trace, mode and run.
+- A replay built with the Rust crate's debug assertions on (`CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true scripts/build-rust`) checked every
+  64x64 the engine marked unchanged, 1,822 maps over the three traces in both modes. None failed.
+- The paced gains are smaller than av1seq's: the clocks above, not the work, decide most of a
+  paced picture's latency.
+
+**Holding an analysis's commits while the filters run (tried, not kept).**
+- The experiment (`GA_HOLD_FOR_FILTERS`) waited up to 5 ms before committing the motion search's
+  and the analysis's command buffers while the filters' were on the GPU.
+- A/B, six rounds: photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %, the same streams.
+- `GA_TIMELINE` shows why: on photos other GPU work still overlapped 62 % of the filters' GPU
+  time (59 → 54 of 149 command buffers). It's committed before the filters start (the motion
+  searches of the pictures after), and Metal has no queue priority to put the filters first.
+- Reverted.
+
+**What else a mostly-unchanged picture costs** (Time Profiler, typing-cc, 120 frames, before the
+change map): the closed loop's `predict_inter` 439 ms (3.7 core-ms a frame), copying every
+copied 64x64 from LAST_FRAME into the new reconstruction.
+- Skipping the 64x64s whose destination already holds that content would need the
+  reconstruction buffers' history, as the padded sources now have. The filters change samples
+  near a changed neighbour's edges, so it isn't exact without the filters' own map.
+- Not built.
 
 ### Metal AV1: the copy finder keeps the last picture's hashes; #128 on the paced path (2026-11-19)
 

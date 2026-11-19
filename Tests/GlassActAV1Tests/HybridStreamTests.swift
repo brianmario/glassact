@@ -77,9 +77,27 @@ struct HybridStreamTests {
         var pictures = Self.pictures(10, width: width, height: height, seed: 0x9a1)
             + Self.screensInTurn(8, width: width, height: height, salt: 1, seed: 0x9a2)
         if chroma444 {
-            pictures = (0..<12).map { i in
-                var p = Hybrid444Tests.picture(width: width, height: height, seed: 0x9a3 + UInt64(i % 3), repeats: true)
-                if i % 4 == 1 { p.y[(i * 977) % p.y.count] ^= 0x40 }
+            // one screen, a band of rows edited in every plane each picture, and a scroll
+            let base = Hybrid444Tests.picture(width: width, height: height, seed: 0x9a3, repeats: true)
+            var p = base
+            pictures = (0..<14).map { i in
+                let top = (i * 37) % (height - 20)
+                for r in top..<top + 12 {
+                    for x in 0..<width / 3 {
+                        let k = r * width + (x + i * 29) % width
+                        p.y[k] = UInt8(truncatingIfNeeded: k &* 31 &+ i)
+                        p.u[k] = UInt8(truncatingIfNeeded: k &* 7 &+ i)
+                        p.v[k] = UInt8(truncatingIfNeeded: k &* 13 &+ i)
+                    }
+                }
+                if i == 9 {  // the whole screen up by 64 rows
+                    for plane in 0..<3 {
+                        let src = plane == 0 ? p.y : plane == 1 ? p.u : p.v
+                        let cut = 64 * width
+                        let moved: [UInt8] = Array(src[cut...]) + Array(src[..<cut])
+                        if plane == 0 { p.y = moved } else if plane == 1 { p.u = moved } else { p.v = moved }
+                    }
+                }
                 return p
             }
         }
