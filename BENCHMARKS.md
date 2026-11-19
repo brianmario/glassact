@@ -300,7 +300,7 @@ the numbers and the reasoning.
 | The Host's change map (the region's own tile diff, per 64x64, OR-ed until a frame is passed) to the encoder's copy finder, which compares only what's marked (`encode(…changed:)`, `Picture.changed`) | kept | the same streams; av1seq typing-cc +13.4 %, scroll-win +12.4 % fps; a lone picture's latency −22 % / −21 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Padded sources updated in place: a pooled set gets only the 64x64s changed since the picture it holds (`updatesSourcesInPlace`) | kept | the same streams; lone latency typing-cc −7.9 %, scroll-win −15 %; fps +3–5 % | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
-| Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured; the owner's call | paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core; the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
+| Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
@@ -455,8 +455,33 @@ the screen changes, not back to back, and `replay`'s encode latency was 13 ms on
   run each). Reverted.
 - **Not tried:** `AudioWorkIntervalCreate`, the public way to tell the performance controller
   about deadline work. It's for real-time audio threads (and unavailable from Swift).
-- **Keeping the CPU's clocks up costs power** (a core spinning while video is live). That's for an
-  opt-in setting if at all, the owner's call. Power is unmeasured (`powermetrics` needs root).
+- **The Host isn't the bench, for the CPU.** In `replay --video hybrid` (the engine's work on the
+  same queue between pictures) scroll-win's closed loop takes 1.73 ms, close to back to back's
+  1.14, against 4.25 in `av1seq --push every=33`. Its GPU stages stay slow (motion 1.51,
+  analysis 2.82, filters 1.46 ms, though not the same pictures). So the spinning core is av1seq's
+  upper bound; for the Host the GPU's state is the term that matters, and nothing here raised it.
+  How a live Host behaves is unmeasured.
+- **Kernel by kernel** (`scripts/metal-trace` on the two typing-cc recordings, ms a frame,
+  back to back → paced), the slowdown isn't uniform:
+  - The wide analysis kernels take the same time: `k_analysis_small_16x8` 0.196 → 0.184, `_4x4`
+    0.112 → 0.116.
+  - The narrow, latency-bound ones slow 2–4×: `l_select` 0.264 → 0.954 (occupancy 5), `k_me`
+    0.030 → 0.111, `k_leaf_small` 0.071 → 0.151, `k_analysis_4x4_w4` 0.042 → 0.101.
+  - `l_select` is a chain of about 40 dependent steps (2026-11-18 below), so a slow clock
+    stretches every step. Paced, it's most of the filters' GPU time on typing-cc (1.59 ms median).
+  - A shorter chain, or the search over only the 64x64s that changed, is the paced path's next GPU
+    lever. It must keep the same presets.
+- **Keeping the CPU's clocks up costs power** (a core spinning while video is live). For an opt-in
+  setting at most, and only after a live Host shows it helps: the owner's call. Power is
+  unmeasured (`powermetrics` needs root).
+- **The filters on the CPU for small regions: sized, not built.**
+  - Paced typing-cc's filters take 2.67 ms of wall time of a 13.6 ms picture: 1.88 ms of GPU,
+    0.43 ms waiting for the GPU to start, 0.37 ms encoding and waking. They filter 5 % of the
+    64x64s.
+  - On the CPU that's about 8 core-ms by the 2026-10 estimate of a whole picture's 150–175. Under
+    a millisecond on 14 cores at full clock, so the saving is about 1 ms at best.
+  - Whether the CPU's search (`av1enc_cdef_select_cpu`, `hybrid::pf444`'s rule) would choose what
+    the GPU's 4:2:0 search does, for the same bytes, is unknown.
 
 **The branch on the paced path.** `replay --mode loop`, `main` before #129 against this branch
 (#129's hash cache, the change map, sources in place), four rounds alternating:
