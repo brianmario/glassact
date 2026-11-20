@@ -11,6 +11,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import QuartzCore
 import GlassActCore
 import GlassActWire
 import VideoToolbox
@@ -43,12 +44,16 @@ enum VTDecodeCheck {
             lines.append("  Viewer path: the session wasn't created (start failed)")
         } else {
             var failed: [Int] = []
-            for (i, f) in frames.enumerated() where !viewer.decode(f.obu, sync: f.key, onPixels: { _, _ in }) {
-                failed.append(i)
+            var interSeconds = 0.0, inter = 0
+            for (i, f) in frames.enumerated() {
+                let t0 = CACurrentMediaTime()
+                if !viewer.decode(f.obu, sync: f.key, onPixels: { _, _ in }) { failed.append(i) }
+                if !f.key { interSeconds += CACurrentMediaTime() - t0; inter += 1 }
             }
             viewer.stop()
             if failed.isEmpty {
-                lines.append("  Viewer path: all \(frames.count) frames decoded")
+                lines.append(String(format: "  Viewer path: all %d frames decoded · inter frames %.2f ms a frame (decode, BGRA at %d×%d)",
+                                    frames.count, interSeconds / Double(max(1, inter)) * 1000, width, height))
             } else {
                 let firstFail = failed[0]
                 lines.append("  Viewer path: \(failed.count) of \(frames.count) frames failed; the first is frame \(firstFail) "

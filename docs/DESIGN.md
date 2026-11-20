@@ -361,7 +361,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
 | 7 | videoAV1GlassAct | AV1 from Glass Act's encoder (codec 3, §4.6): a Viewer advertises it when its user opts in and it decodes the hybrid's streams (VideoToolbox, or Glass Act's decoder, which takes only that toolset); a Host, when its AV1 is Glass Act's. Such a Host sends AV1 to a Viewer with bit 1 or 7; a libaom Host only with bit 1. (Bit 7 was `videoOverlay` before wire version 4, which no peer of this one ever sent) |
-| 8 | videoReducedFrames | reduced AV1 frames (§4.6): coded smaller than the region, the region their render size. A Viewer advertises it when its AV1 decoder shows them at the region's size (VideoToolbox asked for that size, or Glass Act's decoder); a Host whose AV1 is Glass Act's, which codes them only to a Viewer with the bit. Released Viewers fail on such a frame |
+| 8 | videoReducedFrames | reduced AV1 frames (§4.6): coded smaller than the region, the region their render size. A Viewer advertises it when its AV1 decoder is VideoToolbox's, which scales them as it decodes (Glass Act's decoder shows them too, scaled with vImage, but that costs more than the half-size decode saves); a Host whose AV1 is Glass Act's, which codes them only to a Viewer with the bit. Released Viewers fail on such a frame |
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
 | 11 | agentControl | TEXT_INPUT, AGENT_STATE, UI_TREE*, agent-flagged INPUT |
@@ -631,8 +631,10 @@ first negotiated codec whose encoder starts; START carries its id.
   scaled up to fill it), as AV1 reduced frames (`frame_size_override_flag`,
   the region as the render size). The Viewer shows them scaled up: its
   VideoToolbox session asks for the region's size (it otherwise outputs a
-  reduced frame at its coded size, and the size check drops it), and Glass
-  Act's decoder scales them with vImage's Lanczos; the two score the same.
+  reduced frame at its coded size, and the size check drops it), which
+  scores as vImage's Lanczos and costs nothing. Only such a Viewer offers
+  the bit: Glass Act's decoder shows reduced frames too, but its Lanczos on
+  the BGRA (22 ms a 5K frame) costs more than the half-size decode saves.
   - A run: from the fourth inter frame in a row coding more than half its
     64×64s (a switch of screens is one, or three at worst).
   - The margin: the half-size round trip (Lanczos down and up, 8 bands of

@@ -303,7 +303,7 @@ the numbers and the reasoning.
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
-| Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting: 36 → 56 frames a second shown, p50 latency 67 → 29 ms; at the same bytes +1.5–1.7 dB (Lanczos up, RGB PSNR at 5K); a movie at its own resolution, photos and maps lose 1–6 dB at half size and stay full size (the margin gate), movie 57 → 56 | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`, VideoToolbox Viewers only) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | VideoToolbox decoding a reduced AV1 frame | it outputs the coded size unless asked for one | the Viewer's session asks for the region's size (`VTRegionDecoder`); its scaling scores as vImage's Lanczos 3 (35.33 / 35.48 dB at half size, 38.26 / 38.15 at 3/4); the 2026-11-02 finding (scaled up) was ffmpeg's | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | No intra search on inter frames where the inter block's J is under c × step² a pixel (in mostly-new pictures) | rejected | video 5K q36: c 0.02 −2.2 ms of GPU analysis for +0.6 % bytes, −0.08 dB; the movie +4.2 % and −0.2 dB at c 0.004 already; with no intra anywhere inter exists, 15 ms (64 a second) but +17 % / −1.25 dB on video, +25 % on the movie | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | AV1 superres (half width, the decoder upscales) for video | rejected (libaom bound) | loses to half-size reduced frames at every rate on the 60 fps video: at ~850 KB 35.0 against 35.9 dB, at ~530 KB 32.4 against 33.2; full 5K 34.3 at 870 KB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
@@ -424,19 +424,37 @@ load 2–8):
 - **Measuring it on the engine's queue every picture of a run cost 14 ms a tick**, and took
   the movie from 58 to 51 frames a second while it measured; the bands, the period and the
   queue fixed that.
-- **`pace`** (new `--reduced`), 180 frames at 60 fps, 3 waiting, one run each (load 6–8,
-  provisional):
+- **`pace`** (new `--reduced`; it now prints the controller's qindex), 180 frames at 60 fps, 3
+  waiting. First, before the ceiling below and without #133 (load 6–8): the video 36.3 → 56.3
+  frames a second, p50 67 → 29 ms, but at 187 → 74 KB a frame: **both sat on the controller's
+  ceiling, qindex 168**, so half size at the same qindex, about 3.5 dB softer at 5K. The
+  equal-bytes gain needs the ceiling lowered at half size: **48 finer** (`reducedCeilingOffset`,
+  qindex 120), which the curves above put at about the same bytes for ~1 dB more.
+- With it, and with #133 (two rounds each, alternated; load 8–12, provisional):
 
-| | delivered of 60 | p50 / p95 latency | KB a frame | engine tick |
+| | delivered of 60 | p50 / p95 latency | KB a frame | qindex (mean) |
 |---|---|---|---|---|
-| video | 36.3 | 66.5 / 85.3 ms | 186.9 | 11.0 ms |
-| video, `--reduced` | **56.3** | **28.7 / 47.9** | 74.3 | 8.8 |
-| movie | 57.0 | 36.8 / 49.1 | 45.7 | 5.1 |
-| movie, `--reduced` (stays full size) | 55.7 | 38.3 / 46.3 | 45.7 | 5.1 |
+| video | 39.0 / 40.3 | 53.8 / 53.3 · 74.7 / 69.1 ms | 182.8 / 179.0 | 168 |
+| video, `--reduced` | **57.0 / 54.3** | **37.5 / 38.8** · 44.6 / 58.2 | 164.8 / 168.4 | 122 |
+| movie | 53.0 / 57.7 | 39.3 / 36.8 · 58.3 / 42.7 | 45.5 / 45.7 | 168 |
+| movie, `--reduced` (stays full size) | 52.7 / 54.7 | 40.4 / 38.0 · 51.5 / 55.6 | 46.0 / 45.4 | 168 |
+| the video's hitch (240 frames from 700) | 47.7 | 40.3 · 67.8 | 66.9 | 117 |
+| hitch, `--reduced` | 53.0 | 37.7 · 64.9 | 73.3 | 94 |
 
-  The video went to half size after 8 pictures and stayed (161 of 169). Its bytes are the rate
-  controller's at its target: what quality it gives at the Host's rates is the table above at
-  equal bytes, not measured live.
+  The video went to half size after 8 pictures and stayed (155–163 of 163–171), and through the
+  hitch it switched once. Tabs and maps (an earlier build): the same frames, bytes and latency,
+  never reduced.
+- **Quality at those operating points** (`av1seq`, 31 frames, scored at 5K, VideoToolbox's
+  scaling for the half size): full 5K at qindex 168 106.0 KB an inter frame, PSNR 33.20, SSIM
+  0.9227, SSIMULACRA2 30.0 (min 23.3); half size at qindex 120 102.7 KB, PSNR 34.36 (vImage's
+  Lanczos 34.36 too), SSIM 0.9435, SSIMULACRA2 40.3 (min 37.0); 58 → 99 inter frames a second
+  back to back.
+- **The Viewer's decode** (`av1seq --own-decode`, new, and `--vt-decode`'s Viewer path, now
+  timed), an inter frame at 5K: VideoToolbox 10.1 ms at full size, 8.75 reduced (its scaling
+  is free); Glass Act's decoder 19.3 + 0.7 ms at full size, 7.6 + 21.8 reduced (vImage's
+  Lanczos on the 5K BGRA). So only a Viewer decoding with VideoToolbox offers the bit; Glass
+  Act's decoder still shows reduced frames, but would lose frames to them. (A cheaper scaler
+  there, on the planes before the conversion or on the GPU, is the way to offer it too.)
 
 **Rejected.**
 - **No intra search where inter is good enough** (an experiment switch, reverted): skip the

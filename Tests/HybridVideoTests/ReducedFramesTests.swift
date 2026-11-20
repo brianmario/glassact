@@ -13,18 +13,13 @@ import Testing
 /// goes to half size after its run's fourth, with a key frame, and back to its own size with a key
 /// frame once a picture copies most of itself; both of a Viewer's AV1 decoders show every frame
 /// at the region's size, under the region's first av1C config. Without the Viewer's bit,
-/// the same pictures stay at the region's size.
-@Suite(.serialized, .enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (not a VM's paravirtual one)"))
-struct ReducedFramesTests {
-    final class Engine: @unchecked Sendable {
-        let queue = DispatchQueue(label: "test.engine")
-        let delivered = DispatchSemaphore(value: 0)
-        var frames: [(data: [UInt8], sync: Bool, config: [UInt8]?)] = []
-    }
+/// the same pictures stay at the region's size. (In `HybridRegionEncoderTests`' serialized suite:
+/// the process has one hybrid encoder, which a region started elsewhere would take over.)
+extension HybridRegionEncoderTests {
 
     /// A soft picture: a random field of 8×8 cells, bilinear between their centres (no detail a
     /// half-size picture loses), new each seed.
-    static func soft(width: Int, height: Int, seed: UInt64) -> [UInt8] {
+    static func softPicture(width: Int, height: Int, seed: UInt64) -> [UInt8] {
         var rng = SplitMix64(seed: seed)
         let (gw, gh) = (width / 8 + 2, height / 8 + 2)
         let grid = (0..<(gw * gh * 3)).map { _ in Float(rng.int(30..<226)) }
@@ -44,7 +39,7 @@ struct ReducedFramesTests {
     }
 
     @available(macOS 27, *)
-    func run(reduced: Bool) throws -> (frames: [(data: [UInt8], sync: Bool, config: [UInt8]?)], streams: Int, pictures: Int) {
+    func reducedRun(reduced: Bool) throws -> (frames: [(data: [UInt8], sync: Bool, config: [UInt8]?)], streams: Int, pictures: Int) {
         let (width, height) = (640, 384)
         let engine = Engine()
         let encoder = HybridRegionEncoder(callbackQueue: engine.queue)
@@ -58,7 +53,7 @@ struct ReducedFramesTests {
         try #require(started)
         engine.queue.sync { encoder.setReducedFrames(reduced) }
         // 14 new pictures, then the last one 4 times over (two of them, in a row, end the run)
-        let new = (0..<14).map { Self.soft(width: width, height: height, seed: 0x5e_d0 + UInt64($0)) }
+        let new = (0..<14).map { Self.softPicture(width: width, height: height, seed: 0x5e_d0 + UInt64($0)) }
         let pictures = new + Array(repeating: new[13], count: 4)
         for (i, p) in pictures.enumerated() {
             engine.queue.sync { p.withUnsafeBytes { encoder.encode(bgra: $0, forceSync: false, timeUS: UInt64(i) * 16_667) } }
@@ -75,7 +70,7 @@ struct ReducedFramesTests {
     @available(macOS 27, *)
     @Test func aSoftRunGoesToHalfSizeAndBack() throws {
         let (width, height) = (640, 384)
-        let (frames, streams, reducedPictures) = try run(reduced: true)
+        let (frames, streams, reducedPictures) = try reducedRun(reduced: true)
         try #require(frames.count == 18 && frames.allSatisfy { !$0.data.isEmpty })
         #expect(streams == 1, "streams at half size: \(streams)")
         // half size from the run's 5th inter frame (its margin measured on the 5th), until the
@@ -111,7 +106,7 @@ struct ReducedFramesTests {
 
     @available(macOS 27, *)
     @Test func withoutTheViewersBitTheRegionKeepsItsSize() throws {
-        let (frames, streams, reducedPictures) = try run(reduced: false)
+        let (frames, streams, reducedPictures) = try reducedRun(reduced: false)
         try #require(frames.count == 18)
         #expect(streams == 0 && reducedPictures == 0)
         #expect(frames.indices.filter { frames[$0].sync } == [0])

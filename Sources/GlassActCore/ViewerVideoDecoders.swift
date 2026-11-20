@@ -33,9 +33,11 @@ public struct ViewerVideoDecoders: Sendable {
                              glassActAV1: (@Sendable () -> any VideoRegionDecoder)?) -> ViewerVideoDecoders {
         let av1Decoder: (@Sendable () -> any VideoRegionDecoder)? = !av1 ? nil : hardwareAV1 ? hardware : glassActAV1
         var caps = WireCaps.videoHEVC
-        // (both AV1 decoders show reduced frames at the region's size)
-        if av1Decoder != nil { caps |= WireCaps.videoAV1GlassAct | WireCaps.videoReducedFrames }
-        if av1 && hardwareAV1 { caps |= WireCaps.videoAV1 }
+        if av1Decoder != nil { caps |= WireCaps.videoAV1GlassAct }
+        // reduced frames with VideoToolbox's AV1 only: it scales them for free (8.8 ms a 5K frame
+        // against 10.1 at full size), where Glass Act's decoder's Lanczos on the BGRA takes 22 ms
+        // of its 29 (20 at full size: BENCHMARKS "reduced frames for soft video")
+        if av1 && hardwareAV1 { caps |= WireCaps.videoAV1 | WireCaps.videoReducedFrames }
         return ViewerVideoDecoders(caps: caps) { codec in
             switch codec {
             case VideoCodec.hevc: hardware()

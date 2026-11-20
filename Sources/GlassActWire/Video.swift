@@ -42,7 +42,8 @@ public enum WireCaps {
     public static let videoAV1GlassAct: UInt32 = 1 << 7
     /// Reduced frames (§4.6): AV1 frames coded smaller than their region, with the region as
     /// their render size, which the Viewer shows scaled up to it. A Viewer advertises it when its
-    /// AV1 decoder scales them (VideoToolbox asked for the region's size, or Glass Act's decoder);
+    /// AV1 decoder is VideoToolbox's, which scales them as it decodes (Glass Act's decoder shows
+    /// them too, but its scaling costs more than the half-size decode saves);
     /// a Host whose AV1 is Glass Act's, which codes video softer than its region at half size
     /// (`ReducedFramesPolicy`). Released Viewers before it fail on such a frame.
     public static let videoReducedFrames: UInt32 = 1 << 8

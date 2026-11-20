@@ -16,7 +16,7 @@ import GlassActWire
 
     @Test func withoutItGlassActsDecoderTakesAV1UnderItsOwnBit() {
         let d = ViewerVideoDecoders.glassAct(av1: true, hardwareAV1: false)
-        #expect(d.caps == WireCaps.videoHEVC | WireCaps.videoAV1GlassAct | WireCaps.videoReducedFrames)
+        #expect(d.caps == WireCaps.videoHEVC | WireCaps.videoAV1GlassAct)
         #expect(d.decoder(forCodec: VideoCodec.av1) is OwnAV1RegionDecoder)
         #expect(d.decoder(forCodec: VideoCodec.hevc) is VTRegionDecoder)
     }

@@ -7,8 +7,10 @@
 import AV1Core
 import Foundation
 import GlassActAV1
+import GlassActAV1Decode
 import GlassActCore
 import GlassActHybridVideo
+import GlassActWire
 import libaom
 import Metal
 import QuartzCore
@@ -53,6 +55,7 @@ let av1SeqCommand = Command(
         .int("push-pending", "<n>", 1...16, "with --push every=<ms>: at most n pictures waiting for their frames before the next is submitted (default 2, the Host engine's videoMaxPendingFrames)"),
         .int("push-kbit", "<kbit/s>", 10...1_000_000, "with --push: each picture's qindex from GlassActHybridVideo's rate controller aiming at this rate (by the trace's capture times), not --q; prints what it achieved"),
         .string("push", "<mode>", "drive the encoder's stream API (startStream/submit) as a session does, and print each picture's submit-to-frame latency: lone (each picture submitted once the one before came out), burst (all at once), every=<ms> (one every ms, at most --push-pending waiting: 2, as the Host's engine allows)"),
+        .bool("own-decode", "also decode the stream with Glass Act's decoder as the Viewer runs it (OwnAV1RegionDecoder, at the stream's size: reduced frames scaled up), and time its decode and conversion a frame"),
         .bool("vt-decode", "also decode the stream with VideoToolbox's hardware AV1 decoder, as the Viewer does (M3 and later), and compare its output with the encoder's picture"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
@@ -595,6 +598,22 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             encoder.profilesStages = false
         }
         return
+    }
+    if opts.has("own-decode"), let first = frames.first, let seq = AV1Config.sequenceHeaderOBU(inTemporalUnit: first.obu),
+       let config = AV1Config.build(sequenceHeaderOBU: seq) {
+        let (sw, sh) = (stream?.width ?? width, stream?.height ?? height)
+        let own = OwnAV1RegionDecoder()
+        if own.start(codec: VideoCodec.av1, config: config, width: sw, height: sh) {
+            var ok = 0
+            for f in frames where own.decode(f.obu, sync: f.params.frame_type != UInt8(AV1G_FRAME_INTER), onPixels: { _, _ in }) { ok += 1 }
+            let st = own.stats, n = max(1, st.framesShown - st.keyFramesShown)
+            print(String(format: "own-decode: %d of %d frames shown at %d×%d · inter frames: decode %.2f ms, conversion%@ %.2f ms a frame",
+                         ok, frames.count, sw, sh, Double(st.decodeNS - st.keyDecodeNS) / Double(n) / 1e6,
+                         stream == nil ? "" : " and scaling", Double(st.convertNS - st.keyConvertNS) / Double(n) / 1e6))
+            own.stop()
+        } else {
+            print("own-decode: the decoder didn't start")
+        }
     }
     if opts.has("vt-decode") {
         let vt = frames.map { f in
