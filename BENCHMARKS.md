@@ -310,6 +310,7 @@ the numbers and the reasoning.
 | The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | `k_me`'s SADs in floats: the window search's samples as 2^23 + v from their bits, the sub-sample steps' bilinear sums floored in floats (the same whole numbers) (`metal-av1`) | kept; a separate sub-sample kernel, lanes stepping a row at a time, stepped vectors and ten sub-sample variants not (no gain or slower) | the same streams; 5K q36 `k_me` video 4.52 → 3.38 ms a frame (medians), movie 3.05 → 2.66; now bound by instruction throughput, not the integer unit | [entry](#metal-av1-k_mes-sads-in-floats-the-same-streams-in-three-quarters-of-the-time-2026-11-20) |
+| The motion search seeded with the picture before's: in a mostly-new picture after a mostly-new picture, where the picture before searched a 16×16, a ±4 window around its whole-sample best and no motion's ±2 instead of ±8 (`AV1HybridEncoder.motionSeed`, `k_me_seed`) | kept, on; seed ±2 with no motion ±4 (half the bytes gain), seed ±4 with no motion ±4 (0.38 ms), every inter frame seeded (screens unchanged anyway), a zero best seeding and the seed in the inter gate not | 5K q36 motion search: video 5.39 → 4.81 ms, maps 5.60 → 5.30, movie 4.33 → 4.48; BD-rate (q20–44): video −5.4 %, movie −0.5 %, maps −13.0 %, app-switch, tabs, windows, ide, images-scroll and typing the same streams, the four-trace rotation −41 B (the same PSNR); at a fixed q video −0.17 to −0.20 dB; video 57.0 → 58.4–58.9 inter frames a second | [entry](#metal-av1-the-motion-search-seeded-with-the-picture-befores-2026-11-20) |
 
 **Rate control and transport**
 
@@ -376,6 +377,125 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the motion search seeded with the picture before's (2026-11-20)
+
+On the owner's 60 fps video at 5K, q36, the motion search was 5.4 ms of a ~19 ms GPU analysis a
+frame. `k_me` searched each 16x16 ±8 around no motion (289 vectors), ±4 around each of the
+frame's shift candidates (video has none), and ±4 around its 64x64's `k_proj` vector. Video's
+motion is coherent from picture to picture, so the lever is to search around where the picture
+before found the block's best, and search less around no motion.
+
+**Built.** `k_me` writes each 16x16's whole-sample best and whether its window search ran
+(`GpImage.meSeedOut`). The next picture's `k_me` reads that buffer (`meSeedIn`, kept by the
+encoder beside `referenceSource`) on the GPU. Where the 16x16 was searched, it adds a window
+around the seed and shrinks no motion's (`AV1MetalEncoder.MotionSeed`; `av1seq --motion-seed`).
+- Seeds are clamped to `k_proj`'s reach (±192 columns, ±384 rows at 4K and up). Without that, a
+  chain of seeds could grow past what the bitstream codes (2^14 eighths). On video the clamp moved
+  the q36 stream by −338 B, movie by +19 B, maps by none.
+- The seeded search is `k_me_seed`, the same kernel with function constant 2. Each pair of window
+  sizes is a template instance, so the sizes are constants. A first version with the sizes at run
+  time made the unseeded search 0.23 ms slower on video (5.44 → 5.67). Now `k_me` is the search
+  without a seed alone: 5.36–5.42 ms, and the same streams.
+- Compile time after a change to the source (a comment; not a cleared Metal cache, which may
+  still have held the compiled code): `k_me` 19 ms, `k_me_seed` 108 ms (nine instances). Warm:
+  0.1 and 0.3 ms. `compileKernels` makes `k_me_seed` with the rest, under `analysisLock`.
+- `av1seq --profile` codes two pictures, a key frame and the inter frame it times, so it never
+  seeds. `--profile-pictures 3` times the third picture, which is seeded. The numbers below use it.
+
+**First, the ceiling.** No motion's window ±4 on every 16x16, and no seed:
+
+| motion search, ms · bytes (61 frames) | base | no motion ±4 |
+|---|---|---|
+| video | 5.44 · 13,430,695 | 4.44 · +0.38 % |
+| movie | 4.37 · 3,393,060 | 3.83 · +0.01 % |
+| maps | 5.60 · 684,445 | 5.52 · +0.12 % |
+
+**Variants at q36.** Video and movie: the motion search stage (`--profile --profile-pictures 3`,
+best of 10) against 5.42–5.44 and 4.34–4.37 with the seed off, then bytes and RGB PSNR over 61
+frames (`--score-rgb`). Base: video 13,430,695 B at 35.61 dB, movie 3,393,060 B at 44.27 dB.
+These timings are from the first build, with the window sizes at run time (the kept one's
+4.79–4.88 from both builds). None has the clamp. The other traces weren't run for every variant:
+maps for ±4 · ±2 runs-only is 5.52–5.53 ms and 646,307 B (−5.6 %) at 41.28 dB, against 5.60 ms
+and 684,445 B at 41.23 dB.
+
+| no motion · seed | video ms | video bytes · dB | movie ms | movie bytes · dB |
+|---|---|---|---|---|
+| ±4 · ±2 | 4.70–4.73 | −4.7 % · 35.49 | 4.46–4.47 | −1.2 % · 44.22 |
+| ±2 · ±2 | 4.65 | −4.7 % · 35.49 | 4.41 | −1.3 % · 44.22 |
+| ±4 · ±4 | 5.06 | −8.9 % · 35.42 | 4.59 | −2.5 % · 44.16 |
+| **±2 · ±4** | **4.79–4.88** | **−8.9 % · 35.41** | **4.50–4.52** | **−2.5 % · 44.17** |
+| ±8 · ±2 (the seed alone) | | −4.7 % · 35.49 | | −1.2 % · 44.19 |
+| ±4 · ±2, a zero best seeds too | 4.72 | −4.7 % · 35.49 | 4.46 | −1.2 % · 44.23 |
+| ±2 · ±2, a zero best seeds too | 4.63 | −4.7 % · 35.49 | 4.41 | −1.3 % · 44.20 |
+| ±4 · ±2, the seed's centre in the inter gate | 4.71 | −5.2 % · 35.48 | 4.49 | −1.9 % · 44.18 |
+
+- **The seed buys bytes more than time.** The base search misses much of video's motion: it is
+  past ±8, and the 64x64's `k_proj` vector doesn't hold it for every 16x16. The seeds follow it.
+  More of the picture is coded inter (motion-searched blocks 66 → 73 % on video, ±4 · ±2).
+- **At a fixed q the seeded streams are smaller and a little softer,** so they are compared by
+  BD-rate. That is piecewise-linear log rate against PSNR over q20, q36 and q44, 61 frames each:
+
+| BD-rate | ±4 · ±2 | ±4 · ±4 | ±2 · ±4 | ±8 · ±2 |
+|---|---|---|---|---|
+| video | −2.6 % | −5.5 % | −5.4 % | −2.6 % |
+| movie | +0.0 % | −0.45 % | −0.50 % | +0.1 % |
+
+- Movie's motion search is 0.1–0.2 ms slower seeded, with every window size. The kernel isn't
+  the cause, since `k_me` without a seed is as fast as before. Probably `k_inter_sad`, in the same
+  stage, does more work: it has more distinct vectors in an SB. Not measured.
+- ±4 · ±4 saves only 0.38 ms. ±2 · ±4 keeps its bytes and saves 0.54–0.60.
+
+**Kept: no motion ±2 and the seed ±4, only in a mostly-new picture after a mostly-new picture**
+(`MotionSeed.runsOnly`: picture codes more than `interGateOverShare` of its 64x64s, as the inter
+gate's rule says; `AV1HybridEncoder.defaultMotionSeed`). Screens' pictures search as before:
+- With every inter frame seeded instead, images-scroll was −0.03 % and typing +1 B (noise). Maps
+  was 603,761 B against 603,888 runs-only.
+- Screens' runs are short, but a run's second picture is seeded. The four-trace rotation (typing,
+  scroll, photos, drag in turn, 24 pictures, 3 mostly new) has one: 1,512,519 → 1,512,478 B (−41
+  B), PSNR 38.38 dB both. Over 60 pictures, −55 B.
+- The same streams with and without the seed: app-switch (1,300 frames, 2 mostly new), tabs,
+  window-open-close and ide (400 frames each), images-scroll and typing.
+- Video and movie are mostly-new pictures throughout, so both rules give them the same streams.
+
+The final build, the seed off (`--motion-seed off`) and on (the default), alternated:
+
+| | motion search, ms | GPU analysis a frame, ms | inter frames a second |
+|---|---|---|---|
+| video | 5.39, 5.39 → 4.81, 4.81 | 17.6 → 17.0 | 57.0, 57.0 → 58.4, 58.9 |
+| movie | 4.33, 4.33 → 4.48, 4.49 | 13.7 → 13.7 | 72.3, 72.6 → 72.2, 72.3 |
+| maps | 5.60, 5.60 → 5.29, 5.30 | 6.9 → 6.9 | 132.2, 132.0 → 131.9, 133.2 |
+| images-scroll | 0.30 → 0.30 | | |
+| typing | 0.07 → 0.07 | | |
+
+- The motion search stage is `--profile --profile-pictures 3`, best of 10. The other two columns
+  are 91 frames with `--no-planes`, two rounds, from the build before the clamp; load was 4–6.
+- Video's closed loop went 13.0 → 13.6–13.8 ms, because more of the picture is inter. The frame
+  rate still rose.
+
+Bytes and RGB PSNR, 61 frames:
+
+| | q20 | q36 | q44 | BD-rate |
+|---|---|---|---|---|
+| video | 34,187,192 → 32,265,028 (−5.6 %) · 41.13 → 40.96 | 13,430,695 → 12,229,727 (−8.9 %) · 35.61 → 35.41 | 7,474,263 → 6,572,973 (−12.1 %) · 32.36 → 32.19 | −5.4 % |
+| movie | 7,485,766 → 7,346,465 (−1.9 %) · 48.58 → 48.44 | 3,393,060 → 3,307,668 (−2.5 %) · 44.27 → 44.17 | 2,161,002 → 2,104,337 (−2.6 %) · 41.31 → 41.23 | −0.5 % |
+| maps | 2,160,611 → 1,965,061 (−9.1 %) · 45.87 → 46.00 | 684,445 → 603,888 (−11.8 %) · 41.23 → 41.33 | 404,734 → 359,575 (−11.2 %) · 38.56 → 38.64 | −13.0 % |
+| images-scroll, typing | the same streams | the same | the same | 0 |
+
+- The q20 and q44 streams were coded before the clamp. The clamp changed the q36 video by
+  0.003 %.
+- Maps gains at every q in both bytes and quality: its pan and zoom move further than ±8.
+- **Longer, 400 frames at q36** (all decoded exactly):
+  - Video: 67,472,568 → 65,966,140 B (−2.2 %), 35.66 → 35.58 dB. The gain is largest early: −10 %
+    in the first 50 frames, then −0.35 to −1.2 % in each later 50. No segment costs more, so the
+    seeds don't drift.
+  - Maps: 3,665,136 → 3,005,476 B (−18.0 %), 39.93 → 39.96 dB.
+- **At 2560 wide** (61 frames, q36): video 5,248,046 → 4,634,714 B (−11.7 %), 32.20 → 32.15 dB.
+  Maps 224,283 → 218,791 B (−2.4 %), 39.60 → 39.62 dB. The rule applies at every size.
+- `HybridEncoderTests.motionSeedChangesOnlyARunsLaterPicturesAndDecodesExactly` covers it:
+  - The pictures before a run, and the run's first, code as without the seed, byte for byte.
+  - The run's later pictures don't.
+  - Every frame decodes in libaom to the encoder's pictures.
 
 ### Metal AV1: `k_me`'s SADs in floats, the same streams in three quarters of the time (2026-11-20)
 
