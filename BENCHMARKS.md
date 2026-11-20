@@ -302,6 +302,7 @@ the numbers and the reasoning.
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | How many frames may wait for the hybrid at 60 fps (`av1seq --push-pending`) | measured; superseded by the row above (three, kept) | full-change 5K (movie) paced at 60: 45 fps with 2 waiting, 59 with 3 (p50 +2–4 ms); maps and images-scroll unchanged at 59–60 | [entry](#metal-av1-keeping-up-with-60-fps-of-changes-at-5k-how-many-frames-may-wait-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
@@ -374,6 +375,65 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the small shapes in runs of mostly-new pictures (2026-11-20)
+
+The owner's 60 fps video from Photos (`glassact-1795125212`, 5K, 52 fps on average, 1,461 of
+1,596 frames with 90 %+ of the screen changed) ran AV1 at 33–42 inter frames a second back to
+back. Every inter frame is a mostly-new picture (`newPictureEffort`), which already analyzes only
+the squares (`newPictureShapeMask` 0x1249). At q36 (about the Host's 210 KB a frame) the GPU's
+kernels take 24.7 ms a frame against the movie's 18.1 (`scripts/metal-trace`, 40 frames).
+- Intra analysis is ≈ 10.8 ms: 64x64 2.38, 32x32 2.57, 16x16 2.23, 8x8 1.74, 4x4 0.92.
+- The rest: motion ≈ 5.3 (k_me 3.85), inter RD ≈ 4.6, learned pruning ≈ 2.
+- The small-shape kernels spill (stack 48–72 % of their time). That is unchanged here.
+
+**4x4 and 8x8 hardly ever win on video.** `--new-shapes 1240` (no 4x4 or 8x8 in mostly-new
+pictures) gives the video's stream 49 bytes more in 2.17 MB (16 frames), for ~4 ms less GPU
+analysis.
+
+**But they code text, and a switch is a mostly-new picture.** In every mostly-new picture, at q36
+(bytes over the stream, PSNR-Y):
+
+| | 1248 (no 4x4) | 1240 (no 4x4, 8x8) |
+|---|---|---|
+| video, movie | the same | the same |
+| four-trace rotation (24 pictures, 3 of them mostly new) | +2.3 %, −0.40 dB | +9.6 %, −1.76 dB |
+| app-switch (1,300 frames, 2 mostly new) | | the same bytes, −0.38 dB |
+
+One soft picture costs the whole stream: the pictures after it copy it.
+
+**So only in runs** (`NewPictureEffort.runShapeMask`, `runShapesAfter`; `av1seq --fast
+run-shapes=<hex>,run-shapes-after=<n>`). Video makes every picture mostly new. A switch is one
+mostly-new picture, and the rotation's worst case is three in a row, before the long-term
+references hold its screens.
+- From the second picture (after 1): the rotation +1.0 % / −0.21 dB (1248), +5.4 % / −1.03 dB
+  (1240).
+- From the third (after 2), 1240, 60 pictures: +3.0 % / −0.93 dB. Its third picture alone costs
+  that much.
+- **From the fourth (after 3), 1240:** the rotation and app-switch byte-identical. So are the
+  whole of tabs, window-open-close, ide and images-scroll (none has a mostly-new picture).
+- Maps (1,508 frames, 655 mostly new, in long runs while it zooms and pans; its labels are text):
+  10,347,261 → 10,434,582 B (+0.84 %), PSNR-Y 42.18 → 42.10. With 1248 instead: −0.06 %,
+  42.16. The owner's call: 1240, since the cost lasts only while the map moves; the tiles settle
+  it once it stops.
+
+**Kept: 1240 from a run's fourth picture**, in `NewPictureEffort.standard` (pictures larger than
+4K). 91 frames at q36, the old default (`--fast level=1,min-sbs=2400`) and the new in turn, two
+rounds (load 6–16, provisional):
+
+| | bytes | GPU analysis | closed loop | inter frames a second |
+|---|---|---|---|---|
+| video, old | 19,363,810 | 22.5 ms | 10.6 / 16.9 ms | 45.2 / 41.0 |
+| video, new | 19,361,936 (−0.01 %) | **18.7** | 11.6 / 13.3 | **54.6 / 53.2** |
+| movie, old | 5,152,564 | 15.1 / 15.3 | 8.8 / 8.7 | 67.4 / 66.6 |
+| movie, new | 5,154,947 (+0.05 %) | 14.2 | 8.2 | 71.5 / 71.4 |
+
+- `HybridEncoderTests.newPictureEffortMixesFastAndNormalPicturesExactly`: a run's first picture
+  codes as without `runShapeMask`, byte for byte; its second differs; a run that ends before
+  `runShapesAfter + 1` gives the same stream.
+- Still short of 60 on this video: the GPU is ~19–23 ms with the filters, and the closed loop is
+  11–17 ms. Next: the spills in the small-shape kernels and k_me (byte-identical), then the
+  closed loop.
 
 ### Video: three frames waiting for Glass Act's AV1 and HEVC; the Host's rule in real time (2026-11-19)
 

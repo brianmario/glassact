@@ -782,7 +782,8 @@ extension HybridEncoderTests {
     /// of each run (`runLimit`) and in no other, without the motion search in the first alone
     /// (`motionlessRun`), the levers switched frame by frame; libaom decodes
     /// the stream in order to exactly the pictures the encoder reports. An effort that changes
-    /// nothing codes the stream without one, byte for byte.
+    /// nothing codes the stream without one, byte for byte. `runShapeMask` changes a run's
+    /// pictures from its second on, and no other.
     @available(macOS 27, *)
     @Test func newPictureEffortMixesFastAndNormalPicturesExactly() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
@@ -850,6 +851,22 @@ extension HybridEncoderTests {
         try make(AV1HybridEncoder.NewPictureEffort()).encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] },
                                                                output: { _, f in neutral.append(f.obu) })
         #expect(neutral == plain, "an effort that changes nothing changed the stream")
+
+        // `runShapeMask`: a run's first mostly-new picture analyzes `analysis`'s shapes, its
+        // second (and on) the run's; past the run's last picture it changes nothing
+        func stream(_ effort: AV1HybridEncoder.NewPictureEffort) throws -> [[UInt8]] {
+            var obus: [[UInt8]] = []
+            try make(effort).encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { _, f in obus.append(f.obu) })
+            return obus
+        }
+        let fastStream = try stream(effort)
+        var run = effort
+        run.runShapeMask = 0x1000
+        let runStream = try stream(run)
+        #expect(runStream[...5] == fastStream[...5], "the run's first picture changed")
+        #expect(runStream[6] != fastStream[6], "the run's second picture analyzed the same shapes")
+        run.runShapesAfter = 2
+        #expect(try stream(run) == fastStream, "a run shorter than runShapesAfter + 1 changed")
     }
 }
 

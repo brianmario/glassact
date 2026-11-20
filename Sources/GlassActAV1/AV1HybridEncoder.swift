@@ -473,11 +473,23 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// runs at twice 60 a second without it, and with it needs 15–25 % more bytes for its
         /// quality (BENCHMARKS "real streams at 2900").
         public var minSuperblocks = 0
+        /// From the `runShapesAfter + 1`th mostly-new picture in a row: the analysis's shapes
+        /// (GpParams.shapeMask bits) in place of `analysis`'s (nil: the same in every picture of a
+        /// run). A switch of screens is one mostly-new picture, whose text the small shapes code;
+        /// video makes every picture mostly new, and there they hardly ever win.
+        public var runShapeMask: Int32?
+        /// See `runShapeMask`.
+        public var runShapesAfter = 1
         /// The encoder's default: level 1 in pictures larger than 4K (2,400 64×64s and up; 5K is
         /// 3,600, 4K UHD 2,040), where a mostly-new picture is what keeps a stream under 60 a second.
+        /// From a run's fourth mostly-new picture on, no 4x4 or 8x8 shapes (`runShapeMask` 0x1240):
+        /// on 60 fps video ~4 ms of the GPU's analysis for the same bytes, on maps zooming +0.8 %
+        /// bytes and −0.08 dB while they move; from the third, a rotation of text screens loses
+        /// 0.93 dB (BENCHMARKS "the small shapes in runs of mostly-new pictures").
         public static var standard: NewPictureEffort {
             var e = level(1)!
             e.minSuperblocks = 2400
+            (e.runShapeMask, e.runShapesAfter) = (0x1240, 3)
             return e
         }
         /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
@@ -1005,7 +1017,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             let base = chooser?(PictureInfo(index: index, key: key, coded: coded, superblocks: sbs, fast: fast)) ?? qindex
             let q = key ? keyFrameQindex(base) : fast ? fastQindex(base) : base
             let gate: UInt64 = index >= 2 ? s.gateBase + UInt64(index - 1) : 0
-            var pending = try begin(p, copies, qindex: q, after: gate, fast: fast)
+            var pending = try begin(p, copies, qindex: q, after: gate, fast: fast, run: s.newRun)
             read(&pending, of: p, index: index, after: s.reads[(index + 1) % 2])
             s.reads[index % 2] = pending.read
             let started = pending
@@ -1548,7 +1560,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
 
     /// Starts picture `p`'s analysis, without its copies; its GPU work waits for `gate` to reach
     /// `after` (`AV1MetalEncoder.beginPartition(after:)`).
-    private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false) throws -> Pending {
+    private func begin(_ p: Picture, _ copies: Copies, qindex: Int, after gateValue: UInt64 = 0, fast: Bool = false,
+                       run: Int = 0) throws -> Pending {
         Self.trace("begin")
         // (a 4:4:4 picture's analysis decides on a 4:2:0 copy of its chroma, which the GPU makes)
         if p.chroma444 {
@@ -1556,7 +1569,8 @@ public final class AV1HybridEncoder: @unchecked Sendable {
                 throw Failure.encode("4:4:4 picture \(p.width)×\(p.height): planes of \(p.y.count), \(p.u.count), \(p.v.count) samples")
             }
         }
-        let effort = fast ? newPictureEffort?.analysis : nil
+        var effort = fast ? newPictureEffort?.analysis : nil
+        if fast, let e = newPictureEffort, let m = e.runShapeMask, run > e.runShapesAfter { effort?.shapeMask = m }
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         // what changed since the picture its copies compare against: all but its 64×64s copied
