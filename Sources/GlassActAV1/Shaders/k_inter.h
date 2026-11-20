@@ -227,13 +227,18 @@ static inline bool ga_ref_inside(device const GpImage &I, int x, int y, int2 v, 
     return x0 >= 0 && y0 >= 0 && x0 + W + ((v.x & 7) != 0) <= I.aw && y0 + H + ((v.y & 7) != 0) <= I.ah;
 }
 
+// Glass Act: a sample as the float 2^23 + it, from its bits (an OR, not a conversion): k_me's
+// whole-sample SADs subtract two of these, which is exact
+static inline float ga_me_px(uint8_t v) { return as_type<float>(0x4B000000u | (uint)v); }
+
 #define GA_ME_NW 4
 #define GA_ME_WIN 18  // k_me's sub-sample window: 16 + 1 sample either side
 kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
                  constant uint32_t &nCells [[buffer(2)]], uint tg [[threadgroup_position_in_grid]],
                  uint lane [[thread_index_in_simdgroup]], uint warp [[simdgroup_index_in_threadgroup]]) {
     threadgroup uint8_t cur[GA_ME_NW][256];
-    threadgroup uint8_t win[GA_ME_NW][GA_ME_WIN * GA_ME_WIN];
+    threadgroup float win[GA_ME_NW][GA_ME_WIN * GA_ME_WIN];
+    threadgroup float curf[GA_ME_NW][128];  // the cell's even rows, as ga_me_px makes them
     const uint32_t g = tg * GA_ME_NW + warp;
     if (g >= nCells) return;
     device const GpImage &I = B.img[0];
@@ -242,6 +247,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     const int sp = I.spitch[0];
     device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
     for (int p = (int)lane; p < 256; p += 32) cur[warp][p] = src[(p >> 4) * sp + (p & 15)];
+    for (int p = (int)lane; p < 128; p += 32) curf[warp][p] = ga_me_px(src[(p >> 4) * 2 * sp + (p & 15)]);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     const int2 sbv = I.meSb ? int2(I.meSb[2 * sb], I.meSb[2 * sb + 1]) : int2(0, 0);
     const int n = GA_ME_ZERO + 81 * (min(I.nMeCand, GP_ME_CANDS) + (I.meSb && (sbv.x | sbv.y) ? 1 : 0));
@@ -320,14 +326,18 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
                 device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
                 // (the key so far, partial SAD << 11 | i, is at most the vector's: above thr, it can't
                 // be one of the two; so where thr's SAD is 0, nothing after thr's index is measured)
-                uint sad = 0;
+                // Glass Act: the SAD in floats, whole numbers (at most 128 * 255), so exactly the
+                // integer one; it takes the samples' arithmetic off the integer unit, which bounded
+                // the kernel. (key > thr) is (SAD >= lim): (thr - i) / 2048 + 1, rounded down
+                float sadf = 0.f;
                 bool done = (uint)i < thr;
+                const float lim = done ? (float)(((thr - (uint)i) >> 11) + 1) : 0.f;
                 for (int row = 0; row < (done ? 16 : 0); row += 2) {
-                    for (int col = 0; col < 16; col++) sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-                    if (((sad << 11) | (uint)i) > thr) { done = false; break; }
+                    for (int col = 0; col < 16; col++) sadf += fabs(curf[warp][(row >> 1) * 16 + col] - ga_me_px(r[row * sp + col]));
+                    if (sadf >= lim) { done = false; break; }
                 }
                 if (done) {
-                    const uint key = (sad << 11) | (uint)i;
+                    const uint key = ((uint)sadf << 11) | (uint)i;
                     if (key < k0) { k1 = k0; k0 = key; }
                     else if (key < k1) k1 = key;
                 }
@@ -353,14 +363,16 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         const int wx0 = x + (best[0].x >> 3) - 1, wy0 = y + (best[0].y >> 3) - 1;
         for (int p = (int)lane; p < GA_ME_WIN * GA_ME_WIN; p += 32) {
             const int wy = wy0 + p / GA_ME_WIN, wx = wx0 + p % GA_ME_WIN;
-            win[warp][p] = wx >= 0 && wy >= 0 && wx < I.aw && wy < I.ah ? I.ref[(size_t)wy * sp + wx] : (uint8_t)0;
+            win[warp][p] = wx >= 0 && wy >= 0 && wx < I.aw && wy < I.ah ? (float)I.ref[(size_t)wy * sp + wx] : 0.f;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         uint bestSad = 0xFFFFFFFFu;
         const int row = (int)lane >> 1, col0 = ((int)lane & 1) * 8;
         const int bx = best[0].x >> 3, by = best[0].y >> 3;  // the whole-sample best: the window's (1, 1)
-        int cv[8];  // the lane's 8 samples of the cell
-        for (int col = 0; col < 8; col++) cv[col] = cur[warp][row * 16 + col0 + col];
+        // Glass Act: in floats, as the window search: the same whole numbers (the bilinear sums at
+        // most 16320 + 32, and their >> 6 a floor of a product by 1/64, both exact)
+        float cv[8];  // the lane's 8 samples of the cell
+        for (int col = 0; col < 8; col++) cv[col] = (float)cur[warp][row * 16 + col0 + col];
         for (int step = 4; step >= 2; step >>= 1) {
             const int2 c = best[0];
             uint top = 0xFFFFFFFFu;
@@ -369,34 +381,36 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
             // 3 rows of offsets, so the lane makes each column's h once for the 2 or 3 rows they read
             // and the column's 3 positions share them
             const int oy0 = ((c.y - step) >> 3) - by + 1, span = (((c.y + step) >> 3) - by + 1) - oy0;  // rows oy0 .. oy0 + span + 1
-            uint pt[9];  // the lane's part of each position's SAD
+            float pt[9];  // the lane's part of each position's SAD
             for (int j = 0; j < 3; j++) {
-                const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1, fx = vx & 7;
-                int h[3][8];
+                const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1;
+                const float fx = (float)(vx & 7), gx = 8.f - fx;
+                float h[3][8];
                 for (int t = 0; t < 3; t++) {
                     if (t > span + 1) {  // (a row no position reads, and maybe past the window)
-                        for (int col = 0; col < 8; col++) h[t][col] = 0;
+                        for (int col = 0; col < 8; col++) h[t][col] = 0.f;
                         continue;
                     }
-                    threadgroup const uint8_t *w = win[warp] + (row + oy0 + t) * GA_ME_WIN + col0 + ox;
-                    for (int col = 0; col < 8; col++) h[t][col] = (8 - fx) * (int)w[col] + fx * (int)w[col + 1];
+                    threadgroup const float *w = win[warp] + (row + oy0 + t) * GA_ME_WIN + col0 + ox;
+                    for (int col = 0; col < 8; col++) h[t][col] = gx * w[col] + fx * w[col + 1];
                 }
                 for (int k = 0; k < 3; k++) {
                     const int l = k * 3 + j;
-                    pt[l] = 0;
+                    pt[l] = 0.f;
                     if (l == 4 && step != 4) continue;  // the centre, as the last step measured it
                     const int2 v = int2(vx, c.y + (k - 1) * step);
-                    const int fy = v.y & 7, t = ((v.y >> 3) - by + 1) - oy0;
+                    const float fy = (float)(v.y & 7), gy = 8.f - fy;
+                    const int t = ((v.y >> 3) - by + 1) - oy0;
                     for (int col = 0; col < 8; col++)
-                        pt[l] += (uint)abs(cv[col] - (((8 - fy) * (t ? h[1][col] : h[0][col]) +
-                                                       fy * (t ? h[2][col] : h[1][col]) + 32) >> 6));
+                        pt[l] += fabs(cv[col] - floor((gy * (t ? h[1][col] : h[0][col]) +
+                                                       fy * (t ? h[2][col] : h[1][col]) + 32.f) * 0.015625f));
                 }
             }
             // Glass Act: two positions' sums in one simd_sum, 16 bits each (a lane's part is at most
             // 8 * 255, the SIMD-group's 32 * 2040 < 65536: no carry between them)
             uint sum[9];
             for (int l = 0; l < 9; l += 2) {
-                const uint both = simd_sum(pt[l] | (l + 1 < 9 ? pt[l + 1] << 16 : 0u));
+                const uint both = simd_sum((uint)pt[l] | (l + 1 < 9 ? (uint)pt[l + 1] << 16 : 0u));
                 sum[l] = both & 0xFFFFu;
                 if (l + 1 < 9) sum[l + 1] = both >> 16;
             }
