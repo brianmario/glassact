@@ -24,11 +24,14 @@ import GlassActTestSupport
     final class TaggedEncoder: VideoRegionEncoder {
         let codecID: UInt8
         let maker: Maker
+        let shown: Shown?
         private let inner = MockVideoEncoder()
-        init(codecID: UInt8, maker: Maker) {
+        init(codecID: UInt8, maker: Maker, shown: Shown? = nil) {
             self.codecID = codecID
             self.maker = maker
+            self.shown = shown
         }
+        func setReducedFrames(_ allowed: Bool) { shown?.reducedFrames.append(allowed) }
         func start(width: Int, height: Int, onFrame: @escaping ([UInt8], Bool, [UInt8]?) -> Void) -> Bool {
             let tag = maker.rawValue
             return inner.start(width: width, height: height) { data, sync, config in
@@ -46,6 +49,8 @@ import GlassActTestSupport
         var started: [Maker] = []
         var refused: [Maker] = []
         var frames = 0
+        /// The engine's `setReducedFrames` calls on the region's encoder.
+        var reducedFrames: [Bool] = []
     }
 
     /// A mock decoder that takes streams from `accepts` only: VideoToolbox any, Glass Act's own
@@ -149,8 +154,8 @@ import GlassActTestSupport
         var rng = SplitMix64(seed: 709)
         let h = Harness(width: 320, height: 320, video: true, hostCodecs: host.preference,
                         encoderFactory: { codec in
-                            codec == VideoCodec.av1 ? TaggedEncoder(codecID: codec, maker: host.av1Maker)
-                                : TaggedEncoder(codecID: codec, maker: .hevc)
+                            codec == VideoCodec.av1 ? TaggedEncoder(codecID: codec, maker: host.av1Maker, shown: shown)
+                                : TaggedEncoder(codecID: codec, maker: .hevc, shown: shown)
                         },
                         viewerDecoders: viewer.decoders(shown), hostAV1FromGlassAct: host.av1FromGlassAct)
         _ = h.host.linkRoom.noteSecond(deliveredBytesPerSecond: LinkRoomPolicy.roomyBitsPerSecond / 8,
@@ -178,6 +183,10 @@ import GlassActTestSupport
         #expect(h.viewer.stats.videoDropped == 0)
         #expect(h.settle())
         #expect(h.canvasMatchesFrame())
+        // reduced frames (`videoReducedFrames`) only from Glass Act's AV1 to a Viewer of this
+        // release with an AV1 decoder (both of them show them); a released one fails on them
+        let reduced = want == .glassAct && [.newHardware, .newNoHardware].contains(viewer)
+        #expect(shown.reducedFrames == [reduced], "setReducedFrames: \(shown.reducedFrames)")
     }
 
     // MARK: - Caps on the wire
@@ -186,7 +195,7 @@ import GlassActTestSupport
     /// `videoAV1GlassAct` with any AV1 decoder; never AV1 without the opt-in.
     @Test func viewersOfferWhatTheyDecode() {
         let shown = Shown()
-        let (hevc, av1, ours) = (WireCaps.videoHEVC, WireCaps.videoAV1, WireCaps.videoAV1GlassAct)
+        let (hevc, av1, ours) = (WireCaps.videoHEVC, WireCaps.videoAV1, WireCaps.videoAV1GlassAct | WireCaps.videoReducedFrames)
         #expect(ViewerKind.newHardware.decoders(shown).caps == hevc | av1 | ours)
         #expect(ViewerKind.newNoHardware.decoders(shown).caps == hevc | ours)
         #expect(ViewerKind.newOff.decoders(shown).caps == hevc)

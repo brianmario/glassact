@@ -129,6 +129,9 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         /// An inter frame's whole-sample shifts the copy finder proposed to the motion search
         /// (rows that match the last picture's exactly, shifted; -1: no search).
         public var shiftCandidates = -1
+        /// With `measuresLumaError`: the decoded picture's luma error against its source, the
+        /// mean squared difference over every 8th row (-1: not measured).
+        public var lumaMSE = -1.0
     }
 
     /// An encoded picture.
@@ -1851,6 +1854,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.filtersGPU = postfilter.lastGPUSeconds
 
         remember(p, search.planes, sbMotion)
+        if measuresLumaError { timing.lumaMSE = decodedLumaMSE(p, search.planes) }
         // the previous picture's write ran beside this closed loop and these filters: taken back
         // now, before this one's begins
         let ended = try writingBefore?.end()
@@ -1862,6 +1866,37 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     /// The writer's flags for a frame: an inter frame of a stream without its sequence header.
     private func headerFlags(_ fp: av1g_frame_params) -> UInt32 {
         omitsSequenceHeaders && fp.frame_type == UInt8(AV1G_FRAME_INTER) ? UInt32(AV1G_ENC_NO_SEQ_HEADER) : 0
+    }
+
+    /// Each frame's luma error against its source (`Timing.lumaMSE`), from its decoded picture
+    /// (the filters' output), every 8th row: what a picture's coding loses, which the Host's
+    /// reduced frames weigh their resampling's loss against. Off by default.
+    public var measuresLumaError = false
+
+    /// `Timing.lumaMSE`'s: the decoded luma (`planes`' when returned, else the filters' buffers)
+    /// against `p`'s, every 8th row.
+    private func decodedLumaMSE(_ p: Picture, _ planes: [[UInt8]]) -> Double {
+        let (w, h) = (p.width, p.height)
+        let fromGPU = planes.isEmpty && !postfilter.outputPlanes.isEmpty
+        guard fromGPU || planes.first?.count == w * h, p.y.count == w * h, h > 0 else { return -1 }
+        let stride = fromGPU ? postfilter.outputStrides[0] : w
+        var sum: UInt64 = 0, rows = 0
+        p.y.withUnsafeBufferPointer { src in
+            func measure(_ d: UnsafePointer<UInt8>) {
+                for r in Swift.stride(from: 0, to: h, by: 8) {
+                    let a = src.baseAddress! + r * w, b = d + r * stride
+                    var row: UInt32 = 0
+                    for c in 0..<w {
+                        let e = Int32(a[c]) - Int32(b[c])
+                        row &+= UInt32(e * e)
+                    }
+                    sum &+= UInt64(row)
+                    rows += 1
+                }
+            }
+            if fromGPU { measure(postfilter.outputPlanes[0]) } else { planes[0].withUnsafeBufferPointer { measure($0.baseAddress!) } }
+        }
+        return rows == 0 ? -1 : Double(sum) / Double(rows * w)
     }
 
     /// The picture the next inter frame references.

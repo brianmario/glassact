@@ -302,6 +302,12 @@ the numbers and the reasoning.
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting: 36 → 56 frames a second shown, p50 latency 67 → 29 ms; at the same bytes +1.5–1.7 dB (Lanczos up, RGB PSNR at 5K); a movie at its own resolution, photos and maps lose 1–6 dB at half size and stay full size (the margin gate), movie 57 → 56 | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| VideoToolbox decoding a reduced AV1 frame | it outputs the coded size unless asked for one | the Viewer's session asks for the region's size (`VTRegionDecoder`); its scaling scores as vImage's Lanczos 3 (35.33 / 35.48 dB at half size, 38.26 / 38.15 at 3/4); the 2026-11-02 finding (scaled up) was ffmpeg's | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| No intra search on inter frames where the inter block's J is under c × step² a pixel (in mostly-new pictures) | rejected | video 5K q36: c 0.02 −2.2 ms of GPU analysis for +0.6 % bytes, −0.08 dB; the movie +4.2 % and −0.2 dB at c 0.004 already; with no intra anywhere inter exists, 15 ms (64 a second) but +17 % / −1.25 dB on video, +25 % on the movie | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| AV1 superres (half width, the decoder upscales) for video | rejected (libaom bound) | loses to half-size reduced frames at every rate on the 60 fps video: at ~850 KB 35.0 against 35.9 dB, at ~530 KB 32.4 against 33.2; full 5K 34.3 at 870 KB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| AV1 global motion | rejected (libaom bound) | `--enable-global-motion` 1 against 0, cpu-used 3, cq 40: video −0.03 %, maps zooming +0.08 %, movie +0.09 % bytes, PSNR ±0.01 dB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| AV1 film grain synthesis (denoise + grain parameters) | rejected (libaom bound) | `--denoise-noise-level=20`: video −9.5 % bytes, movie −3.4 %, maps −7.9 % with −2.5 dB (the denoiser takes detail that isn't grain); the encode 4× slower; Glass Act's decoder has no grain synthesis | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | How many frames may wait for the hybrid at 60 fps (`av1seq --push-pending`) | measured; superseded by the row above (three, kept) | full-change 5K (movie) paced at 60: 45 fps with 2 waiting, 59 with 3 (p50 +2–4 ms); maps and images-scroll unchanged at 59–60 | [entry](#metal-av1-keeping-up-with-60-fps-of-changes-at-5k-how-many-frames-may-wait-2026-11-19) |
 | The copy finder keeps the last picture's row and column hashes, and hashes only changed 64x64s' lines (`av1enc_motion_set_continues`) | kept | the same streams; the shift search −21 % on photos (2.8 core-ms a frame), photos +3.5 % fps, typing-cc and scroll-win within noise | [entry](#metal-av1-the-copy-finder-keeps-the-last-pictures-hashes-128-on-the-paced-path-2026-11-19) |
 | What limits an inter stream's frame rate: `k_me`'s integer work, the thread kernels, the CPU; and the filters' wall time (`--no-split-motion`, `GA_TIMELINE`) (`metal-av1`) | measured; kept: the copy finder's row hashes four at a time and its rows compared inline, the prediction's rows copied as fixed-size arrays and the someUseIntra scan skipped for inter blocks of 8x8 and up (together against `main`: photos +7.3 %, typing-cc +5.8 %, scroll-win +2.8 %, the same bytes); the rest not | no byte-neutral lever over the A/B's ±2 %; dropping the thread kernels' shapes +2–10 % for +2–11 % bytes; the period is the closed loop plus the filters' wall time, which GPU work beside them lengthens by about 0.5 ms in the pictures it overlaps (about 0.3 ms a picture on photos) | [entry](#metal-av1-what-limits-an-inter-streams-frame-rate-three-levers-measured-2026-11-19) |
@@ -374,6 +380,101 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video: reduced frames for soft video, and the levers that didn't pay (2026-11-20)
+
+The owner's 60 fps video (`glassact-1795125212`, Photos at 5K) after the small shapes in runs
+(PR #133): the GPU's analysis ~19 ms a frame, the closed loop 11–17 ms. The owner asked for every
+lever, conventional and new, as long as the stream stays AV1 a decoder can play.
+
+**Reduced frames: the video is softer than the screen.** `av1seq --stream-width 5120 --width
+<w>`, 31 frames from frame 220, q 20–52, scored at 5K after vImage's Lanczos (RGB luma PSNR;
+load 2–8):
+
+| | 5K | 3840 wide | 2560 wide |
+|---|---|---|---|
+| ~185–195 KB a frame | ≈ 36.0 dB (interpolated) | 37.6 | 37.7 |
+| ~110–117 KB | ≈ 33.3 | 34.7 | 35.0 |
+| ~60 KB | ≈ 30.3 | | 32.0 |
+| inter frames a second at q36-ish | 56 | 57 | 95–118 |
+
+- The movie (`1793736335`) is the opposite: at half size 43.3 dB at 48.5 KB against 44.7 at
+  44.3 KB at 5K; 3840 breaks even. Photos and maps lose more (their round trip is below their
+  coding).
+- **The gate:** the half-size round trip's loss against the coding's, by luma MSE in dB. Round
+  trip (Lanczos down and up, 20 frames, ffmpeg) against coding at 5K q36: video 45.2 against
+  36.4 (+8.8), movie 46.6 against 44.8 (+1.8), maps 38.8 against 42.9 (−4.1); bilinear's
+  round trip ranks them the same with less room (+2.7, −0.3, −7.5). Kept at +5 dB.
+- **VideoToolbox** (`av1seq --vt-decode`, new: `VTDecodeCheck.scaled`) outputs a reduced frame
+  at its coded size (2560×1440), which the Viewer's size check dropped: every frame failed. Asked
+  for the region's size it scales it, as well as vImage's Lanczos 3: 35.33 against 35.48 dB at
+  half size, 38.26 against 38.15 at 3/4 (bilinear 34.68, 38.03). The 2026-11-02 note that it
+  scales them went through ffmpeg. Full-size streams still decode exactly.
+- **The policy** (`ReducedFramesPolicy`, `HybridRegionEncoder`; DESIGN §4.6):
+  - from a run's fourth mostly-new inter frame (by the copies' share, so it holds at half size,
+    under the fast pictures' 2,400-superblock floor);
+  - the margin measured off the engine's queue on 8 bands of 64 rows every 30 pictures;
+  - the encoder's coding loss from its decoded luma, every 8th row (`measuresLumaError`);
+  - back at the region's size when a frame codes half its 64×64s or fewer;
+  - a new stream at each switch, a key frame first. A reduced stream's level follows its own
+    tiles (the writer now takes a reduced stream's level from the stream's size), so its
+    sequence header may differ in level alone; both decoders show every frame under the
+    region's first config (`ReducedFramesTests`).
+- **Measuring it on the engine's queue every picture of a run cost 14 ms a tick**, and took
+  the movie from 58 to 51 frames a second while it measured; the bands, the period and the
+  queue fixed that.
+- **`pace`** (new `--reduced`), 180 frames at 60 fps, 3 waiting, one run each (load 6–8,
+  provisional):
+
+| | delivered of 60 | p50 / p95 latency | KB a frame | engine tick |
+|---|---|---|---|---|
+| video | 36.3 | 66.5 / 85.3 ms | 186.9 | 11.0 ms |
+| video, `--reduced` | **56.3** | **28.7 / 47.9** | 74.3 | 8.8 |
+| movie | 57.0 | 36.8 / 49.1 | 45.7 | 5.1 |
+| movie, `--reduced` (stays full size) | 55.7 | 38.3 / 46.3 | 45.7 | 5.1 |
+
+  The video went to half size after 8 pictures and stayed (161 of 169). Its bytes are the rate
+  controller's at its target: what quality it gives at the Host's rates is the table above at
+  equal bytes, not measured live.
+
+**Rejected.**
+- **No intra search where inter is good enough** (an experiment switch, reverted): skip the
+  intra analysis of a block whose inter J is under c × (ac step)² a pixel, in mostly-new
+  pictures. 61 frames, 5K q36:
+
+| c | video bytes, PSNR-Y, GPU analysis | movie bytes, PSNR-Y, GPU analysis |
+|---|---|---|
+| 0 (today) | 13,432,528 B, 36.95, 22.9 ms | 3,392,627 B, 45.55, 15.4 ms |
+| 0.004 | +0.01 %, 36.95, 23.1 | +4.2 %, 45.35, 14.5 |
+| 0.01 | +0.03 %, 36.94, 22.5 | +11.8 %, 44.23, 12.8 |
+| 0.02 | +0.58 %, 36.87, 21.2 | +19.7 %, 43.59, 11.8 |
+| 0.05 | +12.5 %, 35.97, 17.2 | |
+| skip all | +17.1 %, 35.70, 15.2 (64 a second) | +24.9 %, 43.15, 11.3 |
+
+  Real video's inter frames need their intra blocks; maps +3.2 % with intra skipped everywhere.
+- **No luma tx type search in runs** (`--fast no-tx`): the closed loop 11.8 → 11.2 ms; the GPU
+  decides most of it now.
+- **libaom bounds** (aomenc 3.x `--good --cpu-used 6`/`3`, `--end-usage q`, 20 frames,
+  dav1d decode, ffmpeg PSNR-Y at 5K; for resize, ffmpeg's Lanczos up):
+  - superres (half width) against reduced frames (half each way) and full size, video:
+
+| cq | full 5K | superres | half size |
+|---|---|---|---|
+| 32 | 2,255 KB, 40.22 | 1,320 KB, 37.63 | 873 KB, 35.93 |
+| 40 | 1,405 KB, 37.32 | 835 KB, 35.00 | 534 KB, 33.21 |
+| 48 | 867 KB, 34.34 | 532 KB, 32.39 | 324 KB, 30.51 |
+
+    At equal bytes half size wins (~870 KB: 35.9 against superres 35.0 and full 34.3; ~530 KB:
+    33.2 against 32.4); superres would also need scaled prediction in the analysis and the
+    closed loop.
+  - global motion on and off at cpu-used 3, cq 40: video 1,269,702 → 1,269,298 B (37.90 →
+    37.91 dB), maps zooming 363,600 → 363,902 (49.33 → 49.33), movie 511,115 → 511,588
+    (46.18 → 46.19): nothing to find.
+  - film grain (`--denoise-noise-level=20`): video 1,149,072 B (−9.5 %, 37.38 dB: PSNR counts
+    the synthesized grain as error), movie −3.4 % (45.20), maps −7.9 % at 46.83 against 49.33 dB:
+    the denoiser takes text and lines; 4× the encode time.
+- Still to do: the motion search's spills (a builder, byte-identical), then seeding it from the
+  last picture's vectors; superres and global motion need no more work.
 
 ### Video: three frames waiting for Glass Act's AV1 and HEVC; the Host's rule in real time (2026-11-19)
 

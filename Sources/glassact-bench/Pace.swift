@@ -21,6 +21,7 @@ let paceCommand = Command(
         .string("every", "<ms>", "a frame every ms, in real time (default 16.667: 60 fps)"),
         .int("pending", "<n>", 1...16, "frames waiting for the encoder before the engine skips (default 2, videoMaxPendingFrames)"),
         .int("loops", "<n>", 1...100, "play the loaded frames this many times (default 1)"),
+        .bool("reduced", "with --codec hybrid: the Viewer shows reduced frames (WireCaps.videoReducedFrames), so runs of video softer than the region may be coded at half size (ReducedFramesPolicy)"),
     ],
     run: { opts in try runPace(opts) })
 
@@ -78,6 +79,7 @@ func runPace(_ opts: Options) throws {
         s.bytes += data.count
         s.lastOut = now
     }) else { throw BenchError("the encoder didn't start") }
+    if opts.has("reduced") { encoder.setReducedFrames(true) }
 
     let run = PaceRun(frames: frames, width: w, height: h, loops: loops, every: everyMS / 1000, limit: limit,
                       encoder: encoder, state: s, queue: queue)
@@ -99,6 +101,9 @@ func runPace(_ opts: Options) throws {
                  Double(s.delivered) / playSeconds, playSeconds, Double(s.bytes) / 1024 / Double(max(1, s.delivered))))
     print(String(format: "  encode latency p50 %.1f ms · p95 %.1f ms · max %.1f ms · the engine's tick %.2f ms on average · ticks late %d",
                  pct(0.5), pct(0.95), lat.last.map { $0 * 1000 } ?? .nan, engineSeconds / Double(ticks) * 1000, late))
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder, opts.has("reduced") {
+        print("  reduced frames: \(hybrid.reducedStreams) streams at half size, \(hybrid.reducedPictures) of \(submits) pictures submitted")
+    }
 }
 
 /// The engine's side of `pace`, on its queue: a tick a frame.

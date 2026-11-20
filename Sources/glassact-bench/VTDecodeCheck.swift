@@ -130,6 +130,68 @@ enum VTDecodeCheck {
         return lines
     }
 
+    /// Reduced frames (`--stream-width`): the stream decoded by a session that asks for
+    /// `width` × `height` output (VideoToolbox scales a smaller frame up itself), each frame's
+    /// 4:2:0 planes at that size, for `--score-rgb` to score as the Viewer would show them; nil
+    /// where a frame failed or came out another size.
+    static func scaled(_ frames: [Frame], width: Int, height: Int) -> [YUV420?] {
+        guard let first = frames.first, let seq = AV1Config.sequenceHeaderOBU(inTemporalUnit: first.obu),
+              let config = AV1Config.build(sequenceHeaderOBU: seq) else { return frames.map { _ in nil } }
+        var desc: CMVideoFormatDescription?
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: ["av1C": Data(config)] as CFDictionary,
+        ]
+        guard CMVideoFormatDescriptionCreate(allocator: nil, codecType: kCMVideoCodecType_AV1,
+                                             width: Int32(width), height: Int32(height),
+                                             extensions: extensions as CFDictionary, formatDescriptionOut: &desc) == noErr,
+              let desc else { return frames.map { _ in nil } }
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
+        ]
+        var made: VTDecompressionSession?
+        guard VTDecompressionSessionCreate(allocator: nil, formatDescription: desc, decoderSpecification: nil,
+                                           imageBufferAttributes: attrs as CFDictionary, outputCallback: nil,
+                                           decompressionSessionOut: &made) == noErr, let session = made
+        else { return frames.map { _ in nil } }
+        defer { VTDecompressionSessionInvalidate(session) }
+        final class Result: @unchecked Sendable { var image: CVImageBuffer? }
+        return frames.map { f in
+            let result = Result()
+            let submitted: OSStatus = f.obu.withUnsafeBytes { src in
+                var block: CMBlockBuffer?
+                guard CMBlockBufferCreateWithMemoryBlock(
+                    allocator: nil, memoryBlock: UnsafeMutableRawPointer(mutating: src.baseAddress!),
+                    blockLength: f.obu.count, blockAllocator: kCFAllocatorNull, customBlockSource: nil,
+                    offsetToData: 0, dataLength: f.obu.count, flags: 0, blockBufferOut: &block) == noErr,
+                      let block else { return -1 }
+                var sample: CMSampleBuffer?
+                var size = f.obu.count
+                guard CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: desc,
+                                                sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+                                                sampleSizeEntryCount: 1, sampleSizeArray: &size,
+                                                sampleBufferOut: &sample) == noErr, let sample else { return -1 }
+                return VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) {
+                    s, _, buffer, _, _ in if s == noErr { result.image = buffer }
+                }
+            }
+            guard submitted == noErr, let image = result.image,
+                  CVPixelBufferGetWidth(image) == width, CVPixelBufferGetHeight(image) == height,
+                  CVPixelBufferGetPlaneCount(image) == 2 else { return nil }
+            CVPixelBufferLockBaseAddress(image, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+            guard let yb = CVPixelBufferGetBaseAddressOfPlane(image, 0), let cb = CVPixelBufferGetBaseAddressOfPlane(image, 1)
+            else { return nil }
+            let ys = CVPixelBufferGetBytesPerRowOfPlane(image, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(image, 1)
+            let cw = (width + 1) / 2, ch = (height + 1) / 2
+            var y = [UInt8](repeating: 0, count: width * height), u = [UInt8](repeating: 0, count: cw * ch), v = u
+            let yp = yb.assumingMemoryBound(to: UInt8.self), cp = cb.assumingMemoryBound(to: UInt8.self)
+            for r in 0..<height { for c in 0..<width { y[r * width + c] = yp[r * ys + c] } }
+            for r in 0..<ch { for c in 0..<cw { u[r * cw + c] = cp[r * cs + 2 * c]; v[r * cw + c] = cp[r * cs + 2 * c + 1] } }
+            return YUV420(width: width, height: height, planes: [y, u, v])
+        }
+    }
+
     private static func fourCC(_ t: OSType) -> String {
         let chars = [24, 16, 8, 0].map { Character(UnicodeScalar(UInt8((t >> $0) & 0xFF))) }
         return String(chars)

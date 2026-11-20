@@ -33,7 +33,8 @@ public struct ViewerVideoDecoders: Sendable {
                              glassActAV1: (@Sendable () -> any VideoRegionDecoder)?) -> ViewerVideoDecoders {
         let av1Decoder: (@Sendable () -> any VideoRegionDecoder)? = !av1 ? nil : hardwareAV1 ? hardware : glassActAV1
         var caps = WireCaps.videoHEVC
-        if av1Decoder != nil { caps |= WireCaps.videoAV1GlassAct }
+        // (both AV1 decoders show reduced frames at the region's size)
+        if av1Decoder != nil { caps |= WireCaps.videoAV1GlassAct | WireCaps.videoReducedFrames }
         if av1 && hardwareAV1 { caps |= WireCaps.videoAV1 }
         return ViewerVideoDecoders(caps: caps) { codec in
             switch codec {

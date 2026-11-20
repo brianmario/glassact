@@ -599,6 +599,17 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             VTDecodeCheck.Frame(obu: f.obu, key: f.params.frame_type != UInt8(AV1G_FRAME_INTER), planes: f.planes)
         }
         for line in VTDecodeCheck.run(vt, width: stream?.width ?? width, height: stream?.height ?? height) { print(line) }
+        // reduced frames: VideoToolbox asked for the stream's size, scaling them up itself
+        if let stream, scoreRGB {
+            let scaled = VTDecodeCheck.scaled(vt, width: stream.width, height: stream.height)
+            let vtRGB = try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens,
+                                      firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every,
+                                      width: stream.width, height: stream.height)
+            var failed = 0
+            for s in scaled { if let s { try vtRGB.add(s) } else { failed += 1; break } }
+            print(failed == 0 ? vtRGB.summary("VideoToolbox scaling \(width)×\(height) up to \(stream.width)×\(stream.height)")
+                  : "vt-decode: VideoToolbox didn't output a frame at the stream's size")
+        }
     }
     let n = Double(frames.count)
     func mean(_ f: (AV1HybridEncoder.Timing) -> Double) -> Double { frames.map { f($0.timing) }.reduce(0, +) / n * 1000 }
