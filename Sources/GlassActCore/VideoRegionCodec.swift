@@ -49,6 +49,10 @@ public protocol VideoRegionEncoder: AnyObject {
     /// already set. Runtime. Default no-op: HEVC's trade is that ceiling
     /// alone (`smoothMaxFrameQP`); AV1 uses its own (`AOMRegionEncoder`).
     func setSmoothMotion(_ on: Bool)
+    /// The Viewer shows reduced frames (`WireCaps.videoReducedFrames`, §4.6): the encoder may code
+    /// a region's video smaller than the region, its frames scaled up by the decoder. Set before
+    /// the region's first frame. Default no-op: only Glass Act's AV1 codes them.
+    func setReducedFrames(_ allowed: Bool)
     /// Frames the engine may have waiting in this encoder before it skips new ones (newest
     /// wins): enough to keep the encoder's own pipeline full at the screen's rate, and no more,
     /// since each one waiting is a frame of latency. Default `HostEngine.videoMaxPendingFrames`
@@ -65,6 +69,7 @@ public extension VideoRegionEncoder {
     func setBitrateCap(_ bitsPerSecond: Int?) {}
     func setMaxFrameQP(_ qp: Int?) {}
     func setSmoothMotion(_ on: Bool) {}
+    func setReducedFrames(_ allowed: Bool) {}
     var maxPendingFrames: Int { HostEngine.videoMaxPendingFrames }
 }
 

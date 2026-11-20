@@ -361,7 +361,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
 | 7 | videoAV1GlassAct | AV1 from Glass Act's encoder (codec 3, §4.6): a Viewer advertises it when its user opts in and it decodes the hybrid's streams (VideoToolbox, or Glass Act's decoder, which takes only that toolset); a Host, when its AV1 is Glass Act's. Such a Host sends AV1 to a Viewer with bit 1 or 7; a libaom Host only with bit 1. (Bit 7 was `videoOverlay` before wire version 4, which no peer of this one ever sent) |
-| 8 | — | unassigned |
+| 8 | videoReducedFrames | reduced AV1 frames (§4.6): coded smaller than the region, the region their render size. A Viewer advertises it when its AV1 decoder is VideoToolbox's, which scales them as it decodes (Glass Act's decoder shows them too, scaled with vImage, but that costs more than the half-size decode saves); a Host whose AV1 is Glass Act's, which codes them only to a Viewer with the bit. Released Viewers fail on such a frame |
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
 | 11 | agentControl | TEXT_INPUT, AGENT_STATE, UI_TREE*, agent-flagged INPUT |
@@ -625,6 +625,30 @@ first negotiated codec whose encoder starts; START carries its id.
     is libaom's (a released Host, or this one switched back) only under
     bit 1. Released Hosts don't know bit 7, and released Viewers never send
     it.
+- **Reduced frames** (`ReducedFramesPolicy`, `HybridRegionEncoder`; caps
+  bit 8, `videoReducedFrames`): Glass Act's AV1 codes a run of video at
+  half size each way when its content is softer than the region (video
+  scaled up to fill it), as AV1 reduced frames (`frame_size_override_flag`,
+  the region as the render size). The Viewer shows them scaled up: its
+  VideoToolbox session asks for the region's size (it otherwise outputs a
+  reduced frame at its coded size, and the size check drops it), which
+  scores as vImage's Lanczos and costs nothing. Only such a Viewer offers
+  the bit: Glass Act's decoder shows reduced frames too, but its Lanczos on
+  the BGRA (22 ms a 5K frame) costs more than the half-size decode saves.
+  - A run: from the fourth inter frame in a row coding more than half its
+    64×64s (a switch of screens is one, or three at worst).
+  - The margin: the half-size round trip (Lanczos down and up, 8 bands of
+    the luma, off the engine's queue, every 30 pictures) must lose 5 dB less
+    than the run's coding did (the encoder's luma MSE, every 8th row of
+    its decoded picture, `measuresLumaError`).
+  - Back at the region's size once an inter frame codes half its 64×64s or
+    fewer. Each switch starts a new stream (one size a stream; no scaled
+    references), so its first frame is a key frame, whose sequence header
+    may carry another level (the stream's tiles); the region's one config
+    holds.
+  - The engine tells the encoder once a region starts
+    (`setReducedFrames`), only with both sides' bit; HEVC and libaom never
+    code them.
 - **Codec id 3 for both encoders.** Both streams are standard AV1 with an
   `av1C` config, and the Viewer picks its decoder by what it has, not by
   who encoded. A new id would cost released M3 Viewers their AV1: they

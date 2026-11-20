@@ -9,7 +9,7 @@ import GlassActWire
 @Suite struct GlassActViewerVideoTests {
     @Test func withAV1HardwareVideoToolboxDecodesEverything() {
         let d = ViewerVideoDecoders.glassAct(av1: true, hardwareAV1: true)
-        #expect(d.caps == WireCaps.videoHEVC | WireCaps.videoAV1 | WireCaps.videoAV1GlassAct)
+        #expect(d.caps == WireCaps.videoHEVC | WireCaps.videoAV1 | WireCaps.videoAV1GlassAct | WireCaps.videoReducedFrames)
         #expect(d.decoder(forCodec: VideoCodec.av1) is VTRegionDecoder)
         #expect(d.decoder(forCodec: VideoCodec.hevc) is VTRegionDecoder)
     }
