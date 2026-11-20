@@ -3,6 +3,7 @@ public import GlassActCore
 import AV1Core
 public import GlassActAV1
 import GlassActWire
+import Accelerate
 import Metal
 import QuartzCore
 
@@ -41,6 +42,8 @@ import QuartzCore
 /// under `rateLock`; the encoder is confined to `Shared.control`.
 ///
 /// ## Deviations
+/// - Reduced frames scale each picture's planes into new arrays too, on the caller's queue
+///   (vImage, ~3 ms at 5K), and measure the half-size round trip's loss on a queue of their own.
 /// - Each picture's planes are new arrays: `AV1HybridEncoder.Picture` holds them by value, and the
 ///   encoder keeps past pictures (the copy finder's, the long-term references') for as long as it
 ///   needs them; the encoder itself allocates per picture too (its Deviations).
@@ -121,6 +124,21 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     private var rate = HybridRateController(bitsPerSecond: 8_000_000)
     private var submitted: [Double] = []
     private var configSent = false
+    /// Reduced frames (`ReducedFramesPolicy`), under `rateLock`: the policy, fed by the current
+    /// stream's frames.
+    private var reducedPolicy = ReducedFramesPolicy()
+    /// `epoch` as the frames' thread sees it, so only the current stream's frames feed the policy.
+    private var streamEpoch = 0
+    // the caller's queue: the Viewer shows reduced frames (`setReducedFrames`), and the current
+    // stream's coded size (the region's, or half of it each way)
+    private var reducedAllowed = false
+    private var codedWidth = 0
+    private var codedHeight = 0
+    /// Reduced frames: a margin measurement under way, and pictures since the last (the caller's
+    /// queue); the last one's result, until a picture takes it (`rateLock`).
+    private var marginInFlight = false
+    private var picturesSinceMargin = 0
+    private var roundTripMSE: Double?
 
     /// `callbackQueue` must be the host engine's confining queue (the VideoRegionEncoder threading
     /// contract).
@@ -138,6 +156,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
               let shared = Shared.instance else { return false }
         self.width = width
         self.height = height
+        (codedWidth, codedHeight) = (width, height)
+        picturesSinceMargin = Self.marginEvery
+        marginInFlight = false
         self.onFrame = onFrame
         self.shared = shared
         baseBitrate = AOMRegionEncoder.baseBitrate(width: width, height: height)
@@ -146,6 +167,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             rate.restart()
             submitted = []
             configSent = false
+            reducedPolicy = ReducedFramesPolicy()
+            roundTripMSE = nil
         }
         token = shared.claim()
         restartNext = false
@@ -167,7 +190,12 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         guard let shared, converter != nil || converter444 != nil, onFrame != nil else { return }
         let (w, h) = (width, height)
         let (cw, ch) = chroma444 ? (w, h) : (w / 2, h / 2)
+        // reduced frames: a run that ended goes back to the region's size (a new stream)
+        let policy = reducedAllowed && !chroma444 ? rateLock.withLock { reducedPolicy } : nil
+        var reduceNow = policy != nil && codedWidth != w
+        if let policy, reduceNow, policy.leavesReduced { reduceNow = false }
         // (every sample is the conversion's)
+        // (`var`: a reduced stream's pictures are these scaled down)
         var y = [UInt8](unsafeUninitializedCapacity: w * h) { _, n in n = w * h }
         var u = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
         var v = [UInt8](unsafeUninitializedCapacity: cw * ch) { _, n in n = cw * ch }
@@ -186,16 +214,59 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             deliverNothing()
             return
         }
-        if restartNext {
+        // reduced frames: a run long enough, whose content loses less to the half-size round trip
+        // than to its coding, goes to half size (a new stream)
+        if let policy, !reduceNow, policy.wantsMargin {
+            // (measured off this queue, every `marginEvery` pictures of a run: the last one's
+            // result decides)
+            let measured = rateLock.withLock { () -> Double? in defer { roundTripMSE = nil }; return roundTripMSE }
+            if let measured { reduceNow = policy.entersReduced(resampleMSE: measured) }
+            picturesSinceMargin += 1
+            if !reduceNow, !marginInFlight, picturesSinceMargin >= Self.marginEvery {
+                picturesSinceMargin = 0
+                marginInFlight = true
+                let (w, h, luma) = (width, height, y)
+                Self.marginQueue.async { [weak self] in
+                    let mse = Self.halfRoundTripMSE(luma, width: w, height: h)
+                    guard let self else { return }
+                    self.rateLock.withLock { self.roundTripMSE = mse }
+                    self.callbackQueue.async { [weak self] in self?.marginInFlight = false }
+                }
+            }
+        } else {
+            picturesSinceMargin = Self.marginEvery  // (a run's first chance measures at once)
+        }
+        let sizeChanges = reduceNow != (codedWidth != w)
+        if sizeChanges {
+            (codedWidth, codedHeight) = reduceNow ? (Self.half(w), Self.half(h)) : (w, h)
+        }
+        if restartNext || sizeChanges {
             restartNext = false
-            rateLock.withLock { rate.restart() }
+            let reduced = codedWidth != w
+            if reduced && sizeChanges { reducedStreams += 1 }
             startStream()  // (a key frame: the stream's first)
+            rateLock.withLock {
+                rate.restart()
+                reducedPolicy.started(reduced: reduced)
+                roundTripMSE = nil
+            }
+            if sizeChanges { applyRate() }
+        }
+        if codedWidth != w {
+            guard let small = Self.downscale([y, u, v], from: [(w, h), (cw, ch), (cw, ch)],
+                                             to: [(codedWidth, codedHeight), (codedWidth / 2, codedHeight / 2), (codedWidth / 2, codedHeight / 2)])
+            else {
+                deliverNothing()
+                return
+            }
+            (y, u, v) = (small[0], small[1], small[2])
+            reducedPictures += 1
         }
         // (the engine's frames are the picture's: 64×64s of the frame are the picture's 64×64s,
         // and the conversion is per pixel, 2×2 for 4:2:0's chroma, so an unchanged one converts
         // to the same samples)
-        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: w, height: h, chroma444: chroma444,
-                                               changed: changes)
+        let picture = AV1HybridEncoder.Picture(y: y, u: u, v: v, width: codedWidth, height: codedHeight, chroma444: chroma444,
+                                               changed: codedWidth == w && !sizeChanges ? changes : nil)
         changesBroken = false
         let token = token, fixed = fixedQindex
         let chooser = fixed != nil ? nil : rateChooser(timeUS: timeUS)
@@ -211,6 +282,27 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
                                   forceKey: forceSync, chooser: chooser)
         }
     }
+
+    /// The Viewer shows reduced frames (`WireCaps.videoReducedFrames`): runs of video whose
+    /// content is softer than the region may be coded at half size (`ReducedFramesPolicy`).
+    public func setReducedFrames(_ allowed: Bool) {
+        guard allowed != reducedAllowed else { return }
+        reducedAllowed = allowed
+        // (the stream under way measures its frames' coding loss from now on, or stops)
+        guard let shared else { return }
+        let token = token, measures = allowed && !chroma444
+        shared.control.async {
+            guard shared.owner == token else { return }
+            shared.encoder.measuresLumaError = measures
+        }
+    }
+
+    /// Reduced frames: the streams this region started at half size, and the pictures submitted
+    /// to them (the bench).
+    public private(set) var reducedStreams = 0
+    public private(set) var reducedPictures = 0
+    /// Reduced frames: a margin measurement is under way, off the caller's queue (tests).
+    public var measuringMargin: Bool { marginInFlight }
 
     public func setQualityLevel(_ level: Int) {
         guard level != qualityLevel else { return }
@@ -262,13 +354,21 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     /// The final qindex's ceiling: libaom's quantizer ceiling, on the qindex scale.
-    var maxQindex: Int {
+    public var maxQindex: Int {
         let q = quantizerCeiling ?? (smoothMotion ? smoothQuantizerCeiling : AOMRegionEncoder.quantizer(forFrameQP: maxFrameQP))
         return q >= 63 ? 255 : 4 * max(0, q)
     }
 
+    /// Reduced frames: how much finer than `maxQindex` a half-size stream's ceiling is. At the
+    /// ceiling (no link cap) a half-size picture at the full size's qindex takes ~40 % of its bytes
+    /// and loses ~3.5 dB at the region's size; 48 finer it takes about the same bytes for ~1 dB
+    /// more (BENCHMARKS "reduced frames for soft video").
+    public static let reducedCeilingOffset = 48
+
     private func applyRate() {
-        let (bits, ceiling, key, floor, cap) = (aimedBitrate, maxQindex, keyBudgetUS, minQindex, bitrateCap)
+        let reduced = codedWidth != width
+        let (bits, key, floor, cap) = (aimedBitrate, keyBudgetUS, minQindex, bitrateCap)
+        let ceiling = max(1, maxQindex - (reduced ? Self.reducedCeilingOffset : 0))
         let keyLink = keyLinkUS
         rateLock.withLock {
             rate.bitsPerSecond = bits
@@ -299,8 +399,11 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     private func startStream() {
         guard let shared else { return }
         epoch += 1
+        rateLock.withLock { streamEpoch = epoch }
         let token = token, epoch = epoch, configure = configure
-        let w = width
+        let w = codedWidth
+        let stream: (width: Int, height: Int)? = codedWidth != width ? (width, height) : nil
+        let measures = reducedAllowed && !chroma444
         shared.control.async { [weak self] in
             guard shared.owner == token else { return }
             if shared.streaming { shared.encoder.endStream() }
@@ -310,6 +413,10 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             // eight tile columns, as the encoder was measured (fewer where the picture is narrower)
             let sb128 = (w + 127) / 128
             e.tiling = (min(3, sb128 <= 1 ? 0 : Int(ceil(log2(Double(sb128))))), 0)
+            // (reduced frames: coded smaller, shown at the region's size; and each frame's coding
+            // loss, which the policy weighs)
+            e.streamSize = stream
+            e.measuresLumaError = measures
             configure?(e)
             e.startStream { [weak self] _, result in self?.written(result, token: token, epoch: epoch) }
             shared.streaming = true
@@ -326,6 +433,10 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             let key = frame.params.frame_type != UInt8(AV1G_FRAME_INTER)
             let (config, seconds): ([UInt8]?, Double) = rateLock.withLock {
                 if fixedQindex == nil { rate.wrote(bytes: frame.obu.count) }
+                if epoch == self.streamEpoch {
+                    let t = frame.timing
+                    reducedPolicy.wrote(key: key, codedShare: 1 - t.copied - t.copiedGolden, lumaMSE: t.lumaMSE)
+                }
                 let t0 = submitted.isEmpty ? now : submitted.removeFirst()
                 // the av1C record with the region's first frame (a key frame: its sequence header)
                 guard !configSent, key else { return (nil, now - t0) }
@@ -355,6 +466,78 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     private func deliver(_ data: [UInt8], sync: Bool, config: [UInt8]?, token: Int) {
         guard token == self.token, let onFrame else { return }
         onFrame(data, sync, config)
+    }
+
+    // MARK: - Reduced frames
+
+    /// Half a side, even (4:2:0's chroma is half of it again).
+    static func half(_ n: Int) -> Int { max(2, (n / 2) & ~1) }
+
+    /// Each plane scaled to its size (vImage's high-quality resampling, Lanczos); nil if vImage fails.
+    static func downscale(_ planes: [[UInt8]], from: [(Int, Int)], to: [(Int, Int)]) -> [[UInt8]]? {
+        var out: [[UInt8]] = []
+        for k in planes.indices {
+            let (fw, fh) = from[k], (tw, th) = to[k]
+            var d = [UInt8](unsafeUninitializedCapacity: tw * th) { _, n in n = tw * th }
+            let ok = planes[k].withUnsafeBufferPointer { src in
+                d.withUnsafeMutableBufferPointer { dst in
+                    var sb = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!), height: vImagePixelCount(fh),
+                                           width: vImagePixelCount(fw), rowBytes: fw)
+                    var db = vImage_Buffer(data: dst.baseAddress!, height: vImagePixelCount(th), width: vImagePixelCount(tw), rowBytes: tw)
+                    return vImageScale_Planar8(&sb, &db, nil, vImage_Flags(kvImageHighQualityResampling)) == kvImageNoError
+                }
+            }
+            guard ok else { return nil }
+            out.append(d)
+        }
+        return out
+    }
+
+    /// Reduced frames: a run's pictures between margin measurements (~0.5 s at 60 fps), and the
+    /// queue they're measured on (off the engine's).
+    static let marginEvery = 30
+    static let marginQueue = DispatchQueue(label: "glassact.hybrid.reduced-margin", qos: .utility)
+
+    /// The luma's loss to the half-size round trip (down and back up, as the stream would code and
+    /// the Viewer show it), as mean squared difference: over 8 bands of 64 rows spread down the
+    /// picture, each scaled with 16 rows either side so its edges don't count; nil if vImage fails.
+    static func halfRoundTripMSE(_ y: [UInt8], width w: Int, height h: Int) -> Double? {
+        let bandRows = 64, apron = 16, bands = 8
+        guard w >= 4, h >= bandRows + 2 * apron, y.count == w * h else { return nil }
+        let rows = bandRows + 2 * apron, hw = half(w)
+        var small = [UInt8](repeating: 0, count: hw * rows / 2), back = [UInt8](repeating: 0, count: w * rows)
+        let flags = vImage_Flags(kvImageHighQualityResampling)
+        var sum: UInt64 = 0, count = 0
+        for b in 0..<bands {
+            let top = (h - rows) * b / max(1, bands - 1) & ~1
+            let ok = y.withUnsafeBufferPointer { src in
+                small.withUnsafeMutableBufferPointer { m in
+                    back.withUnsafeMutableBufferPointer { o in
+                        var s = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress! + top * w),
+                                              height: vImagePixelCount(rows), width: vImagePixelCount(w), rowBytes: w)
+                        var d = vImage_Buffer(data: m.baseAddress!, height: vImagePixelCount(rows / 2), width: vImagePixelCount(hw), rowBytes: hw)
+                        var u = vImage_Buffer(data: o.baseAddress!, height: vImagePixelCount(rows), width: vImagePixelCount(w), rowBytes: w)
+                        return vImageScale_Planar8(&s, &d, nil, flags) == kvImageNoError && vImageScale_Planar8(&d, &u, nil, flags) == kvImageNoError
+                    }
+                }
+            }
+            guard ok else { return nil }
+            y.withUnsafeBufferPointer { a in
+                back.withUnsafeBufferPointer { o in
+                    for r in apron..<(apron + bandRows) {
+                        var row: UInt32 = 0
+                        let src = a.baseAddress! + (top + r) * w, got = o.baseAddress! + r * w
+                        for c in 0..<w {
+                            let e = Int32(src[c]) - Int32(got[c])
+                            row &+= UInt32(e * e)
+                        }
+                        sum &+= UInt64(row)
+                        count += w
+                    }
+                }
+            }
+        }
+        return count == 0 ? nil : Double(sum) / Double(count)
     }
 
     private func deliverNothing() {

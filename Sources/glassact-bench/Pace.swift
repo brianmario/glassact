@@ -6,6 +6,7 @@
 // what a Viewer would see: frames delivered a second, skips, and each frame's encode latency.
 // No network, no Viewer: the encoder and the submission rule alone.
 import Foundation
+import GlassActAV1
 import GlassActCore
 import GlassActHybridVideo
 import QuartzCore
@@ -21,6 +22,7 @@ let paceCommand = Command(
         .string("every", "<ms>", "a frame every ms, in real time (default 16.667: 60 fps)"),
         .int("pending", "<n>", 1...16, "frames waiting for the encoder before the engine skips (default 2, videoMaxPendingFrames)"),
         .int("loops", "<n>", 1...100, "play the loaded frames this many times (default 1)"),
+        .bool("reduced", "with --codec hybrid: the Viewer shows reduced frames (WireCaps.videoReducedFrames), so runs of video softer than the region may be coded at half size (ReducedFramesPolicy)"),
     ],
     run: { opts in try runPace(opts) })
 
@@ -32,6 +34,9 @@ private final class PaceState: @unchecked Sendable {
     var empty = 0
     var bytes = 0
     var firstOut = 0.0, lastOut = 0.0
+    /// The hybrid's inter frames' qindex (its rate controller's), from `onWritten`.
+    let lock = NSLock()
+    var qindexes: [Int] = []
 }
 
 func runPace(_ opts: Options) throws {
@@ -64,9 +69,16 @@ func runPace(_ opts: Options) throws {
         HybridRegionEncoder.prepare { _ in prepared.signal() }
         prepared.wait()
         guard HybridRegionEncoder.isReady else { throw BenchError("the hybrid's kernels didn't compile") }
-        encoder = HybridRegionEncoder(callbackQueue: queue)
+        let hybrid = HybridRegionEncoder(callbackQueue: queue)
+        encoder = hybrid
     }
     let s = PaceState()
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder {
+        hybrid.onWritten = { frame, key, _ in
+            guard !key else { return }
+            s.lock.withLock { s.qindexes.append(frame.timing.qindex) }
+        }
+    }
     guard encoder.start(width: w, height: h, onFrame: { data, _, _ in
         // (on `queue`, as the engine's)
         s.pending -= 1
@@ -78,6 +90,7 @@ func runPace(_ opts: Options) throws {
         s.bytes += data.count
         s.lastOut = now
     }) else { throw BenchError("the encoder didn't start") }
+    if opts.has("reduced") { encoder.setReducedFrames(true) }
 
     let run = PaceRun(frames: frames, width: w, height: h, loops: loops, every: everyMS / 1000, limit: limit,
                       encoder: encoder, state: s, queue: queue)
@@ -99,6 +112,17 @@ func runPace(_ opts: Options) throws {
                  Double(s.delivered) / playSeconds, playSeconds, Double(s.bytes) / 1024 / Double(max(1, s.delivered))))
     print(String(format: "  encode latency p50 %.1f ms · p95 %.1f ms · max %.1f ms · the engine's tick %.2f ms on average · ticks late %d",
                  pct(0.5), pct(0.95), lat.last.map { $0 * 1000 } ?? .nan, engineSeconds / Double(ticks) * 1000, late))
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder, opts.has("reduced") {
+        print("  reduced frames: \(hybrid.reducedStreams) streams at half size, \(hybrid.reducedPictures) of \(submits) pictures submitted")
+    }
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder {
+        let q = s.lock.withLock { s.qindexes }
+        let ceiling = hybrid.maxQindex
+        if !q.isEmpty {
+            print(String(format: "  inter frames' qindex: mean %.1f · min %d · max %d · at the ceiling (%d) or within the fast pictures' offset of it: %d of %d",
+                         Double(q.reduce(0, +)) / Double(q.count), q.min()!, q.max()!, ceiling, q.filter { $0 >= ceiling - 8 }.count, q.count))
+        }
+    }
 }
 
 /// The engine's side of `pace`, on its queue: a tick a frame.

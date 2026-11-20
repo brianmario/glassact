@@ -451,6 +451,8 @@ public final class VTRegionDecoder: VideoRegionDecoder {
     private var width = 0
     private var height = 0
     private var awaitingSync = false
+    /// AV1: the session outputs at the region's size (see `createSession`).
+    private var scalesToRegion = false
 
     /// Written by VT's output handler, which runs synchronously inside
     /// DecodeFrame (no async flag) — before `decode` reads it.
@@ -464,6 +466,7 @@ public final class VTRegionDecoder: VideoRegionDecoder {
     public func start(codec: UInt8, config: [UInt8], width: Int, height: Int) -> Bool {
         self.width = width
         self.height = height
+        scalesToRegion = codec == VideoCodec.av1
         switch codec {
         case VideoCodec.hevc: return startHEVC(config: config)
         case VideoCodec.av1: return startAV1(config: config)
@@ -534,9 +537,14 @@ public final class VTRegionDecoder: VideoRegionDecoder {
     }
 
     private func createSession(with desc: CMVideoFormatDescription) -> Bool {
-        let attrs: [CFString: Any] = [
+        // AV1 at the region's size: VideoToolbox scales a reduced frame (coded smaller than the
+        // region, with the region as its render size) up to it itself, which it otherwise outputs
+        // at its coded size; its scaling scores as vImage's Lanczos (BENCHMARKS "reduced frames
+        // for video"). HEVC as it was.
+        var attrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
         ]
+        if scalesToRegion { (attrs[kCVPixelBufferWidthKey], attrs[kCVPixelBufferHeightKey]) = (width, height) }
         var s: VTDecompressionSession?
         guard VTDecompressionSessionCreate(
             allocator: nil, formatDescription: desc, decoderSpecification: nil,

@@ -893,6 +893,7 @@ public final class HostEngine: @unchecked Sendable {
                         }
                     videoNegotiated = !negotiatedVideoCodecs.isEmpty
                     cursorNegotiated = caps & WireCaps.cursor != 0
+                    reducedFramesNegotiated = videoAV1FromGlassAct && caps & WireCaps.videoReducedFrames != 0
                     // The handshake round trip seeds SRTT so the first batch
                     // timeout and tile-governor start are already RTT-aware.
                     // (An arrival stamp can predate a re-offered HELLO's
@@ -1762,7 +1763,11 @@ public final class HostEngine: @unchecked Sendable {
     private var videoCaps: UInt32 {
         videoEncoderFactory == nil ? 0
             : videoCodecPreference.reduce(0) { $0 | WireCaps.viewerBits(forVideoCodec: $1, glassActAV1: videoAV1FromGlassAct) }
+                | (videoAV1FromGlassAct ? WireCaps.videoReducedFrames : 0)
     }
+    /// Reduced frames (§4.6): the Viewer shows them and the AV1 is Glass Act's, so its regions may
+    /// code video smaller than the region (`VideoRegionEncoder.setReducedFrames`).
+    public private(set) var reducedFramesNegotiated = false
     /// Cursor as metadata: the viewer composites the pointer from control messages; while
     /// negotiated the host should capture with showsCursor = false.
     public private(set) var cursorNegotiated = false
