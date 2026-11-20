@@ -636,6 +636,13 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         set { metal.searchesSubpelMotion = newValue }
     }
 
+    /// The motion search seeded with the picture before's (`AV1MetalEncoder.motionSeed`; nil: off).
+    /// On (`defaultMotionSeed`) in a run of mostly-new pictures.
+    public var motionSeed: AV1MetalEncoder.MotionSeed? {
+        get { metal.motionSeed }
+        set { metal.motionSeed = newValue }
+    }
+
     /// The last picture, for the next inter frame: its source, decoded
     /// output and per-64×64 decisions (copy, dx, dy).
     private var previous: (source: Picture, planes: [[UInt8]], motion: [Int32])?
@@ -693,6 +700,19 @@ public final class AV1HybridEncoder: @unchecked Sendable {
     public func compileKernels() throws {
         _ = try metal.analysisKernels(fixed: false)
         _ = try metal.analysisKernels(fixed: true)
+        if metal.motionSeed != nil { _ = try metal.motionSearch(seeded: true) }
+    }
+
+    /// The encoder's motion seed: in a mostly-new picture after a mostly-new picture (video), the
+    /// window around the picture before's best ±4 and no motion's ±2, not ±8. On 60 fps video at
+    /// 5K the motion search 5.4 → 4.8 ms, BD-rate −5.4 % (the seeds follow motion past ±8). Screens
+    /// rarely have two mostly-new pictures in a row: app switching, tabs, windows and an IDE code
+    /// as without it, a rotation of four screens 41 B smaller (BENCHMARKS "the motion search
+    /// seeded with the picture before's").
+    public static var defaultMotionSeed: AV1MetalEncoder.MotionSeed {
+        var m = AV1MetalEncoder.MotionSeed()
+        (m.zeroRadius, m.seedRadius, m.runsOnly) = (2, 4, true)
+        return m
     }
 
     public init(device: any MTLDevice, kernels: AV1Kernels = .shipped) throws {
@@ -707,6 +727,7 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         metal.searchesSubpelMotion = true
         metal.interGate = 2
         metal.newPictureShapeMask = Self.defaultNewPictureShapeMask
+        metal.motionSeed = Self.defaultMotionSeed
         postfilter = try AV1MetalPostfilter(device: device, kernels: kernels)
         guard let cpu = av1enc_hybrid_create(), let motion = av1enc_motion_create(), let readerMotion = av1enc_motion_create()
         else { throw Failure.encode("no CPU state") }
