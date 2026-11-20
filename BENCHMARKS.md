@@ -309,6 +309,7 @@ the numbers and the reasoning.
 | A lone picture's serial path, byte-identical: set-up copies in spans on every core; the copy finder's vote by a hash table; a new analysis cache taking its predecessor's buffers, cleared on the GPU; its first inter frame analyzing only the SBs it codes, choices made as for every SB (`metal-av1`) | kept | the rotation lone p50 40.8 → 37.4 ms, `every=16.7` 40 → 43 a second, burst 55.3 → 56.2; app switching at 6 Mbit/s: the rebuilt pictures 32 → 20.5 ms, the switch 41.7 → 36.0 and the next 39 → 27.4, p95 18 → 12 | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | The copy finder on 14 threads, not 8; the writer's levels set before coding with each neighbour read once; a new cache's first picture with its kernels chosen by the analyzed count (`metal-av1`) | measured, not kept | copies 1.72 → 1.49 ms, p50 in the noise; writer 7.78 → 7.77 ms; the last moves bytes (a shape under 4,096 blocks takes the SIMD-group kernel) | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
+| `k_me`'s SADs in floats: the window search's samples as 2^23 + v from their bits, the sub-sample steps' bilinear sums floored in floats (the same whole numbers) (`metal-av1`) | kept; a separate sub-sample kernel, lanes stepping a row at a time, stepped vectors and ten sub-sample variants not (no gain or slower) | the same streams; 5K q36 `k_me` video 4.52 → 3.38 ms a frame (medians), movie 3.05 → 2.66; now bound by instruction throughput, not the integer unit | [entry](#metal-av1-k_mes-sads-in-floats-the-same-streams-in-three-quarters-of-the-time-2026-11-20) |
 
 **Rate control and transport**
 
@@ -376,6 +377,92 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: `k_me`'s SADs in floats, the same streams in three quarters of the time (2026-11-20)
+
+`k_me` had become the analysis's largest kernel on moving content. The owner's 60 fps video at
+5K, q36: 4.3 ms of GPU time a frame, occupancy 28, bound by its integer and conditional unit
+(86–87 %), stack 62 % of its L1 traffic. Its window search alone (`--no-subpel`, a diagnosis)
+was 3.06 ms at 93 % integer, and its stack was 0 %. The sub-sample steps held all of the stack,
+as on photos (2026-11-18).
+
+**Kept: the arithmetic on samples in floats.** Every value is a whole number under 2^24, so each
+float result is exactly the integer one: the same vectors, keys, ties and `meBest`.
+- **The window search's SAD.** The cell's even rows go to threadgroup memory as floats. A
+  reference sample is made a float from its bits, `as_type<float>(0x4B000000 | v)` (2^23 + v:
+  one OR, where a conversion costs more). The sample's work is then a subtraction and an add
+  of its absolute value, both in the float unit. The early exit `(sad << 11 | i) > thr` becomes
+  `sad >= (thr - i) / 2048 + 1`, rounded down. The key is still the integer one.
+- **The sub-sample steps' bilinear sums and SADs.** The window is held as floats, and `>> 6`
+  becomes `floor((s + 32) * 1/64)`, which is exact. Their sums still pack two into a `simd_sum`
+  as integers.
+
+Each step, by `av1seq --profile`'s motion search stage on video. That is `k_proj_sums`,
+`k_proj`, `k_me` and `k_inter_sad`, best of 10, two runs each, and runs repeated within 0.01 ms:
+
+| step | video motion search, ms |
+|---|---|
+| before | 6.48 |
+| the window search's SAD in floats (converted samples) | 5.89 |
+| and the sub-sample steps in floats | 5.60 |
+| and samples from their bits, not converted | 5.43 |
+
+The same on the movie trace: 4.80 → 4.37.
+
+`k_me` from `xctrace` (the "GlassAct GPU" template, `--frames 41 --inter --no-planes --q 36`,
+per frame). The recordings alternated with the build before, on a Mac with other GPU work in
+0–34 % of the window:
+
+| `k_me` ms a frame · stack · bound by | before | after |
+|---|---|---|
+| video (skip 220) | 4.33, 4.51, 4.59, 4.59, 4.52 · 62 % · integer and conditional 86–87 | 3.44, 2.96, 3.65, 3.32 · 52 % · instruction throughput 76 |
+| movie (skip 300) | 3.10, 3.00 · 57–58 % · integer and conditional 85 | 2.72, 2.59 · 49 % · instruction throughput 67–69 |
+
+- **Video: 4.52 → 3.38 ms (medians), −25 %. Movie: 3.05 → 2.66, −13 %.** The after
+  recordings spread 2.96–3.65 ms, wider than the ±5 % a kernel time is good to, but they don't
+  overlap the before ones: −20 to −35 %. The first of each (4.33, 3.44) were recorded alone,
+  the rest alternated. The kernel is now bound by instruction throughput, not the integer unit.
+  Occupancy stayed 28 on video; on movie it went 29 → 26–27.
+- **The stack wasn't the lever.** It went only 62 → 52 % on video, 57–58 → 49 % on movie. The
+  time came off moving the samples' arithmetic off the integer unit.
+- **The same streams.** The `--ivf` md5 of video, movie, typing and the rotation (24 inter
+  frames, 5K, `--tiles 3x0 --q 36`) is the same before and after.
+- **Recording pitfall.** The first `xctrace` recording after a shader changes compiles its
+  kernels inside the window, and then it has no `k_me` line at all. A short recording first
+  (`--frames 3`) helps, but even after one, 2 of 15 recordings here had no `k_me`: throw those
+  away. To screen a change, `av1seq --profile`'s motion search stage (best of 10) repeats within
+  0.01 ms in about 20 s; `xctrace` then confirms.
+
+**Measured, not kept** (written to keep the stream, but no digests were run on them; video's
+motion search stage, against 5.43 unless said):
+- `k_me`'s sub-sample steps in a kernel of their own (`k_me_sub`, reading and rewriting
+  `meBest`): 5.49. The window search ran at occupancy 40 instead of 28 (2.33 ms), but
+  `k_me_sub` took 1.22 ms (stack 57 %), and the barrier between them costs too.
+- In that kernel, each against its 5.49 or 5.47:
+  - The bilinear sums by row weights instead of selects (5.68).
+  - The bilinear sums as 8·h(top) + fy·(h(below) − h(top)) (5.80).
+  - Each column's positions summed straight away, with no 9-element arrays (5.51).
+  - Four of the lane's samples at a time (5.77).
+  - The window prescaled by 1/64 (5.46–5.47, under the resolution).
+- Merged in `k_me`, against the sub-sample steps in floats from converted samples (5.60):
+  - `h` as three arrays (5.67–5.80).
+  - A uniform branch per position instead of the per-sample selects (6.01).
+- Merged in `k_me`, against 5.43:
+  - Each column's sums straight away, with that loop not unrolled (5.59).
+  - The window prescaled by 1/64 (5.43).
+  - The window's row and column stepped instead of divided (5.44).
+- The window search's lanes each stepping through their own vectors a row at a time, not in
+  rounds a vector each (a round lasts as long as its slowest lane). 7.11; four rows a step,
+  6.03. The per-step bookkeeping costs more than the idle lanes did.
+- The window search's vector stepped as a column and row of its window instead of divided, its
+  centre kept in registers: 5.52.
+- The cell's row read as `float4`s from threadgroup memory (5.44); the reference read as
+  `packed_uchar4` (5.45). The compiler already did as well.
+- Dropping the `seen` scan over earlier candidates (a diagnosis, other streams): 5.44. It costs
+  nothing on video.
+
+Left: the sub-sample steps (about 1.2 ms of video's `k_me`, all of its stack) and the window
+search's per-sample work: two loads, an OR, a subtraction and an add.
+
 ### Metal AV1: the small shapes in runs of mostly-new pictures (2026-11-20)
 
 The owner's 60 fps video from Photos (`glassact-1795125212`, 5K, 52 fps on average, 1,461 of
@@ -434,7 +521,6 @@ rounds (load 6–16, provisional):
 - Still short of 60 on this video: the GPU is ~19–23 ms with the filters, and the closed loop is
   11–17 ms. Next: the spills in the small-shape kernels and k_me (byte-identical), then the
   closed loop.
-
 ### Video: three frames waiting for Glass Act's AV1 and HEVC; the Host's rule in real time (2026-11-19)
 
 **`glassact-bench pace` (new)** plays a trace into a region's real encoder in real time, as the
