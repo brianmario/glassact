@@ -6,6 +6,7 @@
 // what a Viewer would see: frames delivered a second, skips, and each frame's encode latency.
 // No network, no Viewer: the encoder and the submission rule alone.
 import Foundation
+import GlassActAV1
 import GlassActCore
 import GlassActHybridVideo
 import QuartzCore
@@ -33,6 +34,9 @@ private final class PaceState: @unchecked Sendable {
     var empty = 0
     var bytes = 0
     var firstOut = 0.0, lastOut = 0.0
+    /// The hybrid's inter frames' qindex (its rate controller's), from `onWritten`.
+    let lock = NSLock()
+    var qindexes: [Int] = []
 }
 
 func runPace(_ opts: Options) throws {
@@ -65,9 +69,16 @@ func runPace(_ opts: Options) throws {
         HybridRegionEncoder.prepare { _ in prepared.signal() }
         prepared.wait()
         guard HybridRegionEncoder.isReady else { throw BenchError("the hybrid's kernels didn't compile") }
-        encoder = HybridRegionEncoder(callbackQueue: queue)
+        let hybrid = HybridRegionEncoder(callbackQueue: queue)
+        encoder = hybrid
     }
     let s = PaceState()
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder {
+        hybrid.onWritten = { frame, key, _ in
+            guard !key else { return }
+            s.lock.withLock { s.qindexes.append(frame.timing.qindex) }
+        }
+    }
     guard encoder.start(width: w, height: h, onFrame: { data, _, _ in
         // (on `queue`, as the engine's)
         s.pending -= 1
@@ -103,6 +114,14 @@ func runPace(_ opts: Options) throws {
                  pct(0.5), pct(0.95), lat.last.map { $0 * 1000 } ?? .nan, engineSeconds / Double(ticks) * 1000, late))
     if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder, opts.has("reduced") {
         print("  reduced frames: \(hybrid.reducedStreams) streams at half size, \(hybrid.reducedPictures) of \(submits) pictures submitted")
+    }
+    if #available(macOS 27, *), let hybrid = encoder as? HybridRegionEncoder {
+        let q = s.lock.withLock { s.qindexes }
+        let ceiling = hybrid.maxQindex
+        if !q.isEmpty {
+            print(String(format: "  inter frames' qindex: mean %.1f · min %d · max %d · at the ceiling (%d) or within the fast pictures' offset of it: %d of %d",
+                         Double(q.reduce(0, +)) / Double(q.count), q.min()!, q.max()!, ceiling, q.filter { $0 >= ceiling - 8 }.count, q.count))
+        }
     }
 }
 

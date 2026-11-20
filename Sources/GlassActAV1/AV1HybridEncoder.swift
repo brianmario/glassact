@@ -1854,7 +1854,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         timing.filtersGPU = postfilter.lastGPUSeconds
 
         remember(p, search.planes, sbMotion)
-        if measuresLumaError { timing.lumaMSE = decodedLumaMSE(p, search.planes) }
+        // (mostly-new inter frames only: the others don't feed the Host's policy)
+        if measuresLumaError, reference != nil, 1 - timing.copied - timing.copiedGolden > 0.5 {
+            timing.lumaMSE = decodedLumaMSE(p, search.planes)
+        }
         // the previous picture's write ran beside this closed loop and these filters: taken back
         // now, before this one's begins
         let ended = try writingBefore?.end()

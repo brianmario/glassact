@@ -13,7 +13,8 @@ import Foundation
 /// - **The margin**: how much less the half-size round trip (Lanczos down and up) loses than the
 ///   picture's coding does, by luma MSE in dB; at least `marginDB`. The video's is ~+9 dB, the
 ///   movie's +2, maps −4.
-/// - **Back to full size** when the run ends: an inter frame that codes half its 64×64s or less.
+/// - **Back to full size** when the run ends: `leaveAfter` inter frames in a row that code half
+///   their 64×64s or less (one is a pause or a cut; each switch is a key frame).
 ///
 /// Each switch starts a new stream, so its first picture is a key frame (the encoder codes one
 /// size a stream). The caller's queue owns this state; frames' results come in under its lock.
@@ -21,8 +22,13 @@ public struct ReducedFramesPolicy: Sendable, Equatable {
     public static let defaultEnterAfter = 3
     public static let defaultMarginDB = 5.0
 
+    public static let defaultLeaveAfter = 2
+
     public var enterAfter = defaultEnterAfter
     public var marginDB = defaultMarginDB
+    public var leaveAfter = defaultLeaveAfter
+    /// Inter frames in a row coding half their 64×64s or less.
+    public private(set) var quiet = 0
 
     /// Mostly-new inter frames in a row, of the current stream.
     public private(set) var run = 0
@@ -42,9 +48,11 @@ public struct ReducedFramesPolicy: Sendable, Equatable {
         if reduced { sawReducedInter = true }
         if codedShare > 0.5 {
             run += 1
+            quiet = 0
             if !reduced, lumaMSE >= 0 { codingMSE = lumaMSE }
         } else {
             run = 0
+            quiet += 1
             if !reduced { codingMSE = nil }
         }
     }
@@ -60,7 +68,7 @@ public struct ReducedFramesPolicy: Sendable, Equatable {
     }
 
     /// Whether a reduced stream should go back to full size: its run ended.
-    public var leavesReduced: Bool { reduced && run == 0 && sawReducedInter }
+    public var leavesReduced: Bool { reduced && quiet >= leaveAfter && sawReducedInter }
 
     private var sawReducedInter = false
 
@@ -68,6 +76,7 @@ public struct ReducedFramesPolicy: Sendable, Equatable {
     public mutating func started(reduced: Bool) {
         self.reduced = reduced
         sawReducedInter = false
+        quiet = 0
         if !reduced { run = 0 }
         codingMSE = nil
     }

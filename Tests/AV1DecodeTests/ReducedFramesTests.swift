@@ -57,14 +57,15 @@ struct ReducedFramesTests {
         }
         try #require(started)
         engine.queue.sync { encoder.setReducedFrames(reduced) }
-        // 14 new pictures, then the last one 4 times over
+        // 14 new pictures, then the last one 4 times over (two of them, in a row, end the run)
         let new = (0..<14).map { Self.soft(width: width, height: height, seed: 0x5e_d0 + UInt64($0)) }
         let pictures = new + Array(repeating: new[13], count: 4)
         for (i, p) in pictures.enumerated() {
             engine.queue.sync { p.withUnsafeBytes { encoder.encode(bgra: $0, forceSync: false, timeUS: UInt64(i) * 16_667) } }
-            // (one at a time: the margin, measured off the engine's queue, is back before the next)
             #expect(engine.delivered.wait(timeout: .now() + 20) == .success, "picture \(i) didn't come out")
-            usleep(20_000)
+            // (one at a time: the margin, measured off the engine's queue, is back before the next)
+            let deadline = Date().addingTimeInterval(20)
+            while engine.queue.sync(execute: { encoder.measuringMargin }), Date() < deadline { usleep(1000) }
         }
         let (streams, reducedPictures) = engine.queue.sync { (encoder.reducedStreams, encoder.reducedPictures) }
         engine.queue.sync { encoder.stop() }
@@ -77,9 +78,9 @@ struct ReducedFramesTests {
         let (frames, streams, reducedPictures) = try run(reduced: true)
         try #require(frames.count == 18 && frames.allSatisfy { !$0.data.isEmpty })
         #expect(streams == 1, "streams at half size: \(streams)")
-        // half size from the run's 5th inter frame or a little after (the margin's measurement),
-        // until the first repeat (which still codes at half size and ends the run) plus one
-        #expect((8...12).contains(reducedPictures), "pictures at half size: \(reducedPictures)")
+        // half size from the run's 5th inter frame (its margin measured on the 5th), until the
+        // second repeat (the first two still code at half size and end the run)
+        #expect((9...12).contains(reducedPictures), "pictures at half size: \(reducedPictures)")
         let keys = frames.indices.filter { frames[$0].sync }
         #expect(keys.count == 3 && keys.first == 0, "key frames at \(keys)")
         // every key frame's sequence header is the region's size and profile (its level follows

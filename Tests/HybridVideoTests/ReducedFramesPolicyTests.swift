@@ -37,7 +37,12 @@ struct ReducedFramesPolicyTests {
         p.wrote(key: false, codedShare: 1, lumaMSE: 5)
         #expect(!p.leavesReduced, "still a run")
         p.wrote(key: false, codedShare: 0.2, lumaMSE: 1)
-        #expect(p.leavesReduced)
+        #expect(!p.leavesReduced, "one quiet frame: a pause or a cut")
+        p.wrote(key: false, codedShare: 1, lumaMSE: 5)
+        p.wrote(key: false, codedShare: 0.2, lumaMSE: 1)
+        #expect(!p.leavesReduced, "quiet again, but not twice in a row")
+        p.wrote(key: false, codedShare: 0.1, lumaMSE: 1)
+        #expect(p.leavesReduced, "two in a row")
         p.started(reduced: false)
         #expect(!p.reduced && !p.leavesReduced && p.run == 0 && !p.wantsMargin)
     }

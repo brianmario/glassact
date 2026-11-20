@@ -42,6 +42,8 @@ import QuartzCore
 /// under `rateLock`; the encoder is confined to `Shared.control`.
 ///
 /// ## Deviations
+/// - Reduced frames scale each picture's planes into new arrays too, on the caller's queue
+///   (vImage, ~3 ms at 5K), and measure the half-size round trip's loss on a queue of their own.
 /// - Each picture's planes are new arrays: `AV1HybridEncoder.Picture` holds them by value, and the
 ///   encoder keeps past pictures (the copy finder's, the long-term references') for as long as it
 ///   needs them; the encoder itself allocates per picture too (its Deviations).
@@ -156,6 +158,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
         self.height = height
         (codedWidth, codedHeight) = (width, height)
         picturesSinceMargin = Self.marginEvery
+        marginInFlight = false
         self.onFrame = onFrame
         self.shared = shared
         baseBitrate = AOMRegionEncoder.baseBitrate(width: width, height: height)
@@ -165,6 +168,7 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             submitted = []
             configSent = false
             reducedPolicy = ReducedFramesPolicy()
+            roundTripMSE = nil
         }
         token = shared.claim()
         restartNext = false
@@ -244,7 +248,9 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
             rateLock.withLock {
                 rate.restart()
                 reducedPolicy.started(reduced: reduced)
+                roundTripMSE = nil
             }
+            if sizeChanges { applyRate() }
         }
         if codedWidth != w {
             guard let small = Self.downscale([y, u, v], from: [(w, h), (cw, ch), (cw, ch)],
@@ -295,6 +301,8 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     /// to them (the bench).
     public private(set) var reducedStreams = 0
     public private(set) var reducedPictures = 0
+    /// Reduced frames: a margin measurement is under way, off the caller's queue (tests).
+    public var measuringMargin: Bool { marginInFlight }
 
     public func setQualityLevel(_ level: Int) {
         guard level != qualityLevel else { return }
@@ -346,13 +354,21 @@ public final class HybridRegionEncoder: VideoRegionEncoder, @unchecked Sendable 
     }
 
     /// The final qindex's ceiling: libaom's quantizer ceiling, on the qindex scale.
-    var maxQindex: Int {
+    public var maxQindex: Int {
         let q = quantizerCeiling ?? (smoothMotion ? smoothQuantizerCeiling : AOMRegionEncoder.quantizer(forFrameQP: maxFrameQP))
         return q >= 63 ? 255 : 4 * max(0, q)
     }
 
+    /// Reduced frames: how much finer than `maxQindex` a half-size stream's ceiling is. At the
+    /// ceiling (no link cap) a half-size picture at the full size's qindex takes ~40 % of its bytes
+    /// and loses ~3.5 dB at the region's size; 48 finer it takes about the same bytes for ~1 dB
+    /// more (BENCHMARKS "reduced frames for soft video").
+    public static let reducedCeilingOffset = 48
+
     private func applyRate() {
-        let (bits, ceiling, key, floor, cap) = (aimedBitrate, maxQindex, keyBudgetUS, minQindex, bitrateCap)
+        let reduced = codedWidth != width
+        let (bits, key, floor, cap) = (aimedBitrate, keyBudgetUS, minQindex, bitrateCap)
+        let ceiling = max(1, maxQindex - (reduced ? Self.reducedCeilingOffset : 0))
         let keyLink = keyLinkUS
         rateLock.withLock {
             rate.bitsPerSecond = bits
