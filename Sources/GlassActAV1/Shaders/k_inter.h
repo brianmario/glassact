@@ -11,7 +11,11 @@
 //   k_me     one SIMD-group per 16x16 of the listed SBs: SAD (every other row) at whole-sample
 //            vectors within +-8 of no motion, +-4 of each of the frame's shift candidates and +-4
 //            of its SB's k_proj vector; the best refined to half and then quarter samples
-//            (GpParams.meSubpel); keeps the best GP_ME_KEEP in GpImage.meBest
+//            (GpParams.meSubpel); keeps the best GP_ME_KEEP in GpImage.meBest. As k_me_seed (in
+//            a run of mostly-new pictures: AV1MetalEncoder.motionSeed), where the picture before
+//            searched the 16x16 its whole-sample best (GpImage.meSeedIn) is a window too (+-4)
+//            and no motion's is smaller (+-2): video's motion is coherent, and the seeds follow
+//            it past +-8
 //   k_inter  one SIMD-group per (shape, position) of 8x8 and up, before the intra analysis: SAD
 //            screening of no motion and the vectors k_me kept for the 16x16s the block covers, then
 //            the analysis's exact-rate RD (DCT_DCT) of the best, into GpInterRes (J, and zero when
@@ -26,14 +30,16 @@
 #pragma once
 #include "k_analysis.h"
 
-// k_me's vectors: index i < 289 is no motion's +-8 window, then 81 per candidate (+-4): the frame's
-// shift candidates, then the SB's k_proj vector `sbv`
-constant int GA_ME_ZERO = 289;
-static inline int2 ga_me_vector(device const GpImage &I, int i, int2 sbv) {
-    if (i < GA_ME_ZERO) return int2(i % 17 - 8, i / 17 - 8);
-    const int j = i - GA_ME_ZERO, c = j / 81, o = j % 81;
-    const int2 centre = c < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * c], I.meCand[2 * c + 1]) : sbv;
-    return centre + int2(o % 9 - 4, o / 9 - 4);
+// k_me's vectors: index i < nz is no motion's window ((2 rz + 1)^2: rz 8, or with a seed
+// GpImage.meZeroR), then 81 per candidate (+-4): the frame's shift candidates, then the SB's k_proj
+// vector; then, with a seed, its window ((2 rs + 1)^2)
+// Glass Act: k_me reads a seed (GpImage.meSeedIn) only as k_me_seed, its pipeline with this
+// constant: without it, k_me is the search with no seed alone (ga_me_window<8, 0>)
+constant bool ga_me_seed_fc [[function_constant(2)]];
+constant bool ga_me_seeded = is_function_constant_defined(ga_me_seed_fc) && ga_me_seed_fc;
+// the vector at offset o of a window of radius r (8, 4 or 2: the divisors constants)
+static inline int2 ga_me_win(int o, int r) {
+    return r == 8 ? int2(o % 17 - 8, o / 17 - 8) : r == 4 ? int2(o % 9 - 4, o / 9 - 4) : int2(o % 5 - 2, o / 5 - 2);
 }
 
 #define GA_PROJ_T 256
@@ -231,6 +237,140 @@ static inline bool ga_ref_inside(device const GpImage &I, int x, int y, int2 v, 
 // whole-sample SADs subtract two of these, which is exact
 static inline float ga_me_px(uint8_t v) { return as_type<float>(0x4B000000u | (uint)v); }
 
+// Glass Act: k_me's window search, with no motion's window +-RZ and the seed's +-RS (0: none) as
+// constants: the cell's best two whole-sample vectors (no motion where none), whether one was
+// found, and whether the search ran (not stopped by the inter gate)
+template <int RZ, int RS>
+static inline void ga_me_window(device const GpImage &I, constant GpParams &P, uint lane, threadgroup const uint8_t *cur,
+                                threadgroup const float *curf, int x, int y, int sp, int2 sbv, int nCand, int nc, int2 seed,
+                                thread int2 *vecs, thread bool &found, thread bool &searched) {
+    const int zs = 2 * RZ + 1, nz = zs * zs, ns = RS ? (2 * RS + 1) * (2 * RS + 1) : 0;
+    const int nw = 1 + nc + (RS ? 1 : 0), sw = RS ? nc + 1 : -1;  // the windows; the seed's
+    const int n = nz + 81 * nc + ns;
+    auto centre = [&](int c) -> int2 { return c < nCand ? int2(I.meCand[2 * c], I.meCand[2 * c + 1]) : sbv; };
+    auto wbase = [&](int w) -> int { return w == 0 ? 0 : nz + 81 * (w - 1); };
+    auto wsize = [&](int w) -> int { return w == 0 ? nz : w <= nc ? 81 : ns; };
+    auto vec = [&](int i) -> int2 {
+        if (i < nz) return ga_me_win(i, RZ);
+        const int j = i - nz;
+        if (j < 81 * nc) return centre(j / 81) + ga_me_win(j % 81, 4);
+        return seed + ga_me_win(j - 81 * nc, RS);
+    };
+    uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 11 | i): the lane's best two
+    // Glass Act: where no window's centre (no motion, each candidate) predicts better than the
+    // cell's own mean (P.interGate times its SAD to it), new content: the centres only
+    int nSearch = n;
+    int wb = sw > 0 ? sw : 0;  // the window whose centre measured best (with the gate; else the seed's or no motion's)
+    if (P.interGate > 0.f) {
+        wb = 0;
+        uint s1 = 0;
+        for (int p = (int)lane; p < 128; p += 32) s1 += cur[(p >> 4) * 32 + (p & 15)];  // the even rows'
+        const int mean = (int)((simd_sum(s1) + 64) / 128);
+        uint dc = 0;
+        for (int p = (int)lane; p < 128; p += 32) dc += (uint)abs((int)cur[(p >> 4) * 32 + (p & 15)] - mean);
+        dc = simd_sum(dc);
+        // (each centre's SAD on the whole SIMD-group: 4 of its 128 samples a lane; the seed's only
+        // with meSeedFlags & 2)
+        uint best = 0xFFFFFFFFu;
+        for (int w = 0; w < nw; w++) {
+            if (w == sw && !(I.meSeedFlags & 2)) continue;
+            const int2 v = vec(wbase(w) + wsize(w) / 2);  // the window's centre
+            const int rx = x + v.x, ry = y + v.y;
+            if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
+            device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
+            uint sad = 0;
+            for (int p = (int)lane; p < 128; p += 32) {
+                const int row = (p >> 4) * 2, col = p & 15;
+                sad += (uint)abs((int)cur[row * 16 + col] - (int)r[row * sp + col]);
+            }
+            sad = simd_sum(sad);
+            if (sad < best) { best = sad; wb = w; }
+        }
+        if ((float)best > P.interGate * (float)dc) nSearch = 0;
+        // (searched, the seed's window first, its centre predicting as the gate's best can)
+        else if (sw > 0 && !(I.meSeedFlags & 2)) wb = sw;
+    }
+    // Glass Act: 32 vectors a round, each window from a centre; after each round the SIMD-group's
+    // second best key so far, `thr`, and a lane stops measuring a vector once its partial SAD is
+    // above thr's: its key would be above two already measured, so it can't be one of the best
+    // two. The same vectors, indices and full SADs for every one that can, so the same best two
+    // Glass Act: the window whose centre the gate measured best first (from its centre), so the
+    // bound is tight early: where no motion's window has that centre, no motion's from it, else
+    // that candidate's window, then no motion's; the other windows after, in order. (Any order
+    // measures the same vectors, with the same indices.)
+    uint thr = 0xFFFFFFFFu;
+    const int2 cb = wb == 0 ? int2(0, 0) : vec(wbase(wb) + wsize(wb) / 2);
+    const bool inZero = abs(cb.x) <= RZ && abs(cb.y) <= RZ;
+    const int z0 = inZero ? (cb.y + RZ) * zs + cb.x + RZ : nz / 2;
+    auto wOf = [&](int k) -> int { return inZero ? k : k == 0 ? wb : k == 1 ? 0 : k - 1 + (k - 1 >= wb ? 1 : 0); };
+    // (the lane's vector: offset o, from the window's first, in the window at place wi of that
+    // order; stepped 32 a round, past as many windows as that is (the seed's may be smaller))
+    // (where every window is larger than 32: past one at most)
+    int wi = 0, o = (int)lane, w = wOf(0);
+    auto step = [&]() {
+        if (nz < 32 || (ns > 0 && ns < 32)) while (wi < nw && o >= wsize(w)) { o -= wsize(w); w = wOf(++wi); }
+        else if (o >= wsize(w)) { o -= wsize(w); w = wOf(++wi); }
+    };
+    step();
+    for (int q0 = 0; q0 < nSearch; q0 += 32) {
+        const int q = q0 + (int)lane;
+        if (q < nSearch) {
+            int i;
+            int2 v;
+            if (w == 0) {
+                const int io = o + z0 - (o + z0 >= nz ? nz : 0);
+                i = io;
+                v = ga_me_win(io, RZ);
+            } else {
+                const int sz = wsize(w), h = sz / 2, io = o + h - (o + h >= sz ? sz : 0);
+                i = wbase(w) + io;
+                v = w == sw ? seed + ga_me_win(io, RS) : centre(w - 1) + ga_me_win(io, 4);
+            }
+            bool seen = false;
+            if (w > 0) {  // Glass Act: a vector an earlier window has (no motion's, or a candidate's +-4) once
+                seen = abs(v.x) <= RZ && abs(v.y) <= RZ;
+                const int c = min(w - 1, nc);
+                for (int e = 0; e < c && !seen; e++) {
+                    const int2 ce = centre(e);
+                    seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
+                }
+            }
+            const int rx = x + v.x, ry = y + v.y;
+            if (!seen && rx >= 0 && ry >= 0 && rx <= I.aw - 16 && ry <= I.ah - 16) {
+                device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
+                // (the key so far, partial SAD << 11 | i, is at most the vector's: above thr, it can't
+                // be one of the two; so where thr's SAD is 0, nothing after thr's index is measured)
+                // Glass Act: the SAD in floats, whole numbers (at most 128 * 255), so exactly the
+                // integer one; it takes the samples' arithmetic off the integer unit, which bounded
+                // the kernel. (key > thr) is (SAD >= lim): (thr - i) / 2048 + 1, rounded down
+                float sadf = 0.f;
+                bool done = (uint)i < thr;
+                const float lim = done ? (float)(((thr - (uint)i) >> 11) + 1) : 0.f;
+                for (int row = 0; row < (done ? 16 : 0); row += 2) {
+                    for (int col = 0; col < 16; col++) sadf += fabs(curf[(row >> 1) * 16 + col] - ga_me_px(r[row * sp + col]));
+                    if (sadf >= lim) { done = false; break; }
+                }
+                if (done) {
+                    const uint key = ((uint)sadf << 11) | (uint)i;
+                    if (key < k0) { k1 = k0; k0 = key; }
+                    else if (key < k1) k1 = key;
+                }
+            }
+        }
+        o += 32;
+        step();
+        const uint t0 = simd_min(k0);
+        thr = simd_min(k0 == t0 ? k1 : k0);
+    }
+    const uint b0 = simd_min(k0);
+    const uint b1 = simd_min(k0 == b0 ? k1 : k0);
+    // none found (every vector outside the picture): no motion
+    vecs[0] = b0 == 0xFFFFFFFFu ? int2(0, 0) : vec((int)(b0 & 2047));
+    vecs[1] = b1 == 0xFFFFFFFFu ? int2(0, 0) : vec((int)(b1 & 2047));
+    found = b0 != 0xFFFFFFFFu;
+    searched = nSearch > 0;
+}
+
 #define GA_ME_NW 4
 #define GA_ME_WIN 18  // k_me's sub-sample window: 16 + 1 sample either side
 kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffer(1)]],
@@ -250,109 +390,43 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     for (int p = (int)lane; p < 128; p += 32) curf[warp][p] = ga_me_px(src[(p >> 4) * 2 * sp + (p & 15)]);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     const int2 sbv = I.meSb ? int2(I.meSb[2 * sb], I.meSb[2 * sb + 1]) : int2(0, 0);
-    const int n = GA_ME_ZERO + 81 * (min(I.nMeCand, GP_ME_CANDS) + (I.meSb && (sbv.x | sbv.y) ? 1 : 0));
-    uint k0 = 0xFFFFFFFFu, k1 = 0xFFFFFFFFu;  // (sad << 11 | i): the lane's best two
-    // Glass Act: where no window's centre (no motion, each candidate) predicts better than the
-    // cell's own mean (P.interGate times its SAD to it), new content: the centres only
-    int nSearch = n;
-    int wb = 0;  // the window whose centre measured best (with the gate; else no motion's)
-    if (P.interGate > 0.f) {
-        uint s1 = 0;
-        for (int p = (int)lane; p < 128; p += 32) s1 += cur[warp][(p >> 4) * 32 + (p & 15)];  // the even rows'
-        const int mean = (int)((simd_sum(s1) + 64) / 128);
-        uint dc = 0;
-        for (int p = (int)lane; p < 128; p += 32) dc += (uint)abs((int)cur[warp][(p >> 4) * 32 + (p & 15)] - mean);
-        dc = simd_sum(dc);
-        const int nw = 1 + (n - GA_ME_ZERO) / 81;
-        // (each centre's SAD on the whole SIMD-group: 4 of its 128 samples a lane)
-        uint best = 0xFFFFFFFFu;
-        for (int w = 0; w < nw; w++) {
-            const int i = w == 0 ? GA_ME_ZERO / 2 : GA_ME_ZERO + 81 * (w - 1) + 40;  // the window's centre
-            const int2 v = ga_me_vector(I, i, sbv);
-            const int rx = x + v.x, ry = y + v.y;
-            if (rx < 0 || ry < 0 || rx > I.aw - 16 || ry > I.ah - 16) continue;
-            device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
-            uint sad = 0;
-            for (int p = (int)lane; p < 128; p += 32) {
-                const int row = (p >> 4) * 2, col = p & 15;
-                sad += (uint)abs((int)cur[warp][row * 16 + col] - (int)r[row * sp + col]);
-            }
-            sad = simd_sum(sad);
-            if (sad < best) { best = sad; wb = w; }
+    const int nCand = min(I.nMeCand, GP_ME_CANDS);
+    const int nc = nCand + (I.meSb && (sbv.x | sbv.y) ? 1 : 0);  // the +-4 windows
+    const size_t cell = (size_t)(y >> 4) * (I.aw >> 4) + (x >> 4);
+    // Glass Act: the picture before's whole-sample best for this 16x16, where its search ran (and
+    // was not zero, unless meSeedFlags & 1): no motion's window +-meZeroR, and the seed's +-meSeedR
+    // (none where no motion's covers it)
+    int rz = 8, rs = 0;
+    int2 seed = int2(0, 0);
+    if (ga_me_seeded && I.meSeedIn) {
+        device const int16_t *sd = I.meSeedIn + cell * 4;
+        if (sd[2] && ((sd[0] | sd[1]) || (I.meSeedFlags & 1))) {
+            // (within k_proj's reach, so the seeds' windows hold no vector longer than its: a chain
+            // of seeds could otherwise grow past what the bitstream codes, 2^14 eighths)
+            const int big = I.W >= 3840 ? 2 : 1;
+            seed = clamp(int2(sd[0], sd[1]), -int2(GA_PROJ_RX, GA_PROJ_RY) * big, int2(GA_PROJ_RX, GA_PROJ_RY) * big);
+            rz = I.meZeroR;
+            rs = abs(seed.x) + I.meSeedR <= rz && abs(seed.y) + I.meSeedR <= rz ? 0 : I.meSeedR;
         }
-        if ((float)best > P.interGate * (float)dc) nSearch = 0;
     }
-    // Glass Act: 32 vectors a round, each window from a centre; after each round the SIMD-group's
-    // second best key so far, `thr`, and a lane stops measuring a vector once its partial SAD is
-    // above thr's: its key would be above two already measured, so it can't be one of the best
-    // two. The same vectors, indices and full SADs for every one that can, so the same best two
-    // Glass Act: the window whose centre the gate measured best first (from its centre), so the
-    // bound is tight early: where no motion's window has that centre, no motion's from it, else
-    // that candidate's window, then no motion's; the other windows after, in order. (Any order
-    // measures the same vectors, with the same indices.)
-    uint thr = 0xFFFFFFFFu;
-    const int2 cb = wb == 0 ? int2(0, 0) : ga_me_vector(I, GA_ME_ZERO + 81 * (wb - 1) + 40, sbv);
-    const bool inZero = abs(cb.x) <= 8 && abs(cb.y) <= 8;
-    const int f = inZero ? 0 : 81, z0 = inZero ? (cb.y + 8) * 17 + cb.x + 8 : GA_ME_ZERO / 2;
-    // (the lane's vector: offset o, from the window's first, in the window at place wi of that
-    // order; stepped 32 a round, each window larger than 32)
-    int wi = 0, o = (int)lane;
-    for (int q0 = 0; q0 < nSearch; q0 += 32) {
-        const int q = q0 + (int)lane;
-        const int w = f ? (wi == 0 ? wb : wi == 1 ? 0 : wi - 1 + (wi - 1 >= wb ? 1 : 0)) : wi;
-        if (q < nSearch) {
-            int i;
-            int2 v;
-            if (w == 0) {
-                const int io = o + z0 - (o + z0 >= GA_ME_ZERO ? GA_ME_ZERO : 0);
-                i = io;
-                v = int2(io % 17 - 8, io / 17 - 8);
-            } else {
-                const int io = o + 40 - (o + 40 >= 81 ? 81 : 0), c = w - 1;
-                i = GA_ME_ZERO + 81 * c + io;
-                v = (c < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * c], I.meCand[2 * c + 1]) : sbv) + int2(io % 9 - 4, io / 9 - 4);
-            }
-            bool seen = false;
-            if (w > 0) {  // Glass Act: a vector an earlier window has (no motion's +-8, or a candidate's +-4) once
-                seen = abs(v.x) <= 8 && abs(v.y) <= 8;
-                const int c = w - 1;
-                for (int e = 0; e < c && !seen; e++) {
-                    const int2 ce = e < min(I.nMeCand, GP_ME_CANDS) ? int2(I.meCand[2 * e], I.meCand[2 * e + 1]) : sbv;
-                    seen = abs(v.x - ce.x) <= 4 && abs(v.y - ce.y) <= 4;
-                }
-            }
-            const int rx = x + v.x, ry = y + v.y;
-            if (!seen && rx >= 0 && ry >= 0 && rx <= I.aw - 16 && ry <= I.ah - 16) {
-                device const uint8_t *r = I.ref + (size_t)ry * sp + rx;
-                // (the key so far, partial SAD << 11 | i, is at most the vector's: above thr, it can't
-                // be one of the two; so where thr's SAD is 0, nothing after thr's index is measured)
-                // Glass Act: the SAD in floats, whole numbers (at most 128 * 255), so exactly the
-                // integer one; it takes the samples' arithmetic off the integer unit, which bounded
-                // the kernel. (key > thr) is (SAD >= lim): (thr - i) / 2048 + 1, rounded down
-                float sadf = 0.f;
-                bool done = (uint)i < thr;
-                const float lim = done ? (float)(((thr - (uint)i) >> 11) + 1) : 0.f;
-                for (int row = 0; row < (done ? 16 : 0); row += 2) {
-                    for (int col = 0; col < 16; col++) sadf += fabs(curf[warp][(row >> 1) * 16 + col] - ga_me_px(r[row * sp + col]));
-                    if (sadf >= lim) { done = false; break; }
-                }
-                if (done) {
-                    const uint key = ((uint)sadf << 11) | (uint)i;
-                    if (key < k0) { k1 = k0; k0 = key; }
-                    else if (key < k1) k1 = key;
-                }
-            }
-        }
-        o += 32;
-        if (o >= (w == 0 ? GA_ME_ZERO : 81)) { o -= w == 0 ? GA_ME_ZERO : 81; wi++; }
-        const uint t0 = simd_min(k0);
-        thr = simd_min(k0 == t0 ? k1 : k0);
+    int2 vecs[2];
+    bool found, searched;
+#define GA_ME_W(Z, S) ga_me_window<Z, S>(I, P, lane, cur[warp], curf[warp], x, y, sp, sbv, nCand, nc, seed, vecs, found, searched)
+    // (one search per SIMD-group, so the branch is uniform; the seeded ones only in k_me_seed)
+    if (!ga_me_seeded || (rz == 8 && rs == 0)) GA_ME_W(8, 0);
+    else if (rz == 4) { if (rs == 2) GA_ME_W(4, 2); else if (rs == 4) GA_ME_W(4, 4); else GA_ME_W(4, 0); }
+    else if (rz == 2) { if (rs == 2) GA_ME_W(2, 2); else if (rs == 4) GA_ME_W(2, 4); else GA_ME_W(2, 0); }
+    else { if (rs == 2) GA_ME_W(8, 2); else GA_ME_W(8, 4); }
+#undef GA_ME_W
+    const uint b0 = found ? 0u : 0xFFFFFFFFu;  // (whether a best was found, as the steps below test it)
+    const int2 whole = vecs[0];
+    int2 best[2] = {vecs[0] * 8, vecs[1] * 8};
+    if (I.meSeedOut && lane == 0) {  // the next picture's seed: where the window search ran
+        device int16_t *so = I.meSeedOut + cell * 4;
+        so[0] = (int16_t)whole.x;
+        so[1] = (int16_t)whole.y;
+        so[2] = searched && found ? 1 : 0;
     }
-    const uint b0 = simd_min(k0);
-    const uint b1 = simd_min(k0 == b0 ? k1 : k0);
-    // none found (every vector outside the picture): no motion
-    int2 best[2] = {b0 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b0 & 2047), sbv) * 8,
-                    b1 == 0xFFFFFFFFu ? int2(0, 0) : ga_me_vector(I, (int)(b1 & 2047), sbv) * 8};
     if (P.meSubpel && b0 != 0xFFFFFFFFu) {
         // the best one to half, then quarter samples: the 8 neighbours at each step, every row. Each
         // lane measures 8 samples of each (a row's half), and the SIMD-group sums them

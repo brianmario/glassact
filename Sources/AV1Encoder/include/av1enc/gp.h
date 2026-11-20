@@ -144,6 +144,15 @@ struct GpImage {
     GP_DEV int16_t *meBest;
     // per SB (raster): k_proj's long-range vector (dx, dy), whole samples; k_me searches around it
     GP_DEV int16_t *meSb;
+    // Glass Act: the motion search's seed from the picture before (k_me). Per 16x16 (as meBest),
+    // [dx, dy, searched, 0]: its whole-sample best, and 1 where its window search ran. meSeedOut:
+    // this picture's (NULL: none); meSeedIn: the picture before's (NULL: no seed). Where a 16x16's
+    // is set, its no-motion window is +-meZeroR (else +-8) and a +-meSeedR window (2 or 4) around
+    // the seed joins the search. meSeedFlags: 1, a zero best seeds too; 2, the seed's centre joins
+    // the inter gate's.
+    GP_DEV int16_t *meSeedOut;
+    GP_DEV const int16_t *meSeedIn;
+    int meSeedR, meZeroR, meSeedFlags;
     // Glass Act: per SB (raster), k_inter_sad's: its distinct candidates (no motion, then its 16x16s'
     // k_me vectors), and every 8x8's SAD at each (meSad: GP_ME_U x 64 per SB, raster 8x8s)
     GP_DEV GpMeU *meU;

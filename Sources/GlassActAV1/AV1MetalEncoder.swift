@@ -449,6 +449,43 @@ public final class AV1MetalEncoder: @unchecked Sendable {
     /// which wait for their closed loop on the CPU. Only the rest waits for the gate. (On: the
     /// 5K all-new stream's period 21.1 -> 18.6 ms.)
     public var splitsMotion = true
+    /// Seeding an inter frame's motion search with the picture before's (GpImage.meSeedIn): where a
+    /// 16×16's search ran in the picture before, its no-motion window is ±`zeroRadius` instead of
+    /// ±8, and a ±`seedRadius` window around that picture's whole-sample best joins the search.
+    public struct MotionSeed: Sendable, Equatable {
+        /// No motion's window where there is a seed: 8, 4 or 2.
+        public var zeroRadius = 4
+        /// The seed's window: 4 or 2.
+        public var seedRadius = 2
+        /// A best of no motion seeds too (its window then ±`zeroRadius`).
+        public var zeroSeeds = false
+        /// The seed's centre is one of the inter gate's.
+        public var inGate = false
+        /// Only in a mostly-new picture after a mostly-new picture (a run's: video), not screens'.
+        public var runsOnly = false
+        public init() {}
+    }
+    /// nil: off.
+    public var motionSeed: MotionSeed?
+    /// The last analysis's seeds (k_me's per 16×16) and whether it was mostly new; nil: none (no
+    /// motion search). The next one reads them on the GPU, after this one writes them (the
+    /// queue's order: the buffer is tracked).
+    var lastMotionSeed: (buffer: any MTLBuffer, newPicture: Bool)?
+    /// k_me as k_me_seed (function constant 2), compiled the first time a picture seeds (or by
+    /// `AV1HybridEncoder.compileKernels`, on another thread: `analysisLock`).
+    private var seededMotionSearch: (any MTLComputePipelineState)?
+    func motionSearch(seeded: Bool) throws -> any MTLComputePipelineState {
+        guard seeded else { return motionSearch }
+        analysisLock.lock()
+        defer { analysisLock.unlock() }
+        if let p = seededMotionSearch { return p }
+        let values = MTLFunctionConstantValues()
+        var on = true
+        values.setConstantValue(&on, type: .bool, index: 2)
+        let p = try Self.pipeline(try library.makeFunction(name: "k_me", constantValues: values), threads: 128, device: device)
+        seededMotionSearch = p
+        return p
+    }
     /// The last analysis set up reads the analysis's own buffers on the CPU (it has no GPU work,
     /// and so no `Readout`): the next one's GPU work waits for that read.
     var lastReadsLive = false
@@ -496,6 +533,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             (line + width).update(repeating: from[width - 1], count: aw - width)
         }
         referenceSource = planes
+        lastMotionSeed = nil
     }
 
     /// Orders pictures' analyses on the GPU behind the CPU's reading of earlier ones, whose buffers
@@ -941,7 +979,9 @@ public final class AV1MetalEncoder: @unchecked Sendable {
             inter[bsize] = (try Self.pipeline(function, threads: warps * perBlock, device: device), blocks, warps * perBlock)
         }
         self.inter = inter
-        guard let meFunction = library.makeFunction(name: "k_me"), let projFunction = library.makeFunction(name: "k_proj"),
+        // (k_me without its seed constant: k_me_seed is `motionSearch(seeded:)`'s)
+        let meFunction = try library.makeFunction(name: "k_me", constantValues: MTLFunctionConstantValues())
+        guard let projFunction = library.makeFunction(name: "k_proj"),
               let sumsFunction = library.makeFunction(name: "k_proj_sums")
         else { throw Failure.metal("no k_me / k_proj") }
         projectionSums = try Self.pipeline(sumsFunction, threads: 128, device: device)
@@ -1268,6 +1308,8 @@ public final class AV1MetalEncoder: @unchecked Sendable {
         let decidesLeaves: Bool
         /// SBs the caller replaces (`beginPartition(skip:)`): the partition gives each one block.
         let skipped: [UInt8]?
+        /// Its motion search reads the picture before's seeds (GpImage.meSeedIn).
+        var seedsMotion = false
         /// A mostly-new inter frame's cheaper analysis (`beginPartition(newPicture:)`), or nil.
         let newPictureAnalysis: NewPictureAnalysis?
         /// The shapes this picture's analysis tries in place of every other rule's
@@ -1532,12 +1574,30 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                 image.meBest = AV1MetalEncoder.address(me)
                 meBest = me
                 image.meSb = AV1MetalEncoder.address(try make(sbCols * sbRows * 4))
+                if let seeding = encoder.motionSeed {
+                    let out = try make((aw / 16) * (ah / 16) * 8)
+                    image.meSeedOut = AV1MetalEncoder.address(out)
+                    let mostlyNew = skip.map { m in Double(m.count(where: { $0 == 0 })) > encoder.interGateOverShare * Double(max(1, m.count)) } ?? false
+                    if let prev = encoder.lastMotionSeed, prev.buffer.length == out.length,
+                       !seeding.runsOnly || (mostlyNew && prev.newPicture) {
+                        made.append(prev.buffer)
+                        image.meSeedIn = AV1MetalEncoder.address(prev.buffer)
+                        image.meZeroR = Int32(seeding.zeroRadius)
+                        image.meSeedR = Int32(seeding.seedRadius)
+                        image.meSeedFlags = (seeding.zeroSeeds ? 1 : 0) | (seeding.inGate ? 2 : 0)
+                        seedsMotion = true
+                    }
+                    encoder.lastMotionSeed = (out, mostlyNew)
+                } else {
+                    encoder.lastMotionSeed = nil
+                }
                 let tables = try encoder.interTables(superblocks: sbCols * sbRows)
                 made += [tables.candidates, tables.sad]
                 image.meU = AV1MetalEncoder.address(tables.candidates)
                 image.meSad = AV1MetalEncoder.address(tables.sad)
             } else {
                 meBest = nil
+                encoder.lastMotionSeed = nil
             }
             shOff.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shOff) { $0.copyMemory(from: src) } }
             nbx.withUnsafeBytes { src in withUnsafeMutableBytes(of: &image.shNbx) { $0.copyMemory(from: src) } }
@@ -1794,7 +1854,7 @@ public final class AV1MetalEncoder: @unchecked Sendable {
                                        threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
                 e.memoryBarrier(scope: .buffers)
                 var cells = UInt32(analyzed * 16)
-                e.setComputePipelineState(encoder.motionSearch)
+                e.setComputePipelineState(try encoder.motionSearch(seeded: seedsMotion))
                 e.setBytes(&cells, length: 4, index: 2)
                 e.dispatchThreadgroups(MTLSize(width: (Int(cells) + 3) / 4, height: 1, depth: 1),
                                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))

@@ -41,6 +41,8 @@ let av1SeqCommand = Command(
         .bool("no-motion-search", "with --inter: copies only, no motion search in the coded 64x64s"),
         .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
+        .string("motion-seed", "<lever>[,<lever>...]", "with --inter: seed the motion search with the picture before's (AV1HybridEncoder.motionSeed): zero=<8|4|2> (no motion's window where seeded, default 4), seed=<4|2> (the seed's window, default 2), zero-seeds (a best of no motion seeds too), gate (the seed's centre joins the inter gate's), runs (only in mostly-new pictures after mostly-new ones); on: the struct's defaults (zero=4,seed=2); off: none (default the encoder's: zero=2,seed=4,runs)"),
+        .int("profile-pictures", "<n>", 2...16, "with --profile and --inter: the stream each timed run codes, ending with the last picture (default 2: it as an inter frame after a key frame)"),
         .bool("changes", "with --inter: each picture carries its exact change map from the one before (Picture.changed, as the Host passes it), made before the timed run; the same bytes"),
         .bool("whole-sources", "every picture's padded source copied whole (AV1HybridEncoder.updatesSourcesInPlace off; the same bytes)"),
         .bool("no-split-motion", "with --inter: the motion search waits behind the filters' gate with the rest of the analysis (AV1HybridEncoder.splitsMotion off; the same bytes)"),
@@ -409,6 +411,25 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         encoder.interPreset = p
     }
     encoder.searchesSubpelMotion = !opts.has("no-subpel")
+    if opts.string("motion-seed") == "off" {
+        encoder.motionSeed = nil
+    } else if let spec = opts.string("motion-seed") {
+        var m = AV1MetalEncoder.MotionSeed()
+        for lever in spec.split(separator: ",") {
+            let kv = lever.split(separator: "=", maxSplits: 1).map(String.init)
+            let value = kv.count > 1 ? kv[1] : ""
+            switch kv[0] {
+            case "on": break
+            case "zero": guard let n = Int(value), [8, 4, 2].contains(n) else { throw BenchError("--motion-seed zero=<8|4|2>") }; m.zeroRadius = n
+            case "seed": guard let n = Int(value), [4, 2].contains(n) else { throw BenchError("--motion-seed seed=<4|2>") }; m.seedRadius = n
+            case "zero-seeds": m.zeroSeeds = true
+            case "gate": m.inGate = true
+            case "runs": m.runsOnly = true
+            default: throw BenchError("--motion-seed: unknown lever \(kv[0])")
+            }
+        }
+        encoder.motionSeed = m
+    }
     if opts.has("no-split-motion") { encoder.splitsMotion = false }
     if opts.has("whole-sources") { encoder.updatesSourcesInPlace = false }
     if opts.has("leaf-tx") { encoder.leafTxSearchPixels = opts.int("leaf-tx", 0) }
@@ -773,7 +794,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         defer { encoder.searchesMotion = searches }
         for run in 0..<10 {
             if inter, pictures.count > 1 {
-                try encoder.encode(count: 2, qindex: qindex, picture: { picture(pictures.count - 2 + $0) }, output: { _, _ in })
+                let k = min(pictures.count, opts.int("profile-pictures", 2))
+                try encoder.encode(count: k, qindex: qindex, picture: { picture(pictures.count - k + $0) }, output: { _, _ in })
             } else {
                 _ = try encoder.encode(picture(pictures.count - 1), qindex: qindex)
             }

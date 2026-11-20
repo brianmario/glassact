@@ -868,6 +868,64 @@ extension HybridEncoderTests {
         run.runShapesAfter = 2
         #expect(try stream(run) == fastStream, "a run shorter than runShapesAfter + 1 changed")
     }
+
+    /// The motion seed (`motionSeed`, on by default in runs of mostly-new pictures): quiet
+    /// pictures (a small square moving) and a run of mostly-new ones (a texture panning 11 samples
+    /// right and 3 down a picture, past no motion's ±8, with noise so that nothing copies). The
+    /// pictures before the run and its first (whose picture before isn't mostly new) code as
+    /// without it, byte for byte; the run's later pictures don't; every frame decodes in libaom to
+    /// exactly the encoder's pictures.
+    @available(macOS 27, *)
+    @Test func motionSeedChangesOnlyARunsLaterPicturesAndDecodesExactly() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let (width, height) = (640, 384)
+        let base = PartitionTests.Picture(width: width, height: height)
+        var rng = SplitMix64(seed: 0x5eed_9e3)
+        let texture = (0..<(1024 * 512)).map { k in UInt8(clamping: 40 + (k % 1024 * 5 + k / 1024 * 3) % 90 + ((k % 1024 / 13 + k / 1024 / 11) % 4) * 25) }
+        var pictures: [AV1HybridEncoder.Picture] = []
+        for i in 0..<12 {
+            var y = base.y
+            if (4..<10).contains(i) {
+                let (dx, dy) = (11 * (i - 4), 3 * (i - 4))
+                for r in 0..<height {
+                    for c in 0..<width { y[r * width + c] = UInt8(clamping: Int(texture[(r + dy) * 1024 + c + dx]) + rng.int(0..<3)) }
+                }
+            } else {
+                for r in 100..<140 {
+                    for c in (60 + 4 * i)..<(100 + 4 * i) { y[r * width + c] = 200 }
+                }
+            }
+            pictures.append(AV1HybridEncoder.Picture(y: y, u: base.u, v: base.v, width: width, height: height))
+        }
+        func stream(_ seed: AV1MetalEncoder.MotionSeed?, check: Bool) throws -> [[UInt8]] {
+            let encoder = try AV1HybridEncoder(device: device)
+            encoder.tiling = (1, 1)
+            encoder.interFrames = true
+            encoder.motionSeed = seed
+            let decoder = try #require(glassact_aom_dec_create(1))
+            defer { glassact_aom_dec_destroy(decoder) }
+            var obus: [[UInt8]] = []
+            try encoder.encode(count: pictures.count, qindex: 100, picture: { pictures[$0] }, output: { i, f in
+                obus.append(f.obu)
+                guard check else { return }
+                var frame = glassact_aom_frame()
+                try #require(glassact_aom_dec_decode(decoder, f.obu, f.obu.count, &frame) == 0, "libaom rejected frame \(i)")
+                let sizes = [(width, height), ((width + 1) / 2, (height + 1) / 2), ((width + 1) / 2, (height + 1) / 2)]
+                for p in 0..<3 {
+                    let (w, h) = sizes[p]
+                    let theirs = try #require(frame.planesTuple(p))
+                    let stride = Int(frame.stridesTuple(p))
+                    let rows = (0..<h).filter { r in (0..<w).contains { f.planes[p][r * w + $0] != theirs[r * stride + $0] } }
+                    #expect(rows.isEmpty, "frame \(i) plane \(p) differs from libaom on \(rows.count) rows")
+                }
+            })
+            return obus
+        }
+        let seeded = try stream(AV1HybridEncoder.defaultMotionSeed, check: true)
+        let plain = try stream(nil, check: false)
+        #expect(seeded[...4] == plain[...4], "a picture before the run's second changed")
+        #expect((5..<10).contains { seeded[$0] != plain[$0] }, "the seed changed none of the run's later pictures")
+    }
 }
 
 extension HybridEncoderTests {
