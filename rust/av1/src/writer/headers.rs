@@ -400,7 +400,10 @@ pub(crate) fn frame_obus<P: AsRef<[u8]>>(
     } else {
         4
     };
-    let level = level.unwrap_or_else(|| super::choose_level(fp.width, fp.height, n as i32, tiles.cols as i32));
+    // (a stream's level is its largest frame's: a reduced frame's stream is the stream's size, so
+    // its sequence header is the one its full-size frames carry)
+    let (lw, lh) = if fp.video != 0 && fp.stream_width != 0 { (fp.stream_width as u32, fp.stream_height as u32) } else { (fp.width as u32, fp.height as u32) };
+    let level = level.unwrap_or_else(|| super::choose_level(lw, lh, n as i32, tiles.cols as i32));
     seq.clear();
     fh.clear();
     write_headers(fp, tiles, context_tile, level, seq, fh);

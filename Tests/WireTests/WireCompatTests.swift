@@ -109,11 +109,14 @@ import GlassActWire
         #expect(WireCaps.geometryFinal == 1 << 5)
         #expect(WireCaps.windowList == 1 << 6)
         #expect(WireCaps.videoAV1GlassAct == 1 << 7)
+        #expect(WireCaps.videoReducedFrames == 1 << 8)
         #expect(WireCaps.logUpload == 1 << 9)
         #expect(WireCaps.virtualDisplay == 1 << 10)
         #expect(WireCaps.agentControl == 1 << 11)
-        // the released fixtures' caps are made of known bits only, and none of them is bit 7
+        // the released fixtures' caps are made of known bits only, and none of them is bit 7 or 8
+        // (`videoReducedFrames`, new in this release too)
         #expect(0x0E71 & WireCaps.videoAV1GlassAct == 0 && 0x0011 & WireCaps.videoAV1GlassAct == 0)
+        #expect(0x0E71 & WireCaps.videoReducedFrames == 0 && 0x0011 & WireCaps.videoReducedFrames == 0)
         // AV1 stays codec 3 under both AV1 bits; a codec's own bit is unchanged
         #expect(WireCaps.bit(forVideoCodec: VideoCodec.av1) == WireCaps.videoAV1)
         #expect(WireCaps.viewerBits(forVideoCodec: VideoCodec.av1, glassActAV1: true)

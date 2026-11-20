@@ -40,7 +40,13 @@ public enum WireCaps {
     /// Viewer with `videoAV1`. (Bit 7 was `videoOverlay` before wire
     /// version 4, which no peer this one can talk to ever sent.)
     public static let videoAV1GlassAct: UInt32 = 1 << 7
-    // Bit 8 is unassigned.
+    /// Reduced frames (§4.6): AV1 frames coded smaller than their region, with the region as
+    /// their render size, which the Viewer shows scaled up to it. A Viewer advertises it when its
+    /// AV1 decoder is VideoToolbox's, which scales them as it decodes (Glass Act's decoder shows
+    /// them too, but its scaling costs more than the half-size decode saves);
+    /// a Host whose AV1 is Glass Act's, which codes video softer than its region at half size
+    /// (`ReducedFramesPolicy`). Released Viewers before it fail on such a frame.
+    public static let videoReducedFrames: UInt32 = 1 << 8
     /// Host → viewer in HELLO: the host saves VIEWER_LOG uploads (the
     /// viewer's "Send Logs to Host").
     public static let logUpload: UInt32 = 1 << 9

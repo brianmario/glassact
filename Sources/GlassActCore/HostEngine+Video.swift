@@ -157,6 +157,7 @@ extension HostEngine {
         encoder.setBitrateCap(videoRate.bitrateCap)
         if let qp = regionMaxFrameQP { encoder.setMaxFrameQP(qp) }
         if smoothFloor { encoder.setSmoothMotion(true) }
+        encoder.setReducedFrames(reducedFramesNegotiated && codec == VideoCodec.av1)
         regionStartSent = false
         regionFrameSeq = 0
         regionFramesPending = 0
