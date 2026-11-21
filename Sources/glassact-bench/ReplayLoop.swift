@@ -422,9 +422,28 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     let pauseUS = UInt64(opts.int("pause-s", 120)) * 1_000_000
     var resumedAtUS: UInt64?
     let frameLimit = opts.has("frames") ? opts.int("frames", 0) : Int.max
-    while frames < frameLimit, let meta = try reader.readFrame(rects: &rects, into: frameBuf) {
+    // --repeat n: the trace n times over, end to end (a longer session); each
+    // pass starts 50 ms after the last ended, its first frame fully scanned.
+    var reader = reader
+    var passesLeft = opts.int("repeat", 1) - 1
+    var passBaseTS: UInt64?, passOffsetUS: UInt64 = 0, lastTraceUS: UInt64 = 0
+    while frames < frameLimit {
+        guard var meta = try reader.readFrame(rects: &rects, into: frameBuf) else {
+            guard passesLeft > 0 else { break }
+            passesLeft -= 1
+            reader = try openTrace(traceName)
+            passBaseTS = nil
+            passOffsetUS = lastTraceUS + 50_000
+            continue
+        }
+        let firstOfPass = passBaseTS == nil
+        let passBase = passBaseTS ?? meta.timestampUS
+        passBaseTS = passBase
         let base = baseTS ?? meta.timestampUS
         baseTS = base
+        meta.timestampUS = base + passOffsetUS + (meta.timestampUS &- passBase)
+        lastTraceUS = meta.timestampUS - base
+        if firstOfPass && passOffsetUS > 0 { rects.removeAll() }
         if let at = pauseAtUS, meta.timestampUS &- base >= at {
             pauseAtUS = nil
             driveStill(since: lastFeedUS, untilUS: replayStartUS + at)
