@@ -154,6 +154,48 @@ import GlassActTransport
         #expect(rtt?.minUS == 100_000, "minimum RTT is the path's: \(String(describing: rtt))")
     }
 
+    /// Wi-Fi power save (#143, #144): a packet for an idle viewer waits for
+    /// its radio to wake, and everything arriving meanwhile goes with it; a
+    /// busy path stays fast. The modeled RTT sees the waits, with no
+    /// bottleneck. Seeded: the same run delivers at the same times.
+    @Test func powerSaveDelaysAnIdlePath() {
+        func run(seed: UInt64) -> [UInt64] {
+            var faults = FaultConfig()
+            faults.latencyMinUS = 2_000
+            faults.latencyMaxUS = 2_000
+            faults.powerSaveWakeMinUS = 10_000
+            faults.powerSaveWakeMaxUS = 120_000
+            faults.seed = seed
+            let link = InProcLink(faults: faults)
+            var arrivals: [UInt64] = []
+            link.b.onDatagram = { _ in arrivals.append(link.nowUS) }
+            for burst in 0..<10 { // a 1 s gap, then 20 datagrams 5 ms apart
+                let start = UInt64(burst) * 1_000_000
+                link.advance(toUS: start)
+                link.a.sendControl(Data([0])) // a reliable send to a sleeping radio: an RTT sample
+                for i in 0..<20 {
+                    link.advance(toUS: start + UInt64(i) * 5_000)
+                    link.a.sendDatagram(Data([UInt8(i)]))
+                }
+            }
+            link.advance(toUS: 11_000_000)
+            #expect(link.powerSaveWakes == 10, "one wake per burst after a gap: \(link.powerSaveWakes)")
+            let rtt = link.a.transportRTT
+            #expect(rtt.map { $0.smoothedUS > $0.minUS } == true, "the RTT swings: \(String(describing: rtt))")
+            return arrivals
+        }
+        let arrivals = run(seed: 3)
+        #expect(arrivals.count == 200)
+        for burst in 0..<10 {
+            let sent = UInt64(burst) * 1_000_000
+            let first = arrivals[burst * 20], last = arrivals[burst * 20 + 19]
+            #expect(first >= sent + 12_000 && first <= sent + 122_000, "the first waits for the wake: \(first - sent) µs")
+            #expect(last == sent + 95_000 + 2_000 || last == arrivals[burst * 20 + 18],
+                    "awake, the rest arrive at the path's latency (or with the wake)")
+        }
+        #expect(run(seed: 3) == arrivals, "deterministic")
+    }
+
     /// Without a bottleneck nothing models an RTT: the engine falls back to
     /// PING, as before.
     @Test func noBottleneckNoTransportRTT() {

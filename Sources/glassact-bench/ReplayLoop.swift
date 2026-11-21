@@ -237,7 +237,11 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     // The resolution rung (§4.9): the app would halve the capture here; the
     // loop only reports when it would have.
     nonisolated(unsafe) var autoScaleUS: UInt64?
-    host.onScalePressureConstrained = { if autoScaleUS == nil { autoScaleUS = link.nowUS } }
+    host.onScalePressureConstrained = {
+        guard autoScaleUS == nil else { return }
+        autoScaleUS = link.nowUS
+        print("  auto-scale at \(String(format: "%.1f", Double(link.nowUS) / 1e6)) s: \(host.scaleReason)")
+    }
     if opts.has("no-fresh-queue") { host.freshQueueSignal = false }
     if opts.has("no-link-reports") { host.requestDeliveryReports = false }
     if opts.has("handoff-ms") { host.handoffStillUS = UInt64(opts.int("handoff-ms", 1000)) * 1000 }
@@ -607,7 +611,8 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         govSorted.isEmpty ? "-" : String(format: "%.2f", Double(govSorted[min(govSorted.count - 1, Int(Double(govSorted.count) * p))]) / 1e6)
     }
     print("  governor while frames played (MB/s): min \(govAt(0)) p10 \(govAt(0.1)) p50 \(govAt(0.5)) max \(govAt(1))  "
-          + "cuts: queue \(host.stats.governorQueueCuts) severe \(host.stats.governorSevereCuts) loss \(host.stats.governorLossCuts)"
+          + "cuts: queue \(host.stats.governorQueueCuts) severe \(host.stats.governorSevereCuts) loss \(host.stats.governorLossCuts) "
+          + "(held \(host.stats.governorQueueHolds))"
           + (faults.powerSaveWakeMaxUS > 0 ? "  power-save wakes \(link.powerSaveWakes)" : "")
           + (resumedAtUS.map { r in "  auto-scale after the resume: " + (autoScaleUS.map { $0 >= r ? String(format: "%.1f s", Double($0 - r) / 1e6) : "before it" } ?? "never") } ?? ""))
     let exact = exactAfterUS.sorted()

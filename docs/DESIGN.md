@@ -946,7 +946,20 @@ paint. They blit without advancing `tileSeq` and are never ACKed.
     recent windows expires the old clean sample. The baseline still ages
     so a route change can be learned.
   - A standing queue > 60 ms backs off to 0.9 × the measured delivery rate;
-    > 200 ms halves the rate.
+    > 200 ms halves the rate, or drops to 0.9 × delivery if that's lower.
+    Delivery is a reading of the link only while the governor is the limit,
+    so it's measured over the current limited stretch (decisions with
+    tiles deferred since the last), its last second at most. An
+    app-limited sender's delivery is what it chose to send, and over a
+    quiet screen the old 16-sample window spanned minutes of it.
+  - App-limited (nothing deferred), a queue > 60 ms backs off ×0.9 only
+    while the tiles delivered in the last second are at least half the
+    rate; under that the queue isn't ours to drain and the rate holds (as
+    `notOurs` does for video). On a jittery path, such as Wi-Fi power save
+    where an idle path's latency swings 15–130 ms, cutting per reading
+    walked a quiet screen's rate to the floor, which growth (limiting,
+    < 20 ms) rarely wins back. A menu then went out over many ticks,
+    torn (#143). A queue our own bursts build still shows as severe.
   - A large batch that times out mostly unconfirmed halves the rate and holds
     for 1 s.
   - Encode duty caps growth: none above 50 %, and ×0.85 above 75 %.
@@ -1214,6 +1227,13 @@ fixed seed.
   queueing shows in a modeled `transportRTT`. The video stream's
   congestion window is the whole buffer, the worst case for standing queue
   (`InProcLink.Bottleneck`).
+- Optional **Wi-Fi power save** on the viewer's downlink models a jittery
+  path with no bottleneck: once nothing has reached the viewer for a while
+  (50 ms by default), the next packet waits a random 10–120 ms (say) for
+  its radio to wake, and what arrives meanwhile goes with it. An idle
+  path's delay swings and a busy one stays fast; the modeled
+  `transportRTT` sees the waits. It draws from its own seeded stream, so
+  the other faults' sequences don't change (`FaultConfig.powerSaveWakeMinUS`).
 
 ---
 
@@ -1238,6 +1258,9 @@ the same inputs give the same outputs.
   `--link-mbit` and `--link-buffer-ms` put everything the host sends through
   one bottleneck (§6), and the summary adds bytes by kind, the queueing
   delay, and how long each still screen took to become exact.
+  `--power-save lo-hi` adds Wi-Fi power save (§6), `--pause-at`/`--pause-s`
+  pause the viewer for a stretch, and `--repeat n` plays the trace n times
+  as one session; the summary gives the tile governor's rate and its cuts.
 - `synth`: synthetic traces.
 - `glassact-bench help` lists the rest.
 
