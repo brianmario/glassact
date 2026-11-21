@@ -304,6 +304,7 @@ the numbers and the reasoning.
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| Other coded sizes for reduced video: ¾, 1080p (~⅜), ~⅓ and ¼ of a 5K region besides ½, and a scan for the content's own resolution | measured; not built | the owner's 60 fps video: below ½ never wins at equal bytes (30–120 KB a frame, 0.4–1.5 dB worse); ¾ beats ½ by 0.4–0.7 dB at 120–160 KB but takes 14.8 ms of GPU analysis against 7.7 (it falls under the fast pictures' 2,400-SB floor); the round trip's loss rises smoothly (¾ 47.9 dB … ¼ 33.4), no resolution cutoff to find. One trace: 1080p and 720p clips wanted | [entry](#video-reduced-frames-at-other-sizes-and-the-contents-own-resolution-measured-2026-11-21) |
 | VideoToolbox decoding a reduced AV1 frame | it outputs the coded size unless asked for one | the Viewer's session asks for the region's size (`VTRegionDecoder`); its scaling scores as vImage's Lanczos 3 (35.33 / 35.48 dB at half size, 38.26 / 38.15 at 3/4); the 2026-11-02 finding (scaled up) was ffmpeg's | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | No intra search on inter frames where the inter block's J is under c × step² a pixel (in mostly-new pictures) | rejected | video 5K q36: c 0.02 −2.2 ms of GPU analysis for +0.6 % bytes, −0.08 dB; the movie +4.2 % and −0.2 dB at c 0.004 already; with no intra anywhere inter exists, 15 ms (64 a second) but +17 % / −1.25 dB on video, +25 % on the movie | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | AV1 superres (half width, the decoder upscales) for video | rejected (libaom bound) | loses to half-size reduced frames at every rate on the 60 fps video: at ~850 KB 35.0 against 35.9 dB, at ~530 KB 32.4 against 33.2; full 5K 34.3 at 870 KB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
@@ -384,6 +385,47 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Video: reduced frames at other sizes, and the content's own resolution, measured (2026-11-21)
+
+Reduced frames code soft video at exactly half size each way. The question was whether the
+content's own resolution could be detected, so that 1080p shown full screen is coded near 1080p,
+and whether other sizes do better than ½. Bytes and quality only (they don't depend on load).
+- **Setup:** `av1seq` on the owner's 60 fps video (`glassact-1795125212`), 31 frames from 220 and
+  from 1150, `--width <coded> --stream-width 5120 --tiles 3x0 --inter --score-rgb
+  --ssimulacra2-every 6`, at q20, 28, 36 and 44. Scored at 5120, as VideoToolbox shows them.
+- **Sizes:** 5120 (full), 3840 (¾), 2560 (½), 1920 (1080p, ~⅜), 1728 (~⅓) and 1280 (¼).
+- The bench from #139's branch (8a23bc3). `av1seq` codes video range, so these bytes are ~16 % under the live
+  encoder's (the "why full size shows 44" entry); the comparison between sizes stands.
+
+**The round trip's own loss** (q2, 13 frames from 220, RGB PSNR at 5120): ¾ 47.9 dB, ½ 45.3,
+1080p 41.2, ~⅓ 39.2, ¼ 33.4. Content scaled up from a lower resolution would lose almost nothing
+down to that resolution and then fall away. This video's loss rises smoothly, with no cutoff, so a
+scan for its resolution has nothing to find. It is soft, not low-resolution.
+
+**RGB PSNR and SSIMULACRA2 at equal bytes a frame** (interpolated in log bytes; from 220, then 1150):
+
+| KB a frame | full | ¾ | ½ | 1080p | ~⅓ | ¼ |
+|---|---|---|---|---|---|---|
+| 160 | 35.36 · 48.4 / 36.13 · 52.8 | **37.24 · 59.4** / **37.88 · 62.9** | 36.78 · 55.3 / 37.17 · 57.8 | | | |
+| 120 | 34.01 · 36.8 / 34.74 · 42.7 | **35.72 · 49.0** / **36.32 · 52.7** | 35.33 · 47.0 / 35.71 · 49.2 | 35.06 · 43.2 / 35.29 · 45.8 | 34.33 · 38.0 / 34.55 · 41.3 | |
+| 80 | | **33.68 · 32.1** / **34.21 · 36.7** | 33.51 · 31.8 / 33.85 · 34.7 | 33.12 · 29.1 / 33.31 · 31.1 | 32.50 · 23.3 / 32.69 · 26.2 | 31.06 · 13.3 / 30.96 · 14.9 |
+| 50 | | – / **31.99** · 15.1 | **31.52 · 12.4** / 31.84 · **15.9** | 31.13 · 8.0 / 31.31 · 10.6 | 30.60 · 2.5 / 30.76 · 5.9 | 29.61 · −5.5 / 29.55 · −4.4 |
+| 30 | | | **29.55 · −11.9** / **29.89 · −8.0** | 29.15 · −15.1 / 29.33 · −12.1 | 28.69 · −19.8 / 28.81 · −16.8 | 27.98 · −27.2 / 27.93 · −25.9 |
+
+- **Smaller than ½ never wins:** 1080p is 0.3–0.5 dB under ½ at every rate, ~⅓ 0.8–1.1 and ¼ up
+  to 2.5.
+- **¾ wins at the live encoder's rates** (120–200 KB a frame): +0.4–0.7 dB and +2 to +5
+  SSIMULACRA2 over ½, and +1.7–1.9 dB over full size. At 50 KB it ties ½.
+- **But ¾ is slow:** GPU analysis at q36 is 14.8 ms a frame, against 7.7 at ½ and 16.9–17.4 at
+  full; the closed loop 7.3–10.5 against 3.7–6.0. 3840×2160 is 2,040 64×64s, under the fast
+  pictures' 2,400 (`NewPictureEffort.standard`), so its mostly-new pictures get the full
+  analysis. That is part of its quality, too. For 60 fps of changes ½ stays the size.
+
+**Not built:** the scan, and sizes other than ½. A size between full and ½ (¾ with the fast
+pictures' effort) could serve a quality setting where the encoder has time to spare; measure it at
+equal effort first. This is one trace, and a soft one: 1080p and 720p clips shown full screen
+would show whether low-resolution content has the cutoff this one lacks, and whether ⅓ wins there.
 
 ### Glass Act's decoder scales reduced frames up itself (2026-11-20)
 
