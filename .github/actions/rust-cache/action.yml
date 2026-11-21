@@ -1,0 +1,26 @@
+name: Rust build cache
+description: >
+  Restores rust/av1's cargo build output (rust/av1/target) when the crate's sources, the build
+  script and the Rust compiler are exactly what built it, so cargo has nothing to do; saves it
+  otherwise. No partial restore: a source change builds from scratch, as without the cache.
+inputs:
+  job:
+    description: The job's name, in the key (each job builds other targets).
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: rustc
+      shell: sh
+      run: echo "version=$(rustc -V | tr ' ()' '---')" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@v6
+      with:
+        path: rust/av1/target
+        key: rust-av1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.job }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('rust/av1/**', 'scripts/build-rust') }}
+    - if: steps.cache.outputs.cache-hit == 'true'
+      shell: sh
+      # cargo decides freshness by modification time, and a fresh checkout dates every source file
+      # now, later than the restored build: it would rebuild everything. A hit means the sources
+      # are byte-for-byte the ones that built it (their hash is in the key), so date them before it.
+      run: find rust/av1 -path rust/av1/target -prune -o -type f -exec touch -t 200001010000 {} +
