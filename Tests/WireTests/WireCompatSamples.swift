@@ -35,6 +35,7 @@ enum WireCompatSamples {
         .received(bytes: 1_000_000, tUS: 2_000_000),
         .hostNotice(code: HostNotice.sessionOffScreen),
         .viewerBye(reason: ViewerBye.disconnected),
+        .hostDisplay(width: 5120, height: 2880),
     ]
 
     static let video: [VideoMessage] = [

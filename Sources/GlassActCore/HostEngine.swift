@@ -674,6 +674,21 @@ public final class HostEngine: @unchecked Sendable {
     /// under maxBodyLength — the app caps count and thumbnail size.
     /// Single-window mode, host → viewer: the shared window is gone, the session is over
     /// (WINDOW_CONTROL endSession, the viewer's own close message, reversed).
+    /// HOST_DISPLAY (`WireCaps.hostDisplaySize`): the shared display's pixel size, and whether
+    /// this session's viewer asked for it.
+    private var hostDisplaySize: (width: UInt16, height: UInt16)?
+    private var hostDisplayNegotiated = false
+    /// The pixel size of the display this session shares (its current mode's), or nil (single-window
+    /// mode, or unknown): the viewer shows it beside its picture's when they differ. Sent on a
+    /// change, and at the handshake, to a viewer that asked (`WireCaps.hostDisplaySize`).
+    public func setHostDisplaySize(width: Int, height: Int) {
+        let d = width > 0 && height > 0 ? (width: UInt16(clamping: width), height: UInt16(clamping: height)) : nil
+        guard d?.width != hostDisplaySize?.width || d?.height != hostDisplaySize?.height else { return }
+        hostDisplaySize = d
+        guard let d, state == .running, hostDisplayNegotiated else { return }
+        sendControl(.hostDisplay(width: d.width, height: d.height))
+    }
+
     /// Tell the viewer (now, and any that connects later) a `HostNotice`.
     /// Sent only on a change: an unchanged notice costs nothing (INV-10).
     public func setHostNotice(_ code: UInt8) {
@@ -918,6 +933,8 @@ public final class HostEngine: @unchecked Sendable {
                     }
                     lastPingUS = nowUS
                     if hostNotice != HostNotice.none { sendControl(.hostNotice(code: hostNotice)) }
+                    hostDisplayNegotiated = caps & WireCaps.hostDisplaySize != 0
+                    if hostDisplayNegotiated, let d = hostDisplaySize { sendControl(.hostDisplay(width: d.width, height: d.height)) }
                 }
             case let .ack(frameSeq, dgramCnt, bitmap):
                 lastControlNowUS = nowUS
@@ -994,7 +1011,7 @@ public final class HostEngine: @unchecked Sendable {
                                           limitedSinceUS: limitedSinceUS)
             case let .syncRequest(region, generation):
                 noteSyncRequest(region: region, generation: generation)
-            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice:
+            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice, .hostDisplay:
                 break // host-originated / not addressed to the host
             }
         }

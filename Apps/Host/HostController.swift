@@ -533,6 +533,9 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         if flags.contains(.setModeFlag), display == physicalDisplay {
             let b = CGDisplayBounds(display)
             onStatus("display mode changed → \(Int(b.width))×\(Int(b.height)) pt")
+            if let d = sharedDisplayPixelSize() {
+                encodeQueue.async { [weak self] in self?.engine?.setHostDisplaySize(width: d.width, height: d.height) }
+            }
             reapplyViewerModeIfReverted()
         }
         // One reconcile per burst: a rearrangement reports every display,
@@ -1096,6 +1099,19 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
         let w = CGDisplayBounds(display).width
         return w > 0 ? CGFloat(captureWidth) / w : pixelScale
+    }
+
+    /// The pixel size of the display a full-display session shares (its current mode's: a 5K
+    /// display at 5120 × 2880 however the picture is scaled), for HOST_DISPLAY; nil while one window
+    /// is shared.
+    private func sharedDisplayPixelSize() -> (width: Int, height: Int)? {
+        guard singleWindowID == 0 else { return nil }
+        var display = physicalDisplay
+        var count: UInt32 = 0
+        let probe = CGPoint(x: contentOrigin.x + 1, y: contentOrigin.y + 1)
+        if CGGetDisplaysWithPoint(probe, 1, &display, &count) != .success || count == 0 { display = physicalDisplay }
+        guard let mode = CGDisplayCopyDisplayMode(display), mode.pixelWidth > 0 else { return nil }
+        return (mode.pixelWidth, mode.pixelHeight)
     }
 
     private func injectInput(kind rawKind: Int, canvasX: Int, canvasY: Int, a: Int, b: Int) {
@@ -2608,6 +2624,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
         if sessionOffScreen { engine.setHostNotice(HostNotice.sessionOffScreen) }
+        if let d = sharedDisplayPixelSize() { engine.setHostDisplaySize(width: d.width, height: d.height) }
         // Always advertise single-window support (Screen Recording is a
         // runtime gate handled at enumeration — gating the cap would deadlock).
         // A settled geometry is only final while the display is still in the

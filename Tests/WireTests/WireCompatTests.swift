@@ -40,6 +40,7 @@ import GlassActWire
         "1c1040420f000000000080841e0000000000",
         "1d0101",
         "1e0101",
+        "1f040014400b",
     ]
     static let video = [
         "01120102000000000000000005d0020103010203",
@@ -64,7 +65,7 @@ import GlassActWire
 
     @Test func everyTypeIsPinned() {
         #expect(WireCompatSamples.control.count == Self.control.count)
-        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1E)),
+        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1F)),
                 "a control type without a fixture; add one")
         #expect(WireCompatSamples.video.count == Self.video.count)
     }
@@ -113,6 +114,7 @@ import GlassActWire
         #expect(WireCaps.logUpload == 1 << 9)
         #expect(WireCaps.virtualDisplay == 1 << 10)
         #expect(WireCaps.agentControl == 1 << 11)
+        #expect(WireCaps.hostDisplaySize == 1 << 12)
         // the released fixtures' caps are made of known bits only, and none of them is bit 7 or 8
         // (`videoReducedFrames`, new in this release too)
         #expect(0x0E71 & WireCaps.videoAV1GlassAct == 0 && 0x0011 & WireCaps.videoAV1GlassAct == 0)

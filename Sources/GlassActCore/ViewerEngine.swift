@@ -263,6 +263,9 @@ public final class ViewerEngine: @unchecked Sendable {
     public var onVideoCodecChanged: ((UInt8?) -> Void)?
     /// The host's `HostNotice` changed (`HostNotice.none`: nothing to show).
     public var onHostNotice: ((UInt8) -> Void)?
+    /// HOST_DISPLAY: the pixel size of the display the host shares (`WireCaps.hostDisplaySize`,
+    /// which this viewer always asks for). Engine queue.
+    public var onHostDisplay: ((_ width: Int, _ height: Int) -> Void)?
     /// Connect milestones (see SessionMilestones). Engine-queue.
     public private(set) var milestones = SessionMilestones()
     /// `nowUS` of the datagram being applied (tile milestones).
@@ -389,7 +392,7 @@ public final class ViewerEngine: @unchecked Sendable {
                     // Accept unconditionally in-session (geoMode 0): window mode
                     // is host-authoritative — no geometry to negotiate.
                     sendControl(.helloOK(ver: WireVersion.current,
-                                         caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps,
+                                         caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps | WireCaps.hostDisplaySize,
                                          geoMode: GeometryMode.none, geoWidth: 0, geoHeight: 0, geoScale: 0))
                     break
                 }
@@ -416,7 +419,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 // Reply first so the host learns our version even on mismatch;
                 // both sides then fail symmetrically.
                 sendControl(.helloOK(ver: WireVersion.current,
-                                     caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps,
+                                     caps: (advertiseCursor ? WireCaps.cursor : 0) | videoCaps | WireCaps.hostDisplaySize,
                                      geoMode: geo?.mode ?? GeometryMode.none,
                                      geoWidth: UInt16(clamping: geo?.w ?? 0),
                                      geoHeight: UInt16(clamping: geo?.h ?? 0),
@@ -482,6 +485,8 @@ public final class ViewerEngine: @unchecked Sendable {
                 onUITree?(requestID, status, json)
             case let .hostNotice(code):
                 onHostNotice?(code)
+            case let .hostDisplay(width, height):
+                onHostDisplay?(Int(width), Int(height))
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
                  .viewerInfo, .syncRequest, .received, .viewerBye:

@@ -165,6 +165,9 @@ public final class ViewerController: @unchecked Sendable {
                 ?? "video off — lossless tiles"
             DispatchQueue.main.async { self?.onStatus(msg) }
         }
+        engine.onHostDisplay = { [weak self] width, height in
+            DispatchQueue.main.async { self?.hostDisplaySize = (width, height) }
+        }
         engine.onHostNotice = { [weak self] code in
             DispatchQueue.main.async { self?.onHostNotice?(code) }
         }
@@ -174,6 +177,9 @@ public final class ViewerController: @unchecked Sendable {
     public var onConnectionFailed: (() -> Void)?
     /// The host's HOST_NOTICE changed (main thread).
     public var onHostNotice: ((UInt8) -> Void)?
+    /// Main thread: the pixel size of the display the host shares (HOST_DISPLAY), or nil (a host
+    /// without it, or none heard yet).
+    public private(set) var hostDisplaySize: (width: Int, height: Int)?
 
     // MARK: - Clipboard sync (main thread)
 
@@ -211,8 +217,23 @@ public final class ViewerController: @unchecked Sendable {
     /// at this viewer touching the session — an attached agent yields.
     public func sendInput(kind: UInt8, x: Int, y: Int, a: Int, b: Int) {
         agentDriver?.noteHumanInput()
+        held.sent(kind: kind, x: x, y: y, b: b)
         session.sendInput(kind: kind, x: x, y: y, a: a, b: b)
     }
+
+    /// Main thread: what this Viewer's person has pressed on the Host and not released (`HeldInput`).
+    public private(set) var held = HeldInput()
+
+    /// Main thread: release every key and button this Viewer holds on the Host. The app calls it as
+    /// its canvas stops taking input (its window resigns key: another app or window has the
+    /// keyboard, and would get the releases).
+    public func releaseHeldInput() {
+        for e in held.releaseAll() { session.sendInput(kind: e.kind, x: e.x, y: e.y, a: e.a, b: e.b) }
+    }
+
+    /// Main thread: a mouse button's release where the pointer has left the picture: at the last
+    /// position sent, so the Host doesn't keep the button down (nil: none sent yet).
+    public var lastInputPosition: (x: Int, y: Int)? { held.position }
     /// An agent using this session (Settings › Agents), if any. It sends
     /// through `session` directly, so its input never counts as the person's.
     public var agentDriver: AgentDriver?
