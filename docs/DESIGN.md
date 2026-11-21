@@ -991,10 +991,15 @@ ACK-bitmap loss:
   `deliveryReports`, `LinkEstimate` turns the viewer's RECEIVED reports into
   a delivered rate (each over ≥ 1 s of the viewer's clock, since bytes land
   in bursts). The capacity is the most delivered over the last 60 s in a
-  span queued (SRTT − min RTT ≥ 30 ms) at both ends: only then is the
-  bottleneck busy. A
-  span with room reads the sender's own rate back, and a ceiling built on
-  it would ratchet down by 0.9 a minute. The video rate and the startup cap
+  span queued at both ends: only then is the bottleneck busy. Queued means
+  SRTT − min RTT ≥ 30 ms and the host limited (`hostLimited`: within the
+  last second the tile governor deferred, a tick waited on the pacer, the
+  video gate skipped a frame, or video waited in the transport; not a
+  tick waiting on two open batches, which is latency), with no break in
+  the limited stretch since the span's start. A span with room reads the sender's own rate back, and a ceiling
+  built on it would ratchet down by 0.9 a minute. The path's delay alone
+  isn't enough: on Wi-Fi in power save an idle path reads as queued, and a
+  span reaching back across a pause reads close to nothing (#144). The video rate and the startup cap
   stay ≤ 0.9 × capacity. With no queued span, or no reports (an older
   viewer), there's no ceiling.
 
@@ -1015,6 +1020,10 @@ capture (`ScalePressure`) after any of:
   thin link). The video rule needs a window in which video stayed
   backlogged, and a send gate that skips frames keeps it from backing up:
   in an airport lounge at ~0.3 Mbit/s neither older rule fired.
+- The link-capacity rule counts no app-limited second (the capacity needs
+  the host limited, above), and the video rule none by construction. No
+  rule counts a paused second: while the viewer is paused (§4.10) the rung
+  isn't evaluated, and a pause or a resume starts every rule over (#144).
 
 **Back up the rung:** the app arms the halved capture's engine with the full
 capture's pixel count (`armScaleRecovery`), and `onLinkRoomForFullResolution`
@@ -1090,6 +1099,10 @@ visible again.
   viewer's re-ACKs, cursor and clipboard.
 - An active video region is kept, not dissolved, and its quiet timer
   doesn't run, so resuming is a plain continuation with no settle repaint.
+- The resolution rung (§4.9) isn't evaluated while paused, and a pause or a
+  resume starts its rules over; recovery's count holds. Nothing sent means
+  nothing measured: a streak held through minutes of pause completed
+  three seconds after the resume and halved a LAN session's capture (#144).
 - The Host app drops capture to 1 fps while paused; the viewer releases its
   App Nap exemption.
 

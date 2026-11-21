@@ -566,6 +566,7 @@ extension HostEngine {
         let encoderFull = regionFramesPending >= min(max(1, encoder.maxPendingFrames), Self.videoPendingFramesCap)
         guard videoRate.allowsFrame(backlogBytes: backlog) else {
             stats.videoBacklogSkips += 1
+            noteLimited(nowUS: lastEncodeNowUS)
             // Bandwidth pressure: backlog is full. If the encoder is NOT also
             // full, this is the NETWORK, not the CPU → step quality down
             // (cheaper bytes). If the encoder IS full too, it's CPU pressure,

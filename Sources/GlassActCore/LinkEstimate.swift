@@ -8,11 +8,15 @@
 ///   last ~10 s. A lower bound on the link: a quiet screen delivers little,
 ///   which says nothing about it.
 /// - `capacityBytesPerSecond`: the same over the last ~60 s, counting only
-///   spans the path was queued at both ends. Only then is the bottleneck
-///   busy and what arrives the link's rate; spans the sender left room in
-///   would read its own rate back, and a ceiling built on them ratchets down
-///   (video under 0.9 × the ceiling, so the next minute's ceiling under
-///   that). 0 with no queued span: no ceiling.
+///   spans queued at both ends: the path held a standing queue and the host
+///   had more to send than went (`HostEngine.hostLimited`). Only then is
+///   the bottleneck busy and what arrives the link's rate; spans the sender
+///   left room in would read its own rate back, and a ceiling built on them
+///   ratchets down (video under 0.9 × the ceiling, so the next minute's
+///   ceiling under that). The path's queue alone isn't enough: on a Wi-Fi
+///   radio in power save an idle path's RTT swings 15–130 ms, and in replay
+///   a typing session's 0.04 Mbit/s read as the link's capacity (#144). 0
+///   with no queued span: no ceiling.
 /// - `recentCapacityBytesPerSecond`: the capacity over the last ~10 s, for
 ///   noticing a link that just got thinner (AV1 → HEVC).
 ///
@@ -26,7 +30,8 @@ struct LinkEstimate {
     /// the link.
     static let spanUS: UInt64 = 1_000_000
 
-    private struct Report { var tUS: UInt64 = 0, bytes: UInt64 = 0, queued = false }
+    /// `atUS`: when it reached the host (the host's clock).
+    private struct Report { var tUS: UInt64 = 0, atUS: UInt64 = 0, bytes: UInt64 = 0, queued = false }
     private struct Sample { var atUS: UInt64 = 0, rate = 0, queued = false }
 
     /// Recent reports, oldest overwritten.
@@ -36,16 +41,26 @@ struct LinkEstimate {
     private var samples = [Sample](repeating: Sample(), count: 256)
     private var next = 0
     private(set) var reports = 0
+    /// Capacity readings (queued samples) so far.
+    private(set) var queuedSamples = 0
 
-    /// `queued`: the host saw a standing queue on the path when this report
-    /// arrived.
-    mutating func noteReceived(bytes: UInt64, viewerTUS: UInt64, nowUS: UInt64, queued: Bool) {
+    /// `queued`: when this report arrived, the host saw a standing queue on
+    /// the path and was holding back what it had to send, as it has been
+    /// without a break since `limitedSinceUS` (host time; 0: no bound). A
+    /// span is queued only if it lies inside that stretch: one reaching back
+    /// across a quiet stretch reads the quiet, not the link. The viewer
+    /// reports only when bytes arrived, so after minutes of pause the first
+    /// report back, measured against the last one before it, reads close to
+    /// nothing: a capacity that would floor the video ceiling and fire the
+    /// resolution rung on a LAN (#144).
+    mutating func noteReceived(bytes: UInt64, viewerTUS: UInt64, nowUS: UInt64, queued: Bool,
+                               limitedSinceUS: UInt64 = 0) {
         reports += 1
         let last = reportsRing[(reportsNext + reportsRing.count - 1) % reportsRing.count]
         if last.tUS != 0, bytes < last.bytes || viewerTUS < last.tUS { // a new session's counters
-            reportsRing = [Report](repeating: Report(), count: reportsRing.count)
+            for i in reportsRing.indices { reportsRing[i] = Report() }
         }
-        reportsRing[reportsNext] = Report(tUS: viewerTUS, bytes: bytes, queued: queued)
+        reportsRing[reportsNext] = Report(tUS: viewerTUS, atUS: nowUS, bytes: bytes, queued: queued)
         reportsNext = (reportsNext + 1) % reportsRing.count
         // The newest report at least `spanUS` older than this one.
         var base: Report?
@@ -54,8 +69,10 @@ struct LinkEstimate {
         }
         guard let base, bytes >= base.bytes else { return }
         let rate = Int((bytes - base.bytes) &* 1_000_000 / (viewerTUS - base.tUS))
-        samples[next] = Sample(atUS: max(nowUS, 1), rate: rate, queued: queued && base.queued)
+        let spanQueued = queued && base.queued && base.atUS >= limitedSinceUS
+        samples[next] = Sample(atUS: max(nowUS, 1), rate: rate, queued: spanQueued)
         next = (next + 1) % samples.count
+        if spanQueued { queuedSamples += 1 }
     }
 
     /// Bytes/s; 0 with no reading in the window.
