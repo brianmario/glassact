@@ -477,11 +477,55 @@ public final class ViewerController: @unchecked Sendable {
     public func hasPicture(_ done: @escaping @MainActor (Bool) -> Void) { session.hasPicture(done) }
 
     /// Main-thread cache of the engine's PING-derived clock offset (the
-    /// engine is queue-confined; the present path must not hop queues).
-    public private(set) var hostClockOffsetUS: Int64 = 0
+    /// engine is queue-confined; the present path must not hop queues). Nil
+    /// until the engine has one: a frame's capture time rides the Host's
+    /// clock, so without it a latency sample is the two Macs' clock difference
+    /// (days of uptime apart, which the window title showed for the first
+    /// second or two of a session).
+    public private(set) var hostClockOffsetUS: Int64?
+    /// Main thread: an offset fetch is on its way back from the engine's queue.
+    private var offsetFetchPending = false
 
-    /// Called by the present path with capture→present latency samples.
-    public func recordGlassToGlass(_ samples: [UInt64]) {
+    /// Called by the present path (main thread) as a frame flips, with its
+    /// capture timestamps (the Host's clock) and the Viewer's `MonotonicClock`
+    /// at the flip. Dropped until the clock offset is known, which this then
+    /// fetches at once rather than at the next 2 s refresh.
+    public func recordGlassToGlass(captureTimestampsUS: [UInt64], presentedUS: UInt64) {
+        guard !captureTimestampsUS.isEmpty else { return }
+        guard let offset = hostClockOffsetUS else {
+            fetchHostClockOffset()
+            return
+        }
+        recordGlassToGlass(Self.glassToGlassUS(captureTimestampsUS: captureTimestampsUS, presentedUS: presentedUS,
+                                               hostClockOffsetUS: offset))
+    }
+
+    /// Capture → present latency per timestamp: the Viewer's time at the
+    /// present minus the capture time moved onto the Viewer's clock (0 where
+    /// the offset's error puts it before the capture).
+    static func glassToGlassUS(captureTimestampsUS: [UInt64], presentedUS: UInt64, hostClockOffsetUS offset: Int64) -> [UInt64] {
+        let now = Int64(bitPattern: presentedUS)
+        return captureTimestampsUS.map {
+            let g2g = now &- (Int64(bitPattern: $0) &+ offset)
+            return g2g > 0 ? UInt64(g2g) : 0
+        }
+    }
+
+    private func fetchHostClockOffset() {
+        guard !offsetFetchPending else { return }
+        offsetFetchPending = true
+        queue.async { [weak self] in
+            guard let self else { return }
+            let offset = self.engine.hostClockOffsetEstimateUS
+            DispatchQueue.main.async {
+                self.offsetFetchPending = false
+                if let offset { self.hostClockOffsetUS = offset }
+            }
+        }
+    }
+
+    /// Capture→present latency samples (µs).
+    func recordGlassToGlass(_ samples: [UInt64]) {
         telemetryG2G.append(contentsOf: samples)
         g2gLock.lock()
         g2gSamplesUS.append(contentsOf: samples)
@@ -495,9 +539,9 @@ public final class ViewerController: @unchecked Sendable {
             // window, stats for the diagnostic line.
             queue.async { [weak self] in
                 guard let self else { return }
-                let offset = self.engine.hostClockOffsetEstimateUS ?? 0
+                let offset = self.engine.hostClockOffsetEstimateUS
                 let s = self.engine.stats
-                DispatchQueue.main.async { self.hostClockOffsetUS = offset }
+                DispatchQueue.main.async { if let offset { self.hostClockOffsetUS = offset } }
                 let codec = self.engine.activeVideoCodec.map(VideoCodec.name) ?? "off"
                 let diag = "applied \(s.recordsApplied) · stale \(s.recordsStale)"
                     + " · deltas \(s.deltasApplied)/\(s.deltaBaseMisses) miss"
