@@ -22,6 +22,8 @@ let paceCommand = Command(
         .string("every", "<ms>", "a frame every ms, in real time (default 16.667: 60 fps)"),
         .int("pending", "<n>", 1...16, "frames waiting for the encoder before the engine skips (default 2, videoMaxPendingFrames)"),
         .int("loops", "<n>", 1...100, "play the loaded frames this many times (default 1)"),
+        .int("qindex", "<1-255>", 1...255, "with --codec hybrid: every picture at this qindex (HybridRegionEncoder.fixedQindex; a mostly-new picture's fast offset on top), not the rate controller's"),
+        .choice("colour", I420Converter.Colour.allCases.map(\.rawValue), "with --codec hybrid: the pictures' conversion (default bt709Full, the live encoder's; av1seq's is bt709Video)"),
         .bool("reduced", "with --codec hybrid: the Viewer shows reduced frames (WireCaps.videoReducedFrames), so runs of video softer than the region may be coded at half size (ReducedFramesPolicy)"),
     ],
     run: { opts in try runPace(opts) })
@@ -69,7 +71,9 @@ func runPace(_ opts: Options) throws {
         HybridRegionEncoder.prepare { _ in prepared.signal() }
         prepared.wait()
         guard HybridRegionEncoder.isReady else { throw BenchError("the hybrid's kernels didn't compile") }
-        let hybrid = HybridRegionEncoder(callbackQueue: queue)
+        let colour = opts.string("colour").flatMap(I420Converter.Colour.init(rawValue:)) ?? .bt709Full
+        let hybrid = HybridRegionEncoder(callbackQueue: queue, colour: colour)
+        if opts.has("qindex") { hybrid.fixedQindex = opts.int("qindex", 160) }
         encoder = hybrid
     }
     let s = PaceState()
