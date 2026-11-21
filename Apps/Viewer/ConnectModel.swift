@@ -31,7 +31,7 @@ final class ConnectModel {
             switch self {
             case .matchThisMac: "The host switches to this display’s resolution, for a sharp, pixel-for-pixel picture."
             case .fillWindow: "The host adds a virtual display the size of your window, and follows it as you resize."
-            case .scaleToFit: "The host’s display stays as it is; its picture is scaled to fit your window, and follows it as you resize."
+            case .scaleToFit: "The host’s display stays as it is; its picture is scaled down to fit your window, and re-fitted when you make the window bigger or clearly smaller."
             case .native: "Every pixel at full size. Move the pointer to an edge to pan around."
             }
         }
