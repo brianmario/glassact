@@ -158,6 +158,56 @@ import Testing
         #expect(host.scaleReason.contains("capacity unmeasured"), "\(host.scaleReason)")
     }
 
+    /// A pause or a resume starts every rule over: thin seconds from before
+    /// it don't add up with seconds after it (#144: a streak held through
+    /// minutes of pause completed three seconds after the resume).
+    @Test func aRestartStartsEveryRuleOver() {
+        var sample: UInt64 = 0, video = 0
+        func second(_ p: inout ScalePressure) -> Bool {
+            sample += 1
+            video += 1
+            return p.noteSecond(ackSampleUS: sample, ackDelayUS: 900_000, severeAckDelayUS: Self.severe,
+                                videoLinkMeasurements: video, videoRateBytesPerSecond: 30_000,
+                                videoLastDrainBytesPerSecond: 30_000, linkCapacityBytesPerSecond: 300_000 / 8,
+                                pixels: Self.capture)
+        }
+        var p = ScalePressure()
+        for _ in 0..<(ScalePressure.thinVideoSeconds - 1) { #expect(!second(&p)) }
+        p.restart()
+        for _ in 0..<(ScalePressure.thinVideoSeconds - 1) { #expect(!second(&p), "the count started over") }
+        #expect(second(&p))
+    }
+
+    /// The engine: while the viewer is paused, thin readings aren't
+    /// evaluated; after the resume the rule needs its full count again.
+    @Test func aPausedViewerIsntEvidence() {
+        let h = Harness(width: 256, height: 192)
+        var fired: UInt64?
+        h.host.onScalePressureConstrained = { fired = h.now }
+        var bytes: UInt64 = 0, viewerT: UInt64 = 0
+        func thinSeconds(_ n: Int) {
+            for _ in 0..<(n * 4) { // 20 kbit/s (the bar at 256×192 is 37), queued, 250 ms reports
+                viewerT += 250_000
+                bytes += 20_000 / 8 / 4
+                h.host.linkEstimate.noteReceived(bytes: bytes, viewerTUS: viewerT, nowUS: h.now, queued: true)
+                h.run(untilUS: h.now + 250_000)
+            }
+        }
+        thinSeconds(ScalePressure.thinVideoSeconds - 2)
+        #expect(fired == nil)
+        h.viewer.setContentPaused(true)
+        h.run(untilUS: h.now + 100_000)
+        #expect(h.host.contentPaused)
+        thinSeconds(30)
+        #expect(fired == nil, "paused seconds aren't evaluated")
+        h.viewer.setContentPaused(false)
+        h.run(untilUS: h.now + 100_000)
+        let resumed = h.now
+        thinSeconds(ScalePressure.thinVideoSeconds + 2)
+        #expect(fired.map { $0 - resumed >= UInt64(ScalePressure.thinVideoSeconds - 1) * 1_000_000 } == true,
+                "the resume starts the count over: \(fired.map { "\($0 - resumed) µs after it" } ?? "never")")
+    }
+
     /// The log says which evidence moved the rung.
     @Test func itSaysWhichRuleFired() {
         var p = ScalePressure()

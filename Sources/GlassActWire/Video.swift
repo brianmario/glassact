@@ -60,6 +60,10 @@ public enum WireCaps {
     /// TEXT_INPUT, AGENT_STATE, UI_TREE_REQUEST and agent-flagged INPUT, and
     /// answers with AGENT_SCOPE / UI_TREE.
     public static let agentControl: UInt32 = 1 << 11
+    /// Viewer → host in HELLO_OK: the viewer shows the size of the display the host shares
+    /// (HOST_DISPLAY), beside its picture's when they differ (Scale Down, a halved capture). Only
+    /// the viewer's bit matters: a host sends HOST_DISPLAY to a viewer whose HELLO_OK carries it.
+    public static let hostDisplaySize: UInt32 = 1 << 12
 
     /// Caps bit advertising support for a given region codec id. The rig-only
     /// mock ids map onto the real bits (0x7F → HEVC bit, 0x7E → AV1 bit) so

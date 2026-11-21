@@ -66,7 +66,10 @@ import GlassActTestSupport
         let before = footprint()
         #expect(try ScapRaw.compress(raw: raw, to: out, threads: 2) == count)
         let grew = footprint() - before
-        #expect(grew < 64 << 20, "footprint grew \(grew >> 20) MB compressing \((count * width * height * 4) >> 20) MB")
+        // (the footprint is the whole test process's, and other suites run beside this one: on a
+        // busy CI runner it grew 65 MB with the fix. Holding the frames read is at least their
+        // 256 MB, so the bar sits between the two)
+        #expect(grew < 160 << 20, "footprint grew \(grew >> 20) MB compressing \((count * width * height * 4) >> 20) MB")
     }
 
     /// `finish` leaves only the whole trace; a capture without a whole frame leaves nothing; both

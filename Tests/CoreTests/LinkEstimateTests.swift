@@ -5,12 +5,12 @@ import Testing
 @Suite struct LinkEstimateTests {
     /// Reports every 250 ms of `bytesPerReport` each, from viewer time `t0`.
     private func feed(_ e: inout LinkEstimate, from t0: UInt64, reports: Int, bytesPerReport: [UInt64],
-                      startBytes: UInt64 = 0, queued: Bool = true) -> (UInt64, UInt64) {
+                      startBytes: UInt64 = 0, queued: Bool = true, limitedSinceUS: UInt64 = 0) -> (UInt64, UInt64) {
         var bytes = startBytes, t = t0
         for i in 0..<reports {
             t += 250_000
             bytes += bytesPerReport[i % bytesPerReport.count]
-            e.noteReceived(bytes: bytes, viewerTUS: t, nowUS: t, queued: queued)
+            e.noteReceived(bytes: bytes, viewerTUS: t, nowUS: t, queued: queued, limitedSinceUS: limitedSinceUS)
         }
         return (bytes, t)
     }
@@ -53,6 +53,26 @@ import Testing
         #expect(e.capacityBytesPerSecond(nowUS: t) == 0, "the span's base report wasn't queued")
         _ = feed(&e, from: t, reports: 4, bytesPerReport: [62_500], startBytes: bytes)
         #expect(e.capacityBytesPerSecond(nowUS: t + 4 * 250_000) == 250_000)
+    }
+
+    /// The viewer reports only when bytes arrived, so the first report after
+    /// a quiet stretch (a paused viewer, an idle screen) measured against
+    /// the last one before it reads the quiet: after two minutes of pause,
+    /// ~1.5 KB/s, queued at both ends (#144). A span is a capacity reading
+    /// only inside the host's current limited stretch.
+    @Test func aSpanAcrossAQuietStretchIsntCapacity() {
+        var e = LinkEstimate()
+        var (bytes, t) = feed(&e, from: 0, reports: 20, bytesPerReport: [62_500], limitedSinceUS: 1) // 2 Mbit/s
+        let before = e.queuedSamples
+        t += 120_000_000 // paused; the host's next limited stretch starts at the resume
+        let resumed = t + 1
+        (bytes, t) = feed(&e, from: t, reports: 3, bytesPerReport: [62_500], startBytes: bytes, limitedSinceUS: resumed)
+        #expect(e.queuedSamples == before, "no capacity from a span reaching back across the pause")
+        #expect(e.capacityBytesPerSecond(nowUS: t) == 0, "nothing from before it is left in the window")
+        #expect(e.deliveredBytesPerSecond(nowUS: t) < 2_000, "(the span read the pause)")
+        _ = feed(&e, from: t, reports: 2, bytesPerReport: [62_500], startBytes: bytes, limitedSinceUS: resumed)
+        #expect(e.queuedSamples == before + 1)
+        #expect(e.capacityBytesPerSecond(nowUS: t + 500_000) == 250_000, "the link's rate, not the pause's")
     }
 
     /// A reconnect restarts the viewer's counters: no negative or bogus rate.

@@ -323,6 +323,11 @@ public enum ControlMessage: Equatable, Sendable {
     /// leaving from a drop, which a closed stream alone can't (the viewer's
     /// watchdog closes it cleanly too). Hosts ignore codes they don't know.
     case viewerBye(reason: UInt8)
+    /// Host → viewer (`WireCaps.hostDisplaySize`): the pixel size of the display the host shares,
+    /// its current mode's (a 5K display at 5120 × 2880 however its picture is scaled). Sent after
+    /// the handshake and whenever it changes, to a viewer whose HELLO_OK carries the bit; never in
+    /// single-window mode. Display only.
+    case hostDisplay(width: UInt16, height: UInt16)
 
     public static let maxViewerLogChunk = 64 << 10
     public static let maxTextInputBytes = 4096
@@ -373,6 +378,7 @@ public enum ControlMessage: Equatable, Sendable {
         case .received: 0x1C
         case .hostNotice: 0x1D
         case .viewerBye: 0x1E
+        case .hostDisplay: 0x1F
         }
     }
 
@@ -554,6 +560,9 @@ public enum ControlMessage: Equatable, Sendable {
             body.writeU8(code)
         case let .viewerBye(reason):
             body.writeU8(reason)
+        case let .hostDisplay(width, height):
+            body.writeU16(width)
+            body.writeU16(height)
         }
         return body.bytes
     }
@@ -735,6 +744,9 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x1E:
             guard let reason = r.readU8() else { return nil }
             return .viewerBye(reason: reason)
+        case 0x1F:
+            guard let w = r.readU16(), let h = r.readU16() else { return nil }
+            return .hostDisplay(width: w, height: h)
         default:
             return nil
         }

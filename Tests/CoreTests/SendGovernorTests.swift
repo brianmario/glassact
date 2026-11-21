@@ -103,8 +103,10 @@ import Testing
     @Test func backoffHoldsGrowthToo() {
         var g = SendGovernor()
         sample(&g, queueUS: 100_000, at: 1_000_000)
+        g.noteDeferred() // the limit: a building queue is a backoff (app-limited, it would hold)
         g.adapt(nowUS: 1_000_000, ceiling: G.maxAutoRate)
         let after = g.autoRate
+        #expect(after < G.initialAutoRate)
         g.notePathDelay(10_000, nowUS: 1_100_000)
         g.noteDeferred()
         g.adapt(nowUS: 1_100_000, ceiling: G.maxAutoRate)
@@ -176,6 +178,82 @@ import Testing
         g.noteDeferred() // limiting: delivery is the bottleneck's rate, not ours
         g.adapt(nowUS: t, ceiling: G.maxAutoRate)
         #expect(g.autoRate == Int(Double(delivered) * G.drainFactor), "drains to 0.9 × delivered")
+    }
+
+    /// A quiet screen on a jittery path (#143): readings of a 60–200 ms
+    /// queue arrive while the host sends almost nothing. The queue isn't
+    /// ours, and cutting a rate we don't use only lowers the next burst's
+    /// budget: the rate holds. (Cut ×0.9 per reading, it reached the floor.)
+    @Test func aQueueWeArentFeedingHolds() {
+        var g = SendGovernor()
+        var t: UInt64 = 0
+        for _ in 0..<600 { // 5 minutes, a 1 KB update and a 100 ms "queue" every half second
+            t += 500_000
+            g.noteDelivered(1_000, nowUS: t)
+            sample(&g, queueUS: 100_000, at: t)
+            g.adapt(nowUS: t, ceiling: G.maxAutoRate)
+        }
+        #expect(g.autoRate == G.initialAutoRate, "held at \(g.autoRate)")
+        #expect(g.queueHolds > 0 && g.queueCuts == 0)
+    }
+
+    /// App-limited but sending enough to fill the path (at least half the
+    /// rate delivered in the last second): a building queue may be ours,
+    /// and it still backs off gently.
+    @Test func aQueueWeAreFeedingStillBacksOff() {
+        var g = SendGovernor()
+        var t: UInt64 = 1_000_000
+        for _ in 0..<40 { // 1.2 MB/s delivered for 1 s, rate 2 MB/s
+            t += 25_000
+            g.noteDelivered(30_000, nowUS: t)
+        }
+        sample(&g, queueUS: 100_000, at: t)
+        g.adapt(nowUS: t, ceiling: G.maxAutoRate)
+        #expect(g.autoRate == Int(Double(G.initialAutoRate) * G.drainFactor))
+    }
+
+    /// The delivery rate a backoff drains to is measured over the governor's
+    /// limited stretch only. Here a minute of a quiet screen sits in the ring
+    /// ahead of a burst: across it, delivery reads ~1 KB/s, and 0.9 × that
+    /// is the floor (#143). Over the burst it reads the link.
+    @Test func aBurstAfterIdleDrainsToItsOwnDelivery() {
+        var g = SendGovernor()
+        var t: UInt64 = 0
+        for _ in 0..<60 { // a minute of 1 KB a second, no queue
+            t += 1_000_000
+            g.noteDelivered(1_000, nowUS: t)
+            sample(&g, queueUS: 0, at: t)
+            g.adapt(nowUS: t, ceiling: G.maxAutoRate)
+        }
+        // A burst: the governor is the limit, the link delivers 1.6 MB/s.
+        for i in 1...12 {
+            t += 25_000
+            g.noteDelivered(40_000, nowUS: t)
+            if i == 1 {
+                sample(&g, queueUS: 0, at: t)
+                g.noteDeferred()
+                g.adapt(nowUS: t, ceiling: G.maxAutoRate) // the stretch starts
+            }
+        }
+        sample(&g, queueUS: 100_000, at: t)
+        g.noteDeferred()
+        g.adapt(nowUS: t, ceiling: G.maxAutoRate)
+        let expected = Int(Double(1_600_000) * G.drainFactor)
+        #expect(abs(g.autoRate - expected) < 50_000, "drained to \(g.autoRate), want ~\(expected)")
+    }
+
+    /// A severe queue while app-limited halves; the delivered bound applies
+    /// only to a limited stretch's reading.
+    @Test func aSevereQueueWhileAppLimitedHalves() {
+        var g = SendGovernor()
+        var t: UInt64 = 0
+        for _ in 0..<30 {
+            t += 1_000_000
+            g.noteDelivered(1_000, nowUS: t)
+        }
+        sample(&g, queueUS: 300_000, at: t)
+        g.adapt(nowUS: t, ceiling: G.maxAutoRate)
+        #expect(g.autoRate == G.initialAutoRate / 2)
     }
 
     @Test func severeQueueHalvesOncePerHoldAndTheFloorHolds() {
