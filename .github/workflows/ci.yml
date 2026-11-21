@@ -41,7 +41,23 @@ jobs:
       - name: Rust tests
         run: cargo test --release --manifest-path rust/av1/Cargo.toml
       - name: Build
-        run: swift build --build-tests
+        # Release: the engine's session simulations (a virtual network for
+        # many simulated seconds: bandwidth adaptation, handoffs, faults) run
+        # ~14× faster optimized. Serial on an M4 Pro the suite took 923 s in
+        # debug, 150 s in release, and on a slow hosted runner the debug job
+        # hit its 30 minutes with every test passed (2026-11-21). The code
+        # keeps its checks in -O (preconditions, overflow traps, checked wire
+        # parsing; the one `assert` is in GPU code CI skips), and allocation
+        # counts are asserted only optimized. `just test` stays debug.
+        #
+        # The build is `swift test`'s own, stopped before any test runs (its
+        # list of them): `swift build -c release --build-tests` doesn't build
+        # release modules for testing, so every `@testable import` fails
+        # ("unable to resolve Swift module dependency to a compatible
+        # module"), and only `swift test` has the setting that does
+        # (--enable-testable-imports, its default). The two steps below then
+        # find their build done.
+        run: swift test -c release list
       - name: Test
         # VideoSendGateTests emulates a 3 Mbit/s link through a loopback relay
         # and first checks the rig reproduces the byte-gate baseline's seconds
@@ -52,13 +68,13 @@ jobs:
         # VM whose paravirtual GPU doesn't compile or run the kernels exactly
         # (AV1ShaderSource.hasCapableGPU). Their CPU half runs: the Rust tests above and the libaom
         # decode gates (AV1CoreTests).
-        run: swift test --skip "VideoSendGateTests|$QUIC_SUITES"
+        run: swift test -c release --skip "VideoSendGateTests|$QUIC_SUITES"
       - name: Real-QUIC tests
         # One suite at a time: run side by side, the suites still starved each
         # other on a hosted VM (QUICSustainedSessionTests' 2048×2048 session
         # missing its 25 s round with its control path alive, 2026-10-26).
         # ~100 s instead of ~45 s.
-        run: swift test --filter "$QUIC_SUITES" --no-parallel
+        run: swift test -c release --filter "$QUIC_SUITES" --no-parallel
 
   apps:
     name: Apps
