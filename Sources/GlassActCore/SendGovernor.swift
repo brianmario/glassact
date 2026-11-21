@@ -173,6 +173,9 @@ struct SendGovernor {
     private var lastGrowthUS: UInt64 = 0
     private var lastDecreaseUS: UInt64 = 0
     private(set) var lossCuts = 0
+    /// Delay-based decreases (telemetry): a building queue, a severe one.
+    private(set) var queueCuts = 0
+    private(set) var severeCuts = 0
     private var recentMinUS = UInt64.max
     private var previousRecentMinUS = UInt64.max
     private var recentWindowStartUS: UInt64 = 0
@@ -339,6 +342,7 @@ struct SendGovernor {
                 autoRate = next
                 lastDecreaseUS = nowUS
                 slowStart = false
+                severeCuts += 1
             }
         } else if queue > Self.queueBuildingUS {
             if !decreaseHeld {
@@ -349,6 +353,7 @@ struct SendGovernor {
                 }
                 lastDecreaseUS = nowUS
                 slowStart = false
+                queueCuts += 1
             }
         } else if queue < Self.queueHealthyUS && deferredSinceAdapt && encodeHeadroom && !decreaseHeld
                     && (lastLossEventUS == 0 || nowUS &- lastLossEventUS >= Self.growthQuietAfterLossUS)

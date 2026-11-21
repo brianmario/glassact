@@ -98,6 +98,13 @@ public struct HostStats: Sendable {
     public var lossyFirstPaintsSent = 0
     /// The governor's current refill rate (bytes/s) under the rate policy.
     public var governorRate = 0
+    /// The governor's decreases so far, by cause (§4.9): a building queue
+    /// (> 60 ms), a severe one (> 200 ms), a loss event.
+    public var governorQueueCuts = 0
+    public var governorSevereCuts = 0
+    public var governorLossCuts = 0
+    /// The governor's standing-queue estimate at its last decision (µs).
+    public var governorQueueUS: UInt64 = 0
     /// Encode time as a share of the capture interval (EWMA, %; 0 when the
     /// host doesn't measure it) — Auto's headroom bound.
     public var encodeDutyPercent = 0
@@ -1371,6 +1378,10 @@ public final class HostEngine: @unchecked Sendable {
                        ceiling: transport.pacesDatagrams ? pace.rate : SendGovernor.maxAutoRate)
         governor.refill(nowUS: nowUS, limit: rateLimit)
         stats.governorRate = governor.rate(rateLimit)
+        stats.governorQueueCuts = governor.queueCuts
+        stats.governorSevereCuts = governor.severeCuts
+        stats.governorLossCuts = governor.lossCuts
+        stats.governorQueueUS = governor.queueDelayUS
         stats.encodeDutyPercent = Int((governor.encodeDuty ?? 0) * 100)
         var governorBudget = governor.tokens
         var governorDeferred = 0

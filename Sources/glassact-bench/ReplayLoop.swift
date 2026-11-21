@@ -19,6 +19,13 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
         faults.latencyMinUS = UInt64(latency.lo) * 1000
         faults.latencyMaxUS = UInt64(latency.hi) * 1000
     }
+    // --power-save lo-hi: Wi-Fi power save on the viewer's downlink, a
+    // jittery path with no bottleneck (FaultConfig.powerSaveWakeMinUS).
+    if let wake = opts.span("power-save") {
+        faults.powerSaveWakeMinUS = UInt64(wake.lo) * 1000
+        faults.powerSaveWakeMaxUS = UInt64(wake.hi) * 1000
+        faults.powerSaveIdleUS = UInt64(opts.int("power-save-idle-ms", 50)) * 1000
+    }
 
     let width = reader.header.width
     let height = reader.header.height
@@ -279,6 +286,9 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var nextBacklogSampleUS: UInt64 = 0
     let timeline = opts.has("timeline")
     var nextTimelineUS: UInt64 = 0
+    // The governor's rate every 100 ms of virtual time while frames play.
+    var governorSamples: [Int] = []
+    var nextGovernorSampleUS: UInt64 = 0
     // the video faults that come by the Host's frame count
     var hostResetDueUS: UInt64?
     func videoFaultsTick() {
@@ -328,7 +338,15 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
                       + "vcap \(host.videoRate.bitrateCap.map { String(format: "%.2f", Double($0) / 1e6) } ?? "none") "
                       + "backoffs \(host.videoRate.backoffs) vskips \(host.stats.videoBacklogSkips) "
                       + "netq \((host.videoNetworkQueueUS ?? 0) / 1000) ms "
-                      + "ldeliv \(String(format: "%.2f", Double(host.linkDeliveredBytesPerSecond * 8) / 1e6)) lcap \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6))")
+                      + "ldeliv \(String(format: "%.2f", Double(host.linkDeliveredBytesPerSecond * 8) / 1e6)) lcap \(String(format: "%.2f", Double(host.linkCapacityBytesPerSecond * 8) / 1e6))",
+                      terminator: "")
+                let gov: String = " deferred \(host.stats.governorDeferredTiles) govq \(host.stats.governorQueueUS / 1000) ms "
+                    + "cuts \(host.stats.governorQueueCuts)/\(host.stats.governorSevereCuts)/\(host.stats.governorLossCuts)"
+                print(gov + (host.contentPaused ? " PAUSED" : ""))
+            }
+            if sampling && !host.contentPaused && host.stats.governorRate > 0 && t >= nextGovernorSampleUS {
+                nextGovernorSampleUS = t + 100_000
+                governorSamples.append(host.stats.governorRate)
             }
             if link.bottleneck != nil && t >= nextBacklogSampleUS {
                 nextBacklogSampleUS = t + 10_000
@@ -358,7 +376,7 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     var rects: [DirtyRect] = []
     var baseTS: UInt64?
     var frames = 0
-    let replayStartUS = link.nowUS + 16_000
+    var replayStartUS = link.nowUS + 16_000
     sampling = true
 
     // Time to exact: once the screen stops changing for `stillGapUS`, how
@@ -396,10 +414,28 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
     }
     var lastFeedUS = link.nowUS
 
+    // --pause-at s: the Viewer's window hides at that point of the trace
+    // (PAUSE_HINT 1, §4.10) for --pause-s seconds of virtual time, then shows
+    // again (PAUSE_HINT 0); the trace's clock stops meanwhile, so the screen
+    // picks up where it left off.
+    var pauseAtUS: UInt64? = opts.has("pause-at") ? UInt64(opts.int("pause-at", 0)) * 1_000_000 : nil
+    let pauseUS = UInt64(opts.int("pause-s", 120)) * 1_000_000
+    var resumedAtUS: UInt64?
     let frameLimit = opts.has("frames") ? opts.int("frames", 0) : Int.max
     while frames < frameLimit, let meta = try reader.readFrame(rects: &rects, into: frameBuf) {
         let base = baseTS ?? meta.timestampUS
         baseTS = base
+        if let at = pauseAtUS, meta.timestampUS &- base >= at {
+            pauseAtUS = nil
+            driveStill(since: lastFeedUS, untilUS: replayStartUS + at)
+            print("  paused at \(String(format: "%.1f", Double(link.nowUS) / 1e6)) s (trace \(at / 1_000_000) s) for \(pauseUS / 1_000_000) s")
+            viewer.setContentPaused(true)
+            drive(untilUS: link.nowUS + pauseUS)
+            viewer.setContentPaused(false)
+            resumedAtUS = link.nowUS
+            replayStartUS += pauseUS
+            lastFeedUS = link.nowUS
+        }
         driveStill(since: lastFeedUS, untilUS: replayStartUS + (meta.timestampUS &- base))
         lastFeedUS = link.nowUS
         lastFrame.withUnsafeMutableBytes { dst in
@@ -545,6 +581,16 @@ func cmdReplayLoop(_ reader: ScapReader, traceName: String, opts: Options) throw
               + "buffer \(formatBytes(bottleneck.bufferBytes))  queue p95 \(p95 / 1000) ms  "
               + "worst \((sorted.last ?? 0) / 1000) ms  datagrams dropped \(link.bottleneckDroppedDatagrams)")
     }
+    // The tile governor over the trace (§4.9; DESIGN's #143 case): where its
+    // rate sat and what cut it.
+    let govSorted = governorSamples.sorted()
+    func govAt(_ p: Double) -> String {
+        govSorted.isEmpty ? "-" : String(format: "%.2f", Double(govSorted[min(govSorted.count - 1, Int(Double(govSorted.count) * p))]) / 1e6)
+    }
+    print("  governor while frames played (MB/s): min \(govAt(0)) p10 \(govAt(0.1)) p50 \(govAt(0.5)) max \(govAt(1))  "
+          + "cuts: queue \(host.stats.governorQueueCuts) severe \(host.stats.governorSevereCuts) loss \(host.stats.governorLossCuts)"
+          + (faults.powerSaveWakeMaxUS > 0 ? "  power-save wakes \(link.powerSaveWakes)" : "")
+          + (resumedAtUS.map { r in "  auto-scale after the resume: " + (autoScaleUS.map { $0 >= r ? String(format: "%.1f s", Double($0 - r) / 1e6) : "before it" } ?? "never") } ?? ""))
     let exact = exactAfterUS.sorted()
     let exactP50 = exact.isEmpty ? "-" : "\(exact[exact.count / 2] / 1000) ms"
     let exactMax = exact.isEmpty ? "-" : "\(exact.last! / 1000) ms"

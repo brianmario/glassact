@@ -14,6 +14,18 @@ public struct FaultConfig: Sendable {
     /// Uniform per-datagram latency range. Control uses the midpoint, FIFO.
     public var latencyMinUS: UInt64 = 0
     public var latencyMaxUS: UInt64 = 0
+    /// Wi-Fi power save on the viewer's downlink (host → viewer: datagrams,
+    /// video and control alike): once nothing has reached the viewer for
+    /// `powerSaveIdleUS`, its radio sleeps, and the next packet for it waits
+    /// at the access point until it wakes, a uniform `powerSaveWakeMinUS`–
+    /// `powerSaveWakeMaxUS` later; everything that arrives meanwhile goes
+    /// with it. An idle path's latency swings while a busy one stays fast:
+    /// a jittery LAN with no bottleneck. The modeled transport RTT
+    /// (`InProcTransport.transportRTT`) sees the wait. 0: off. Its own RNG
+    /// stream (from `seed`), so the other faults' sequences don't move.
+    public var powerSaveWakeMinUS: UInt64 = 0
+    public var powerSaveWakeMaxUS: UInt64 = 0
+    public var powerSaveIdleUS: UInt64 = 50_000
     public var seed: UInt64 = 1
 
     public init() {}
@@ -237,7 +249,50 @@ public final class InProcLink: @unchecked Sendable {
     private var rttSmoothedUS: UInt64 = 0
     private var rttMinUS: UInt64 = 0
     var modeledRTT: (smoothedUS: UInt64, minUS: UInt64)? {
-        bottleneck != nil && rttSampled ? (rttSmoothedUS, rttMinUS) : nil
+        (bottleneck != nil || powerSaves) && rttSampled ? (rttSmoothedUS, rttMinUS) : nil
+    }
+
+    // Wi-Fi power save (`FaultConfig.powerSaveWakeMinUS`).
+    private var powerSaveRNG: SeededRNG
+    private var stationAwakeUntilUS: UInt64 = 0
+    private var stationWakeUS: UInt64 = 0
+    private var powerSaves: Bool { faults.powerSaveWakeMaxUS > 0 }
+    /// Wakes the modeled station made (each held what arrived while it slept).
+    public private(set) var powerSaveWakes = 0
+
+    /// When a host → viewer packet that reaches the viewer's access point
+    /// at `arriveUS` is delivered: with a wake pending, at that wake; at once
+    /// while the station is awake; else at a new wake.
+    private func powerSaveDeliver(_ arriveUS: UInt64) -> UInt64 {
+        guard powerSaves else { return arriveUS }
+        var deliver = arriveUS
+        if stationWakeUS > arriveUS {
+            deliver = stationWakeUS
+        } else if arriveUS > stationAwakeUntilUS {
+            stationWakeUS = arriveUS &+ powerSaveRNG.uniform(faults.powerSaveWakeMinUS, faults.powerSaveWakeMaxUS)
+            powerSaveWakes += 1
+            deliver = stationWakeUS
+        }
+        stationAwakeUntilUS = max(stationAwakeUntilUS, deliver &+ faults.powerSaveIdleUS)
+        return deliver
+    }
+
+    private func noteRTT(_ sample: UInt64) {
+        if rttSampled {
+            rttSmoothedUS = (rttSmoothedUS &* 7 &+ sample) / 8
+            rttMinUS = min(rttMinUS, sample)
+        } else {
+            rttSampled = true
+            rttSmoothedUS = sample
+            rttMinUS = sample
+        }
+    }
+
+    /// With power save, a reliable host → viewer send's RTT sample, once its
+    /// delivery is known: there and back (the reply at control's latency).
+    private func notePowerSaveRTT(deliverUS: UInt64) {
+        guard powerSaves else { return }
+        noteRTT((deliverUS > nowUS ? deliverUS - nowUS : 0) &+ (faults.latencyMinUS + faults.latencyMaxUS) / 2)
     }
     /// Time the modeled bottleneck still needs to drain what it holds (its
     /// queueing delay right now; 0 when idle or unmodeled).
@@ -274,6 +329,7 @@ public final class InProcLink: @unchecked Sendable {
     public init(faults: FaultConfig = .none) {
         self.faults = faults
         rng = SeededRNG(seed: faults.seed)
+        powerSaveRNG = SeededRNG(seed: faults.seed ^ 0x5057_5253_4156_4531)
         a = InProcTransport(isA: true)
         b = InProcTransport(isA: false)
         a.link = self
@@ -287,8 +343,9 @@ public final class InProcLink: @unchecked Sendable {
         if fromA, let bottleneck { departUS = bottleneckAdmit(data.count, bottleneck) }
         var deliver = departUS &+ latency
         if fromA {
-            deliver = max(deliver, lastControlDeliverToB)
+            deliver = max(powerSaveDeliver(deliver), lastControlDeliverToB)
             lastControlDeliverToB = deliver
+            notePowerSaveRTT(deliverUS: deliver)
         } else {
             deliver = max(deliver, lastControlDeliverToA)
             lastControlDeliverToA = deliver
@@ -310,8 +367,9 @@ public final class InProcLink: @unchecked Sendable {
         let latency = (faults.latencyMinUS + faults.latencyMaxUS) / 2
         var deliver = nowUS &+ latency
         if fromA {
-            deliver = max(deliver, lastVideoDeliverToB)
+            deliver = max(powerSaveDeliver(deliver), lastVideoDeliverToB)
             lastVideoDeliverToB = deliver
+            notePowerSaveRTT(deliverUS: deliver)
         } else {
             deliver = max(deliver, lastVideoDeliverToA)
             lastVideoDeliverToA = deliver
@@ -330,15 +388,8 @@ public final class InProcLink: @unchecked Sendable {
     /// they have left it. The queue ahead of them is this send's RTT sample.
     private func bottleneckAdmit(_ bytes: Int, _ b: Bottleneck) -> UInt64 {
         let aheadUS = bottleneckFreeUS > nowUS ? bottleneckFreeUS - nowUS : 0
-        let sample = faults.latencyMinUS &+ faults.latencyMaxUS &+ aheadUS // 2 × one way + queue
-        if rttSampled {
-            rttSmoothedUS = (rttSmoothedUS &* 7 &+ sample) / 8
-            rttMinUS = min(rttMinUS, sample)
-        } else {
-            rttSampled = true
-            rttSmoothedUS = sample
-            rttMinUS = sample
-        }
+        // (with power save, the caller samples once the delivery is known)
+        if !powerSaves { noteRTT(faults.latencyMinUS &+ faults.latencyMaxUS &+ aheadUS) } // 2 × one way + queue
         bottleneckFreeUS = max(nowUS, bottleneckFreeUS) &+ UInt64(bytes) * 1_000_000 / UInt64(b.bytesPerSecond)
         return bottleneckFreeUS
     }
@@ -352,7 +403,7 @@ public final class InProcLink: @unchecked Sendable {
             // The bottleneck was lifted with video still waiting for it:
             // all of it goes now (else `advance` waits forever for room).
             for queued in videoSendQueue {
-                let deliver = max(nowUS &+ latency, lastVideoDeliverToB)
+                let deliver = max(powerSaveDeliver(nowUS &+ latency), lastVideoDeliverToB)
                 lastVideoDeliverToB = deliver
                 seqNo &+= 1
                 pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .video, toA: false, data: queued.data))
@@ -375,8 +426,9 @@ public final class InProcLink: @unchecked Sendable {
             videoSendBufferBytes -= take
             if videoSendQueue[0].unadmitted == 0 {
                 let data = videoSendQueue.removeFirst().data
-                let deliver = max(departUS &+ latency, lastVideoDeliverToB)
+                let deliver = max(powerSaveDeliver(departUS &+ latency), lastVideoDeliverToB)
                 lastVideoDeliverToB = deliver
+                notePowerSaveRTT(deliverUS: deliver)
                 seqNo &+= 1
                 pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .video, toA: false, data: data))
             }
@@ -418,6 +470,7 @@ public final class InProcLink: @unchecked Sendable {
             if faults.reorderPermille > 0 && rng.permille() < faults.reorderPermille {
                 deliver &+= rng.uniform(0, faults.reorderExtraMaxUS)
             }
+            if fromA { deliver = powerSaveDeliver(deliver) }
             seqNo &+= 1
             pending.append(Event(deliverUS: deliver, seq: seqNo, channel: .datagram, toA: !fromA, data: data))
         }
