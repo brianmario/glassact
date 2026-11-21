@@ -165,6 +165,9 @@ public final class ViewerController: @unchecked Sendable {
                 ?? "video off — lossless tiles"
             DispatchQueue.main.async { self?.onStatus(msg) }
         }
+        engine.onHostDisplay = { [weak self] width, height in
+            DispatchQueue.main.async { self?.hostDisplaySize = (width, height) }
+        }
         engine.onHostNotice = { [weak self] code in
             DispatchQueue.main.async { self?.onHostNotice?(code) }
         }
@@ -174,6 +177,9 @@ public final class ViewerController: @unchecked Sendable {
     public var onConnectionFailed: (() -> Void)?
     /// The host's HOST_NOTICE changed (main thread).
     public var onHostNotice: ((UInt8) -> Void)?
+    /// Main thread: the pixel size of the display the host shares (HOST_DISPLAY), or nil (a host
+    /// without it, or none heard yet).
+    public private(set) var hostDisplaySize: (width: Int, height: Int)?
 
     // MARK: - Clipboard sync (main thread)
 
