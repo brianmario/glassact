@@ -18,7 +18,9 @@ jobs:
     # Apple silicon, macOS 27, Xcode 27. The package targets macOS 15.5, so
     # availability mistakes fail the build here too.
     runs-on: xcode-27
-    timeout-minutes: 30
+    # 45: on a slow runner the core suite alone took 16 minutes and the job hit
+    # 30 with every test passed (2026-11-21, #146's first run).
+    timeout-minutes: 45
     env:
       # The suites tagged `.quic`: real QUIC sessions on loopback, run in
       # real time. SwiftPM runs test binaries in parallel, and alongside the
