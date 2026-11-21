@@ -305,6 +305,7 @@ the numbers and the reasoning.
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | Other coded sizes for reduced video: ¾, 1080p (~⅜), ~⅓ and ¼ of a 5K region besides ½, and a scan for the content's own resolution | measured; not built | the owner's 60 fps video: below ½ never wins at equal bytes (30–120 KB a frame, 0.4–1.5 dB worse); ¾ beats ½ by 0.4–0.7 dB at 120–160 KB but takes 14.8 ms of GPU analysis against 7.7 (it falls under the fast pictures' 2,400-SB floor); the round trip's loss rises smoothly (¾ 47.9 dB … ¼ 33.4), no resolution cutoff to find. One trace: 1080p and 720p clips wanted | [entry](#video-reduced-frames-at-other-sizes-and-the-contents-own-resolution-measured-2026-11-21) |
+| `av1seq`'s 4:2:0 pictures BT.709 full range, the live encoder's own conversion (`--colour video`: before) | kept, the default | the live encoder's pictures; video +19 % bytes at a q (q40: 106.4 → 126.8 KB, 33.84 → 34.73 dB); the own decoder's as-shown scores no longer 5 dB low; older entries' numbers are video range | [entry](#bench-av1seq-codes-what-the-live-encoder-codes-bt709-full-range-2026-11-21) |
 | VideoToolbox decoding a reduced AV1 frame | it outputs the coded size unless asked for one | the Viewer's session asks for the region's size (`VTRegionDecoder`); its scaling scores as vImage's Lanczos 3 (35.33 / 35.48 dB at half size, 38.26 / 38.15 at 3/4); the 2026-11-02 finding (scaled up) was ffmpeg's | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | No intra search on inter frames where the inter block's J is under c × step² a pixel (in mostly-new pictures) | rejected | video 5K q36: c 0.02 −2.2 ms of GPU analysis for +0.6 % bytes, −0.08 dB; the movie +4.2 % and −0.2 dB at c 0.004 already; with no intra anywhere inter exists, 15 ms (64 a second) but +17 % / −1.25 dB on video, +25 % on the movie | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | AV1 superres (half width, the decoder upscales) for video | rejected (libaom bound) | loses to half-size reduced frames at every rate on the 60 fps video: at ~850 KB 35.0 against 35.9 dB, at ~530 KB 32.4 against 33.2; full 5K 34.3 at 870 KB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
@@ -426,6 +427,38 @@ scan for its resolution has nothing to find. It is soft, not low-resolution.
 pictures' effort) could serve a quality setting where the encoder has time to spare; measure it at
 equal effort first. This is one trace, and a soft one: 1080p and 720p clips shown full screen
 would show whether low-resolution content has the cutoff this one lacks, and whether ⅓ wins there.
+
+### Bench: `av1seq` codes what the live encoder codes, BT.709 full range (2026-11-21)
+
+`av1seq` converted its 4:2:0 pictures to BT.709 video range (16–235). The live encoder
+(`HybridRegionEncoder`) converts full range (`I420Converter(.bt709Full)`), which its sequence header
+signals and VideoToolbox shows (the "why full size shows 44" entry). So every `av1seq` 4:2:0
+number before today is of other pictures than the Host's:
+- fewer bytes at a q, about 16–19 % on video;
+- a different PSNR;
+- Glass Act's decoder's "as shown" scores were ~5 dB low, because it showed video-range planes as
+  the full range the stream signals.
+
+**Now:** `av1seq` converts 4:2:0 pictures with the live encoder's own `I420Converter(.bt709Full)`,
+and its RGB scoring converts decoded planes back as full range. `--colour video` gives the old
+pictures: its stream digest equals the old build's (`569ebfc2b790d92e`, the 60 fps video from
+220, 12 frames, q40, `--tiles 3x0 --inter --no-planes`). 4:4:4 (`--chroma 444`) was full range
+already and is unchanged.
+
+| the 60 fps video from 220, 31 frames, q40, 5K | inter frames, KB | RGB PSNR, dB |
+|---|---|---|
+| `--colour video` (before) | 106.4 | 33.84 |
+| full range (now) | 126.8 (+19 %) | 34.73 |
+
+With reduced frames (2560 in 5120, q30, 13 frames), the own decoder's shown pictures now score the
+same as the encoder's decode: 35.36 dB both.
+
+- **Older entries keep their numbers,** recorded at video range. To compare with one, run with
+  `--colour video`.
+- **`scripts/train-pruner`'s dumps are full range from now on,** as the live pictures are. The
+  shipped weights were trained on video range; retraining is for later.
+- **Odd sizes:** `--colour full` needs an even width and height; `--crop` to an odd size takes
+  `--colour video`.
 
 ### Glass Act's decoder scales reduced frames up itself (2026-11-20)
 
