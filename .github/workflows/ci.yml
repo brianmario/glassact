@@ -49,7 +49,15 @@ jobs:
         # keeps its checks in -O (preconditions, overflow traps, checked wire
         # parsing; the one `assert` is in GPU code CI skips), and allocation
         # counts are asserted only optimized. `just test` stays debug.
-        run: swift build -c release --build-tests
+        #
+        # The build is `swift test`'s own, stopped before any test runs (its
+        # list of them): `swift build -c release --build-tests` doesn't build
+        # release modules for testing, so every `@testable import` fails
+        # ("unable to resolve Swift module dependency to a compatible
+        # module"), and only `swift test` has the setting that does
+        # (--enable-testable-imports, its default). The two steps below then
+        # find their build done.
+        run: swift test -c release list
       - name: Test
         # VideoSendGateTests emulates a 3 Mbit/s link through a loopback relay
         # and first checks the rig reproduces the byte-gate baseline's seconds
