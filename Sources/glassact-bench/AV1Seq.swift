@@ -108,7 +108,8 @@ let av1SeqCommand = Command(
         .int("ml-min-coded", "<n>", 1...1_000_000, "with --ml-prune: also in pictures coding at least this many 64x64s"),
         .string("ml-over", "<share>", "with --ml-prune: only in pictures coding more than this share of their superblocks (default 0.5; key frames count as all)"),
         .string("dump-sse", "<dir>", "also write each decoded frame's squared error by 4x4 (UInt32, Y then U then V, rows of ceil(w/4)), the hybrid's as hNNN.sse and libaom's as aNNN.sse, and each picture's 64x64 luma statistics as sNNN.stats (Float32 per 64x64: variance, distinct values, share of strong horizontal or vertical edges), for per-block study"),
-        .string("chroma", "<420|444>", "the pictures' chroma: 420 (default; BT.709 video range) or 444 (the High profile, BT.709 full range as a 4:4:4 stream signals; every frame checked against libaom's decode; not with --score-rgb, --stream-width, --ref-from-half, --two-steps, --vt-decode, --aom-speed, --dump-partition)"),
+        .choice("colour", ["full", "video"], "4:2:0 pictures' range: full (default: BT.709 full range, the live encoder's I420Converter(.bt709Full), which its streams signal) or video (BT.709 video range, av1seq's before 2026-11-21: ~16 % fewer bytes on video at a q)"),
+        .string("chroma", "<420|444>", "the pictures' chroma: 420 (default; BT.709, --colour's range) or 444 (the High profile, BT.709 full range as a 4:4:4 stream signals; every frame checked against libaom's decode; not with --score-rgb, --stream-width, --ref-from-half, --two-steps, --vt-decode, --aom-speed, --dump-partition)"),
         .bool("cpu-filters", "with --chroma 444: deblock and CDEF the pictures on the CPU (AV1HybridEncoder.chroma444CPUFilters, research; off: on the GPU)"),
         .bool("444-cpu-chroma", "with --chroma 444: chroma modes decided on the CPU on the real planes (AV1HybridEncoder.chroma444CPUChroma), not by the GPU on the analysis's 4:2:0 copy"),
         .bool("no-444-palettes", "with --chroma 444: no palettes and every shape, as 4:2:0 pictures are analyzed (AV1HybridEncoder.chroma444Palettes off)"),
@@ -161,8 +162,27 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     }
     let converter444 = c444 ? YCbCr444Converter() : nil
     if c444, converter444 == nil { throw BenchError("vImage: no BGRA → 4:4:4 conversion") }
+    // --colour: the 4:2:0 pictures as the live encoder converts them (full), or video range
+    let fullRange = (opts.string("colour") ?? "full") == "full"
+    let converter420 = fullRange ? I420Converter(.bt709Full) : nil
+    if fullRange, converter420 == nil { throw BenchError("vImage: no BGRA → 4:2:0 full-range conversion") }
+    func yuv420(_ b: UnsafeMutableRawBufferPointer, _ w: Int, _ h: Int) throws -> YUV420 {
+        guard let converter420 else { return try YUV420(bgra: b, width: w, height: h) }
+        guard w & 1 == 0, h & 1 == 0 else { throw BenchError("--colour full: an odd size (\(w)×\(h)); --colour video takes it") }
+        var y = [UInt8](repeating: 0, count: w * h), u = [UInt8](repeating: 0, count: w / 2 * (h / 2)), v = u
+        let ok = y.withUnsafeMutableBytes { yp in
+            u.withUnsafeMutableBytes { up in
+                v.withUnsafeMutableBytes { vp in
+                    converter420.convert(bgra: UnsafeRawBufferPointer(b), width: w, height: h,
+                                         y: yp.baseAddress!, u: up.baseAddress!, v: vp.baseAddress!)
+                }
+            }
+        }
+        guard ok else { throw BenchError("vImage: BGRA → 4:2:0 failed") }
+        return YUV420(width: w, height: h, planes: [y, u, v])
+    }
     func yuv(_ b: UnsafeMutableRawBufferPointer) throws -> YUV420 {
-        guard let converter444 else { return try YUV420(bgra: b, width: width, height: height) }
+        guard let converter444 else { return try yuv420(b, width, height) }
         var y = [UInt8](repeating: 0, count: width * height), u = y, v = y
         let ok = y.withUnsafeMutableBytes { yp in
             u.withUnsafeMutableBytes { up in
@@ -274,18 +294,18 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         let small = UnsafeMutableRawBufferPointer.allocate(byteCount: hw * hh * 4, alignment: 64)
         defer { small.deallocate() }
         firstBGRA.withUnsafeMutableBytes { resample($0, width, height, into: small, hw, hh) }
-        let half = try YUV420(bgra: small, width: hw, height: hh)
+        let half = try yuv420(small, hw, hh)
         let e = try AV1HybridEncoder(device: device)
         e.preset = preset
         e.tiling = (tileParts[0], tileParts[1])
         let f = try e.encode(AV1HybridEncoder.Picture(y: half.planes[0], u: half.planes[1], v: half.planes[2], width: hw, height: hh),
                              qindex: hq == 63 ? 255 : 4 * hq)
-        try YUV420.decode(f.obu, width: hw, height: hh).bgra(into: small)
+        try YUV420.decode(f.obu, width: hw, height: hh).bgra(into: small, fullRange: fullRange)
         if let upscaler { try upscaler.scale(small, hw, hh, into: bgra, width, height) } else { resample(small, hw, hh, into: bgra, width, height) }
-        pictures[0] = try YUV420(bgra: bgra, width: width, height: height)
+        pictures[0] = try yuv420(bgra, width, height)
         print(String(format: "  ref-from-half: picture 0 coded alone at %d×%d q%d: %@, decoded and scaled up to %d×%d (%@); PSNR-Y %.2f against the source's",
                      hw, hh, hq, formatBytes(f.obu.count), width, height, upscaler?.kind.rawValue ?? "vImage high quality",
-                     pictures[0].psnrY(try firstBGRA.withUnsafeMutableBytes { try YUV420(bgra: $0, width: width, height: height) })))
+                     pictures[0].psnrY(try firstBGRA.withUnsafeMutableBytes { try yuv420($0, width, height) })))
     }
     let encoder = try AV1HybridEncoder(device: device)
     encoder.preset = preset
@@ -517,7 +537,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     func scorer() throws -> RGBScorer {
         try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens, firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every, width: stream?.width ?? width, height: stream?.height ?? height,
                       coded: stream == nil ? nil : (width, height),
-                      ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil)
+                      ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil, fullRange: fullRange)
     }
     let rgb = scoreRGB ? try scorer() : nil
     if let rgb {
@@ -643,8 +663,9 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             let shownRGB = scoreRGB
                 ? try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens,
                                 firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every,
-                                width: sw, height: sh) : nil
-            shownRGB?.referenceAsShown = true
+                                width: sw, height: sh, fullRange: fullRange) : nil
+            // (video range: the planes shown as the full range the stream signals)
+            shownRGB?.referenceAsShown = !fullRange
             guard own.start(codec: VideoCodec.av1, config: config, width: sw, height: sh) else {
                 print("own-decode: the decoder didn't start")
                 break
@@ -679,7 +700,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             let scaled = VTDecodeCheck.scaled(vt, width: stream.width, height: stream.height)
             let vtRGB = try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens,
                                       firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every,
-                                      width: stream.width, height: stream.height)
+                                      width: stream.width, height: stream.height, fullRange: fullRange)
             var failed = 0
             for s in scaled { if let s { try vtRGB.add(s) } else { failed += 1; break } }
             print(failed == 0 ? vtRGB.summary("VideoToolbox scaling \(width)×\(height) up to \(stream.width)×\(stream.height)")
@@ -908,7 +929,8 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         guard let aomDecoder = glassact_aom_dec_create(4) else { throw BenchError("libaom: no decoder") }
         defer { glassact_aom_dec_destroy(aomDecoder) }
         let aomRGB = scoreRGB ? try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens, firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every, width: width, height: height,
-                                              ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil) : nil
+                                              ssimulacra2Every: opts.has("ssimulacra2-every") ? opts.int("ssimulacra2-every", 1) : nil,
+                                              fullRange: fullRange) : nil
         for (i, s) in streams.enumerated() {
             let full = headerSize > 0 && (!aomInter || i == 0) ? Array(header.prefix(headerSize)) + s : s
             let decoded = aomInter ? try YUV420.decode(full, width: width, height: height, with: aomDecoder)
@@ -1053,7 +1075,8 @@ final class RGBScorer {
 
     init(trace: String, mix mixTraces: [String] = [], then thens: [(path: String, frames: Int, skip: Int)] = [], firstCount: Int = .max,
          skip: Int, step: Int = 1, width: Int, height: Int,
-         coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil) throws {
+         coded: (width: Int, height: Int)? = nil, ssimulacra2Every: Int? = nil, fullRange: Bool = false) throws {
+        self.fullRange = fullRange
         reader = try openTrace(trace)
         mix = try mixTraces.map { try ScapReader(url: URL(fileURLWithPath: $0)) }
         mixFull = mix.map { .allocate(byteCount: $0.header.width * $0.header.height * 4, alignment: 64) }
@@ -1089,11 +1112,14 @@ final class RGBScorer {
         other?.deallocate()
     }
 
-    /// `addShown`'s: av1seq codes BT.709 video-range planes in streams that signal full range (the
-    /// Host's I420Converter's), so a Viewer's decoder shows them as full range. The reference is
+    /// `addShown`'s, with `--colour video`: av1seq then codes BT.709 video-range planes in streams
+    /// that signal full range (the Host's I420Converter's), so a Viewer's decoder shows them as
+    /// full range. The reference is
     /// then the trace frame as it would show the same planes uncoded and unscaled: to av1seq's
     /// 4:2:0 and back as full range.
     var referenceAsShown = false
+    /// The pictures' range (av1seq's --colour): decoded planes go to BGRA as it says.
+    let fullRange: Bool
 
     /// A picture already in BGRA at width × height (rows width × 4 bytes: what a Viewer's decoder
     /// shows), scored as `add` scores a decoded one.
@@ -1107,14 +1133,14 @@ final class RGBScorer {
     func add(_ decoded: YUV420) throws {
         try nextReference()
         if let coded {
-            try decoded.bgra(into: small)
+            try decoded.bgra(into: small, fullRange: fullRange)
             if let upscaler = upscalers.first {
                 try upscaler.scale(small, coded.width, coded.height, into: shown, width, height)
             } else {
                 resample(small, coded.width, coded.height, into: shown, width, height)
             }
         } else {
-            try decoded.bgra(into: shown)
+            try decoded.bgra(into: shown, fullRange: fullRange)
         }
         try score(extraFrom: coded)
     }
