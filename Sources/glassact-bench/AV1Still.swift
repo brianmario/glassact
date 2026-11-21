@@ -294,9 +294,14 @@ struct YUV420 {
         planes = [y, u, v]
     }
 
-    func bgra(into out: UnsafeMutableRawBufferPointer) throws {
-        var range = vImage_YpCbCrPixelRange(Yp_bias: 16, CbCr_bias: 128, YpRangeMax: 235, CbCrRangeMax: 240,
-                                            YpMax: 235, YpMin: 16, CbCrMax: 240, CbCrMin: 16)
+    /// To BGRA, BT.709 video range (`fullRange`: as full range, which the hybrid's streams signal
+    /// whatever their planes are, so as Glass Act's decoder shows av1seq's video-range planes).
+    func bgra(into out: UnsafeMutableRawBufferPointer, fullRange: Bool = false) throws {
+        var range = fullRange
+            ? vImage_YpCbCrPixelRange(Yp_bias: 0, CbCr_bias: 128, YpRangeMax: 255, CbCrRangeMax: 255,
+                                      YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
+            : vImage_YpCbCrPixelRange(Yp_bias: 16, CbCr_bias: 128, YpRangeMax: 235, CbCrRangeMax: 240,
+                                      YpMax: 235, YpMin: 16, CbCrMax: 240, CbCrMin: 16)
         var matrix = vImage_YpCbCrToARGBMatrix(Yp: 1, Cr_R: 1.5748, Cr_G: -0.4681, Cb_G: -0.1873, Cb_B: 1.8556)
         var conversion = vImage_YpCbCrToARGB()
         guard vImageConvert_YpCbCrToARGB_GenerateConversion(&matrix, &range, &conversion, kvImage420Yp8_Cb8_Cr8,

@@ -1,16 +1,24 @@
 // av1seq --upscale: the scalers a Viewer could show a reduced frame with (a picture coded smaller
 // than the stream, decisions.h "Reduced frames"), for --score-rgb to score it at the stream's
 // size: bilinear, vImage's Lanczos (3 and 5 lobes), Core Image's Lanczos and MetalFX's spatial
-// scaler. Without --upscale the scorer resamples as it always has (vImage, high quality).
+// scaler, and Glass Act's upscaler (av1g_upscaler, the Viewer's own decoder's) with each of its
+// filters. Without --upscale the scorer resamples as it always has (vImage, high quality).
 import Accelerate
+import AV1Core
 import CoreImage
 import Foundation
 import Metal
 import MetalFX
 
 final class Upscaler {
-    enum Kind: String, CaseIterable { case bilinear, lanczos3, lanczos5, ci, metalfx }
+    enum Kind: String, CaseIterable {
+        case bilinear, lanczos3, lanczos5, ci, metalfx
+        case ownLanczos3 = "own-lanczos3", ownLanczos2 = "own-lanczos2", ownLanczos4 = "own-lanczos4"
+        case ownCatmullRom = "own-catmull-rom", ownLanczos5 = "own-lanczos5"
+    }
     let kind: Kind
+    /// the own kinds' upscaler
+    private var own: OpaquePointer?
     private let device: (any MTLDevice)?, queue: (any MTLCommandQueue)?
     private var scaler: (any MTLFXSpatialScaler)?
     private var input: (any MTLTexture)?, output: (any MTLTexture)?, readback: (any MTLBuffer)?
@@ -25,6 +33,14 @@ final class Upscaler {
         device = k == .metalfx ? MTLCreateSystemDefaultDevice() : nil
         queue = device?.makeCommandQueue()
         if k == .metalfx, queue == nil { throw BenchError("--upscale metalfx: no Metal device") }
+        let filters: [Kind: Int32] = [.ownLanczos3: AV1G_UPSCALE_LANCZOS3, .ownLanczos2: AV1G_UPSCALE_LANCZOS2,
+                                      .ownLanczos4: AV1G_UPSCALE_LANCZOS4, .ownCatmullRom: AV1G_UPSCALE_CATMULL_ROM,
+                                      .ownLanczos5: AV1G_UPSCALE_LANCZOS5]
+        if let f = filters[k] { own = av1g_upscaler_create(0, f) }
+    }
+
+    deinit {
+        if let own { av1g_upscaler_destroy(own) }
     }
 
     /// BGRA `fw` × `fh` → BGRA `tw` × `th`.
@@ -39,6 +55,11 @@ final class Upscaler {
             guard vImageScale_ARGB8888(&s, &d, nil, flags) == kvImageNoError else { throw BenchError("vImage: scale failed") }
         case .ci: try coreImage(from, fw, fh, into: to, tw, th)
         case .metalfx: try metalFX(from, fw, fh, into: to, tw, th)
+        case .ownLanczos3, .ownLanczos2, .ownLanczos4, .ownCatmullRom, .ownLanczos5:
+            guard let own, av1g_upscaler_scale(own, from.baseAddress!.assumingMemoryBound(to: UInt8.self), UInt32(fw), UInt32(fh),
+                                               fw * 4, to.baseAddress!.assumingMemoryBound(to: UInt8.self), UInt32(tw), UInt32(th),
+                                               tw * 4, 4) == AV1G_OK
+            else { throw BenchError("av1g_upscaler: scale failed") }
         }
     }
 

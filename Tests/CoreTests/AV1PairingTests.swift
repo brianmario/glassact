@@ -111,7 +111,8 @@ import GlassActTestSupport
     enum ViewerKind: CaseIterable, Sendable {
         /// This release, AV1 on, with VideoToolbox's AV1 (M3 and later).
         case newHardware
-        /// This release, AV1 on, without it (M1, M2, Intel, older iPads): Glass Act's decoder.
+        /// This release, AV1 on, without it (M1, M2, Intel, older iPads): Glass Act's decoder,
+        /// which shows reduced frames for less than full-size ones (its own upscaler).
         case newNoHardware
         /// This release, AV1 off.
         case newOff
@@ -127,7 +128,8 @@ import GlassActTestSupport
             let own: @Sendable () -> any VideoRegionDecoder = { TaggedDecoder(accepts: [.glassAct], shown: shown) }
             switch self {
             case .newHardware: return .offer(av1: true, hardwareAV1: true, hardware: hardware, glassActAV1: own)
-            case .newNoHardware: return .offer(av1: true, hardwareAV1: false, hardware: hardware, glassActAV1: own)
+            case .newNoHardware: return .offer(av1: true, hardwareAV1: false, hardware: hardware, glassActAV1: own,
+                                               glassActReducedFrames: true)
             case .newOff: return .offer(av1: false, hardwareAV1: true, hardware: hardware, glassActAV1: own)
             // HELLO_OK's video caps as released Viewers send them: HEVC, AV1 (0x03); HEVC (0x01).
             // One VideoToolbox decoder for every codec, as theirs.
@@ -184,21 +186,34 @@ import GlassActTestSupport
         #expect(h.settle())
         #expect(h.canvasMatchesFrame())
         // reduced frames (`videoReducedFrames`) only from Glass Act's AV1 to a Viewer of this
-        // release decoding with VideoToolbox (it scales them for free); a released one fails on them
-        let reduced = want == .glassAct && viewer == .newHardware
+        // release (VideoToolbox scales them for free, Glass Act's decoder with its upscaler); a
+        // released one fails on them
+        let reduced = want == .glassAct && (viewer == .newHardware || viewer == .newNoHardware)
         #expect(shown.reducedFrames == [reduced], "setReducedFrames: \(shown.reducedFrames)")
     }
 
     // MARK: - Caps on the wire
 
     /// HELLO_OK's video caps, by Viewer. `videoAV1` only with VideoToolbox's AV1;
-    /// `videoAV1GlassAct` with any AV1 decoder; never AV1 without the opt-in.
+    /// `videoAV1GlassAct` with any AV1 decoder; `videoReducedFrames` with VideoToolbox's, and
+    /// with Glass Act's where it shows them cheaply; never AV1 without the opt-in.
     @Test func viewersOfferWhatTheyDecode() {
         let shown = Shown()
-        let (hevc, av1, ours) = (WireCaps.videoHEVC, WireCaps.videoAV1 | WireCaps.videoReducedFrames, WireCaps.videoAV1GlassAct)
+        let reduced = WireCaps.videoReducedFrames
+        let (hevc, av1, ours) = (WireCaps.videoHEVC, WireCaps.videoAV1 | reduced, WireCaps.videoAV1GlassAct)
         #expect(ViewerKind.newHardware.decoders(shown).caps == hevc | av1 | ours)
-        #expect(ViewerKind.newNoHardware.decoders(shown).caps == hevc | ours)
+        #expect(ViewerKind.newNoHardware.decoders(shown).caps == hevc | ours | reduced)
         #expect(ViewerKind.newOff.decoders(shown).caps == hevc)
+        let own: @Sendable () -> any VideoRegionDecoder = { MockVideoDecoder() }
+        #expect(ViewerVideoDecoders.offer(av1: true, hardwareAV1: false, hardware: { MockVideoDecoder() },
+                                          glassActAV1: own).caps == hevc | ours,
+                "Glass Act's decoder where reduced frames cost it more than full-size ones")
+        #expect(ViewerVideoDecoders.offer(av1: false, hardwareAV1: false, hardware: { MockVideoDecoder() },
+                                          glassActAV1: own, glassActReducedFrames: true).caps == hevc,
+                "no reduced frames without AV1")
+        #expect(ViewerVideoDecoders.offer(av1: true, hardwareAV1: false, hardware: { MockVideoDecoder() },
+                                          glassActAV1: nil, glassActReducedFrames: true).caps == hevc,
+                "nor without an AV1 decoder")
         #expect(ViewerVideoDecoders.offer(av1: true, hardwareAV1: false, hardware: { MockVideoDecoder() },
                                           glassActAV1: nil).caps == hevc,
                 "VideoToolbox alone, without the hardware: HEVC")

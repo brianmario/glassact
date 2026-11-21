@@ -57,7 +57,9 @@ let av1SeqCommand = Command(
         .int("push-pending", "<n>", 1...16, "with --push every=<ms>: at most n pictures waiting for their frames before the next is submitted (default 2, the Host engine's videoMaxPendingFrames)"),
         .int("push-kbit", "<kbit/s>", 10...1_000_000, "with --push: each picture's qindex from GlassActHybridVideo's rate controller aiming at this rate (by the trace's capture times), not --q; prints what it achieved"),
         .string("push", "<mode>", "drive the encoder's stream API (startStream/submit) as a session does, and print each picture's submit-to-frame latency: lone (each picture submitted once the one before came out), burst (all at once), every=<ms> (one every ms, at most --push-pending waiting: 2, as the Host's engine allows)"),
-        .bool("own-decode", "also decode the stream with Glass Act's decoder as the Viewer runs it (OwnAV1RegionDecoder, at the stream's size: reduced frames scaled up), and time its decode and conversion a frame"),
+        .bool("own-decode", "also decode the stream with Glass Act's decoder as the Viewer runs it (OwnAV1RegionDecoder, at the stream's size: reduced frames scaled up), and time its decode, conversion and scaling a frame; with --score-rgb, also score what it shows"),
+        .string("own-upscale", "<way>[:<filter>][,...]", "with --own-decode: how it scales reduced frames up (OwnAV1RegionDecoder.Upscale: planes, bgra or vImage; filter lanczos5 (the default), lanczos3, lanczos4, lanczos2 or catmull-rom); several: each in turn (default: the decoder's)"),
+        .int("own-threads", "<n>", 1...64, "with --own-decode: the decoder's threads (default: the available parallelism)"),
         .bool("vt-decode", "also decode the stream with VideoToolbox's hardware AV1 decoder, as the Viewer does (M3 and later), and compare its output with the encoder's picture"),
         .bool("no-cdf-carry", "with --inter: every inter frame starts from the default CDFs, not its reference's"),
         .bool("no-filters", "no deblocking or CDEF (tiles then decode alone as in their frame)"),
@@ -623,17 +625,48 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
     if opts.has("own-decode"), let first = frames.first, let seq = AV1Config.sequenceHeaderOBU(inTemporalUnit: first.obu),
        let config = AV1Config.build(sequenceHeaderOBU: seq) {
         let (sw, sh) = (stream?.width ?? width, stream?.height ?? height)
-        let own = OwnAV1RegionDecoder()
-        if own.start(codec: VideoCodec.av1, config: config, width: sw, height: sh) {
-            var ok = 0
-            for f in frames where own.decode(f.obu, sync: f.params.frame_type != UInt8(AV1G_FRAME_INTER), onPixels: { _, _ in }) { ok += 1 }
-            let st = own.stats, n = max(1, st.framesShown - st.keyFramesShown)
-            print(String(format: "own-decode: %d of %d frames shown at %d×%d · inter frames: decode %.2f ms, conversion%@ %.2f ms a frame",
-                         ok, frames.count, sw, sh, Double(st.decodeNS - st.keyDecodeNS) / Double(n) / 1e6,
-                         stream == nil ? "" : " and scaling", Double(st.convertNS - st.keyConvertNS) / Double(n) / 1e6))
+        // --own-upscale: each way of scaling reduced frames up, in turn (default the decoder's)
+        let ways = try (opts.string("own-upscale")?.split(separator: ",") ?? [""]).map { spec -> (OwnAV1RegionDecoder.Upscale, Int32, String) in
+            if spec.isEmpty { return (OwnAV1RegionDecoder().upscale, Int32(AV1G_UPSCALE_LANCZOS5), "") }
+            let parts = spec.split(separator: ":").map(String.init)
+            let filters = ["lanczos3": AV1G_UPSCALE_LANCZOS3, "lanczos2": AV1G_UPSCALE_LANCZOS2, "lanczos4": AV1G_UPSCALE_LANCZOS4,
+                           "catmull-rom": AV1G_UPSCALE_CATMULL_ROM, "lanczos5": AV1G_UPSCALE_LANCZOS5]
+            guard let way = OwnAV1RegionDecoder.Upscale(rawValue: parts[0]), parts.count <= 2,
+                  let filter = parts.count == 2 ? filters[parts[1]] : AV1G_UPSCALE_LANCZOS5
+            else { throw BenchError("--own-upscale \(spec): <planes|bgra|vImage>[:<lanczos5|lanczos3|lanczos4|lanczos2|catmull-rom>]") }
+            return (way, Int32(filter), " (\(spec))")
+        }
+        for (way, filter, name) in ways {
+            let own = OwnAV1RegionDecoder(threads: opts.int("own-threads", 0))
+            (own.upscale, own.filter) = (way, filter)
+            // with --score-rgb, what it shows scored against the trace at the stream's size
+            let shownRGB = scoreRGB
+                ? try RGBScorer(trace: traceName, mix: mixTraces(opts), then: thens,
+                                firstCount: pictures.count - thens.map(\.frames).reduce(0, +), skip: skip, step: every,
+                                width: sw, height: sh) : nil
+            shownRGB?.referenceAsShown = true
+            guard own.start(codec: VideoCodec.av1, config: config, width: sw, height: sh) else {
+                print("own-decode: the decoder didn't start")
+                break
+            }
+            var ok = 0, colour = ""
+            for f in frames {
+                var scored: (any Error)?
+                if own.decode(f.obu, sync: f.params.frame_type != UInt8(AV1G_FRAME_INTER), onPixels: { px, _ in
+                    do { try shownRGB?.addShown(px) } catch { scored = error }
+                }) { ok += 1 }
+                if let scored { throw scored }
+                if colour.isEmpty {
+                    colour = own.withShownPicture { " (matrix \($0.matrix_coefficients), range \($0.color_range))" } ?? ""
+                }
+            }
+            let st = own.stats, n = Double(max(1, st.framesShown - st.keyFramesShown))
+            let (dec, conv, scale) = (Double(st.decodeNS - st.keyDecodeNS) / n / 1e6, Double(st.convertNS - st.keyConvertNS) / n / 1e6,
+                                      Double(st.scaleNS - st.keyScaleNS) / n / 1e6)
+            print(String(format: "own-decode%@: %d of %d frames shown at %d×%d%@ · inter frames: decode %.2f ms, conversion %.2f ms, scaling %.2f ms, total %.2f ms a frame",
+                         name, ok, frames.count, sw, sh, colour, dec, conv, scale, dec + conv + scale))
+            if let shownRGB { print(shownRGB.summary("own-decode\(name), as shown")) }
             own.stop()
-        } else {
-            print("own-decode: the decoder didn't start")
         }
     }
     if opts.has("vt-decode") {
@@ -1056,7 +1089,38 @@ final class RGBScorer {
         other?.deallocate()
     }
 
+    /// `addShown`'s: av1seq codes BT.709 video-range planes in streams that signal full range (the
+    /// Host's I420Converter's), so a Viewer's decoder shows them as full range. The reference is
+    /// then the trace frame as it would show the same planes uncoded and unscaled: to av1seq's
+    /// 4:2:0 and back as full range.
+    var referenceAsShown = false
+
+    /// A picture already in BGRA at width × height (rows width × 4 bytes: what a Viewer's decoder
+    /// shows), scored as `add` scores a decoded one.
+    func addShown(_ pixels: UnsafeRawBufferPointer) throws {
+        guard pixels.count >= width * height * 4 else { throw BenchError("--score-rgb: a picture smaller than the stream") }
+        try nextReference()
+        shown.baseAddress!.copyMemory(from: pixels.baseAddress!, byteCount: width * height * 4)
+        try score(extraFrom: nil)
+    }
+
     func add(_ decoded: YUV420) throws {
+        try nextReference()
+        if let coded {
+            try decoded.bgra(into: small)
+            if let upscaler = upscalers.first {
+                try upscaler.scale(small, coded.width, coded.height, into: shown, width, height)
+            } else {
+                resample(small, coded.width, coded.height, into: shown, width, height)
+            }
+        } else {
+            try decoded.bgra(into: shown)
+        }
+        try score(extraFrom: coded)
+    }
+
+    /// The next trace frame, resampled into `reference`.
+    private func nextReference() throws {
         let r: ScapReader, f: UnsafeMutableRawBufferPointer
         if frames >= firstCount {
             // --then: the segment this frame is in
@@ -1076,16 +1140,14 @@ final class RGBScorer {
         }
         guard try pooledRead(r, &rects, into: f) != nil else { throw BenchError("--score-rgb: the trace ended early") }
         resample(f, r.header.width, r.header.height, into: reference, width, height)
-        if let coded {
-            try decoded.bgra(into: small)
-            if let upscaler = upscalers.first {
-                try upscaler.scale(small, coded.width, coded.height, into: shown, width, height)
-            } else {
-                resample(small, coded.width, coded.height, into: shown, width, height)
-            }
-        } else {
-            try decoded.bgra(into: shown)
+        if referenceAsShown {
+            try YUV420(bgra: reference, width: width, height: height).bgra(into: reference, fullRange: true)
         }
+    }
+
+    /// `shown` against `reference`; with several --upscale scalers (`coded`: the reduced size), each
+    /// other's too.
+    private func score(extraFrom coded: (width: Int, height: Int)?) throws {
         let (s, p) = lumaQuality(UnsafeRawBufferPointer(reference), UnsafeRawBufferPointer(shown), width, height)
         if let ssimu2, frames % ssimu2Every == 0 {
             _ = try ssimu2.add(reference: reference, distorted: shown, width: width, height: height)
