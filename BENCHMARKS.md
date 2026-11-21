@@ -384,6 +384,47 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Video at 60 fps, live: why full size shows 44 frames a second when the encoder does 60 (2026-11-20)
+
+The quiet-Mac run below showed the 60 fps video at full size, live, at 42–46 frames a second.
+Back to back, `av1seq` says the same encoder does 62–65 inter frames a second on it. All at 5K,
+from frame 220 or 1150 of `glassact-1795125212`, `main` at b501cae. `pace` gains `--qindex`
+(every picture at one qindex, no rate control) and `--colour` (the pictures' conversion).
+
+**The encoder keeps up; three frames waiting don't.**
+- **Nothing skipped:** with 16 allowed to wait, pace delivers all 120 frames. Latency holds at
+  155–174 ms p50 and doesn't grow, so the live path sustains 60 frames a second.
+- **Three waiting:** a frame takes ~50 ms from submit to frame while the encoder is full. At 30 fps
+  (no queue) it takes 37 ms. 3 frames ÷ 50 ms is 60 a second exactly, so any jitter skips one.
+- **Skips feed on themselves:** the next picture coded is two frames on, so it is larger: 197 KB
+  against 173 with nothing skipped. A larger frame takes longer, and more are skipped. It settles
+  at ~44.
+
+| frames waiting | video from 220: frames a second · skipped · KB · p50 | video from 1150 | movie |
+|---|---|---|---|
+| 3 | 36.0, 35.3 · 40 % · 187 · 59–69 ms | 42.3, 39.3 · 29–34 % · 176 · 53 ms | 56.7, 55.0 · 38 ms |
+| 4 | 51.3, 29.3 · 14 %, 51 % · 165, 196 · 60, 135 ms | 49.3, 47.3 · 18–21 % · 165 · 65–69 ms | 58.3, 58.3 · 38–39 ms |
+| 5 | 56.7, 38.3 · 6 %, 36 % · 158, 178 · 70, 102 ms | 54.7, 53.7 · 9–11 % · 157 · 72–75 ms | 58.7, 58.7 · 39 ms |
+
+(Load 10–13 from Time Machine and the bench's own threads, so the runs from frame 220 vary; the
+second of each was the worse. Each frame waiting costs ~10 ms p50 on video.)
+
+**`av1seq`'s pictures aren't the live encoder's.** `av1seq` converts BT.709 video range (16–235).
+The live encoder converts BT.709 full range, which is how VideoToolbox shows its streams. At the
+same qindex (160, fast pictures 167; nothing skipped), live video is 167 KB a frame at full range
+and 144 KB at video range: +16 %, all of the difference from `av1seq` (141 KB). Every `av1seq`
+byte count and frame rate on video understates the live encoder's by about that much. It doesn't
+explain the frame rate, though. At three waiting, video range shows 36.7–40.7 frames a second
+against 38.3–44.3 at full range.
+
+**So the levers for full size are:**
+- More frames waiting: 4 is ~47–51 frames a second, 5 is ~54–57. Each one costs ~10 ms p50.
+- A shorter submit-to-frame time under load: ≤ ~40 ms would let three keep up.
+- Reduced frames, where the Viewer has them: 55–57 at 35–38 ms p50 (below).
+
+Not tried: skipping more cheaply. A skipped frame still makes the next one larger, which is the
+feedback.
+
 ### Video at 60 fps, live: the day's work on a quiet Mac (2026-11-20)
 
 The re-run the day's entries asked for. `glassact-bench pace` plays 180 frames of a trace in
