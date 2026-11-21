@@ -589,6 +589,70 @@ pub unsafe extern "C" fn av1g_decoder_destroy(d: *mut DecoderHandle) {
     }
 }
 
+/// av1g_upscaler: the upscaler behind the C API.
+pub struct UpscalerHandle {
+    u: crate::upscale::Upscaler,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn av1g_upscaler_create(threads: c_int, filter: c_int) -> *mut UpscalerHandle {
+    let Some(f) = crate::upscale::Filter::from_c(filter) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(UpscalerHandle {
+        u: crate::upscale::Upscaler::new(threads.max(0) as usize, f),
+    }))
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn av1g_upscaler_scale(
+    u: *mut UpscalerHandle,
+    src: *const u8,
+    src_width: u32,
+    src_height: u32,
+    src_stride: usize,
+    dst: *mut u8,
+    dst_width: u32,
+    dst_height: u32,
+    dst_stride: usize,
+    channels: u32,
+) -> c_int {
+    let (sw, sh, dw, dh, ch) = (
+        src_width as usize,
+        src_height as usize,
+        dst_width as usize,
+        dst_height as usize,
+        channels as usize,
+    );
+    if u.is_null() || src.is_null() || dst.is_null() || sw == 0 || sh == 0 || dw == 0 || dh == 0 || !(ch == 1 || ch == 4) {
+        return ERR_INVALID;
+    }
+    // the buffers' lengths, as the pictures and strides give them (Upscaler::scale checks the rest)
+    let len = |w: usize, h: usize, s: usize| (h - 1).checked_mul(s).and_then(|n| n.checked_add(w * ch));
+    let (Some(sl), Some(dl)) = (len(sw, sh, src_stride), len(dw, dh, dst_stride)) else {
+        return ERR_INVALID;
+    };
+    if src_stride < sw * ch || dst_stride < dw * ch {
+        return ERR_INVALID;
+    }
+    // SAFETY: u is an upscaler from av1g_upscaler_create, used from one thread; src holds the
+    // source's sl bytes and dst the destination's dl, which don't overlap (decoder.h).
+    let (h, s, d) = unsafe { (&mut *u, core::slice::from_raw_parts(src, sl), core::slice::from_raw_parts_mut(dst, dl)) };
+    match h.u.scale(s, sw, sh, src_stride, ch, d, dw, dh, dst_stride) {
+        Ok(()) => OK,
+        Err(_) => ERR_INVALID,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn av1g_upscaler_destroy(u: *mut UpscalerHandle) {
+    if !u.is_null() {
+        // SAFETY: u is an upscaler from av1g_upscaler_create, not used after this.
+        drop(unsafe { Box::from_raw(u) });
+    }
+}
+
 // ---- av1enc.h (the hybrid encoder's part is in capi_hybrid) ----
 
 #[unsafe(no_mangle)]

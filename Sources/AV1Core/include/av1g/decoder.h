@@ -85,6 +85,39 @@ void av1g_decoder_reset(av1g_decoder *d);
 
 void av1g_decoder_destroy(av1g_decoder *d);
 
+/* ---- the upscaler (rust/av1/src/upscale.rs): a reduced frame shown at its render size ----
+ *
+ *   av1g_upscaler_create()    an upscaler: its tables and rows, kept between pictures
+ *   av1g_upscaler_scale()     one plane, or BGRA, scaled up
+ *   av1g_upscaler_destroy()
+ *
+ * A separable filter in integers (Lanczos-5 by default), sample centres mapped onto each other
+ * (the extents), edges extended; exactly twice the size on an axis takes a faster path with the
+ * same results.  The same output on every architecture.  A picture allocates no buffers, except when
+ * the sizes change.  Used from one thread at a time; it scales on the crate's worker threads. */
+typedef struct av1g_upscaler av1g_upscaler;
+
+#define AV1G_UPSCALE_LANCZOS5 0     /* the default (10 taps) */
+#define AV1G_UPSCALE_LANCZOS3 1     /* research: the other candidates (BENCHMARKS) */
+#define AV1G_UPSCALE_LANCZOS4 2
+#define AV1G_UPSCALE_LANCZOS2 3
+#define AV1G_UPSCALE_CATMULL_ROM 4
+
+/* An upscaler on at most `threads` threads (<= 0: the available parallelism) with `filter`
+ * (AV1G_UPSCALE_*).  NULL for another filter, or out of memory. */
+av1g_upscaler *av1g_upscaler_create(int threads, int filter);
+
+/* Scales `src` (`src_width` x `src_height` pixels of `channels` interleaved 8-bit samples, 1 or
+ * 4; rows `src_stride` bytes apart) up to `dst` (`dst_width` x `dst_height`, each at least the
+ * source's; rows `dst_stride` bytes apart), which mustn't overlap it.  With 4 channels the
+ * channels are filtered alike (BGRA: alpha 255 stays 255).  AV1G_OK, or AV1G_ERR_INVALID (a size,
+ * stride or channel count it doesn't take; nothing written). */
+int av1g_upscaler_scale(av1g_upscaler *u, const uint8_t *src, uint32_t src_width, uint32_t src_height,
+                        size_t src_stride, uint8_t *dst, uint32_t dst_width, uint32_t dst_height,
+                        size_t dst_stride, uint32_t channels);
+
+void av1g_upscaler_destroy(av1g_upscaler *u);
+
 #ifdef __cplusplus
 }
 #endif
