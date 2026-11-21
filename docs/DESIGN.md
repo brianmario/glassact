@@ -361,7 +361,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 5 | geometryFinal | this HELLO is final; don't request geometry again |
 | 6 | windowList | single-window mode available |
 | 7 | videoAV1GlassAct | AV1 from Glass Act's encoder (codec 3, §4.6): a Viewer advertises it when its user opts in and it decodes the hybrid's streams (VideoToolbox, or Glass Act's decoder, which takes only that toolset); a Host, when its AV1 is Glass Act's. Such a Host sends AV1 to a Viewer with bit 1 or 7; a libaom Host only with bit 1. (Bit 7 was `videoOverlay` before wire version 4, which no peer of this one ever sent) |
-| 8 | videoReducedFrames | reduced AV1 frames (§4.6): coded smaller than the region, the region their render size. A Viewer advertises it when its AV1 decoder is VideoToolbox's, which scales them as it decodes (Glass Act's decoder shows them too, scaled with vImage, but that costs more than the half-size decode saves); a Host whose AV1 is Glass Act's, which codes them only to a Viewer with the bit. Released Viewers fail on such a frame |
+| 8 | videoReducedFrames | reduced AV1 frames (§4.6): coded smaller than the region, the region their render size. A Viewer advertises it with either AV1 decoder, each of which shows a reduced frame for less than a full-size one: VideoToolbox's scales them as it decodes, Glass Act's with its own upscaler; a Host whose AV1 is Glass Act's, which codes them only to a Viewer with the bit. Released Viewers fail on such a frame |
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
 | 11 | agentControl | TEXT_INPUT, AGENT_STATE, UI_TREE*, agent-flagged INPUT |
@@ -619,7 +619,8 @@ first negotiated codec whose encoder starts; START carries its id.
   - A Viewer with VideoToolbox's AV1 (M3 and later) decodes any AV1 and
     offers caps bits 1 and 7. One without it decodes with Glass Act's own
     decoder (`OwnAV1RegionDecoder`), which takes only the hybrid's toolset,
-    and offers bit 7 alone. Its region decoder is VideoToolbox's whenever
+    and offers bit 7 but not 1 (both offer bit 8, reduced frames, below).
+    Its region decoder is VideoToolbox's whenever
     it has it, since only then can libaom's streams come.
   - A Host whose AV1 is Glass Act's sends it under bit 1 or 7; one whose AV1
     is libaom's (a released Host, or this one switched back) only under
@@ -629,12 +630,20 @@ first negotiated codec whose encoder starts; START carries its id.
   bit 8, `videoReducedFrames`): Glass Act's AV1 codes a run of video at
   half size each way when its content is softer than the region (video
   scaled up to fill it), as AV1 reduced frames (`frame_size_override_flag`,
-  the region as the render size). The Viewer shows them scaled up: its
-  VideoToolbox session asks for the region's size (it otherwise outputs a
-  reduced frame at its coded size, and the size check drops it), which
-  scores as vImage's Lanczos and costs nothing. Only such a Viewer offers
-  the bit: Glass Act's decoder shows reduced frames too, but its Lanczos on
-  the BGRA (22 ms a 5K frame) costs more than the half-size decode saves.
+  the region as the render size). The Viewer shows them scaled up to the
+  region, and offers the bit with either AV1 decoder:
+  - VideoToolbox: its session asks for the region's size (it otherwise
+    outputs a reduced frame at its coded size, and the size check drops
+    it), which scores as vImage's Lanczos and costs nothing.
+  - Glass Act's decoder (`OwnAV1RegionDecoder`): its own upscaler
+    (`av1g_upscaler`, `rust/av1`'s `upscale`) scales the decoded Y, U and V
+    up to their sizes at the region's (Lanczos-5 in integers, SIMD, on the
+    decoder's threads; as close to the source as vImage's high-quality
+    Lanczos or closer), which are then converted as a full-size frame's
+    are. A 5K frame: 8.7 ms against 14 at full size on 14 cores,
+    15 against 28 on 4 (BENCHMARKS, 2026-11-20). The Host's coded size is
+    exactly half a side that's a multiple of 4, and a little under half
+    another (`HybridRegionEncoder.half`); the upscaler takes any size.
   - A run: from the fourth inter frame in a row coding more than half its
     64×64s (a switch of screens is one, or three at worst).
   - The margin: the half-size round trip (Lanczos down and up, 8 bands of

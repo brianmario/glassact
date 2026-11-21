@@ -339,35 +339,162 @@ struct OwnAV1RegionDecoderTests {
         #expect(matrices == [1, 6], "matrices \(matrices.sorted())")
     }
 
+    /// Smooth content (periods of 40 to 100 samples of the region, so the half size loses little of
+    /// it), sampled at the centres of a `width` × `height` picture of a `region`-sized one, as a
+    /// scaled picture's samples sit: the same content at any size.
+    @available(macOS 27, *)
+    static func smooth(width: Int, height: Int, region: (Int, Int), frame: Int, chroma444: Bool = false) -> AV1HybridEncoder.Picture {
+        func plane(_ w: Int, _ h: Int, _ f: (Double, Double) -> Double) -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: w * h)
+            for r in 0..<h {
+                for c in 0..<w {
+                    let x = (Double(c) + 0.5) * Double(region.0) / Double(w) - 0.5
+                    let y = (Double(r) + 0.5) * Double(region.1) / Double(h) - 0.5
+                    out[r * w + c] = UInt8(clamping: Int(f(x, y).rounded()))
+                }
+            }
+            return out
+        }
+        let t = Double(frame) * 3
+        let (cw, ch) = chroma444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+        let y = plane(width, height) { x, y in
+            128 + 55 * sin(2 * .pi * (x + t) / 97) * cos(2 * .pi * y / 61) + 40 * sin(2 * .pi * (x - y) / 173)
+        }
+        let u = plane(cw, ch) { x, y in 128 + 50 * sin(2 * .pi * (x + y + t) / 131) }
+        let v = plane(cw, ch) { x, y in 128 + 45 * cos(2 * .pi * (x - t) / 89) * sin(2 * .pi * y / 113) }
+        return AV1HybridEncoder.Picture(y: y, u: u, v: v, width: width, height: height, chroma444: chroma444)
+    }
+
+    /// RGB PSNR between two BGRA pictures (alpha left out).
+    static func psnr(_ a: [UInt8], _ b: [UInt8]) -> Double {
+        var se = 0.0, n = 0
+        for k in a.indices where k % 4 != 3 {
+            let d = Double(Int(a[k]) - Int(b[k]))
+            se += d * d
+            n += 1
+        }
+        return se == 0 ? 99 : 10 * log10(255 * 255 * Double(n) / se)
+    }
+
+    /// Reduced frames are shown at the region's size by each way of scaling them up: at the Host's
+    /// coded size (`HybridRegionEncoder.half`, max(2, (n / 2) & ~1): exactly half a side that's a
+    /// multiple of 4, a little under half elsewhere), 4:2:0 and 4:4:4 (which the Host doesn't
+    /// reduce, but the decoder takes). Their planes are the encoder's; what they show is close to
+    /// what a full-size stream of the same content shows, at least as close as vImage's Lanczos
+    /// makes it (4:2:0 planes much closer: they're converted as a full-size frame's are, where the
+    /// BGRA paths scale up vImage's chroma upsampling at the coded size); Glass Act's BGRA path
+    /// shows nearly vImage's picture; alpha is opaque.
+    @available(macOS 27, *)
+    @Test(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (the hybrid encoder)"),
+          arguments: [(640, 360, false), (642, 362, false), (643, 361, false), (70, 41, false), (642, 361, true)])
+    func reducedFramesAreScaledUpToTheRegion(width: Int, height: Int, chroma444: Bool) throws {
+        let half = { (n: Int) in max(2, (n / 2) & ~1) }
+        let (cw, ch) = (half(width), half(height))
+        let frameCount = 3
+        func encoder() throws -> AV1HybridEncoder {
+            let e = try Self.encoder(interFrames: true)
+            e.tiling = (0, 0)  // (one tile: the small sizes have no room for two)
+            return e
+        }
+        // the same content at the region's size, and what it shows
+        let fullStream = try Self.frames(encoder(),
+                                         (0..<frameCount).map { Self.smooth(width: width, height: height, region: (width, height),
+                                                                            frame: $0, chroma444: chroma444) }, qindex: 16)
+        let full = OwnAV1RegionDecoder(threads: 2)
+        try #require(full.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
+        let shownFull = fullStream.map { Self.decode(full, $0, width: width, height: height) }
+        let allShown = shownFull.allSatisfy { $0.0 }
+        try #require(allShown)
+        // reduced: coded at cw × ch, shown at the region's size
+        let e = try encoder()
+        e.streamSize = (width, height)
+        let frames = try Self.frames(e, (0..<frameCount).map { Self.smooth(width: cw, height: ch, region: (width, height),
+                                                                           frame: $0, chroma444: chroma444) }, qindex: 16)
+        var shown: [OwnAV1RegionDecoder.Upscale: [[UInt8]]] = [:]
+        for way in OwnAV1RegionDecoder.Upscale.allCases {
+            let d = OwnAV1RegionDecoder(threads: 3)
+            d.upscale = way
+            try #require(d.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
+            for (i, f) in frames.enumerated() {
+                let (ok, bgra) = Self.decode(d, f, width: width, height: height)
+                #expect(ok, "\(way): reduced frame \(i)")
+                guard ok else { continue }
+                #expect(bgra.count == width * height * 4)
+                #expect(Self.shownPlanes(d) == f.planes, "\(way): reduced frame \(i): not the encoder's picture")
+                #expect(d.withShownPicture { (Int($0.width), Int($0.height), Int($0.render_width), Int($0.render_height)) }
+                        ?? (0, 0, 0, 0) == (cw, ch, width, height))
+                #expect(stride(from: 3, to: bgra.count, by: 4).allSatisfy { bgra[$0] == 255 }, "\(way): alpha")
+                shown[way, default: []].append(bgra)
+            }
+            #expect(d.stats.framesShown == frameCount && d.stats.scaleNS > 0)
+        }
+        let ref = shownFull.map(\.1)
+        func mean(_ way: OwnAV1RegionDecoder.Upscale) -> Double {
+            let s = shown[way] ?? []
+            return s.isEmpty ? 0 : zip(s, ref).map { Self.psnr($0, $1) }.reduce(0, +) / Double(s.count)
+        }
+        let (planes, bgra, vImage) = (mean(.planes), mean(.bgra), mean(.vImage))
+        let what = "\(width)×\(height)\(chroma444 ? " 4:4:4" : ""): against the full-size stream planes \(planes), BGRA \(bgra), vImage \(vImage) dB"
+        #expect(planes >= 40 && bgra >= 34, "\(what)")
+        // (4:4:4: scaled before the conversion or after, 0.1–0.3 dB apart at 46 dB)
+        #expect(planes >= vImage - 0.2 && bgra >= vImage - 0.1, "\(what)")
+        // the same pipeline as vImage's but the filter: a phase or channel slip would show here
+        let paths = zip(shown[.bgra] ?? [], shown[.vImage] ?? []).map { Self.psnr($0, $1) }.min() ?? 0
+        #expect(paths >= 45, "\(what); BGRA against vImage \(paths) dB")
+    }
+
+    /// One region's decoder through reduced streams of each chroma format in turn (a key frame may
+    /// bring a new sequence header): the 4:4:4 one needs twice the 4:2:0 one's planes, and gets
+    /// them (run under AddressSanitizer: an overrun would pass unseen otherwise).
     @available(macOS 27, *)
     @Test(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (the hybrid encoder)"))
-    func reducedFramesAreScaledUpToTheRegion() throws {
-        let (width, height) = (640, 360)
-        let e = try Self.encoder(interFrames: true)
-        e.streamSize = (width, height)
-        // the encoder's pictures at the coded size, exactly
-        let frames = try Self.frames(e, Self.pictures(4, width: width / 2, height: height / 2, seed: 5), qindex: 80)
+    func reducedStreamsOfEitherChromaFormatInTurn() throws {
+        let (width, height) = (642, 361)
+        let (cw, ch) = (max(2, (width / 2) & ~1), max(2, (height / 2) & ~1))
+        func stream(_ c444: Bool, from frame: Int) throws -> [AV1HybridEncoder.Frame] {
+            let e = try Self.encoder(interFrames: true)
+            e.tiling = (0, 0)
+            e.streamSize = (width, height)
+            return try Self.frames(e, (0..<2).map { Self.smooth(width: cw, height: ch, region: (width, height), frame: frame + $0,
+                                                                 chroma444: c444) }, qindex: 30)
+        }
         let d = OwnAV1RegionDecoder(threads: 2)
         try #require(d.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
-        for (i, f) in frames.enumerated() {
-            let (ok, bgra) = Self.decode(d, f, width: width, height: height)
-            #expect(ok, "reduced frame \(i)")
-            #expect(bgra.count == width * height * 4)
-            #expect(Self.shownPlanes(d) == f.planes, "reduced frame \(i): not the encoder's picture")
-            #expect(d.withShownPicture { (Int($0.width), Int($0.render_width)) } ?? (0, 0) == (width / 2, width))
+        for (k, c444) in [false, true, false].enumerated() {
+            for (i, f) in try stream(c444, from: 2 * k).enumerated() {
+                let (ok, bgra) = Self.decode(d, f, width: width, height: height)
+                #expect(ok, "stream \(k) (\(c444 ? "4:4:4" : "4:2:0")), frame \(i)")
+                #expect(Self.shownPlanes(d) == f.planes, "stream \(k), frame \(i): not the encoder's picture")
+                #expect(d.withShownPicture { $0.chroma_format } == UInt8(c444 ? AV1G_CHROMA_444 : AV1G_CHROMA_420))
+                #expect(bgra.count == width * height * 4)
+            }
         }
-        // a flat picture comes out flat at the region's size
-        let n = width / 2 * height / 2
-        let flat = AV1HybridEncoder.Picture(y: .init(repeating: 120, count: n), u: .init(repeating: 90, count: n / 4),
-                                            v: .init(repeating: 170, count: n / 4), width: width / 2, height: height / 2)
+        #expect(d.stats.framesShown == 6 && d.stats.failures == 0)
+    }
+
+    /// A flat reduced frame comes out flat at the region's size, in its colour.
+    @available(macOS 27, *)
+    @Test(.enabled(if: AV1ShaderSource.hasCapableGPU, "needs an Apple-silicon GPU (the hybrid encoder)"),
+          arguments: [(640, 360), (643, 361)])
+    func aFlatReducedFrameStaysFlat(width: Int, height: Int) throws {
+        let (cw, ch) = (max(2, (width / 2) & ~1), max(2, (height / 2) & ~1))
+        let e = try Self.encoder(interFrames: true)
+        e.streamSize = (width, height)
+        let n = cw * ch, c = ((cw + 1) / 2) * ((ch + 1) / 2)
+        let flat = AV1HybridEncoder.Picture(y: .init(repeating: 120, count: n), u: .init(repeating: 90, count: c),
+                                            v: .init(repeating: 170, count: c), width: cw, height: ch)
         let f = try Self.frames(e, [flat], qindex: 20)[0]
-        try #require(d.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
-        let (ok, bgra) = Self.decode(d, f, width: width, height: height)
-        try #require(ok && bgra.count == width * height * 4)
-        let first = Array(bgra[0..<4])
-        var off = 0
-        for k in stride(from: 0, to: bgra.count, by: 4) { for j in 0..<4 { off = max(off, abs(Int(bgra[k + j]) - Int(first[j]))) } }
-        #expect(off <= 2, "a flat picture scaled up varies by \(off)")
-        #expect(first[3] == 255 && first[2] > first[0], "BGRA \(first): (120, 90, 170) is more red than blue")
+        for way in OwnAV1RegionDecoder.Upscale.allCases {
+            let d = OwnAV1RegionDecoder(threads: 2)
+            d.upscale = way
+            try #require(d.start(codec: VideoCodec.av1, config: Self.av1C, width: width, height: height))
+            let (ok, bgra) = Self.decode(d, f, width: width, height: height)
+            try #require(ok && bgra.count == width * height * 4)
+            let first = Array(bgra[0..<4])
+            var off = 0
+            for k in stride(from: 0, to: bgra.count, by: 4) { for j in 0..<4 { off = max(off, abs(Int(bgra[k + j]) - Int(first[j]))) } }
+            #expect(off <= (way == .vImage ? 2 : 0), "\(way): a flat picture scaled up varies by \(off)")
+            #expect(first[3] == 255 && first[2] > first[0], "\(way): BGRA \(first): (120, 90, 170) is more red than blue")
+        }
     }
 }

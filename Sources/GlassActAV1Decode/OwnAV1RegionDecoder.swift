@@ -14,38 +14,63 @@ import GlassActWire
 /// - **Start**: `VideoCodec.av1` with an `av1C` config (its sequence header isn't needed: every key
 ///   frame carries one). The decoder is capped at the region's size
 ///   (`av1g_decoder_create_capped`): a stream for larger frames fails before anything is allocated
-///   for it. The BGRA picture and the colour conversions are made here, not per frame.
+///   for it. The BGRA picture, the colour conversions and the upscaler are made here, not per frame.
 /// - **Decode**: one temporal unit, then the frame it shows converted to BGRA with vImage by the
 ///   matrix and range its sequence header gives (the hybrid's streams BT.709, its stills BT.601;
 ///   full or video range), 4:2:0 or 4:4:4. A reduced frame (decisions.h "Reduced frames": coded
-///   smaller, its render size the stream's) is converted at its coded size and scaled up to the
-///   region (vImage's high-quality resampling), since VideoToolbox hands the engine a reduced
-///   frame already scaled to the region. Any other size, monochrome, or a matrix it doesn't know is
-///   a failure.
+///   smaller, its render size the stream's) is shown at the region's size, as VideoToolbox shows
+///   it: its planes scaled up by Glass Act's upscaler (`av1g_upscaler`, Lanczos-5 in integers on
+///   the decoder's threads; `upscale`), then converted as a full-size frame is. Any other size,
+///   monochrome, or a matrix it doesn't know is a failure.
 /// - **Failure**, as `VTRegionDecoder`'s: any error (damage, a frame outside the toolset, an inter
 ///   frame whose references the decoder doesn't hold) forgets the stream and drops every frame
 ///   until a sync frame, and `decode` returns false, so the engine asks for one (SYNC_REQUEST).
 /// - **Stop** frees the decoder and the buffers; `start` again builds new ones.
 ///
 /// The pixels `onPixels` gets are this decoder's own buffer (stride width × 4), valid for the
-/// call. One region, one thread at a time (the engine's queue); the Rust decoder runs its stages
-/// on its own worker threads. `decode` allocates nothing (no `err` text is asked for), except the
-/// first reduced frame's coded-size buffer and a larger scaling buffer when its size changes.
+/// call. One region, one thread at a time (the engine's queue); the Rust decoder and upscaler run
+/// on their own worker threads. `decode` allocates no buffers (no `err` text is asked for), except
+/// for the first reduced frame: the region-size planes it's scaled into (again, larger, at the
+/// first 4:4:4 one), and the upscaler's tables (again when the coded size changes).
 public final class OwnAV1RegionDecoder: VideoRegionDecoder {
-    /// Time spent per frame shown, in nanoseconds (the bench): the Rust decoder's, and the
-    /// conversion to BGRA (with the scaling of reduced frames).
+    /// Time spent per frame shown, in nanoseconds (the bench): the Rust decoder's, the conversion
+    /// to BGRA, and the scaling of reduced frames.
     public struct Stats: Sendable, Equatable {
         public var framesShown = 0, keyFramesShown = 0
-        public var decodeNS: UInt64 = 0, convertNS: UInt64 = 0
-        public var keyDecodeNS: UInt64 = 0, keyConvertNS: UInt64 = 0
+        public var decodeNS: UInt64 = 0, convertNS: UInt64 = 0, scaleNS: UInt64 = 0
+        public var keyDecodeNS: UInt64 = 0, keyConvertNS: UInt64 = 0, keyScaleNS: UInt64 = 0
         public var failures = 0
     }
+
+    /// How a reduced frame is scaled up to the region.
+    public enum Upscale: String, Sendable, CaseIterable {
+        /// Y, U and V each by `av1g_upscaler`, then converted at the region's size (the default:
+        /// the cheapest, BENCHMARKS "Glass Act's decoder scales reduced frames up itself")
+        case planes
+        /// converted at the coded size, then the BGRA by `av1g_upscaler`
+        case bgra
+        /// converted at the coded size, then the BGRA by vImage's high-quality resampling (Lanczos;
+        /// what it did before, ~20 ms a 5K frame)
+        case vImage
+    }
+
+    /// Whether it shows a reduced frame for less than a full-size one, so a Viewer offers
+    /// `videoReducedFrames` with it (`ViewerVideoDecoders.glassAct`). It does on both
+    /// architectures: a 5K frame on an M4 Pro 8.7 ms against 14 at full size (15.5 against 28 on 4
+    /// threads); x86_64 under Rosetta about 39 against 80 (BENCHMARKS, 2026-11-20).
+    public static let showsReducedFramesCheaply = true
 
     public private(set) var stats = Stats()
     /// The decoder's threads (0: the available parallelism).
     public let threads: Int
+    /// Reduced frames' scaling (the bench compares them); `filter` is the upscaler's
+    /// (`AV1G_UPSCALE_*`). Both are read at `start`.
+    public var upscale = Upscale.planes
+    public var filter = Int32(AV1G_UPSCALE_LANCZOS5)
 
     private var decoder: OpaquePointer?
+    private var upscaler: OpaquePointer?
+    private var scaling = Upscale.planes
     private var width = 0
     private var height = 0
     private var awaitingSync = false
@@ -54,7 +79,10 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
     private var shown = false
     /// The region's BGRA picture (width × height × 4).
     private var bgra: UnsafeMutableRawPointer?
-    /// Reduced frames: the coded size's BGRA, and vImage's scaling buffer.
+    /// Reduced frames: `.planes`' region-size Y, U and V (made at the first, larger at the first
+    /// 4:4:4 one), or the others' BGRA at the coded size and vImage's scaling buffer.
+    private var planes: UnsafeMutableRawPointer?
+    private var planesBytes = 0
     private var coded: UnsafeMutableRawPointer?
     private var codedBytes = 0
     private var scaleTemp: UnsafeMutableRawPointer?
@@ -90,6 +118,14 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
               makeConversions(),
               let created = av1g_decoder_create_capped(Int32(clamping: threads), UInt32(width), UInt32(height))
         else { return false }
+        scaling = upscale
+        if scaling != .vImage {
+            guard let u = av1g_upscaler_create(Int32(clamping: threads), filter) else {
+                av1g_decoder_destroy(created)
+                return false
+            }
+            upscaler = u
+        }
         decoder = created
         self.width = width
         self.height = height
@@ -106,7 +142,8 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
         let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let rc = data.withUnsafeBufferPointer { av1g_decoder_decode(decoder, $0.baseAddress, $0.count, &picture, nil, 0) }
         let t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        guard rc == AV1G_OK, convert(into: bgra) else {
+        var scaleNS: UInt64 = 0
+        guard rc == AV1G_OK, convert(into: bgra, scaleNS: &scaleNS) else {
             // (the Rust decoder drops its references on an error but keeps the sequence header,
             // which the damage may have reached: the stream starts over at a sync frame)
             av1g_decoder_reset(decoder)
@@ -119,11 +156,13 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
         shown = true
         stats.framesShown += 1
         stats.decodeNS &+= t1 &- t0
-        stats.convertNS &+= t2 &- t1
+        stats.convertNS &+= t2 &- t1 &- scaleNS
+        stats.scaleNS &+= scaleNS
         if picture.key != 0 {
             stats.keyFramesShown += 1
             stats.keyDecodeNS &+= t1 &- t0
-            stats.keyConvertNS &+= t2 &- t1
+            stats.keyConvertNS &+= t2 &- t1 &- scaleNS
+            stats.keyScaleNS &+= scaleNS
         }
         onPixels(UnsafeRawBufferPointer(start: bgra, count: width * height * 4), width * 4)
         return true
@@ -132,8 +171,13 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
     public func stop() {
         if let decoder { av1g_decoder_destroy(decoder) }
         decoder = nil
+        if let upscaler { av1g_upscaler_destroy(upscaler) }
+        upscaler = nil
         bgra?.deallocate()
         bgra = nil
+        planes?.deallocate()
+        planes = nil
+        planesBytes = 0
         coded?.deallocate()
         coded = nil
         codedBytes = 0
@@ -195,52 +239,97 @@ public final class OwnAV1RegionDecoder: VideoRegionDecoder {
         return true
     }
 
-    /// `picture` into the region's BGRA buffer.
-    private func convert(into out: UnsafeMutableRawPointer) -> Bool {
+    /// A plane for the conversion: `w` × `h` samples, rows `stride` bytes apart.
+    private struct Plane {
+        var base: UnsafePointer<UInt8>, stride: Int, w: Int, h: Int
+    }
+
+    /// `picture` into the region's BGRA buffer; `scaleNS` the time a reduced frame's scaling took.
+    private func convert(into out: UnsafeMutableRawPointer, scaleNS: inout UInt64) -> Bool {
         let p = picture
         let (w, h) = (Int(p.width), Int(p.height))
+        let c444 = p.chroma_format == UInt8(AV1G_CHROMA_444)
         guard p.monochrome == 0, let yp = p.planes.0, let up = p.planes.1, let vp = p.planes.2,
               w >= 1, h >= 1, w <= width, h <= height,
               Int(p.render_width) == width, Int(p.render_height) == height,
               let index = Self.conversionIndex(matrix: p.matrix_coefficients, fullRange: p.color_range != 0,
-                                               chroma444: p.chroma_format == UInt8(AV1G_CHROMA_444))
+                                               chroma444: c444)
         else { return false }
-        let reduced = w != width || h != height
-        if reduced && codedBytes < w * h * 4 {
-            // (the region's size: a reduced frame is never larger)
-            coded?.deallocate()
-            codedBytes = width * height * 4
-            coded = .allocate(byteCount: codedBytes, alignment: 64)
+        let decoded = (Plane(base: yp, stride: Int(p.stride.0), w: Int(p.plane_w.0), h: Int(p.plane_h.0)),
+                       Plane(base: up, stride: Int(p.stride.1), w: Int(p.plane_w.1), h: Int(p.plane_h.1)),
+                       Plane(base: vp, stride: Int(p.stride.2), w: Int(p.plane_w.2), h: Int(p.plane_h.2)))
+        guard w != width || h != height else {
+            return convert(decoded, w, h, c444: c444, index: index, into: out)
         }
-        guard let target = reduced ? coded : out else { return false }
-        func buffer(_ base: UnsafePointer<UInt8>, _ k: Int, _ stride: UInt32) -> vImage_Buffer {
-            let (pw, ph) = k == 0 ? (p.plane_w.0, p.plane_h.0) : k == 1 ? (p.plane_w.1, p.plane_h.1) : (p.plane_w.2, p.plane_h.2)
-            return vImage_Buffer(data: UnsafeMutableRawPointer(mutating: base), height: vImagePixelCount(ph),
-                                 width: vImagePixelCount(pw), rowBytes: Int(stride))
+        let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        switch scaling {
+        case .planes:
+            // each plane scaled up to its size at the region's (4:2:0 chroma (w+1)/2 × (h+1)/2), then
+            // converted as a full-size frame is
+            let (cw, ch) = c444 ? (width, height) : ((width + 1) / 2, (height + 1) / 2)
+            if planesBytes < width * height + 2 * cw * ch {
+                // (a stream's chroma format may change at a key frame: 4:4:4 takes twice 4:2:0's)
+                planes?.deallocate()
+                planesBytes = width * height + 2 * cw * ch
+                planes = .allocate(byteCount: planesBytes, alignment: 64)
+            }
+            guard let upscaler, let planes else { return false }
+            let y = planes.assumingMemoryBound(to: UInt8.self), u = y + width * height, v = u + cw * ch
+            func scale(_ d: Plane, into to: UnsafeMutablePointer<UInt8>, _ tw: Int, _ th: Int) -> Bool {
+                av1g_upscaler_scale(upscaler, d.base, UInt32(d.w), UInt32(d.h), d.stride, to, UInt32(tw), UInt32(th), tw,
+                                    1) == AV1G_OK
+            }
+            guard scale(decoded.0, into: y, width, height), scale(decoded.1, into: u, cw, ch),
+                  scale(decoded.2, into: v, cw, ch) else { return false }
+            scaleNS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) &- t0
+            return convert((Plane(base: y, stride: width, w: width, h: height), Plane(base: u, stride: cw, w: cw, h: ch),
+                            Plane(base: v, stride: cw, w: cw, h: ch)), width, height, c444: c444, index: index, into: out)
+        case .bgra, .vImage:
+            if codedBytes < w * h * 4 {
+                // (the region's size: a reduced frame is never larger)
+                coded?.deallocate()
+                codedBytes = width * height * 4
+                coded = .allocate(byteCount: codedBytes, alignment: 64)
+            }
+            guard let coded, convert(decoded, w, h, c444: c444, index: index, into: coded) else { return false }
+            let t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            defer { scaleNS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) &- t1 }
+            if scaling == .bgra {
+                guard let upscaler else { return false }
+                return av1g_upscaler_scale(upscaler, coded, UInt32(w), UInt32(h), w * 4, out.assumingMemoryBound(to: UInt8.self),
+                                           UInt32(width), UInt32(height), width * 4, 4) == AV1G_OK
+            }
+            var small = vImage_Buffer(data: coded, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
+            var full = vImage_Buffer(data: out, height: vImagePixelCount(height), width: vImagePixelCount(width),
+                                     rowBytes: width * 4)
+            let scaleFlags = vImage_Flags(kvImageHighQualityResampling)
+            let need = vImageScale_ARGB8888(&small, &full, nil, scaleFlags | vImage_Flags(kvImageGetTempBufferSize))
+            guard need >= 0 else { return false }
+            if scaleTempBytes < need {
+                scaleTemp?.deallocate()
+                scaleTempBytes = need
+                scaleTemp = .allocate(byteCount: max(1, need), alignment: 64)
+            }
+            return vImageScale_ARGB8888(&small, &full, scaleTemp, scaleFlags) == kvImageNoError
         }
-        var y = buffer(yp, 0, p.stride.0), cb = buffer(up, 1, p.stride.1), cr = buffer(vp, 2, p.stride.2)
+    }
+
+    /// Y, U, V planes of a `w` × `h` picture into BGRA (rows `w` × 4 bytes) by `conversions[index]`.
+    private func convert(_ planes: (Plane, Plane, Plane), _ w: Int, _ h: Int, c444: Bool, index: Int,
+                         into target: UnsafeMutableRawPointer) -> Bool {
+        func buffer(_ p: Plane) -> vImage_Buffer {
+            vImage_Buffer(data: UnsafeMutableRawPointer(mutating: p.base), height: vImagePixelCount(p.h),
+                          width: vImagePixelCount(p.w), rowBytes: p.stride)
+        }
+        var y = buffer(planes.0), cb = buffer(planes.1), cr = buffer(planes.2)
         var dst = vImage_Buffer(data: target, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
         let flags = vImage_Flags(kvImageNoFlags)
-        if p.chroma_format == UInt8(AV1G_CHROMA_444) {
+        if c444 {
             // A, Y', Cb, Cr interleaved (vImage converts no planar 4:4:4), then to ARGB in place
-            guard vImageConvert_Planar8ToXRGB8888(255, &y, &cb, &cr, &dst, flags) == kvImageNoError,
-                  vImageConvert_444AYpCbCr8ToARGB8888(&dst, &dst, conversions + index, permute, flags) == kvImageNoError
-            else { return false }
-        } else {
-            guard vImageConvert_420Yp8_Cb8_Cr8ToARGB8888(&y, &cb, &cr, &dst, conversions + index, permute, 255,
-                                                         flags) == kvImageNoError else { return false }
+            return vImageConvert_Planar8ToXRGB8888(255, &y, &cb, &cr, &dst, flags) == kvImageNoError
+                && vImageConvert_444AYpCbCr8ToARGB8888(&dst, &dst, conversions + index, permute, flags) == kvImageNoError
         }
-        guard reduced else { return true }
-        var full = vImage_Buffer(data: out, height: vImagePixelCount(height), width: vImagePixelCount(width),
-                                 rowBytes: width * 4)
-        let scaleFlags = vImage_Flags(kvImageHighQualityResampling)
-        let need = vImageScale_ARGB8888(&dst, &full, nil, scaleFlags | vImage_Flags(kvImageGetTempBufferSize))
-        guard need >= 0 else { return false }
-        if scaleTempBytes < need {
-            scaleTemp?.deallocate()
-            scaleTempBytes = need
-            scaleTemp = .allocate(byteCount: max(1, need), alignment: 64)
-        }
-        return vImageScale_ARGB8888(&dst, &full, scaleTemp, scaleFlags) == kvImageNoError
+        return vImageConvert_420Yp8_Cb8_Cr8ToARGB8888(&y, &cb, &cr, &dst, conversions + index, permute, 255,
+                                                      flags) == kvImageNoError
     }
 }

@@ -26,4 +26,5 @@ pub mod postfilter;
 pub mod tables;
 pub mod testsupport;
 pub mod types;
+pub mod upscale;
 pub mod writer;

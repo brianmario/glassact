@@ -3,13 +3,17 @@
 //! `writer::parse_with` into its record, then reconstructed by `Writer::encode_ex`, which re-codes
 //! the symbols too, from the slots its earlier frames refreshed).
 //!
-//!   cargo run --release --example own_decode -- [--writer] [--444] [--threads N] [--repeat K] <stream.ivf> [<aomdec.i420>]
+//!   cargo run --release --example own_decode -- [--writer] [--444] [--upscale] [--threads N] [--repeat K] <stream.ivf> [<aomdec.i420>]
+//!
+//! `--upscale`: reduced frames' planes are also scaled up to the stream's size by the Viewer's
+//! upscaler (`upscale::Upscaler`), and timed apart.
 //!
 //! With an I420 file (`aomdec --rawvideo -o <file> <stream.ivf>`), every frame is compared with
 //! libaom's; with `--444`, a 4:4:4 stream's planar 4:4:4 file (aomdec's raw output of it). `--repeat` decodes the stream K times (after a reset) and keeps each frame's fastest
 //! time.
 use glassact_av1::decoder::Decoder;
 use glassact_av1::types::EncodeOpts;
+use glassact_av1::upscale::{Filter, Upscaler};
 use glassact_av1::writer::{Output, ParseState, RefPicture, RefSlots, Writer, parse_with};
 use std::rc::Rc;
 use std::time::Instant;
@@ -19,10 +23,11 @@ fn main() {
     let mut take = |flag: &str| -> Option<String> {
         let i = args.iter().position(|a| a == flag)?;
         args.remove(i);
-        (flag != "--writer" && flag != "--444").then(|| args.remove(i)).or(Some(String::new()))
+        (!["--writer", "--444", "--upscale"].contains(&flag)).then(|| args.remove(i)).or(Some(String::new()))
     };
     let writer_path = take("--writer").is_some();
     let full_chroma = take("--444").is_some();
+    let upscale = take("--upscale").is_some();
     let threads: usize = take("--threads").map_or(0, |v| v.parse().unwrap());
     let repeat: usize = take("--repeat").map_or(1, |v| v.parse().unwrap());
     let ivf = std::fs::read(&args[0]).expect("read ivf");
@@ -53,6 +58,12 @@ fn main() {
             .all(|(p, &(pw, ph, off))| (0..ph).all(|y| planes[p][y * stride[p]..][..pw] == f[off + y * pw..][..pw]))
     };
     let mut threads_used = 0;
+    // --upscale: reduced frames' planes scaled up to the stream's size (the Viewer's upscaler)
+    let mut scaler = upscale.then(|| {
+        let c = if full_chroma { w * h } else { w.div_ceil(2) * h.div_ceil(2) };
+        (Upscaler::new(threads, Filter::default()), [vec![0u8; w * h], vec![0u8; c], vec![0u8; c]])
+    });
+    let mut best_up = vec![f64::MAX; n];
     for round in 0..repeat {
         if writer_path {
             let mut state = ParseState::default();
@@ -88,6 +99,19 @@ fn main() {
                 let p = d.decode(tu).unwrap_or_else(|e| panic!("frame {k}: {}", e.msg));
                 let dt = t0.elapsed().as_secs_f64() * 1e3;
                 key[k] = p.key;
+                if let Some((u, out)) = scaler.as_mut()
+                    && (p.width, p.height) != (p.render_width, p.render_height)
+                {
+                    // a reduced frame's planes scaled up to its render size, as the Viewer shows it
+                    let t1 = Instant::now();
+                    let (rw, rh) = (p.render_width as usize, p.render_height as usize);
+                    for i in 0..3 {
+                        let (dw, dh) = if i == 0 || full_chroma { (rw, rh) } else { (rw.div_ceil(2), rh.div_ceil(2)) };
+                        let (sw, sh) = (p.plane_w[i] as usize, p.plane_h[i] as usize);
+                        u.scale(p.planes[i], sw, sh, p.stride[i], 1, &mut out[i], dw, dh, dw).expect("upscale");
+                    }
+                    best_up[k] = best_up[k].min(t1.elapsed().as_secs_f64() * 1e3);
+                }
                 if round == 0 && compare(k, p.planes, p.stride) {
                     exact += 1;
                 }
@@ -149,5 +173,11 @@ fn main() {
     }
     if reference.is_some() {
         println!("  {exact} of {n} frames identical to libaom's");
+    }
+    let mut up: Vec<f64> = (0..n).filter(|&k| !key[k] && best_up[k] < f64::MAX).map(|k| best_up[k]).collect();
+    if !up.is_empty() {
+        up.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = up.iter().sum::<f64>() / up.len() as f64;
+        println!("  inter frames' planes scaled up to {w}x{h}: median {:.2} ms, mean {mean:.2} ({} frames)", up[up.len() / 2], up.len());
     }
 }

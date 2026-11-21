@@ -303,7 +303,7 @@ the numbers and the reasoning.
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
-| Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`, VideoToolbox Viewers only) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
+| Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | VideoToolbox decoding a reduced AV1 frame | it outputs the coded size unless asked for one | the Viewer's session asks for the region's size (`VTRegionDecoder`); its scaling scores as vImage's Lanczos 3 (35.33 / 35.48 dB at half size, 38.26 / 38.15 at 3/4); the 2026-11-02 finding (scaled up) was ffmpeg's | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | No intra search on inter frames where the inter block's J is under c × step² a pixel (in mostly-new pictures) | rejected | video 5K q36: c 0.02 −2.2 ms of GPU analysis for +0.6 % bytes, −0.08 dB; the movie +4.2 % and −0.2 dB at c 0.004 already; with no intra anywhere inter exists, 15 ms (64 a second) but +17 % / −1.25 dB on video, +25 % on the movie | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | AV1 superres (half width, the decoder upscales) for video | rejected (libaom bound) | loses to half-size reduced frames at every rate on the 60 fps video: at ~850 KB 35.0 against 35.9 dB, at ~530 KB 32.4 against 33.2; full 5K 34.3 at 870 KB | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
@@ -317,6 +317,7 @@ the numbers and the reasoning.
 | 16 tile columns at 5K (`--tiles 4x0`, against 8) (`metal-av1`) | measured; the owner's choice | +1.5 % bytes at q20, same PSNR; writer 7.9 → 5.5 ms, lone p50 38 → 36.5 ms; not BD-measured | [entry](#metal-av1-a-lone-new-5k-picture-stage-by-stage-and-kernel-by-kernel-its-serial-set-up-copies-and-a-new-caches-analysis-cut-2026-11-17) |
 | `k_me`'s SADs in floats: the window search's samples as 2^23 + v from their bits, the sub-sample steps' bilinear sums floored in floats (the same whole numbers) (`metal-av1`) | kept; a separate sub-sample kernel, lanes stepping a row at a time, stepped vectors and ten sub-sample variants not (no gain or slower) | the same streams; 5K q36 `k_me` video 4.52 → 3.38 ms a frame (medians), movie 3.05 → 2.66; now bound by instruction throughput, not the integer unit | [entry](#metal-av1-k_mes-sads-in-floats-the-same-streams-in-three-quarters-of-the-time-2026-11-20) |
 | The motion search seeded with the picture before's: in a mostly-new picture after a mostly-new picture, where the picture before searched a 16×16, a ±4 window around its whole-sample best and no motion's ±2 instead of ±8 (`AV1HybridEncoder.motionSeed`, `k_me_seed`) | kept, on; seed ±2 with no motion ±4 (half the bytes gain), seed ±4 with no motion ±4 (0.38 ms), every inter frame seeded (screens unchanged anyway), a zero best seeding and the seed in the inter gate not | 5K q36 motion search: video 5.39 → 4.81 ms, maps 5.60 → 5.30, movie 4.33 → 4.48; BD-rate (q20–44): video −5.4 %, movie −0.5 %, maps −13.0 %, app-switch, tabs, windows, ide, images-scroll and typing the same streams, the four-trace rotation −41 B (the same PSNR); at a fixed q video −0.17 to −0.20 dB; video 57.0 → 58.4–58.9 inter frames a second | [entry](#metal-av1-the-motion-search-seeded-with-the-picture-befores-2026-11-20) |
+| Glass Act's decoder scales reduced frames up itself (`rust/av1` `upscale`, `av1g_upscaler`: Lanczos-5 on the planes, then the full-size conversion), and offers `videoReducedFrames` | kept | a 5K inter frame, M4 Pro: reduced 8.7 ms against 14 at full size (was 26 with vImage's HQ on the BGRA), 15.5 against 28 on 4 threads; x86_64 under Rosetta ~39 against ~80; PSNR at or above vImage's HQ on video and text (+0.006 to +0.018 dB; Lanczos-3 −0.17 on text, rejected) | [entry](#glass-acts-decoder-scales-reduced-frames-up-itself-2026-11-20) |
 
 **Rate control and transport**
 
@@ -383,6 +384,123 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Glass Act's decoder scales reduced frames up itself (2026-11-20)
+
+Reduced frames (the entry below, "reduced frames for soft video") were offered only by Viewers
+decoding AV1 with VideoToolbox: Glass Act's decoder (`OwnAV1RegionDecoder`: M1, M2, older
+iPads, Intel) scaled them with vImage's high-quality resampling on the BGRA, which cost more
+than the half-size decode saved. Now `rust/av1`'s `upscale` (`av1g_upscaler`) scales the decoded
+Y, U and V up to their sizes at the region's, and they're converted as a full-size frame is. A
+Viewer offers `videoReducedFrames` with either AV1 decoder.
+
+**The upscaler** (`upscale.rs`; DESIGN §4.6):
+- A separable filter, sample centres mapped onto each other, edges extended.
+- Vertical pass first, then horizontal. Both take Q15 weights (`vqrdmulh`, `pmulhrsw`) on the
+  samples ×32, summed in i16. The weights are rounded to sum exactly to one, so a flat picture
+  stays flat and alpha stays 255. They come from plain IEEE arithmetic (no libm), so the outputs
+  are the same bits on arm64 and x86_64 (one snapshot for both).
+- Exactly twice the size takes fixed phases (±1/4). Any other ratio takes a table per output
+  sample: the Host's coded size is `max(2, (n / 2) & ~1)`, a little under half a side that isn't
+  a multiple of 4, such as 1470 → 734.
+- NEON and SSE4.1 are held exactly to the scalar code: random, checkerboard and stripe inputs,
+  every filter, strides, sizes 1×1 up, ratios 1 to 7.
+- Bands of 16 rows run on the crate's pool. Tables for 8 sizes are kept, so Y's and chroma's
+  don't rebuild each other's. A picture allocates no buffers. The decoder allocates its region-size
+  planes at its first reduced frame.
+
+**Which filter.** PSNR (the scorer's BT.601 luma of BGRA against the trace frame; 31 frames,
+2560×1440 coded, shown at 5120×2880), each scaler on the same decoded BGRA (`av1seq --upscale`):
+
+| trace, q | vImage HQ (before) | Lanczos-5 | Lanczos-4 | Lanczos-3 | Lanczos-2 | Catmull-Rom | vImage Lanczos-3 | bilinear |
+|---|---|---|---|---|---|---|---|---|
+| video from 220, q30 | 34.3270 | **34.3333** | 34.3475 | 34.3409 | 34.3841 | 34.3808 | 34.3344 | 33.94 |
+| video from 220, q16 | 38.8370 | **38.8546** | 38.8626 | 38.8456 | 38.6895 | 38.6571 | 38.8278 | 37.03 |
+| video from 1150, q30 | 34.3571 | **34.3634** | 34.3767 | 34.3676 | 34.4043 | 34.3991 | 34.3611 | |
+| typing (`1786116323` from 150), q16 | 29.7954 | **29.8027** | 29.7412 | 29.6113 | 29.0831 | 29.0029 | 29.6053 | 27.89 |
+| typing, q30 | 29.4977 | **29.5035** | 29.4517 | 29.3371 | 28.8489 | 28.7744 | 29.3323 | |
+
+- **Lanczos-5 is the one at or above vImage's HQ everywhere**, +0.006 to +0.018 dB, and SSIM
+  too (video q30 0.94275 against 0.94262, typing q16 0.95974 against 0.95962). vImage's HQ looks
+  like a Lanczos-5 too.
+- Our Lanczos-3 matches vImage's non-HQ Lanczos-3 within 0.01 dB, which checks the phases.
+- Lanczos-3 and -4 win on video, but trail on text: −0.17 and −0.05 dB. Lanczos-2 and
+  Catmull-Rom win on soft video at q30 (+0.05), but lose 0.7–0.8 dB on text and 0.15–0.18 at q16.
+- A side that isn't a multiple of 4 (734×412 shown at 1470×826, the table both ways, video
+  q30): vImage HQ 25.38, Lanczos-5 25.39, Lanczos-3 25.29.
+- What the decoder itself shows (`--own-decode --score-rgb`, new) is the same:
+  - video q30: Lanczos-5 on the planes 35.59, on the BGRA 35.60, vImage 35.59; Lanczos-3 on the
+    planes 35.60.
+  - typing q16: 31.14, 31.14, 31.13; Lanczos-3 30.95.
+  - The reference here is the trace frame through av1seq's video-range 4:2:0 and back as full
+    range. av1seq codes video-range planes in streams that signal full range, the Host's
+    I420Converter's, so this is how a Viewer shows them, coding and scaling aside.
+
+**Planes or BGRA.** Scaling the planes costs a full-size conversion (vImage, 0.4–0.6 ms at 5K)
+but writes 22 MB instead of 59, and on 4:2:0 it converts exactly as a full-size frame does.
+- Planes: 1.24–1.29 ms of scaling, plus 0.56 of conversion.
+- BGRA: 2.91–2.98 ms of scaling, plus 0.14 at the coded size (both Lanczos-5, 14 threads).
+- On a smooth synthetic picture with strong chroma (`reducedFramesAreScaledUpToTheRegion`), the
+  planes come out 45.4 dB from what the full-size stream shows, against 38.3 for both BGRA paths
+  (ours and vImage's). Those scale up vImage's 4:2:0 chroma upsampling at the coded size. On the
+  traces the two are within 0.01 dB of each other.
+
+**The decode, a 5K inter frame** (`av1seq --own-decode`, mean of 30 inter frames; M4 Pro, 14
+threads unless noted; load 3.6–6.5, except where noted):
+
+| | decode | conversion | upscale | total |
+|---|---|---|---|---|
+| full size (q42, qindex 168: the video's operating point) | 13.39 / 14.23 | 0.54 / 0.56 | | **13.9 / 14.8** |
+| reduced, vImage HQ on the BGRA (before) | 6.60 | 19.74 with the scaling (timed together then) | | 26.3 (first run of the day) |
+| reduced, Lanczos-5 on the planes (now) | 6.95 / 6.85 | 0.56 / 0.56 | 1.29 / 1.24 | **8.80 / 8.65** |
+| reduced, Lanczos-5 on the BGRA | 6.77 / 7.05 | 0.14 / 0.15 | 2.91 / 2.98 | 9.8 / 10.2 |
+| reduced, vImage HQ (this build) | 6.74 / 7.01 | 0.14 / 0.16 | 19.15 / 19.51 | 26.0 / 26.7 |
+| full size, 8 threads (load 4.7–7.9; again at 4.2–4.9) | 15.62, 13.89 (from 1150); 19.91 / 23.33 | 0.57, 0.53; 0.64 / 0.71 | | 16.2, 14.4; 20.6 / 24.0 |
+| reduced, planes, 8 threads (load 6–8; again at 4.8–5.2) | 7.40, 7.43 (from 1150); 9.03 / 8.96 | 0.58, 0.57; 0.67 / 0.64 | 1.50, 1.61; 2.00 / 1.95 | 9.5, 9.6; 11.7 / 11.6 |
+| full size, 4 threads (load 7.7; again at 5.8–6.0) | 27.33; 28.25 / 26.80 | 0.55; 0.56 / 0.58 | | 27.9; 28.8 / 27.4 |
+| reduced, planes, 4 threads (load 7.3; again at 5.4–6.3) | 12.21; 12.83 / 11.79 | 0.57; 0.61 / 0.57 | 2.75; 2.94 / 2.67 | **15.5; 16.4 / 15.0** (vImage 31.8; 32.8 / 31.6, BGRA 19.9; 20.0 / 18.9) |
+
+- The Mac never got below load 3.5 while these ran (other work), and the full-size 8-thread runs
+  vary 14–24 ms from run to run; the best-of-5 runs below are the steadier figures.
+- A reduced frame now costs about 60 % of a full-size one at any thread count, where it cost
+  190 %. The upscale is 1.2–1.3 ms on 14 threads and 2.7 on 4; the aim was 3.
+- Without the encoder in the process (`examples/own_decode --upscale`, best of 5 runs a frame;
+  conversion not included; load 4–5): full size 12.43 / 13.97 / 25.56 ms on 14 / 8 / 4 threads,
+  reduced 6.23 + 1.13, 6.80 + 1.42, 11.13 + 2.58.
+- The upscaler alone (`cargo test --release -- --ignored bench_upscale`, Lanczos-5, 5K planes):
+  1.12 / 1.44 / 2.73 / 9.67 ms on 14 / 8 / 4 / 1 threads; BGRA 2.66 / 3.36 / 6.47 / 24.85.
+- 1470×956 from 734×478 (the table across, twice the size down): 0.29 ms planes, 0.51 BGRA.
+- 14 cores of an M4 Pro aren't an M1's 8 or an iPad's 6: the 4-thread rows are the closer
+  proxy, and the ratio holds there.
+
+**x86_64, under Rosetta** (this Mac; no Intel Mac to hand, so a proxy):
+- `own_decode`: full size 78.8 / 108.7 / 185.2 ms on 14 / 8 / 4 threads, reduced 34.4 + 3.7,
+  44.8 + 5.2, 76.7 + 9.7.
+- vImage's full-size conversion is 1.15 ms, so a reduced frame is about half a full-size one
+  there too.
+- The upscaler alone, Lanczos-5 5K planes: 6.3 / 5.0 / 9.5 / 36.7 ms on 14 / 8 / 4 / 1 threads,
+  about 4× native. Rosetta's translation of `pmulhrsw` and `phaddw` is the likely cost.
+- The decoder's own output stage is 63 of its 79 ms under Rosetta, against 4.7 of 12.4 native,
+  so Rosetta flatters neither side. No architecture gate:
+  `OwnAV1RegionDecoder.showsReducedFramesCheaply` is true on both, and the seam is there should
+  a real Intel measurement say otherwise.
+
+**Rejected:**
+- vImage on the Viewer (arm64, best of 5, load 9–14: the Mac was busy):
+  - HQ BGRA scaling 19.0 ms; without HQ (Lanczos-3) 12.9.
+  - Planar8 scaling of Y, U and V 10.5 ms HQ, 7.8 without, before a 0.4 ms conversion.
+  - (Under Rosetta vImage's scaling is twice as fast as native: HQ 8.7, Planar8 5.1.)
+- The BGRA path: twice the scaling time, and farther from a full-size frame's colours (above).
+- Lanczos-3 and -4: 0.35 / 0.2 ms less a 5K frame on 14 threads, but under vImage's HQ on text.
+- On the way:
+  - 6-bit vertical weights (u8 × weight in i16): RMSE 1.25 against the filter in f64 on noise.
+    Q15 on samples ×64, then ×32 (Lanczos-5's lobes reach 36.5K at a ratio a little over 2, past
+    i16), give RMSE ≤ 0.35.
+  - A weight of exactly 1 (32768) wraps in i16: capped at 32767, the unit to its neighbour.
+  - One upscaler alternating Y's and chroma's sizes rebuilt its tables each call: 2.4 ms against
+    0.6; it now keeps 8 sizes.
+  - The table's path (ratios other than 2) all scalar at first: 20 ms at 5K; now SIMD, an
+    8-lane dot product (planes) or 4 lanes a pixel (BGRA), 3 ms.
 
 ### Video at 60 fps, live: why full size shows 44 frames a second when the encoder does 60 (2026-11-20)
 
