@@ -384,6 +384,40 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Video at 60 fps, live: the day's work on a quiet Mac (2026-11-20)
+
+The re-run the day's entries asked for. `glassact-bench pace` plays 180 frames of a trace in
+real time at 60 fps into the region encoder, as the Host's engine submits them: 3 waiting,
+newest wins. All at 5K. Two rounds, the second in reverse order. Spotlight had settled first:
+load 1.8–2.3 before the first run, and 2–9 during them, which includes the bench's own threads.
+
+- **before:** the 11-19 build with #132's trace fix, before the small shapes in runs (#133).
+- **main:** #133–#136 (b501cae).
+- **main, reduced:** the same, for a Viewer that offers `videoReducedFrames` (`pace --reduced`).
+- **HEVC:** VideoToolbox at 3 waiting.
+
+| frames shown a second (runs) · p50 ms · KB a frame | before | main | main, reduced | HEVC |
+|---|---|---|---|---|
+| video, from frame 220 | 42.0 (41.0, 43.0) · 51.6 · 179 | 43.8 (42.3, 45.3) · 49.9 · 174 | **56.6** (57.0, 56.3) · 35.0 · 161 | 50.9 (58.7, 43.0) · 43.1 · 162 |
+| video, from frame 1150 | 43.1 (41.3, 45.0) · 52.2 · 173 | 45.5 (40.7, 50.3) · 47.2 · 170 | **54.8** (53.3, 56.3) · 37.9 · 158 | 51.6 (58.3, 45.0) · 43.4 · 156 |
+| movie | 56.9 · 36.4 · 45.5 | 57.0 · 36.7 · 45.2 | 56.9 · 37.0 · 45.2 | 49.0 · 46.8 · 132 |
+| maps | 57.2 · 33.8 · 17.5 | 57.4 · 32.2 · 17.6 | 55.7 (57.7, 53.7) · 34.3 · 17.7 | 47.3 · 45.8 · 51.2 |
+
+- **Video at full size gains little live:** 42–43 → 44–46 frames a second. Back to back
+  (`av1seq`) the same builds' throughput rose much more (#133, #136), so on the live path
+  something besides the GPU analysis bounds it. Its rate controller sits at the qindex ceiling
+  (168) on 125 of 126 inter frames: the full-size stream can't meet its byte budget. The
+  engine's tick (conversion and the change map, on the CPU beside the closed loop) is 5–12 ms.
+  That gap is the next thing to measure.
+- **Reduced frames carry video to 55–57 frames a second,** at 35–38 ms p50 and about 7 % fewer
+  bytes. Each video run went to half size once and stayed (153–163 of 160–171 pictures).
+- **HEVC** varies between runs (43–59 on the same video). On movie and maps it shows 47–49 frames
+  a second at about three times the bytes.
+- **Movie and maps never went to half size,** as the gate intends. Maps' second reduced run
+  (53.7, p95 59 ms) is the one slow run; the first matched `main` (57.7). The gate's cost there
+  (a luma error read on mostly-new pictures and a round trip every 30) is small, so this is
+  likely noise. Not re-run.
+
 ### Metal AV1: the motion search seeded with the picture before's (2026-11-20)
 
 On the owner's 60 fps video at 5K, q36, the motion search was 5.4 ms of a ~19 ms GPU analysis a
