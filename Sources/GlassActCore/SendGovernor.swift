@@ -29,7 +29,8 @@ public enum RateLimit: Equatable, Sendable {
 ///  - grows ×1.25 while the governor is actually limiting (tiles deferred)
 ///    and the path shows no queue (< 20 ms over its baseline);
 ///  - drops to 0.9 × the measured delivery rate once a queue builds
-///    (> 60 ms) — the bottleneck's own rate is what it just delivered;
+///    (> 60 ms) — the bottleneck's own rate is what it just delivered
+///    (below: app-limited, it holds unless it's feeding the queue);
 ///  - halves under a severe queue (> 200 ms) so it drains.
 /// "Queue" is STANDING path delay: the minimum path delay (a confirmed
 /// datagram's ACK time minus its estimated departure from the transport's
@@ -60,8 +61,14 @@ public enum RateLimit: Equatable, Sendable {
 /// would sit 4× above a 2 Mbps link.
 /// Delivery rate only bounds the rate when the governor was limiting: an
 /// app-limited sender's delivery rate is just what it sent (draining to it
-/// would spiral the rate to the floor); otherwise a building queue backs
-/// off gently (×0.9).
+/// would spiral the rate to the floor). So it's measured only over the
+/// governor's limited stretch, the last second at most
+/// (`limitedDeliveryRate`), never over a ring of samples that can span
+/// minutes of a quiet screen (#143). App-limited, a building queue backs
+/// off gently (×0.9) only while the host delivered at least half the rate
+/// in the last second; under that the queue isn't ours and the rate holds.
+/// The tester's jittery LAN (#143) cut per reading and sat at 0.0–0.2 MB/s
+/// for minutes.
 ///
 /// Stored inline in `HostEngine` and confined to its encode queue.
 struct SendGovernor {
@@ -133,6 +140,8 @@ struct SendGovernor {
     /// Standing-queue window: the queue estimate is the path-delay minimum
     /// over this window and the previous one.
     static let recentWindowUS: UInt64 = 200_000
+    /// `limitedDeliveryRate` reads at most this much of the limited stretch.
+    static let deliveryWindowUS: UInt64 = 1_000_000
 
     /// Spendable bytes; may go negative (bounded debt) after an overshoot.
     private(set) var tokens = Int(Double(SendGovernor.initialAutoRate) * SendGovernor.bucketSeconds)
@@ -173,6 +182,9 @@ struct SendGovernor {
     private var lastGrowthUS: UInt64 = 0
     private var lastDecreaseUS: UInt64 = 0
     private(set) var lossCuts = 0
+    /// Delay-based decreases (telemetry): a building queue, a severe one.
+    private(set) var queueCuts = 0
+    private(set) var severeCuts = 0
     private var recentMinUS = UInt64.max
     private var previousRecentMinUS = UInt64.max
     private var recentWindowStartUS: UInt64 = 0
@@ -185,9 +197,15 @@ struct SendGovernor {
     private(set) var encodeDuty: Double?
     private var lastAdaptUS: UInt64 = 0
     private var deliveredBytes = 0
-    private var deliveryRing = [(timeUS: UInt64, bytes: Int)](repeating: (0, 0), count: 16)
+    /// ≥ 20 ms apart, so 64 hold at least the last 1.3 s.
+    private var deliveryRing = [(timeUS: UInt64, bytes: Int)](repeating: (0, 0), count: 64)
     private var deliveryHead = 0
     private var deliveryCount = 0
+    /// The decision before the governor became the limit (a tick deferred
+    /// tiles at every decision since); 0 while it isn't.
+    private var limitedSinceUS: UInt64 = 0
+    /// Building-queue readings held as not ours (telemetry).
+    private(set) var queueHolds = 0
 
     /// Per-tile admission charge for this tick.
     var admissionEstimate: Int { max(256, Int(tileEstimate)) }
@@ -269,14 +287,45 @@ struct SendGovernor {
         deliveryCount += 1
     }
 
-    /// Confirmed bytes/s over the recent window (≥ 100 ms of samples).
-    var deliveryRate: Int? {
+    /// Confirmed bytes/s over the samples kept (≥ 100 ms of them), however
+    /// old: telemetry. The rate decisions use `limitedDeliveryRate`.
+    var deliveryRate: Int? { deliveryRate(sinceUS: 0) }
+
+    /// Confirmed bytes/s since the governor became the limit, over at most
+    /// the last `deliveryWindowUS` (≥ 100 ms of samples); nil while it isn't
+    /// the limit. Only then is delivery a reading of the link: an
+    /// app-limited sender's delivery is just what it chose to send, and the
+    /// ring's samples can span minutes of a quiet screen. A burst after
+    /// one measured 0.9 × that and took the rate to its floor (#143).
+    func limitedDeliveryRate(nowUS: UInt64) -> Int? {
+        guard limitedSinceUS != 0 else { return nil }
+        return deliveryRate(sinceUS: max(limitedSinceUS, nowUS > Self.deliveryWindowUS ? nowUS - Self.deliveryWindowUS : 0))
+    }
+
+    private func deliveryRate(sinceUS: UInt64) -> Int? {
         guard deliveryCount >= 2 else { return nil }
-        let oldest = deliveryRing[deliveryHead]
         let newest = deliveryRing[(deliveryHead + deliveryCount - 1) % deliveryRing.count]
-        let span = newest.timeUS &- oldest.timeUS
-        guard span >= 100_000 else { return nil }
-        return Int(UInt64(newest.bytes - oldest.bytes) &* 1_000_000 / span)
+        for i in 0..<(deliveryCount - 1) {
+            let oldest = deliveryRing[(deliveryHead + i) % deliveryRing.count]
+            guard oldest.timeUS >= sinceUS else { continue }
+            let span = newest.timeUS &- oldest.timeUS
+            guard span >= 100_000 else { return nil }
+            return Int(UInt64(newest.bytes - oldest.bytes) &* 1_000_000 / span)
+        }
+        return nil
+    }
+
+    /// Bytes confirmed in about the last second: from the newest sample a
+    /// second old, else the oldest kept.
+    func deliveredInLastSecond(nowUS: UInt64) -> Int {
+        guard deliveryCount > 0 else { return 0 }
+        var base = deliveryRing[deliveryHead]
+        for i in 1..<max(1, deliveryCount) {
+            let s = deliveryRing[(deliveryHead + i) % deliveryRing.count]
+            guard s.timeUS &+ 1_000_000 <= nowUS else { break }
+            base = s
+        }
+        return deliveredBytes - base.bytes
     }
 
     /// One encode tick took `durationUS` of real time out of a capture
@@ -302,6 +351,13 @@ struct SendGovernor {
         guard pathSampleFresh || overloaded || lossPending,
               nowUS &- lastAdaptUS >= Self.adaptIntervalUS else { return }
         pathSampleFresh = false
+        // The limited stretch: from the decision before the first one with
+        // a deferral behind it, until a decision without.
+        if !deferredSinceAdapt {
+            limitedSinceUS = 0
+        } else if limitedSinceUS == 0 {
+            limitedSinceUS = max(lastAdaptUS, 1)
+        }
         lastAdaptUS = nowUS
         if lossPending {
             lossPending = false
@@ -331,24 +387,45 @@ struct SendGovernor {
         if queue > Self.queueSevereUS {
             if !decreaseHeld {
                 // Halve, or straight to what the link just delivered if
-                // that's lower (late ACKs keep it honest under a deep queue).
+                // that's lower (late ACKs keep it honest under a deep queue)
+                // — a reading only while the governor is the limit.
                 var next = autoRate / 2
-                if let delivered = deliveryRate, delivered > 0 {
+                if let delivered = limitedDeliveryRate(nowUS: nowUS), delivered > 0 {
                     next = min(next, Int(Double(delivered) * Self.drainFactor))
                 }
                 autoRate = next
                 lastDecreaseUS = nowUS
                 slowStart = false
+                severeCuts += 1
             }
         } else if queue > Self.queueBuildingUS {
             if !decreaseHeld {
-                if deferredSinceAdapt, let delivered = deliveryRate {
-                    autoRate = min(autoRate, Int(Double(delivered) * Self.drainFactor))
-                } else {
-                    autoRate = Int(Double(autoRate) * Self.drainFactor)
-                }
-                lastDecreaseUS = nowUS
                 slowStart = false
+                if deferredSinceAdapt {
+                    if let delivered = limitedDeliveryRate(nowUS: nowUS) {
+                        autoRate = min(autoRate, Int(Double(delivered) * Self.drainFactor))
+                    } else {
+                        autoRate = Int(Double(autoRate) * Self.drainFactor)
+                    }
+                    lastDecreaseUS = nowUS
+                    queueCuts += 1
+                } else if deliveredInLastSecond(nowUS: nowUS) * 2 >= autoRate {
+                    // App-limited, but sending enough to fill the path.
+                    autoRate = Int(Double(autoRate) * Self.drainFactor)
+                    lastDecreaseUS = nowUS
+                    queueCuts += 1
+                } else {
+                    // A queue we aren't feeding isn't ours to drain: under
+                    // half the rate delivered in the last second, cutting a
+                    // rate we don't use only lowers the next burst's budget,
+                    // and on a jittery path (Wi-Fi power save: an idle
+                    // path's latency swings 15–130 ms) growth rarely sees the
+                    // clean < 20 ms it needs to win it back. Cut per reading,
+                    // a quiet screen walked the rate to its floor in minutes
+                    // and a menu then went out over many ticks, torn (#143).
+                    // A queue our bursts do build is severe soon enough.
+                    queueHolds += 1
+                }
             }
         } else if queue < Self.queueHealthyUS && deferredSinceAdapt && encodeHeadroom && !decreaseHeld
                     && (lastLossEventUS == 0 || nowUS &- lastLossEventUS >= Self.growthQuietAfterLossUS)

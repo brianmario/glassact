@@ -948,7 +948,20 @@ paint. They blit without advancing `tileSeq` and are never ACKed.
     recent windows expires the old clean sample. The baseline still ages
     so a route change can be learned.
   - A standing queue > 60 ms backs off to 0.9 × the measured delivery rate;
-    > 200 ms halves the rate.
+    > 200 ms halves the rate, or drops to 0.9 × delivery if that's lower.
+    Delivery is a reading of the link only while the governor is the limit,
+    so it's measured over the current limited stretch (decisions with
+    tiles deferred since the last), its last second at most. An
+    app-limited sender's delivery is what it chose to send, and over a
+    quiet screen the old 16-sample window spanned minutes of it.
+  - App-limited (nothing deferred), a queue > 60 ms backs off ×0.9 only
+    while the tiles delivered in the last second are at least half the
+    rate; under that the queue isn't ours to drain and the rate holds (as
+    `notOurs` does for video). On a jittery path, such as Wi-Fi power save
+    where an idle path's latency swings 15–130 ms, cutting per reading
+    walked a quiet screen's rate to the floor, which growth (limiting,
+    < 20 ms) rarely wins back. A menu then went out over many ticks,
+    torn (#143). A queue our own bursts build still shows as severe.
   - A large batch that times out mostly unconfirmed halves the rate and holds
     for 1 s.
   - Encode duty caps growth: none above 50 %, and ×0.85 above 75 %.
@@ -980,10 +993,15 @@ ACK-bitmap loss:
   `deliveryReports`, `LinkEstimate` turns the viewer's RECEIVED reports into
   a delivered rate (each over ≥ 1 s of the viewer's clock, since bytes land
   in bursts). The capacity is the most delivered over the last 60 s in a
-  span queued (SRTT − min RTT ≥ 30 ms) at both ends: only then is the
-  bottleneck busy. A
-  span with room reads the sender's own rate back, and a ceiling built on
-  it would ratchet down by 0.9 a minute. The video rate and the startup cap
+  span queued at both ends: only then is the bottleneck busy. Queued means
+  SRTT − min RTT ≥ 30 ms and the host limited (`hostLimited`: within the
+  last second the tile governor deferred, a tick waited on the pacer, the
+  video gate skipped a frame, or video waited in the transport; not a
+  tick waiting on two open batches, which is latency), with no break in
+  the limited stretch since the span's start. A span with room reads the sender's own rate back, and a ceiling
+  built on it would ratchet down by 0.9 a minute. The path's delay alone
+  isn't enough: on Wi-Fi in power save an idle path reads as queued, and a
+  span reaching back across a pause reads close to nothing (#144). The video rate and the startup cap
   stay ≤ 0.9 × capacity. With no queued span, or no reports (an older
   viewer), there's no ceiling.
 
@@ -1004,6 +1022,10 @@ capture (`ScalePressure`) after any of:
   thin link). The video rule needs a window in which video stayed
   backlogged, and a send gate that skips frames keeps it from backing up:
   in an airport lounge at ~0.3 Mbit/s neither older rule fired.
+- The link-capacity rule counts no app-limited second (the capacity needs
+  the host limited, above), and the video rule none by construction. No
+  rule counts a paused second: while the viewer is paused (§4.10) the rung
+  isn't evaluated, and a pause or a resume starts every rule over (#144).
 
 **Back up the rung:** the app arms the halved capture's engine with the full
 capture's pixel count (`armScaleRecovery`), and `onLinkRoomForFullResolution`
@@ -1079,6 +1101,10 @@ visible again.
   viewer's re-ACKs, cursor and clipboard.
 - An active video region is kept, not dissolved, and its quiet timer
   doesn't run, so resuming is a plain continuation with no settle repaint.
+- The resolution rung (§4.9) isn't evaluated while paused, and a pause or a
+  resume starts its rules over; recovery's count holds. Nothing sent means
+  nothing measured: a streak held through minutes of pause completed
+  three seconds after the resume and halved a LAN session's capture (#144).
 - The Host app drops capture to 1 fps while paused; the viewer releases its
   App Nap exemption.
 
@@ -1216,6 +1242,13 @@ fixed seed.
   queueing shows in a modeled `transportRTT`. The video stream's
   congestion window is the whole buffer, the worst case for standing queue
   (`InProcLink.Bottleneck`).
+- Optional **Wi-Fi power save** on the viewer's downlink models a jittery
+  path with no bottleneck: once nothing has reached the viewer for a while
+  (50 ms by default), the next packet waits a random 10–120 ms (say) for
+  its radio to wake, and what arrives meanwhile goes with it. An idle
+  path's delay swings and a busy one stays fast; the modeled
+  `transportRTT` sees the waits. It draws from its own seeded stream, so
+  the other faults' sequences don't change (`FaultConfig.powerSaveWakeMinUS`).
 
 ---
 
@@ -1240,6 +1273,9 @@ the same inputs give the same outputs.
   `--link-mbit` and `--link-buffer-ms` put everything the host sends through
   one bottleneck (§6), and the summary adds bytes by kind, the queueing
   delay, and how long each still screen took to become exact.
+  `--power-save lo-hi` adds Wi-Fi power save (§6), `--pause-at`/`--pause-s`
+  pause the viewer for a stretch, and `--repeat n` plays the trace n times
+  as one session; the summary gives the tile governor's rate and its cuts.
 - `synth`: synthetic traces.
 - `glassact-bench help` lists the rest.
 

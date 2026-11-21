@@ -8,7 +8,8 @@ import GlassActCodec
 private let loopOnlyFlags = ["drop", "dup", "reorder", "latency", "seed", "video", "golden", "av1-vbr", "av1-target-pct", "no-fresh-queue", "no-link-reports", "av1-qmax", "max-qp", "settle-s", "min-encoder-cap", "prefer-smoothness", "no-codec-upgrade",
                              "link-mbit", "link-buffer-ms", "hybrid-q", "hybrid-colour", "hybrid-key-ms", "hybrid-key-link-ms", "hybrid-min-qindex", "hybrid-fast-cdef", "frames", "score-every",
                              "fault-decode", "fault-reset", "fault-dissolve", "check-pictures",
-                             "no-check-pictures", "fault-reset-untold", "decoder", "chroma", "score-rgb-every"]
+                             "no-check-pictures", "fault-reset-untold", "decoder", "chroma", "score-rgb-every",
+                             "power-save", "power-save-idle-ms", "pause-at", "pause-s", "repeat"]
 
 let replayCommand = Command(
     name: "replay",
@@ -23,6 +24,11 @@ let replayCommand = Command(
         .int("seed", "<n>", 0...Int.max, "loop: fault RNG seed (default 1)"),
         .int("link-mbit", "<n>", 1...10_000, "loop: a thin link — everything the host sends shares one n Mbit/s bottleneck (default none)"),
         .int("link-buffer-ms", "<n>", 1...60_000, "loop: the bottleneck's buffer, as time at its rate (default 2000, airline Wi-Fi depth)"),
+        .span("power-save", "<lo-hi>", "loop: Wi-Fi power save on the Viewer's downlink — after --power-save-idle-ms with nothing arriving, the next packet waits lo-hi ms for the radio to wake (a jittery path with no bottleneck; the modeled RTT sees it)"),
+        .int("power-save-idle-ms", "<n>", 1...10_000, "loop, --power-save: how long the radio stays awake after a packet (default 50)"),
+        .int("pause-at", "<s>", 0...86_400, "loop: the Viewer's window hides at this second of the trace (PAUSE_HINT, §4.10), for --pause-s, then shows again"),
+        .int("pause-s", "<n>", 1...86_400, "loop, --pause-at: how long the Viewer stays paused, virtual seconds (default 120)"),
+        .int("repeat", "<n>", 1...100, "loop: play the trace n times over, end to end, as one longer session (default 1)"),
         .choice("video", ["mock", "vt", "av1", "hybrid", "av1-hevc", "hybrid-hevc"], "loop: video codec — pinned full-screen video, as the Host app runs it (default none; hybrid: the Metal/CPU hybrid AV1 encoder in libaom's place, research; hybrid-hevc: the shipping pair, Glass Act's AV1 with HEVC on a thin link)"),
         .int("hybrid-q", "<0-63>", 0...63, "loop experiment, --video hybrid: every frame at this quantizer (libaom's scale; qindex 4q), no rate control"),
         .string("hybrid-colour", "<c>", "loop experiment, --video hybrid: the BGRA → 4:2:0 conversion (bt709Full, the default: how VideoToolbox shows the encoder's streams; bt601Full, as its header says; bt601Video; bt709Video, libaom's)"),

@@ -331,6 +331,10 @@ the numbers and the reasoning.
 | RTT-aware tile start, smaller minimum burst, feedback-paced growth | kept | 2 Mbit/s, 175 ms RTT rig: first-round queue 1,986 → 529 ms, drops 27 → 0; LAN golden unchanged | [entry](#tile-governor-high-rtt-start-and-feedback-cadence-2026-10-22) |
 | Pin the tile delay baseline while congested | rejected | full replay queue p95 still 1,999 ms; a 175 → 700 ms route change stays a false 525 ms queue | [entry](#tile-governor-high-rtt-start-and-feedback-cadence-2026-10-22) |
 | Fresh tiles before owed tiles | kept | keystrokes no longer queue behind a dissolve repaint (live spikes were 0.6–1.8 s) | [entry](#fresh-before-owed-admission-video-cap-on-an-unmeasured-queue-2026-09-29) |
+| Tile governor: delivery measured over the limited stretch only; app-limited, a queue it isn't feeding holds the rate (#143) | kept | Wi-Fi power-save loop, typing-cc ×4: rate p50 0.33 → 2.00 MB/s (end 0.062 → 2.00); ide: deferred tiles 9,336 → 1,006 (1,309 with no power save), ×4 53,803 → 27,142; thin-link rig unchanged (224 KB/s on 250) | [entry](#a-jittery-lan-the-tile-governors-ratchet-and-the-rungs-false-scale-down-143-144-2026-11-20) |
+| Resolution rung: capacity only from spans the host was limited throughout; paused seconds not evaluated, a pause or resume restarts the rules (#144) | kept | power-save loop: typing-cc fired at 16.1 s (paused or not), ide at 16.1 s → never; 1 Mbit true positives unchanged (cursor-drag 7.2, scroll-win 8.2, photos 7.2 s) | [entry](#a-jittery-lan-the-tile-governors-ratchet-and-the-rungs-false-scale-down-143-144-2026-11-20) |
+| Rung counts only seconds with a new link reading | rejected | the same fixes cover #144; on the 1 Mbit cursor-drag true positive it fired 7.2 → 9.2 s (the rig's reports come in bursts) | [entry](#a-jittery-lan-the-tile-governors-ratchet-and-the-rungs-false-scale-down-143-144-2026-11-20) |
+| No span across a gap of > 1 s between the viewer's reports | rejected | the 1 Mbit cursor-drag true positive went 7.2 → 17.2 s: on a thin link bytes can land in bursts more than a second apart | [entry](#a-jittery-lan-the-tile-governors-ratchet-and-the-rungs-false-scale-down-143-144-2026-11-20) |
 | Datagram pacing, then adaptive pace | kept | 6 loopback rounds ~28 s → ~11 s with 0 lost | [pacing](#datagram-pacing-burst-loss-at-the-viewers-receive-buffer-2026-09-27), [adaptive](#adaptive-datagram-pacing-2026-09-27), [cold start](#cold-start-phantom-loss-stale-send-stamps--pacer-overflow-2026-09-27) |
 | Video send gate in time at the drain rate | kept | 3 Mbit/s relay: p50 1,900 → 53 ms | [entry](#video-send-gate-time-at-the-drain-rate-not-bytes-2026-09-28) |
 | CUBIC-style video cap recovery | kept | back to 70 % in 2.0 s instead of 9.25 s | [entry](#video-cap-cubic-style-recovery-after-a-hiccup-2026-09-29) |
@@ -385,6 +389,103 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### A jittery LAN: the tile governor's ratchet and the rung's false scale-down (#143, #144) (2026-11-20)
+
+A tester on a LAN with a jittery path (probably Wi-Fi), Host 26.11.3: the tile governor sat at
+0.0–0.2 MB/s for minutes, with 82–920 deferrals a 2 s window and once 14,526, and menus arrived
+torn (#143); three seconds after the Viewer's window came back from minutes hidden, the
+resolution rung halved the capture (#144). srtt 15–134 ms, `path` 9–99 ms, `netq` up to 82 ms,
+no loss.
+
+**The rig.** The loop had neither: its RTT was constant (no jitter in `transportRTT`, none at all
+without a bottleneck), and `--latency lo-hi` is per-datagram noise the governor's short-window
+minimum already rejects. New loop flags (DESIGN §6, §7): `--power-save lo-hi`, Wi-Fi power save on
+the Viewer's downlink (after 50 ms with nothing arriving, the next packet waits lo-hi ms for the
+radio to wake, and what arrives meanwhile goes with it; a busy path stays fast; the modeled RTT
+sees it; its own RNG stream, so existing runs don't move); `--pause-at s --pause-s n`, a Viewer
+pause; `--repeat n`, the trace n times as one session. The summary adds the governor's rate while
+frames played and its cuts by cause, and the rung's reason when it fires. All runs: M4 Pro,
+release `glassact-bench`, `--latency 2-4 --power-save 10-120` (PS below) unless noted, seed 1.
+
+**Root causes, in the code:**
+- **#143, delivery over a quiet screen.** A building queue (> 60 ms) cut ×0.9 per reading while
+  the governor was app-limited, and to 0.9 × the delivery rate when it was the limit. That rate
+  came from a ring of 16 ACK samples with no time bound, so after a quiet stretch it spanned
+  minutes of it and read ~1 KB/s; the severe branch used it without even the limit check. On a
+  power-save path the first ACKs after a quiet gap wait for the radio and, both short windows
+  having expired, are the whole "queue": app-limited readings of 60–110 ms, one cut each.
+- **#144, an idle path read as queued.** `LinkEstimate` called a span queued when SRTT − min RTT
+  ≥ 30 ms at both ends, which a power-save path's idle RTT is; so a typing session's own
+  0.04 Mbit/s became the link's capacity, under the 4 Mbit/s bar. The viewer reports only when
+  bytes arrive, so a span can also reach back across a pause and read ~0. A reading stays in the
+  10 s window and counts every second, and the streak held across the pause: in replay the rung
+  fired 6 s into a pause; live, the pre-pause streak was completed by the resume's first seconds.
+
+**The fix:**
+- Governor: delivery is measured only over its limited stretch (decisions with tiles deferred
+  since the last), the last second at most (`limitedDeliveryRate`), in both branches.
+  App-limited, a building queue cuts ×0.9 only while the last second delivered at least half the
+  rate; under that it holds (`queueHolds`), as `VideoRateController`'s `notOurs` does for video.
+  The severe branch still halves. The delivery ring grows 16 → 64 samples (≥ 1.3 s).
+- Rung: a span is a capacity reading only if the host was limited (tile deferrals, a tick waiting
+  on the pacer, a video gate skip, video waiting in the transport, within the last second) at
+  both ends with no break in between (`hostLimited`, `limitedSinceUS`). A tick waiting on two
+  open batches doesn't count: that's latency, and on power save every ACK can wait for a wake (a
+  first version counted it, and typing-cc paused on PS fired 8.8 s after the resume). The rung
+  isn't evaluated while the Viewer is paused, and a pause or a resume restarts its rules
+  (`ScalePressure.restart`); recovery's count holds while paused.
+
+**#143**, tiles only:
+
+| run | governor min / p10 / p50 (MB/s) | at end | cuts: queue, loss | tiles deferred |
+|---|---|---|---|---|
+| typing-cc ×4, PS | 0.06 / 0.08 / 0.33 → 2.00 / 2.00 / 2.00 | 0.062 → 2.000 | 33, 0 → 0, 0 (38 held) | 0 → 0 |
+| ide, PS | 2.00 / 4.00 / 5.83 → 2.00 / 10.00 / 10.00 | 6.90 → 10.00 | 12, 0 → 0, 0 (19 held) | 9,336 → 1,006 |
+| ide ×4, PS | 1.82 / 2.46 / 5.25 → 2.00 / 5.00 / 10.00 | 5.07 → 7.63 | 38, 1 → 0, 2 (57 held) | 53,803 → 27,142 |
+| ide and ide ×4, no PS (both builds) | 2.00 / 8.00 / 8.00 | 8.00 | 0, 0 | 1,309 |
+
+ide ×4 on PS still defers 20× what it does without: its two loss cuts (batches whose ACKs waited
+for wakes past the timeout) and ticks waiting on two open batches, which are latency, not this
+rate. Time to exact on ide is unchanged (p50 100 ms, max 150 ms, ×1 and ×4; 50 ms steps, and the
+wakes dominate it). The standard golden run (typing-cc, 5 % drop, 1 % dup, 10 % reorder,
+20–80 ms) settles byte-identical with the same bytes; the governor ends at 2.00 MB/s, where it had
+cut twice to 1.62 on that jitter alone.
+
+**#144**, when the rung fired (5K, bar 4 Mbit/s):
+
+| run | before | after |
+|---|---|---|
+| typing-cc, `--video mock`, PS | 16.1 s | never |
+| typing-cc, `--video mock`, PS, paused at 10 s for 120 s | 16.1 s (in the pause) | never |
+| typing-cc and ide, tiles only, PS | 16.1 s | never |
+| typing-cc and ide ×4, tiles only, PS | 16.1 s | never |
+| tabs, `--video mock`, PS, paused | 5.7 s after the resume | 5.7 s after the resume |
+| tabs, `--video vt`, PS, paused | never | never |
+| typing-cc, `--video mock`, paused, no PS | never | never |
+
+The tabs-and-mock row is the mock codec: its frames are megabytes (3.2 GB for 553 frames), the
+video gate cuts its rate to the 0.3 Mbit/s floor on the resume's queue readings, and the host is
+then limited by its own budget, so what arrives reads as a thin link. HEVC on the same run never
+goes below 14 Mbit/s and the rung never fires. A video rate that collapses on a jittery path would
+do the same live; not seen here with a real codec.
+
+**True positives**, unchanged: `--video mock --link-mbit 1 --link-buffer-ms 2000 --latency 75-100`
+(the 2026-10-26 entry's runs) fires at cursor-drag 7.2 s, scroll-win 8.2 s, photos 7.2 s, before
+and after. `GovernorTests.autoFollowsAThinLinkDown` (250 KB/s, 2 s buffer): rate 224,480 →
+224,719 B/s, worst backlog in the last four rounds 318/268/251/184 → 183/184/184/179 ms;
+`autoFollowsAHighLatencyLink` within a round's noise (175 ms RTT, 250 KB/s: worst backlog
+251–663 → 190–529 ms). `ScalePressureTests`' plane and lounge rigs pass unchanged.
+
+**Rejected on the way:**
+- No span across a gap of more than 1 s between reports: the 1 Mbit cursor-drag run went
+  7.2 → 17.2 s, since the rig, like a lossy thin link's head-of-line blocking, lands bytes in
+  bursts more than a second apart. The limited-stretch bound covers the pause instead.
+- Counting only seconds with a new reading: 7.2 → 9.2 s on the same run; with the host-limited
+  readings it isn't needed.
+
+Not done: the issue's optional idea, admitting deferred tiles as whole changed areas instead of by
+the rotor.
 
 ### Bench: `av1seq` codes what the live encoder codes, BT.709 full range (2026-11-21)
 

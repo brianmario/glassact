@@ -98,6 +98,15 @@ public struct HostStats: Sendable {
     public var lossyFirstPaintsSent = 0
     /// The governor's current refill rate (bytes/s) under the rate policy.
     public var governorRate = 0
+    /// The governor's decreases so far, by cause (§4.9): a building queue
+    /// (> 60 ms), a severe one (> 200 ms), a loss event.
+    public var governorQueueCuts = 0
+    public var governorSevereCuts = 0
+    public var governorLossCuts = 0
+    /// Building-queue readings it held as not its own (app-limited, #143).
+    public var governorQueueHolds = 0
+    /// The governor's standing-queue estimate at its last decision (µs).
+    public var governorQueueUS: UInt64 = 0
     /// Encode time as a share of the capture interval (EWMA, %; 0 when the
     /// host doesn't measure it) — Auto's headroom bound.
     public var encodeDutyPercent = 0
@@ -189,6 +198,10 @@ public final class HostEngine: @unchecked Sendable {
     /// measure against (the bench).
     public var requestDeliveryReports = true
     var linkEstimate = LinkEstimate()
+    /// When the host last held back something it had to send, and when the
+    /// stretch of that it's in began (`hostLimited`).
+    var lastLimitedUS: UInt64 = 0
+    var limitedSinceUS: UInt64 = 0
     public var linkDeliveredBytesPerSecond: Int { linkEstimate.deliveredBytesPerSecond(nowUS: lastEncodeNowUS) }
     public var linkCapacityBytesPerSecond: Int { linkEstimate.capacityBytesPerSecond(nowUS: lastEncodeNowUS) }
     public var linkReports: Int { linkEstimate.reports }
@@ -945,6 +958,9 @@ public final class HostEngine: @unchecked Sendable {
             case let .pauseHint(paused):
                 guard paused != contentPaused else { break }
                 contentPaused = paused
+                // The resolution rung starts over either way (§4.9): what
+                // the paused stretch read is no evidence about the link.
+                scalePressure.restart()
                 if !paused && regionActive {
                     // Quiet accumulated while paused must not dissolve the
                     // region the instant we resume.
@@ -987,8 +1003,12 @@ public final class HostEngine: @unchecked Sendable {
                 // The smoothed reading: a PING between bursts reads empty
                 // while the link is full. Its lag after a burst only marks
                 // slow spans, which the max filter passes over.
-                let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
-                linkEstimate.noteReceived(bytes: bytes, viewerTUS: tUS, nowUS: nowUS, queued: queued)
+                // Queued: a standing queue on the path, and the host holding
+                // back what it had to send (§4.9, #144).
+                if transport.videoBacklogBytes > 0 { noteLimited(nowUS: nowUS) }
+                let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS && hostLimited(nowUS: nowUS)
+                linkEstimate.noteReceived(bytes: bytes, viewerTUS: tUS, nowUS: nowUS, queued: queued,
+                                          limitedSinceUS: limitedSinceUS)
             case let .syncRequest(region, generation):
                 noteSyncRequest(region: region, generation: generation)
             case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice, .hostDisplay:
@@ -1148,6 +1168,25 @@ public final class HostEngine: @unchecked Sendable {
         return capacity == 0 ? 0 : max(capacity, linkEstimate.deliveredBytesPerSecond(nowUS: nowUS))
     }
 
+    /// The host had more to send than went (§4.9): within the last
+    /// `limitedHoldUS` the tile governor deferred tiles, a tick waited on
+    /// the pacer, the video gate skipped a frame, or video waited in the
+    /// transport. Otherwise it is app-limited, sending well
+    /// under its budget: what arrives is what it chose to send, whatever the
+    /// path's queue reads, and it says nothing about the link (#144).
+    func hostLimited(nowUS: UInt64) -> Bool {
+        lastLimitedUS != 0 && Self.elapsedUS(nowUS, since: lastLimitedUS) <= Self.limitedHoldUS
+    }
+    static let limitedHoldUS: UInt64 = 1_000_000
+
+    /// The host held something back just now: extends the limited stretch,
+    /// or starts one after a break longer than `limitedHoldUS`.
+    func noteLimited(nowUS: UInt64) {
+        let t = max(nowUS, 1)
+        if !hostLimited(nowUS: t) { limitedSinceUS = t }
+        lastLimitedUS = max(lastLimitedUS, t)
+    }
+
     /// Why the resolution rung last moved, with the numbers behind it, for
     /// the app's log. Set just before `onScalePressureConstrained` or
     /// `onLinkRoomForFullResolution` fires (engine queue).
@@ -1187,7 +1226,8 @@ public final class HostEngine: @unchecked Sendable {
     }
 
     private func evaluateScaleRecovery(nowUS: UInt64) {
-        guard var recovery = scaleRecovery else { return }
+        // (nor is a paused second evidence of room: the count holds)
+        guard var recovery = scaleRecovery, !contentPaused else { return }
         let queued = (videoSmoothedQueueUS ?? 0) >= VideoRateController.queueLowUS
         let capacity = linkEstimate.capacityBytesPerSecond(nowUS: nowUS)
         if recovery.noteSecond(nowUS: nowUS, linkCapacityBytesPerSecond: capacity, queued: queued) {
@@ -1201,6 +1241,9 @@ public final class HostEngine: @unchecked Sendable {
     }
 
     private func evaluateScalePressure(nowUS: UInt64) {
+        // Paused (the viewer can't be seen): the host sends nothing, and
+        // nothing it reads is evidence (#144).
+        guard !contentPaused else { return }
         let evidence = thinLinkEvidence(nowUS: nowUS)
         let pixels = grid.width * grid.height
         guard scalePressure.noteSecond(ackSampleUS: ackDelaySampleUS, ackDelayUS: ackDelayUS,
@@ -1287,7 +1330,12 @@ public final class HostEngine: @unchecked Sendable {
             && transport.queuedDatagramBytes > pace.rate / 1_000_000 * Self.pacerBacklogLimitUS
         guard openBatchCount < 2 && !pacerBacklogged else {
             stats.batchesDropped += 1
-            if pacerBacklogged { stats.pacerBacklogSkips += 1 }
+            if pacerBacklogged {
+                stats.pacerBacklogSkips += 1
+                // (Waiting on two open batches is latency, not the link's
+                // rate: on Wi-Fi power save every ACK can wait for a wake.)
+                noteLimited(nowUS: nowUS)
+            }
             noteSkippedRects(dirtyRects)
             // Video: the path is exempt from record-pipeline saturation —
             // an active region keeps streaming (its frames don't ride
@@ -1388,6 +1436,11 @@ public final class HostEngine: @unchecked Sendable {
                        ceiling: transport.pacesDatagrams ? pace.rate : SendGovernor.maxAutoRate)
         governor.refill(nowUS: nowUS, limit: rateLimit)
         stats.governorRate = governor.rate(rateLimit)
+        stats.governorQueueCuts = governor.queueCuts
+        stats.governorSevereCuts = governor.severeCuts
+        stats.governorLossCuts = governor.lossCuts
+        stats.governorQueueHolds = governor.queueHolds
+        stats.governorQueueUS = governor.queueDelayUS
         stats.encodeDutyPercent = Int((governor.encodeDuty ?? 0) * 100)
         var governorBudget = governor.tokens
         var governorDeferred = 0
@@ -1447,7 +1500,10 @@ public final class HostEngine: @unchecked Sendable {
         }
         }
         governor.rotor = exhaustedAt >= 0 ? exhaustedAt : 0
-        if governorDeferred > 0 { governor.noteDeferred() }
+        if governorDeferred > 0 {
+            governor.noteDeferred()
+            noteLimited(nowUS: nowUS)
+        }
         stats.governorDeferredTiles += governorDeferred
         let qualCount = qualTiles.count
 

@@ -18,14 +18,22 @@
 ///   Wi-Fi the ACK-delay rule alone took 45 s to fire while video drained
 ///   at 0.3–2.3 Mbit/s for a 2900×1572 capture.
 /// - The link's capacity as the viewer reports it (`LinkEstimate`: what
-///   arrived while the path was queued, the last ~10 s) under the same bars
-///   for `thinVideoSeconds` in a row, counting only seconds with a reading.
-///   The video rule's evidence needs a window that stayed backlogged, and a
+///   arrived while the path was queued and the host had more to send, the
+///   last ~10 s) under the same bars for `thinVideoSeconds` in a row,
+///   counting only seconds with a reading. Only a span in which the host
+///   was holding back what it had to send is a reading: on a jittery Wi-Fi
+///   path an idle screen's own rate read as queued (#144). The
+///   video rule's evidence needs a window that stayed backlogged, and a
 ///   send gate that skips frames keeps video from backing up: in an airport
 ///   lounge at ~0.3 Mbit/s it never fired, while the viewer's reports said
 ///   0.3 Mbit/s for a minute. The engine passes the larger of that and what
 ///   the link delivered in the last ~10 s, so a stall right after a fast
 ///   stretch doesn't read as a thin link (`HostEngine.thinLinkEvidence`).
+///
+/// Seconds while the viewer is paused (hidden or covered: PAUSE_HINT,
+/// §4.10) aren't evaluated, and a pause or a resume starts every rule over
+/// (`restart`): a streak held through minutes of pause, then completed by
+/// the resume's first seconds, halved a LAN session's capture (#144).
 ///
 /// Plain value type; latches once fired.
 struct ScalePressure {
@@ -51,6 +59,14 @@ struct ScalePressure {
     private var thinLinkStreakS = 0
     private var prevAckSampleUS: UInt64 = 0
     private var prevVideoMeasurements = 0
+
+    /// A pause or a resume (§4.10): every rule starts over. The readings'
+    /// counters are kept, so only evidence that arrives from here on counts.
+    mutating func restart() {
+        severeStreakS = 0
+        thinVideoStreakS = 0
+        thinLinkStreakS = 0
+    }
 
     /// One second's evidence; true the one time it decides the link is
     /// constrained. `ackSampleUS` changes whenever a new ACK delay was
