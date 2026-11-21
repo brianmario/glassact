@@ -330,14 +330,7 @@ final class CanvasView: NSView {
         layoutContent()
         updateCursorLayer()
         if !frame.captureTimestampsUS.isEmpty {
-            // capture_ts rides the host clock; correct by the PING offset or
-            // cross-machine g2g reads as 0. Stamped at the flip.
-            let nowUS = Int64(bitPattern: MonotonicClock.nowUS)
-            let offset = controller.hostClockOffsetUS
-            controller.recordGlassToGlass(frame.captureTimestampsUS.map {
-                let g2g = nowUS &- (Int64(bitPattern: $0) &+ offset)
-                return g2g > 0 ? UInt64(g2g) : 0
-            })
+            controller.recordGlassToGlass(captureTimestampsUS: frame.captureTimestampsUS, presentedUS: MonotonicClock.nowUS)
         }
     }
 
@@ -398,6 +391,21 @@ final class CanvasView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Keys held on the Host are released when this window stops being key: their releases go to
+    /// whichever app or window has the keyboard then (⌘-Tab away leaves ⌘ held on the Host, and
+    /// every remote click a ⌘-click).
+    private var resignKeyObserver: (any NSObjectProtocol)?
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
+        resignKeyObserver = nil
+        guard let window else { return }
+        resignKeyObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window,
+                                                                   queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.controller.releaseHeldInput() }
+        }
+    }
     override func resetCursorRects() { addCursorRect(bounds, cursor: Self.blankCursor) }
 
     /// View point → canvas pixel, honoring the current mode's mapping.
@@ -421,7 +429,9 @@ final class CanvasView: NSView {
     }
 
     private func sendMouse(_ event: NSEvent, kind: UInt8, button: Int) {
-        guard let (cx, cy) = canvasPoint(event) else { return }
+        // (a release outside the picture still goes, at the last position: dropped, the Host
+        // would keep the button down)
+        guard let (cx, cy) = canvasPoint(event) ?? (kind == 3 ? controller.lastInputPosition : nil) else { return }
         noteLocalCursor(cx, cy)
         // Buttons carry this Mac's click count (its double-click speed and
         // slop decide), so the host posts a real double or triple click.

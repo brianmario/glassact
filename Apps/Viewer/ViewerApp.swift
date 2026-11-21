@@ -1391,6 +1391,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         SessionLog.shared.write("full_screen", "on=1 size=\(Int(window.frame.width))x\(Int(window.frame.height))")
         scheduleVirtualDisplayResize()
         reshapeHostForFullScreen(window)
+        // Scale Down re-fits to the full-screen window (unless the host took the screen's shape)
+        if model.resolution == .scaleToFit, !fullScreenReshaped { scheduleScaleRefit() }
     }
 
     /// Full screen with a picture of another shape: ask the host to take
@@ -1441,7 +1443,11 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         (window.contentView as? CanvasView)?.startPresenting()
         SessionLog.shared.write("full_screen", "on=0")
         scheduleVirtualDisplayResize()
+        // (after a reshape, its restore asks for the session's own geometry; else Scale Down re-fits
+        // to the window it's back in)
+        let reshaped = fullScreenReshaped
         restoreHostShapeAfterFullScreen()
+        if model.resolution == .scaleToFit, !reshaped { scheduleScaleRefit() }
     }
 
     func windowDidFailToEnterFullScreen(_ window: NSWindow) {
@@ -1499,13 +1505,13 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard model.resolution == .scaleToFit, !fullScreenReshaped, !inFullScreenTransition,
               let window = canvasWindow, let size = window.contentView?.bounds.size,
               let screen = window.screen, let controller else { return }
-        // Only when it matters: the window outgrew the picture (it would
-        // upscale) or is far smaller (pixels nobody sees). A small
+        // Only when it matters (`ScaleRefit`): the window outgrew the picture
+        // (it would upscale) or is clearly smaller, either way. A small
         // difference, like the window's first layout, isn't worth a capture
         // rebuild.
-        guard let grid = controller.configuredGrid(), grid.width > 0 else { return }
-        let ratio = size.width * screen.backingScaleFactor / CGFloat(grid.width)
-        guard ratio > 1.02 || ratio < 0.75 else { return }
+        guard let grid = controller.configuredGrid() else { return }
+        let px = (width: Double(size.width * screen.backingScaleFactor), height: Double(size.height * screen.backingScaleFactor))
+        guard ScaleRefit.shouldRefit(window: px, picture: (grid.width, grid.height)) else { return }
         let w = Int(size.width.rounded()), h = Int(size.height.rounded())
         let scale = Int(screen.backingScaleFactor)
         if let g = requestedGeometry, g.mode == GeometryMode.scale, g.w == w, g.h == h, g.scale == scale { return }
