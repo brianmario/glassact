@@ -135,12 +135,7 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
         controller.recordPresent(blitUS: frame.blitUS,
                                  flipDelayUS: flippedUS > frame.completedUptimeUS ? flippedUS - frame.completedUptimeUS : 0)
         if !frame.captureTimestampsUS.isEmpty {
-            let nowUS = Int64(bitPattern: MonotonicClock.nowUS)
-            let offset = controller.hostClockOffsetUS
-            controller.recordGlassToGlass(frame.captureTimestampsUS.map {
-                let g2g = nowUS &- (Int64(bitPattern: $0) &+ offset)
-                return g2g > 0 ? UInt64(g2g) : 0
-            })
+            controller.recordGlassToGlass(captureTimestampsUS: frame.captureTimestampsUS, presentedUS: MonotonicClock.nowUS)
         }
     }
 
