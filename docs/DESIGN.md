@@ -293,6 +293,7 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x1C | RECEIVED | V→H | bytes u64, tUS u64: datagram and video-stream bytes received this session, at the viewer's clock. Sent only to a host advertising `deliveryReports` (§3.8), at most every 250 ms, and only when the count changed (§4.9) |
 | 0x1D | HOST_NOTICE | H→V | code u8 (`HostNotice`: 0 none, 1 the host's session is off the screen). Sent on a change, and at the handshake while one is in force. Viewers ignore codes they don't know |
 | 0x1E | VIEWER_BYE | V→H | reason u8 (`ViewerBye`: 1 its user disconnected or closed the window, 2 its user quit, 3 nothing from the host, redialing, 4 the session failed at the viewer, redialing). The control stream's last message: the viewer then ends the stream and gives the host 1 s to hang up before closing (a quitting Viewer waits that long). Hosts treat codes they don't know as no goodbye |
+| 0x1F | HOST_DISPLAY | H→V | width u16, height u16: the pixel size of the display the host shares, its current mode's. Sent at the handshake and on a change, only to a viewer whose HELLO_OK carries `hostDisplaySize` (§3.8), never in single-window mode. The viewer shows it beside its picture's size where they differ (Scale Down, a halved capture). Display only |
 
 **Cadence:**
 - **ACKs:**
@@ -365,6 +366,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 9 | logUpload | host accepts VIEWER_LOG |
 | 10 | virtualDisplay | geoMode 4 allowed |
 | 11 | agentControl | TEXT_INPUT, AGENT_STATE, UI_TREE*, agent-flagged INPUT |
+| 12 | hostDisplaySize | the viewer shows the shared display's size: a host sends it HOST_DISPLAY (§3.5). Only the viewer's bit matters |
 
 **Enums:**
 - **INPUT kinds** (low 7 bits): 1 move, 2 down / 3 up (a = clicks, b = button),

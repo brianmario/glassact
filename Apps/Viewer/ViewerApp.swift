@@ -1304,13 +1304,20 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
     }
 
+    /// The picture's size, and the host display's beside it where they differ (HOST_DISPLAY: Scale
+    /// Down, a halved capture): "5120 × 2880 shown at 2896 × 1628".
+    private static func sizeText(_ grid: TileGrid, hostDisplay: (width: Int, height: Int)?) -> String {
+        guard let d = hostDisplay, d.width != grid.width || d.height != grid.height else { return "\(grid.width) × \(grid.height)" }
+        return "\(d.width) × \(d.height) shown at \(grid.width) × \(grid.height)"
+    }
+
     private static func sizeSubtitle(_ grid: TileGrid, panMode: Bool) -> String {
         "\(grid.width) × \(grid.height)" + (panMode ? " · move to an edge to pan" : "")
     }
 
     private func refreshSubtitle(grid: TileGrid, sharedWindow: Bool) {
         guard let window = canvasWindow else { return }
-        let base = (agentActive ? "Agent active · " : "") + (sharedWindow ? sessionName : "\(grid.width) × \(grid.height)")
+        let base = (agentActive ? "Agent active · " : "") + (sharedWindow ? sessionName : Self.sizeText(grid, hostDisplay: controller?.hostDisplaySize))
         let g2g = sharedWindow ? nil : controller?.glassToGlassMedianMS().map { String(format: "%.0f ms latency", $0) }
         controller?.bandwidthSummary { [weak window] bw in
             window?.subtitle = ([base] + [bw, g2g].compactMap { $0 }).joined(separator: " · ")
