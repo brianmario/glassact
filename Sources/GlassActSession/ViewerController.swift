@@ -211,8 +211,23 @@ public final class ViewerController: @unchecked Sendable {
     /// at this viewer touching the session — an attached agent yields.
     public func sendInput(kind: UInt8, x: Int, y: Int, a: Int, b: Int) {
         agentDriver?.noteHumanInput()
+        held.sent(kind: kind, x: x, y: y, b: b)
         session.sendInput(kind: kind, x: x, y: y, a: a, b: b)
     }
+
+    /// Main thread: what this Viewer's person has pressed on the Host and not released (`HeldInput`).
+    public private(set) var held = HeldInput()
+
+    /// Main thread: release every key and button this Viewer holds on the Host. The app calls it as
+    /// its canvas stops taking input (its window resigns key: another app or window has the
+    /// keyboard, and would get the releases).
+    public func releaseHeldInput() {
+        for e in held.releaseAll() { session.sendInput(kind: e.kind, x: e.x, y: e.y, a: e.a, b: e.b) }
+    }
+
+    /// Main thread: a mouse button's release where the pointer has left the picture: at the last
+    /// position sent, so the Host doesn't keep the button down (nil: none sent yet).
+    public var lastInputPosition: (x: Int, y: Int)? { held.position }
     /// An agent using this session (Settings › Agents), if any. It sends
     /// through `session` directly, so its input never counts as the person's.
     public var agentDriver: AgentDriver?
