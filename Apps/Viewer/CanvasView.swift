@@ -330,14 +330,7 @@ final class CanvasView: NSView {
         layoutContent()
         updateCursorLayer()
         if !frame.captureTimestampsUS.isEmpty {
-            // capture_ts rides the host clock; correct by the PING offset or
-            // cross-machine g2g reads as 0. Stamped at the flip.
-            let nowUS = Int64(bitPattern: MonotonicClock.nowUS)
-            let offset = controller.hostClockOffsetUS
-            controller.recordGlassToGlass(frame.captureTimestampsUS.map {
-                let g2g = nowUS &- (Int64(bitPattern: $0) &+ offset)
-                return g2g > 0 ? UInt64(g2g) : 0
-            })
+            controller.recordGlassToGlass(captureTimestampsUS: frame.captureTimestampsUS, presentedUS: MonotonicClock.nowUS)
         }
     }
 
