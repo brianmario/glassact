@@ -396,8 +396,9 @@ and whether other sizes do better than ½. Bytes and quality only (they don't de
   from 1150, `--width <coded> --stream-width 5120 --tiles 3x0 --inter --score-rgb
   --ssimulacra2-every 6`, at q20, 28, 36 and 44. Scored at 5120, as VideoToolbox shows them.
 - **Sizes:** 5120 (full), 3840 (¾), 2560 (½), 1920 (1080p, ~⅜), 1728 (~⅓) and 1280 (¼).
-- The bench from #139's branch (8a23bc3). `av1seq` codes video range, so these bytes are ~16 % under the live
-  encoder's (the "why full size shows 44" entry); the comparison between sizes stands.
+- The bench from #139's branch (8a23bc3). `av1seq` still coded video range then (`--colour
+  video` since the full-range entry below), so these bytes are ~16 % under the live encoder's;
+  the comparison between sizes stands.
 
 **The round trip's own loss** (q2, 13 frames from 220, RGB PSNR at 5120): ¾ 47.9 dB, ½ 45.3,
 1080p 41.2, ~⅓ 39.2, ¼ 33.4. Content scaled up from a lower resolution would lose almost nothing
