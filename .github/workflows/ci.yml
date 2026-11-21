@@ -38,8 +38,6 @@ jobs:
         # The AV1 CPU code is Rust (rust/av1); the package links its static
         # library, arm64 + x86_64.
         run: scripts/build-rust --universal
-      - name: Rust tests
-        run: cargo test --release --manifest-path rust/av1/Cargo.toml
       - name: Build
         # Release: the engine's session simulations (a virtual network for
         # many simulated seconds: bandwidth adaptation, handoffs, faults) run
@@ -143,19 +141,16 @@ jobs:
           -configuration Release -destination 'generic/platform=macOS'
           CODE_SIGNING_ALLOWED=NO build
 
-  allocations:
-    name: Allocations
-    # The no-allocation hot-path tests (INV-7) assert their counts only in
-    # optimized code: in a debug build the stdlib's own hashing allocates
-    # per row and buries the engine's numbers. So they get a release build
-    # of their own (`just test-alloc`).
+  rust:
+    name: Rust
+    # The Rust AV1 crate's tests (rust/av1), on a runner of their own beside
+    # the Tests job: in it they took 3–5 minutes on the critical path. This
+    # job replaced "Allocations" (2026-11-21): its allocation-count tests
+    # (INV-7, counts asserted only in optimized code) now run in the Tests
+    # job's release build.
     runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Rust
-        # The AV1 CPU code is Rust (rust/av1); the package links its static
-        # library, arm64 + x86_64.
-        run: scripts/build-rust --universal
-      - name: Allocation-count tests (release)
-        run: swift test -c release --filter ScrollAllocationTests
+      - name: Rust tests
+        run: cargo test --release --manifest-path rust/av1/Cargo.toml

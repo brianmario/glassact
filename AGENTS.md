@@ -54,9 +54,10 @@ retransmission.
 
 ## Rules
 
-- **Changes land through pull requests.** `main` is protected: CI (tests,
-  the release allocation-count tests, both app builds and the Intel build)
-  must pass, and the branch must be up to date with `main`.
+- **Changes land through pull requests.** `main` is protected: CI (the
+  tests in a release build, which assert the allocation counts too; the Rust
+  crate's tests; both app builds and the Intel build) must pass, and the
+  branch must be up to date with `main`.
 - **Invariants are frozen** (DESIGN §1). Each keeps an `INV_*` test, and a
   failing one blocks the change. Don't weaken an invariant to make something
   work; ask instead.
