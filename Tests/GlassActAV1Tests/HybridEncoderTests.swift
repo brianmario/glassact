@@ -3,7 +3,7 @@ import Foundation
 import GlassActAV1
 import GlassActTestSupport
 import Metal
-import Synchronization
+import GlassActSync
 import Testing
 import libaom
 

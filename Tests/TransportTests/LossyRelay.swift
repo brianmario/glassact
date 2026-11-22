@@ -1,6 +1,6 @@
 import Foundation
 import Network
-import Synchronization
+import GlassActSync
 
 /// A user-space UDP relay for QUIC tests: forwards every packet between a
 /// client and a target port on loopback, dropping a seeded fraction and

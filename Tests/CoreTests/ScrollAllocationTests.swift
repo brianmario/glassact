@@ -1,5 +1,5 @@
 import Foundation
-import Synchronization
+import GlassActSync
 import Testing
 import GlassActWire
 @testable import GlassActCore

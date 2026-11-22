@@ -1,6 +1,6 @@
 import Foundation
 import Security
-import Synchronization
+import GlassActSync
 import Testing
 import GlassActTestSupport
 @testable import GlassActTransport
@@ -180,6 +180,8 @@ import GlassActTestSupport
     /// In-process generation (no openssl): the container imports memory-only
     /// as an identity whose key is P-256 and whose certificate is valid for
     /// ~10 years. (Import itself proves the PKCS#12 MAC and PBES2 layers.)
+    /// macOS 15+: the file identity needs memory-only import.
+    @available(macOS 15, *)
     @Test func generatedIdentityIsP256() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("glassact-p256-\(UInt64.random(in: 0...UInt64.max))")

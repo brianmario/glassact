@@ -3,7 +3,7 @@ import Foundation
 import GlassActCore
 import GlassActTransport
 public import GlassActWire
-import Synchronization
+import GlassActSync
 
 /// An agent's hands and eyes on one viewer session: screenshots, mouse,
 /// keyboard, clipboard, windows and the accessibility tree, in the action

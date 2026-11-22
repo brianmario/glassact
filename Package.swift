@@ -19,7 +19,7 @@ let strictLibrary: [SwiftSetting] = strict + [
 
 let package = Package(
     name: "glassact",
-    platforms: [.macOS("15.5"), .iOS("27")],
+    platforms: [.macOS("14.4"), .iOS("27")],
     products: [
         // The Mac apps': the Host's AV1 encoder (GlassActHybridVideo) and the Viewer's AV1
         // decoder (GlassActAV1Decode) link the Rust library (scripts/build-rust, which the apps'
@@ -103,7 +103,7 @@ let package = Package(
         // from Shaders/ and AV1Core's shared headers.
         .target(
             name: "GlassActAV1",
-            dependencies: ["AV1Core", "AV1Encoder"],
+            dependencies: ["AV1Core", "AV1Encoder", "GlassActSync"],
             exclude: ["Shaders"],
             swiftSettings: strictLibrary
         ),
@@ -139,14 +139,17 @@ let package = Package(
             dependencies: ["libwebp"],
             swiftSettings: strictLibrary
         ),
-        .target(name: "GlassActCore", dependencies: ["GlassActWire", "GlassActCodec", "GlassActTransport", "libaom"],
+        .target(name: "GlassActCore", dependencies: ["GlassActWire", "GlassActCodec", "GlassActTransport", "GlassActSync", "libaom"],
                 swiftSettings: strictLibrary),
-        .target(name: "GlassActTransport", dependencies: ["GlassActWire"], swiftSettings: strictLibrary),
+        .target(name: "GlassActTransport", dependencies: ["GlassActWire", "GlassActSync"], swiftSettings: strictLibrary),
+        // Mutex and Atomic for the macOS 14.4 floor (Synchronization's need 15).
+        .target(name: "GlassActSync", dependencies: ["GlassActSyncC"], swiftSettings: strictLibrary),
+        .target(name: "GlassActSyncC"),
         // A viewer session without a window, and everything that lets an
         // agent drive one: screenshots, input in agent coordinates, the local
         // agent socket, and the MCP server. Shared by the Viewer app and the
         // `glassact` CLI.
-        .target(name: "GlassActSession", dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport"],
+        .target(name: "GlassActSession", dependencies: ["GlassActWire", "GlassActCore", "GlassActTransport", "GlassActSync"],
                 swiftSettings: strictLibrary),
         // Sharing a screen (#42): ScreenCaptureKit capture and its recovery,
         // and in time the rest of what the Host app does to share. Apps add
@@ -162,7 +165,7 @@ let package = Package(
         .executableTarget(
             name: "glassact-bench",
             dependencies: ["GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTransport", "GlassActShare",
-                           "GlassActAV1", "AV1Core", "libaom", "GlassActHybridVideo", "GlassActAV1Decode"],
+                           "GlassActAV1", "AV1Core", "libaom", "GlassActHybridVideo", "GlassActAV1Decode", "GlassActSync"],
             swiftSettings: strict
         ),
         // A Host with a synthetic screen, for developing a viewer (the iPad
@@ -182,17 +185,17 @@ let package = Package(
                 swiftSettings: strictLibrary),
         .testTarget(name: "WireTests", dependencies: ["GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "CodecTests", dependencies: ["GlassActCodec", "GlassActTestSupport"], swiftSettings: strict),
-        .testTarget(name: "CoreTests", dependencies: ["GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport", "libaom"], swiftSettings: strict),
-        .testTarget(name: "SessionTests", dependencies: ["GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
+        .testTarget(name: "CoreTests", dependencies: ["GlassActSync", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActTestSupport", "libaom"], swiftSettings: strict),
+        .testTarget(name: "SessionTests", dependencies: ["GlassActSync", "GlassActSession", "GlassActCore", "GlassActTransport", "GlassActWire", "GlassActTestSupport"], swiftSettings: strict),
         .testTarget(name: "ShareTests", dependencies: ["GlassActShare", "GlassActCore"], swiftSettings: strict),
         .testTarget(name: "AV1CoreTests", dependencies: ["AV1Core", "AV1CoreTestSupport", "GlassActTestSupport", "libaom"], swiftSettings: strict),
-        .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActCore", "GlassActWire", "GlassActTestSupport", "libaom"],
+        .testTarget(name: "GlassActAV1Tests", dependencies: ["GlassActSync", "GlassActAV1", "AV1Core", "AV1CoreTestSupport", "AV1Encoder", "GlassActCore", "GlassActWire", "GlassActTestSupport", "libaom"],
                     exclude: ["Shaders"], swiftSettings: strict),
         .testTarget(name: "AV1DecodeTests", dependencies: ["GlassActAV1Decode", "GlassActAV1", "AV1Core", "GlassActCore", "GlassActWire", "GlassActTestSupport",
                                                          "GlassActHybridVideo", "GlassActTransport", "GlassActCodec"],
                     swiftSettings: strict),
         .testTarget(name: "HybridVideoTests", dependencies: ["GlassActHybridVideo", "GlassActCore", "GlassActWire", "AV1Core", "GlassActAV1Decode", "GlassActTestSupport"],
                     swiftSettings: strict),
-        .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActTestSupport"], swiftSettings: strict),
+        .testTarget(name: "TransportTests", dependencies: ["GlassActTransport", "GlassActWire", "GlassActCodec", "GlassActCore", "GlassActSync", "GlassActTestSupport"], swiftSettings: strict),
     ]
 )

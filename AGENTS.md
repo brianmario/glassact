@@ -30,10 +30,12 @@ retransmission.
 
 ## Constraints
 
-- Runs on macOS 15.5+, Apple silicon and Intel (universal Release builds).
-  Built with Xcode 27 / Swift 6.4, Swift 6 strict concurrency, warnings as
-  errors. Anything newer than macOS 15.5 goes behind `#available` with a
-  sensible fallback; the CI build at the 15.5 target catches misses.
+- The Host runs on macOS 14.4+ and the Viewer on 15.5+, Apple silicon and
+  Intel (universal Release builds). Built with Xcode 27 / Swift 6.4, Swift 6
+  strict concurrency, warnings as errors. The package targets 14.4: anything
+  newer goes behind `#available` with a sensible fallback, and the CI build
+  at the 14.4 target catches misses. Synchronization's `Mutex` and `Atomic`
+  are macOS 15: import `GlassActSync` for its stand-ins instead.
 - The `GlassActViewer` product (everything but GlassActShare) also builds
   for iPadOS 27+ (the latest only: the older macOS floor is for Intel Macs,
   which iPads don't need). Mac-only APIs in it go behind `#if os(macOS)`,

@@ -142,6 +142,50 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let granted = permissions.requiredGranted
         if requiredWereGranted && !granted { showSetup(recheck: true) }
         requiredWereGranted = granted
+        refitHandSizedWindows()
+    }
+
+    // MARK: - Window sizing below macOS 27
+
+    /// On macOS 27 SwiftUI sizes the setup and crash-notice windows to their
+    /// content (`.preferredContentSize`). Below 27 that can loop: on one Mac
+    /// with macOS 15.7.5, at first launch, each frame change made the hosting
+    /// view redo its title-bar safe area (these windows have full-size
+    /// content), which asked for another frame change, until AppKit stopped
+    /// the app (found and fixed in Duo Desktop's Host patches, 2026-11-21).
+    /// There those windows are sized here, from the content, instead.
+    private static var swiftUISizesWindows: Bool {
+        if #available(macOS 27, *) { return true }
+        return false
+    }
+
+    private static func sizingOptions() -> NSHostingSizingOptions {
+        swiftUISizesWindows ? [.preferredContentSize] : []
+    }
+
+    /// Below macOS 27: the window's content size set to what the content asks
+    /// for. `sizeThatFits` because with no sizing options the view's
+    /// `fittingSize` is zero. A no-op while the size already fits.
+    private static func fit<V: View>(_ window: NSWindow, _ hosting: NSHostingController<V>) {
+        guard !swiftUISizesWindows else { return }
+        window.layoutIfNeeded()
+        let fit = hosting.sizeThatFits(in: NSSize(width: 10_000, height: 10_000))
+        let now = window.contentRect(forFrameRect: window.frame).size
+        if fit.width >= 1, fit.height >= 1, abs(fit.width - now.width) >= 1 || abs(fit.height - now.height) >= 1 {
+            window.setContentSize(fit)
+        }
+    }
+
+    /// Below macOS 27, from the one-second check: the setup and crash-notice
+    /// windows follow rows that grew or shrank, as SwiftUI does on 27.
+    private func refitHandSizedWindows() {
+        guard !Self.swiftUISizesWindows else { return }
+        if let window = setupWindow, let hosting = window.contentViewController as? NSHostingController<SetupView> {
+            Self.fit(window, hosting)
+        }
+        if let window = crashNoticeWindow, let hosting = window.contentViewController as? NSHostingController<AnyView> {
+            Self.fit(window, hosting)
+        }
     }
 
     private func showSetup(recheck: Bool) {
@@ -152,7 +196,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         }
         let view = SetupView(permissions: permissions, isRecheck: recheck) { [weak self] in self?.finishSetup() }
         let hosting = NSHostingController(rootView: view)
-        hosting.sizingOptions = [.preferredContentSize]
+        hosting.sizingOptions = Self.sizingOptions()
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.titlebarAppearsTransparent = true
@@ -162,6 +206,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.setContentSize(hosting.view.fittingSize)
+        Self.fit(window, hosting)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
@@ -213,7 +258,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
             return
         }
         let hosting = NSHostingController(rootView: AnyView(view))
-        hosting.sizingOptions = [.preferredContentSize]
+        hosting.sizingOptions = Self.sizingOptions()
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.titlebarAppearsTransparent = true
@@ -223,6 +268,7 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.setContentSize(hosting.view.fittingSize)
+        Self.fit(window, hosting)
         window.center()
         window.orderFrontRegardless()
         crashNoticeWindow = window
@@ -540,6 +586,9 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let model = ApprovedViewersModel(controller: controller)
         let view = ApprovedViewersView(model: model) { [weak self] in self?.approvalsWindow?.close() }
         let hosting = NSHostingController(rootView: view)
+        // SwiftUI sizes this one on every macOS: the loop below 27 was seen in
+        // the full-size-content, fixed-size windows, and this list would ask
+        // the hand sizing for all the height it's offered.
         hosting.sizingOptions = [.preferredContentSize]
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled, .closable, .resizable]
