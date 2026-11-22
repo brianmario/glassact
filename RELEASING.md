@@ -18,10 +18,13 @@ works for builds you hand out yourself.
   The version promises nothing by itself; compatibility comes from the
   wire rules instead. Releases work with older and newer ones unless
   `WireVersion.current` changes, which is a rare, deliberate break (AGENTS.md).
+- A release candidate adds `-rcK` (`26.11.5-rc1`, `-rc2`, …) and doesn't use
+  up its number: the release that follows is plain `26.11.5`. See
+  [Release candidates](#release-candidates).
 - The version lives in `Apps/Version.xcconfig` (`GLASSACT_VERSION`) and in the
   CLI (`let version` in `Sources/glassact/main.swift`). `scripts/check-version`
-  checks they agree and are `YY.M.N`, and the workflow checks the tag names
-  that version.
+  checks they agree and are `YY.M.N` or `YY.M.N-rcK`, and the workflow checks
+  the tag names that version.
 - The build number is a UTC timestamp (`YYYYMMDDHHMM`), set at build time. It
   only increases, which update checks rely on. Finder's Get Info shows it
   after the version: `26.10.0 (202610222020)`.
@@ -44,6 +47,29 @@ works for builds you hand out yourself.
 3. Wait for the Release workflow (about 5–30 minutes; notarization is most
    of it).
 4. Open the draft release, edit the notes, and publish it.
+
+### Release candidates
+
+A build for a few people to try before everyone gets it: a change that
+hasn't merged yet, or a Mac no one has tested on.
+
+1. On the commit to try (a branch is fine, pushed), set the version in both
+   places to the next release's number plus `-rcK`: `26.11.5-rc1`.
+2. Tag that commit `v26.11.5-rc1` and push the tag, as above.
+3. The workflow makes the draft a **pre-release**. Edit its notes and
+   publish it; it stays a pre-release.
+4. Check that nobody is offered it as an update. The feed is the latest
+   release's appcast, and "latest" skips pre-releases:
+   ```sh
+   gh api repos/brianmario/glassact/releases/latest --jq .tag_name
+   ```
+   That should still name the last full release.
+
+Testers install it from the release page. When the full `26.11.5` is
+published, Sparkle offers it to them as well: it compares build numbers
+(timestamps), and the full release is built later. Don't publish a
+candidate without the pre-release box ticked: it would become "latest", and
+every Mac would be offered it.
 
 Each release attaches:
 

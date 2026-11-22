@@ -1,8 +1,9 @@
 // The apps' version: set here, and in the glassact CLI (Sources/glassact/
 // main.swift), and nowhere else. It's YY.M.N: the year and month of the
 // release, and N counting releases within that month from 0 (26.10.0,
-// 26.10.1, 26.11.0). A release tag vYY.M.N must match it;
-// scripts/check-version enforces that. RELEASING.md has the steps.
+// 26.10.1, 26.11.0). A release candidate adds -rcK (26.11.5-rc1). A
+// release tag vYY.M.N[-rcK] must match it; scripts/check-version
+// enforces that. RELEASING.md has the steps.
 //
 // GLASSACT_BUILD is overridden at release time with a UTC timestamp
 // (YYYYMMDDHHMM): it only ever increases, which update checks rely on.
