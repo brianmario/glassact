@@ -1184,7 +1184,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 // held through its key-up.
                 let own = (54...63).contains(canvasX) ? []
                     : ev.flags.intersection([.maskNumericPad, .maskSecondaryFn])
-                ev.flags = CGEventFlags(rawValue: UInt64(UInt32(bitPattern: Int32(a)))).union(own)
+                // And each held modifier's side, as a keyboard's events carry
+                // it: a virtual machine's view goes by those bits (⌘V reached a
+                // VM as V without them).
+                let flags = KeyModifiers.posted(UInt32(bitPattern: Int32(a)), heldKeyCodes: keysDown)
+                ev.flags = CGEventFlags(rawValue: UInt64(flags)).union(own)
                 ev.post(tap: .cghidEventTap)
             }
         default: break

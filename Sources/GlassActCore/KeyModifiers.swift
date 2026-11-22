@@ -21,6 +21,33 @@ public enum KeyModifiers {
         UInt32(truncatingIfNeeded: modifierFlags & (capsLock | shift | control | option | command | numericPad | function))
     }
 
+    /// The flags the Host posts a key event with: `forwarded` (what the
+    /// Viewer sent) plus the left/right device bit of each modifier key the
+    /// Host holds down (`heldKeyCodes`, Mac virtual key codes), as a
+    /// keyboard's events carry them. Most apps read only the side-less
+    /// flags, but a virtual machine's view (Virtualization.framework) works
+    /// out which keys the guest holds from the device bits: without them it
+    /// saw ⌘V as a bare V. A side's bit is set only while its side-less flag
+    /// is, so the two never disagree.
+    public static func posted(_ forwarded: UInt32, heldKeyCodes: Set<Int>) -> UInt32 {
+        var flags = UInt(forwarded)
+        for code in heldKeyCodes {
+            let (bit, either): (UInt, UInt) = switch code {
+            case 59: (0x0001, control)
+            case 62: (0x2000, control)
+            case 56: (0x0002, shift)
+            case 60: (0x0004, shift)
+            case 55: (0x0008, command)
+            case 54: (0x0010, command)
+            case 58: (0x0020, option)
+            case 61: (0x0040, option)
+            default: (0, 0)
+            }
+            if bit != 0, flags & either != 0 { flags |= bit }
+        }
+        return UInt32(truncatingIfNeeded: flags)
+    }
+
     /// Whether the modifier key `keyCode` is down after a flags-changed
     /// event with `modifierFlags`, or nil if `keyCode` isn't a modifier key.
     ///
