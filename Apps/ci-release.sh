@@ -35,7 +35,7 @@ if (( NOTARIZE )); then : ${ASC_KEY_PATH:?} ${ASC_KEY_ID:?}; fi
 BUILD_NUMBER=${BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}
 COMMIT=$(git rev-parse --short=7 HEAD)
 OUT=${OUT:-build/ci-release}
-VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9.]*\).*/\1/p' Version.xcconfig)
+VERSION=$(sed -n 's/^GLASSACT_VERSION *= *\([0-9a-z.-]*\).*/\1/p' Version.xcconfig)
 TAG=${TAG:-v$VERSION}
 REPO=${REPO:-brianmario/glassact}
 IDENTITY="Developer ID Application"
