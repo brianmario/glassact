@@ -30,6 +30,9 @@ jobs:
       QUIC_SUITES: AV1SessionQUICTests|AgentDriverTests|QUICBurstTests|QUICLifecycleTests|QUICLoopbackTests|QUICSustainedSessionTests|SignInQUICTests|ViewerAuthTests
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-cache
+        with:
+          job: tests
       - name: Toolchain
         run: xcodebuild -version && swift --version
       - name: Version
@@ -80,6 +83,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-cache
+        with:
+          job: apps
       - name: Rust targets
         # Each app target runs scripts/build-rust --xcode, which builds the Rust AV1 library
         # (rust/av1) for the platform and architectures Xcode asks for: the Mac apps link it
@@ -123,6 +129,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-cache
+        with:
+          job: intel
       - name: Rust
         # The AV1 CPU code is Rust (rust/av1); the package links its static
         # library, arm64 + x86_64.
@@ -152,5 +161,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust-cache
+        with:
+          job: rust
       - name: Rust tests
         run: cargo test --release --manifest-path rust/av1/Cargo.toml
