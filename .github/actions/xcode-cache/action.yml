@@ -1,0 +1,39 @@
+name: Xcode compilation cache
+description: >
+  Restores Xcode's compilation cache (its CAS, a content-addressed store of compile results) from
+  main's last run. Builds that pass COMPILATION_CACHE_ENABLE_CACHING=YES then replay every compile
+  whose inputs are unchanged and run only the rest. Its keys are hashes of a compile's complete
+  inputs, so an old cache is always safe to use: what changed misses and compiles as it would
+  without one. Restore only; `./.github/actions/xcode-cache/save` saves it, on main.
+inputs:
+  job:
+    description: The job's name, in the key (each job builds other configurations).
+    required: true
+outputs:
+  key:
+    description: The key to save under (this commit's).
+    value: ${{ steps.key.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: sh
+      run: |
+        p="xcode-cas-${{ runner.os }}-${{ runner.arch }}-${{ inputs.job }}-$(xcodebuild -version | tr '\n ' '--')"
+        echo "prefix=$p-" >> "$GITHUB_OUTPUT"
+        echo "key=$p-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@v6
+      with:
+        # Xcode's default CAS path (COMPILATION_CACHE_CAS_PATH), so the builds need only the switch.
+        path: ~/Library/Developer/Xcode/DerivedData/CompilationCache.noindex
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+    - shell: sh
+      # Every save adds this run's new compiles to what it restored. Past 4 GB, start over (this run
+      # compiles from scratch, and main's next save is just what the code compiles to now).
+      run: |
+        c="$HOME/Library/Developer/Xcode/DerivedData/CompilationCache.noindex"
+        if [ -d "$c" ]; then
+          mb=$(du -sm "$c" | cut -f1); echo "compilation cache: $mb MB"
+          [ "$mb" -le 4096 ] || { echo "over 4 GB: starting over"; rm -rf "$c"; }
+        fi
