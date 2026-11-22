@@ -125,7 +125,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=YES build
       - name: Save the compilation cache
         # On main only (see the action). Pull requests restore main's.
-        if: github.event_name == 'push' || github.head_ref == 'ci-swift-cache'  # TEMPORARY: measure on this PR
+        if: github.event_name == 'push'
         uses: ./.github/actions/xcode-cache/save
         with:
           key: ${{ steps.xcode-cache.outputs.key }}
@@ -165,7 +165,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=YES build
       - name: Save the compilation cache
         # On main only (see the action). Pull requests restore main's.
-        if: github.event_name == 'push' || github.head_ref == 'ci-swift-cache'  # TEMPORARY: measure on this PR
+        if: github.event_name == 'push'
         uses: ./.github/actions/xcode-cache/save
         with:
           key: ${{ steps.xcode-cache.outputs.key }}
