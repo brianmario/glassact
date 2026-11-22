@@ -53,4 +53,28 @@ import Testing
         #expect(KeyModifiers.forwarded(arrow)
             == UInt32(KeyModifiers.command | KeyModifiers.option | KeyModifiers.numericPad | KeyModifiers.function))
     }
+
+    /// The Host's posted flags: ⌘ held, then V. Both events carry the left
+    /// ⌘ device bit, as a keyboard's do (a VM's view reads ⌘ from it).
+    @Test func postedFlagsCarryEachHeldModifiersSide() {
+        let cmd = UInt32(KeyModifiers.command)
+        #expect(KeyModifiers.posted(cmd, heldKeyCodes: [55]) == UInt32(Self.lCmd))
+        #expect(KeyModifiers.posted(cmd, heldKeyCodes: [55, 9]) == UInt32(Self.lCmd))
+        #expect(KeyModifiers.posted(cmd, heldKeyCodes: [54]) == UInt32(Self.rCmd))
+        #expect(KeyModifiers.posted(cmd, heldKeyCodes: [54, 55]) == UInt32(Self.lCmd | 0x10))
+        let cmdShift = UInt32(KeyModifiers.command | KeyModifiers.shift)
+        #expect(KeyModifiers.posted(cmdShift, heldKeyCodes: [55, 56, 9]) == UInt32(Self.lCmd | Self.lShift))
+    }
+
+    /// ⌘'s key-up: the Viewer's flags no longer have ⌘, so no side bit
+    /// either, even if the Host's set of held keys disagrees for a moment.
+    /// Keys that aren't modifiers, caps lock and fn add nothing.
+    @Test func postedFlagsNeverContradictTheSideLessFlags() {
+        #expect(KeyModifiers.posted(0, heldKeyCodes: [55]) == 0)
+        #expect(KeyModifiers.posted(0, heldKeyCodes: [9, 57, 63]) == 0)
+        let fnPad = UInt32(KeyModifiers.function | KeyModifiers.numericPad)
+        #expect(KeyModifiers.posted(fnPad, heldKeyCodes: [123]) == fnPad)
+        // An agent's ⌘ with no ⌘ key pressed: unchanged, as before.
+        #expect(KeyModifiers.posted(UInt32(KeyModifiers.command), heldKeyCodes: [9]) == UInt32(KeyModifiers.command))
+    }
 }

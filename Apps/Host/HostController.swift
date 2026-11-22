@@ -152,6 +152,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
     private var mouseButtonsDown = 0 // bitmask (bit 0 L, 1 R, 2 other) — drag vs move
     /// Keys this session pressed and hasn't released (encode queue).
     private var keysDown: Set<Int> = []
+    /// The source of every key event the Host posts: a private one, with its
+    /// own key-state table, as macOS Screen Sharing's agent posts from. The
+    /// events are what a nil source gives (the keyboard type included), but
+    /// the Host's keys don't mix into the session's combined state.
+    private let keySource = CGEventSource(stateID: .privateState)
     /// The held press's click count: a double-click-drag selects by word.
     private var heldClickState: Int64 = 1
     private var warnedNoAccessibility = false
@@ -1174,9 +1179,14 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 ev.post(tap: .cghidEventTap)
             }
         case 5, 6: // key down / up
+            // A down for a key already down is the Viewer's key repeat: mark it
+            // one, as a keyboard's repeats are (and Screen Sharing's), so apps
+            // and VMs don't read it as a fresh press.
+            let repeated = kind == 5 && keysDown.contains(canvasX)
             if kind == 5 { keysDown.insert(canvasX) } else { keysDown.remove(canvasX) }
-            if let ev = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(canvasX),
+            if let ev = CGEvent(keyboardEventSource: keySource, virtualKey: CGKeyCode(canvasX),
                                 keyDown: kind == 5) {
+                if repeated { ev.setIntegerValueField(.keyboardEventAutorepeat, value: 1) }
                 // Keep the flags a key carries itself (numeric pad and
                 // function on arrows and the like), which an agent's flags
                 // may leave out; replacing them made a ← unlike a real one.
@@ -1184,7 +1194,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 // held through its key-up.
                 let own = (54...63).contains(canvasX) ? []
                     : ev.flags.intersection([.maskNumericPad, .maskSecondaryFn])
-                ev.flags = CGEventFlags(rawValue: UInt64(UInt32(bitPattern: Int32(a)))).union(own)
+                // And each held modifier's side, as a keyboard's events carry
+                // it: a virtual machine's view goes by those bits (⌘V reached a
+                // VM as V without them).
+                let flags = KeyModifiers.posted(UInt32(bitPattern: Int32(a)), heldKeyCodes: keysDown)
+                ev.flags = CGEventFlags(rawValue: UInt64(flags)).union(own)
                 ev.post(tap: .cghidEventTap)
             }
         default: break
@@ -1242,7 +1256,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         guard ensureAccessibility() else { return }
         func press(_ code: CGKeyCode) {
             for down in [true, false] {
-                CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
+                CGEvent(keyboardEventSource: keySource, virtualKey: code, keyDown: down)?.post(tap: .cghidEventTap)
             }
         }
         func type(_ run: Substring) {
@@ -1253,7 +1267,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 if end < units.count, UTF16.isTrailSurrogate(units[end]) { end -= 1 }
                 let chunk = Array(units[i..<end])
                 for down in [true, false] {
-                    guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
+                    guard let ev = CGEvent(keyboardEventSource: keySource, virtualKey: 0, keyDown: down) else { continue }
                     ev.flags = []
                     ev.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
                     ev.post(tap: .cghidEventTap)
@@ -1280,7 +1294,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         }
         guard (!keysDown.isEmpty || mouseButtonsDown != 0), AXIsProcessTrusted() else { return }
         for code in keysDown {
-            guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: false) else { continue }
+            guard let ev = CGEvent(keyboardEventSource: keySource, virtualKey: CGKeyCode(code), keyDown: false) else { continue }
             ev.flags = []
             ev.post(tap: .cghidEventTap)
         }
