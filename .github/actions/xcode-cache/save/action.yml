@@ -1,0 +1,16 @@
+name: Save the Xcode compilation cache
+description: >
+  Saves the compilation cache the job's builds filled, under the key that
+  `./.github/actions/xcode-cache` gave. Run it on main only: a pull request's cache is visible only
+  to that pull request, and every save is a GB or more of the repository's 10 GB of caches.
+inputs:
+  key:
+    description: The restore step's `key` output.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache/save@v6
+      with:
+        path: ~/Library/Developer/Xcode/DerivedData/CompilationCache.noindex
+        key: ${{ inputs.key }}
