@@ -854,14 +854,17 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     }
 
     static func negotiatedALPN(_ metadata: sec_protocol_metadata_t) -> String? {
-        if #available(macOS 15.5, iOS 18.5, *) {
-            guard let p = sec_protocol_metadata_copy_negotiated_protocol(metadata) else { return nil }
-            defer { free(UnsafeMutablePointer(mutating: p)) }
+        #if os(macOS)
+        guard #available(macOS 15.5, *) else {
+            // macOS 14.4–15.4 (the Host's floor): the older call, whose string
+            // the metadata owns. (Mac only: iPadOS 27 builds would see it as
+            // deprecated, and never need it.)
+            guard let p = sec_protocol_metadata_get_negotiated_protocol(metadata) else { return nil }
             return String(cString: p)
         }
-        // macOS 14.4–15.4 (the Host's floor): the older call, whose string the
-        // metadata owns.
-        guard let p = sec_protocol_metadata_get_negotiated_protocol(metadata) else { return nil }
+        #endif
+        guard let p = sec_protocol_metadata_copy_negotiated_protocol(metadata) else { return nil }
+        defer { free(UnsafeMutablePointer(mutating: p)) }
         return String(cString: p)
     }
 
