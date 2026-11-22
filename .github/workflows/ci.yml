@@ -15,7 +15,7 @@ permissions:
 jobs:
   test:
     name: Tests
-    # Apple silicon, macOS 27, Xcode 27. The package targets macOS 15.5, so
+    # Apple silicon, macOS 27, Xcode 27. The package targets macOS 14.4, so
     # availability mistakes fail the build here too.
     runs-on: xcode-27
     timeout-minutes: 30

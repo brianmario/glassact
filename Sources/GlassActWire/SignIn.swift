@@ -128,6 +128,6 @@ extension ByteReader {
     /// `length` bytes of valid UTF-8, nil if `length > max` or the bytes run out.
     fileprivate mutating func readString(length: Int, max: Int) -> String? {
         guard length <= max, let bytes = unsafe readBytes(length) else { return nil }
-        return unsafe String(validating: bytes, as: UTF8.self)
+        return unsafe UTF8Text.string(bytes)
     }
 }

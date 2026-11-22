@@ -4,7 +4,7 @@
 // process. Counting is armed only around `encodeTick`, so the bench's own
 // bookkeeping (ACK synthesis, trace reads) stays out of the numbers.
 import Foundation
-import Synchronization
+import GlassActSync
 
 enum AllocCounter {
     private typealias Logger = @convention(c) (UInt32, UInt, UInt, UInt, UInt, UInt32) -> Void

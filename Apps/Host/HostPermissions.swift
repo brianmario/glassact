@@ -32,7 +32,7 @@ final class HostPermissions {
     private(set) var localNetwork: LocalNetwork = .unknown
     /// Recommended: clipboard sync reads the pasteboard programmatically,
     /// which macOS gates per app (Ask / Always Allow / Always Deny).
-    private(set) var clipboard = NSPasteboard.general.accessBehavior
+    private(set) var clipboard = PasteAccess.current
     /// Screen Recording is on but this process started without it, or the
     /// user went to turn it on: macOS applies it to a fresh launch only.
     var captureNeedsRelaunch = false
@@ -60,7 +60,7 @@ final class HostPermissions {
         if available != screenRecordingAvailable { screenRecordingAvailable = available }
         let ax = AXIsProcessTrusted()
         if ax != accessibility { accessibility = ax }
-        let paste = NSPasteboard.general.accessBehavior
+        let paste = PasteAccess.current
         if paste != clipboard { clipboard = paste }
     }
 
@@ -160,5 +160,25 @@ final class HostPermissions {
                                     + "/usr/bin/open \"$0\"", Bundle.main.bundlePath]
         try? relauncher.run()
         NSApp.terminate(nil)
+    }
+}
+
+/// What macOS lets this app do with the pasteboard (`NSPasteboard.accessBehavior`,
+/// macOS 15.4). Before 15.4 reads aren't gated and there's no setting to show.
+enum PasteAccess: Equatable {
+    case notGated
+    case `default`
+    case ask
+    case alwaysAllow
+    case alwaysDeny
+
+    static var current: PasteAccess {
+        guard #available(macOS 15.4, *) else { return .notGated }
+        return switch NSPasteboard.general.accessBehavior {
+        case .ask: .ask
+        case .alwaysAllow: .alwaysAllow
+        case .alwaysDeny: .alwaysDeny
+        default: .default
+        }
     }
 }

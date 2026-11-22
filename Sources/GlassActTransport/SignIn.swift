@@ -5,7 +5,7 @@ import Network
 import OpenDirectory
 #endif
 public import Security
-import Synchronization
+import GlassActSync
 
 // §13 — signing in with the host Mac's account. A viewer the host doesn't
 // know is refused on the session ALPN during the TLS handshake (no prompt).

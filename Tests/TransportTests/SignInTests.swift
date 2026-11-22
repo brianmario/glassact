@@ -1,6 +1,6 @@
 import Foundation
 import Security
-import Synchronization
+import GlassActSync
 import Testing
 import GlassActWire
 import GlassActTestSupport

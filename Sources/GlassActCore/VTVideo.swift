@@ -2,7 +2,7 @@ public import Foundation
 import CoreMedia
 import CoreVideo
 import GlassActWire
-import Synchronization
+import GlassActSync
 import VideoToolbox
 
 /// Video regions (§4.6) — hardware HEVC region codec via VideoToolbox

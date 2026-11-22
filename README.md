@@ -20,7 +20,8 @@ headless connection of their own.
 
 ## Requirements
 
-- macOS 15.5 or later, on Apple silicon or Intel. That applies to both ends.
+- On Apple silicon or Intel: macOS 14.4 or later for the Host, macOS 15.5 or
+  later for the Viewer. The Host on macOS 14 is new and lightly tested.
   Intel Macs are newly supported and still need performance testing; expect
   a heavier CPU load on the Host than on Apple silicon.
 - A few extras need macOS 27: the Host noticing a capture stream that stopped

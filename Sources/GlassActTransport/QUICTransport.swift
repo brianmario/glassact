@@ -3,7 +3,7 @@ public import Foundation
 public import GlassActWire
 import Network
 public import Security
-import Synchronization
+import GlassActSync
 
 // ## Deviations
 //
@@ -42,6 +42,10 @@ import Synchronization
 
 public enum QUICError: Error {
     case identityImportFailed
+    /// A file identity (`QUICIdentity.loadOrCreate`) needs macOS 15: before
+    /// it, importing the PKCS#12 would add the key to the login keychain
+    /// (no memory-only import). Team-signed apps use the keychain identity.
+    case fileIdentityNeedsMacOS15
     case invalidPort
     case invalidFingerprint
 }
@@ -850,8 +854,14 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     }
 
     static func negotiatedALPN(_ metadata: sec_protocol_metadata_t) -> String? {
-        guard let p = sec_protocol_metadata_copy_negotiated_protocol(metadata) else { return nil }
-        defer { free(UnsafeMutablePointer(mutating: p)) }
+        if #available(macOS 15.5, iOS 18.5, *) {
+            guard let p = sec_protocol_metadata_copy_negotiated_protocol(metadata) else { return nil }
+            defer { free(UnsafeMutablePointer(mutating: p)) }
+            return String(cString: p)
+        }
+        // macOS 14.4–15.4 (the Host's floor): the older call, whose string the
+        // metadata owns.
+        guard let p = sec_protocol_metadata_get_negotiated_protocol(metadata) else { return nil }
         return String(cString: p)
     }
 

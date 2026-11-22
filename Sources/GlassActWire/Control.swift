@@ -704,13 +704,13 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x15:
             guard (1...Self.maxTextInputBytes).contains(r.remaining),
                   let bytes = unsafe r.readBytes(r.remaining),
-                  let text = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
+                  let text = unsafe UTF8Text.string(bytes) else { return nil }
             return .textInput(text: text)
         case 0x16:
             guard let active = r.readU8(), active <= 1,
                   let len = r.readU8(), Int(len) <= Self.maxAgentLabelBytes,
                   let bytes = unsafe r.readBytes(Int(len)),
-                  let label = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
+                  let label = unsafe UTF8Text.string(bytes) else { return nil }
             return .agentState(active: active == 1, label: label)
         case 0x17:
             guard let requestID = r.readU32(), let windowID = r.readU32(),
@@ -725,12 +725,12 @@ public enum ControlMessage: Equatable, Sendable {
             guard let control = r.readU8(), control <= 1,
                   let len = r.readU8(), Int(len) <= Self.maxAgentReasonBytes,
                   let bytes = unsafe r.readBytes(Int(len)),
-                  let reason = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
+                  let reason = unsafe UTF8Text.string(bytes) else { return nil }
             return .agentScope(control: control == 1, reason: reason)
         case 0x1A:
             guard (1...Self.maxViewerNameBytes).contains(r.remaining),
                   let bytes = unsafe r.readBytes(r.remaining),
-                  let name = unsafe String(validating: bytes, as: UTF8.self) else { return nil }
+                  let name = unsafe UTF8Text.string(bytes) else { return nil }
             return .viewerInfo(name: name)
         case 0x1B:
             guard let region = r.readU8(), let generation = r.readU32() else { return nil }

@@ -1,7 +1,7 @@
 import CryptoKit
 public import Foundation
 public import Security
-import Synchronization
+import GlassActSync
 
 /// TLS identities for both ends. Each side has a self-signed certificate;
 /// the peer is authenticated by its key ID, the SHA-256 of the leaf's
@@ -27,6 +27,10 @@ public enum QUICIdentity {
     }
 
     static func importPKCS12(_ data: Data, passphrase: String = containerPassphrase) throws -> SecIdentity {
+        // Memory-only import is macOS 15+; without it SecPKCS12Import adds
+        // the key to the login keychain, which this file identity exists to
+        // avoid (no prompts, nothing left behind).
+        guard #available(macOS 15, iOS 18, *) else { throw QUICError.fileIdentityNeedsMacOS15 }
         let options: [String: Any] = [
             kSecImportExportPassphrase as String: passphrase,
             kSecImportToMemoryOnly as String: true,
@@ -49,6 +53,9 @@ public enum QUICIdentity {
     /// viewers get the changed-key refusal, and a viewer or agent is approved
     /// again like a new one.
     public static func loadOrCreate(directory: URL, name: String, commonName: String) throws -> SecIdentity {
+        // Before anything is written: below macOS 15 the import can't succeed,
+        // and the unreadable-file path below would replace a good key.
+        guard #available(macOS 15, iOS 18, *) else { throw QUICError.fileIdentityNeedsMacOS15 }
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true,
                                attributes: [.posixPermissions: 0o700])
