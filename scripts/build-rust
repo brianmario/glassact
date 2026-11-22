@@ -27,7 +27,7 @@ export PATH
 command -v cargo >/dev/null || { echo "build-rust: no cargo; install Rust with rustup (https://rustup.rs)" >&2; exit 1; }
 
 # The apps' deployment targets (Package.swift's platforms, the Xcode project's settings).
-macos_min=15.5
+macos_min=14.4
 ios_min=27.0
 
 # cargo with only what it needs from the environment: an Xcode script's SDKROOT, deployment

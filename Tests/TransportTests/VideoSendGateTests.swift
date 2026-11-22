@@ -1,6 +1,6 @@
 import Foundation
 import Network
-import Synchronization
+import GlassActSync
 import Testing
 @testable import GlassActTransport
 import GlassActCore

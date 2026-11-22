@@ -44,9 +44,11 @@ struct SetupView: View {
                 PermissionRow(symbol: "network", title: HostPermissions.PaneName.localNetwork,
                               detail: "Lets viewers on this network find and reach this Mac. Recommended.",
                               state: localNetworkState, action: permissions.requestLocalNetwork)
-                Divider().padding(.leading, 54)
-                PermissionRow(symbol: "doc.on.clipboard", title: HostPermissions.PaneName.clipboard,
-                              detail: clipboardDetail, state: clipboardState, action: permissions.requestClipboard)
+                if permissions.clipboard != .notGated { // macOS 15.4+ only
+                    Divider().padding(.leading, 54)
+                    PermissionRow(symbol: "doc.on.clipboard", title: HostPermissions.PaneName.clipboard,
+                                  detail: clipboardDetail, state: clipboardState, action: permissions.requestClipboard)
+                }
             }
 
             HStack {
@@ -103,7 +105,7 @@ struct SetupView: View {
 
     private var clipboardState: PermissionRow.State {
         switch permissions.clipboard {
-        case .alwaysAllow: .granted("Always Allowed")
+        case .alwaysAllow, .notGated: .granted("Always Allowed")
         case .default: .needed("Allow…")
         default: .needed("Open Settings…")
         }

@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
-import Synchronization
+import GlassActSync
 import Testing
 import GlassActCore
 import GlassActSession
@@ -169,9 +169,10 @@ import GlassActWire
         #expect(try wait(["since": later + 1_000_000, "timeout": 0.2]).changed)
 
         // a change during a region wait without `since`: its pixels, and only there
-        rig.serverQueue.asyncAfter(deadline: .now() + 0.2) {
-            rig.hostBox.frame = setPixels(x: 300, y: 200, to: 0xAA, changed)
-        }
+        // Computed here: the closure captures only Sendable values (Dispatch's
+        // Sendable-closure overload at the Host's macOS 14.4 floor).
+        let box = rig.hostBox, next = setPixels(x: 300, y: 200, to: 0xAA, changed)
+        rig.serverQueue.asyncAfter(deadline: .now() + 0.2) { box.frame = next }
         #expect(try wait(["region": [292, 196, 16, 16], "timeout": 5.0]).changed)
         #expect(try wait(["region": [96, 96, 16, 16], "timeout": 0.2]).changed == false)
 

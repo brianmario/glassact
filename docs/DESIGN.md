@@ -601,7 +601,7 @@ first negotiated codec whose encoder starts; START carries its id.
   below):
   - The Host's AV1 is Glass Act's own encoder (`HybridRegionEncoder`, the
     hybrid), on macOS 27 with an Apple-silicon GPU. Elsewhere (macOS
-    15.5–26, Intel, a VM's GPU) the Host offers HEVC only. Its kernels
+    14.4–26, Intel, a VM's GPU) the Host offers HEVC only. Its kernels
     compile once a process, every one of them, started at launch
     (`HybridRegionEncoder.prepare`; `AV1HybridEncoder.compileKernels`
     covers the analysis kernels the encoder would otherwise compile on a
@@ -671,7 +671,7 @@ first negotiated codec whose encoder starts; START carries its id.
   | Host ↓ · Viewer → | new, AV1 hardware | new, no AV1 hardware | released, AV1 hardware, opted in | AV1 off, or released without the hardware |
   |---|---|---|---|---|
   | new, Glass Act's encoder runs | Glass Act's AV1, VideoToolbox | Glass Act's AV1, Glass Act's decoder | Glass Act's AV1, VideoToolbox | HEVC |
-  | new, macOS 15.5–26 or Intel | HEVC | HEVC | HEVC | HEVC |
+  | new, macOS 14.4–26 or Intel | HEVC | HEVC | HEVC | HEVC |
   | new, switched back to libaom | libaom's AV1, VideoToolbox | HEVC | libaom's AV1, VideoToolbox | HEVC |
   | released, Apple silicon (libaom) | libaom's AV1, VideoToolbox | HEVC | libaom's AV1, VideoToolbox | HEVC |
   | released, Intel | HEVC | HEVC | HEVC | HEVC |
@@ -1333,8 +1333,8 @@ These apply to the hot paths: diff, encode, parse, apply and blit.
 ## 9. Repository layout
 
 ```
-Package.swift              tools 6.4, macOS 15.5 (+ iPadOS 27: the GlassActViewer product),
-                           warnings as errors
+Package.swift              tools 6.4, macOS 14.4 (the Host's floor; the Viewer app's is 15.5)
+                           (+ iPadOS 27: the GlassActViewer product), warnings as errors
 Sources/
   GlassActWire/            bytes: varint, TLV, datagrams, control, video, serial (checked)
   GlassActCodec/           xxh64, RAW/LZ4/LZBITMAP/VP8L tile codecs, arenas
@@ -1346,6 +1346,7 @@ Sources/
                            clipboard, log upload), SessionLog, AgentDriver, HeadlessAgent,
                            agent socket, MCP (the socket, MCP and daemon are macOS only)
   GlassActShare/           sharing: ScreenCapture (lifecycle, recovery), SCK backend, latest slot
+  GlassActSync/ …SyncC/    Mutex and Atomic for the macOS 14.4 floor (Synchronization's are 15+)
   AV1Core/ AV1Encoder/     the AV1 code's C API and the kernels' shared headers; implemented by
                            rust/av1 (scripts/build-rust → .build/rust/libglassact_av1.a)
   GlassActAV1/             the Metal AV1 encoder and the hybrid (AV1HybridEncoder), kernels in Shaders/

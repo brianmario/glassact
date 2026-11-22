@@ -1,7 +1,7 @@
 public import AV1Core
 internal import AV1Encoder
 internal import Foundation
-internal import Synchronization
+internal import GlassActSync
 public import Metal
 internal import QuartzCore
 

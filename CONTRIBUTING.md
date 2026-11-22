@@ -8,8 +8,8 @@ works is in [docs/DESIGN.md](docs/DESIGN.md).
 ## Requirements
 
 - To build: Xcode 27 (Swift 6.4), on a Mac that runs it.
-- To run: macOS 15.5 or later, on Apple silicon or Intel. The Host and the
-  Viewer both need it. One Mac is enough to start: the Viewer can connect
+- To run: on Apple silicon or Intel, the Host needs macOS 14.4 or later and
+  the Viewer macOS 15.5 or later. One Mac is enough to start: the Viewer can connect
   to a Host on the same machine. Release builds are universal; Debug builds
   are for the Mac you build on.
 - The iPad Viewer: iPadOS 27 or later.

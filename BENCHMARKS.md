@@ -391,6 +391,23 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
+
+Lowering the package's floor to macOS 14.4 replaces Synchronization's `Atomic`, which needs
+macOS 15, with GlassActSync's C11 atomics everywhere, because stored properties can't be
+gated by `#available`. The ones that run often are `QUICTransport`'s per-datagram queue
+counter, its pace rate and its datagram size. No bench drives `QUICTransport` (`replay`
+uses the in-process transport), so the evidence is the generated code instead:
+
+- In the universal Release Host (arm64), the datagram path's add and subtract are an
+  inline `ldadd` each, and relaxed loads are a plain `ldr`, as with Synchronization's.
+- A few protocol-witness getters (`maxDatagramSize`, `transportRTT`) tail-call a
+  two-instruction `ldr; ret` instead of inlining it: one extra branch a call.
+
+Not measured, and no change in the bytes sent: nothing on the wire or in the engines'
+decisions depends on these atomics' ordering, which stays relaxed (Synchronization's
+`.sequentiallyConsistent` arm in the bench's allocation counter maps to C11 `seq_cst`).
+
 ### Video: reduced frames at other sizes, and the content's own resolution, measured (2026-11-21)
 
 Reduced frames code soft video at exactly half size each way. The question was whether the
