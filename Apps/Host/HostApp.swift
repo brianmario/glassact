@@ -147,12 +147,13 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
 
     // MARK: - Window sizing below macOS 27
 
-    /// On macOS 27 SwiftUI sizes the Host's windows to their content
-    /// (`.preferredContentSize`). Below 27 that can loop: on macOS 15.7.5, at
-    /// first launch, each frame change made the hosting view redo its title-bar
-    /// safe area, which asked for another frame change, until AppKit stopped
+    /// On macOS 27 SwiftUI sizes the setup and crash-notice windows to their
+    /// content (`.preferredContentSize`). Below 27 that can loop: on one Mac
+    /// with macOS 15.7.5, at first launch, each frame change made the hosting
+    /// view redo its title-bar safe area (these windows have full-size
+    /// content), which asked for another frame change, until AppKit stopped
     /// the app (found and fixed in Duo Desktop's Host patches, 2026-11-21).
-    /// There the windows are sized here, from the content, instead.
+    /// There those windows are sized here, from the content, instead.
     private static var swiftUISizesWindows: Bool {
         if #available(macOS 27, *) { return true }
         return false
@@ -585,14 +586,16 @@ final class HostAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NS
         let model = ApprovedViewersModel(controller: controller)
         let view = ApprovedViewersView(model: model) { [weak self] in self?.approvalsWindow?.close() }
         let hosting = NSHostingController(rootView: view)
-        hosting.sizingOptions = Self.sizingOptions()
+        // SwiftUI sizes this one on every macOS: the loop below 27 was seen in
+        // the full-size-content, fixed-size windows, and this list would ask
+        // the hand sizing for all the height it's offered.
+        hosting.sizingOptions = [.preferredContentSize]
         let window = NSWindow(contentViewController: hosting)
         window.styleMask = [.titled, .closable, .resizable]
         window.title = "Approved Viewers"
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.setContentSize(hosting.view.fittingSize)
-        Self.fit(window, hosting)
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
