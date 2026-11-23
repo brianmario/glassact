@@ -10,27 +10,6 @@ fn ld8(s: &[u8]) -> uint8x8_t {
     // SAFETY: 8 bytes.
     unsafe { vld1_u8(s.as_ptr()) }
 }
-#[inline(always)]
-fn st8(d: &mut [u8], v: uint8x8_t) {
-    let d = &mut d[..8];
-    // SAFETY: 8 bytes.
-    unsafe { vst1_u8(d.as_mut_ptr(), v) }
-}
-/// 4 bytes at `a` and 4 at `b` as one vector.
-#[inline(always)]
-fn ld4x2(s: &[u8], a: usize, b: usize) -> uint8x8_t {
-    let lo = u32::from_le_bytes(s[a..a + 4].try_into().unwrap()) as u64;
-    let hi = u32::from_le_bytes(s[b..b + 4].try_into().unwrap()) as u64;
-    // SAFETY: NEON is part of the aarch64 baseline; no memory access.
-    unsafe { vcreate_u8(lo | hi << 32) }
-}
-#[inline(always)]
-fn st4x2(d: &mut [u8], a: usize, b: usize, v: uint8x8_t) {
-    // SAFETY: NEON is part of the aarch64 baseline; no memory access.
-    let x = unsafe { vget_lane_u64::<0>(vreinterpret_u64_u8(v)) };
-    d[a..a + 4].copy_from_slice(&(x as u32).to_le_bytes());
-    d[b..b + 4].copy_from_slice(&((x >> 32) as u32).to_le_bytes());
-}
 
 // ---------------- CDEF ----------------
 
@@ -124,15 +103,18 @@ pub(super) fn cdef_direction_neon(src: &[u8], stride: usize) -> (i32, i32) {
     }
 }
 
-/// constrain(), 8 lanes: `thr` the strength, `nadj` = -dampingAdj (a right shift).
+/// constrain(), 16 lanes of u8, signed: `p` the taps, `x` the samples, `thr` the strength,
+/// `nadj` = -dampingAdj (a right shift). |p - x| and every intermediate fit in u8 (the strength is
+/// at most 15 at 8 bits, so the result is too), so this is cdef_constrain's integers exactly;
+/// returned as i8 with the sign of p - x.
 #[inline(always)]
-fn constrain(d: int16x8_t, thr: int16x8_t, nadj: int16x8_t) -> int16x8_t {
+fn constrain16(p: uint8x16_t, x: uint8x16_t, thr: uint8x16_t, nadj: int8x16_t) -> int8x16_t {
     // SAFETY: NEON is part of the aarch64 baseline; no memory access.
     unsafe {
-        let a = vabsq_s16(d);
-        let t = vmaxq_s16(vsubq_s16(thr, vshlq_s16(a, nadj)), vdupq_n_s16(0));
-        let v = vminq_s16(a, t);
-        vbslq_s16(vcltzq_s16(d), vnegq_s16(v), v)
+        let a = vabdq_u8(p, x);
+        let v = vminq_u8(a, vqsubq_u8(thr, vshlq_u8(a, nadj)));
+        let neg = vreinterpretq_s8_u8(vcltq_u8(p, x)); // -1 where p < x
+        vsubq_s8(veorq_s8(vreinterpretq_s8_u8(v), neg), neg)
     }
 }
 
@@ -152,7 +134,97 @@ fn cdef_filter<const W: usize>(
     damping: i32,
     dir: i32,
 ) {
-    // SAFETY: NEON is part of the aarch64 baseline; memory goes through checked slices.
+    // Every tap is within 2 rows and 2 columns of its sample (CDEF_DIRS), so the block reads
+    // rows y0 - 2 ..= y0 + W + 1 and columns x0 - 2 ..= x0 + W + 1 of `src` (x0, y0 >= 2: the
+    // caller's interior test), and writes rows y0 - dy .. y0 - dy + W, columns x0 .. x0 + W of
+    // `dst`. Checked once here; the loads and stores are then unchecked.
+    // (With a slice check per tap, 13 a row, each two compares on an offset reloaded from the
+    // stack, the checks were most of the filter's instructions: BENCHMARKS, 2026-11-22.)
+    assert!(x0 >= 2 && y0 >= 2 && y0 >= dy);
+    assert!((y0 + W + 1) * ss + x0 + W + 2 <= src.len());
+    assert!((y0 - dy + W - 1) * ds + x0 + W <= dst.len());
+    // SAFETY: the block and its taps are inside `src` and its rows inside `dst` (asserted above).
+    unsafe {
+        cdef_filter_raw::<W, false>(
+            src.as_ptr().add(y0 * ss + x0),
+            ss,
+            core::ptr::null(),
+            dst.as_mut_ptr().add((y0 - dy) * ds + x0),
+            ds,
+            pri,
+            sec,
+            damping,
+            dir,
+        )
+    }
+}
+
+/// [`cdef_filter`] of a block on the border ring: its neighbourhood copied into a padded 16 x 16
+/// with a mask of the samples inside the filter region (is_inside_filter_region), and each tap
+/// outside it taken as the sample itself, which adds nothing to the sum and leaves the maximum
+/// and minimum as they are: as cdef_pixel's skipped taps.
+#[inline(always)]
+fn cdef_filter_border<const W: usize>(
+    src: &[u8],
+    ss: usize,
+    dst: &mut [u8],
+    ds: usize,
+    dy: usize,
+    (x0, y0): (i32, i32),
+    (pw, ph): (i32, i32),
+    pri: i32,
+    sec: i32,
+    damping: i32,
+    dir: i32,
+) {
+    let (mut buf, mut ok) = ([0u8; 256], [0u8; 256]);
+    for r in 0..W as i32 + 4 {
+        for c in 0..W as i32 + 4 {
+            let (y, x) = (y0 - 2 + r, x0 - 2 + c);
+            let inside = y >= 0 && x >= 0 && y < ph && x < pw;
+            // (the block's own samples are read even past the region, as cdef_pixel reads them)
+            let own = (2..W as i32 + 2).contains(&r) && (2..W as i32 + 2).contains(&c);
+            if inside || own {
+                buf[(r * 16 + c) as usize] = src[y as usize * ss + x as usize];
+            }
+            ok[(r * 16 + c) as usize] = if inside { 0xFF } else { 0 };
+        }
+    }
+    let mut out = [0u8; 64]; // (W x W)
+    // SAFETY: buf and ok hold the block at (2, 2) with 2 samples all round (stride 16, W + 4 <= 16
+    // columns and rows read); out holds its W rows of W.
+    unsafe {
+        cdef_filter_raw::<W, true>(buf.as_ptr().add(34), 16, ok.as_ptr().add(34), out.as_mut_ptr(), W, pri, sec, damping, dir)
+    }
+    for i in 0..W {
+        let o = (y0 as usize + i - dy) * ds + x0 as usize;
+        dst[o..o + W].copy_from_slice(&out[i * W..i * W + W]);
+    }
+}
+
+/// The CDEF filter on 16 lanes of u8 (two rows of 8, or the 4x4's four rows of 4), the weighted
+/// sums in two halves of i16. `c` is the block's first sample (stride `ss`), `dst` its first
+/// output (stride `ds`); with MASKED, `mask` (stride `ss`, at the block's first sample) is 0xFF
+/// where a tap may be read and 0 where cdef_pixel skips it.
+///
+/// # Safety
+/// Rows -2 ..= W + 1 and columns -2 ..= W + 1 around `c` (and `mask`) are readable, and W rows of
+/// W at `dst` writable.
+#[inline(always)]
+unsafe fn cdef_filter_raw<const W: usize, const MASKED: bool>(
+    c: *const u8,
+    ss: usize,
+    mask: *const u8,
+    dst: *mut u8,
+    ds: usize,
+    pri: i32,
+    sec: i32,
+    damping: i32,
+    dir: i32,
+) {
+    // SAFETY: NEON is part of the aarch64 baseline; every load is a tap of the block, at most 2
+    // rows and 2 columns out (CDEF_DIRS), and every store a row of the block: the caller's
+    // promise.
     unsafe {
         let dirs = |d: i32, k: usize| {
             let v = CDEF_DIRS[(d & 7) as usize][k];
@@ -164,49 +236,67 @@ fn cdef_filter<const W: usize>(
             [dirs(dir - 2, 0), dirs(dir + 2, 0)],
             [dirs(dir - 2, 1), dirs(dir + 2, 1)],
         ];
-        let pri_taps: [i16; 2] = if pri & 1 != 0 { [3, 3] } else { [4, 2] };
-        let sec_taps: [i16; 2] = [2, 1];
-        let (pt, st) = (vdupq_n_s16(pri as i16), vdupq_n_s16(sec as i16));
-        let pa = vdupq_n_s16(-(cdef_damping_adj(pri, damping) as i16));
-        let sa = vdupq_n_s16(-(cdef_damping_adj(sec, damping) as i16));
-        // rows: 8 lanes = one row of 8, or two rows of 4
-        let rows = if W == 8 { 8 } else { 2 };
-        for i in 0..rows {
-            let c = ((y0 + if W == 8 { i } else { 2 * i }) * ss + x0) as isize;
-            let load = |off: isize| -> int16x8_t {
-                let a = (c + off) as usize;
-                let v = if W == 8 { ld8(&src[a..]) } else { ld4x2(src, a, a + ss) };
-                vreinterpretq_s16_u16(vmovl_u8(v))
+        let pri_taps: [i8; 2] = if pri & 1 != 0 { [3, 3] } else { [4, 2] };
+        let sec_taps: [i8; 2] = [2, 1];
+        let (pt, st) = (vdupq_n_u8(pri as u8), vdupq_n_u8(sec as u8));
+        let pa = vdupq_n_s8(-(cdef_damping_adj(pri, damping) as i8));
+        let sa = vdupq_n_s8(-(cdef_damping_adj(sec, damping) as i8));
+        let ld16 = |a: *const u8| -> uint8x16_t {
+            if W == 8 {
+                vcombine_u8(vld1_u8(a), vld1_u8(a.add(ss)))
+            } else {
+                let r = |k: usize| u32::from_le((a.add(k * ss) as *const u32).read_unaligned()) as u64;
+                vcombine_u8(vcreate_u8(r(0) | r(1) << 32), vcreate_u8(r(2) | r(3) << 32))
+            }
+        };
+        // 16 lanes: rows 2i and 2i + 1 of 8, or rows 0..4 of 4
+        for i in 0..(if W == 8 { 4 } else { 1 }) {
+            let row = c.add(2 * i * ss);
+            let x = ld16(row);
+            let load = |off: isize| -> uint8x16_t {
+                let p = ld16(row.offset(off));
+                if MASKED { vbslq_u8(ld16(mask.add(2 * i * ss).offset(off)), p, x) } else { p }
             };
-            let x = load(0);
             let (mut mx, mut mn) = (x, x);
-            let mut sum = vdupq_n_s16(0);
+            let (mut lo, mut hi) = (vdupq_n_s16(0), vdupq_n_s16(0));
             for k in 0..2 {
                 for sign in [1isize, -1] {
                     let p = load(sign * po[k]);
-                    sum = vmlaq_n_s16(sum, constrain(vsubq_s16(p, x), pt, pa), pri_taps[k]);
-                    mx = vmaxq_s16(mx, p);
-                    mn = vminq_s16(mn, p);
+                    let v = constrain16(p, x, pt, pa);
+                    let w = vdup_n_s8(pri_taps[k]);
+                    lo = vmlal_s8(lo, vget_low_s8(v), w);
+                    hi = vmlal_high_s8(hi, v, vcombine_s8(w, w));
+                    mx = vmaxq_u8(mx, p);
+                    mn = vminq_u8(mn, p);
                     for &o in &so[k] {
                         let p = load(sign * o);
-                        sum = vmlaq_n_s16(sum, constrain(vsubq_s16(p, x), st, sa), sec_taps[k]);
-                        mx = vmaxq_s16(mx, p);
-                        mn = vminq_s16(mn, p);
+                        let v = constrain16(p, x, st, sa);
+                        let w = vdup_n_s8(sec_taps[k]);
+                        lo = vmlal_s8(lo, vget_low_s8(v), w);
+                        hi = vmlal_high_s8(hi, v, vcombine_s8(w, w));
+                        mx = vmaxq_u8(mx, p);
+                        mn = vminq_u8(mn, p);
                     }
                 }
             }
-            // x + ((8 + sum - (sum < 0)) >> 4), clamped to [mn, mx]
-            let r = vshrq_n_s16::<4>(vaddq_s16(
-                vaddq_s16(sum, vdupq_n_s16(8)),
-                vreinterpretq_s16_u16(vcltzq_s16(sum)),
-            ));
-            let v = vminq_s16(vmaxq_s16(vaddq_s16(x, r), mn), mx);
-            let v = vmovn_u16(vreinterpretq_u16_s16(v));
-            let o = (y0 - dy + if W == 8 { i } else { 2 * i }) * ds + x0;
+            // x + ((8 + sum - (sum < 0)) >> 4), clamped to [mn, mx] (in [0, 255], so narrowing
+            // with saturation first gives the same bytes)
+            let r = |sum: int16x8_t, x: uint8x8_t| -> uint8x8_t {
+                let d = vshrq_n_s16::<4>(vaddq_s16(vaddq_s16(sum, vdupq_n_s16(8)), vreinterpretq_s16_u16(vcltzq_s16(sum))));
+                vqmovun_s16(vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(x)), d))
+            };
+            let v = vcombine_u8(r(lo, vget_low_u8(x)), r(hi, vget_high_u8(x)));
+            let v = vminq_u8(vmaxq_u8(v, mn), mx);
+            let o = dst.add(2 * i * ds);
             if W == 8 {
-                st8(&mut dst[o..], v);
+                vst1_u8(o, vget_low_u8(v));
+                vst1_u8(o.add(ds), vget_high_u8(v));
             } else {
-                st4x2(dst, o, o + ds, v);
+                let q = vreinterpretq_u32_u8(v);
+                (o as *mut u32).write_unaligned(vgetq_lane_u32::<0>(q).to_le());
+                (o.add(ds) as *mut u32).write_unaligned(vgetq_lane_u32::<1>(q).to_le());
+                (o.add(2 * ds) as *mut u32).write_unaligned(vgetq_lane_u32::<2>(q).to_le());
+                (o.add(3 * ds) as *mut u32).write_unaligned(vgetq_lane_u32::<3>(q).to_le());
             }
         }
     }
@@ -281,14 +371,10 @@ pub(super) fn cdef_rect(
                     } else {
                         cdef_filter::<4>(s, ss, d, ds, dy, x0, y0, pri, sec, damp, dir);
                     }
+                } else if w == 8 {
+                    cdef_filter_border::<8>(s, ss, d, ds, dy, (x0, y0), (pw, ph), pri, sec, damp, dir);
                 } else {
-                    for i in 0..w {
-                        for j in 0..w {
-                            let (x, y) = (x0 + j, y0 + i);
-                            d[(y as usize - dy) * ds + x as usize] =
-                                cdef_pixel(f, s, ss, p, x, y, pri, sec, damp, dir) as u8;
-                        }
-                    }
+                    cdef_filter_border::<4>(s, ss, d, ds, dy, (x0, y0), (pw, ph), pri, sec, damp, dir);
                 }
             }
         }
