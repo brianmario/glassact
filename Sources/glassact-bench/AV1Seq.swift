@@ -42,7 +42,7 @@ let av1SeqCommand = Command(
         .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("motion-seed", "<lever>[,<lever>...]", "with --inter: seed the motion search with the picture before's (AV1HybridEncoder.motionSeed): zero=<8|4|2> (no motion's window where seeded, default 4), seed=<4|2> (the seed's window, default 2), zero-seeds (a best of no motion seeds too), gate (the seed's centre joins the inter gate's), runs (only in mostly-new pictures after mostly-new ones); on: the struct's defaults (zero=4,seed=2); off: none (default the encoder's: zero=2,seed=4,runs)"),
-        .int("profile-pictures", "<n>", 2...16, "with --profile and --inter: the stream each timed run codes, ending with the last picture (default 2: it as an inter frame after a key frame)"),
+        .int("profile-pictures", "<n>", 2...16, "with --profile or --gpu-capture and --inter: the stream each timed run (or the capture) codes, ending with the last picture (default 2: it as an inter frame after a key frame)"),
         .bool("changes", "with --inter: each picture carries its exact change map from the one before (Picture.changed, as the Host passes it), made before the timed run; the same bytes"),
         .bool("whole-sources", "every picture's padded source copied whole (AV1HybridEncoder.updatesSourcesInPlace off; the same bytes)"),
         .bool("no-split-motion", "with --inter: the motion search waits behind the filters' gate with the rest of the analysis (AV1HybridEncoder.splitsMotion off; the same bytes)"),
@@ -885,12 +885,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         descriptor.captureObject = device
         descriptor.destination = .gpuTraceDocument
         descriptor.outputURL = url
-        // the key frame first (not captured), then the inter frame alone
+        // the stream before it first (not captured: a key frame, then --profile-pictures' inter
+        // frames), then the last picture alone, as the stream codes it
         if inter, pictures.count > 1 {
             var started = false
-            try encoder.encode(count: 2, qindex: qindex, picture: { i in
-                if i == 1 { try capture.startCapture(with: descriptor); started = true }
-                return picture(pictures.count - 2 + i)
+            let k = min(pictures.count, opts.int("profile-pictures", 2))
+            try encoder.encode(count: k, qindex: qindex, picture: { i in
+                if i == k - 1 { try capture.startCapture(with: descriptor); started = true }
+                return picture(pictures.count - k + i)
             }, output: { _, _ in })
             if started { capture.stopCapture() }
         } else {

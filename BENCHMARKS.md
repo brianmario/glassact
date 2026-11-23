@@ -391,6 +391,68 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Line by line: our AV1 decoder's CPU profile, and Xcode's per-line shader profile of the encoder (2026-11-22)
+
+The owner's 60 fps Photos video (`glassact-1795125212`, frames 220.., 5K, q36, tiles 3x0), on a
+quiet M4 Pro (load 2–9).
+
+**How, CPU (our decoder):** `rust/av1`'s `own_decode` example built with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, recorded with `xctrace`'s Time Profiler on one
+thread, symbolicated with a dSYM, and every sample's address put through `atos -i` (the innermost
+line in the crate, past inlined std helpers) and against `otool -tv` (samples per instruction).
+`own_decode --dump <file.i420>` (new) writes the frames, so each change was checked against the
+build before it: all 31 frames identical, every time.
+
+| one thread, a 5K inter frame | tiles | output | frame (median) |
+|---|---|---|---|
+| main | 69.3 | 44.9 | 121 ms |
+| CDEF: one footprint check a block, raw loads (was two slice checks a tap, its 13 offsets reloaded from the stack) | | 38.2 | 116 |
+| CDEF on 16 lanes of u8 (every constrained term fits; sums widen to i16) | | 29.7 | 107 |
+| CDEF's border ring in NEON (a masked copy; outside taps take the sample, as the spec skips them) | | 26.2 | 102 |
+| the symbol decoder's bits from a 64-bit window a byte at a time (the spec reads one bit at a time) | 63.0 | | 96 |
+| motion compensation in i16 (every subpel filter sums to 128 with sum \|f\| <= 240: with p - 128 the sums fit and the rounding shifts divide the offset exactly), the vertical window in registers (it was an array shifted through the stack) | 54.9 | | **88 (−27 %)** |
+
+Left, one thread: CDEF 26 % (real work now, ~60 cycles a 16-lane step), inter prediction ~13 %,
+coefficient parsing 12 %, the symbol search loop 11 % (its exit mispredicts), inverse transforms 13 %.
+
+**How, GPU (the encoder):** Xcode's per-line profile needs the kernels compiled with line tables and
+their sources, which the run-time compile can't give: `scripts/build-rust --metallib-debug <dir>` (new)
+builds the metallibs `--metallib` builds plus `-gline-tables-only -frecord-sources`, each library
+flattened into one file first (Xcode 27.2 crashed, an assertion in its source editor, on kernels whose
+lines span include files), and `GLASSACT_AV1_METALLIB=<dir>` makes the encoder load them. The same
+stream digest and stage times as the run-time compile. `av1seq --gpu-capture` takes
+`--profile-pictures` (new): the capture was the 8th picture of a stream (seeded motion search, run
+shapes), not an inter frame after a key frame, whose profile is the key frame's. In Xcode:
+Performance, the navigator by pipeline state, the kernel's source; the metric menu under it (Cost,
+Number of Instructions, Thread Divergence, Live Registers); a line's dot shows its statistics.
+
+| kernel (share of the capture) | registers | spilled |
+|---|---|---|
+| `k_me` (21.7 %) | 192 | 112 B |
+| `k_analysis_64x64_w1t256` (15.7 %) | 192 | 768 B |
+| `k_analysis_32x32_w1t128` (12.2 %) | 192 | 32 B |
+| `k_analysis_16x16_w2` (7.4 %) | 170 | 0 |
+| `k_ml_stats` (5.7 %) | 192 | 80 B |
+
+What the lines say:
+- `k_me`: the seeded window search is 50 % of the kernel; its whole-sample SAD line 27 %, with
+  **52 % divergence** (757 M instruction slots, 364 M active: lanes that stopped early, or have a
+  vector already seen or outside, wait for the rest), 120 math instructions a row pair, 118 live
+  registers. The sub-sample step's vertical blend is 14 % (no divergence, 178 live registers, ~3.9
+  float instructions a sample: already tight).
+- The analysis's per-block set-up is ~15 % of the 32x32 kernel: lambda 2.75 %, `tile_of` 1.5 %, and
+  x / y from block indices.
+- **Kept:** those coordinates without integer division (`ga_udiv`: a float quotient corrected by
+  one, exact for indices under 2^22; division by a run-time value is emulated). The same streams at
+  5K, 2900 and 1280; inter candidates 3.20 → 3.16 ms, analysis −0.05 ms (six interleaved runs):
+  the profile's 5 % on those lines was partly its loads' latency.
+- **Rejected, measured before the profile:** `k_ml_stats` accumulating its value set and orientation
+  bins in threadgroup memory (they index registers by the sample): learned pruning 1.61 → 1.71 ms.
+  `k_me`'s sub-sample step without its cached horizontal sums (fewer registers, more threadgroup
+  reads): motion search 4.35 → 4.46 ms.
+- **Next:** `k_me`'s idle lanes: pack only the vectors each round measures into the 32 lanes (a
+  ballot and prefix sum; the best two don't depend on the order measured, so the same streams).
+
 ### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
 
 Lowering the package's floor to macOS 14.4 replaces Synchronization's `Atomic`, which needs

@@ -2,18 +2,27 @@
 //! scalar passes in mc.rs are the reference (`mc_passes_simd_match_scalar`).
 use core::arch::aarch64::*;
 
-/// The 8 source vectors of 8 columns starting at `p` (tap t: samples p[t .. t + 8]), widened,
-/// from two 8-byte loads that stay inside p[0 .. 15].
+// Every Subpel_Filters entry the passes use (positions 1..15) sums to 128 with sum |f| <= 240, so
+// with the samples as q = p - 128 (in [-128, 127]) a filtered sum is sum f q + 16384, and
+// |sum f q| <= 240 * 128 = 30720: every partial sum fits in i16. The rounding shifts the passes
+// take of the sum (3, 3 then 4, 7) divide 16384 exactly, so they take them of sum f q and add the
+// quotient back: the same integers as in i32 (`subpel_filters_fit_i16` checks the bound).
+// (The i32 sums widened every tap twice and were most of the passes' instructions; the vertical
+// passes' window lived on the stack, shifted a row at a time: BENCHMARKS, 2026-11-22.)
+
+/// The 8 source vectors of 8 columns starting at `p` (tap t: samples p[t .. t + 8]) as q = p - 128,
+/// widened, from two 8-byte loads that stay inside p[0 .. 15].
 ///
 /// # Safety
 /// p[0 .. 15] must be readable.
 #[inline(always)]
-unsafe fn taps(p: *const u8) -> [int16x8_t; 8] {
+unsafe fn taps_q(p: *const u8) -> [int16x8_t; 8] {
     unsafe {
-        let a = vld1_u8(p);
-        let b = vld1_u8(p.add(7)); // p[7 .. 15]
+        let m = vdup_n_u8(0x80);
+        let a = veor_u8(vld1_u8(p), m);
+        let b = veor_u8(vld1_u8(p.add(7)), m); // p[7 .. 15]
         let b = vext_u8::<1>(b, b); // p[8 .. 15] in lanes 0..6 (lane 7 unused)
-        let w = |v: uint8x8_t| vreinterpretq_s16_u16(vmovl_u8(v));
+        let w = |v: uint8x8_t| vmovl_s8(vreinterpret_s8_u8(v));
         [
             w(a),
             w(vext_u8::<1>(a, b)),
@@ -27,9 +36,21 @@ unsafe fn taps(p: *const u8) -> [int16x8_t; 8] {
     }
 }
 
+/// sum over t of f[t] * v[t] in i16 (q samples: see above)
+#[inline(always)]
+unsafe fn dot_q(v: [int16x8_t; 8], f: &[i16; 8]) -> int16x8_t {
+    unsafe {
+        let mut acc = vmulq_n_s16(v[0], f[0]);
+        for t in 1..8 {
+            acc = vmlaq_n_s16(acc, v[t], f[t]);
+        }
+        acc
+    }
+}
+
 /// sum over t of f[t] * v[t], in two i32x4 halves
 #[inline(always)]
-unsafe fn dot(v: &[int16x8_t; 8], f: &[i16; 8]) -> (int32x4_t, int32x4_t) {
+unsafe fn dot(v: [int16x8_t; 8], f: &[i16; 8]) -> (int32x4_t, int32x4_t) {
     unsafe {
         let mut lo = vmull_n_s16(vget_low_s16(v[0]), f[0]);
         let mut hi = vmull_high_n_s16(v[0], f[0]);
@@ -50,6 +71,38 @@ unsafe fn store_u8(d: *mut u8, lo: int32x4_t, hi: int32x4_t) {
     }
 }
 
+/// Runs `out(r, window)` for r in 0..h over a column's sliding window of 8 rows (`row(k)`: row k):
+/// eight output rows at a time with the window in fixed slots (registers, not a shifted array),
+/// the rows left over from 8 rows loaded afresh.
+#[inline(always)]
+fn v_rows(h: usize, row: impl Fn(usize) -> int16x8_t, mut out: impl FnMut(usize, [int16x8_t; 8])) {
+    let mut w = [row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(0)];
+    let mut r = 0;
+    macro_rules! step {
+        ($j:literal) => {{
+            w[($j + 7) % 8] = row(r + $j + 7);
+            out(
+                r + $j,
+                [w[$j % 8], w[($j + 1) % 8], w[($j + 2) % 8], w[($j + 3) % 8], w[($j + 4) % 8], w[($j + 5) % 8], w[($j + 6) % 8], w[($j + 7) % 8]],
+            );
+        }};
+    }
+    while r + 8 <= h {
+        step!(0);
+        step!(1);
+        step!(2);
+        step!(3);
+        step!(4);
+        step!(5);
+        step!(6);
+        step!(7);
+        r += 8;
+    }
+    for r in r..h {
+        out(r, core::array::from_fn(|t| row(r + t)));
+    }
+}
+
 pub(super) fn h_only(src: &[u8], ss: usize, w: usize, h: usize, f: &[i16; 8], dst: &mut [u8], ds: usize) {
     assert!(h > 0 && src.len() >= (h - 1) * ss + w + 7 && dst.len() >= (h - 1) * ds + w);
     // SAFETY: NEON is baseline on aarch64; row r reads src[r * ss + c .. + 15] for c + 8 <= w
@@ -57,13 +110,9 @@ pub(super) fn h_only(src: &[u8], ss: usize, w: usize, h: usize, f: &[i16; 8], ds
     unsafe {
         for r in 0..h {
             for c in (0..w).step_by(8) {
-                let v = taps(src.as_ptr().add(r * ss + c));
-                let (lo, hi) = dot(&v, f);
-                let (lo, hi) = (
-                    vrshrq_n_s32::<4>(vrshrq_n_s32::<3>(lo)),
-                    vrshrq_n_s32::<4>(vrshrq_n_s32::<3>(hi)),
-                );
-                store_u8(dst.as_mut_ptr().add(r * ds + c), lo, hi);
+                // round(round(sum, 3), 4): of sum f q, plus 16384 / 128
+                let t = vrshrq_n_s16::<4>(vrshrq_n_s16::<3>(dot_q(taps_q(src.as_ptr().add(r * ss + c)), f)));
+                vst1_u8(dst.as_mut_ptr().add(r * ds + c), vqmovun_s16(vaddq_s16(t, vdupq_n_s16(128))));
             }
         }
     }
@@ -75,18 +124,14 @@ pub(super) fn v_only(src: &[u8], ss: usize, w: usize, h: usize, f: &[i16; 8], ds
     unsafe {
         for c in (0..w).step_by(8) {
             let p = src.as_ptr().add(c);
-            let row = |k: usize| vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.add(k * ss))));
-            let mut v = [row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(0)];
-            for r in 0..h {
-                v[7] = row(r + 7);
-                let (lo, hi) = dot(&v, f);
-                store_u8(
-                    dst.as_mut_ptr().add(r * ds + c),
-                    vrshrq_n_s32::<7>(lo),
-                    vrshrq_n_s32::<7>(hi),
-                );
-                v.copy_within(1.., 0);
-            }
+            let m = vdup_n_u8(0x80);
+            let row = |k: usize| vmovl_s8(vreinterpret_s8_u8(veor_u8(vld1_u8(p.add(k * ss)), m)));
+            let d = dst.as_mut_ptr().add(c);
+            v_rows(h, row, |r, v| {
+                // round(sum, 7): of sum f q, plus 16384 / 128
+                let t = vrshrq_n_s16::<7>(dot_q(v, f));
+                vst1_u8(d.add(r * ds), vqmovun_s16(vaddq_s16(t, vdupq_n_s16(128))));
+            });
         }
     }
 }
@@ -97,9 +142,8 @@ pub(super) fn h_pass(src: &[u8], ss: usize, w: usize, rows: usize, f: &[i16; 8],
     unsafe {
         for r in 0..rows {
             for c in (0..w).step_by(8) {
-                let v = taps(src.as_ptr().add(r * ss + c));
-                let (lo, hi) = dot(&v, f);
-                let o = vcombine_s16(vmovn_s32(vrshrq_n_s32::<3>(lo)), vmovn_s32(vrshrq_n_s32::<3>(hi)));
+                // round(sum, 3): of sum f q, plus 16384 / 8
+                let o = vaddq_s16(vrshrq_n_s16::<3>(dot_q(taps_q(src.as_ptr().add(r * ss + c)), f)), vdupq_n_s16(2048));
                 vst1q_s16(inter.as_mut_ptr().add(r * w + c), o);
             }
         }
@@ -112,18 +156,11 @@ pub(super) fn v_pass(inter: &[i16], w: usize, h: usize, f: &[i16; 8], dst: &mut 
     unsafe {
         for c in (0..w).step_by(8) {
             let p = inter.as_ptr().add(c);
-            let row = |k: usize| vld1q_s16(p.add(k * w));
-            let mut v = [row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(0)];
-            for r in 0..h {
-                v[7] = row(r + 7);
-                let (lo, hi) = dot(&v, f);
-                store_u8(
-                    dst.as_mut_ptr().add(r * ds + c),
-                    vrshrq_n_s32::<11>(lo),
-                    vrshrq_n_s32::<11>(hi),
-                );
-                v.copy_within(1.., 0);
-            }
+            let d = dst.as_mut_ptr().add(c);
+            v_rows(h, |k| vld1q_s16(p.add(k * w)), |r, v| {
+                let (lo, hi) = dot(v, f);
+                store_u8(d.add(r * ds), vrshrq_n_s32::<11>(lo), vrshrq_n_s32::<11>(hi));
+            });
         }
     }
 }

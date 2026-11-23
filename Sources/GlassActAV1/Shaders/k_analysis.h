@@ -553,12 +553,12 @@ kernel void k_analysis(constant GpBatch &B [[buffer(0)]], constant GpParams &P [
         uint32_t li = gb - starts[lo];
         if (B.sbList) {  // Glass Act: only the listed SBs (one image)
             const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
-            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
-            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            const int bx = (int)ga_umod(sb, (uint)I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)ga_udiv(sb, (uint)I.sbCols) * (64 / H) + (int)(k / (64 / W));
             if (bx >= nbx || by >= I.shNby[BS]) continue;
             li = (uint32_t)(by * nbx + bx);
         }
-        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        const int x = (int)ga_umod(li, (uint)nbx) * W, y = (int)ga_udiv(li, (uint)nbx) * H;
         device GpBlockRes &out = B.blk[I.shOff[BS] + li];
         if (x >= I.MiCols * 4 || y >= I.MiRows * 4) {
             if (lane == 0) { out.J = GP_INF; out.ncand = 0; }

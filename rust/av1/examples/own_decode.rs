@@ -5,6 +5,9 @@
 //!
 //!   cargo run --release --example own_decode -- [--writer] [--444] [--upscale] [--threads N] [--repeat K] <stream.ivf> [<aomdec.i420>]
 //!
+//! `--dump <file.i420>`: writes the decoder's frames as one I420 file (the format the comparison
+//! reads), so one build's output can check another's.
+//!
 //! `--upscale`: reduced frames' planes are also scaled up to the stream's size by the Viewer's
 //! upscaler (`upscale::Upscaler`), and timed apart.
 //!
@@ -30,6 +33,8 @@ fn main() {
     let upscale = take("--upscale").is_some();
     let threads: usize = take("--threads").map_or(0, |v| v.parse().unwrap());
     let repeat: usize = take("--repeat").map_or(1, |v| v.parse().unwrap());
+    let dump = take("--dump");
+    let mut dumped = Vec::new();
     let ivf = std::fs::read(&args[0]).expect("read ivf");
     let reference = args.get(1).map(|p| std::fs::read(p).expect("read i420"));
     assert_eq!(&ivf[0..4], b"DKIF");
@@ -115,6 +120,14 @@ fn main() {
                 if round == 0 && compare(k, p.planes, p.stride) {
                     exact += 1;
                 }
+                if round == 0 && dump.is_some() {
+                    let dims = [(w, h), (cw, ch), (cw, ch)];
+                    for (i, &(pw, ph)) in dims.iter().enumerate() {
+                        for y in 0..ph {
+                            dumped.extend_from_slice(&p.planes[i][y * p.stride[i]..][..pw]);
+                        }
+                    }
+                }
                 if dt < best[k] {
                     best[k] = dt;
                 }
@@ -135,6 +148,9 @@ fn main() {
                 }
             }
         }
+    }
+    if let Some(path) = &dump {
+        std::fs::write(path, &dumped).expect("write --dump");
     }
     let stats = |key_frames: bool| -> Option<(usize, f64, f64)> {
         let mut v: Vec<f64> = (0..n).filter(|&k| key[k] == key_frames).map(|k| best[k]).collect();
