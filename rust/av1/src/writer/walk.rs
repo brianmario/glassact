@@ -309,6 +309,8 @@ pub(crate) struct TileState {
     dq: Box<[i32; 1024]>,
     res: Box<[i32; 4096]>,
     lev: Box<[u8; LEV_N]>,
+    /// the scan indices of a block's non-zero levels, last first (coeffs)
+    nz: Box<[u16; 1024]>,
     // tile
     mi_row_start: i32,
     mi_row_end: i32,
@@ -362,6 +364,7 @@ impl Default for TileState {
             dq: Box::new([0; 1024]),
             res: Box::new([0; 4096]),
             lev: Box::new([0; LEV_N]),
+            nz: Box::new([0; 1024]),
             mi_row_start: 0,
             mi_row_end: 0,
             mi_col_start: 0,
@@ -3193,6 +3196,8 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
             let coeff_base_eob = &mut cdf.coeff_base_eob[tx_sz_ctx][ptype];
             let coeff_base = &mut cdf.coeff_base[tx_sz_ctx][ptype];
             let coeff_br = &mut cdf.coeff_br[brsz][ptype];
+            let nz = &mut st.nz[..];
+            let mut nn = 0;
             for c in (0..eob).rev() {
                 let pos = scan[c as usize] as usize;
                 let v = (q[pos] as i32).abs();
@@ -3259,16 +3264,18 @@ impl<S: Sink, H: TxbHook, const SS: i32> Walk<'_, S, H, SS> {
                     }
                 }
                 lev[lp] = level as u8;
+                // (appended either way, kept where non-zero: the sign loop below then visits only
+                // those, without a branch on each level)
+                nz[nn & 1023] = c as u16;
+                nn += (level != 0) as usize;
             }
             // signs and Golomb remainders (forward scan order)
             let ad = &st.above_dc[plane];
             let ld = &st.left_dc[plane];
-            for c in 0..eob as usize {
+            for &c in nz[..nn].iter().rev() {
+                let c = c as usize;
                 let pos = scan[c] as usize;
                 let lp = (pos >> bwl) * ls + (pos & (width - 1));
-                if lev[lp] == 0 {
-                    continue;
-                }
                 let v_w = q[pos] as i32;
                 let sign_w = (v_w < 0) as i32;
                 let a_w = v_w.abs();

@@ -145,17 +145,18 @@ fn cdef_filter<const W: usize>(
     assert!((y0 - dy + W - 1) * ds + x0 + W <= dst.len());
     // SAFETY: the block and its taps are inside `src` and its rows inside `dst` (asserted above).
     unsafe {
-        cdef_filter_raw::<W, false>(
+        let (c, d) = (
             src.as_ptr().add(y0 * ss + x0),
-            ss,
-            core::ptr::null(),
             dst.as_mut_ptr().add((y0 - dy) * ds + x0),
-            ds,
-            pri,
-            sec,
-            damping,
-            dir,
-        )
+        );
+        let n = core::ptr::null();
+        // (the taps of a strength of 0 add nothing: skipped, and with them the clamp)
+        match (pri != 0, sec != 0) {
+            (true, true) => cdef_filter_raw::<W, false, true, true>(c, ss, n, d, ds, pri, sec, damping, dir),
+            (true, false) => cdef_filter_raw::<W, false, true, false>(c, ss, n, d, ds, pri, sec, damping, dir),
+            (false, true) => cdef_filter_raw::<W, false, false, true>(c, ss, n, d, ds, pri, sec, damping, dir),
+            (false, false) => cdef_filter_raw::<W, false, false, false>(c, ss, n, d, ds, pri, sec, damping, dir),
+        }
     }
 }
 
@@ -194,7 +195,17 @@ fn cdef_filter_border<const W: usize>(
     // SAFETY: buf and ok hold the block at (2, 2) with 2 samples all round (stride 16, W + 4 <= 16
     // columns and rows read); out holds its W rows of W.
     unsafe {
-        cdef_filter_raw::<W, true>(buf.as_ptr().add(34), 16, ok.as_ptr().add(34), out.as_mut_ptr(), W, pri, sec, damping, dir)
+        cdef_filter_raw::<W, true, true, true>(
+            buf.as_ptr().add(34),
+            16,
+            ok.as_ptr().add(34),
+            out.as_mut_ptr(),
+            W,
+            pri,
+            sec,
+            damping,
+            dir,
+        )
     }
     for i in 0..W {
         let o = (y0 as usize + i - dy) * ds + x0 as usize;
@@ -211,7 +222,7 @@ fn cdef_filter_border<const W: usize>(
 /// Rows -2 ..= W + 1 and columns -2 ..= W + 1 around `c` (and `mask`) are readable, and W rows of
 /// W at `dst` writable.
 #[inline(always)]
-unsafe fn cdef_filter_raw<const W: usize, const MASKED: bool>(
+unsafe fn cdef_filter_raw<const W: usize, const MASKED: bool, const PRI: bool, const SEC: bool>(
     c: *const u8,
     ss: usize,
     mask: *const u8,
@@ -261,21 +272,29 @@ unsafe fn cdef_filter_raw<const W: usize, const MASKED: bool>(
             let (mut lo, mut hi) = (vdupq_n_s16(0), vdupq_n_s16(0));
             for k in 0..2 {
                 for sign in [1isize, -1] {
-                    let p = load(sign * po[k]);
-                    let v = constrain16(p, x, pt, pa);
-                    let w = vdup_n_s8(pri_taps[k]);
-                    lo = vmlal_s8(lo, vget_low_s8(v), w);
-                    hi = vmlal_high_s8(hi, v, vcombine_s8(w, w));
-                    mx = vmaxq_u8(mx, p);
-                    mn = vminq_u8(mn, p);
-                    for &o in &so[k] {
-                        let p = load(sign * o);
-                        let v = constrain16(p, x, st, sa);
-                        let w = vdup_n_s8(sec_taps[k]);
+                    if PRI {
+                        let p = load(sign * po[k]);
+                        let v = constrain16(p, x, pt, pa);
+                        let w = vdup_n_s8(pri_taps[k]);
                         lo = vmlal_s8(lo, vget_low_s8(v), w);
                         hi = vmlal_high_s8(hi, v, vcombine_s8(w, w));
-                        mx = vmaxq_u8(mx, p);
-                        mn = vminq_u8(mn, p);
+                        if SEC {
+                            mx = vmaxq_u8(mx, p);
+                            mn = vminq_u8(mn, p);
+                        }
+                    }
+                    if SEC {
+                        for &o in &so[k] {
+                            let p = load(sign * o);
+                            let v = constrain16(p, x, st, sa);
+                            let w = vdup_n_s8(sec_taps[k]);
+                            lo = vmlal_s8(lo, vget_low_s8(v), w);
+                            hi = vmlal_high_s8(hi, v, vcombine_s8(w, w));
+                            if PRI {
+                                mx = vmaxq_u8(mx, p);
+                                mn = vminq_u8(mn, p);
+                            }
+                        }
                     }
                 }
             }
@@ -286,7 +305,11 @@ unsafe fn cdef_filter_raw<const W: usize, const MASKED: bool>(
                 vqmovun_s16(vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(x)), d))
             };
             let v = vcombine_u8(r(lo, vget_low_u8(x)), r(hi, vget_high_u8(x)));
-            let v = vminq_u8(vmaxq_u8(v, mn), mx);
+            // With one of the strengths 0, the taps' weights sum to 12, and the result stays
+            // within the taps' range without the clamp: a positive sum is at most 12 D (D: the
+            // largest p - x), and (8 + 12 D) >> 4 <= D; a negative one at least -12 D' (D': the
+            // largest x - p), and (7 - 12 D') >> 4 >= -D'. dav1d skips the clamp there too.
+            let v = if PRI && SEC { vminq_u8(vmaxq_u8(v, mn), mx) } else { v };
             let o = dst.add(2 * i * ds);
             if W == 8 {
                 vst1_u8(o, vget_low_u8(v));
@@ -327,10 +350,14 @@ pub(super) fn cdef_rect(
     (r0, r1): (i32, i32),
     (c0, c1): (i32, i32),
 ) {
-    for r in (r0..r1.min(f.mi_rows)).step_by(2) {
-        for c in (c0..c1.min(f.mi_cols)).step_by(2) {
+    if cdef_rect_copy(f, m, src, sstride, dst, dstride, dst_row, (r0, r1), (c0, c1)) {
+        return;
+    }
+    let (re, ce) = (r1.min(f.mi_rows), c1.min(f.mi_cols));
+    for r in (r0..re).step_by(2) {
+        for c in (c0..ce).step_by(2) {
             let idx = cdef_active_idx(f, m, r, c);
-            let o = if idx < 0 {
+            let o = if cdef_quiet(f, idx) {
                 CdefBlk::default()
             } else {
                 let (s0, ss0) = (src[0], sstride[0]);

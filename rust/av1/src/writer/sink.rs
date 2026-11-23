@@ -159,7 +159,21 @@ impl<'a> DecSink<'a> {
         x
     }
 
+    /// The new range and value after a symbol (`SymbolRange = prev - cur`, `SymbolValue -= cur`),
+    /// renormalized.
+    #[inline(always)]
+    fn finish(&mut self, range: u32, value: u32) {
+        let bits = range.leading_zeros() - 16;
+        self.symbol_range = range << bits;
+        self.symbol_value = (value << bits) | self.take(bits);
+    }
+
     /// read_symbol: decodes with `cdf` (`n` symbols).
+    ///
+    /// (The loop stays: counting the bounds above the value in NEON, as dav1d does, without the
+    /// loop's branches, was 10 % slower a frame. A correctly predicted exit lets the core run on
+    /// into the next symbol's context; the count's latency sat in front of every use of the
+    /// symbol: BENCHMARKS, 2026-11-23.)
     fn read(&mut self, cdf: &[u16], n: usize) -> usize {
         let mut cur = self.symbol_range;
         let mut prev;
@@ -174,12 +188,22 @@ impl<'a> DecSink<'a> {
                 break;
             }
         }
-        self.symbol_range = prev - cur;
-        self.symbol_value -= cur;
-        let bits = self.symbol_range.leading_zeros() - 16;
-        self.symbol_range <<= bits;
-        self.symbol_value = (self.symbol_value << bits) | self.take(bits);
+        self.finish(prev - cur, self.symbol_value - cur);
         symbol
+    }
+
+    /// read_symbol of the 2-symbol CDF {32768 - fq, 32768}, without a branch: the loop's first
+    /// bound is `((SymbolRange >> 8) * (fq >> 6) >> 1) + 4` and its second 0, so the symbol is 1
+    /// where the value is below the first. The equiprobable bits (signs, Golomb codes) and
+    /// split_or's bools are this; their branches mispredicted half the time.
+    #[inline(always)]
+    fn read_bool(&mut self, fq: u32) -> usize {
+        let (r, v) = (self.symbol_range, self.symbol_value);
+        let cur = (((r >> 8) * (fq >> 6)) >> 1) + 4;
+        let b = v < cur;
+        let (range, value) = if b { (cur, v) } else { (r - cur, v - cur) };
+        self.finish(range, value);
+        b as usize
     }
 }
 
@@ -193,11 +217,48 @@ impl Sink for DecSink<'_> {
     }
     #[inline]
     fn bit(&mut self, _: i32) -> i32 {
-        self.read(&[1 << 14, 1 << 15, 0], 2) as i32
+        self.read_bool(1 << 14) as i32
     }
     #[inline]
     fn split_or(&mut self, pc: &[u16], vert: bool, _: i32) -> i32 {
-        let tmp = [32768u32.wrapping_sub(split_or_psum(pc, vert)) as u16, 32768, 0];
-        self.read(&tmp, 2) as i32
+        // (the CDF {32768 - psum, 32768}, as the encoder's)
+        let c0 = 32768u32.wrapping_sub(split_or_psum(pc, vert)) as u16;
+        self.read_bool(32768 - c0 as u32) as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::Rng;
+
+    /// The branchless bool reads against the spec's loop, on random streams and bounds (0 and
+    /// 32768 among them), interleaved with symbols of larger CDFs.
+    #[test]
+    fn bool_reads_match_the_loop() {
+        let mut rnd = Rng(0x5eed);
+        for _ in 0..300 {
+            let len = rnd.below(64) as usize;
+            let data: Vec<u8> = (0..len).map(|_| rnd.below(256) as u8).collect();
+            let (mut a, mut b) = (DecSink::new(&data), DecSink::new(&data));
+            for _ in 0..2000 {
+                let c0 = match rnd.below(8) {
+                    0 => 0,
+                    1 => 32768,
+                    2 => 1 << 14,
+                    _ => rnd.below(32769),
+                } as u16;
+                let cdf = [c0, 32768, 0];
+                match rnd.below(3) {
+                    0 => assert_eq!(a.read_bool(32768 - c0 as u32), b.read(&cdf, 2)),
+                    1 => assert_eq!(a.bit(0), b.read(&[1 << 14, 1 << 15, 0], 2) as i32),
+                    _ => {
+                        let c = [8000, 20000, 32768, 0];
+                        assert_eq!(a.read(&c, 3), b.read(&c, 3));
+                    }
+                }
+                assert_eq!((a.symbol_range, a.symbol_value), (b.symbol_range, b.symbol_value));
+            }
+        }
     }
 }

@@ -158,6 +158,8 @@ the numbers and the reasoning.
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
 | The own decoder's 4:2:0 chroma scaled up with vImage's Lanczos before converting, instead of vImage's 4:2:0 conversion (`av1-viewer-decoder`) | rejected | +0.03 dB (47.92 → 47.95, VideoToolbox 48.19), conversion 0.60 → 14.9 ms a 5K frame | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
+| Our decoder on one thread: DCT_DCT on 8 lanes of i16, CDEF's blocks of strength 0 copied (on x86_64 too), one strength 0 without its taps and clamp, branchless 2-symbol reads, the sign pass over non-zero levels | kept | a 5K inter frame 82.6 → 50.3 ms on M4 Pro (output 24.9 → 3.0, tiles 51.8 → 41.6); x86_64 under Rosetta 784 → 144 ms; the same frames | [entry](#our-av1-decoder-on-one-thread-16-bit-dcts-cdefs-no-op-blocks-branchless-bits-2026-11-23) |
+| Our decoder's symbol search in NEON without the loop's branches (dav1d's count of the bounds above the value) | rejected | a 5K inter frame 87.1 → 95.9 ms: the count's latency lands on every use of the symbol, where a predicted exit lets the core run ahead | [entry](#our-av1-decoder-on-one-thread-16-bit-dcts-cdefs-no-op-blocks-branchless-bits-2026-11-23) |
 | Lossless 4:4:4 AV1 tiles from the hybrid (qindex 0, identity matrix) | not built | at qindex 1, short of lossless, text and UI tiles already cost 9–34 % more than VP8L's lossless ones | [entry](#lossless-444-av1-tiles-from-the-hybrid-a-bound-before-building-it-2026-11-17) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
@@ -390,6 +392,61 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Our AV1 decoder on one thread: 16-bit DCTs, CDEF's no-op blocks, branchless bits (2026-11-23)
+
+The same stream as the entry below (the owner's 60 fps Photos video, 31 frames, 5K, q36), an M4
+Pro shared with a GPU benchmark (load 2–9; every run through one lock, A/B runs interleaved with
+the order alternating, 3–6 rounds). Each change was checked against main's frames (all 31
+identical), `cargo test --release`, and the x86_64 tests under Rosetta where it touches that path.
+Main's own build measured 87 ms early in the session and 82 ms later (88 in the entry below): the
+Mac's state, so every row compares builds timed side by side.
+
+What the stream does: 99 % of its 2,540 TX_64X64 transforms a frame have more than 64
+coefficients, so a DC-only path would buy nothing; and 96.5 % of the 8x8s CDEF filters, luma and
+chroma alike, have **every strength 0** (the rest: luma 3.2 % secondary only, 0.3 % both; chroma
+3.5 % primary only). Those blocks ran the direction search and all 13 taps to give back the block.
+
+| one thread, a 5K inter frame | tiles | output | frame (median) |
+|---|---|---|---|
+| main | 51.8 | 24.8 | 82.2 ms |
+| equiprobable bits (signs, Golomb codes) and split_or's bools without a branch: the value against one bound, the new state by selects | 50.5 | | 81.3 |
+| DCT_DCT (8x8 and up) on 8 lanes of i16: every DCT value fits 16 bits until the first range violation; H is the saturating add / subtract, B widens and narrows with saturation, a result on a limit goes to the scalar reference | 43.9 | | 74.4 |
+| CDEF of blocks whose entry has every strength 0: a copy, without the direction search; a 64x64 of such an entry one copy of its rows | | 3.1 | 51.9 |
+| CDEF with one strength 0: without that kind's taps and without the clamp (the other kind's weights sum to 12, so the result stays in the taps' range) | | 2.8 | 51.5 |
+| the sign pass over the non-zero levels only (the level pass keeps their scan indices; the skip of zero levels mispredicted) | 41.0 | | 49.7 |
+| main → all, 3 interleaved rounds | 51.8 → 41.6 | 24.9 → 3.0 | **82.6 → 50.3 (−39 %)** |
+
+The 16-bit DCT at every size it takes (`bench_inv_txfm2d`, DCT_DCT, the low-frequency quarter
+populated, two runs each): 8x8 34 → 30 ns, 16x8 78 → 63, 8x16 85 → 50, 16x16 176 → 115, 16x32 537
+→ 358, 32x32 1188 → 751, 64x64 4598 → 2571; the encoder's closed loop shares it. The real-decoder
+tests (`decoders`, `decoders_444`, `decoders_444_inter`, `palette_decoders`,
+`decoders_agree`) pass, and the stream decodes identically on 8 threads.
+
+**x86_64 (Intel Viewers):** its CDEF is the scalar per-sample code, so the quiet-block copy is shared
+with it (`postfilter::cdef_rect_copy`). Under Rosetta, one thread: output 647 → 40 ms, a 5K inter
+frame 784 → 144 ms; the same frames.
+
+**Rejected:** the symbol search in NEON for every adaptive CDF, as dav1d does it (the symbol is the
+number of the loop's bounds above the value: they fall strictly, by at least 4 a symbol, and the
+last is 0): a 5K inter frame **87.1 → 95.9 ms**, tiles 54.4 → 62.6 (4 rounds against main). The
+search's own samples fell (1,305 → 934), but `txb` rose from 12 % to 20 %, its samples on the
+first instruction that uses the symbol: a correctly predicted exit lets the core run on into the next
+symbol's context, while the branchless count (multiply, narrow, compare, add across, index) puts
+its whole latency in front of every use. The first version also hit a `memset_pattern16` call and a
+vector load across several small stores; a version with direct loads, and `prev` / `cur`
+recomputed from the CDF, wasn't timed (its extra load and multiply sit on the same chain). Only
+the 2-symbol reads, whose branch is a coin flip, went branchless.
+
+Left, one thread (50 ms): coefficient parsing 17 %, inter prediction 15 %, the symbol loop 15 %,
+inverse transforms ~21 % (the 64-point column pass 9 %), deblocking 8 %, the 64x64 copies between
+the tile, frame and output buffers ~8 %, CDEF 2.6 %. 2.5 % is slice-range checks, two thirds
+of them in the 16-bit column pass's stores of the residual (i32).
+
+**Next:** the 16-bit transforms with one footprint check and raw loads and stores, and the residual
+handed to `add_residual` as i16; the 64-point DCT with its upper half of inputs zero (half the first
+stage's multiplies, as dav1d's dct64); the 16-bit DCT in SSE for Intel; the symbol decoder's state
+in registers (`read` isn't inlined, so range and value go through memory every symbol).
 
 ### Line by line: our AV1 decoder's CPU profile, and Xcode's per-line shader profile of the encoder (2026-11-22)
 
