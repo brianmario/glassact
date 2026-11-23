@@ -327,10 +327,39 @@ pub(super) fn cdef_rect(
     (r0, r1): (i32, i32),
     (c0, c1): (i32, i32),
 ) {
-    for r in (r0..r1.min(f.mi_rows)).step_by(2) {
-        for c in (c0..c1.min(f.mi_cols)).step_by(2) {
+    // CDEF with every strength of the block's entry 0 leaves it as it is (no tap adds anything;
+    // the direction only steers taps): a copy, without the direction search. A rect of such
+    // blocks (one 64x64 has one entry) is one copy of the samples the blocks would write.
+    let zero = |idx: i32| {
+        let i = idx as usize;
+        idx < 0 || (f.cdef_y_pri[i] | f.cdef_y_sec[i] | f.cdef_uv_pri[i] | f.cdef_uv_sec[i]) == 0
+    };
+    let (re, ce) = (r1.min(f.mi_rows), c1.min(f.mi_cols));
+    if r0 < re && c0 < ce {
+        let (sr0, sr1, sc0, sc1) = (r0 >> 4, (re - 1) >> 4, c0 >> 4, (ce - 1) >> 4);
+        let all = (sr0..=sr1).all(|sr| (sc0..=sc1).all(|sc| zero(m.cdef_idx[(sr * f.sb_cols + sc) as usize] as i32)));
+        if all {
+            // (the blocks are 8x8 luma: the rect rounded up to even 4x4s)
+            let (rn, cn) = ((re - r0 + 1) & !1, (ce - c0 + 1) & !1);
+            for p in 0..f.planes() {
+                let sub = f.sub(p);
+                let (x0, y0) = (((c0 * 4) >> sub) as usize, ((r0 * 4) >> sub) as usize);
+                let (w, h) = (((cn * 4) >> sub) as usize, ((rn * 4) >> sub) as usize);
+                let dy = ((dst_row * 4) >> sub) as usize;
+                let (s, ss, ds) = (src[p], sstride[p], dstride[p]);
+                let d = &mut *dst[p];
+                for i in 0..h {
+                    let (a, b) = ((y0 + i) * ss + x0, (y0 - dy + i) * ds + x0);
+                    d[b..b + w].copy_from_slice(&s[a..a + w]);
+                }
+            }
+            return;
+        }
+    }
+    for r in (r0..re).step_by(2) {
+        for c in (c0..ce).step_by(2) {
             let idx = cdef_active_idx(f, m, r, c);
-            let o = if idx < 0 {
+            let o = if zero(idx) {
                 CdefBlk::default()
             } else {
                 let (s0, ss0) = (src[0], sstride[0]);
