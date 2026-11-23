@@ -35,6 +35,21 @@ import Testing
         #expect(KeyModifiers.isDown(keyCode: 60, modifierFlags: KeyModifiers.command) == false)
     }
 
+    /// ⌃⌘Q for Lock Screen (#166): the modifiers go down first and up last,
+    /// and every event carries what's held, with each side's device bit.
+    @Test func lockScreenKeystrokesAreTypedWithTheirModifiers() {
+        let lCtrl = UInt32(KeyModifiers.control | 0x01), lCmd = UInt32(Self.lCmd)
+        let steps = KeyModifiers.lockScreenKeystrokes
+        #expect(steps.map(\.keyCode) == [59, 55, 12, 12, 55, 59])
+        #expect(steps.map(\.down) == [true, true, true, false, false, false])
+        #expect(steps.map(\.flags) == [lCtrl, lCtrl | lCmd, lCtrl | lCmd, lCtrl | lCmd, lCtrl, 0])
+        // what the system reads back from each modifier event: ⌃ then ⌘ down, ⌘ then ⌃ up
+        #expect(KeyModifiers.isDown(keyCode: 59, modifierFlags: UInt(steps[0].flags)) == true)
+        #expect(KeyModifiers.isDown(keyCode: 55, modifierFlags: UInt(steps[1].flags)) == true)
+        #expect(KeyModifiers.isDown(keyCode: 55, modifierFlags: UInt(steps[4].flags)) == false)
+        #expect(KeyModifiers.isDown(keyCode: 59, modifierFlags: UInt(steps[5].flags)) == false)
+    }
+
     @Test func capsLockAndFunction() {
         #expect(KeyModifiers.isDown(keyCode: 57, modifierFlags: KeyModifiers.capsLock) == true)
         #expect(KeyModifiers.isDown(keyCode: 57, modifierFlags: 0) == false)

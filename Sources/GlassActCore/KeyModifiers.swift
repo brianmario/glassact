@@ -48,6 +48,25 @@ public enum KeyModifiers {
         return UInt32(truncatingIfNeeded: flags)
     }
 
+    /// ⌃⌘Q, the system's Lock Screen shortcut, as a person types it: left ⌃
+    /// down, left ⌘ down, Q down and up, then ⌘ and ⌃ up, each event with the
+    /// flags `posted` gives the keys held at that point (the side-less flags
+    /// and each side's device bit), as the Host posts remote input. The Host
+    /// used to post a bare Q down/up with the ⌃⌘ flags only, and on a Mac
+    /// where remote input worked that didn't lock (#166).
+    public static let lockScreenKeystrokes: [(keyCode: UInt16, down: Bool, flags: UInt32)] = {
+        let control = UInt32(Self.control), command = UInt32(Self.command)
+        let steps: [(UInt16, Bool, UInt32, Set<Int>)] = [
+            (59, true, control, [59]),
+            (55, true, control | command, [59, 55]),
+            (12, true, control | command, [59, 55]),
+            (12, false, control | command, [59, 55]),
+            (55, false, control, [59]),
+            (59, false, 0, []),
+        ]
+        return steps.map { ($0.0, $0.1, posted($0.2, heldKeyCodes: $0.3)) }
+    }()
+
     /// Whether the modifier key `keyCode` is down after a flags-changed
     /// event with `modifierFlags`, or nil if `keyCode` isn't a modifier key.
     ///

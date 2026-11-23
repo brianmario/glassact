@@ -1690,9 +1690,12 @@ automatic checks.
     left unlocked stays unlocked. It locks 1 s after a leave on purpose, once the
     restore has settled (macOS refuses mode changes at the lock screen), or
     30 s after a dropped connection.
-  - It posts ⌃⌘Q, the system's Lock Screen shortcut, and confirms the lock
-    from the `screenIsLocked` notification; if it doesn't lock (a remapped
-    shortcut, no Device Control grant), the Host reports it.
+  - It posts ⌃⌘Q, the system's Lock Screen shortcut, typed as a person types
+    it (⌃ and ⌘ down first and up last, each event with each side's device
+    bit, from a private source like remote input's), and confirms the lock
+    from the `screenIsLocked` notification or the session's state within 3 s;
+    if it doesn't lock (a remapped shortcut, no Device Control grant), the
+    Host reports it.
 - Bonjour advertises the computer name.
 
 ---

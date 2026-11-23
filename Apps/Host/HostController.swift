@@ -2542,8 +2542,8 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                 if locked {
                     self.onStatus("screen locked (viewer disconnected)")
                 } else {
-                    self.onStatus("couldn't lock the screen — is ⌃⌘Q still the Lock Screen shortcut, "
-                                  + "and does Glass Act Host have Device Control?")
+                    self.onStatus("couldn't lock the screen — ⌃⌘Q, posted as keystrokes, didn't lock it within 3 s: "
+                                  + "is ⌃⌘Q still the Lock Screen shortcut, and does Glass Act Host have Device Control?")
                 }
             } }
         }
@@ -2553,10 +2553,14 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
     /// Main thread. Locks the session with ⌃⌘Q, the system's own Lock
     /// Screen shortcut, posted as keystrokes: public API, using the
-    /// Accessibility grant remote input already needs. `done` gets whether
-    /// the screen actually locked, from the system's `screenIsLocked`
-    /// notification within 2 s, so a remapped shortcut or a missing grant
-    /// reports failure instead of a false "locked".
+    /// Accessibility grant remote input already needs. The keys go as a person
+    /// types them, modifiers first, with each side's device bit, from a private
+    /// source as remote input's are (`KeyModifiers.lockScreenKeystrokes`): a
+    /// bare Q with the ⌃⌘ flags didn't lock a Mac where remote input worked
+    /// (#166). `done` gets whether the screen actually locked, from the system's
+    /// `screenIsLocked` notification or the session's state within 3 s, so a
+    /// remapped shortcut or a missing grant reports failure instead of a false
+    /// "locked".
     @MainActor private func lockScreen(then done: @escaping @MainActor (Bool) -> Void) {
         if Self.screenIsLocked { done(true); return }
         let center = DistributedNotificationCenter.default()
@@ -2565,16 +2569,21 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
                                             object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { state.finish(true, done) }
         }
-        let q: CGKeyCode = 12
-        if let down = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: true),
-           let up = CGEvent(keyboardEventSource: nil, virtualKey: q, keyDown: false) {
-            down.flags = [.maskControl, .maskCommand]
-            up.flags = [.maskControl, .maskCommand]
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
+        let source = CGEventSource(stateID: .privateState)
+        for key in KeyModifiers.lockScreenKeystrokes {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key.keyCode), keyDown: key.down)
+            else { continue }
+            event.flags = CGEventFlags(rawValue: UInt64(key.flags))
+            event.post(tap: .cghidEventTap)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            MainActor.assumeIsolated { state.finish(Self.screenIsLocked, done) }
+        // (the notification can come before the session's state says locked, or
+        // not at all: also look at the state every quarter second)
+        for tick in 1...12 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 * Double(tick)) {
+                MainActor.assumeIsolated {
+                    if Self.screenIsLocked { state.finish(true, done) } else if tick == 12 { state.finish(false, done) }
+                }
+            }
         }
     }
 
