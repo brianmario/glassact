@@ -447,6 +447,9 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         // most 16320 + 32, and their >> 6 a floor of a product by 1/64, both exact)
         float cv[8];  // the lane's 8 samples of the cell
         for (int col = 0; col < 8; col++) cv[col] = (float)cur[warp][row * 16 + col0 + col];
+        // Glass Act: both steps and their 3 columns unrolled: the same sums, 0.06 ms less of video's
+        // motion search a 5K picture (BENCHMARKS "k_me's sub-sample steps unrolled")
+#pragma clang loop unroll(full)
         for (int step = 4; step >= 2; step >>= 1) {
             const int2 c = best[0];
             uint top = 0xFFFFFFFFu;
@@ -456,6 +459,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
             // and the column's 3 positions share them
             const int oy0 = ((c.y - step) >> 3) - by + 1, span = (((c.y + step) >> 3) - by + 1) - oy0;  // rows oy0 .. oy0 + span + 1
             float pt[9];  // the lane's part of each position's SAD
+#pragma clang loop unroll(full)
             for (int j = 0; j < 3; j++) {
                 const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1;
                 const float fx = (float)(vx & 7), gx = 8.f - fx;
