@@ -450,8 +450,17 @@ What the lines say:
   bins in threadgroup memory (they index registers by the sample): learned pruning 1.61 → 1.71 ms.
   `k_me`'s sub-sample step without its cached horizontal sums (fewer registers, more threadgroup
   reads): motion search 4.35 → 4.46 ms.
-- **Next:** `k_me`'s idle lanes: pack only the vectors each round measures into the 32 lanes (a
-  ballot and prefix sum; the best two don't depend on the order measured, so the same streams).
+- **Rejected: `k_me`'s idle lanes packed** (the same streams at 5K, 2900 and 1280 every time; six or
+  two interleaved runs each, motion search against 4.34–4.36 ms):
+  - a SIMD-group queue of only the vectors a round measures (not seen, inside, below thr), 32 a
+    batch: 4.36, unchanged. The lanes weren't idle for skipped vectors: a round lasts as long as its
+    longest vector, and most vectors stop at their first row pair;
+  - persistent lanes on a ring of 64 (each lane a row pair of its vector a step, taking the next
+    vector when done): 4.65 (+7 %); 2 row pairs a step 4.54, 4 4.43. The ring's upkeep (prefix sums,
+    a ballot, two `simd_min`s, barriers) costs more than the idle lanes did.
+  The SAD line's 120 synchronization instructions a row pair (one wait a load) say it's bound by
+  its byte loads' latency, not by ALU slots: the next lever there is the reference read from
+  threadgroup memory (a window's 24 x 24 region staged once), not the lanes' occupancy.
 
 ### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
 
