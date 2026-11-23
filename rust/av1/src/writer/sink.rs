@@ -106,45 +106,56 @@ impl Sink for TeeSink<'_> {
     }
 }
 
-/// The symbol decoder exactly as specified in AV1 spec 8.2.2 .. 8.2.6.
+/// The symbol decoder of AV1 spec 8.2.2 .. 8.2.6, with the bits it reads kept in a window.
+///
+/// The spec reads its new bits one at a time and keeps `SymbolValue` as
+/// `((value + 1) << bits) - 1) ^ paddedData`, which is `(value << bits)` with the next `bits` bits
+/// of the stream complemented below it (past the end of the data, zeros: complemented, ones). So
+/// the stream is read a byte at a time, complemented, into `cache` (its next bits from the top;
+/// past the end, zero bytes), and each renormalization takes its bits from there: the same
+/// symbols. (The spec's bit-at-a-time reading was most of decoding a symbol: BENCHMARKS,
+/// 2026-11-22.) `SymbolMaxBits` and the bit position only bound that reading, so they're gone.
 pub(crate) struct DecSink<'a> {
     data: &'a [u8],
-    bitpos: usize,
+    /// the next byte of `data` to go into the cache
+    pos: usize,
+    /// the stream's next `cnt` bits from the top, complemented
+    cache: u64,
+    cnt: u32,
     symbol_value: u32,
     symbol_range: u32,
-    symbol_max_bits: i64,
 }
 
 impl<'a> DecSink<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         let mut d = DecSink {
             data,
-            bitpos: 0,
+            pos: 0,
+            cache: 0,
+            cnt: 0,
             symbol_value: 0,
-            symbol_range: 0,
-            symbol_max_bits: 0,
+            symbol_range: 1 << 15,
         };
-        let num_bits = (data.len() * 8).min(15) as i32;
-        let buf = d.f(num_bits);
-        let padded_buf = buf << (15 - num_bits);
-        d.symbol_value = ((1u32 << 15) - 1) ^ padded_buf;
-        d.symbol_range = 1 << 15;
-        d.symbol_max_bits = 8 * data.len() as i64 - 15;
+        // (the spec: the first 15 bits, zeros past the end, XOR (1 << 15) - 1)
+        d.symbol_value = d.take(15);
         d
     }
 
-    fn f(&mut self, n: i32) -> u32 {
-        let mut x = 0u32;
-        for _ in 0..n {
-            let byte = self.bitpos >> 3;
-            let b = if byte < self.data.len() {
-                (self.data[byte] >> (7 - (self.bitpos & 7))) & 1
-            } else {
-                0
-            };
-            x = 2 * x + b as u32;
-            self.bitpos += 1;
+    /// The stream's next `n` (<= 16) bits, complemented.
+    #[inline(always)]
+    fn take(&mut self, n: u32) -> u32 {
+        if self.cnt < 16 {
+            while self.cnt <= 56 {
+                let b = self.data.get(self.pos).map_or(0, |&b| b);
+                self.cache |= u64::from(!b) << (56 - self.cnt);
+                self.pos += 1;
+                self.cnt += 8;
+            }
         }
+        // (two shifts, so that n = 0 takes nothing)
+        let x = ((self.cache >> 1) >> (63 - n)) as u32;
+        self.cache <<= n;
+        self.cnt -= n;
         x
     }
 
@@ -165,13 +176,9 @@ impl<'a> DecSink<'a> {
         }
         self.symbol_range = prev - cur;
         self.symbol_value -= cur;
-        let bits = 15 - (31 - self.symbol_range.leading_zeros() as i32);
+        let bits = self.symbol_range.leading_zeros() - 16;
         self.symbol_range <<= bits;
-        let num_bits = (bits as i64).min(self.symbol_max_bits.max(0)) as i32;
-        let new_data = self.f(num_bits);
-        let padded_data = new_data << (bits - num_bits);
-        self.symbol_value = padded_data ^ (((self.symbol_value + 1) << bits) - 1);
-        self.symbol_max_bits -= bits as i64;
+        self.symbol_value = (self.symbol_value << bits) | self.take(bits);
         symbol
     }
 }
