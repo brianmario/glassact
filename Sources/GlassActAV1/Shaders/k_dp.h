@@ -37,7 +37,7 @@ kernel void k_dp(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     threadgroup DpNode *node = nodes[warp];
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
-    const int sbx = (int)(local % I.sbCols) * 64, sby = (int)(local / I.sbCols) * 64;
+    const int sbx = (int)ga_umod(local, (uint)I.sbCols) * 64, sby = (int)ga_udiv(local, (uint)I.sbCols) * 64;
     const int FW = I.MiCols * 4, FH = I.MiRows * 4;
     const float lambda = gp_lambda(sb_qindex(I, sbx, sby), P.lambdaMul);
     const int lvBase[4] = {0, 1, 5, 21};

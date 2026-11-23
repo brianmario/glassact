@@ -592,7 +592,7 @@ kernel void k_leaf_small(constant GpBatch &B [[buffer(0)]], constant GpParams &P
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
     const GpLeaf leaf = B.leaves[sb * GP_MAX_LEAVES + k];
-    const int x = (int)(local % I.sbCols) * 64 + leaf.x4 * 4, y = (int)(local / I.sbCols) * 64 + leaf.y4 * 4;
+    const int x = (int)ga_umod(local, (uint)I.sbCols) * 64 + leaf.x4 * 4, y = (int)ga_udiv(local, (uint)I.sbCols) * 64 + leaf.y4 * 4;
     const int bs = leaf.bsize;
     GpLeafDecision d;
     d.uvMode = AV1G_DC_PRED; d.angleUV = 0; d.cflU = d.cflV = 0; d.lumaTx = AV1G_DCT_DCT;
@@ -626,7 +626,7 @@ kernel void k_leaf(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
     const uint32_t local = sb - I.sbBase;
     {
         const GpLeaf leaf = B.leaves[sb * GP_MAX_LEAVES + k];
-        const int x = (int)(local % I.sbCols) * 64 + leaf.x4 * 4, y = (int)(local / I.sbCols) * 64 + leaf.y4 * 4;
+        const int x = (int)ga_umod(local, (uint)I.sbCols) * 64 + leaf.x4 * 4, y = (int)ga_udiv(local, (uint)I.sbCols) * 64 + leaf.y4 * 4;
         const int bs = leaf.bsize;
         GpLeafDecision d;
         d.uvMode = AV1G_DC_PRED; d.angleUV = 0; d.cflU = d.cflV = 0; d.lumaTx = AV1G_DCT_DCT;
