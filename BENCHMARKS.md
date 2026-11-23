@@ -304,6 +304,7 @@ the numbers and the reasoning.
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| `k_me`'s sub-sample steps unrolled (`metal-av1`) | kept; the steps by column (no `h[3][8]`), unrolled or not, not (slower) | the same streams (video, movie, typing, the rotation, maps); 5K q36 motion search: video 4.79–4.80 → 4.73–4.74 ms, movie 3.42–3.45 → 3.40–3.43; `k_me`'s cold compile +20 ms | [entry](#metal-av1-k_mes-sub-sample-steps-unrolled-the-steps-by-column-timed-and-rejected-2026-11-23) |
 | Learned mode pruning's eps 0.60 from a run's fourth mostly-new picture on (`NewPictureEffort.runModeEps`, `av1seq --fast run-mode-eps=<p>`; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 17.5 → 15.6 ms a frame, 57.9 → 63.3 inter frames a second back to back, live at 3 waiting 39.7 → 43.1; movie 14.0 → 12.4 ms, 70.9 → 78.4, live 56.2 → 57.9. BD-rate video −0.02 % (from frame 1150 −0.00 %), movie −2.36 %, maps −0.02 % (SSIM agrees); the rotation and app switching byte-identical; text screens new in every picture (`--no-golden`) +1.53 %, video then typing +0.68 %. In every mostly-new picture instead: the rotation +0.28 % at 0.20, +1.10 % at 0.40. Not kept the same day: no 64x64s in runs (movie +21 %, maps +31 %), no 16x16s (maps +8.8 %), whole-sample motion (+28 % bytes on video) | [entry](#metal-av1-the-learned-mode-pruning-in-runs-of-mostly-new-pictures-and-the-levers-that-cost-bytes-2026-11-23) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
@@ -394,6 +395,33 @@ Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
 
+### Metal AV1: `k_me`'s sub-sample steps unrolled; the steps by column, timed and rejected (2026-11-23)
+
+The entry "the learned mode pruning in runs" left the sub-sample refinement's stack traffic (50 %
+of `k_me`'s L1) as an untimed lead. Timed here against `main` at 07c7f1a, at 5K, `--tiles 3x0`,
+q36, the motion search stage of a run's fourth mostly-new picture (`av1seq --profile
+--profile-pictures 5`, best of 10), four rounds in alternating order, load 4–10. Every variant
+was first checked to code the same streams: `--digest` on video, movie, typing, the four-trace
+rotation and maps (24 inter frames each), all decoding exactly in libaom.
+
+| motion search, ms (four rounds) | video from 220 | movie | video from 1150 (three) |
+|---|---|---|---|
+| `main` | 4.79–4.80 | 3.42–3.45 | 4.65–4.67 |
+| **both steps and their 3 columns unrolled** | **4.73–4.74** | **3.40–3.43** | **4.59–4.61** |
+| the three rows' horizontal sums by column, no `h[3][8]` | 4.98–5.00 | 3.55–3.58 | |
+| the same, unrolled | 4.81–4.82 | 3.47–3.48 | |
+
+- **Kept: the steps unrolled** (two `#pragma clang loop unroll(full)`), −0.06 ms on video and
+  −0.02 on movie, the ranges apart in every round. Maps' motion search varied 5.7–6.6 ms in both
+  builds, too noisy to read.
+- **By column is slower,** as on 11-18 (0.50 → 0.53 ms by `metal-trace`): fewer registers on the
+  stack doesn't make `k_me` faster.
+- **Compile time:** `k_me`'s first compile (a pipeline from a metallib, a no-op made unique each
+  run so no cache holds it) 265–274 → 285–288 ms. The hybrid compiles its kernels before it offers
+  AV1 (`compileKernels`), where the whole set takes seconds cold.
+- That closes the sub-sample stack lead: about 1.2 ms of video's `k_me` is the refinement, and
+  what's left is its arithmetic.
+
 ### Metal AV1: the learned mode pruning in runs of mostly-new pictures, and the levers that cost bytes (2026-11-23)
 
 The GPU work per picture looked tuned to its limit at the instruction level (the entry "Line by
@@ -442,7 +470,8 @@ movie `1793736335` from 300, maps `1794284096` from 180):
   didn't move with any rewrite tried: streaming the three rows' horizontal sums by column (exact:
   whole numbers below 2^24), one refinement step, the loops unrolled. None was timed, and the
   stack figure also counts private arrays indexed at run time (`h`, `pt`, `cv`), which the spill
-  events don't: a timed A/B is what's left to do there.
+  events don't: a timed A/B is what's left to do there (since done: the entry above, "`k_me`'s
+  sub-sample steps unrolled").
 - **The mode pruning keeps its bytes far looser than it is.** The mode network picks which of the
   13 luma modes a node's blocks screen, keeping the likeliest until all but eps of the probability
   is kept. On the movie, quality rises at the same bytes (q36: 45.10 → 45.23 dB at 3,685,737 →
