@@ -15,6 +15,9 @@
 #                                   them: BENCHMARKS "The AV1 kernels compiled with the app").
 #   scripts/build-rust --copy-shaders <dir>   only the sources' copy, into <dir> (a test checks it)
 #   scripts/build-rust --metallib <dir>       only the metallibs, into <dir> (tests, the bench)
+#   scripts/build-rust --metallib-debug <dir> the same with line tables and the sources embedded,
+#                                   for Xcode's per-line shader profiling: run the bench with
+#                                   GLASSACT_AV1_METALLIB=<dir> (AV1Kernels.shipped) and capture
 # `just` runs it before every build and test; run it yourself before a bare `swift build`. Xcode
 # runs it in each app target (Apps/GlassActApps.xcodeproj), so the apps need nothing else.
 set -eu
@@ -108,6 +111,7 @@ has_metal() {
 # them: metal_stdlib has the fixed-width types). Skipped when no input changed.
 build_metallibs() {
     dest=$1
+    debug=${2:-}
     work="$out/metallib"
     mkdir -p "$work/sys" "$work/gen" "$dest"
     : > "$work/sys/stdint.h"
@@ -122,6 +126,8 @@ build_metallibs() {
     # warnings off are the runtime compile's too, which shows none: av1core's tables' braces,
     # dev_tx.h's divisions in loops of 0 tiles, k_inter.h's threadgroup count set before a barrier)
     flags="-std=metal4.1 -fmetal-math-mode=safe -mmacosx-version-min=27.0 -Wno-missing-braces -Wno-division-by-zero -Wno-sometimes-uninitialized"
+    # (--metallib-debug: debug info for Xcode's shader profiler; line tables don't change the code)
+    [ -n "$debug" ] && flags="$flags -gline-tables-only -frecord-sources -Wno-unused-function"
     stamp=$({
         echo "$flags"
         xcrun -sdk macosx metal --version
@@ -139,11 +145,23 @@ build_metallibs() {
         return 0
     fi
     for m in encoder entropy postfilter; do
+        src="$root/Sources/GlassActAV1/Shaders/$m.metal"
+        if [ -n "$debug" ]; then
+            # One file without line markers, its includes inlined (metal_stdlib comes from the
+            # prelude when it compiles), so every line the debug info names is in the one source
+            # it embeds: Xcode 27's shader profiler stops on a kernel whose lines span include files
+            # (an out-of-range selection in its source editor)
+            # shellcheck disable=SC2086
+            xcrun -sdk macosx metal -E -P -std=metal4.1 -isystem "$work/sys" \
+                -I "$root/Sources/AV1Core/include" -I "$root/Sources/AV1Encoder/include" \
+                -I "$root/Sources/GlassActAV1/Shaders" -I "$work/gen" "$src" -o "$dest/$m.metal"
+            src="$dest/$m.metal"
+        fi
         # shellcheck disable=SC2086
         xcrun -sdk macosx metal $flags -isystem "$work/sys" -include "$work/prelude.h" \
             -I "$root/Sources/AV1Core/include" -I "$root/Sources/AV1Encoder/include" \
             -I "$root/Sources/GlassActAV1/Shaders" -I "$work/gen" \
-            -c "$root/Sources/GlassActAV1/Shaders/$m.metal" -o "$work/$m.air"
+            -c "$src" -o "$work/$m.air"
         xcrun -sdk macosx metallib "$work/$m.air" -o "$dest/$m.metallib.tmp.$$"
         mv -f "$dest/$m.metallib.tmp.$$" "$dest/$m.metallib"
         rm -f "$work/$m.air"
@@ -175,6 +193,10 @@ case "${1:-}" in
         has_metal || { echo "build-rust: no Metal toolchain (xcodebuild -downloadComponent MetalToolchain)" >&2; exit 1; }
         build_metallibs "${2:?usage: scripts/build-rust --metallib <dir>}"
         ;;
+    --metallib-debug)
+        has_metal || { echo "build-rust: no Metal toolchain (xcodebuild -downloadComponent MetalToolchain)" >&2; exit 1; }
+        build_metallibs "${2:?usage: scripts/build-rust --metallib-debug <dir>}" debug
+        ;;
     --copy-shaders)
         # (what --shaders copies, into a directory of your choosing: a test checks it)
         copy_shaders "${2:?usage: scripts/build-rust --copy-shaders <dir>}"
@@ -184,7 +206,7 @@ case "${1:-}" in
         install_lib "$root/rust/av1/target/release/libglassact_av1.a" "$out/libglassact_av1.a"
         ;;
     *)
-        echo "usage: scripts/build-rust [--universal | --xcode [--shaders] | --copy-shaders <dir> | --metallib <dir>]" >&2
+        echo "usage: scripts/build-rust [--universal | --xcode [--shaders] | --copy-shaders <dir> | --metallib <dir> | --metallib-debug <dir>]" >&2
         exit 2
         ;;
 esac

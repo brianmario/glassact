@@ -159,8 +159,15 @@ public enum AV1Kernels: Sendable, Equatable {
     /// Sources laid out as under `Sources/`, compiled at run time.
     case source(URL)
 
-    /// What the Host runs: the sources, the app's copy or the tree's.
-    public static let shipped: AV1Kernels = .source(AV1ShaderSource.sourceRoot)
+    /// What the Host runs: the sources, the app's copy or the tree's. With GLASSACT_AV1_METALLIB
+    /// set to a directory, its metallibs instead (`scripts/build-rust --metallib-debug`: the same
+    /// kernels with line tables and sources, for Xcode's per-line shader profiling).
+    public static let shipped: AV1Kernels = {
+        if let dir = ProcessInfo.processInfo.environment["GLASSACT_AV1_METALLIB"], !dir.isEmpty {
+            return .compiled(URL(filePath: dir, directoryHint: .isDirectory))
+        }
+        return .source(AV1ShaderSource.sourceRoot)
+    }()
 
     /// The library of `name`'s kernels (encoder, entropy, postfilter) for `device`.
     @available(macOS 27, iOS 27, *)
