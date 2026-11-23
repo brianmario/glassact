@@ -466,7 +466,24 @@ What the lines say:
   4.35 → 6.10 ms (+40 %, six interleaved runs). Device memory gave the loop its samples two at a
   time (the profile's 8 global loads a 16-sample row) from L1, against one unaligned byte at a time
   from threadgroup memory; the staging loop and 6.9 KB more threadgroup memory a threadgroup add to
-  it. As floats the regions don't fit in 32 KB at four SIMD-groups. `k_me`'s SAD stays as it is.
+  it. As floats the regions don't fit in 32 KB at four SIMD-groups.
+- **Rejected: `k_me`'s SAD in four partial sums** (whole numbers below 2^24, so exact in any order;
+  the kernel's safe math won't reorder a chain itself): the same streams, motion search 4.36 →
+  4.38 ms. The 16-add chain wasn't the bound: other SIMD-groups cover it. `k_me`'s SAD stays as it is.
+- **Where the 64x64 analysis spills, and why it pays: the matrix-unit forward DCT.** A spill oracle
+  without Xcode: compile one pipeline from a flattened source (function constants written in), run
+  it once on an empty grid under the GlassAct GPU template, and read the trace's
+  graphics-compiler-spill-events (a pipeline compiled but never dispatched records none; an
+  unchanged function is a shader-cache hit and records nothing either). Stubbing stages out: no
+  screening 768 B, no quantizer and rate 768 B, **no `warp_fwd_mma` 80 B**. Not unrolling its inner
+  loops (`#pragma unroll 1`, the same products in the same order) takes the spill to 80 B, but
+  64x64 1.98 → 2.14 ms, 32x32 1.39 → 1.53, 16x16 0.80 → 0.85, and the inter candidates (the same
+  transform) 3.16 → 4.13: the unrolled loop hoists its tile loads ahead of the multiplies, which
+  hides more latency than the spills cost. Kept as it is.
+- Not available: Apple GPU disassembly. The Metal toolchain's `applegpu-nt` (AIR to GPU code) has
+  no assembly or object output for Apple GPUs, and `metal-objdump` has no instruction printer for
+  the `agx` targets; a binary archive's GPU slice (`metal-lipo -thin applegpu_g16s`) holds the code
+  but nothing reads it.
 
 ### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
 
