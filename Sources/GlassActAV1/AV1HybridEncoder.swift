@@ -483,16 +483,25 @@ public final class AV1HybridEncoder: @unchecked Sendable {
         public var runShapeMask: Int32?
         /// See `runShapeMask`.
         public var runShapesAfter = 1
+        /// From the `runShapesAfter + 1`th mostly-new picture in a row, as `runShapeMask`: the
+        /// learned pruning's mode eps in place of `analysis`'s (nil: the same in every picture of a
+        /// run). Looser, the analysis screens fewer luma modes. On screens' text that costs bytes
+        /// (a switch's picture), on video and maps it doesn't (BENCHMARKS "the learned mode pruning
+        /// in runs of mostly-new pictures").
+        public var runModeEps: Float?
         /// The encoder's default: level 1 in pictures larger than 4K (2,400 64×64s and up; 5K is
         /// 3,600, 4K UHD 2,040), where a mostly-new picture is what keeps a stream under 60 a second.
         /// From a run's fourth mostly-new picture on, no 4x4 or 8x8 shapes (`runShapeMask` 0x1240):
         /// on 60 fps video ~4 ms of the GPU's analysis for the same bytes, on maps zooming +0.8 %
         /// bytes and −0.08 dB while they move; from the third, a rotation of text screens loses
-        /// 0.93 dB (BENCHMARKS "the small shapes in runs of mostly-new pictures").
+        /// 0.93 dB (BENCHMARKS "the small shapes in runs of mostly-new pictures"). From there too,
+        /// the learned pruning's mode eps 0.60 (`runModeEps`): on 60 fps video ~2.5 ms of the GPU's
+        /// analysis, on a movie ~1.5, for the same or fewer bytes at their quality (BENCHMARKS "the
+        /// learned mode pruning in runs of mostly-new pictures").
         public static var standard: NewPictureEffort {
             var e = level(1)!
             e.minSuperblocks = 2400
-            (e.runShapeMask, e.runShapesAfter) = (0x1240, 3)
+            (e.runShapeMask, e.runShapesAfter, e.runModeEps) = (0x1240, 3, 0.60)
             return e
         }
         /// The measured levels (nil above the last; 0 changes nothing), each with the qindex offset
@@ -1594,7 +1603,10 @@ public final class AV1HybridEncoder: @unchecked Sendable {
             }
         }
         var effort = fast ? newPictureEffort?.analysis : nil
-        if fast, let e = newPictureEffort, let m = e.runShapeMask, run > e.runShapesAfter { effort?.shapeMask = m }
+        if fast, let e = newPictureEffort, run > e.runShapesAfter {
+            if let m = e.runShapeMask { effort?.shapeMask = m }
+            if let x = e.runModeEps { effort?.modeEps = x }
+        }
         let sbs = ((p.width + 63) / 64) * ((p.height + 63) / 64)
         let qmap = sbQindex?(p, qindex).flatMap { $0.count == sbs ? $0 : nil }
         // what changed since the picture its copies compare against: all but its 64×64s copied

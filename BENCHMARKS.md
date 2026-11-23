@@ -304,6 +304,7 @@ the numbers and the reasoning.
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| Learned mode pruning's eps 0.60 from a run's fourth mostly-new picture on (`NewPictureEffort.runModeEps`, `av1seq --fast run-mode-eps=<p>`; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 17.5 → 15.6 ms a frame, 57.9 → 63.3 inter frames a second back to back, live at 3 waiting 39.7 → 43.1; movie 14.0 → 12.4 ms, 70.9 → 78.4, live 56.2 → 57.9. BD-rate video −0.02 %, movie −2.36 %, maps −0.02 %; the rotation and app switching byte-identical; text screens new in every picture (`--no-golden`) +1.53 %. In every mostly-new picture instead: the rotation +0.28 % at 0.20, +1.10 % at 0.40. Not kept the same day: no 64x64s in runs (movie +21 %, maps +31 %), no 16x16s (maps +8.8 %), whole-sample motion (+28 % bytes on video) | [entry](#metal-av1-the-learned-mode-pruning-in-runs-of-mostly-new-pictures-and-the-levers-that-cost-bytes-2026-11-23) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | Other coded sizes for reduced video: ¾, 1080p (~⅜), ~⅓ and ¼ of a 5K region besides ½, and a scan for the content's own resolution | measured; not built | the owner's 60 fps video: below ½ never wins at equal bytes (30–120 KB a frame, 0.4–1.5 dB worse); ¾ beats ½ by 0.4–0.7 dB at 120–160 KB but takes 14.8 ms of GPU analysis against 7.7 (it falls under the fast pictures' 2,400-SB floor); the round trip's loss rises smoothly (¾ 47.9 dB … ¼ 33.4), no resolution cutoff to find. One trace: 1080p and 720p clips wanted | [entry](#video-reduced-frames-at-other-sizes-and-the-contents-own-resolution-measured-2026-11-21) |
@@ -392,6 +393,103 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Metal AV1: the learned mode pruning in runs of mostly-new pictures, and the levers that cost bytes (2026-11-23)
+
+The GPU work per picture looked tuned to its limit at the instruction level (the entry "Line by
+line" below), so this round measured levers that change the stream: less work for each mostly-new
+picture, each priced in BD-rate. All at 5K, `--tiles 3x0`, `main` at e1edef7, an M4 Pro at load
+6–17 (a Spotlight updater and another project's tests; every run through one lock).
+
+**Where the time goes.** The owner's 60 fps video (`glassact-1795125212` from frame 220, q36), its
+fifth picture (`av1seq --profile --profile-pictures 5`, so a run's fourth mostly-new picture, with
+the small shapes off): motion search 4.80 ms, inter candidates 3.42, intra analysis 8.4 (16x16
+2.46, 32x32 3.15, 64x64 2.79), learned pruning 1.61; the closed loop ~9–11. The GPU stages were
+the same to ±0.05 ms over two rounds, so one round says what a lever saves.
+
+**The levers, on that picture** (`--fast`, the default's levers plus one):
+
+| lever, in every mostly-new picture | GPU stages saved | inter KB (7 frames, q36) |
+|---|---|---|
+| the default (`level=1,min-sbs=2400,run-shapes=1240,run-shapes-after=3`, its digest the default's) | | 135.0 |
+| no 64x64 (`run-shapes=0240`) | 4.0 ms (analysis 2.8, inter candidates 1.3) | 131.9 |
+| no 16x16 (`run-shapes=1200`) | 3.3 (2.4, 0.9) | 136.7 |
+| whole-sample motion (`no-subpel`) | 2.4 (motion search 1.9) | 172.6 |
+| mode eps 0.20 / 0.30 / 0.40 / 0.60 / 0.80 (`mode-eps`) | 0.9 / 1.4 / 1.9 / 2.6 / 3.0 | 135.0 |
+| level eps 0.10 (`eps`) | 0.1 | 135.0 |
+| `preset=turbo2`, `turbo3` | 0 (the closed loop alone; noise) | 135.0 |
+
+**BD-rate** (log rate against RGB PSNR over q20, q36 and q44, 61 frames; video from frame 220, the
+movie `1793736335` from 300, maps `1794284096` from 180):
+
+| | video | movie | maps |
+|---|---|---|---|
+| no 64x64 | +5.02 % | +21.10 % | +30.51 % |
+| no 16x16 | +0.79 % | +0.39 % | +8.78 % |
+| mode eps 0.20 | −0.07 % | −1.89 % | −0.24 % |
+| 0.30 | −0.16 % | −2.37 % | −0.22 % |
+| 0.40 | −0.14 % | −2.30 % | −0.45 % |
+| 0.50 | −0.06 % | −2.26 % | −0.11 % |
+| **0.60** | **−0.02 %** | **−2.42 %** | **−0.12 %** |
+| 0.80 | +0.59 % | −2.35 % | +0.13 % |
+
+- **Large and small shapes code real content.** Without 64x64s the movie and maps lose a fifth to
+  a third; without 16x16s maps (its labels are text) loses 8.8 %. Not kept.
+- **Whole-sample motion** costs +28 % bytes on the video at a fixed q. Not kept. Its time is the
+  sub-sample refinement in `k_me` (3.15 → 1.91 ms) and `k_inter_sad`'s bilinear SADs (0.65 →
+  0.15). `k_me` reads 50 % of its L1 traffic from the stack with the refinement on and 0 % with it
+  off, but the compiler's spill events (80–192 B a thread) didn't move with any rewrite tried:
+  streaming the three rows' horizontal sums by column (exact: whole numbers below 2^24), one
+  refinement step, the loops unrolled. By its arithmetic the refinement's 1.24 ms is about what
+  it costs at the kernel's ALU use; not pursued.
+- **The mode pruning keeps its bytes far looser than it is.** The mode network picks which of the
+  13 luma modes a node's blocks screen, keeping the likeliest until all but eps of the probability
+  is kept. In video's mostly-new pictures inter prediction wins most blocks (96.7 % of the picture
+  motion-searched), so fewer intra modes cost nothing there. On the movie, PSNR rises at the same
+  bytes (q36: 45.10 → 45.23 dB at 3,685,737 → 3,681,133 B). Not looked into why.
+
+**But on screens' text it costs**, so it goes where the small shapes rule went: from a run's fourth
+mostly-new picture. In every mostly-new picture instead (four traces in turn, 60 pictures, three of
+them mostly new; the same with `--no-golden`, 24 pictures, every one new; app switching, 400
+frames, one):
+
+| mode eps in every mostly-new picture | rotation | rotation, every picture new | app switching |
+|---|---|---|---|
+| 0.20 | +0.28 % | +0.21 % | +0.16 % |
+| 0.30 | +0.57 % | +0.58 % | +0.31 % |
+| 0.40 | +1.10 % | +1.04 % | +0.47 % |
+
+**Kept: mode eps 0.60 from a run's fourth mostly-new picture** (`NewPictureEffort.runModeEps`,
+from the same picture as `runShapeMask`; `--fast run-mode-eps=<p>`; in `standard`, pictures larger
+than 4K). Against `main`:
+
+| BD-rate | video | movie | maps | rotation | every picture new | app switching |
+|---|---|---|---|---|---|---|
+| runs-only 0.60 | −0.02 % | −2.36 % | −0.02 % | byte-identical | +1.53 % | byte-identical |
+
+The `--no-golden` rotation is text screens new in every picture, so its run reaches a fourth
+picture: the case the small shapes rule pays for too. With long-term references on (the default)
+the rotation's screens come back as copies and no run reaches it.
+
+Frame rate, `main` and the new default alternated, four rounds (load 6–17, provisional):
+
+| | GPU analysis a frame | back to back, inter frames a second | live, 3 waiting (`pace --pending 3`) · p50 |
+|---|---|---|---|
+| video from 220 | 17.5 → 15.6 ms | 57.9 → 63.3 (+9 %) | 39.7 → 43.1 · 51.1 → 48.9 ms |
+| video from 1150 | | | 40.0 → 42.2 · 52.0 → 49.2 ms |
+| movie | 14.0 → 12.4 ms | 70.9 → 78.4 (+11 %) | 56.2 → 57.9 · 36.8 → 35.2 ms |
+
+(Back to back is 91 frames with `--no-planes`. `pace` defaults to 2 waiting; the Host lets the
+hybrid have 3, #131.) The video at full size still shows ~43 frames a second live: its frames
+take ~50 ms from submit to frame at 3 waiting (the entry "why full size shows 44 frames a second"),
+where reduced frames carry it to 55–57.
+
+New default digests (61 frames, `--score-rgb`, q36): video 9c062d68376040f8 (`main`
+dbe3698381bdf01c), movie fae07af909e5822b (388299222215927c), maps 69c5dac1f9fba365
+(aa387c13bedf0e38); `--fast level=1,min-sbs=2400,run-shapes=1240,run-shapes-after=3` gives the old
+ones. All decode exactly in libaom. `HybridEncoderTests.newPictureEffortMixesFastAndNormalPicturesExactly`
+now also checks that `runModeEps` leaves a run's first picture, and a run shorter than
+`runShapesAfter + 1`, byte for byte as without it.
 
 ### Our AV1 decoder on one thread: 16-bit DCTs, CDEF's no-op blocks, branchless bits (2026-11-23)
 

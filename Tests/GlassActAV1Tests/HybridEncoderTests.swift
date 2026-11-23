@@ -783,7 +783,7 @@ extension HybridEncoderTests {
     /// (`motionlessRun`), the levers switched frame by frame; libaom decodes
     /// the stream in order to exactly the pictures the encoder reports. An effort that changes
     /// nothing codes the stream without one, byte for byte. `runShapeMask` changes a run's
-    /// pictures from its second on, and no other.
+    /// pictures from its second on, and no other; `runModeEps` none before then either.
     @available(macOS 27, *)
     @Test func newPictureEffortMixesFastAndNormalPicturesExactly() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
@@ -867,6 +867,12 @@ extension HybridEncoderTests {
         #expect(runStream[6] != fastStream[6], "the run's second picture analyzed the same shapes")
         run.runShapesAfter = 2
         #expect(try stream(run) == fastStream, "a run shorter than runShapesAfter + 1 changed")
+        // `runModeEps` from the same picture: never in a run's first, nor in a run that ends sooner
+        var modes = effort
+        modes.runModeEps = 0.9
+        #expect(try stream(modes)[...5] == fastStream[...5], "runModeEps changed the run's first picture")
+        modes.runShapesAfter = 2
+        #expect(try stream(modes) == fastStream, "runModeEps changed a run shorter than runShapesAfter + 1")
     }
 
     /// The motion seed (`motionSeed`, on by default in runs of mostly-new pictures): quiet
