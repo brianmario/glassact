@@ -459,8 +459,14 @@ What the lines say:
     vector when done): 4.65 (+7 %); 2 row pairs a step 4.54, 4 4.43. The ring's upkeep (prefix sums,
     a ballot, two `simd_min`s, barriers) costs more than the idle lanes did.
   The SAD line's 120 synchronization instructions a row pair (one wait a load) say it's bound by
-  its byte loads' latency, not by ALU slots: the next lever there is the reference read from
-  threadgroup memory (a window's 24 x 24 region staged once), not the lanes' occupancy.
+  its byte loads' latency, not by ALU slots.
+- **Rejected: the reference staged in threadgroup memory.** Each window of radius 4 or less (24 x 24
+  samples; three slots a SIMD-group, as a round spans at most three windows) staged before the
+  round that first measures it, the SAD reading it from there: the same streams, but motion search
+  4.35 → 6.10 ms (+40 %, six interleaved runs). Device memory gave the loop its samples two at a
+  time (the profile's 8 global loads a 16-sample row) from L1, against one unaligned byte at a time
+  from threadgroup memory; the staging loop and 6.9 KB more threadgroup memory a threadgroup add to
+  it. As floats the regions don't fit in 32 KB at four SIMD-groups. `k_me`'s SAD stays as it is.
 
 ### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
 
