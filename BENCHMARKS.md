@@ -208,6 +208,7 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in, until 2026-11-17: the opt-in's AV1 is now Glass Act's (below), libaom kept unused; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| Apple Screen Sharing's High Performance mode at 5K, beside Glass Act's AV1 (rootshell-vnc's live benchmark, its frames scored against a recording of the screen) | measured | four 5120x720 HEVC bands, 48–55 pictures a second (never 60) at 28–33 Mbit/s, whatever changes; on a film at Apple's bitrate Glass Act scores +8–10 dB luma PSNR (SSIMULACRA2 77–79 vs 33), and matches Apple's quality at ¼–½ of its bits | [entry](#apple-screen-sharings-high-performance-mode-at-5k-frame-rate-bitrate-and-quality-beside-glass-acts-av1-2026-11-23) |
 | Intra block copy in key frames (`metal-av1`, on by default) | kept | 5K BD-rate typing −18 %, cursor-drag −14 %, scroll −7 %; photos and 720p unchanged (a frame copies only when copies cover ≥ 6 % of its non-flat 8×8s: no filters then); ~10 ms of search per 5K key frame | [entry](#metal-av1-intra-block-copy-in-key-frames-2026-11-01) |
 | Lossy intra block copies; inter blocks' tx types searched (`metal-av1`) | kept | key frames also copy where a near copy's residual is ≤ 0.005 × 1.5 × step² per sample: 5K BD-rate typing −2.3 %, scroll −1.7 %, drag −3.2 % (1080p terminal crop's key frame −11 %); inter tx types: −0.1 to −2.4 % more (720p photos), 2–5 % slower on most points (one 5K point 25 %); split transforms in copies and 4×4 copies measured, not worth it | [entry](#metal-av1-lossy-intra-block-copies-and-inter-blocks-tx-types-2026-11-01) |
 | AV2's 3.7× on text, attributed (AVM, each tool off in turn) | measured; intra block copy is next for `metal-av1` | intra block copy alone is 3.4× on typing; libaom at speed 2 with it gets within ~15 % of AV2 (typing 60 dB: 43 vs 37 KB, 131 KB without); key frames 2.9× smaller at ~45 dB | [entry](#av2s-gain-on-text-attributed-intra-block-copy-which-av1-has-too-2026-11-01) |
@@ -394,6 +395,79 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Apple Screen Sharing's High Performance mode at 5K: frame rate, bitrate and quality beside Glass Act's AV1 (2026-11-23)
+
+Until now the HEVC numbers here were Glass Act's own VideoToolbox HEVC. This is Apple's: the
+Screen Sharing server of macOS 27.2.1 on the M4 Pro (Studio Display, 5120x2880), measured through
+[rootshell-vnc](https://github.com/kitknox/rootshell-vnc), the MIT Swift client that
+[OpenScreens](https://github.com/burakgon/OpenScreens) is built on. Its `LiveVideoBenchmarkTests`
+logs in to a server, takes the High Performance stream and decodes it with VideoToolbox. The
+viewer was the same Mac (127.0.0.1), so its four decoders shared the media engine with the
+server's encoder, and the link was lossless.
+
+**What the server sends at 5K.** Above HEVC level 5.1's luma picture size (8,912,896 samples),
+High Performance mode sends four horizontal bands, 5120x720 each, as four RTP sources. They form
+one HEVC stream: an IDR at the start, then only predicted pictures. VideoToolbox decoded every
+band picture, and the four bands stitch with no seams. Per second:
+
+| Apple High Performance, 5K | full pictures a second | Mbit/s |
+|---|---|---|
+| a desktop with little changing (a terminal, then the pointer over the Dock) | 48.4 (38–56) | 31.8 |
+| a film playing full screen (not the movie trace's) | 53.5 (50–56) | 27.5 |
+| the movie trace's film, from its first frame | 54.6 (52–57) | 33.0 |
+
+It never reached 60, and it spends about 30 Mbit/s whether much changes or not. Its bitrate
+follows a budget more than the content.
+
+**Quality.** The film again, with the benchmark patched (locally, outside this repo) to save every
+12th set of bands, stitched and converted to sRGB by Core Image with their decode time on the
+host clock. Beside the session, `glassact-bench record --no-cursor` recorded the screen as the
+reference (1,110 frames over 44 s: the film's own frame rate, none dropped). A scorer matched each
+saved band to the recorded frame it shows (a 1/16 luma thumbnail within ±250 ms of the session's
+median latency, 30 ms) and scored as `av1seq --score-rgb` does: BT.601 luma from BGRA, PSNR, and
+SSIM on 8x8 blocks. Apple's video draws the pointer, so its 80x80 square is left out of the
+scores. 170 pictures covering recorded frames 112–1087.
+
+Glass Act's side is `av1seq` (`main` with #161 and #162; `--tiles 3x0 --inter --score-rgb
+--ssimulacra2-every 12`) on two 244-frame stretches of the same recording, at four fixed q. Its
+bitrate is the stretch's bytes over the stretch's recorded duration. Apple's is its per-second
+counts over the same seconds of the session.
+
+| frames 112–355 (9.2 s) | Mbit/s | luma PSNR | SSIM | SSIMULACRA2 |
+|---|---|---|---|---|
+| Apple | 29.6 | 39.33 dB | 0.9880 | 33.0 (22 pictures across the run) |
+| Glass Act q20 | 22.9 | **49.85 dB** | 0.9933 | 78.8 |
+| Glass Act q28 | 15.9 | 48.05 | 0.9908 | 72.7 |
+| Glass Act q36 | 10.4 | 45.57 | 0.9857 | 61.5 |
+| Glass Act q44 | 6.7 | 42.52 | 0.9775 | 44.2 |
+
+| frames 600–843 (10.2 s) | Mbit/s | luma PSNR | SSIM | SSIMULACRA2 |
+|---|---|---|---|---|
+| Apple | 34.1 | 39.82 dB | 0.9771 | |
+| Glass Act q20 | 31.7 | **47.62 dB** | 0.9886 | 77.1 |
+| Glass Act q28 | 21.6 | 45.67 | 0.9833 | 68.3 |
+| Glass Act q36 | 13.6 | 43.06 | 0.9735 | 53.1 |
+| Glass Act q44 | 8.2 | 40.02 | 0.9569 | 30.0 |
+
+- **At Apple's bitrate Glass Act is 8–10 dB higher** in luma PSNR, and 77–79 against 33 in
+  SSIMULACRA2.
+- **At Apple's quality Glass Act needs a quarter to a half of its bits:** about q44 (7–8 Mbit/s) by
+  PSNR and SSIMULACRA2, about q32 (~17 Mbit/s) by SSIM. Apple ranks better by SSIM than by
+  PSNR.
+- **Colour:** Apple's stream is Display P3 (BT.709 matrix, sRGB transfer). After Core Image's
+  conversion to sRGB its red channel averages 4.8 levels below the recording's (blue +0.2, green
+  +0.3). With each picture's mean luma offset removed Apple scores 41.28 dB instead of 39.81 dB,
+  which changes none of the above. Its SSIMULACRA2 keeps both the offset and the pointer, so it
+  is the harshest of the three for Apple.
+- **Not like for like:** Glass Act's numbers are fixed-q `av1seq`, not a live session with rate
+  control. It coded these stretches at 66 inter frames a second, more than the film's 25. Apple's
+  were live, with the viewer on the same Mac. Apple sends a picture at the screen's rate (≈ 53 a
+  second) where Glass Act codes the film's 25 changes; bits a second is the fair measure either
+  way.
+
+Not kept anywhere: the recording (32 GB), Apple's pictures and the scorer live outside the repo.
+A rerun needs a Screen Sharing login on the measured Mac.
 
 ### Metal AV1: `k_me`'s sub-sample steps unrolled; the steps by column, timed and rejected (2026-11-23)
 
