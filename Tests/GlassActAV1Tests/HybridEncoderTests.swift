@@ -867,12 +867,23 @@ extension HybridEncoderTests {
         #expect(runStream[6] != fastStream[6], "the run's second picture analyzed the same shapes")
         run.runShapesAfter = 2
         #expect(try stream(run) == fastStream, "a run shorter than runShapesAfter + 1 changed")
-        // `runModeEps` from the same picture: never in a run's first, nor in a run that ends sooner
+        // `runModeEps` from the same picture: never in a run's first, nor in a run that ends sooner.
+        // (Learned pruning, whose mode eps it is, at any size here: these pictures are 60 SBs)
+        func pruned(_ effort: AV1HybridEncoder.NewPictureEffort) throws -> [[UInt8]] {
+            let encoder = try make(effort)
+            encoder.learnedPruneMinSuperblocks = 0
+            var obus: [[UInt8]] = []
+            try encoder.encode(count: pictures.count, qindex: qindex, picture: { pictures[$0] }, output: { _, f in obus.append(f.obu) })
+            return obus
+        }
+        let prunedStream = try pruned(effort)
         var modes = effort
         modes.runModeEps = 0.9
-        #expect(try stream(modes)[...5] == fastStream[...5], "runModeEps changed the run's first picture")
+        let modeStream = try pruned(modes)
+        #expect(modeStream[...5] == prunedStream[...5], "runModeEps changed the run's first picture")
+        #expect(modeStream[6] != prunedStream[6], "the run's second picture screened the same modes")
         modes.runShapesAfter = 2
-        #expect(try stream(modes) == fastStream, "runModeEps changed a run shorter than runShapesAfter + 1")
+        #expect(try pruned(modes) == prunedStream, "runModeEps changed a run shorter than runShapesAfter + 1")
     }
 
     /// The motion seed (`motionSeed`, on by default in runs of mostly-new pictures): quiet
