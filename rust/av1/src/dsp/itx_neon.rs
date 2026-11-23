@@ -1,6 +1,7 @@
 //! NEON inverse transforms: the generic 1-D transforms of itx.rs on 4 lanes of i32 (4 rows, then
-//! 4 columns, at once). Exact while the block is conformant (see itx.rs); `inv_txfm2d` returns false
-//! when the scalar reference must redo the block.
+//! 4 columns, at once), and DCT_DCT blocks of 8x8 and more on 8 lanes of i16 ([`W`]). Exact while
+//! the block is conformant (see itx.rs); `inv_txfm2d` returns false when the scalar reference must
+//! redo the block.
 use super::itx::*;
 use crate::tables::*;
 use core::arch::aarch64::*;
@@ -262,6 +263,261 @@ fn cols_n<const N: u32, const M: usize>(w: usize, kind: i32, res: &mut [i32], e:
     }
 }
 
+/// 8 lanes of i16, for the DCTs of 8 points and more: every DCT value fits 16 bits until the first
+/// range violation (the butterflies' results are checked to 16 bits, the H steps clamp to them, and
+/// the inputs are within them), so 16-bit lanes are exact. H's clamped sum and difference are the
+/// saturating ones; B's products are widened, and its results narrowed with saturation: a result
+/// on a 16-bit limit may have been clamped, so [`E16`] records any (rarely a real one), and the
+/// scalar reference redoes the block.
+#[derive(Clone, Copy)]
+pub(crate) struct W(int16x8_t);
+
+/// The largest and smallest results of the butterflies.
+pub(crate) struct E16 {
+    max: int16x8_t,
+    min: int16x8_t,
+}
+impl E16 {
+    #[inline(always)]
+    fn new() -> E16 {
+        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+        unsafe {
+            E16 {
+                max: vdupq_n_s16(0),
+                min: vdupq_n_s16(0),
+            }
+        }
+    }
+    #[inline(always)]
+    fn bad(&self) -> bool {
+        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+        unsafe { vmaxvq_s16(self.max) == i16::MAX || vminvq_s16(self.min) == i16::MIN }
+    }
+}
+
+impl Lane for W {
+    type Wide = W;
+    type Err = E16;
+    #[inline(always)]
+    fn zero() -> W {
+        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+        unsafe { W(vdupq_n_s16(0)) }
+    }
+    #[inline(always)]
+    fn bfly(a: W, b: W, c: i32, s: i32, r: i32, e: &mut E16) -> (W, W) {
+        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+        unsafe {
+            debug_assert!(r == 16);
+            // (|c|, |s| <= 4096)
+            let (c, s) = (c as i16, s as i16);
+            let (al, bl) = (vget_low_s16(a.0), vget_low_s16(b.0));
+            let xl = vmlsl_n_s16(vmull_n_s16(al, c), bl, s);
+            let xh = vmlsl_high_n_s16(vmull_high_n_s16(a.0, c), b.0, s);
+            let yl = vmlal_n_s16(vmull_n_s16(al, s), bl, c);
+            let yh = vmlal_high_n_s16(vmull_high_n_s16(a.0, s), b.0, c);
+            let x = vqrshrn_high_n_s32::<12>(vqrshrn_n_s32::<12>(xl), xh);
+            let y = vqrshrn_high_n_s32::<12>(vqrshrn_n_s32::<12>(yl), yh);
+            e.max = vmaxq_s16(e.max, vmaxq_s16(x, y));
+            e.min = vminq_s16(e.min, vminq_s16(x, y));
+            (W(x), W(y))
+        }
+    }
+    #[inline(always)]
+    fn hadd(x: W, y: W, r: i32) -> (W, W) {
+        // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+        unsafe {
+            debug_assert!(r == 16);
+            (W(vqaddq_s16(x.0, y.0)), W(vqsubq_s16(x.0, y.0)))
+        }
+    }
+    // (the DCT uses only B and H)
+    fn neg(_: W) -> W {
+        unreachable!()
+    }
+    fn identity<const N: u32>(_: W) -> W {
+        unreachable!()
+    }
+    fn wide(_: W) -> W {
+        unreachable!()
+    }
+    fn wmul(_: W, _: i32) -> W {
+        unreachable!()
+    }
+    fn wadd(_: W, _: W) -> W {
+        unreachable!()
+    }
+    fn wsub(_: W, _: W) -> W {
+        unreachable!()
+    }
+    fn wchk(_: W, _: i32, _: u32, _: &mut E16) {
+        unreachable!()
+    }
+    fn wround12(_: W) -> W {
+        unreachable!()
+    }
+}
+
+#[inline(always)]
+fn transpose8(r: [int16x8_t; 8]) -> [int16x8_t; 8] {
+    // SAFETY: NEON is part of the aarch64 baseline; no memory access.
+    unsafe {
+        let a: [int16x8_t; 8] = core::array::from_fn(|i| {
+            let (x, y) = (r[i & !1], r[i | 1]);
+            if i & 1 == 0 { vtrn1q_s16(x, y) } else { vtrn2q_s16(x, y) }
+        });
+        let b: [int32x4_t; 8] = core::array::from_fn(|i| {
+            let (x, y) = (
+                vreinterpretq_s32_s16(a[(i & !3) + (i & 1)]),
+                vreinterpretq_s32_s16(a[(i & !3) + (i & 1) + 2]),
+            );
+            if i & 2 == 0 { vtrn1q_s32(x, y) } else { vtrn2q_s32(x, y) }
+        });
+        core::array::from_fn(|i| {
+            let (x, y) = (vreinterpretq_s64_s32(b[i & 3]), vreinterpretq_s64_s32(b[(i & 3) + 4]));
+            vreinterpretq_s16_s64(if i & 4 == 0 { vtrn1q_s64(x, y) } else { vtrn2q_s64(x, y) })
+        })
+    }
+}
+
+/// The DCT row pass on 8 rows at a time, into `buf` (h x w, i16).
+#[inline(always)]
+fn rows16<const N: u32, const M: usize>(
+    dq: &[i32],
+    tw: usize,
+    th: usize,
+    h: usize,
+    rect: bool,
+    shift: i32,
+    buf: &mut [i16],
+    e: &mut E16,
+) {
+    // SAFETY: NEON is part of the aarch64 baseline; the loads and stores go through bounds-checked
+    // slices of 8 elements.
+    unsafe {
+        let w = 1usize << N;
+        let mut t = [W::zero(); M];
+        let sh = vdupq_n_s16(-shift as i16);
+        for i0 in (0..h).step_by(8) {
+            let out = &mut buf[i0 * w..(i0 + 8) * w];
+            if i0 >= th {
+                out.fill(0);
+                continue;
+            }
+            let inp = &dq[i0 * tw..(i0 + 8) * tw];
+            let mut nz = vdupq_n_s16(0);
+            for k in (0..tw).step_by(8) {
+                // (the inputs are within 16 bits)
+                let r: [int16x8_t; 8] = core::array::from_fn(|m| {
+                    let s = &inp[m * tw + k..m * tw + k + 8];
+                    vcombine_s16(
+                        vmovn_s32(vld1q_s32(s.as_ptr())),
+                        vmovn_s32(vld1q_s32(s.as_ptr().add(4))),
+                    )
+                });
+                for v in r {
+                    nz = vorrq_s16(nz, v);
+                }
+                let c = transpose8(r);
+                for m in 0..8 {
+                    // Round2(v * 2896, 12) is vqrdmulh's (2 * v * 23168 + 2^15) >> 16
+                    t[k + m] = W(if rect { vqrdmulhq_n_s16(c[m], 2896 * 8) } else { c[m] });
+                }
+            }
+            if vmaxvq_u16(vreinterpretq_u16_s16(nz)) == 0 {
+                out.fill(0);
+                continue;
+            }
+            for v in &mut t[tw..w] {
+                *v = W::zero();
+            }
+            idct::<W, N, M>(&mut t, 16, e);
+            for k in (0..w).step_by(8) {
+                // (a DCT's outputs are H's, within 16 bits: the shift needs no clamp)
+                let c = transpose8(core::array::from_fn(|m| vrshlq_s16(t[k + m].0, sh)));
+                for (m, &v) in c.iter().enumerate() {
+                    let d = &mut out[m * w + k..m * w + k + 8];
+                    vst1q_s16(d.as_mut_ptr(), v);
+                }
+            }
+        }
+    }
+}
+
+/// The DCT column pass on 8 columns at a time: `res` (h x w, i32) from `buf`.
+#[inline(always)]
+fn cols16<const N: u32, const M: usize>(w: usize, buf: &[i16], res: &mut [i32], e: &mut E16) {
+    // SAFETY: NEON is part of the aarch64 baseline; the loads and stores go through bounds-checked
+    // slices of 8 elements.
+    unsafe {
+        let h = 1usize << N;
+        let mut t = [W::zero(); M];
+        for j0 in (0..w).step_by(8) {
+            for i in 0..h {
+                let s = &buf[i * w + j0..i * w + j0 + 8];
+                t[i] = W(vld1q_s16(s.as_ptr()));
+            }
+            idct::<W, N, M>(&mut t, 16, e);
+            for i in 0..h {
+                let v = vrshrq_n_s16::<4>(t[i].0);
+                let d = &mut res[i * w + j0..i * w + j0 + 8];
+                vst1q_s32(d.as_mut_ptr(), vmovl_s16(vget_low_s16(v)));
+                vst1q_s32(d.as_mut_ptr().add(4), vmovl_high_s16(v));
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn rows16_n<const N: u32, const M: usize>(
+    dq: &[i32],
+    tw: usize,
+    th: usize,
+    h: usize,
+    rect: bool,
+    shift: i32,
+    buf: &mut [i16],
+    e: &mut E16,
+) {
+    rows16::<N, M>(dq, tw, th, h, rect, shift, buf, e)
+}
+#[inline(never)]
+fn cols16_n<const N: u32, const M: usize>(w: usize, buf: &[i16], res: &mut [i32], e: &mut E16) {
+    cols16::<N, M>(w, buf, res, e)
+}
+
+/// The DCT_DCT blocks of 8x8 and more on 16-bit lanes ([`W`]). False as [`inv_txfm2d`].
+fn inv_txfm2d_dct16(dq: &[i32], log2w: u32, log2h: u32, shift: i32, res: &mut [i32]) -> bool {
+    // (the intermediate on the stack, as large as the block needs: zeroing 8 KB for an 8x8 costs
+    // more than its transform)
+    match log2w + log2h {
+        ..=8 => dct16_in::<256>(dq, log2w, log2h, shift, res),
+        9 | 10 => dct16_in::<1024>(dq, log2w, log2h, shift, res),
+        _ => dct16_in::<4096>(dq, log2w, log2h, shift, res),
+    }
+}
+#[inline(always)]
+fn dct16_in<const B: usize>(dq: &[i32], log2w: u32, log2h: u32, shift: i32, res: &mut [i32]) -> bool {
+    let (w, h) = (1usize << log2w, 1usize << log2h);
+    let (tw, th) = (w.min(32), h.min(32));
+    let rect = log2w.abs_diff(log2h) == 1;
+    let mut buf = [0i16; B];
+    let buf = &mut buf[..w * h];
+    let mut e = E16::new();
+    match log2w {
+        3 => rows16_n::<3, 8>(dq, tw, th, h, rect, shift, buf, &mut e),
+        4 => rows16_n::<4, 16>(dq, tw, th, h, rect, shift, buf, &mut e),
+        5 => rows16_n::<5, 32>(dq, tw, th, h, rect, shift, buf, &mut e),
+        _ => rows16_n::<6, 64>(dq, tw, th, h, rect, shift, buf, &mut e),
+    }
+    match log2h {
+        3 => cols16_n::<3, 8>(w, buf, res, &mut e),
+        4 => cols16_n::<4, 16>(w, buf, res, &mut e),
+        5 => cols16_n::<5, 32>(w, buf, res, &mut e),
+        _ => cols16_n::<6, 64>(w, buf, res, &mut e),
+    }
+    !e.bad()
+}
+
 /// [`super::inv_txfm2d`] in NEON. False when the block is not conformant (or its input is outside
 /// 16 bits): `res` is then garbage and the scalar reference must redo it.
 pub(super) fn inv_txfm2d(dq: &[i32], tx_sz: i32, tx_type: i32, res: &mut [i32]) -> bool {
@@ -286,6 +542,9 @@ pub(super) fn inv_txfm2d(dq: &[i32], tx_sz: i32, tx_type: i32, res: &mut [i32]) 
         let rect = log2w.abs_diff(log2h) == 1;
         let shift = Transform_Row_Shift[tx_sz as usize] as i32;
         let (rk, ck) = (row_kind(tx_type), col_kind(tx_type));
+        if rk == K_DCT && ck == K_DCT && log2w >= 3 && log2h >= 3 {
+            return inv_txfm2d_dct16(dq, log2w, log2h, shift, res);
+        }
         let mut e = E::new();
         match log2w {
             2 => rows_n::<2, 4>(dq, tw, th, h, rk, rect, shift, res, &mut e),
