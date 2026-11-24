@@ -45,12 +45,14 @@ import GlassActTestSupport
     /// read (reads that were autoreleased and never drained once held a whole 5K capture, 86 GB,
     /// until the Host was killed for memory).
     @Test func compressingDoesNotHoldTheFramesItRead() throws {
-        let width = 1024, height = 1024, count = 64  // 256 MB of frames
+        let width = 2048, height = 2048, count = 64  // 1 GiB of frames
         let (raw, out) = (tempURL("mem"), tempURL("memout"))
         defer { [raw, out].forEach { try? FileManager.default.removeItem(at: $0) } }
         let writer = try ScapRawWriter(url: raw, width: width, height: height)
+        // (frames that compress well, so the test stays quick: what's measured is the reads)
         var rng = SplitMix64(seed: 81)
-        var frame = rng.bytes(width * height * 4)
+        var frame = [UInt8](repeating: 0x40, count: width * height * 4)
+        for i in stride(from: 0, to: frame.count, by: 4096) { frame[i] = UInt8(truncatingIfNeeded: rng.next()) }
         for i in 0..<count {
             frame[i] &+= 1
             try frame.withUnsafeBytes { try writer.appendFrame(timestampUS: UInt64(i), dirtyRects: [], frame: $0, bytesPerRow: width * 4) }
@@ -67,9 +69,9 @@ import GlassActTestSupport
         #expect(try ScapRaw.compress(raw: raw, to: out, threads: 2) == count)
         let grew = footprint() - before
         // (the footprint is the whole test process's, and other suites run beside this one: on a
-        // busy CI runner it grew 65 MB with the fix. Holding the frames read is at least their
-        // 256 MB, so the bar sits between the two)
-        #expect(grew < 160 << 20, "footprint grew \(grew >> 20) MB compressing \((count * width * height * 4) >> 20) MB")
+        // busy CI runner it grew 65 MB, and 182 MB, with the fix. Holding the frames read is at
+        // least their 1 GiB, so the bar sits well between the two)
+        #expect(grew < 576 << 20, "footprint grew \(grew >> 20) MB compressing \((count * width * height * 4) >> 20) MB")
     }
 
     /// `finish` leaves only the whole trace; a capture without a whole frame leaves nothing; both
