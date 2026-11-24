@@ -1040,6 +1040,12 @@ brings the full capture back in session (`ScaleRecovery`) once:
   each time the rung comes down again after a recovery, so a link near the
   line settles instead of flapping.
 
+**The rung holds through a resize:** a geometry change while the capture is
+halved (the viewer's window resized, a virtual display re-made) is captured
+halved too, and the size the rung comes back to follows it. A full-size
+capture would undo the rung while it stayed latched, so it could never come
+down again (#165).
+
 ### 4.10 Session, geometry and windows
 
 **Watchdogs:**
@@ -1068,6 +1074,12 @@ session never redials.
   scale or preferences change, not on a re-HELLO, so a rebuild that
   dropped it lost the floor and the motion preference for the rest of the
   session.
+- It keeps what the session learned of the link too: SRTT and the PING
+  readings, the tile governor (§4.9), the datagram pacer, and the link's
+  delivery readings. The re-HELLO's round trip doesn't seed them, because the
+  viewer rebuilds its canvas before it answers. Seeded from it (205 ms on a
+  LAN at ~10 ms), SRTT took ~20 s to decay and the governor restarted at a
+  rate set by it (2.0 → 0.2 MB/s), so a resize's repaint took ~10 s (#165).
 - **Virtual display** (mode 4):
   - Uses the CGVirtualDisplay SPI: HiDPI 2×, up to 3840×2400 pt, mirrored
     `.forAppOnly`, so macOS undoes it when the Host exits.

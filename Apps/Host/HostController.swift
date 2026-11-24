@@ -1477,11 +1477,27 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
 
     /// Main thread. Rebuild the SCK stream at a new output size and reset
     /// the session so the next HELLO carries the new dimensions.
+    /// `atRung`: this is auto-scale's own halving (the size is already half).
     private func restartCapture(pixelWidth: Int, pixelHeight: Int, pointScale: CGFloat,
-                                origin: CGPoint? = nil, inSession: Bool = false) {
+                                origin: CGPoint? = nil, inSession: Bool = false, atRung: Bool = false) {
         guard isRunning, let filter = lastFilter else { return }
+        var (pixelWidth, pixelHeight, pointScale) = (pixelWidth, pixelHeight, pointScale)
+        // Auto-scale's rung holds through the Viewer's geometry changes: a resize while the
+        // capture is halved is captured halved too, and the size the rung comes back to
+        // follows it. Before, the resize's full-size capture undid the rung while it stayed
+        // latched, so it could never come down again (#165: down at 21:00:00, back to 2x a
+        // second later on the Viewer's next geometry request).
+        if autoScaledDown, !atRung, singleWindowID == 0 {
+            autoScaleFull = (pixelWidth, pixelHeight, pointScale)
+            captureModified = true
+            let full = pixelWidth * pixelHeight
+            encodeQueue.async { [weak self] in
+                if let self, self.autoScaleRecovery != nil { self.autoScaleRecovery?.pixels = full }
+            }
+            (pixelWidth, pixelHeight, pointScale) = ((pixelWidth / 2) & ~1, (pixelHeight / 2) & ~1, pointScale / 2)
+        }
         let size = CaptureGeometry.clamp(pixelWidth, pixelHeight)
-        let pixelWidth = size.w, pixelHeight = size.h
+        (pixelWidth, pixelHeight) = (size.w, size.h)
         pixelScale = pointScale * size.factor
         contentOrigin = origin ?? CGDisplayBounds(physicalDisplay).origin
         captureWidth = pixelWidth
@@ -2909,7 +2925,7 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         onStatus("link constrained (\(why)) — auto-scaling capture to \(pw)×\(ph) (back up unless the link "
                  + "shows it's thin, after \(autoScaleRecoverHoldS) s at least)")
         restartCapture(pixelWidth: pw, pixelHeight: ph, pointScale: pixelScale / 2,
-                       origin: contentOrigin, inSession: true)
+                       origin: contentOrigin, inSession: true, atRung: true)
     }
 
     /// Main thread. The halved capture's engine saw nothing saying the link

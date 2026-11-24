@@ -118,6 +118,36 @@ import GlassActTestSupport
     /// The same with video showing: a session that just connected shows the
     /// pinned region's video while the canvas under it may still be black, so
     /// the placeholder is what was on screen, video included.
+    /// A resize keeps what the session learned of the link (#165). The re-HELLO's round
+    /// trip waits on the Viewer rebuilding its canvas (205 ms live, on a LAN at ~10 ms):
+    /// seeded from it, SRTT took ~20 s to decay and the tile governor started over at a
+    /// rate set by it (2.0 → 0.2 MB/s), so the resize's repaint took ~10 s.
+    @Test func aResizeKeepsTheLinksReadings() {
+        var rng = SplitMix64(seed: 165)
+        var faults = FaultConfig.none
+        (faults.latencyMinUS, faults.latencyMaxUS) = (5_000, 5_000)  // ~10 ms round trips
+        let h = Harness(width: 640, height: 384, faults: faults)
+        for _ in 0..<20 {
+            h.frame.fillRandom(&rng)
+            h.encodeFrame()
+            h.run(untilUS: h.now + 100_000)
+        }
+        #expect(h.settle())
+        let srtt = h.host.srttUS, rate = h.host.stats.governorRate
+        #expect(srtt > 0 && srtt < 150_000 && rate > 0, "setup: srtt \(srtt) µs, rate \(rate) B/s")
+
+        h.reconfigure(width: 512, height: 384, viewerBusyUS: 200_000)
+        h.frame.fillRandom(&rng)
+        h.encodeFrame()  // (the governor's rate as the first tick at the new size reads it)
+        #expect(h.viewer.grid?.width == 512, "the resize went through")
+        // (a PING answered late during the rebuild may move SRTT an eighth of the way)
+        #expect(h.host.srttUS < srtt + 60_000, "SRTT \(h.host.srttUS) µs, from \(srtt) before the resize")
+        #expect(h.host.stats.governorRate >= rate * 9 / 10,
+                "the governor kept its rate: \(h.host.stats.governorRate) B/s, from \(rate)")
+        #expect(h.settle())
+        #expect(h.canvasMatchesFrame())
+    }
+
     @Test func thePlaceholderIncludesTheVideoThatWasShowing() {
         let h = Harness(width: 512, height: 384, video: true)
         for i in stride(from: 0, to: h.frame.bytes.count, by: 4) {
