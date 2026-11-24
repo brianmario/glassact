@@ -186,8 +186,8 @@ the project's release key and by the same developer as the app you have.
     the agent sockets.
   - Agent status is declared by the client.
   - The Viewer is sandboxed. The Host can't be: remote input needs
-    Accessibility, which sandboxed apps can't have. It also uses one private
-    API, for the virtual display.
+    Accessibility, which sandboxed apps can't have. It also uses private API
+    for the virtual display and for locking the screen.
 
 See [docs/DESIGN.md §13](docs/DESIGN.md#13-security-model) for the full
 model.

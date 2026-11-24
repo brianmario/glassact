@@ -1684,7 +1684,8 @@ automatic checks.
   to 10 min (an Allow resets it; `ApprovalPromptGate`). A key turned away
   meanwhile is refused as usual and asks again on its next retry.
 - First contact is only as safe as the person comparing codes.
-- The Host is unsandboxed and uses one private API, CGVirtualDisplay.
+- The Host is unsandboxed and uses two private APIs: CGVirtualDisplay, and
+  login.framework's `SACLockScreenImmediate` to lock the screen (below).
   Remote input needs Accessibility, which no sandboxed app can have.
 - **When a viewer leaves**, the Host puts the Mac back the way it was:
   - The display comes back first: its own mode, the virtual display gone,
@@ -1702,9 +1703,14 @@ automatic checks.
     left unlocked stays unlocked. It locks 1 s after a leave on purpose, once the
     restore has settled (macOS refuses mode changes at the lock screen), or
     30 s after a dropped connection.
-  - It posts ⌃⌘Q, the system's Lock Screen shortcut, and confirms the lock
-    from the `screenIsLocked` notification; if it doesn't lock (a remapped
-    shortcut, no Device Control grant), the Host reports it.
+  - It locks with login.framework's private `SACLockScreenImmediate`, what
+    the Apple menu's Lock Screen calls, so no shortcut setting or keyboard
+    layout changes it. ⌃⌘Q posted as keystrokes is the fallback, where the
+    call is missing or hasn't locked within a second: alone it was fragile (a
+    remapped shortcut, a remapper, the key's position on another layout) and
+    didn't lock a macOS 14.8 Host (#166). The lock is confirmed from the
+    `screenIsLocked` notification or the session's state within 3 s; if it
+    doesn't lock, the Host reports it.
 - Bonjour advertises the computer name.
 
 ---
