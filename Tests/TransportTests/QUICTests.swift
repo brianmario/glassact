@@ -32,6 +32,7 @@ import GlassActTestSupport
         fingerprint: String, identity: SecIdentity,
         clientIdentity: SecIdentity? = nil,
         authorizeViewer: (@Sendable (String) -> Bool)? = nil,
+        clientHost: String = "127.0.0.1",
         configureHost: @escaping (QUICTransport) -> Void,
         configureClient: @escaping (QUICTransport) -> Void
     ) throws -> Session? {
@@ -60,7 +61,7 @@ import GlassActTestSupport
             return nil
         }
 
-        let client = QUICTransport.connect(host: "127.0.0.1", port: port,
+        let client = QUICTransport.connect(host: clientHost, port: port,
                                            fingerprint: fingerprint,
                                            datagramPort: datagramPort, identity: clientIdentity,
                                            queue: clientQueue)

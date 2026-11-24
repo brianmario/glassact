@@ -24,6 +24,27 @@ import GlassActTestSupport
         session?.server.cancel()
     }
 
+    /// The two tunnels reach the host at different addresses (#164): a Viewer dials the
+    /// host's `.local` name once per tunnel, and each races its addresses on its own, so
+    /// control can arrive over IPv6 and datagrams over IPv4. Paired by address alone, the
+    /// datagram tunnel was parked and never attached, and the session failed at its 10 s
+    /// deadline; the Viewer's retry connected. Both tunnels present the viewer's key, so
+    /// they pair by that.
+    @Test func tunnelsFromTwoAddressesPairByTheViewersKey() throws {
+        let (hostID, hostFP) = try QUICLoopbackTests.makeTestIdentity()
+        let (viewerID, viewerFP) = try QUICLoopbackTests.makeTestIdentity()
+        let started = Date()
+        let session = try QUICLoopbackTests.makeSession(
+            fingerprint: hostFP, identity: hostID, clientIdentity: viewerID,
+            authorizeViewer: { $0 == viewerFP },
+            clientHost: "::1",
+            configureHost: { _ in }, configureClient: { $0.dialDatagramHost = "127.0.0.1" })
+        #expect(session != nil, "control over IPv6 and datagrams over IPv4 must still make one session")
+        #expect(Date().timeIntervalSince(started) < 5, "and at once, not at a deadline")
+        session?.client.cancel()
+        session?.server.cancel()
+    }
+
     /// The host's transport names its peer: the viewer certificate's
     /// fingerprint and common name ("glassact-agent" marks an agent), read
     /// from the established connection — what scopes are enforced against.
