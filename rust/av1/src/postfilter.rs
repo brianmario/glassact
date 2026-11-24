@@ -861,6 +861,53 @@ pub(crate) fn cdef_rect_scalar(
     }
 }
 
+/// No CDEF entry, or one whose strengths are all 0: CDEF then leaves the block as it is (no tap
+/// adds anything; the direction only steers taps), a copy without the direction search.
+#[inline(always)]
+pub(crate) fn cdef_quiet(f: &PfFrame, idx: i32) -> bool {
+    let i = idx as usize;
+    idx < 0 || (f.cdef_y_pri[i] | f.cdef_y_sec[i] | f.cdef_uv_pri[i] | f.cdef_uv_sec[i]) == 0
+}
+
+/// [`cdef_rect`] where every 64x64 the rect touches is [`cdef_quiet`] (one 64x64 has one entry):
+/// one copy of the samples its blocks would write, and true; false (nothing written) otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cdef_rect_copy(
+    f: &PfFrame,
+    m: &PfMaps,
+    src: &[&[u8]; 3],
+    sstride: &[usize; 3],
+    dst: &mut [&mut [u8]; 3],
+    dstride: &[usize; 3],
+    dst_row: i32,
+    (r0, r1): (i32, i32),
+    (c0, c1): (i32, i32),
+) -> bool {
+    let (re, ce) = (r1.min(f.mi_rows), c1.min(f.mi_cols));
+    if r0 >= re || c0 >= ce {
+        return false;
+    }
+    let (sr0, sr1, sc0, sc1) = (r0 >> 4, (re - 1) >> 4, c0 >> 4, (ce - 1) >> 4);
+    if !(sr0..=sr1).all(|sr| (sc0..=sc1).all(|sc| cdef_quiet(f, m.cdef_idx[(sr * f.sb_cols + sc) as usize] as i32))) {
+        return false;
+    }
+    // (the blocks are 8x8 luma: the rect rounded up to even 4x4s)
+    let (rn, cn) = ((re - r0 + 1) & !1, (ce - c0 + 1) & !1);
+    for p in 0..f.planes() {
+        let sub = f.sub(p);
+        let (x0, y0) = (((c0 * 4) >> sub) as usize, ((r0 * 4) >> sub) as usize);
+        let (w, h) = (((cn * 4) >> sub) as usize, ((rn * 4) >> sub) as usize);
+        let dy = ((dst_row * 4) >> sub) as usize;
+        let (s, ss, ds) = (src[p], sstride[p], dstride[p]);
+        let d = &mut *dst[p];
+        for i in 0..h {
+            let (a, b) = ((y0 + i) * ss + x0, (y0 - dy + i) * ds + x0);
+            d[b..b + w].copy_from_slice(&s[a..a + w]);
+        }
+    }
+    true
+}
+
 /// CDEF (spec 7.15) of the 8x8 blocks of the luma 4x4 rows `rows` and columns `cols` (even) of
 /// the frame: `src` = the deblocked frame (every sample within 2 of the blocks, inside the
 /// frame), `dst` = the output planes' rows from luma 4x4 row `dst_row` on (the chroma planes'
@@ -881,7 +928,7 @@ pub fn cdef_rect(
         neon::cdef_rect(f, m, src, sstride, dst, dstride, dst_row, rows, cols);
     }
     #[cfg(not(target_arch = "aarch64"))]
-    {
+    if !cdef_rect_copy(f, m, src, sstride, dst, dstride, dst_row, rows, cols) {
         cdef_rect_scalar(f, m, src, sstride, dst, dstride, dst_row, rows, cols);
     }
 }

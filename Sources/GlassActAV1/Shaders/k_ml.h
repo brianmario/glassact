@@ -441,13 +441,13 @@ kernel void k_ml_list(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
         const uint per = (uint)((64 / W) * (64 / H));
         if (tid / per >= B.nSbList) return;
         const uint sb = B.sbList[tid / per], k = tid % per;
-        const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
-        const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+        const int bx = (int)ga_umod(sb, (uint)I.sbCols) * (64 / W) + (int)(k % (64 / W));
+        const int by = (int)ga_udiv(sb, (uint)I.sbCols) * (64 / H) + (int)(k / (64 / W));
         if (bx >= nbx || by >= nby) return;
         gid = (uint)(by * nbx + bx);
     }
     if ((int)gid >= nbx * nby) return;
-    const int x = (int)(gid % nbx) * W, y = (int)(gid / nbx) * H;
+    const int x = (int)ga_umod(gid, (uint)nbx) * W, y = (int)ga_udiv(gid, (uint)nbx) * H;
     bool analyze = true;
     if (x < I.MiCols * 4 && y < I.MiRows * 4) {
         if (B.sbKeep && B.sbKeep[I.sbBase + (y >> 6) * I.sbCols + (x >> 6)]) return;  // kept: untouched

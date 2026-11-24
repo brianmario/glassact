@@ -317,7 +317,10 @@ final class Harness {
     /// for LWW continuity, and re-point the control route. The viewer
     /// reconfigures its canvas in place on the re-HELLO. Mirrors
     /// HostController.reconfigureEngineInSession — no reconnect.
-    func reconfigure(width: Int, height: Int) {
+    /// `viewerBusyUS`: the Viewer answers nothing for that long after the
+    /// re-HELLO goes out (it rebuilds its canvas first, #165): what reaches it
+    /// meanwhile is handed over at the end, in order.
+    func reconfigure(width: Int, height: Int, viewerBusyUS: UInt64 = 0) {
         let seed = host.currentFrameSeq
         let previous = host
         host = HostEngine(width: width, height: height, transport: link.a,
@@ -331,7 +334,17 @@ final class Harness {
             guard let self else { return }
             self.host.handleControl(data, nowUS: self.link.nowUS)
         }
-        host.start(nowUS: link.nowUS) // HELLO at new dims → viewer reconfigures
+        if viewerBusyUS > 0 {
+            let deliver = link.b.onControl
+            var held: [Data] = []
+            link.b.onControl = { held.append($0) }
+            host.start(nowUS: link.nowUS)
+            run(untilUS: now + viewerBusyUS)
+            link.b.onControl = deliver
+            for data in held { deliver(data) }
+        } else {
+            host.start(nowUS: link.nowUS) // HELLO at new dims → viewer reconfigures
+        }
         frame = TestFrame(width: width, height: height)
         run(untilUS: now + 300_000)   // let the re-HELLO / HELLO_OK settle
     }

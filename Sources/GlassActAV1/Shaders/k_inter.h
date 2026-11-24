@@ -64,7 +64,7 @@ kernel void k_proj_sums(constant GpBatch &B [[buffer(0)]], device int *sums [[bu
                         uint sb [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
     device const GpImage &I = B.img[0];
     if ((int)sb >= I.sbCols * I.sbRows) return;
-    const int x = (int)(sb % I.sbCols) * 64, y = (int)(sb / I.sbCols) * 64, sp = I.spitch[0];
+    const int x = (int)ga_umod(sb, (uint)I.sbCols) * 64, y = (int)ga_udiv(sb, (uint)I.sbCols) * 64, sp = I.spitch[0];
     device const uint8_t *ref = I.ref;
     const int k = (int)tid & 63;
     int t = 0;
@@ -89,7 +89,7 @@ kernel void k_proj(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buf
     if (tg >= nSbs) return;
     device const GpImage &I = B.img[0];
     const uint32_t sb = B.sbList ? B.sbList[tg] : tg;
-    const int x = (int)(sb % I.sbCols) * 64, y = (int)(sb / I.sbCols) * 64, sp = I.spitch[0];
+    const int x = (int)ga_umod(sb, (uint)I.sbCols) * 64, y = (int)ga_udiv(sb, (uint)I.sbCols) * 64, sp = I.spitch[0];
     const int big = I.W >= 3840 ? 2 : 1, ry = GA_PROJ_RY * big, rx = GA_PROJ_RX * big;
     device const uint8_t *src = I.src[0], *ref = I.ref;
     // the SB's projections, and the previous picture's over the search range (outside it: none)
@@ -383,7 +383,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
     if (g >= nCells) return;
     device const GpImage &I = B.img[0];
     const uint32_t sb = B.sbList ? B.sbList[g / 16] : g / 16, k = g % 16;
-    const int x = (int)(sb % I.sbCols) * 64 + (int)(k % 4) * 16, y = (int)(sb / I.sbCols) * 64 + (int)(k / 4) * 16;
+    const int x = (int)ga_umod(sb, (uint)I.sbCols) * 64 + (int)(k % 4) * 16, y = (int)ga_udiv(sb, (uint)I.sbCols) * 64 + (int)(k / 4) * 16;
     const int sp = I.spitch[0];
     device const uint8_t *src = I.src[0] + (size_t)y * sp + x;
     for (int p = (int)lane; p < 256; p += 32) cur[warp][p] = src[(p >> 4) * sp + (p & 15)];
@@ -447,6 +447,9 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
         // most 16320 + 32, and their >> 6 a floor of a product by 1/64, both exact)
         float cv[8];  // the lane's 8 samples of the cell
         for (int col = 0; col < 8; col++) cv[col] = (float)cur[warp][row * 16 + col0 + col];
+        // Glass Act: both steps and their 3 columns unrolled: the same sums, 0.06 ms less of video's
+        // motion search a 5K picture (BENCHMARKS "k_me's sub-sample steps unrolled")
+#pragma clang loop unroll(full)
         for (int step = 4; step >= 2; step >>= 1) {
             const int2 c = best[0];
             uint top = 0xFFFFFFFFu;
@@ -456,6 +459,7 @@ kernel void k_me(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[buffe
             // and the column's 3 positions share them
             const int oy0 = ((c.y - step) >> 3) - by + 1, span = (((c.y + step) >> 3) - by + 1) - oy0;  // rows oy0 .. oy0 + span + 1
             float pt[9];  // the lane's part of each position's SAD
+#pragma clang loop unroll(full)
             for (int j = 0; j < 3; j++) {
                 const int vx = c.x + (j - 1) * step, ox = (vx >> 3) - bx + 1;
                 const float fx = (float)(vx & 7), gx = 8.f - fx;
@@ -527,7 +531,7 @@ kernel void k_inter_sad(constant GpBatch &B [[buffer(0)]], constant GpParams &P 
     threadgroup uchar first[16 * GP_ME_KEEP];
     device const GpImage &I = B.img[0];
     const uint32_t sb = B.sbList ? B.sbList[tg] : tg;
-    const int sbx = (int)(sb % I.sbCols) * 64, sby = (int)(sb / I.sbCols) * 64;
+    const int sbx = (int)ga_umod(sb, (uint)I.sbCols) * 64, sby = (int)ga_udiv(sb, (uint)I.sbCols) * 64;
     device GpMeU &U = I.meU[sb];
     // Glass Act: the distinct list on 32 threads, as a walk in raster order builds it: vector t is
     // new where it isn't no motion and no earlier one is the same; its slot is 1 + the new ones before
@@ -671,12 +675,12 @@ kernel void k_inter(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
         uint32_t li = gb;
         if (B.sbList) {
             const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
-            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
-            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            const int bx = (int)ga_umod(sb, (uint)I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)ga_udiv(sb, (uint)I.sbCols) * (64 / H) + (int)(k / (64 / W));
             if (bx >= nbx || by >= I.shNby[BS]) continue;
             li = (uint32_t)(by * nbx + bx);
         }
-        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        const int x = (int)ga_umod(li, (uint)nbx) * W, y = (int)ga_udiv(li, (uint)nbx) * H;
         device GpInterRes &ir = B.inter[I.shOff[BS] + li];
         if (x >= I.MiCols * 4 || y >= I.MiRows * 4) {
             if (lane == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
@@ -859,12 +863,12 @@ kernel void k_inter_q(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
         uint32_t li = gb;
         if (live && B.sbList) {
             const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
-            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
-            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            const int bx = (int)ga_umod(sb, (uint)I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)ga_udiv(sb, (uint)I.sbCols) * (64 / H) + (int)(k / (64 / W));
             if (bx >= nbx || by >= I.shNby[BS]) live = false;
             else li = (uint32_t)(by * nbx + bx);
         }
-        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        const int x = (int)ga_umod(li, (uint)nbx) * W, y = (int)ga_udiv(li, (uint)nbx) * H;
         device GpInterRes &ir = B.inter[I.shOff[BS] + li];
         if (live && (x >= I.MiCols * 4 || y >= I.MiRows * 4)) {
             if (sl == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
@@ -1023,12 +1027,12 @@ kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
         uint32_t li = gb;
         if (live && B.sbList) {
             const uint32_t per = (64 / W) * (64 / H), sb = B.sbList[gb / per], k = gb % per;
-            const int bx = (int)(sb % I.sbCols) * (64 / W) + (int)(k % (64 / W));
-            const int by = (int)(sb / I.sbCols) * (64 / H) + (int)(k / (64 / W));
+            const int bx = (int)ga_umod(sb, (uint)I.sbCols) * (64 / W) + (int)(k % (64 / W));
+            const int by = (int)ga_udiv(sb, (uint)I.sbCols) * (64 / H) + (int)(k / (64 / W));
             if (bx >= nbx || by >= I.shNby[BS]) live = false;
             else li = (uint32_t)(by * nbx + bx);
         }
-        const int x = (int)(li % nbx) * W, y = (int)(li / nbx) * H;
+        const int x = (int)ga_umod(li, (uint)nbx) * W, y = (int)ga_udiv(li, (uint)nbx) * H;
         device GpInterRes &ir = B.inter[I.shOff[BS] + li];
         if (live && (x >= I.MiCols * 4 || y >= I.MiRows * 4)) {
             if (l32 == 0) { ir.isInter = 0; ir.zero = 0; ir.J = GP_INF; }
@@ -1132,7 +1136,7 @@ kernel void k_inter_s(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[
             const uint qli = slot[q].li, qSad = slot[q].sad;
             const int2 qBest = int2(slot[q].bx, slot[q].by);
             const float qLambda = slot[q].lambda;
-            const int qx = (int)(qli % nbx) * W, qy = (int)(qli / nbx) * H;
+            const int qx = (int)ga_umod(qli, (uint)nbx) * W, qy = (int)ga_udiv(qli, (uint)nbx) * H;
             const int qidx = sb_qindex(I, qx, qy);
             const int lane = tid;
             constexpr int NPX = W * H / NT;

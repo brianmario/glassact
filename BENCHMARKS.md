@@ -158,6 +158,8 @@ the numbers and the reasoning.
 | Glass Act's own AV1 decoder for the hybrid's streams (`rust/av1/src/decoder.rs`, C API `av1g/decoder.h`; `av1-decoder`) | built, stage 1 (no Swift yet) | 5K, 8 threads: inter frames 0.8 ms median on copy-heavy streams (aomdec 8 threads 1.8 without its output, 2.6 with; dav1d 1.1), photos 3.3 (4.2 / 5.1, 2.1); key frames 11–43 ms; every frame identical to libaom's | [entry](#our-own-av1-decoder-stage-1-2026-11-16) |
 | Our own AV1 decoder in the Viewer's place: `OwnAV1RegionDecoder` (`GlassActAV1Decode`, a `VideoRegionDecoder` over the Rust decoder with vImage's BGRA conversion), capped at the region's size (`av1g_decoder_create_capped`); `replay --video hybrid --decoder own` (`av1-viewer-decoder`) | built, stage 2 (in no app; no codec offer) | tabs, whole trace: every frame shown the encoder's picture (1699/1699; 1691/1691 with 4 decode faults, 33 ms recoveries as VideoToolbox; 1595/1595 with 4 resets, 526 / 926 ms as VideoToolbox); 1.74 ms a 5K inter frame wall time with the conversion (VideoToolbox 9.56), key frames 23 ms (22.6); PSNR of what's shown 0.4–0.6 dB under VideoToolbox's | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
 | The own decoder's 4:2:0 chroma scaled up with vImage's Lanczos before converting, instead of vImage's 4:2:0 conversion (`av1-viewer-decoder`) | rejected | +0.03 dB (47.92 → 47.95, VideoToolbox 48.19), conversion 0.60 → 14.9 ms a 5K frame | [entry](#our-own-av1-decoder-in-the-viewers-place-stage-2-2026-11-16) |
+| Our decoder on one thread: DCT_DCT on 8 lanes of i16, CDEF's blocks of strength 0 copied (on x86_64 too), one strength 0 without its taps and clamp, branchless 2-symbol reads, the sign pass over non-zero levels | kept | a 5K inter frame 82.6 → 50.3 ms on M4 Pro (output 24.9 → 3.0, tiles 51.8 → 41.6); x86_64 under Rosetta 784 → 144 ms; the same frames | [entry](#our-av1-decoder-on-one-thread-16-bit-dcts-cdefs-no-op-blocks-branchless-bits-2026-11-23) |
+| Our decoder's symbol search in NEON without the loop's branches (dav1d's count of the bounds above the value) | rejected | a 5K inter frame 87.1 → 95.9 ms: the count's latency lands on every use of the symbol, where a predicted exit lets the core run ahead | [entry](#our-av1-decoder-on-one-thread-16-bit-dcts-cdefs-no-op-blocks-branchless-bits-2026-11-23) |
 | Lossless 4:4:4 AV1 tiles from the hybrid (qindex 0, identity matrix) | not built | at qindex 1, short of lossless, text and UI tiles already cost 9–34 % more than VP8L's lossless ones | [entry](#lossless-444-av1-tiles-from-the-hybrid-a-bound-before-building-it-2026-11-17) |
 | AVIF lossless per 64×64 tile | rejected (re-measured 2026-10-31, 2026-11-16 with screen tools forced) | libaom's best (speed 0, palette and IntraBC on) still 1.2–2.5× VP8L z4's bytes; the hybrid has no lossless mode | [entry](#tiles-as-av1-lossless-and-lossy-avif-and-the-metal-encoder-against-vp8l-2026-10-31), [re-check](#tiles-as-avif-from-the-hybrid-re-measured-2026-11-16) |
 | Lossy WebP / AVIF tiles (incl. the hybrid's 4:2:0 key frames, 2026-11-16) | rejected | on text, lossless VP8L is smaller than WebP q90 (398 vs 423 B/tile on typing-cc) | [entry](#lossy-webp--avif-for-tiles--measured-and-rejected-2026-08-10) |
@@ -206,6 +208,7 @@ the numbers and the reasoning.
 | HEVC Main 4:4:4 (full-resolution chroma) for video regions | rejected | at equal bytes 4:2:0 scores higher (typing-cc 0.57 Mbit/s: 77.2 vs 67.8 SSIMULACRA2); 4:4:4 costs 5–35 % more bits | [entry](#hevc-main-444-for-video-regions-rejected-2026-10-25) |
 | Software AV1 (vendored libaom) as a Viewer opt-in | kept, opt-in, until 2026-11-17: the opt-in's AV1 is now Glass Act's (below), libaom kept unused; hardware HEVC stays the default | not a bandwidth saving: at equal bytes HEVC is 3–6 SSIMULACRA2 better on text and wins photos; AV1 wins scrolling and reaches sharper text at higher rates; aiming at 40 % of the link it delivers more frames than HEVC on 10 Mbit/s; encode 2–10 ms vs ~13 ms | [entry](#av1-back-as-a-viewer-opt-in-2026-10-25) |
 | AV2 (AVM reference encoder) for video; AV1 speed and decode re-measured | measured, not actionable | at 60 dB on typing-cc 38 KB vs 141 KB AV1 vs 233 KB x265 vs >647 KB hardware HEVC; but 0.09 fps at 1080p and no hardware or VideoToolbox support | [entry](#av2-on-screen-text-avm-research-v1500-2026-10-25) |
+| Apple Screen Sharing's High Performance mode at 5K, beside Glass Act's AV1 (rootshell-vnc's live benchmark, its frames scored against a recording of the screen) | measured | four 5120x720 HEVC bands, 48–55 pictures a second (never 60) at 28–33 Mbit/s, whatever changes; on a film at Apple's bitrate Glass Act scores +8–10 dB luma PSNR (SSIMULACRA2 77–79 vs 33), and matches Apple's quality at ¼–½ of its bits | [entry](#apple-screen-sharings-high-performance-mode-at-5k-frame-rate-bitrate-and-quality-beside-glass-acts-av1-2026-11-23) |
 | Intra block copy in key frames (`metal-av1`, on by default) | kept | 5K BD-rate typing −18 %, cursor-drag −14 %, scroll −7 %; photos and 720p unchanged (a frame copies only when copies cover ≥ 6 % of its non-flat 8×8s: no filters then); ~10 ms of search per 5K key frame | [entry](#metal-av1-intra-block-copy-in-key-frames-2026-11-01) |
 | Lossy intra block copies; inter blocks' tx types searched (`metal-av1`) | kept | key frames also copy where a near copy's residual is ≤ 0.005 × 1.5 × step² per sample: 5K BD-rate typing −2.3 %, scroll −1.7 %, drag −3.2 % (1080p terminal crop's key frame −11 %); inter tx types: −0.1 to −2.4 % more (720p photos), 2–5 % slower on most points (one 5K point 25 %); split transforms in copies and 4×4 copies measured, not worth it | [entry](#metal-av1-lossy-intra-block-copies-and-inter-blocks-tx-types-2026-11-01) |
 | AV2's 3.7× on text, attributed (AVM, each tool off in turn) | measured; intra block copy is next for `metal-av1` | intra block copy alone is 3.4× on typing; libaom at speed 2 with it gets within ~15 % of AV2 (typing 60 dB: 43 vs 37 KB, 131 KB without); key frames 2.9× smaller at ~45 dB | [entry](#av2s-gain-on-text-attributed-intra-block-copy-which-av1-has-too-2026-11-01) |
@@ -302,6 +305,8 @@ the numbers and the reasoning.
 | Holding a picture's analysis commits while the filters run (`GA_HOLD_FOR_FILTERS`) | tried, not kept | photos +0.4 %, typing-cc −0.1 %, scroll-win −0.3 %; the overlap (62 % of the filters' GPU time) is committed before the filters start | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Keeping the CPU's clocks up between paced pictures (a spinning thread; `GA_WARM_CPU`) or the GPU's (a blit every few ms; `GA_WARM_GPU`) | measured in av1seq; the owner's call | av1seq paced every 33 ms: typing-cc 13.5 → 6.9 ms, scroll-win 10.8 → 5.7 ms with one spinning core, an upper bound (the replay's closed loop is near warm already); the blits don't raise the GPU's state (Metal System Trace: paced work 75 % at Minimum; the narrow kernels, `l_select` most, slow 2–4×) | [entry](#metal-av1-the-hosts-change-map-padded-sources-updated-in-place-and-paced-pictures-clocks-2026-11-19) |
 | Three frames waiting for Glass Act's AV1 and HEVC (`maxPendingFrames`), measured with the Host's rule in real time (`glassact-bench pace`) | kept | of 60 fps of changes at 5K: AV1 41–57 → 57–58 frames a second shown, HEVC 36–38 → 48–53; p50 +0–4 ms (AV1), +2–10 ms (HEVC) | [entry](#video-three-frames-waiting-for-glass-acts-av1-and-hevc-the-hosts-rule-in-real-time-2026-11-19) |
+| `k_me`'s sub-sample steps unrolled (`metal-av1`) | kept; the steps by column (no `h[3][8]`), unrolled or not, not (slower) | the same streams (video, movie, typing, the rotation, maps); 5K q36 motion search: video 4.79–4.80 → 4.73–4.74 ms, movie 3.42–3.45 → 3.40–3.43; `k_me`'s cold compile +20 ms | [entry](#metal-av1-k_mes-sub-sample-steps-unrolled-the-steps-by-column-timed-and-rejected-2026-11-23) |
+| Learned mode pruning's eps 0.60 from a run's fourth mostly-new picture on (`NewPictureEffort.runModeEps`, `av1seq --fast run-mode-eps=<p>`; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 17.5 → 15.6 ms a frame, 57.9 → 63.3 inter frames a second back to back, live at 3 waiting 39.7 → 43.1; movie 14.0 → 12.4 ms, 70.9 → 78.4, live 56.2 → 57.9. BD-rate video −0.02 % (from frame 1150 −0.00 %), movie −2.36 %, maps −0.02 % (SSIM agrees); the rotation and app switching byte-identical; text screens new in every picture (`--no-golden`) +1.53 %, video then typing +0.68 %. In every mostly-new picture instead: the rotation +0.28 % at 0.20, +1.10 % at 0.40. Not kept the same day: no 64x64s in runs (movie +21 %, maps +31 %), no 16x16s (maps +8.8 %), whole-sample motion (+28 % bytes on video) | [entry](#metal-av1-the-learned-mode-pruning-in-runs-of-mostly-new-pictures-and-the-levers-that-cost-bytes-2026-11-23) |
 | No 4x4 or 8x8 shapes from a run's fourth mostly-new picture on (`NewPictureEffort.runShapeMask` 0x1240, `runShapesAfter` 3; in `standard`, pictures larger than 4K) | kept | 60 fps video at 5K q36: GPU analysis 22.5 → 18.7 ms, 41–45 → 53–55 inter frames a second, −0.01 % bytes; movie 67 → 71, +0.05 %; lone switches, tabs, windows, IDE, images-scroll and the four-trace rotation byte-identical; maps zooming +0.8 % bytes, −0.08 dB while it moves. From the third picture the rotation loses 0.93 dB; in every mostly-new picture (not only runs) +9.6 %, −1.76 dB | [entry](#metal-av1-the-small-shapes-in-runs-of-mostly-new-pictures-2026-11-20) |
 | Reduced frames for video: a run of soft video coded at half size each way, shown scaled up (`ReducedFramesPolicy`, caps bit 8 `videoReducedFrames`; VideoToolbox Viewers only, and Glass Act's decoder too since its own upscaler, below) | kept | the owner's 60 fps video at 5K, `pace` at 60 fps with 3 waiting, after #133: 39–40 → 54–57 frames a second shown, p50 latency 53–54 → 38–39 ms, at about the same bytes (165–168 against 179–183 KB) with its ceiling 48 finer; at those operating points PSNR 33.20 → 34.36 dB, SSIMULACRA2 30.0 → 40.3; a movie at its own resolution, photos, maps and tabs stay full size (the margin gate) | [entry](#video-reduced-frames-for-soft-video-and-the-levers-that-didnt-pay-2026-11-20) |
 | Other coded sizes for reduced video: ¾, 1080p (~⅜), ~⅓ and ¼ of a 5K region besides ½, and a scan for the content's own resolution | measured; not built | the owner's 60 fps video: below ½ never wins at equal bytes (30–120 KB a frame, 0.4–1.5 dB worse); ¾ beats ½ by 0.4–0.7 dB at 120–160 KB but takes 14.8 ms of GPU analysis against 7.7 (it falls under the fast pictures' 2,400-SB floor); the round trip's loss rises smoothly (¾ 47.9 dB … ¼ 33.4), no resolution cutoff to find. One trace: 1080p and 720p clips wanted | [entry](#video-reduced-frames-at-other-sizes-and-the-contents-own-resolution-measured-2026-11-21) |
@@ -390,6 +395,363 @@ answered; each result stays in the log.
 Newest first. Entries keep the names and numbers of their day: a later
 entry may supersede an earlier one, and the decisions table above says
 which.
+
+### Apple Screen Sharing's High Performance mode at 5K: frame rate, bitrate and quality beside Glass Act's AV1 (2026-11-23)
+
+Until now the HEVC numbers here were Glass Act's own VideoToolbox HEVC. This is Apple's: the
+Screen Sharing server of macOS 27.2.1 on the M4 Pro (Studio Display, 5120x2880), measured through
+[rootshell-vnc](https://github.com/kitknox/rootshell-vnc), the MIT Swift client that
+[OpenScreens](https://github.com/burakgon/OpenScreens) is built on. Its `LiveVideoBenchmarkTests`
+logs in to a server, takes the High Performance stream and decodes it with VideoToolbox. The
+viewer was the same Mac (127.0.0.1), so its four decoders shared the media engine with the
+server's encoder, and the link was lossless.
+
+**What the server sends at 5K.** Above HEVC level 5.1's luma picture size (8,912,896 samples),
+High Performance mode sends four horizontal bands, 5120x720 each, as four RTP sources. They form
+one HEVC stream: an IDR at the start, then only predicted pictures. VideoToolbox decoded every
+band picture, and the four bands stitch with no seams. Per second:
+
+| Apple High Performance, 5K | full pictures a second | Mbit/s |
+|---|---|---|
+| a desktop with little changing (a terminal, then the pointer over the Dock) | 48.4 (38–56) | 31.8 |
+| a film playing full screen (not the movie trace's) | 53.5 (50–56) | 27.5 |
+| the movie trace's film, from its first frame | 54.6 (52–57) | 33.0 |
+
+It never reached 60, and it spends about 30 Mbit/s whether much changes or not. Its bitrate
+follows a budget more than the content.
+
+**Quality.** The film again, with the benchmark patched (locally, outside this repo) to save every
+12th set of bands, stitched and converted to sRGB by Core Image with their decode time on the
+host clock. Beside the session, `glassact-bench record --no-cursor` recorded the screen as the
+reference (1,110 frames over 44 s: the film's own frame rate, none dropped). A scorer matched each
+saved band to the recorded frame it shows (a 1/16 luma thumbnail within ±250 ms of the session's
+median latency, 30 ms) and scored as `av1seq --score-rgb` does: BT.601 luma from BGRA, PSNR, and
+SSIM on 8x8 blocks. Apple's video draws the pointer, so its 80x80 square is left out of the
+scores. 170 pictures covering recorded frames 112–1087.
+
+Glass Act's side is `av1seq` (`main` with #161 and #162; `--tiles 3x0 --inter --score-rgb
+--ssimulacra2-every 12`) on two 244-frame stretches of the same recording, at four fixed q. Its
+bitrate is the stretch's bytes over the stretch's recorded duration. Apple's is its per-second
+counts over the same seconds of the session.
+
+| frames 112–355 (9.2 s) | Mbit/s | luma PSNR | SSIM | SSIMULACRA2 |
+|---|---|---|---|---|
+| Apple | 29.6 | 39.33 dB | 0.9880 | 33.0 (22 pictures across the run) |
+| Glass Act q20 | 22.9 | **49.85 dB** | 0.9933 | 78.8 |
+| Glass Act q28 | 15.9 | 48.05 | 0.9908 | 72.7 |
+| Glass Act q36 | 10.4 | 45.57 | 0.9857 | 61.5 |
+| Glass Act q44 | 6.7 | 42.52 | 0.9775 | 44.2 |
+
+| frames 600–843 (10.2 s) | Mbit/s | luma PSNR | SSIM | SSIMULACRA2 |
+|---|---|---|---|---|
+| Apple | 34.1 | 39.82 dB | 0.9771 | |
+| Glass Act q20 | 31.7 | **47.62 dB** | 0.9886 | 77.1 |
+| Glass Act q28 | 21.6 | 45.67 | 0.9833 | 68.3 |
+| Glass Act q36 | 13.6 | 43.06 | 0.9735 | 53.1 |
+| Glass Act q44 | 8.2 | 40.02 | 0.9569 | 30.0 |
+
+- **At Apple's bitrate Glass Act is 8–10 dB higher** in luma PSNR, and 77–79 against 33 in
+  SSIMULACRA2.
+- **At Apple's quality Glass Act needs a quarter to a half of its bits:** about q44 (7–8 Mbit/s) by
+  PSNR and SSIMULACRA2, about q32 (~17 Mbit/s) by SSIM. Apple ranks better by SSIM than by
+  PSNR.
+- **Colour:** Apple's stream is Display P3 (BT.709 matrix, sRGB transfer). After Core Image's
+  conversion to sRGB its red channel averages 4.8 levels below the recording's (blue +0.2, green
+  +0.3). With each picture's mean luma offset removed Apple scores 41.28 dB instead of 39.81 dB,
+  which changes none of the above. Its SSIMULACRA2 keeps both the offset and the pointer, so it
+  is the harshest of the three for Apple.
+- **Not like for like:** Glass Act's numbers are fixed-q `av1seq`, not a live session with rate
+  control. It coded these stretches at 66 inter frames a second, more than the film's 25. Apple's
+  were live, with the viewer on the same Mac. Apple sends a picture at the screen's rate (≈ 53 a
+  second) where Glass Act codes the film's 25 changes; bits a second is the fair measure either
+  way.
+
+Not kept anywhere: the recording (32 GB), Apple's pictures and the scorer live outside the repo.
+A rerun needs a Screen Sharing login on the measured Mac.
+
+### Metal AV1: `k_me`'s sub-sample steps unrolled; the steps by column, timed and rejected (2026-11-23)
+
+The entry "the learned mode pruning in runs" left the sub-sample refinement's stack traffic (50 %
+of `k_me`'s L1) as an untimed lead. Timed here against `main` at 07c7f1a, at 5K, `--tiles 3x0`,
+q36, the motion search stage of a run's fourth mostly-new picture (`av1seq --profile
+--profile-pictures 5`, best of 10), four rounds in alternating order, load 4–10. Every variant
+was first checked to code the same streams: `--digest` on video, movie, typing, the four-trace
+rotation and maps (24 inter frames each), all decoding exactly in libaom.
+
+| motion search, ms (four rounds) | video from 220 | movie | video from 1150 (three) |
+|---|---|---|---|
+| `main` | 4.79–4.80 | 3.42–3.45 | 4.65–4.67 |
+| **both steps and their 3 columns unrolled** | **4.73–4.74** | **3.40–3.43** | **4.59–4.61** |
+| the three rows' horizontal sums by column, no `h[3][8]` | 4.98–5.00 | 3.55–3.58 | |
+| the same, unrolled | 4.81–4.82 | 3.47–3.48 | |
+
+- **Kept: the steps unrolled** (two `#pragma clang loop unroll(full)`), −0.06 ms on video and
+  −0.02 on movie, the ranges apart in every round. Maps' motion search varied 5.7–6.6 ms in both
+  builds, too noisy to read.
+- **By column is slower,** as on 11-18 (0.50 → 0.53 ms by `metal-trace`): fewer registers on the
+  stack doesn't make `k_me` faster.
+- **Compile time:** `k_me`'s first compile (a pipeline from a metallib, a no-op made unique each
+  run so no cache holds it) 265–274 → 285–288 ms. The hybrid compiles its kernels before it offers
+  AV1 (`compileKernels`), where the whole set takes seconds cold.
+- That closes the sub-sample stack lead: about 1.2 ms of video's `k_me` is the refinement, and
+  what's left is its arithmetic.
+
+### Metal AV1: the learned mode pruning in runs of mostly-new pictures, and the levers that cost bytes (2026-11-23)
+
+The GPU work per picture looked tuned to its limit at the instruction level (the entry "Line by
+line" below), so this round measured levers that change the stream: less work for each mostly-new
+picture, each priced in BD-rate. All at 5K, `--tiles 3x0`, `main` at e1edef7, an M4 Pro at load
+6–17 (a Spotlight updater and another project's tests; every run through one lock).
+
+**Where the time goes.** The owner's 60 fps video (`glassact-1795125212` from frame 220, q36), its
+fifth picture (`av1seq --profile --profile-pictures 5`, so a run's fourth mostly-new picture, with
+the small shapes off): motion search 4.80 ms, inter candidates 3.42, intra analysis 8.4 (16x16
+2.46, 32x32 3.15, 64x64 2.79), learned pruning 1.61; the closed loop ~9–11. The GPU stages were
+the same to ±0.05 ms over two rounds, so one round says what a lever saves.
+
+**The levers, on that picture** (`--fast`, the default's levers plus one):
+
+| lever, in every mostly-new picture | GPU stages saved | inter KB (7 frames, q36) |
+|---|---|---|
+| the default (`level=1,min-sbs=2400,run-shapes=1240,run-shapes-after=3`, its digest the default's) | | 135.0 |
+| no 64x64 (`run-shapes=0240`) | 4.0 ms (analysis 2.8, inter candidates 1.3) | 131.9 |
+| no 16x16 (`run-shapes=1200`) | 3.3 (2.4, 0.9) | 136.7 |
+| whole-sample motion (`no-subpel`) | 2.4 (motion search 1.9) | 172.6 |
+| mode eps 0.20 / 0.30 / 0.40 / 0.60 / 0.80 (`mode-eps`) | 0.9 / 1.4 / 1.9 / 2.6 / 3.0 | 135.0 |
+| level eps 0.10 (`eps`) | 0.1 | 135.0 |
+| `preset=turbo2`, `turbo3` | 0 (the closed loop alone; noise) | 135.0 |
+
+**BD-rate** (log rate against RGB PSNR over q20, q36 and q44, 61 frames; video from frame 220, the
+movie `1793736335` from 300, maps `1794284096` from 180):
+
+| | video | movie | maps |
+|---|---|---|---|
+| no 64x64 | +5.02 % | +21.10 % | +30.51 % |
+| no 16x16 | +0.79 % | +0.39 % | +8.78 % |
+| mode eps 0.20 | −0.07 % | −1.89 % | −0.24 % |
+| 0.30 | −0.16 % | −2.37 % | −0.22 % |
+| 0.40 | −0.14 % | −2.30 % | −0.45 % |
+| 0.50 | −0.06 % | −2.26 % | −0.11 % |
+| **0.60** | **−0.02 %** | **−2.42 %** | **−0.12 %** |
+| 0.80 | +0.59 % | −2.35 % | +0.13 % |
+
+- **Large and small shapes code real content.** Without 64x64s the movie and maps lose a fifth to
+  a third; without 16x16s maps (its labels are text) loses 8.8 %. Not kept.
+- **Whole-sample motion** costs +28 % bytes on the video at a fixed q. Not kept. Its time is the
+  sub-sample refinement in `k_me` (3.15 → 1.91 ms) and `k_inter_sad`'s bilinear SADs (0.65 →
+  0.15). `k_me` reads 50 % of its L1 traffic from the stack with the refinement on and 0 % with it
+  off. The compiler's spill events (80–192 B a thread, from the spill oracle in "Line by line")
+  didn't move with any rewrite tried: streaming the three rows' horizontal sums by column (exact:
+  whole numbers below 2^24), one refinement step, the loops unrolled. None was timed, and the
+  stack figure also counts private arrays indexed at run time (`h`, `pt`, `cv`), which the spill
+  events don't: a timed A/B is what's left to do there (since done: the entry above, "`k_me`'s
+  sub-sample steps unrolled").
+- **The mode pruning keeps its bytes far looser than it is.** The mode network picks which of the
+  13 luma modes a node's blocks screen, keeping the likeliest until all but eps of the probability
+  is kept. On the movie, quality rises at the same bytes (q36: 45.10 → 45.23 dB at 3,685,737 →
+  3,681,133 B; SSIM 0.9834 → 0.9839). Not looked into why.
+
+**But on screens' text it costs**, so it goes where the small shapes rule went: from a run's fourth
+mostly-new picture. In every mostly-new picture instead (four traces in turn, 60 pictures, three of
+them mostly new; the same with `--no-golden`, 24 pictures, every one new; app switching, 400
+frames, one):
+
+| mode eps in every mostly-new picture | rotation | rotation, every picture new | app switching |
+|---|---|---|---|
+| 0.20 | +0.28 % | +0.21 % | +0.16 % |
+| 0.30 | +0.57 % | +0.58 % | +0.31 % |
+| 0.40 | +1.10 % | +1.04 % | +0.47 % |
+
+**Kept: mode eps 0.60 from a run's fourth mostly-new picture** (`NewPictureEffort.runModeEps`,
+from the same picture as `runShapeMask`; `--fast run-mode-eps=<p>`; in `standard`, pictures larger
+than 4K). Against `main`:
+
+| BD-rate, by RGB PSNR · by SSIM | runs-only 0.60 |
+|---|---|
+| video from frame 220 | −0.02 % · −0.11 % |
+| video from frame 1150 | −0.00 % · −0.00 % |
+| movie | −2.36 % · −3.71 % |
+| maps | −0.02 % · −0.33 % |
+| the rotation, app switching | byte-identical |
+| the rotation with every picture new (`--no-golden`) | +1.53 % · +1.83 % |
+| video then typing (30 + 30 pictures, `--then`) | +0.68 % · +0.96 % |
+| two screens in turn then video (30 + 30) | +0.11 % · +0.08 % |
+
+(SSIM's BD-rate is against −10 log10(1 − SSIM).) The `--no-golden` rotation is text screens new in
+every picture, so its run reaches a fourth picture: the case the small shapes rule pays for too.
+With long-term references on (the default) the rotation's screens come back as copies and no run
+reaches it. After the video, typing's first pictures are still in the run (mostly new against the
+last video picture), so they pay part of that.
+
+Frame rate, `main` and the new default alternated, four rounds (load 6–17, provisional):
+
+| | GPU analysis a frame | back to back, inter frames a second | live, 3 waiting (`pace --pending 3`) · p50 |
+|---|---|---|---|
+| video from 220 | 17.5 → 15.6 ms | 57.9 → 63.3 (+9 %) | 39.7 → 43.1 · 51.1 → 48.9 ms |
+| video from 1150 | | | 40.0 → 42.2 · 52.0 → 49.2 ms |
+| movie | 14.0 → 12.4 ms | 70.9 → 78.4 (+11 %) | 56.2 → 57.9 · 36.8 → 35.2 ms |
+
+(Back to back is 91 frames with `--no-planes`. `pace` defaults to 2 waiting; the Host lets the
+hybrid have 3, #131.) The video at full size still shows ~43 frames a second live: its frames
+take ~50 ms from submit to frame at 3 waiting (the entry "why full size shows 44 frames a second"),
+where reduced frames carry it to 55–57.
+
+New default digests (61 frames, `--score-rgb`, q36): video 9c062d68376040f8 (`main`
+dbe3698381bdf01c), movie fae07af909e5822b (388299222215927c), maps 69c5dac1f9fba365
+(aa387c13bedf0e38); `--fast level=1,min-sbs=2400,run-shapes=1240,run-shapes-after=3` gives the old
+ones. All decode exactly in libaom. `HybridEncoderTests.newPictureEffortMixesFastAndNormalPicturesExactly`
+now also checks that `runModeEps` leaves a run's first picture, and a run shorter than
+`runShapesAfter + 1`, byte for byte as without it, and changes its second (learned pruning at any
+size there, since the test's pictures are under its 900-superblock floor).
+
+### Our AV1 decoder on one thread: 16-bit DCTs, CDEF's no-op blocks, branchless bits (2026-11-23)
+
+The same stream as the entry below (the owner's 60 fps Photos video, 31 frames, 5K, q36), an M4
+Pro shared with a GPU benchmark (load 2–9; every run through one lock, A/B runs interleaved with
+the order alternating, 3–6 rounds). Each change was checked against main's frames (all 31
+identical), `cargo test --release`, and the x86_64 tests under Rosetta where it touches that path.
+Main's own build measured 87 ms early in the session and 82 ms later (88 in the entry below): the
+Mac's state, so every row compares builds timed side by side.
+
+What the stream does: 99 % of its 2,540 TX_64X64 transforms a frame have more than 64
+coefficients, so a DC-only path would buy nothing; and 96.5 % of the 8x8s CDEF filters, luma and
+chroma alike, have **every strength 0** (the rest: luma 3.2 % secondary only, 0.3 % both; chroma
+3.5 % primary only). Those blocks ran the direction search and all 13 taps to give back the block.
+
+| one thread, a 5K inter frame | tiles | output | frame (median) |
+|---|---|---|---|
+| main | 51.8 | 24.8 | 82.2 ms |
+| equiprobable bits (signs, Golomb codes) and split_or's bools without a branch: the value against one bound, the new state by selects | 50.5 | | 81.3 |
+| DCT_DCT (8x8 and up) on 8 lanes of i16: every DCT value fits 16 bits until the first range violation; H is the saturating add / subtract, B widens and narrows with saturation, a result on a limit goes to the scalar reference | 43.9 | | 74.4 |
+| CDEF of blocks whose entry has every strength 0: a copy, without the direction search; a 64x64 of such an entry one copy of its rows | | 3.1 | 51.9 |
+| CDEF with one strength 0: without that kind's taps and without the clamp (the other kind's weights sum to 12, so the result stays in the taps' range) | | 2.8 | 51.5 |
+| the sign pass over the non-zero levels only (the level pass keeps their scan indices; the skip of zero levels mispredicted) | 41.0 | | 49.7 |
+| main → all, 3 interleaved rounds | 51.8 → 41.6 | 24.9 → 3.0 | **82.6 → 50.3 (−39 %)** |
+
+The 16-bit DCT at every size it takes (`bench_inv_txfm2d`, DCT_DCT, the low-frequency quarter
+populated, two runs each): 8x8 34 → 30 ns, 16x8 78 → 63, 8x16 85 → 50, 16x16 176 → 115, 16x32 537
+→ 358, 32x32 1188 → 751, 64x64 4598 → 2571; the encoder's closed loop shares it. The real-decoder
+tests (`decoders`, `decoders_444`, `decoders_444_inter`, `palette_decoders`,
+`decoders_agree`) pass, and the stream decodes identically on 8 threads.
+
+**x86_64 (Intel Viewers):** its CDEF is the scalar per-sample code, so the quiet-block copy is shared
+with it (`postfilter::cdef_rect_copy`). Under Rosetta, one thread: output 647 → 40 ms, a 5K inter
+frame 784 → 144 ms; the same frames.
+
+**Rejected:** the symbol search in NEON for every adaptive CDF, as dav1d does it (the symbol is the
+number of the loop's bounds above the value: they fall strictly, by at least 4 a symbol, and the
+last is 0): a 5K inter frame **87.1 → 95.9 ms**, tiles 54.4 → 62.6 (4 rounds against main). The
+search's own samples fell (1,305 → 934), but `txb` rose from 12 % to 20 %, its samples on the
+first instruction that uses the symbol: a correctly predicted exit lets the core run on into the next
+symbol's context, while the branchless count (multiply, narrow, compare, add across, index) puts
+its whole latency in front of every use. The first version also hit a `memset_pattern16` call and a
+vector load across several small stores; a version with direct loads, and `prev` / `cur`
+recomputed from the CDF, wasn't timed (its extra load and multiply sit on the same chain). Only
+the 2-symbol reads, whose branch is a coin flip, went branchless.
+
+Left, one thread (50 ms): coefficient parsing 17 %, inter prediction 15 %, the symbol loop 15 %,
+inverse transforms ~21 % (the 64-point column pass 9 %), deblocking 8 %, the 64x64 copies between
+the tile, frame and output buffers ~8 %, CDEF 2.6 %. 2.5 % is slice-range checks, two thirds
+of them in the 16-bit column pass's stores of the residual (i32).
+
+**Next:** the 16-bit transforms with one footprint check and raw loads and stores, and the residual
+handed to `add_residual` as i16; the 64-point DCT with its upper half of inputs zero (half the first
+stage's multiplies, as dav1d's dct64); the 16-bit DCT in SSE for Intel; the symbol decoder's state
+in registers (`read` isn't inlined, so range and value go through memory every symbol).
+
+### Line by line: our AV1 decoder's CPU profile, and Xcode's per-line shader profile of the encoder (2026-11-22)
+
+The owner's 60 fps Photos video (`glassact-1795125212`, frames 220.., 5K, q36, tiles 3x0), on a
+quiet M4 Pro (load 2–9).
+
+**How, CPU (our decoder):** `rust/av1`'s `own_decode` example built with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, recorded with `xctrace`'s Time Profiler on one
+thread, symbolicated with a dSYM, and every sample's address put through `atos -i` (the innermost
+line in the crate, past inlined std helpers) and against `otool -tv` (samples per instruction).
+`own_decode --dump <file.i420>` (new) writes the frames, so each change was checked against the
+build before it: all 31 frames identical, every time.
+
+| one thread, a 5K inter frame | tiles | output | frame (median) |
+|---|---|---|---|
+| main | 69.3 | 44.9 | 121 ms |
+| CDEF: one footprint check a block, raw loads (was two slice checks a tap, its 13 offsets reloaded from the stack) | | 38.2 | 116 |
+| CDEF on 16 lanes of u8 (every constrained term fits; sums widen to i16) | | 29.7 | 107 |
+| CDEF's border ring in NEON (a masked copy; outside taps take the sample, as the spec skips them) | | 26.2 | 102 |
+| the symbol decoder's bits from a 64-bit window a byte at a time (the spec reads one bit at a time) | 63.0 | | 96 |
+| motion compensation in i16 (every subpel filter sums to 128 with sum \|f\| <= 240: with p - 128 the sums fit and the rounding shifts divide the offset exactly), the vertical window in registers (it was an array shifted through the stack) | 54.9 | | **88 (−27 %)** |
+
+Left, one thread: CDEF 26 % (real work now, ~60 cycles a 16-lane step), inter prediction ~13 %,
+coefficient parsing 12 %, the symbol search loop 11 % (its exit mispredicts), inverse transforms 13 %.
+
+**How, GPU (the encoder):** Xcode's per-line profile needs the kernels compiled with line tables and
+their sources, which the run-time compile can't give: `scripts/build-rust --metallib-debug <dir>` (new)
+builds the metallibs `--metallib` builds plus `-gline-tables-only -frecord-sources`, each library
+flattened into one file first (Xcode 27.2 crashed, an assertion in its source editor, on kernels whose
+lines span include files), and `GLASSACT_AV1_METALLIB=<dir>` makes the encoder load them. The same
+stream digest and stage times as the run-time compile. `av1seq --gpu-capture` takes
+`--profile-pictures` (new): the capture was the 8th picture of a stream (seeded motion search, run
+shapes), not an inter frame after a key frame, whose profile is the key frame's. In Xcode:
+Performance, the navigator by pipeline state, the kernel's source; the metric menu under it (Cost,
+Number of Instructions, Thread Divergence, Live Registers); a line's dot shows its statistics.
+
+| kernel (share of the capture) | registers | spilled |
+|---|---|---|
+| `k_me` (21.7 %) | 192 | 112 B |
+| `k_analysis_64x64_w1t256` (15.7 %) | 192 | 768 B |
+| `k_analysis_32x32_w1t128` (12.2 %) | 192 | 32 B |
+| `k_analysis_16x16_w2` (7.4 %) | 170 | 0 |
+| `k_ml_stats` (5.7 %) | 192 | 80 B |
+
+What the lines say:
+- `k_me`: the seeded window search is 50 % of the kernel; its whole-sample SAD line 27 %, with
+  **52 % divergence** (757 M instruction slots, 364 M active: lanes that stopped early, or have a
+  vector already seen or outside, wait for the rest), 120 math instructions a row pair, 118 live
+  registers. The sub-sample step's vertical blend is 14 % (no divergence, 178 live registers, ~3.9
+  float instructions a sample: already tight).
+- The analysis's per-block set-up is ~15 % of the 32x32 kernel: lambda 2.75 %, `tile_of` 1.5 %, and
+  x / y from block indices.
+- **Kept:** those coordinates without integer division (`ga_udiv`: a float quotient corrected by
+  one, exact for indices under 2^22; division by a run-time value is emulated). The same streams at
+  5K, 2900 and 1280; inter candidates 3.20 → 3.16 ms, analysis −0.05 ms (six interleaved runs):
+  the profile's 5 % on those lines was partly its loads' latency.
+- **Rejected, measured before the profile:** `k_ml_stats` accumulating its value set and orientation
+  bins in threadgroup memory (they index registers by the sample): learned pruning 1.61 → 1.71 ms.
+  `k_me`'s sub-sample step without its cached horizontal sums (fewer registers, more threadgroup
+  reads): motion search 4.35 → 4.46 ms.
+- **Rejected: `k_me`'s idle lanes packed** (the same streams at 5K, 2900 and 1280 every time; six or
+  two interleaved runs each, motion search against 4.34–4.36 ms):
+  - a SIMD-group queue of only the vectors a round measures (not seen, inside, below thr), 32 a
+    batch: 4.36, unchanged. The lanes weren't idle for skipped vectors: a round lasts as long as its
+    longest vector, and most vectors stop at their first row pair;
+  - persistent lanes on a ring of 64 (each lane a row pair of its vector a step, taking the next
+    vector when done): 4.65 (+7 %); 2 row pairs a step 4.54, 4 4.43. The ring's upkeep (prefix sums,
+    a ballot, two `simd_min`s, barriers) costs more than the idle lanes did.
+  The SAD line's 120 synchronization instructions a row pair (one wait a load) say it's bound by
+  its byte loads' latency, not by ALU slots.
+- **Rejected: the reference staged in threadgroup memory.** Each window of radius 4 or less (24 x 24
+  samples; three slots a SIMD-group, as a round spans at most three windows) staged before the
+  round that first measures it, the SAD reading it from there: the same streams, but motion search
+  4.35 → 6.10 ms (+40 %, six interleaved runs). Device memory gave the loop its samples two at a
+  time (the profile's 8 global loads a 16-sample row) from L1, against one unaligned byte at a time
+  from threadgroup memory; the staging loop and 6.9 KB more threadgroup memory a threadgroup add to
+  it. As floats the regions don't fit in 32 KB at four SIMD-groups.
+- **Rejected: `k_me`'s SAD in four partial sums** (whole numbers below 2^24, so exact in any order;
+  the kernel's safe math won't reorder a chain itself): the same streams, motion search 4.36 →
+  4.38 ms. The 16-add chain wasn't the bound: other SIMD-groups cover it. `k_me`'s SAD stays as it is.
+- **Where the 64x64 analysis spills, and why it pays: the matrix-unit forward DCT.** A spill oracle
+  without Xcode: compile one pipeline from a flattened source (function constants written in), run
+  it once on an empty grid under the GlassAct GPU template, and read the trace's
+  graphics-compiler-spill-events (a pipeline compiled but never dispatched records none; an
+  unchanged function is a shader-cache hit and records nothing either). Stubbing stages out: no
+  screening 768 B, no quantizer and rate 768 B, **no `warp_fwd_mma` 80 B**. Not unrolling its inner
+  loops (`#pragma unroll 1`, the same products in the same order) takes the spill to 80 B, but
+  64x64 1.98 → 2.14 ms, 32x32 1.39 → 1.53, 16x16 0.80 → 0.85, and the inter candidates (the same
+  transform) 3.16 → 4.13: the unrolled loop hoists its tile loads ahead of the multiplies, which
+  hides more latency than the spills cost. Kept as it is.
+- Not available: Apple GPU disassembly. The Metal toolchain's `applegpu-nt` (AIR to GPU code) has
+  no assembly or object output for Apple GPUs, and `metal-objdump` has no instruction printer for
+  the `agx` targets; a binary archive's GPU slice (`metal-lipo -thin applegpu_g16s`) holds the code
+  but nothing reads it.
 
 ### The Host on macOS 14.4: GlassActSync's Atomic in place of Synchronization's (2026-11-22)
 

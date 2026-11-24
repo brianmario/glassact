@@ -1210,7 +1210,7 @@ kernel void k_recon(constant GpBatch &B [[buffer(0)]], constant GpParams &P [[bu
     const uint32_t sb = sbList[blockIdx_x];
     device const GpImage &I = B.img[B.sbImg[sb]];
     const uint32_t local = sb - I.sbBase;
-    const int sbc = (int)(local % I.sbCols), sbr = (int)(local / I.sbCols);
+    const int sbc = (int)ga_umod(local, (uint)I.sbCols), sbr = (int)ga_udiv(local, (uint)I.sbCols);
     const int sbx = sbc * 64, sby = sbr * 64;
     const int tid = tid_;
     const TileBox tb = tile_of(I, sbx, sby);

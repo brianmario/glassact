@@ -20,6 +20,20 @@
 #include "av1enc/gp.h"
 #include "av1enc_tables.h"
 
+// Glass Act: a / d and a % d of unsigned integers, for a < 2^22 and d > 0 (block and superblock
+// indices: under 2^20). An integer division by a value known only at run time is a long emulated
+// sequence on Apple GPUs (5 % of k_me's time, 4 % of the analysis's, in Xcode's per-line profile);
+// a float quotient is within 1 of the true one at these sizes, and one step corrects it: the same
+// quotient and remainder.
+static inline uint ga_udiv(uint a, uint d) {
+    uint q = (uint)fast::divide((float)a, (float)d);
+    const int r = (int)a - (int)(q * d);
+    if (r < 0) q--;
+    else if (r >= (int)d) q++;
+    return q;
+}
+static inline uint ga_umod(uint a, uint d) { return a - ga_udiv(a, d) * d; }
+
 #define GP_INF 3.0e38f
 
 // ---------------------------------------------------------------------------

@@ -357,6 +357,52 @@ fn cdef_simd_matches_scalar() {
     }
 }
 
+/// [`cdef_simd_matches_scalar`] with strengths of 0, by 64x64 as the decoder filters: entries with
+/// every strength 0 (whole rects copied), and with only the primary or only the secondary 0 (the
+/// filters without the other's taps and the clamp).
+#[test]
+fn cdef_zero_strengths_match_scalar() {
+    let mut r = Rng(35);
+    let (mut quiet, mut changed) = (0, 0);
+    for k in 0..80 {
+        let c = random_case_fmt(&mut r, 200, false, k % 3 == 2);
+        let mut fp = c.fp;
+        fp.enable_cdef = 1;
+        for i in 0..8 {
+            match r.below(4) {
+                0 => (fp.cdef_y_pri[i], fp.cdef_y_sec[i], fp.cdef_uv_pri[i], fp.cdef_uv_sec[i]) = (0, 0, 0, 0),
+                1 => (fp.cdef_y_pri[i], fp.cdef_uv_pri[i]) = (0, 0),
+                2 => (fp.cdef_y_sec[i], fp.cdef_uv_sec[i]) = (0, 0),
+                _ => {}
+            }
+        }
+        let f = PfFrame::new(&fp);
+        let mut mb = PfMapsBuf::new(&f);
+        for b in &c.blocks {
+            mb.mark_block(&f, b);
+        }
+        let m = mb.maps();
+        let src: [&[u8]; 3] = [&c.planes[0], &c.planes[1], &c.planes[2]];
+        let (mut a, mut b) = (c.planes.clone(), c.planes.clone());
+        for p in 0..3 {
+            a[p].fill(0);
+            b[p].fill(0);
+        }
+        for r0 in (0..f.mi_rows).step_by(16) {
+            for c0 in (0..f.mi_cols).step_by(16) {
+                let (rs, cs) = ((r0, r0 + 16), (c0, c0 + 16));
+                cdef_rect(&f, &m, &src, &c.stride, &mut split(&mut a), &c.stride, 0, rs, cs);
+                cdef_rect_scalar(&f, &m, &src, &c.stride, &mut split(&mut b), &c.stride, 0, rs, cs);
+                let i = m.cdef_idx[((r0 >> 4) * f.sb_cols + (c0 >> 4)) as usize];
+                quiet += (i < 0 || fp.cdef_y_pri[i as usize] | fp.cdef_y_sec[i as usize] == 0) as u32;
+            }
+        }
+        assert!(a == b, "{fp:?}");
+        changed += (a[0] != c.planes[0]) as u32;
+    }
+    assert!(quiet > 100 && changed > 40, "{quiet} {changed}");
+}
+
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn cdef_direction_simd_matches_scalar() {

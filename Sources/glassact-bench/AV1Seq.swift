@@ -42,7 +42,7 @@ let av1SeqCommand = Command(
         .string("motion-skip", "<share>,<every>[,<k>]", "with --inter: an inter frame skips the motion search (as --no-motion-search) when the last k frames that searched (default 2) each found motion in less than this share of what they coded; every <every>th frame searches anyway (AV1HybridEncoder.motionSkip; default off: every inter frame searches)"),
         .bool("no-subpel", "with --inter: whole-sample motion vectors only in the motion search"),
         .string("motion-seed", "<lever>[,<lever>...]", "with --inter: seed the motion search with the picture before's (AV1HybridEncoder.motionSeed): zero=<8|4|2> (no motion's window where seeded, default 4), seed=<4|2> (the seed's window, default 2), zero-seeds (a best of no motion seeds too), gate (the seed's centre joins the inter gate's), runs (only in mostly-new pictures after mostly-new ones); on: the struct's defaults (zero=4,seed=2); off: none (default the encoder's: zero=2,seed=4,runs)"),
-        .int("profile-pictures", "<n>", 2...16, "with --profile and --inter: the stream each timed run codes, ending with the last picture (default 2: it as an inter frame after a key frame)"),
+        .int("profile-pictures", "<n>", 2...16, "with --profile or --gpu-capture and --inter: the stream each timed run (or the capture) codes, ending with the last picture (default 2: it as an inter frame after a key frame)"),
         .bool("changes", "with --inter: each picture carries its exact change map from the one before (Picture.changed, as the Host passes it), made before the timed run; the same bytes"),
         .bool("whole-sources", "every picture's padded source copied whole (AV1HybridEncoder.updatesSourcesInPlace off; the same bytes)"),
         .bool("no-split-motion", "with --inter: the motion search waits behind the filters' gate with the rest of the analysis (AV1HybridEncoder.splitsMotion off; the same bytes)"),
@@ -95,7 +95,7 @@ let av1SeqCommand = Command(
         .string("tx-model-eps", "<p>", "the closed loop's learned tx type pruning at this eps (off by default)"),
         .string("tx-types", "<hex>", "the tx types the closed loop's luma search tries (bit t: type t; default E01: DCT, IDTX, V_DCT, H_DCT; FFFFFFFF: all)"),
         .bool("exact-tx-trials", "the tx type search's exact reconstruction SSE for every type (default: transform-domain distortion, stopping where DCT_DCT codes nothing)"),
-        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, no-subpel, shifts-ok, rdoq-coeffs=<n>, shapes=<hex>, run-shapes=<hex> (these shapes from a run's second mostly-new picture on), run-shapes-after=<n> (from its (n+1)th instead), eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), min-sbs=<n> (only in pictures of at least n 64x64s), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level; off: none (default the encoder's: level 1 in pictures of 2,400 64x64s and up, larger than 4K, and from a run's fourth on run-shapes=1240)"),
+        .string("fast", "<lever>[,<lever>...]", "with --inter: inter frames coding more than half their 64x64s are coded fast (AV1HybridEncoder.newPictureEffort): dq=<n> (qindex + n), no-motion, no-tx, no-rdoq, no-cdef, no-subpel, shifts-ok, rdoq-coeffs=<n>, shapes=<hex>, run-shapes=<hex> (these shapes from a run's second mostly-new picture on), run-shapes-after=<n> (from its (n+1)th instead), run-mode-eps=<p> (this mode eps from there too), eps=<p>, mode-eps=<p>, preset=<name>, run=<n> (only the first n mostly-new pictures in a row), min-sbs=<n> (only in pictures of at least n 64x64s), motionless=<n> (no-motion in the first n of a run, default 1); or level=<n> for a level of AV1HybridEncoder.NewPictureEffort.level; off: none (default the encoder's: level 1 in pictures of 2,400 64x64s and up, larger than 4K, and from a run's fourth on run-shapes=1240,run-mode-eps=0.60)"),
         .bool("no-tx-search", "the closed loop codes DCT_DCT (or the analysis's types, with --leaf-tx) instead of searching luma tx types"),
         .int("two-steps", "<0-63>", 0...63, "with --inter, a measurement: code each picture twice in one stream, at this q first (as the other options say) and then at --q against the first's decoded picture (no copies, motion searched from no shift), one picture at a time; each step's bytes and scores are printed, and with --profile its GPU stages"),
         .bool("print-size", "print the trace's own width and height and stop (scripts/train-pruner)"),
@@ -393,6 +393,7 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
             case "shapes": guard let v = Int32(value, radix: 16) else { throw BenchError("--fast shapes=<hex>") }; e.analysis.shapeMask = v
             case "run-shapes": guard let v = Int32(value, radix: 16) else { throw BenchError("--fast run-shapes=<hex>") }; e.runShapeMask = v
             case "run-shapes-after": guard let n = Int(value), n >= 0 else { throw BenchError("--fast run-shapes-after=<n>") }; e.runShapesAfter = n
+            case "run-mode-eps": guard let v = Float(value) else { throw BenchError("--fast run-mode-eps=<p>") }; e.runModeEps = v
             case "eps": guard let v = Float(value) else { throw BenchError("--fast eps=<p>") }; e.analysis.eps = v
             case "motionless": guard let n = Int(value), n >= 1 else { throw BenchError("--fast motionless=<n>") }; e.motionlessRun = n
             case "shifts-ok": e.motionlessNeedsNoShifts = false
@@ -885,12 +886,14 @@ func cmdAV1Seq(_ reader: ScapReader, traceName: String, opts: Options) throws {
         descriptor.captureObject = device
         descriptor.destination = .gpuTraceDocument
         descriptor.outputURL = url
-        // the key frame first (not captured), then the inter frame alone
+        // the stream before it first (not captured: a key frame, then --profile-pictures' inter
+        // frames), then the last picture alone, as the stream codes it
         if inter, pictures.count > 1 {
             var started = false
-            try encoder.encode(count: 2, qindex: qindex, picture: { i in
-                if i == 1 { try capture.startCapture(with: descriptor); started = true }
-                return picture(pictures.count - 2 + i)
+            let k = min(pictures.count, opts.int("profile-pictures", 2))
+            try encoder.encode(count: k, qindex: qindex, picture: { i in
+                if i == k - 1 { try capture.startCapture(with: descriptor); started = true }
+                return picture(pictures.count - k + i)
             }, output: { _, _ in })
             if started { capture.stopCapture() }
         } else {

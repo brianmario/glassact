@@ -734,6 +734,9 @@ public final class HostEngine: @unchecked Sendable {
     static let keyframeMaxBytes = 7 << 20 // fits the 8 MB video-TLV bound with headroom
     public var keyframeInFlight: Bool { kfActive }
     private var helloSentUS: UInt64 = 0
+    /// `continueSession` carried the link's readings over: the re-HELLO's
+    /// round trip doesn't seed SRTT or the governor.
+    private var linkCarriedOver = false
     private var lastPingUS: UInt64 = 0
     var currentCaptureUS: UInt64 = 0 // capture_ts of the frame being processed (video g2g)
     /// Liveness: time of the last PONG (0 until the first). PINGs go out 1/s;
@@ -927,7 +930,10 @@ public final class HostEngine: @unchecked Sendable {
                     // (An arrival stamp can predate a re-offered HELLO's
                     // stamp only for a stale reply; no sample beats a
                     // wrapped one.)
-                    if nowUS > helloSentUS {
+                    // (Not after an in-session rebuild: `continueSession` kept the
+                    // session's readings, and this exchange waited on the Viewer
+                    // rebuilding its canvas.)
+                    if nowUS > helloSentUS, !linkCarriedOver {
                         updateSRTT(sample: nowUS - helloSentUS)
                         governor.start(roundTripUS: nowUS - helloSentUS, nowUS: nowUS)
                     }
@@ -1033,8 +1039,27 @@ public final class HostEngine: @unchecked Sendable {
     /// auto-scale dropped Prefer Smooth Motion for the rest of the session:
     /// the next region formed on HEVC, and the one after on AV1 at its
     /// default ceiling, on a 0.3–0.8 Mbit/s link.
+    ///
+    /// It keeps what it learned of the link, too: the round trip (SRTT and the
+    /// PING readings), the tile governor, the datagram pacer, and what the
+    /// link delivered. The link didn't change, only the picture did, and the
+    /// re-HELLO's round trip is no reading of it: the Viewer rebuilds its
+    /// canvas before it answers. Seeded from that exchange (205 ms live on a LAN
+    /// at ~10 ms, #165), SRTT took ~20 s to decay, and the governor started over
+    /// at a rate set by it (2.0 → 0.2 MB/s), so a resize's repaint took ~10 s.
     public func continueSession(from previous: HostEngine) {
         sessionOpen = previous.sessionOpen
+        if previous.sessionOpen {
+            srttUS = previous.srttUS
+            pingRTTLatestUS = previous.pingRTTLatestUS
+            pingRTTAtUS = previous.pingRTTAtUS
+            pingRTTMinUS = previous.pingRTTMinUS
+            governor = previous.governor
+            pace = previous.pace
+            linkEstimate = previous.linkEstimate
+            linkRoom = previous.linkRoom
+            linkCarriedOver = true
+        }
         // (an encoder that stopped answering stays given up: a resize doesn't revive it)
         stalledVideoCodecs = previous.stalledVideoCodecs
         videoStalled = previous.videoStalled

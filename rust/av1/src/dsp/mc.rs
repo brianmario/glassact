@@ -381,6 +381,18 @@ mod tests {
         }
     }
 
+    /// The NEON passes' i16 sums (mc_neon.rs): every filter they use sums to 128, with sum |f|
+    /// at most 255, so sum f (p - 128) stays inside i16 for any samples.
+    #[test]
+    fn subpel_filters_fit_i16() {
+        for set in &Subpel_Filters {
+            for f in &set[1..] {
+                assert_eq!(f.iter().map(|&t| t as i32).sum::<i32>(), 128);
+                assert!(f.iter().map(|&t| (t as i32).abs()).sum::<i32>() * 128 <= i16::MAX as i32);
+            }
+        }
+    }
+
     /// The NEON passes equal the scalar ones on random rows (any filter and position).
     #[test]
     fn mc_passes_simd_match_scalar() {
