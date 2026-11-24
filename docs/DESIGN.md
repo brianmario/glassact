@@ -1223,6 +1223,15 @@ owner. Swapping a handler can lose an event that was already queued for the
 old one: a datagram tunnel parked until its control tunnel is classified
 re-checks its state after the hand-off for the same reason.
 
+**Pairing:** the server matches a datagram tunnel to its control tunnel by the
+viewer's address, or, under mutual TLS, by the viewer key both present. A
+Viewer dials the host's `.local` name once per tunnel, and each races the
+name's addresses on its own, so control can come over IPv6 and datagrams over
+IPv4. Paired by address alone, such a session never got its datagram tunnel
+and failed at the 10 s establishment timeout, and the Viewer's retry
+connected (#164). A datagram tunnel from another address waits, parked, until
+its handshake shows the key.
+
 Both tunnels:
 - run full mutual TLS with the same identities (§13);
 - idle out after 30 s, with QUIC keepalives every 5 s and a 10 s

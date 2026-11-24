@@ -196,6 +196,9 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     private var announcedReady = false
     /// Server pairing: remote host of the control tunnel (host role).
     var remoteHost: NWEndpoint.Host?
+    /// Host side: the key the viewer's control tunnel presented (mutual TLS; nil without),
+    /// which its datagram tunnel presents too. Set by QUICServer to pair them.
+    var pairingKey: String?
     /// Host side: the viewer's address as dialed from ("100.64.0.7",
     /// "fe80::…"), for the approved-viewers list. Empty when unknown.
     public var remoteAddress: String { Self.addressString(remoteHost) }
@@ -226,6 +229,9 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
     private var dialHost: String = ""
     private var dialControlPort: UInt16 = 0
     private var dialDatagramPort: UInt16 = 0
+    /// Tests: dial the datagram tunnel at another address of the host than the control
+    /// tunnel (`dialHost`), as two connections racing a `.local` name's addresses can.
+    var dialDatagramHost: String?
     private var pinnedFingerprint: String = ""
     private var clientIdentity: SecIdentity?
     private let observedHost = ObservedFingerprint()
@@ -749,7 +755,7 @@ public final class QUICTransport: GlassActTransport, @unchecked Sendable {
 
         let datagramOptions = Self.tunnelOptions(datagram: true)
         pinFingerprint(on: datagramOptions)
-        let datagramEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(dialHost),
+        let datagramEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(dialDatagramHost ?? dialHost),
                                                    port: NWEndpoint.Port(rawValue: dialDatagramPort) ?? 4434)
         let flow = NWConnection(to: datagramEndpoint, using: NWParameters(quic: datagramOptions))
         datagram = flow
@@ -1124,7 +1130,10 @@ private final class SignInExchange: @unchecked Sendable {
 /// as an unstarted `QUICTransport` via `onTransport` — set callbacks, then
 /// `start()` it.
 ///
-/// Pairing: the two tunnels are matched by remote host, newest first. A
+/// Pairing: the two tunnels are matched by remote host, newest first, or, under mutual TLS, by
+/// the viewer key both present: a Viewer dials the host's `.local` name once per tunnel, and each
+/// races the name's addresses on its own, so control can come over IPv6 and datagrams over IPv4
+/// (#164: paired by address alone, that session failed at its 10 s deadline). A
 /// session that has not finished establishing yields to a newer dial from
 /// any viewer (the old one is cancelled): a dial that stalled half-built must
 /// never hold the only session slot. An established session is exclusive.
@@ -1249,6 +1258,20 @@ public final class QUICServer: @unchecked Sendable {
         return a == b
     }
 
+    /// A datagram tunnel whose handshake is done presented the key `transport`'s control
+    /// tunnel did (false where either is unknown: no mutual TLS, or not yet ready).
+    static func sameKey(_ connection: NWConnection, _ transport: QUICTransport) -> Bool {
+        guard connection.state == .ready, let key = transport.pairingKey,
+              let peer = QUICTransport.peerCertificate(of: connection.metadata(definition: NWProtocolQUIC.definition))
+        else { return false }
+        return peer.fingerprint == key
+    }
+
+    /// A datagram tunnel belongs to `transport`'s session: the same address, or the same key.
+    static func pairs(_ connection: NWConnection, with transport: QUICTransport) -> Bool {
+        sameHost(host(of: connection.endpoint), transport.remoteHost) || sameKey(connection, transport)
+    }
+
     /// `queue` only. A control tunnel's ALPN is known only once its
     /// handshake completes, so the server starts it and classifies it then:
     /// the session ALPN becomes a session, the sign-in ALPN gets one sign-in
@@ -1320,9 +1343,9 @@ public final class QUICServer: @unchecked Sendable {
         }
         let transport = QUICTransport(role: .host, queue: queue)
         transport.remoteHost = remoteHost
+        transport.pairingKey = QUICTransport.peerCertificate(of: group.metadata(definition: NWProtocolQUIC.definition))?.fingerprint
         transport.attachControlGroup(group)
-        if let pending = pendingDatagram,
-           Self.sameHost(Self.host(of: pending.endpoint), transport.remoteHost) {
+        if let pending = pendingDatagram, Self.pairs(pending, with: transport) {
             pendingDatagram = nil
             handoff?.cancel()
             transport.attachDatagram(pending)
@@ -1370,6 +1393,14 @@ public final class QUICServer: @unchecked Sendable {
         pendingDatagram = connection
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
+            case .ready:
+                // (from another address than the control tunnel's: its handshake done, it pairs
+                // by the viewer's key if the session it belongs to is establishing)
+                guard let self, self.pendingDatagram === connection, let current = self.current,
+                      !current.isFinished, !current.isEstablished, Self.sameKey(connection, current) else { return }
+                quicDebug("server: datagram tunnel from another address paired by the viewer's key")
+                self.pendingDatagram = nil
+                current.attachDatagram(connection)
             case .failed, .cancelled:
                 if self?.pendingDatagram === connection { self?.pendingDatagram = nil }
             default:
