@@ -1126,12 +1126,23 @@ for byte so its iPhone app works with this Host.
   pointer there, inside the new display (`DisplayChoice.pointerPlacement`);
   else in its middle.
 - DISPLAY_SELECTED answers each pick once the new session runs (or refuses
-  it at once: not offered, not now in single-window mode, or failed). The
-  viewer sends one pick at a time; a newer one waiting replaces an older
-  waiting one, and those still waiting when the connection ends are
-  answered "connection lost" (`ViewerSession.selectDisplay`).
-- The pick lasts for the session: the next session starts on the display
-  chosen at the Mac, or the main one.
+  it at once: not offered, not now, or failed). The viewer sends one pick at
+  a time; a newer one waiting replaces an older waiting one, and those still
+  waiting when the connection ends are answered "connection lost"
+  (`ViewerSession.selectDisplay`).
+- The Host offers every display ScreenCaptureKit lists but its own virtual
+  one, and refuses a pick ("not now") in single-window mode, with a virtual
+  display (it mirrors every display into one, so there's nothing to pick) or
+  under Client Resolution (it has switched the shared display's own mode).
+  Scale fits the picked display into the viewer's request; a halved capture
+  (auto-scale's rung) stays halved. The display already shown only moves the
+  pointer.
+- The list shows, and a pick shares, displays the person at the Mac didn't
+  choose to share: not for a View Only key, nor an agent whose control is off
+  (§14).
+- The pick lasts while capture runs: a reconnect within the grace keeps it,
+  and the next capture starts on the display chosen at the Mac, or the main
+  one.
 - Duo Desktop's other messages are reserved, never reused: 0x63 SCREEN_LOCK,
   0x64 TEXT_FOCUS, 0x65 DISPLAY_SNAPSHOT_REQUEST, 0x66 DISPLAY_SNAPSHOT,
   0x67 UNLOCK_TYPE, 0x68 UNLOCK_STATE, 0x70 and 0x71 (an SSH key install).
