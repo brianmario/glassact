@@ -710,10 +710,10 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(
                     false, onScreenWindowsOnly: false)
-                guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-                        ?? content.displays.first else {
-                    // Asleep (or locked): nothing to capture yet. Wake it and
-                    // try again while the viewer (or the recording) waits.
+                guard let display = CaptureTarget.pick(content.displays, wanted: CGMainDisplayID(), id: \.displayID) else {
+                    // Asleep (or locked), or not listed yet: nothing to capture.
+                    // Wake it and try again while the viewer (or the recording)
+                    // waits. Never another display in its place (`pick`).
                     self.retryDefaultDisplay(after: 2, reason: "no display available to capture")
                     return
                 }
@@ -1143,6 +1143,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
             onStatus("remote input active (first event kind \(kind))")
         }
         let scale = mappingScale
+        // (sharing a display, the pointer stays on it: a drag past the picture's edge
+        // doesn't land on a neighbouring screen the viewer can't see)
+        let (canvasX, canvasY) = singleWindowID == 0
+            ? PointerInput.onPicture(kind: kind, x: canvasX, y: canvasY, width: captureWidth, height: captureHeight)
+            : (canvasX, canvasY)
         let gx = contentOrigin.x + CGFloat(canvasX) / scale
         let gy = contentOrigin.y + CGFloat(canvasY) / scale
         let pt = CGPoint(x: gx, y: gy)

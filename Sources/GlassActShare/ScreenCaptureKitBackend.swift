@@ -18,7 +18,7 @@ public struct ScreenCaptureKitBackend: CaptureBackend {
             }
             return CaptureContent(filter: SCContentFilter(desktopIndependentWindow: window), displayID: nil)
         case let .display(wanted):
-            guard let display = content.displays.first(where: { $0.displayID == wanted }) ?? content.displays.first
+            guard let display = CaptureTarget.pick(content.displays, wanted: wanted, id: \.displayID)
             else { throw CaptureError.noDisplay }
             return CaptureContent(filter: SCContentFilter(display: display, excludingWindows: []),
                                   displayID: display.displayID)

@@ -374,6 +374,9 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
   (a = CGKeyCode, b = CGEventFlags).
   - Flag `0x80` marks agent-generated input, which the host runs through agent
     policy (§14).
+  - Sharing a display, the host clamps a move's or click's x and y to the
+    picture (`PointerInput`), so a drag past its edge can't land on a
+    neighbouring display the viewer doesn't see.
   - Receivers ignore kinds they don't know.
 - **GeometryMode:** 0 none, 1 client resolution, 2 scale, 3 native, 4 virtual
   display. RESIZE accepts only 1, 2 and 4.
@@ -430,7 +433,10 @@ and Screen Recording are there) until the Host quits; there is no sharing
 switch, and quitting the Host is how the person at the Mac stops sharing.
 Capture runs only while something needs frames:
 - A viewer's transport is adopted: capture starts on the chosen display
-  (Choose Display…) or the main one, and the session's engine is made at the
+  (Choose Display…) or the main one, never another in its place
+  (`CaptureTarget.pick`): with that display missing (asleep, or behind a KVM
+  switched away) capture waits for it, as it does with no display at all.
+  The session's engine is made at the
   size of the first frame, its HELLO then. With no frame within 10 s (under
   the viewer's 15 s handshake deadline, §4.10) the session resets.
 - The session ends: capture stops a second after a viewer that left on
