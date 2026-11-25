@@ -29,6 +29,9 @@ struct Options {
     var signInPassword: String?
     /// Ask for new keys, approving each this long after its first dial.
     var askAfter: Double?
+    /// Every input but plain moves as a timed stdout line, and what the viewer still
+    /// held when its session ended.
+    var inputLog = false
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -45,13 +48,16 @@ struct Options {
             case "--still": o.motion = false
             case "--sign-in-password": o.signInPassword = next()
             case "--ask-after": o.askAfter = next().flatMap(Double.init)
+            case "--input-log": o.inputLog = true
             case "-h", "--help":
                 print("""
                     usage: glassact-testhost [--port 4533] [--size 1600x1000] [--tiles-only] [--libaom] [--still]
-                                             [--sign-in-password P | --ask-after SECONDS]
+                                             [--sign-in-password P | --ask-after SECONDS] [--input-log]
                     A Glass Act host with a synthetic screen, for developing viewers. Its AV1 is
                     Glass Act's encoder, as the Host's (macOS 27, Apple-silicon GPU); --libaom
-                    runs libaom's instead, as older releases did.
+                    runs libaom's instead, as older releases did. --input-log prints every input
+                    but plain moves with the time, and what the viewer still held down when its
+                    session ended (a viewer should release everything before it leaves).
                     """)
                 exit(0)
             default:
@@ -77,6 +83,12 @@ final class Scene {
     private var typed = ""
     private var scrollTotal = (x: 0, y: 0)
     private var startUS = MonotonicClock.nowUS
+    /// `--input-log`: timed stdout lines for input.
+    var logInput = false
+    /// What the viewer holds down: key codes, and buttons as bits.
+    private var keysDown: Set<Int> = []
+    private var buttonsDown = 0
+    private var dragMoves = 0
 
     init(width: Int, height: Int, motion: Bool) {
         self.width = width
@@ -101,8 +113,56 @@ final class Scene {
         if lines.count > 12 { lines.removeFirst(lines.count - 12) }
     }
 
+    /// One stdout line with the wall-clock time, flushed (stdout may be a file).
+    static func log(_ line: String) {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        print("glassact-testhost: [\(f.string(from: Date()))] \(line)")
+        fflush(stdout)
+    }
+
+    private static let buttonNames = ["left", "right", "middle"]
+
+    /// `--input-log`: the line for one input, nil for a plain move.
+    private func logLine(kind: Int, x: Int, y: Int, a: Int, b: Int) -> String? {
+        switch kind {
+        case 1:
+            if buttonsDown != 0 { dragMoves += 1 }
+            return nil
+        case 2: return "\(Self.buttonNames[min(b, 2)]) down at \(x),\(y) click \(max(1, a))"
+        case 3: return "\(Self.buttonNames[min(b, 2)]) up at \(x),\(y) after \(dragMoves) drag moves"
+        case 4, 7: return "scroll \(a),\(b) (\(kind == 7 ? "points" : "lines"))"
+        case 5, 6:
+            return "key \(Self.keyName(x)) (0x\(String(x, radix: 16))) \(kind == 5 ? "down" : "up")"
+                + " · flags 0x\(String(UInt32(truncatingIfNeeded: a), radix: 16))"
+        default: return "input kind \(kind) \(x),\(y) \(a) \(b)"
+        }
+    }
+
+    /// The session ended: let go of what the viewer still held, saying what that was.
+    func releaseHeld() {
+        let keys = keysDown.sorted().map { "key \(Self.keyName($0)) (0x\(String($0, radix: 16)))" }
+        let buttons = (0..<3).filter { buttonsDown & (1 << $0) != 0 }.map { "\(Self.buttonNames[$0]) button" }
+        let held = keys + buttons
+        if !held.isEmpty { note("released at session end: \(held.joined(separator: ", "))") }
+        if logInput {
+            Self.log(held.isEmpty ? "session ended with nothing held" : "released at session end: \(held.joined(separator: ", "))")
+        }
+        keysDown.removeAll()
+        buttonsDown = 0
+        dragging = false
+    }
+
     /// INPUT (kind, x, y, a, b) as `ControlMessage.input` defines it.
     func apply(kind: Int, x: Int, y: Int, a: Int, b: Int) {
+        switch kind {
+        case 2: buttonsDown |= 1 << min(b, 2); dragMoves = 0
+        case 3: buttonsDown &= ~(1 << min(b, 2))
+        case 5: keysDown.insert(x)
+        case 6: keysDown.remove(x)
+        default: break
+        }
+        if logInput, let line = logLine(kind: kind, x: x, y: y, a: a, b: b) { Self.log("input: \(line)") }
         switch kind {
         case 1:
             pointer = (x, y)
@@ -322,6 +382,7 @@ final class TestHost: @unchecked Sendable {
     init(options: Options) {
         self.options = options
         scene = Scene(width: options.width, height: options.height, motion: options.motion)
+        scene.logInput = options.inputLog
     }
 
     /// `--ask-after`: refuse `fp` until `wait` seconds after its first dial,
@@ -404,6 +465,7 @@ final class TestHost: @unchecked Sendable {
 
     private func adopt(_ transport: QUICTransport) {
         print("glassact-testhost: viewer connected")
+        if self.transport != nil { scene.releaseHeld() } // a superseded session lets go too
         self.transport?.cancel()
         self.transport = transport
         geometrySettled = false
@@ -419,6 +481,7 @@ final class TestHost: @unchecked Sendable {
 
     private func endSession() {
         print("glassact-testhost: viewer left")
+        scene.releaseHeld()
         engine = nil
         transport = nil
     }
