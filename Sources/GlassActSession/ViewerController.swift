@@ -252,6 +252,12 @@ public final class ViewerController: @unchecked Sendable {
 
     /// Fired when the host's pickable-window snapshot arrives.
     public var onWindowList: (([WireWindow]) -> Void)?
+    /// The host's screen list (main thread).
+    public var onDisplayList: (([WireDisplay]) -> Void)?
+    /// The host's answer to each screen choice
+    /// (main thread): the screen now shared, its place, the picture size, the
+    /// pointer it placed, or a refusal. Choices are serialized until each answer.
+    public var onDisplaySelected: ((WireDisplaySelection) -> Void)?
     /// Main thread: the host ended the session on purpose (shared window
     /// closed) — show why, don't redial.
     public var onHostEndedSession: ((String) -> Void)?
@@ -366,6 +372,15 @@ public final class ViewerController: @unchecked Sendable {
     /// Pick a window (the host swaps its capture filter and re-HELLOs in
     /// place — see onGeometryChanged).
     public func selectWindow(_ id: UInt32) { session.selectWindow(id) }
+    /// Display choice (§4.10): True when the host lists screens.
+    public func hostSupportsDisplayList() -> Bool { session.hostSupportsDisplayList() }
+    /// A screen choice is waiting for its answer.
+    public func displaySelectPending() -> Bool { session.displaySelectPending() }
+    /// 0 = ask for the list; else share that screen,
+    /// with the host placing the pointer at `pointerAt` (global points) if given.
+    public func selectDisplay(_ id: UInt32, pointerAt point: (x: Int32, y: Int32)? = nil) {
+        session.selectDisplay(id, pointerAt: point)
+    }
     /// A window-chrome action (fullscreen / resize / endSession).
     public func windowControl(action: UInt8, width: Int = 0, height: Int = 0) {
         session.windowControl(action: action, width: width, height: height)
@@ -450,6 +465,8 @@ public final class ViewerController: @unchecked Sendable {
             self?.agentDriver?.noteHostClipboard(format: format, data: data)
             self?.applyInboundClipboard(format, data)
         }
+        session.onDisplayList = { [weak self] displays in self?.onDisplayList?(displays) }
+        session.onDisplaySelected = { [weak self] result in self?.onDisplaySelected?(result) }
         session.onWindowList = { [weak self] windows in
             self?.agentDriver?.noteWindowList(windows)
             self?.onWindowList?(windows)
