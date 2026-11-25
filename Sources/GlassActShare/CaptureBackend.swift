@@ -12,9 +12,9 @@ public protocol CaptureBackend: Sendable {
     associatedtype Filter
     associatedtype Stream: CaptureStream
 
-    /// The content `target` names, now: the window if it still exists,
-    /// else the display, or any display if that one is gone. Throws
-    /// `CaptureError.windowClosed` or `.noDisplay` when there's nothing.
+    /// The content `target` names, now: the window if it still exists, else
+    /// the display. Never another display in its place (`CaptureTarget.pick`):
+    /// throws `CaptureError.windowClosed` or `.noDisplay` when it's gone.
     func content(for target: CaptureTarget) async throws -> CaptureContent<Filter>
 
     /// A stream of `filter`, not yet started. Each frame goes into `frames`
@@ -47,6 +47,16 @@ public enum CaptureTarget: Equatable, Sendable {
     case display(CGDirectDisplayID)
     /// A single window (§4.10), by window ID.
     case window(UInt32)
+
+    /// The display to capture among `displays` (as `id` names them): `wanted`, or none.
+    /// Never "the first listed" in its place: a display nobody chose to share, a second
+    /// screen with something private on it, say, would go to the viewer. With none,
+    /// capture waits for `wanted` (asleep, or a KVM switched away) as it does with no
+    /// display at all.
+    public static func pick<D>(_ displays: [D], wanted: CGDirectDisplayID,
+                               id: (D) -> CGDirectDisplayID) -> D? {
+        displays.first { id($0) == wanted }
+    }
 }
 
 public struct CaptureContent<Filter> {
