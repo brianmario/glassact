@@ -1,3 +1,96 @@
+/// Display choice (§4.10) — one of the host's displays, in DISPLAY_LIST (0x60). Place and
+/// size are in global points (macOS display space: the main display's top-left is 0,0;
+/// others may be negative). `pixelsPerPoint100` is the backing scale × 100 (200 = Retina);
+/// `rotation` in degrees; the thumbnail as WireWindow's. The wire form is Duo Desktop's
+/// (github.com/Stratechery/duo-desktop), byte for byte.
+public struct WireDisplay: Equatable, Sendable {
+    public var displayID: UInt32
+    public var name: String
+    public var x: Int32
+    public var y: Int32
+    public var width: UInt16
+    public var height: UInt16
+    public var pixelsPerPoint100: UInt16
+    public var rotation: UInt16
+    public var isMain: Bool
+    /// The screen being shared right now.
+    public var isShown: Bool
+    public var thumbFormat: UInt8
+    public var thumbWidth: UInt16
+    public var thumbHeight: UInt16
+    public var thumb: [UInt8]
+
+    public init(displayID: UInt32, name: String, x: Int32, y: Int32, width: UInt16, height: UInt16,
+                pixelsPerPoint100: UInt16 = 100, rotation: UInt16 = 0, isMain: Bool, isShown: Bool,
+                thumbFormat: UInt8 = 0, thumbWidth: UInt16 = 0, thumbHeight: UInt16 = 0, thumb: [UInt8] = []) {
+        self.displayID = displayID
+        self.name = name
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.pixelsPerPoint100 = pixelsPerPoint100
+        self.rotation = rotation
+        self.isMain = isMain
+        self.isShown = isShown
+        self.thumbFormat = thumbFormat
+        self.thumbWidth = thumbWidth
+        self.thumbHeight = thumbHeight
+        self.thumb = thumb
+    }
+}
+
+/// Display choice (§4.10) — the host's answer to one DISPLAY_SELECT
+/// (DISPLAY_SELECTED, type 0x62). Sent once the switch is committed (the new
+/// session is running at the new screen's size) or refused. It says which
+/// screen is now shared (on a refusal: the one still shared), where it sits
+/// (global points), the picture size it is sent at (pixels; the mapping is
+/// picture → that rect), and where the host put the pointer (global points).
+/// Picture-ready is separate: the first frame of the new screen.
+public struct WireDisplaySelection: Equatable, Sendable {
+    public enum Status: UInt8, Sendable {
+        case ok = 0
+        /// The screen is not offered (unknown, gone, or hidden): nothing changed.
+        case notOffered = 1
+        /// Not now (window sharing, no capture): nothing changed.
+        case notNow = 2
+        /// The host tried and the capture could not be rebuilt.
+        case failed = 3
+        /// Viewer-side only: the connection ended before an answer.
+        case connectionLost = 255
+    }
+    public var requestedID: UInt32
+    public var status: Status
+    public var displayID: UInt32
+    public var x: Int32
+    public var y: Int32
+    public var width: UInt16
+    public var height: UInt16
+    public var pictureWidth: UInt16
+    public var pictureHeight: UInt16
+    public var pointerPlaced: Bool
+    public var pointerX: Int32
+    public var pointerY: Int32
+
+    public init(requestedID: UInt32, status: Status, displayID: UInt32, x: Int32 = 0, y: Int32 = 0,
+                width: UInt16 = 0, height: UInt16 = 0, pictureWidth: UInt16 = 0, pictureHeight: UInt16 = 0,
+                pointerPlaced: Bool = false, pointerX: Int32 = 0, pointerY: Int32 = 0) {
+        self.requestedID = requestedID
+        self.status = status
+        self.displayID = displayID
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.pictureWidth = pictureWidth
+        self.pictureHeight = pictureHeight
+        self.pointerPlaced = pointerPlaced
+        self.pointerX = pointerX
+        self.pointerY = pointerY
+    }
+    public var succeeded: Bool { status == .ok }
+}
+
 /// Single-window mode (§4.10) — one pickable window in a WINDOW_LIST. `appName`
 /// and `title` are UTF-8 for display; `thumb` is a small lossy image in
 /// `thumbFormat` (1 = WebP-lossy, 2 = AVIF-still, 0 = none) at
@@ -252,6 +345,19 @@ public enum ControlMessage: Equatable, Sendable {
     /// window; the pinned-video path takes over unchanged. `windowID == 0`
     /// reverts to full-display.
     case windowSelect(windowID: UInt32)
+    /// host → viewer: every screen the host
+    /// offers, with place, size and a small picture. Sent on DISPLAY_SELECT 0
+    /// and again whenever screens are added, removed or moved. Type 0x60.
+    case displayList(displays: [WireDisplay])
+    /// viewer → host: share this screen
+    /// (`displayID` from DISPLAY_LIST); 0 = just send the list. When `placePointer`
+    /// is set the host, as part of the switch, puts the pointer at (`pointerX`,
+    /// `pointerY`) in global points, clamped inside the new screen (a drag if a
+    /// button is held). Type 0x61.
+    case displaySelect(displayID: UInt32, placePointer: Bool, pointerX: Int32, pointerY: Int32)
+    /// host → viewer: the answer to one
+    /// DISPLAY_SELECT (not to 0, which is answered by DISPLAY_LIST). Type 0x62.
+    case displaySelected(WireDisplaySelection)
     /// Single-window mode — viewer → host: a window-chrome action on the
     /// shared window:
     ///   1 fullscreen  — toggle the host window full-screen (via Accessibility);
@@ -379,6 +485,9 @@ public enum ControlMessage: Equatable, Sendable {
         case .hostNotice: 0x1D
         case .viewerBye: 0x1E
         case .hostDisplay: 0x1F
+        case .displayList: 0x60
+        case .displaySelect: 0x61
+        case .displaySelected: 0x62
         }
     }
 
@@ -563,6 +672,45 @@ public enum ControlMessage: Equatable, Sendable {
         case let .hostDisplay(width, height):
             body.writeU16(width)
             body.writeU16(height)
+        case let .displayList(displays):
+            precondition(displays.count <= 255)
+            body.writeU8(UInt8(displays.count))
+            for d in displays {
+                let n = Array(d.name.utf8)
+                body.writeU32(d.displayID)
+                body.writeVarint(UInt32(n.count))
+                body.writeBytes(n)
+                body.writeU32(UInt32(bitPattern: d.x))
+                body.writeU32(UInt32(bitPattern: d.y))
+                body.writeU16(d.width)
+                body.writeU16(d.height)
+                body.writeU16(d.pixelsPerPoint100)
+                body.writeU16(d.rotation)
+                body.writeU8((d.isMain ? 1 : 0) | (d.isShown ? 2 : 0))
+                body.writeU8(d.thumbFormat)
+                body.writeU16(d.thumbWidth)
+                body.writeU16(d.thumbHeight)
+                body.writeVarint(UInt32(d.thumb.count))
+                body.writeBytes(d.thumb)
+            }
+        case let .displaySelect(displayID, placePointer, pointerX, pointerY):
+            body.writeU32(displayID)
+            body.writeU8(placePointer ? 1 : 0)
+            body.writeU32(UInt32(bitPattern: pointerX))
+            body.writeU32(UInt32(bitPattern: pointerY))
+        case let .displaySelected(r):
+            body.writeU32(r.requestedID)
+            body.writeU8(r.status.rawValue)
+            body.writeU32(r.displayID)
+            body.writeU32(UInt32(bitPattern: r.x))
+            body.writeU32(UInt32(bitPattern: r.y))
+            body.writeU16(r.width)
+            body.writeU16(r.height)
+            body.writeU16(r.pictureWidth)
+            body.writeU16(r.pictureHeight)
+            body.writeU8(r.pointerPlaced ? 1 : 0)
+            body.writeU32(UInt32(bitPattern: r.pointerX))
+            body.writeU32(UInt32(bitPattern: r.pointerY))
         }
         return body.bytes
     }
@@ -747,6 +895,44 @@ public enum ControlMessage: Equatable, Sendable {
         case 0x1F:
             guard let w = r.readU16(), let h = r.readU16() else { return nil }
             return .hostDisplay(width: w, height: h)
+        case 0x60:
+            // Every screen is ≥ 26 bytes: bound the reservation by the body.
+            guard let count = r.readU8(), Int(count) <= r.remaining / 26 else { return nil }
+            var displays: [WireDisplay] = []
+            displays.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let id = r.readU32(),
+                      let nameLen = r.readVarint(), let name = unsafe r.readBytes(Int(nameLen)),
+                      let x = r.readU32(), let y = r.readU32(),
+                      let w = r.readU16(), let h = r.readU16(),
+                      let ppp = r.readU16(), let rot = r.readU16(),
+                      let flags = r.readU8(), let fmt = r.readU8(), fmt <= 2,
+                      let tw = r.readU16(), let th = r.readU16(),
+                      let thumbLen = r.readVarint(), let thumb = unsafe r.readBytes(Int(thumbLen))
+                else { return nil }
+                unsafe displays.append(WireDisplay(
+                    displayID: id, name: String(decoding: name, as: UTF8.self),
+                    x: Int32(bitPattern: x), y: Int32(bitPattern: y), width: w, height: h,
+                    pixelsPerPoint100: ppp, rotation: rot,
+                    isMain: flags & 1 != 0, isShown: flags & 2 != 0,
+                    thumbFormat: fmt, thumbWidth: tw, thumbHeight: th, thumb: [UInt8](thumb)))
+            }
+            return .displayList(displays: displays)
+        case 0x61:
+            guard let id = r.readU32(), let place = r.readU8(), place <= 1,
+                  let x = r.readU32(), let y = r.readU32() else { return nil }
+            return .displaySelect(displayID: id, placePointer: place == 1,
+                                  pointerX: Int32(bitPattern: x), pointerY: Int32(bitPattern: y))
+        case 0x62:
+            guard let req = r.readU32(), let raw = r.readU8(), let status = WireDisplaySelection.Status(rawValue: raw),
+                  status != .connectionLost, let id = r.readU32(),
+                  let x = r.readU32(), let y = r.readU32(), let w = r.readU16(), let h = r.readU16(),
+                  let pw = r.readU16(), let ph = r.readU16(), let placed = r.readU8(), placed <= 1,
+                  let px = r.readU32(), let py = r.readU32() else { return nil }
+            return .displaySelected(WireDisplaySelection(
+                requestedID: req, status: status, displayID: id, x: Int32(bitPattern: x), y: Int32(bitPattern: y),
+                width: w, height: h, pictureWidth: pw, pictureHeight: ph, pointerPlaced: placed == 1,
+                pointerX: Int32(bitPattern: px), pointerY: Int32(bitPattern: py)))
         default:
             return nil
         }
@@ -755,7 +941,7 @@ public enum ControlMessage: Equatable, Sendable {
     /// Known TLV types. Everything beyond is skipped by the deframer
     /// using its declared length.
     public static func isKnownType(_ t: UInt8) -> Bool {
-        (0x01...0x1E).contains(t)
+        (0x01...0x1E).contains(t) || (0x60...0x62).contains(t) // 0x60–0x62: display choice (§4.10)
     }
 }
 

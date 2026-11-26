@@ -72,6 +72,16 @@ public final class ViewerSession: @unchecked Sendable {
     public var onHostKeyChanged: ((_ expected: String, _ presented: String) -> Void)?
     /// Main: the host's pickable-window snapshot.
     public var onWindowList: (([WireWindow]) -> Void)?
+    /// The host's screen list (main thread).
+    public var onDisplayList: (([WireDisplay]) -> Void)?
+    /// The answer to each screen choice (main
+    /// thread), in order. A choice still waiting when the connection ends is
+    /// answered `.connectionLost`.
+    public var onDisplaySelected: ((WireDisplaySelection) -> Void)?
+    /// `queue`: the choice sent and not yet answered, and the one waiting behind
+    /// it (a newer one replaces an older waiting one). Selections are serialized.
+    private var displaySelectInFlight: (id: UInt32, point: (x: Int32, y: Int32)?)?
+    private var displaySelectQueued: (id: UInt32, point: (x: Int32, y: Int32)?)?
     /// Main: the host ended the session on purpose — show why, don't redial.
     public var onHostEndedSession: ((String) -> Void)?
     /// Main thread: the host runs a different build (its wire version);
@@ -168,6 +178,18 @@ public final class ViewerSession: @unchecked Sendable {
         engine.onClipboard = { [weak self] format, data in
             DispatchQueue.main.async { self?.onClipboard?(format, data) }
         }
+        engine.onDisplayList = { [weak self] displays in
+            DispatchQueue.main.async { self?.onDisplayList?(displays) }
+        }
+        engine.onDisplaySelected = { [weak self] result in // engine queue = `queue`
+            guard let self else { return }
+            self.displaySelectInFlight = nil
+            DispatchQueue.main.async { self.onDisplaySelected?(result) }
+            if let next = self.displaySelectQueued {
+                self.displaySelectQueued = nil
+                self.sendDisplaySelectNow(next.id, next.point)
+            }
+        }
         engine.onWindowList = { [weak self] windows in
             DispatchQueue.main.async { self?.onWindowList?(windows) }
         }
@@ -212,6 +234,7 @@ public final class ViewerSession: @unchecked Sendable {
                 self.tickTimer?.cancel()
                 self.tickTimer = nil
                 self.onTransportEnded?()
+                self.failPendingDisplaySelects()
                 guard !self.failureReported else { return }
                 self.failureReported = true
                 switch ViewerSessionEnd.classify(
@@ -317,6 +340,59 @@ public final class ViewerSession: @unchecked Sendable {
     /// Ask the host to enumerate and send its window list.
     public func requestWindowList() {
         queue.async { [weak self] in self?.engine.sendWindowSelect(windowID: 0) }
+    }
+
+    /// Share this screen (0 = just send the
+    /// list); with a point, the host places the pointer there (global points).
+    /// A real screen choice is serialized: while one waits for its
+    /// DISPLAY_SELECTED, the next waits (only the newest), then goes.
+    public func selectDisplay(_ id: UInt32, pointerAt point: (x: Int32, y: Int32)? = nil) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if id == 0 {
+                self.engine.sendDisplaySelect(displayID: 0)
+            } else if let waiting = self.displaySelectInFlight {
+                if let dropped = self.displaySelectQueued {
+                    self.onStatus("screen choice \(dropped.id) replaced by \(id) while \(waiting.id) is pending")
+                }
+                self.displaySelectQueued = (id, point)
+            } else {
+                self.sendDisplaySelectNow(id, point)
+            }
+        }
+    }
+
+    /// `queue`.
+    private func sendDisplaySelectNow(_ id: UInt32, _ point: (x: Int32, y: Int32)?) {
+        guard engine.state == .running else {
+            let result = WireDisplaySelection(requestedID: id, status: .connectionLost, displayID: 0)
+            DispatchQueue.main.async { self.onDisplaySelected?(result) }
+            return
+        }
+        displaySelectInFlight = (id, point)
+        engine.sendDisplaySelect(displayID: id, placePointer: point != nil, x: point?.x ?? 0, y: point?.y ?? 0)
+    }
+
+    /// `queue`: the connection ended; answer what was waiting.
+    private func failPendingDisplaySelects() {
+        let ids = [displaySelectInFlight?.id, displaySelectQueued?.id].compactMap { $0 }
+        displaySelectInFlight = nil
+        displaySelectQueued = nil
+        guard !ids.isEmpty else { return }
+        DispatchQueue.main.async {
+            for id in ids {
+                self.onDisplaySelected?(WireDisplaySelection(requestedID: id, status: .connectionLost, displayID: 0))
+            }
+        }
+    }
+
+    /// True while a screen choice waits for its answer (`queue`-safe from any thread).
+    public func displaySelectPending() -> Bool {
+        queue.sync { displaySelectInFlight != nil || displaySelectQueued != nil }
+    }
+
+    public func hostSupportsDisplayList() -> Bool {
+        queue.sync { engine.hostCaps & WireCaps.displayList != 0 }
     }
 
     /// Share one window (0 = back to the whole display).

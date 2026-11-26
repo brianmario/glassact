@@ -36,6 +36,14 @@ enum WireCompatSamples {
         .hostNotice(code: HostNotice.sessionOffScreen),
         .viewerBye(reason: ViewerBye.disconnected),
         .hostDisplay(width: 5120, height: 2880),
+        // display choice (0x60–0x62): as Duo Desktop's builds encode them
+        .displayList(displays: [WireDisplay(displayID: 1, name: "Studio", x: -1, y: 0, width: 2560, height: 1440,
+                                            pixelsPerPoint100: 200, rotation: 0, isMain: true, isShown: true,
+                                            thumbFormat: 1, thumbWidth: 2, thumbHeight: 1, thumb: [7])]),
+        .displaySelect(displayID: 3, placePointer: true, pointerX: -10, pointerY: 20),
+        .displaySelected(WireDisplaySelection(requestedID: 3, status: .ok, displayID: 3, x: -1920, y: 0,
+                                              width: 1920, height: 1080, pictureWidth: 3840, pictureHeight: 2160,
+                                              pointerPlaced: true, pointerX: -10, pointerY: 20)),
     ]
 
     static let video: [VideoMessage] = [
