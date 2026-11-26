@@ -398,6 +398,9 @@ public final class ViewerController: @unchecked Sendable {
     public private(set) var cursorVisible = false
     public private(set) var cursorImage: CGImage?
     public private(set) var cursorHotspot = CGPoint.zero // image pixels
+    /// The pointer image's pixels per point on the host (1 or 2): its size on screen is
+    /// `cursorImage`'s pixels divided by this, whatever the picture's zoom.
+    public private(set) var cursorScale: CGFloat = 1
 
     /// First-picture timing (see SessionMilestones): session start and
     /// transport-ready times (MonotonicClock µs), and whether the one-time
@@ -455,10 +458,11 @@ public final class ViewerController: @unchecked Sendable {
             self.cursorVisible = visible
             self.onCursorUpdate?()
         }
-        session.onCursorImage = { [weak self] image, hotspot in
+        session.onCursorImage = { [weak self] image, hotspot, scale in
             guard let self else { return }
             self.cursorImage = image
             self.cursorHotspot = hotspot
+            self.cursorScale = CGFloat(scale)
             self.onCursorUpdate?()
         }
         session.onClipboard = { [weak self] format, data in
