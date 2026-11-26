@@ -11193,10 +11193,14 @@ advertises them.** This is new.
   No cost was seen.
 - Each end extracts its own datagram flow. A flow extracted only by the
   host reaches the viewer as an anonymous inbound flow, like a stream.
-- Open: the viewer saw one extra inbound flow that never became ready
-  (stream 1; control was stream 5 and video stream 9). Today's first-byte
-  demux would hold it as a candidate that never speaks, so whether the
-  tunnel-pairing logic can go isn't settled.
+- The viewer sees one extra inbound flow that never becomes ready. It's
+  stream 1, and nothing is sent on it: the host's first extracted stream
+  is stream 5 (its own metadata says so), so the viewer's QUIC opens the
+  lower-numbered stream 1 implicitly (RFC 9000 §3.2) and surfaces it. It
+  appears with no datagram flow at all, and in a plain stream group like
+  today's control tunnel, so it isn't caused by carrying datagrams. Today's
+  first-byte demux already leaves such streams idle ("tunnel artifacts" in
+  `QUICTransport.swift`), so it doesn't stand in the way of one connection.
 - Not shown:
   - any macOS below 27.2 (the floors are 14.4 for the Host and 15.5 for the
     Viewer);
