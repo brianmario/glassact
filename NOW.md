@@ -2,6 +2,9 @@
 
 ## In flight
 
+- **#180 `session-docs`** (this file, RUNBOOK.md, CLAUDE.md's rules, AGENTS.md's commands moved): open.
+  Until it merges, read NOW.md and RUNBOOK.md from that branch (`git show origin/session-docs:NOW.md`).
+
 - **Display choice from the Viewer** (Duo Desktop's feature, their wire format adopted byte for byte:
   DISPLAY_LIST 0x60 / DISPLAY_SELECT 0x61 / DISPLAY_SELECTED 0x62, caps bit 31).
   - #177 `display-picking`: protocol, engines, session API, tests, DESIGN §3.5/§4.10. Green, waiting to merge.
@@ -30,7 +33,8 @@
 
 - The main checkout (`~/code/glassact`) sits on the merged branch `reduced-video`: make a worktree off
   `origin/main` for any change.
-- No background jobs or servers running. #108 (iPad TestFlight workflow) is an old open draft.
+- No background jobs, servers or uncommitted work; no worktrees left. #108 (iPad TestFlight workflow) is
+  an old open draft. Merge order for what's open: #180 any time; #177 then #178.
 - Duo Desktop: github.com/Stratechery/duo-desktop; their Host patches are in `patches/`. Their app works
   with a stock Host once #177/#178 ship.
 - The Apple Screen Sharing comparison's scorer and frame-dump patch live only in one session's scratch
