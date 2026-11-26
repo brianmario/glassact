@@ -60,7 +60,9 @@ swift build -c release --product glassact && rm -f ~/.local/bin/glassact && cp "
   only under scale or native).
 - Mac Viewer against it (Debug, unsigned): `"<derived data>/Build/Products/Debug/Glass Act Viewer.app/Contents/MacOS/Glass Act Viewer"
   --host 127.0.0.1 --port 4533 --connect -glassact.viewer.displayMode 1` (✓ connects; `displayMode` 0 Match
-  This Mac, 1 Scale Down, 2 Native, 3 Fit to Window; the argument overrides the saved choice for that launch).
+  This Mac, 1 Scale Down, 2 Native, 3 Fit to Window). An unsigned build isn't sandboxed: connecting saves its
+  settings to `~/Library/Preferences/app.glassact.viewer.plist` (not the release's container); remove it after with
+  `defaults delete ~/Library/Preferences/app.glassact.viewer.plist`.
 - The real Host runs from /Applications (the notarized release): TCC grants follow the signature, so a
   Debug Host has none. Quit it with `osascript -e 'tell application "Glass Act Host" to quit'`, never SIGKILL.
 - Logs: `/usr/bin/log show --last 30m --predicate 'subsystem == "app.glassact.host"'` (Viewer:
