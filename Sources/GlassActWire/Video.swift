@@ -64,6 +64,11 @@ public enum WireCaps {
     /// (HOST_DISPLAY), beside its picture's when they differ (Scale Down, a halved capture). Only
     /// the viewer's bit matters: a host sends HOST_DISPLAY to a viewer whose HELLO_OK carries it.
     public static let hostDisplaySize: UInt32 = 1 << 12
+    /// The host lists its displays (DISPLAY_LIST) and shares the one the viewer picks
+    /// (DISPLAY_SELECT), in session (§4.10). Bit 31 and types 0x60–0x62 are Duo Desktop's
+    /// (github.com/Stratechery/duo-desktop), taken as they encode them so its app and this Host
+    /// work together; only the host's bit matters.
+    public static let displayList: UInt32 = 1 << 31
 
     /// Caps bit advertising support for a given region codec id. The rig-only
     /// mock ids map onto the real bits (0x7F → HEVC bit, 0x7E → AV1 bit) so

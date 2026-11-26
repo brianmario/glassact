@@ -294,6 +294,9 @@ TileLedger / batches ◄────── QUIC control ─── ACK, NACKs, SC
 | 0x1D | HOST_NOTICE | H→V | code u8 (`HostNotice`: 0 none, 1 the host's session is off the screen). Sent on a change, and at the handshake while one is in force. Viewers ignore codes they don't know |
 | 0x1E | VIEWER_BYE | V→H | reason u8 (`ViewerBye`: 1 its user disconnected or closed the window, 2 its user quit, 3 nothing from the host, redialing, 4 the session failed at the viewer, redialing). The control stream's last message: the viewer then ends the stream and gives the host 1 s to hang up before closing (a quitting Viewer waits that long). Hosts treat codes they don't know as no goodbye |
 | 0x1F | HOST_DISPLAY | H→V | width u16, height u16: the pixel size of the display the host shares, its current mode's. Sent at the handshake and on a change, only to a viewer whose HELLO_OK carries `hostDisplaySize` (§3.8), never in single-window mode. The viewer shows it beside its picture's size where they differ (Scale Down, a halved capture). Display only |
+| 0x60 | DISPLAY_LIST | H→V | count u8, then each display: id u32, name (varint length + UTF-8), x i32, y i32 (global points), width u16, height u16 (points), pixelsPerPoint×100 u16, rotation u16 (degrees), flags u8 (1 main, 2 shown now), thumbFormat u8 (as WINDOW_LIST's, ≤ 2), thumbWidth u16, thumbHeight u16, thumb (varint length + bytes). Sent on DISPLAY_SELECT 0 and again when displays change, to a viewer that asked (§4.10 display choice) |
+| 0x61 | DISPLAY_SELECT | V→H | displayID u32 (0 = send DISPLAY_LIST), placePointer u8 (0/1), pointerX i32, pointerY i32 (global points). Share that display, in session; with placePointer, put the pointer there, clamped inside it. Only to a host whose HELLO carries `displayList` (§3.8) |
+| 0x62 | DISPLAY_SELECTED | H→V | requestedID u32, status u8 (0 ok, 1 not offered, 2 not now, 3 failed; 255 is the viewer's own "connection lost", never sent), displayID u32 (now shared; on a refusal the one still shared), x i32, y i32, width u16, height u16 (its place, points), pictureWidth u16, pictureHeight u16 (the picture sent, pixels), pointerPlaced u8, pointerX i32, pointerY i32. The answer to each DISPLAY_SELECT but 0, once the new session runs |
 
 **Cadence:**
 - **ACKs:**
@@ -367,6 +370,7 @@ byte t/8, LSB first. Missing trailing bytes count as 0.
 | 10 | virtualDisplay | geoMode 4 allowed |
 | 11 | agentControl | TEXT_INPUT, AGENT_STATE, UI_TREE*, agent-flagged INPUT |
 | 12 | hostDisplaySize | the viewer shows the shared display's size: a host sends it HOST_DISPLAY (§3.5). Only the viewer's bit matters |
+| 31 | displayList | the host lists its displays and shares the one the viewer picks (DISPLAY_LIST, DISPLAY_SELECT, §4.10). Only the host's bit matters. Bit 31 and types 0x60–0x62 are Duo Desktop's (github.com/Stratechery/duo-desktop), taken as its builds send them |
 
 **Enums:**
 - **INPUT kinds** (low 7 bits): 1 move, 2 down / 3 up (a = clicks, b = button),
@@ -1108,6 +1112,29 @@ session never redials.
 - WINDOW_LIST and WINDOW_SELECT rebuild the SCK filter around one window.
 - WINDOW_CONTROL drives the window's chrome.
 - If the shared window closes, the session ends without a redial.
+
+**Display choice:** a host with several displays lists them and shares the
+one the viewer picks, in session, as a resize does (re-HELLO, no reconnect).
+The messages are Duo Desktop's (§3.5, 0x60–0x62, caps bit 31), taken byte
+for byte so its iPhone app works with this Host.
+- The viewer asks with DISPLAY_SELECT 0. The host answers with DISPLAY_LIST
+  (each display's place, size, scale and a small picture, the one shown
+  marked) and sends it again when displays are added, removed or moved.
+- DISPLAY_SELECT n shares display n: the viewer's pick while the host offers
+  it, else the display chosen at the Mac or the main one, never "the first
+  listed" (`DisplayChoice.displayToShare`). With a point, the host puts the
+  pointer there, inside the new display (`DisplayChoice.pointerPlacement`);
+  else in its middle.
+- DISPLAY_SELECTED answers each pick once the new session runs (or refuses
+  it at once: not offered, not now in single-window mode, or failed). The
+  viewer sends one pick at a time; a newer one waiting replaces an older
+  waiting one, and those still waiting when the connection ends are
+  answered "connection lost" (`ViewerSession.selectDisplay`).
+- The pick lasts for the session: the next session starts on the display
+  chosen at the Mac, or the main one.
+- Duo Desktop's other messages are reserved, never reused: 0x63 SCREEN_LOCK,
+  0x64 TEXT_FOCUS, 0x65 DISPLAY_SNAPSHOT_REQUEST, 0x66 DISPLAY_SNAPSHOT,
+  0x67 UNLOCK_TYPE, 0x68 UNLOCK_STATE, 0x70 and 0x71 (an SSH key install).
 
 **Pause:** a viewer whose window can't be seen (minimized, hidden, fully
 covered) for 3 s sends PAUSE_HINT 1, and PAUSE_HINT 0 the moment it is

@@ -110,6 +110,10 @@ public final class ViewerEngine: @unchecked Sendable {
     /// Single-window mode: host → viewer, the pickable-window snapshot.
     /// The app shows the picker; the choice comes back via sendWindowSelect.
     public var onWindowList: ((_ windows: [WireWindow]) -> Void)?
+    /// Host → viewer, the screen list.
+    public var onDisplayList: ((_ displays: [WireDisplay]) -> Void)?
+    /// Host → viewer, the answer to a DISPLAY_SELECT.
+    public var onDisplaySelected: ((_ result: WireDisplaySelection) -> Void)?
     /// The host ended the session on purpose (someone at the Mac disconnected
     /// this viewer, or in single-window mode the shared window closed). The
     /// app shows why and does NOT redial.
@@ -130,6 +134,13 @@ public final class ViewerEngine: @unchecked Sendable {
     /// queue AFTER the canvas is reallocated; the app rebuilds its present
     /// surfaces to the new grid. Not fired for the first HELLO.
     public var onGeometryChanged: ((_ width: Int, _ height: Int) -> Void)?
+    /// Display choice (§4.10): viewer → host, share this display (0 = send the list),
+    /// optionally placing the pointer at a global point as part of the switch.
+    public func sendDisplaySelect(displayID: UInt32, placePointer: Bool = false, x: Int32 = 0, y: Int32 = 0) {
+        guard state == .running else { return }
+        sendControl(.displaySelect(displayID: displayID, placePointer: placePointer, pointerX: x, pointerY: y))
+    }
+
     /// Single-window mode: viewer → host, pick a window from the last
     /// WINDOW_LIST (0 reverts to full display).
     public func sendWindowSelect(windowID: UInt32) {
@@ -471,6 +482,10 @@ public final class ViewerEngine: @unchecked Sendable {
                 onClipboard?(format, data)
             case let .windowList(windows):
                 onWindowList?(windows)
+            case let .displayList(displays):
+                onDisplayList?(displays)
+            case let .displaySelected(result):
+                onDisplaySelected?(result)
             case let .windowControl(action, _, _):
                 // Host → viewer endSession: the session is over, not interrupted —
                 // someone at the Mac disconnected this viewer, or the shared window
@@ -489,7 +504,7 @@ public final class ViewerEngine: @unchecked Sendable {
                 onHostDisplay?(Int(width), Int(height))
             case .helloOK, .ack, .pong, .scrollAck, .pauseHint, .keyframeAck, .deltaNack,
                  .resize, .input, .quality, .windowSelect, .viewerLog, .textInput, .agentState, .uiTreeRequest,
-                 .viewerInfo, .syncRequest, .received, .viewerBye:
+                 .viewerInfo, .syncRequest, .received, .viewerBye, .displaySelect:
                 break // viewer-originated / not addressed to the viewer
             }
         }

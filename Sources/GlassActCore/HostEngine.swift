@@ -634,6 +634,9 @@ public final class HostEngine: @unchecked Sendable {
     /// Single-window mode (§4.10): the viewer picked a window (0 = revert to full
     /// display). The app rebuilds its SCK capture filter around that window.
     public var onWindowSelect: ((_ windowID: UInt32) -> Void)?
+    /// DISPLAY_SELECT — share this screen
+    /// (0 = send the list), optionally placing the pointer (global points).
+    public var onDisplaySelect: ((_ displayID: UInt32, _ placePointer: Bool, _ x: Int32, _ y: Int32) -> Void)?
     /// Single-window mode: the viewer issued a window-chrome action (see
     /// WindowAction). The app drives the host window via Accessibility
     /// (fullscreen / resize) or ends the single-window session.
@@ -700,6 +703,19 @@ public final class HostEngine: @unchecked Sendable {
 
     public func sendSharedWindowClosed() {
         sendControl(.windowControl(action: WindowAction.endSession, width: 0, height: 0))
+    }
+
+    /// Push the screen list (DISPLAY_LIST).
+    /// Dropped, not sent, if it would exceed maxBodyLength (sendControl's bound).
+    public func sendDisplayList(_ displays: [WireDisplay]) {
+        guard state == .running else { return }
+        sendControl(.displayList(displays: displays))
+    }
+
+    /// Answer one DISPLAY_SELECT (DISPLAY_SELECTED).
+    public func sendDisplaySelected(_ result: WireDisplaySelection) {
+        guard state == .running else { return }
+        sendControl(.displaySelected(result))
     }
 
     public func sendWindowList(_ windows: [WireWindow]) {
@@ -990,6 +1006,8 @@ public final class HostEngine: @unchecked Sendable {
                                    preferSmoothness: pref == 2)
             case let .windowSelect(windowID):
                 onWindowSelect?(windowID)
+            case let .displaySelect(displayID, place, x, y):
+                onDisplaySelect?(displayID, place, x, y)
             case let .windowControl(action, width, height):
                 onWindowControl?(action, width, height)
             case let .viewerLog(name, offset, total, data):
@@ -1017,7 +1035,7 @@ public final class HostEngine: @unchecked Sendable {
                                           limitedSinceUS: limitedSinceUS)
             case let .syncRequest(region, generation):
                 noteSyncRequest(region: region, generation: generation)
-            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice, .hostDisplay:
+            case .hello, .scroll, .cursorPos, .cursorImage, .windowList, .uiTree, .agentScope, .hostNotice, .hostDisplay, .displayList, .displaySelected:
                 break // host-originated / not addressed to the host
             }
         }
@@ -1078,7 +1096,7 @@ public final class HostEngine: @unchecked Sendable {
             return k != 3 && k != 6 // mouse-up, key-up
         case let .windowControl(action, _, _):
             return action != WindowAction.endSession
-        case .clipboard, .textInput, .windowSelect, .uiTreeRequest, .agentState, .resize:
+        case .clipboard, .textInput, .windowSelect, .uiTreeRequest, .agentState, .resize, .displaySelect:
             return true
         default:
             return false

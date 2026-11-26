@@ -41,6 +41,10 @@ import GlassActWire
         "1d0101",
         "1e0101",
         "1f040014400b",
+        // display choice, as Duo Desktop's builds send it (github.com/Stratechery/duo-desktop)
+        "602401010000000653747564696fffffffff00000000000aa005c80000000301020001000107",
+        "610d0300000001f6ffffff14000000",
+        "622203000000000300000080f8ffff0000000080073804000f700801f6ffffff14000000",
     ]
     static let video = [
         "01120102000000000000000005d0020103010203",
@@ -65,7 +69,7 @@ import GlassActWire
 
     @Test func everyTypeIsPinned() {
         #expect(WireCompatSamples.control.count == Self.control.count)
-        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1F)),
+        #expect(Set(Self.control.map { Self.bytes($0)[0] }) == Set(UInt8(0x01)...UInt8(0x1F)).union(0x60...0x62),
                 "a control type without a fixture; add one")
         #expect(WireCompatSamples.video.count == Self.video.count)
     }
@@ -115,6 +119,7 @@ import GlassActWire
         #expect(WireCaps.virtualDisplay == 1 << 10)
         #expect(WireCaps.agentControl == 1 << 11)
         #expect(WireCaps.hostDisplaySize == 1 << 12)
+        #expect(WireCaps.displayList == 1 << 31) // Duo Desktop's, as its builds send it
         // the released fixtures' caps are made of known bits only, and none of them is bit 7 or 8
         // (`videoReducedFrames`, new in this release too)
         #expect(0x0E71 & WireCaps.videoAV1GlassAct == 0 && 0x0011 & WireCaps.videoAV1GlassAct == 0)
