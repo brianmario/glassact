@@ -11245,11 +11245,10 @@ datagram pacer only above 10 % loss (DESIGN §4.9).
   tunnel's own controller held the datagrams back. On loopback the same
   two-tunnel cells delivered 99 % of datagrams in their round, so where that
   backlog waits varies.
-- Under capacity, on loopback through the same relay, two runs a rate:
-  - Two tunnels: control stayed at a 21 ms median, 25–31 ms p95, at 0.5 and
-    2 MB/s.
-  - One connection: a 22 ms median, but 278–527 ms p95; one 2 MB/s run sat
-    at a 2.0 s median.
+- Nearer capacity, on loopback through the same relay at 1 % loss (three
+  runs at 2 MB/s, one at 0.5 MB/s):
+  - Two tunnels: control stayed at a 21 ms median and a 25–36 ms p95.
+  - One connection: medians of 22 ms to 2.0 s, and a p95 of 0.28–2.8 s.
 - With no loss on loopback, the round right after connecting raised control
   to 210–410 ms in both modes, so that part of the delay isn't the sharing.
 - A harness quirk: with two tunnels under any loss, the viewer's own
