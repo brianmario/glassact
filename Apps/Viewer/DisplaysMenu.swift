@@ -31,24 +31,32 @@ import GlassActSession
         holder.addSubview(button)
         accessory.view = holder
         accessory.layoutAttribute = .trailing
-        accessory.isHidden = true
     }
 
     /// The session window, once it opens (and again when it's replaced).
     func attach(to window: NSWindow?) {
         guard window !== self.window else { return }
-        if let index = self.window?.titlebarAccessoryViewControllers.firstIndex(of: accessory) {
-            self.window?.removeTitlebarAccessoryViewController(at: index)
-        }
+        showAccessory(false)
         self.window = window
-        if let window { window.addTitlebarAccessoryViewController(accessory) }
         update(picker)
+    }
+
+    /// In the title bar only while there's something to pick: an accessory's `isHidden` set
+    /// before it joins a window doesn't hide it.
+    private func showAccessory(_ show: Bool) {
+        guard let window else { return }
+        let index = window.titlebarAccessoryViewControllers.firstIndex(of: accessory)
+        if show, index == nil {
+            window.addTitlebarAccessoryViewController(accessory)
+        } else if !show, let index {
+            window.removeTitlebarAccessoryViewController(at: index)
+        }
     }
 
     func update(_ picker: DisplayPicker) {
         self.picker = picker
         let visible = picker.isVisible && window != nil
-        accessory.isHidden = !visible
+        showAccessory(visible)
         viewMenuItem.isHidden = !visible
         let items = picker.items
 

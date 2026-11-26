@@ -98,6 +98,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var windowPicker: WindowPicker?
     /// Display choice (§4.10): the title bar's Displays pull-down and View ▸ Displays.
     private let displaysMenu = DisplaysMenu()
+    /// The picture's grid now: the window's first, then each in-session change (a display
+    /// pick, a refit), for the live subtitle's size.
+    private var shownGrid: TileGrid?
     /// The app asked for the host's window list (the picker opens for those
     /// answers only — an agent's list_windows mustn't pop UI at the person).
     private var windowListRequested = false
@@ -784,6 +787,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             openCanvasWindow(grid: grid, sharedWindow: singleWindowMode)
             if singleWindowMode { maybeRequestHostFit(grid: grid) }
         } else {
+            shownGrid = grid
             rebuildCanvasContent(grid: grid)
         }
     }
@@ -1313,8 +1317,9 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         // Live subtitle: bandwidth (+ codec) for every session; g2g appended
         // on full-display sessions. The title stays the host's (or the shared
         // window's) name.
+        shownGrid = grid
         titleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refreshSubtitle(grid: grid, sharedWindow: sharedWindow) }
+            MainActor.assumeIsolated { self?.refreshSubtitle(grid: self?.shownGrid ?? grid, sharedWindow: sharedWindow) }
         }
     }
 
