@@ -46,6 +46,7 @@ swift test -c release --filter ScrollAllocationTests # not verified here (alloca
 
 ```sh
 swift run glassact-testhost --port 4533 [--size WxH] [--still] [--tiles-only] [--ask-after S] [--sign-in-password P] [--input-log]   # ✓
+swift run glassact-testhost --port 4533 --displays 1600x1000,1280x800 --still   # ✓ a host with two displays, for the Viewers' Displays menu
 ```
 
 ```sh
@@ -53,8 +54,13 @@ swift build -c release --product glassact && rm -f ~/.local/bin/glassact && cp "
 ```
 
 - iPad Viewer in the Simulator against it: build the iPad scheme above, launch the `.app`, connect to
-  `127.0.0.1:4533` (✓ via the Simulator tool). Or `xcrun simctl launch --terminate-running-process booted
-  app.glassact.viewer --host 127.0.0.1 --port 4533 --connect --keep-controls` (not verified here).
+  `127.0.0.1:4533` (✓ via the Simulator tool). Or `xcrun simctl install booted "<derived data>/Build/Products/Debug-iphonesimulator/Glass Act.app"`
+  then `xcrun simctl launch --terminate-running-process booted app.glassact.viewer --host 127.0.0.1 --port 4533
+  --resolution scale --connect --keep-controls` (✓; `--resolution fit|scale|native`; the Displays menu shows
+  only under scale or native).
+- Mac Viewer against it (Debug, unsigned): `"<derived data>/Build/Products/Debug/Glass Act Viewer.app/Contents/MacOS/Glass Act Viewer"
+  --host 127.0.0.1 --port 4533 --connect -glassact.viewer.displayMode 1` (✓ connects; `displayMode` 0 Match
+  This Mac, 1 Scale Down, 2 Native, 3 Fit to Window; the argument overrides the saved choice for that launch).
 - The real Host runs from /Applications (the notarized release): TCC grants follow the signature, so a
   Debug Host has none. Quit it with `osascript -e 'tell application "Glass Act Host" to quit'`, never SIGKILL.
 - Logs: `/usr/bin/log show --last 30m --predicate 'subsystem == "app.glassact.host"'` (Viewer:
