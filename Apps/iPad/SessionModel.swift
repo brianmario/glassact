@@ -127,6 +127,8 @@ final class SessionModel {
     private(set) var gridGeneration = 0
     /// What the host says is wrong with its screen (HOST_NOTICE), if anything.
     private(set) var hostNotice: String?
+    /// Display choice (§4.10): the Mac's displays, for the controls' Displays menu.
+    private(set) var displayPicker = DisplayPicker()
     /// "4.2 Mbps · 60 fps (HEVC)", refreshed while the session runs.
     private(set) var throughput: String?
     /// The picture's area, in points, and the screen's scale: the geometry
@@ -342,6 +344,10 @@ final class SessionModel {
             self.grid = grid
             self.gridGeneration += 1
         }
+        controller.onDisplayPickerChanged = { [weak self, weak controller] in
+            guard let self, let controller, self.controller === controller else { return }
+            self.displayPicker = controller.displayPicker
+        }
         controller.setQualityPrefs(floor: 0, motionPreference: motion.rawValue)
         self.controller = controller
         controller.start()
@@ -452,6 +458,9 @@ final class SessionModel {
         endSession()
     }
 
+    /// Show another of the Mac's displays (the host answers; the menu follows its answer).
+    func selectDisplay(_ id: UInt32) { controller?.selectDisplay(id) }
+
     func disconnect() {
         guard controller != nil else { return }
         note("disconnected by the user")
@@ -466,6 +475,7 @@ final class SessionModel {
         controller = nil
         grid = nil
         hostNotice = nil
+        displayPicker = DisplayPicker()
         throughput = nil
         reconnect.reset()
         approvalWaitStarted = nil

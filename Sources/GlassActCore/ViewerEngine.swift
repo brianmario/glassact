@@ -114,6 +114,9 @@ public final class ViewerEngine: @unchecked Sendable {
     public var onDisplayList: ((_ displays: [WireDisplay]) -> Void)?
     /// Host → viewer, the answer to a DISPLAY_SELECT.
     public var onDisplaySelected: ((_ result: WireDisplaySelection) -> Void)?
+    /// The handshake is done and the session runs (once, not for in-session re-HELLOs),
+    /// with what the host offers.
+    public var onRunning: ((_ hostCaps: UInt32) -> Void)?
     /// The host ended the session on purpose (someone at the Mac disconnected
     /// this viewer, or in single-window mode the shared window closed). The
     /// app shows why and does NOT redial.
@@ -463,6 +466,7 @@ public final class ViewerEngine: @unchecked Sendable {
                                       preferSharpness: policy.preferSharpness,
                                       preferSmoothness: policy.preferSmoothness)
                 }
+                onRunning?(hostCaps)
             case let .ping(nonce, tUS):
                 // Cross-machine clock offset estimate for glass-to-glass
                 // telemetry: (viewer now − host send time) = offset + one-way

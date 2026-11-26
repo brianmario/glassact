@@ -96,6 +96,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     private var selectedWindowID: UInt32 = 0
     private var selectedWindowTitle = ""
     private var windowPicker: WindowPicker?
+    /// Display choice (§4.10): the title bar's Displays pull-down and View ▸ Displays.
+    private let displaysMenu = DisplaysMenu()
     /// The app asked for the host's window list (the picker opens for those
     /// answers only — an agent's list_windows mustn't pop UI at the person).
     private var windowListRequested = false
@@ -376,7 +378,10 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             item("Paste", #selector(NSText.paste(_:)), "v"),
             item("Select All", #selector(NSText.selectAll(_:)), "a"),
         ])
+        displaysMenu.onPick = { [weak self] id in self?.controller?.selectDisplay(id) }
         submenu("View", [
+            // Hidden unless the host has displays to pick from (DisplaysMenu).
+            displaysMenu.viewMenuItem,
             // Mouse-driven while a session has focus: every key equivalent
             // goes to the host (CanvasView.performKeyEquivalent).
             item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]),
@@ -502,7 +507,12 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             self.handleIncompatibleHost(version)
         }
         controller.onGeometryChanged = { [weak self] w, h in self?.handleGeometryChanged(w, h) }
+        controller.onDisplayPickerChanged = { [weak self, weak controller] in
+            guard let self, let controller, self.controller === controller else { return }
+            self.displaysMenu.update(controller.displayPicker)
+        }
         singleWindowMode = model.shareMode == .window
+        controller.singleWindow = singleWindowMode
         controller.setQualityPrefs(floor: settings.qualityFloor, motionPreference: settings.motionPreference)
         self.controller = controller
         updateAgentSharing() // a new dial gets a new driver; agents keep their socket
@@ -575,6 +585,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
             } else {
                 note("host can't share a single window (needs Screen Recording) — showing full display")
                 singleWindowMode = false
+                controller?.singleWindow = false
                 openCanvasWindow(grid: grid, sharedWindow: false)
             }
         } else {
@@ -1071,6 +1082,7 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         (canvasWindow?.contentView as? CanvasView)?.stopPresenting()
         canvasWindow?.orderOut(nil)
         canvasWindow = nil
+        displaysMenu.attach(to: nil)
     }
 
     // MARK: - Agents (Settings › Agents)
@@ -1282,6 +1294,8 @@ final class ViewerAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         window.acceptsMouseMovedEvents = true
         canvas.startPresenting()
         canvasWindow = window
+        displaysMenu.attach(to: window)
+        displaysMenu.update(controller.displayPicker)
         model.phase = .inSession
         model.noteConnected()
         // Content pauses while the window can't be seen (minimized, hidden,

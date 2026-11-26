@@ -241,11 +241,22 @@ public final class ViewerController: @unchecked Sendable {
     /// Handshake geometry (main thread → engine queue, BEFORE HELLO lands).
     public func setRequestedGeometry(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
         session.setRequestedGeometry(mode: mode, widthPoints: widthPoints, heightPoints: heightPoints, scale: scale)
+        noteGeometryRequest(mode)
     }
 
     /// RESIZE request (main thread → engine queue).
     public func requestResize(mode: UInt8, widthPoints: Int, heightPoints: Int, scale: Int) {
         session.requestResize(mode: mode, widthPoints: widthPoints, heightPoints: heightPoints, scale: scale)
+        noteGeometryRequest(mode)
+    }
+
+    /// Main thread: a geometry that lets a pick take effect asks for the list, if it hasn't one.
+    private func noteGeometryRequest(_ mode: UInt8) {
+        let before = displayPicker
+        if displayPicker.geometryRequested(mode: mode, singleWindow: singleWindow), sessionRunning {
+            session.selectDisplay(0)
+        }
+        if displayPicker != before { onDisplayPickerChanged?() }
     }
 
     // MARK: - Single-window mode (main thread → engine queue)
@@ -258,6 +269,18 @@ public final class ViewerController: @unchecked Sendable {
     /// (main thread): the screen now shared, its place, the picture size, the
     /// pointer it placed, or a refusal. Choices are serialized until each answer.
     public var onDisplaySelected: ((WireDisplaySelection) -> Void)?
+    /// Display choice (§4.10), main thread: the host's displays and when to show the picker.
+    /// The controller asks for the list itself, once the session runs and whenever the
+    /// geometry asked for lets a pick take effect; `selectDisplay` picks.
+    public private(set) var displayPicker = DisplayPicker()
+    /// Main thread: `displayPicker` changed.
+    public var onDisplayPickerChanged: (() -> Void)?
+    /// Single-window mode (no display to pick): set by the app before `start`, and cleared if
+    /// it falls back to the whole display.
+    public var singleWindow = false {
+        didSet { if singleWindow != oldValue { noteGeometryRequest(displayPicker.geometryMode) } }
+    }
+    private var sessionRunning = false
     /// Main thread: the host ended the session on purpose (shared window
     /// closed) — show why, don't redial.
     public var onHostEndedSession: ((String) -> Void)?
@@ -379,6 +402,10 @@ public final class ViewerController: @unchecked Sendable {
     /// 0 = ask for the list; else share that screen,
     /// with the host placing the pointer at `pointerAt` (global points) if given.
     public func selectDisplay(_ id: UInt32, pointerAt point: (x: Int32, y: Int32)? = nil) {
+        if id != 0 {
+            guard displayPicker.pick(id) else { return }
+            onDisplayPickerChanged?()
+        }
         session.selectDisplay(id, pointerAt: point)
     }
     /// A window-chrome action (fullscreen / resize / endSession).
@@ -444,6 +471,12 @@ public final class ViewerController: @unchecked Sendable {
             }
         }
         session.onTransportEnded = { [weak self] in // queue
+            DispatchQueue.main.async { [weak self] in // nothing to pick until the next session's list
+                guard let self else { return }
+                self.sessionRunning = false
+                self.displayPicker.sessionEnded()
+                self.onDisplayPickerChanged?()
+            }
             guard let self, let token = self.sessionActivity else { return }
             ProcessInfo.processInfo.endActivity(token)
             self.sessionActivity = nil
@@ -465,8 +498,29 @@ public final class ViewerController: @unchecked Sendable {
             self?.agentDriver?.noteHostClipboard(format: format, data: data)
             self?.applyInboundClipboard(format, data)
         }
-        session.onDisplayList = { [weak self] displays in self?.onDisplayList?(displays) }
-        session.onDisplaySelected = { [weak self] result in self?.onDisplaySelected?(result) }
+        session.onDisplayList = { [weak self] displays in
+            guard let self else { return }
+            self.displayPicker.received(displays)
+            SessionLog.shared.write("display_list", "count=\(displays.count) shown=\(self.displayPicker.shownID)"
+                + " visible=\(self.displayPicker.isVisible ? 1 : 0)")
+            self.onDisplayList?(displays)
+            self.onDisplayPickerChanged?()
+        }
+        session.onDisplaySelected = { [weak self] result in
+            guard let self else { return }
+            self.displayPicker.received(result)
+            SessionLog.shared.write("display_selected", "requested=\(result.requestedID) status=\(result.status.rawValue)"
+                + " shown=\(result.displayID) picture=\(result.pictureWidth)x\(result.pictureHeight)")
+            self.onDisplaySelected?(result)
+            self.onDisplayPickerChanged?()
+        }
+        session.onRunning = { [weak self] caps in
+            guard let self else { return }
+            self.sessionRunning = true
+            if self.displayPicker.sessionStarted(hostLists: caps & WireCaps.displayList != 0) {
+                self.session.selectDisplay(0)
+            }
+        }
         session.onWindowList = { [weak self] windows in
             self?.agentDriver?.noteWindowList(windows)
             self?.onWindowList?(windows)
