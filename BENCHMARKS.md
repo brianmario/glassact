@@ -354,7 +354,7 @@ the numbers and the reasoning.
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09, again 2026-11 on macOS 27.2; issue #10 | no batch or idempotent datagram send: ~5× the Host CPU per datagram (27.4–28.9 vs 5.5 µs) | [2026-09](#networkconnectionquic-spike--not-adopted-2026-09-27), [2026-11](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
-| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | candidate 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; macOS 27.2 loopback only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
+| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | works, not adopted as is, 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; under 1–3 % emulated loss its datagrams held control pings at a 2–3 s median, against 27–29 ms on two tunnels; macOS 27.2 only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
 
 **Engine and build**
 
@@ -11204,12 +11204,57 @@ advertises them.** This is new.
 - Not shown:
   - any macOS below 27.2 (the floors are 14.4 for the Host and 15.5 for the
     Viewer);
-  - a real link;
-  - behaviour under loss, with datagrams and streams sharing one congestion
-    controller.
+  - a real link (loss was emulated, below).
 
   It also goes against the DTS guidance cited in `QUICTransport.swift`'s
   Deviations note, so it relies on undocumented behaviour.
+
+**Under loss, one connection lets datagrams hold up the control stream.**
+The same workload ran over one connection and over today's two tunnels:
+- host and viewer in separate processes;
+- a control stream with an echoed ping every 5 ms, timed on the host's clock;
+- paced datagram rounds, one of them alongside an 8 MiB video stream.
+
+Loss came from a userspace UDP relay on the Mac:
+- i.i.d. drops from a fixed seed, both ways;
+- 10 ms each way (a 20 ms round trip);
+- QUIC packets capped at 1452 B (`maxUDPPayloadSize`), so they are a
+  1500-byte link's and not loopback's 16 KB.
+
+The host ran in a macOS 27.2 VM, with one run per cell. The Mac's load was
+6–23 from an unrelated job, so the latencies are rough. The datagram round
+offers 12,000 × 1150 B at 50 MB/s. That's far above what a loss-based
+controller sustains at 1 % and 20 ms (on the order of 1 MB/s), so these
+cells show where the backlog waits. Today's Host would offer rates like this
+at 1–3 % random loss: its governor backs off on queueing delay, and its
+datagram pacer only above 10 % loss (DESIGN §4.9).
+
+| VM host, 50 MB/s offered | control ping, median | p95 | datagrams in their round |
+|---|---|---|---|
+| one connection, no loss | 112 ms | 442 ms | 100 % |
+| two tunnels, no loss | 25 ms | 78 ms | 100 % |
+| one connection, 1 % | 2.0 s | 2.3 s | 99.0 % |
+| two tunnels, 1 % | 29 ms | 69 ms | 9.1 % (the rest arrived seconds late) |
+| one connection, 3 % | 3.0 s | 3.3 s | 96.9 % |
+| two tunnels, 3 % | 27 ms | 48 ms | 3.9 % (the rest arrived seconds late) |
+
+- One shared controller: datagrams went out on time and control waited
+  seconds behind them. In the round with the video stream, control pings had
+  a median of 7–14 s, and video delivered 0.07–2 MiB of 8 in 10 s.
+- Two tunnels: control stayed near the path's round trip, and the datagram
+  tunnel's own controller held the datagrams back. On loopback the same
+  two-tunnel cells delivered 99 % of datagrams in their round, so where that
+  backlog waits varies.
+- Under capacity, on loopback through the same relay, two runs a rate:
+  - Two tunnels: control stayed at a 21 ms median, 25–31 ms p95, at 0.5 and
+    2 MB/s.
+  - One connection: a 22 ms median, but 278–527 ms p95; one 2 MB/s run sat
+    at a 2.0 s median.
+- With no loss on loopback, the round right after connecting raised control
+  to 210–410 ms in both modes, so that part of the delay isn't the sharing.
+- A harness quirk: with two tunnels under any loss, the viewer's own
+  datagrams to the host (4,000, every send reported done without error)
+  mostly never reached the wire. Today's Viewer sends no datagrams.
 
 **One port, two connections:** a group listener whose options advertise
 datagrams also accepts a datagram-only connection (today's second tunnel)
@@ -11219,9 +11264,13 @@ and a connection handler (EINVAL). A datagram listener takes a stream
 group's dial as a plain connection with frame size 0.
 
 Verdict: `NetworkConnection` stays not adopted. The group API with
-datagrams advertised is a candidate for #10. It keeps batched sends, and it
-doesn't need macOS 26 if it holds on older systems. Next: check it on 14.4
-and 15.5 and over Wi-Fi with loss; a negotiated mode is the owner's call.
+datagrams advertised works on one connection with batched sends, but it
+isn't adopted as is. Under loss its one congestion controller lets the
+Host's datagrams hold up the control stream by seconds, where two tunnels
+keep control near the path's round trip. One tunnel would need control
+traffic to go ahead of datagrams within the connection, plus a Host that
+paces datagrams to what the connection carries; neither is tested. Still
+open: older macOS and a real link.
 
 ### `NetworkConnection<QUIC>` spike — not adopted (2026-09-27)
 
