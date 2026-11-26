@@ -84,46 +84,10 @@ retransmission.
   and hides a tile the engine forgot to re-send
   (see `Tests/CoreTests/StrandedTileTests.swift`).
 
-## Commands
+## Commands and gotchas
 
-```sh
-just test-fast        # skips real-QUIC and slow tests (~40 s); run this while iterating
-just test-rust        # the Rust AV1 crate's tests, including the snapshots that pin its outputs
-just test             # everything; must be green before landing
-just test-asan        # AddressSanitizer
-just bench <args>     # release glassact-bench (replay, synth, goldens)
-just install-cli      # glassact → ~/.local/bin
-scripts/train-pruner all   # retrain the AV1 encoder's learned pruning from scripts/pruner-traces.txt; then `install`
-just release [Host|Viewer]   # Developer ID archive → notarize → staple → zip
-xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host build   # or Viewer; "(Release)" schemes for perf
-```
-
-## Gotchas
-
-- **TCC follows the code signature.** Run the Host from `/Applications` (the
-  notarized release). Debug builds sign as Apple Development, which is a
-  different identity, so Screen Recording and Device Control grants don't
-  carry over. A frozen canvas usually means a missing grant, not an engine
-  bug.
-- **Quit the Host gracefully** (`osascript -e 'tell application "Glass Act Host" to quit'`),
-  never with SIGKILL. That way the virtual display and session state unwind.
-- **Replacing a signed binary:** `rm` it before `cp`. Overwriting it in place
-  gets the new process killed (exit 137).
-- **Logs:** use `/usr/bin/log`, because zsh has a `log` builtin. The subsystem
-  is `app.glassact.host`. The Viewer is sandboxed: its log files are in its
-  container, which a terminal can't read without a prompt, so read it from
-  the unified log instead (subsystem `app.glassact.viewer`).
-- **Releases** notarize through the Apple ID signed in to Xcode. Xcode 27's
-  xcodebuild sometimes drops that account ("No Accounts", or a notarization
-  timeout). Check `defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists`;
-  if it's empty, re-sign in to Xcode and re-run.
-- **Signing setup:** `Apps/Signing.local.xcconfig` (git-ignored) sets
-  `DEVELOPMENT_TEAM` and optionally `GLASSACT_BUNDLE_PREFIX`. With a team,
-  the apps carry a keychain entitlement and need a provisioning profile:
-  the first signed build after a profile change needs
-  `-allowProvisioningUpdates` and the Xcode account. Builds signed by the
-  team, Debug and Release alike, share the apps' keychain keys, so
-  rebuilding never prompts or changes a key.
-- **Env flags** (Host): `GLASSACT_TILE_ONLY=1` disables video (no video caps
-  are offered; tiles only). The `*_DEBUG` flags add logging, and
-  `GLASSACT_TRACE_TILE=<idx>` logs every change to one tile.
+[RUNBOOK.md](RUNBOOK.md) has the exact commands (build, test, run,
+benchmark, release, CI), which of them have been checked on this Mac, and
+the gotchas (TCC follows the signature, quitting the Host gracefully,
+replacing signed binaries, `/usr/bin/log`, release sign-in, env flags).
+[NOW.md](NOW.md) is what's in flight.
