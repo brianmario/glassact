@@ -94,7 +94,9 @@ public final class ViewerSession: @unchecked Sendable {
     /// Main: pointer position (canvas pixels) and visibility, metadata mode.
     public var onCursorPos: ((_ x: Int, _ y: Int, _ visible: Bool) -> Void)?
     /// Main: pointer image and hotspot (image pixels), metadata mode.
-    public var onCursorImage: ((_ image: CGImage, _ hotspot: CGPoint) -> Void)?
+    /// `scale`: the image's pixels per point on the host (CURSOR_IMAGE's), so the pointer can be
+    /// drawn at its own size.
+    public var onCursorImage: ((_ image: CGImage, _ hotspot: CGPoint, _ scale: Int) -> Void)?
     /// Main: the host's clipboard changed (format 1 = UTF-8 text).
     public var onClipboard: ((_ format: UInt8, _ data: [UInt8]) -> Void)?
 
@@ -160,7 +162,7 @@ public final class ViewerSession: @unchecked Sendable {
         engine.onCursorPos = { [weak self] x, y, visible in
             DispatchQueue.main.async { self?.onCursorPos?(x, y, visible) }
         }
-        engine.onCursorImage = { [weak self] w, h, hx, hy, _, bgra in
+        engine.onCursorImage = { [weak self] w, h, hx, hy, scale, bgra in
             var bytes = bgra
             let image: CGImage? = bytes.withUnsafeMutableBytes { buf in
                 guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h,
@@ -173,7 +175,7 @@ public final class ViewerSession: @unchecked Sendable {
             }
             guard let image else { return }
             let box = UnsafeSendable(image)
-            DispatchQueue.main.async { self?.onCursorImage?(box.value, CGPoint(x: hx, y: hy)) }
+            DispatchQueue.main.async { self?.onCursorImage?(box.value, CGPoint(x: hx, y: hy), max(1, scale)) }
         }
         engine.onClipboard = { [weak self] format, data in
             DispatchQueue.main.async { self?.onClipboard?(format, data) }

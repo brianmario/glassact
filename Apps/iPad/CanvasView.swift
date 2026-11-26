@@ -286,13 +286,18 @@ final class CanvasView: UIView, UIGestureRecognizerDelegate {
             return
         }
         // The content layer's bounds are the picture in view points: canvas
-        // pixels scale by `k` into it. The pointer keeps the Mac's size
-        // relative to its screen (it scales with the picture).
+        // pixels scale by `k` into it. The pointer follows the picture but is
+        // sized as a pointer is: its own points (the image's pixels over its
+        // scale), whatever the picture's zoom. Scaled with the picture, it was
+        // a few points tall when a large Mac display filled the iPad.
         let k = contentLayer.bounds.width / CGFloat(grid.width)
+        let p = 1 / max(controller.cursorScale, 1) // image pixels → view points
         let x = CGFloat(local?.x ?? controller.cursorX), y = CGFloat(local?.y ?? controller.cursorY)
         cursorLayer.contents = image
-        cursorLayer.frame = CGRect(x: (x - controller.cursorHotspot.x) * k, y: (y - controller.cursorHotspot.y) * k,
-                                   width: CGFloat(image.width) * k, height: CGFloat(image.height) * k)
+        // (exact pixels where the image's scale is the screen's; smooth where it's scaled)
+        cursorLayer.magnificationFilter = controller.cursorScale == (window?.screen.scale ?? 2) ? .nearest : .linear
+        cursorLayer.frame = CGRect(x: x * k - controller.cursorHotspot.x * p, y: y * k - controller.cursorHotspot.y * p,
+                                   width: CGFloat(image.width) * p, height: CGFloat(image.height) * p)
         cursorLayer.isHidden = false
     }
 

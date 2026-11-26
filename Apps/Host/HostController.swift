@@ -2447,8 +2447,11 @@ final class HostController: NSObject, SCContentSharingPickerObserver,
         // the one on screen.
         guard let cursor = NSCursor.currentSystem else { return }
         let image = cursor.image
+        // The sharpest bitmap, not the first (often the 1x one): the viewer draws the pointer
+        // at its own size in points, so a 2x image stays crisp on a Retina viewer.
         guard let rep = image.representations
-            .compactMap({ $0 as? NSBitmapImageRep }).first
+            .compactMap({ $0 as? NSBitmapImageRep })
+            .max(by: { $0.pixelsWide < $1.pixelsWide })
             ?? tiffRep(of: image) else { return }
         let w = rep.pixelsWide
         let h = rep.pixelsHigh
