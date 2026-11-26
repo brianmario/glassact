@@ -62,7 +62,11 @@ swift build -c release --product glassact && rm -f ~/.local/bin/glassact && cp "
   --host 127.0.0.1 --port 4533 --connect -glassact.viewer.displayMode 1` (✓ connects; `displayMode` 0 Match
   This Mac, 1 Scale Down, 2 Native, 3 Fit to Window). An unsigned build isn't sandboxed: connecting saves its
   settings to `~/Library/Preferences/app.glassact.viewer.plist` (not the release's container); remove it after with
-  `defaults delete ~/Library/Preferences/app.glassact.viewer.plist`.
+  `defaults delete ~/Library/Preferences/app.glassact.viewer.plist` (that empties it), then `rm` the file.
+  Quit it with `kill -TERM <pid>` (osascript would reach the release Viewer, same bundle ID).
+- Looking at the Debug Mac Viewer: the computer-use `app_*` tools attach to the release Viewer when it runs
+  (same bundle ID), so screenshots of the Debug window need full-screen control (`computer_batch`
+  screenshot/zoom); ask for it, and release it after. The iPad Simulator tool needs no such grant.
 - The real Host runs from /Applications (the notarized release): TCC grants follow the signature, so a
   Debug Host has none. Quit it with `osascript -e 'tell application "Glass Act Host" to quit'`, never SIGKILL.
 - Logs: `/usr/bin/log show --last 30m --predicate 'subsystem == "app.glassact.host"'` (Viewer:
