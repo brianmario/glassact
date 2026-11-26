@@ -353,7 +353,8 @@ the numbers and the reasoning.
 | Auto-scale on the viewer-reported link capacity | kept | lounge Wi-Fi at ~0.3 Mbit/s: neither older rule fired in 61 s; loop cursor-drag 17.2 → 7.2 s | [entry](#auto-scale-from-the-viewers-link-reports-2026-10-26) |
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
-| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09; issue #10 | async-only sends, no batch; datagram frame size read 0 | [entry](#networkconnectionquic-spike--not-adopted-2026-09-27) |
+| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09, again 2026-11 on macOS 27.2; issue #10 | no batch or idempotent datagram send: ~5× the Host CPU per datagram (27.4–28.9 vs 5.5 µs) | [2026-09](#networkconnectionquic-spike--not-adopted-2026-09-27), [2026-11](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
+| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | candidate 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; macOS 27.2 loopback only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
 
 **Engine and build**
 
@@ -11127,6 +11128,97 @@ start. Round 0 still showed ~4k datagrams sent-not-counted — *not*
 datagrams beating HELLO, as first guessed here: see "Cold-start phantom
 loss".
 
+### One QUIC tunnel spike on macOS 27 (2026-11-26)
+
+Question (issue #10): can one QUIC connection carry the control stream, the
+video stream and the datagrams? A re-run of the 2026-09 spike (next entry)
+on macOS 27.2 with the Xcode 27.2 SDK: M4 Pro, loopback, 1150 B datagrams,
+12,000 a round (a 5K full-screen batch is ~14k). A standalone harness, not
+in the repo, with in-memory self-signed identities. The Mac was busy with an
+unrelated job (load average 10–13) throughout, so the timings are rough:
+re-time on an idle Mac before relying on the CPU comparisons.
+
+**`NetworkConnection<QUIC>`: still not adopted.**
+- The SDK is unchanged for datagrams. `send` on a datagram channel is
+  `async throws`, with no `sendIdempotent` (streams have one) and no batch.
+  macOS 27 adds only path, viability and better-path handlers.
+- Frame size: `conn.usableDatagramFrameSize` still reads 0, but the
+  `NWProtocolQUIC.Metadata` of the datagrams channel
+  (`dg.metadata(definition: NWProtocolQUIC.definition)`) reads 1397. The
+  2026-09 "reads 0" came from reading the connection, not the channel.
+  Sends of 1398–1500 B don't throw.
+- Host-first works: a stream the server opens reaches the viewer's
+  `inboundStreams`, and a datagram the host sends first arrives.
+- CPU per datagram, 12k datagrams, with the host and viewer in separate
+  processes:
+
+  | | host, per datagram sent | viewer, per datagram received |
+  |---|---|---|
+  | today: datagram-only `NWConnection`, `batch` + idempotent sends, paced at 50 MB/s | 5.5 µs | 13.2–13.9 µs |
+  | `NetworkConnection`, each send awaited | 27.4–28.9 µs | 29.2–30.7 µs |
+
+  That's ~5× on the Host and ~2.2× on the Viewer. A 14k-datagram batch
+  would cost ~80 ms of Host CPU today and ~390 ms on `NetworkConnection`,
+  and more on Intel.
+- Awaited one at a time in one process, a send takes 25–28 µs (41–45 MB/s,
+  under the 50 MB/s pace) and usually delivers 100 %. It doesn't pace
+  reliably, though: a sequential round right after a wide fan-out delivered
+  11 % and 43 % in two of four runs (100 % in the others), so a pacer is
+  still needed.
+- Fan-outs in one process: width 8 delivered 97–99 %, width 64 11–21 %,
+  width 1024 5.5–100 %. In separate processes every width delivered 100 %,
+  so the in-process losses are partly receiver starvation, not the API's
+  limit.
+
+**The group API carries datagrams on the stream connection when the group
+advertises them.** This is new.
+- The premise in DESIGN §6 was that `group.extract(using:)` with datagram
+  options fails (ENETDOWN). On 27.2, with no `maxDatagramFrameSize` in the
+  group's QUIC options, the extracted flow stays in `preparing`. ENETDOWN
+  wasn't reproduced. With `maxDatagramFrameSize = 1400` in the group's
+  options at both ends (`isDatagram` false), the extracted flow goes ready
+  at both ends with `usableDatagramFrameSize` 1397.
+- It's one connection: the listener accepted one group, the TLS verify
+  block ran once a side, and the host's control stream and datagram flow
+  report the same remote port.
+- Over it, at once:
+  - the host-first HELLO on an extracted control stream;
+  - a video stream (8 MiB);
+  - datagrams host → viewer, 12,000 of 12,000 in each of five rounds (paced
+    at 50 MB/s, batched idempotent sends), one round sharing the link with
+    the 8 MiB stream and 60 control messages;
+  - datagrams viewer → host, 4,000 of 4,000.
+- CPU, both ends in one process: 16.1–17.1 µs per datagram, against
+  16.3–16.6 µs for today's separate datagram tunnel in the same harness.
+  No cost was seen.
+- Each end extracts its own datagram flow. A flow extracted only by the
+  host reaches the viewer as an anonymous inbound flow, like a stream.
+- Open: the viewer saw one extra inbound flow that never became ready
+  (stream 1; control was stream 5 and video stream 9). Today's first-byte
+  demux would hold it as a candidate that never speaks, so whether the
+  tunnel-pairing logic can go isn't settled.
+- Not shown:
+  - any macOS below 27.2 (the floors are 14.4 for the Host and 15.5 for the
+    Viewer);
+  - a real link;
+  - behaviour under loss, with datagrams and streams sharing one congestion
+    controller.
+
+  It also goes against the DTS guidance cited in `QUICTransport.swift`'s
+  Deviations note, so it relies on undocumented behaviour.
+
+**One port, two connections:** a group listener whose options advertise
+datagrams also accepts a datagram-only connection (today's second tunnel)
+as a group, and that connection's datagrams arrive on the group's
+`newConnectionHandler` (100 of 100). A listener can't take both a group
+and a connection handler (EINVAL). A datagram listener takes a stream
+group's dial as a plain connection with frame size 0.
+
+Verdict: `NetworkConnection` stays not adopted. The group API with
+datagrams advertised is a candidate for #10. It keeps batched sends, and it
+doesn't need macOS 26 if it holds on older systems. Next: check it on 14.4
+and 15.5 and over Wi-Fi with loss; a negotiated mode is the owner's call.
+
 ### `NetworkConnection<QUIC>` spike — not adopted (2026-09-27)
 
 Question: should the transport move to the async `NetworkConnection<QUIC>`
@@ -11152,6 +11244,8 @@ tunnel on `port + 1` (DESIGN §6) would go away. Spike on loopback with
 Verdict: not adopted then. Revisit if Apple adds batch or idempotent
 datagram sends, or when the two-port split becomes a deployment problem
 (NAT, firewalls). Issue #10 tracks a single tunnel.
+Re-run on macOS 27.2 (previous entry): the frame size reads 1397 from the
+datagrams channel's metadata, and the group API can carry datagrams itself.
 
 ### Review pass: section-5 performance (2026-09-26)
 
