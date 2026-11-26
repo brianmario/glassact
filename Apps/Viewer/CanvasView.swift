@@ -62,6 +62,9 @@ final class CanvasView: NSView {
     }()
 
     private var backingScale: CGFloat { window?.backingScaleFactor ?? 2 }
+    /// The content layer's scale to the view (fit mode; 1 when panning): the pointer is sized
+    /// against it, so it keeps its own size on screen.
+    private var contentZoom: CGFloat = 1
 
     init(controller: ViewerController, grid: TileGrid, panMode: Bool) {
         self.controller = controller
@@ -192,6 +195,7 @@ final class CanvasView: NSView {
             // Scale the layer to the fit rect via its transform so the cursor
             // sublayer (in canvas-point space) scales with it.
             contentLayer.transform = CATransform3DMakeScale(place.fit, place.fit, 1)
+            contentZoom = place.fit
             // Nearest at 1:1 and whole-number zoom, where each received pixel
             // becomes an exact block of screen pixels. Smooth at any other
             // upscale (a half-size auto-scaled picture filling the window,
@@ -202,6 +206,7 @@ final class CanvasView: NSView {
             return
         }
         contentLayer.transform = CATransform3DIdentity
+        contentZoom = 1
         contentLayer.magnificationFilter = .nearest // the pan viewport is 1:1
     }
 
@@ -372,17 +377,23 @@ final class CanvasView: NSView {
             cursorLayer.isHidden = true
             return
         }
-        // Positioned in the content layer's canvas-point space (bottom-left),
-        // so it scales in fit mode and pans in pan mode automatically.
+        // Positioned in the content layer's canvas-point space (bottom-left), so it follows
+        // the picture in fit and pan mode. Sized as a pointer is, though: its own points
+        // (the image's pixels over its scale) on screen, whatever the picture's zoom. Sized
+        // in canvas space it shrank with the picture, and the host's scale was ignored, so a
+        // 1x arrow came out half size (an arrow a few points tall on a large host display).
         let s = backingScale
-        let w = CGFloat(image.width) / s
-        let h = CGFloat(image.height) / s
-        let hx = controller.cursorHotspot.x / s
-        let hy = controller.cursorHotspot.y / s
+        let k = 1 / (controller.cursorScale * max(contentZoom, 0.01)) // image pixels → canvas points
+        let w = CGFloat(image.width) * k
+        let h = CGFloat(image.height) * k
+        let hx = controller.cursorHotspot.x * k
+        let hy = controller.cursorHotspot.y * k
         let cx = CGFloat(local?.x ?? controller.cursorX) / s - hx
         let cyTop = CGFloat(local?.y ?? controller.cursorY) / s - hy
         let ch = canvasPoints.height
         cursorLayer.contents = image
+        // (exact pixels where the image's scale is the screen's; smooth where it's scaled)
+        cursorLayer.magnificationFilter = controller.cursorScale == s ? .nearest : .linear
         cursorLayer.frame = CGRect(x: cx, y: ch - cyTop - h, width: w, height: h)
         cursorLayer.isHidden = false
     }
