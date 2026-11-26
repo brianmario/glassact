@@ -354,7 +354,7 @@ the numbers and the reasoning.
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
 | `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09, again 2026-11 on macOS 27.2; issue #10 | no batch or idempotent datagram send: ~5× the Host CPU per datagram (27.4–28.9 vs 5.5 µs) | [2026-09](#networkconnectionquic-spike--not-adopted-2026-09-27), [2026-11](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
-| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | works, not adopted, 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; under 1–3 % emulated loss its datagrams held control pings at a 2–3 s median, against 27–29 ms on two tunnels; content priorities and an in-flight cap didn't help, and paced well under capacity control's p95 stayed 3–9× two tunnels'; macOS 27.2 only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
+| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | works, not adopted as is, 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; under 1–3 % emulated loss its datagrams held control pings at a 2–3 s median, against 27–29 ms on two tunnels; content priorities and an in-flight cap showed no effect, and paced under capacity control's p95 stayed 4–11× two tunnels' (load 6–56, rough); macOS 27.2 only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
 
 **Engine and build**
 
@@ -11259,45 +11259,50 @@ datagram pacer only above 10 % loss (DESIGN §4.9).
   later, 1 % loss: 30.6 % → 99.0 %. Over one connection the "sent" line
   waits behind them, so the count looked complete.
 
-**Control ahead of datagrams, tested: no help.** Two levers in one
-connection, on loopback through the same relay (10 ms each way), the host
-on the Mac, load 6–37:
+**Control ahead of datagrams: no effect seen.** Two levers in one
+connection, on loopback through the same relay (10 ms each way, 1 % loss),
+the host on the Mac. Load was 6–56 (Time Machine and Spotlight), so the
+numbers are rough.
 - *Content priorities:* `NWConnection.ContentContext(priority:)` of 1.0 on
   every control line at both ends, 0.0 on every datagram and 0.2 on the
-  video stream's sends (the default is 0.5).
+  video stream's sends (the default is 0.5). Whether the stack honours
+  priority across a group's flows at all wasn't shown either way.
 - *A cap on the host's datagrams in flight:* at most 256 KiB sent and not
-  yet reported by `.contentProcessed`. It never held a send back: the round
-  took 272 ms as without it. A datagram is reported processed once the stack
-  takes it, not once it's on the wire, so the app can't see the connection's
-  backlog this way.
+  yet reported by `.contentProcessed`. It barely held sends back: a round
+  took 272 ms as without it in five rounds of six, 404 ms in one. A datagram
+  is reported processed once the stack takes it, not once it's on the wire,
+  so the app can't see the connection's backlog this way. One run a cell,
+  no effect seen; not repeated.
 
-| 1 % loss, 50 MB/s offered, one run each | control ping median, datagrams alone | with the video stream |
+Priorities, alternated with the baseline, four runs each, two rounds a run
+(the second, warmed up, below; the first round after connecting inflates
+control in every mode), 50 MB/s offered:
+
+| 1 % loss, 50 MB/s, 4 runs | control ping median, datagrams alone | p95 with the video stream |
 |---|---|---|
-| one connection | 2.6 s | 6.2 s |
-| with priorities | 1.5 s | 0.88 s |
-| with the in-flight cap | 1.7 s | 2.8 s |
-
-At 3 % the three were 1.7, 1.7 and 2.6 s (datagrams alone) and 2.1, 4.3
-and 13.9 s (with video). The spread is the runs' own: priorities don't put
-control ahead.
+| one connection | 1.9, 2.3, 2.4, 3.0 s | 0.89, 1.3, 4.0, 5.7 s |
+| with priorities | 2.3, 2.3, 4.3, 4.9 s | 1.6, 1.8, 4.7, 7.0 s |
 
 Below what 1 % loss leaves the controller (1,000 datagrams at 500 and
-250 kB/s, two runs a cell):
+250 kB/s), two runs a cell, the warmed-up round:
 
-| 1 % loss | control ping median / p95, datagrams alone | p95 with the video stream |
+| 1 % loss | control ping p95, datagrams alone | p95 with the video stream |
 |---|---|---|
-| one connection, 500 kB/s | 21–22 / 173–269 ms | 285–306 ms |
-| with priorities, 500 kB/s | 21–22 / 282–471 ms | 102 ms, 2.2 s |
-| two tunnels, 500 kB/s | 20 / 29 ms | 46 ms |
-| one connection, 250 kB/s | 20 / 117–134 ms | 48–55 ms |
-| with priorities, 250 kB/s | 20 / 107–111 ms | 41 ms, 2.6 s |
-| two tunnels, 250 kB/s | 20 / 30–35 ms | 45–46 ms |
+| one connection, 500 kB/s | 272, 365 ms | 258, 264 ms |
+| with priorities, 500 kB/s | 470 ms, 1.1 s | 105, 111 ms |
+| two tunnels, 500 kB/s | 32, 36 ms | 43, 60 ms |
+| one connection, 250 kB/s | 148, 224 ms | 53, 56 ms |
+| with priorities, 250 kB/s | 152, 156 ms | 4.9 s, 12 s |
+| two tunnels, 250 kB/s | 35, 39 ms | 51 ms, 3.3 s |
 
-- Even well under capacity, one connection's control has a tail 3–9× two
-  tunnels' p95, and priorities don't shorten it.
-- The video stream delivered 8 MiB in 10–15 s in every run but one (6.0 of
-  8 MiB by the round's end, one connection with priorities), about what the
-  loss-limited controller carries (0.6–0.8 MB/s).
+- Medians under capacity were 20–23 ms in every mode except one round
+  (146 ms, with priorities).
+- With datagrams alone, one connection's control p95 was 4–11× two
+  tunnels' even under capacity, priorities or not. With the video stream
+  the rounds were noisier (seconds-long p95 in every mode at the load's
+  peaks), and at 250 kB/s the baseline matched two tunnels.
+- The video stream delivered 8 MiB in 10–15 s in most rounds, about what
+  the loss-limited controller carries (0.6–0.8 MB/s).
 - The VM cells (host in the 27.2 VM) didn't run: the Mac was locked, so the
   VM couldn't resume.
 
@@ -11310,15 +11315,14 @@ group's dial as a plain connection with frame size 0.
 
 Verdict: `NetworkConnection` stays not adopted. The group API with
 datagrams advertised works on one connection with batched sends, but it
-isn't adopted. Under loss its one congestion controller lets the
+isn't adopted as is. Under loss its one congestion controller lets the
 Host's datagrams hold up the control stream by seconds, where two tunnels
-keep control near the path's round trip. Content priorities don't put
-control ahead within the connection, and the app can't see the
-connection's datagram backlog to hold sends back, so one tunnel would leave
-control's latency to the Host's own pacing. Even paced well under capacity
-at 1 % loss, control's p95 was 3–9× two tunnels'. Two tunnels stay. Still
-open: older macOS and a real link, though neither would change the verdict
-unless the API gains a priority or backlog signal.
+keep control near the path's round trip. Content priorities showed no
+effect within the connection, and the app can't see the connection's
+datagram backlog through send completions, so one tunnel would leave
+control's latency to the Host's own pacing. Paced well under capacity at
+1 % loss with datagrams alone, control's p95 was still 4–11× two tunnels'.
+Still open: older macOS, a real link, and re-timing on an idle Mac.
 
 ### `NetworkConnection<QUIC>` spike — not adopted (2026-09-27)
 
