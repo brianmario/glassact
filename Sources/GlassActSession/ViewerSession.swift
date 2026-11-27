@@ -78,6 +78,8 @@ public final class ViewerSession: @unchecked Sendable {
     /// thread), in order. A choice still waiting when the connection ends is
     /// answered `.connectionLost`.
     public var onDisplaySelected: ((WireDisplaySelection) -> Void)?
+    /// Main thread: the session runs (once a connection), with the host's caps.
+    public var onRunning: ((_ hostCaps: UInt32) -> Void)?
     /// `queue`: the choice sent and not yet answered, and the one waiting behind
     /// it (a newer one replaces an older waiting one). Selections are serialized.
     private var displaySelectInFlight: (id: UInt32, point: (x: Int32, y: Int32)?)?
@@ -180,6 +182,9 @@ public final class ViewerSession: @unchecked Sendable {
         }
         engine.onDisplayList = { [weak self] displays in
             DispatchQueue.main.async { self?.onDisplayList?(displays) }
+        }
+        engine.onRunning = { [weak self] caps in
+            DispatchQueue.main.async { self?.onRunning?(caps) }
         }
         engine.onDisplaySelected = { [weak self] result in // engine queue = `queue`
             guard let self else { return }

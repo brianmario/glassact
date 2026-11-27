@@ -1137,6 +1137,15 @@ for byte so its iPhone app works with this Host.
   Scale fits the picked display into the viewer's request; a halved capture
   (auto-scale's rung) stays halved. The display already shown only moves the
   pointer.
+- The Viewers show a picker (the Mac's title-bar Displays pull-down and View ▸
+  Displays; the iPad's Displays menu in its controls) only where a pick takes
+  effect: the host has the caps bit, it lists two or more displays, and the
+  viewer asked for Scale or Native, not a virtual display, Client Resolution or
+  one window (`DisplayPicker.isVisible`). The viewer asks for the list itself
+  (DISPLAY_SELECT 0) once the session runs, or when a RESIZE first makes picks
+  work, so a host isn't asked for pictures of displays it can't switch to. The
+  checkmark is the display the host says it shares; a pick waiting for its
+  answer says "Switching…".
 - The list shows, and a pick shares, displays the person at the Mac didn't
   choose to share: not for a View Only key, nor an agent whose control is off
   (§14).

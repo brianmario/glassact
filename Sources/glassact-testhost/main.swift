@@ -32,6 +32,9 @@ struct Options {
     /// Every input but plain moves as a timed stdout line, and what the viewer still
     /// held when its session ended.
     var inputLog = false
+    /// `--displays`: the host's displays (display choice, §4.10), side by side, the first the
+    /// main one. Empty: one screen and no display list, as before.
+    var displays: [(width: Int, height: Int)] = []
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -49,15 +52,31 @@ struct Options {
             case "--sign-in-password": o.signInPassword = next()
             case "--ask-after": o.askAfter = next().flatMap(Double.init)
             case "--input-log": o.inputLog = true
+            case "--displays":
+                o.displays = (next() ?? "").split(separator: ",").compactMap { size in
+                    let wh = size.split(separator: "x").compactMap { Int($0) }
+                    guard wh.count == 2, (320...4096).contains(wh[0]), (240...4096).contains(wh[1]) else { return nil }
+                    return (wh[0], wh[1])
+                }
+                guard o.displays.count >= 2 else {
+                    FileHandle.standardError.write(Data("--displays wants two or more sizes, e.g. 1600x1000,1280x800\n".utf8))
+                    exit(2)
+                }
+                (o.width, o.height) = o.displays[0]
             case "-h", "--help":
                 print("""
                     usage: glassact-testhost [--port 4533] [--size 1600x1000] [--tiles-only] [--libaom] [--still]
                                              [--sign-in-password P | --ask-after SECONDS] [--input-log]
+                                             [--displays WxH,WxH[,…]]
                     A Glass Act host with a synthetic screen, for developing viewers. Its AV1 is
                     Glass Act's encoder, as the Host's (macOS 27, Apple-silicon GPU); --libaom
                     runs libaom's instead, as older releases did. --input-log prints every input
                     but plain moves with the time, and what the viewer still held down when its
                     session ended (a viewer should release everything before it leaves).
+                    --displays makes it a host with several displays (display choice): the viewer
+                    can list them and pick one, as from a Mac with more than one. Picks are
+                    refused ("not now") under Virtual Display and Client Resolution, as the Host
+                    does; Scale fits the picked display into the viewer's size, Native shows it.
                     """)
                 exit(0)
             default:
@@ -89,6 +108,9 @@ final class Scene {
     private var keysDown: Set<Int> = []
     private var buttonsDown = 0
     private var dragMoves = 0
+    /// `--displays`: which display this is, in the header, and its own background.
+    var displayLabel: String?
+    var tint: (r: CGFloat, g: CGFloat, b: CGFloat) = (0.12, 0.16, 0.20)
 
     init(width: Int, height: Int, motion: Bool) {
         self.width = width
@@ -106,6 +128,11 @@ final class Scene {
         trail.removeAll()
         pointer = (width / 2, height / 2)
         note("screen is now \(width)×\(height)")
+    }
+
+    /// The host moved the pointer (a display pick that places it).
+    func placePointer(x: Int, y: Int) {
+        pointer = (max(0, min(x, width - 1)), max(0, min(y, height - 1)))
     }
 
     private func note(_ line: String) {
@@ -241,7 +268,7 @@ final class Scene {
 
     private func draw(in ctx: CGContext, nowUS: UInt64) {
         let w = CGFloat(width), h = CGFloat(height)
-        ctx.setFillColor(red: 0.12, green: 0.16, blue: 0.20, alpha: 1)
+        ctx.setFillColor(red: tint.r, green: tint.g, blue: tint.b, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         // A 64 px grid: one line per tile edge.
         ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 0.06)
@@ -253,7 +280,8 @@ final class Scene {
         ctx.setFillColor(red: 0.05, green: 0.08, blue: 0.10, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: 44))
         let clock = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        text(ctx, "Glass Act test host · \(width)×\(height) · \(clock)", x: 16, y: 30, size: 20, bold: true)
+        let label = displayLabel.map { "\($0) · " } ?? ""
+        text(ctx, "Glass Act test host · \(label)\(width)×\(height) · \(clock)", x: 16, y: 30, size: 20, bold: true)
 
         // Fine text to judge sharpness.
         let panel = CGRect(x: 24, y: 68, width: min(760, w - 48), height: min(330, h - 100))
@@ -378,11 +406,20 @@ final class TestHost: @unchecked Sendable {
     var asked: [String: Date] = [:]
     var geometrySettled = false
     var lastPointer: (x: Int, y: Int) = (-1, -1)
+    /// `--displays` (display choice, §4.10), `queue`: the display shown, the viewer's last
+    /// RESIZE (mode and pixels), whether it asked for the list (it gets it again after a
+    /// switch), and a pick's answer held until the rebuilt session runs.
+    var shownDisplay = 0
+    var geometryMode = 0
+    var requestedPixels: (width: Int, height: Int)?
+    var viewerWantsDisplayList = false
+    var pendingDisplayAnswer: WireDisplaySelection?
 
     init(options: Options) {
         self.options = options
         scene = Scene(width: options.width, height: options.height, motion: options.motion)
         scene.logInput = options.inputLog
+        if !options.displays.isEmpty { showDisplay(0) }
     }
 
     /// `--ask-after`: refuse `fp` until `wait` seconds after its first dial,
@@ -469,6 +506,8 @@ final class TestHost: @unchecked Sendable {
         self.transport?.cancel()
         self.transport = transport
         geometrySettled = false
+        viewerWantsDisplayList = false
+        pendingDisplayAnswer = nil
         transport.onControl = { [weak self] data in self?.engine?.handleControl(data, nowUS: MonotonicClock.nowUS) }
         transport.onState = { [weak self, weak transport] state in
             guard let self, let transport, self.transport === transport else { return }
@@ -497,6 +536,10 @@ final class TestHost: @unchecked Sendable {
             startFrameSeq: startFrameSeq,
             clock: { MonotonicClock.nowUS })
         engine.extraHelloCaps = (geometrySettled ? WireCaps.geometryFinal : 0) | WireCaps.virtualDisplay
+            | (options.displays.isEmpty ? 0 : WireCaps.displayList)
+        engine.onDisplaySelect = { [weak self] id, place, x, y in
+            self?.selectDisplay(id, pointer: place ? (Double(x), Double(y)) : nil)
+        }
         engine.onInput = { [weak self] kind, x, y, a, b in self?.scene.apply(kind: kind, x: x, y: y, a: a, b: b) }
         engine.onTextInput = { [weak self] text in self?.scene.text(text) }
         engine.onClipboard = { [weak self] format, data in
@@ -517,31 +560,141 @@ final class TestHost: @unchecked Sendable {
     }
 
     /// RESIZE: anything but Native gets a screen of the asked-for size, as a
-    /// virtual display would; Native keeps this one.
+    /// virtual display would; Native keeps this one. With `--displays`, Scale
+    /// fits the shown display into the asked-for size and Native shows it as it is.
     private func resize(mode: Int, w: Int, h: Int, scale: Int) {
         print("glassact-testhost: geometry requested: mode \(mode) \(w)×\(h) @\(scale)x")
-        guard mode != Int(GeometryMode.native), w > 0, h > 0 else {
+        geometryMode = mode
+        if w > 0, h > 0 {
+            let s = max(1, min(scale, 3))
+            requestedPixels = (max(320, min(w * s, 4096)), max(240, min(h * s, 4096)))
+        }
+        if !options.displays.isEmpty, mode == Int(GeometryMode.native) || mode == Int(GeometryMode.scale) {
+            geometrySettled = true
+            let size = displayScreenSize(shownDisplay)
+            if !rebuild(width: size.width, height: size.height) { engine?.reofferHelloFinal(nowUS: MonotonicClock.nowUS) }
+            return
+        }
+        guard mode != Int(GeometryMode.native), let size = requestedPixels else {
             engine?.reofferHelloFinal(nowUS: MonotonicClock.nowUS)
             return
         }
-        let s = max(1, min(scale, 3))
-        let width = max(320, min(w * s, 4096)), height = max(240, min(h * s, 4096))
         geometrySettled = true
-        if width == scene.width && height == scene.height {
-            engine?.reofferHelloFinal(nowUS: MonotonicClock.nowUS)
-            return
-        }
+        if !rebuild(width: size.width, height: size.height) { engine?.reofferHelloFinal(nowUS: MonotonicClock.nowUS) }
+    }
+
+    /// A screen of this size, in session (re-HELLO, no reconnect). False if it's the size already.
+    private func rebuild(width: Int, height: Int) -> Bool {
+        guard width != scene.width || height != scene.height else { return false }
         scene.resize(width: width, height: height)
         let seed = engine?.currentFrameSeq ?? 1
         if let old = engine { old.onFailed = nil }
         let previous = engine
         makeEngine(startFrameSeq: seed)
         if let previous { engine?.continueSession(from: previous) }
+        return true
+    }
+
+    // MARK: - Display choice (`--displays`, §4.10)
+
+    private static let firstDisplayID: UInt32 = 0x4A10 // not 1, 2…: IDs aren't indices
+    private static let tints: [(CGFloat, CGFloat, CGFloat)] = [
+        (0.12, 0.16, 0.20), (0.20, 0.13, 0.22), (0.10, 0.20, 0.15), (0.22, 0.16, 0.10),
+    ]
+
+    private func displayID(_ index: Int) -> UInt32 { Self.firstDisplayID + UInt32(index) }
+
+    /// Display `index` in global points: side by side, left to right, tops aligned.
+    private func displayRect(_ index: Int) -> DisplayChoice.Rect {
+        let x = options.displays[..<index].reduce(0) { $0 + $1.width }
+        let d = options.displays[index]
+        return DisplayChoice.Rect(x: Double(x), y: 0, width: Double(d.width), height: Double(d.height))
+    }
+
+    /// The screen to draw for display `index`: Scale fits it into the viewer's size
+    /// (never larger), anything else shows it at its own.
+    private func displayScreenSize(_ index: Int) -> (width: Int, height: Int) {
+        let d = options.displays[index]
+        guard geometryMode == Int(GeometryMode.scale), let r = requestedPixels else { return d }
+        let f = min(1, min(Double(r.width) / Double(d.width), Double(r.height) / Double(d.height)))
+        return (max(320, Int(Double(d.width) * f) & ~1), max(240, Int(Double(d.height) * f) & ~1))
+    }
+
+    private func showDisplay(_ index: Int) {
+        shownDisplay = index
+        scene.displayLabel = "Display \(index + 1) of \(options.displays.count)"
+        let t = Self.tints[index % Self.tints.count]
+        scene.tint = (t.0, t.1, t.2)
+    }
+
+    private func displayList() -> [WireDisplay] {
+        options.displays.indices.map { i in
+            let r = displayRect(i)
+            return WireDisplay(displayID: displayID(i), name: i == 0 ? "Test Display" : "Test Display \(i + 1)",
+                               x: Int32(r.x), y: Int32(r.y), width: UInt16(r.width), height: UInt16(r.height),
+                               isMain: i == 0, isShown: i == shownDisplay)
+        }
+    }
+
+    private func answer(_ requested: UInt32, _ status: WireDisplaySelection.Status,
+                        pointer: (x: Double, y: Double)? = nil) -> WireDisplaySelection {
+        let r = displayRect(shownDisplay)
+        return WireDisplaySelection(requestedID: requested, status: status, displayID: displayID(shownDisplay),
+                                    x: Int32(r.x), y: Int32(r.y), width: UInt16(r.width), height: UInt16(r.height),
+                                    pictureWidth: UInt16(scene.width), pictureHeight: UInt16(scene.height),
+                                    pointerPlaced: pointer != nil,
+                                    pointerX: Int32(pointer?.x ?? 0), pointerY: Int32(pointer?.y ?? 0))
+    }
+
+    /// DISPLAY_SELECT, on `queue`: 0 sends the list; a pick switches in session and is
+    /// answered once the rebuilt session runs (`tick`), or refused at once.
+    private func selectDisplay(_ id: UInt32, pointer asked: (x: Double, y: Double)?) {
+        guard !options.displays.isEmpty else { return }
+        if id == 0 {
+            viewerWantsDisplayList = true
+            engine?.sendDisplayList(displayList())
+            print("glassact-testhost: sent the display list (\(options.displays.count) displays)")
+            return
+        }
+        func refuse(_ status: WireDisplaySelection.Status, _ why: String) {
+            print("glassact-testhost: display pick \(id) refused: \(why)")
+            engine?.sendDisplaySelected(answer(id, status))
+        }
+        if pendingDisplayAnswer != nil { return refuse(.notNow, "another switch is under way") }
+        if geometryMode == Int(GeometryMode.virtualDisplay) || geometryMode == Int(GeometryMode.clientResolution) {
+            return refuse(.notNow, geometryMode == Int(GeometryMode.virtualDisplay)
+                ? "a virtual display mirrors every display into one" : "Client Resolution has switched the display's mode")
+        }
+        guard let index = options.displays.indices.first(where: { displayID($0) == id }) else {
+            return refuse(.notOffered, "no display \(id)")
+        }
+        let placed = DisplayChoice.pointerPlacement(asked: asked, on: displayRect(index))
+        let origin = displayRect(index)
+        let local = (x: Int(placed.x - origin.x), y: Int(placed.y - origin.y))
+        if index == shownDisplay { // already shown: only the pointer moves
+            if asked != nil { scene.placePointer(x: local.x * scene.width / Int(origin.width),
+                                                 y: local.y * scene.height / Int(origin.height)) }
+            engine?.sendDisplaySelected(answer(id, .ok, pointer: asked != nil ? placed : nil))
+            return
+        }
+        showDisplay(index)
+        let size = displayScreenSize(index)
+        if !rebuild(width: size.width, height: size.height) { scene.resize(width: size.width, height: size.height) }
+        scene.placePointer(x: local.x * scene.width / Int(origin.width), y: local.y * scene.height / Int(origin.height))
+        pendingDisplayAnswer = answer(id, .ok, pointer: placed)
+        print("glassact-testhost: switching to display \(index + 1) (\(size.width)×\(size.height))")
     }
 
     private func tick() {
         guard let engine else { return }
         let now = MonotonicClock.nowUS
+        if engine.state == .running, let answer = pendingDisplayAnswer {
+            // A pick's answer, then the list, once the rebuilt session runs (sent earlier, the
+            // new engine would drop them), as the Host does.
+            pendingDisplayAnswer = nil
+            engine.sendDisplaySelected(answer)
+            if viewerWantsDisplayList { engine.sendDisplayList(displayList()) }
+        }
         if engine.state == .running {
             scene.render(nowUS: now)
             scene.pixels.withUnsafeBytes { raw in

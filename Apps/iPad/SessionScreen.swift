@@ -69,6 +69,7 @@ struct SessionScreen: View {
                         canvas.view?.resetZoom()
                         scheduleHide()
                     }
+                    if model.displayPicker.isVisible { displays }
                     Button("Connection", systemImage: "antenna.radiowaves.left.and.right") {
                         showingInfo.toggle()
                         scheduleHide()
@@ -106,6 +107,31 @@ struct SessionScreen: View {
                 .accessibilityLabel("Show Controls")
             }
         }
+    }
+
+    /// Display choice (§4.10): which of the Mac's displays to show, when it has more than one
+    /// and the resolution lets a pick take effect. The checkmark is the display the Mac says
+    /// it shares; a pick waiting for its answer says "Switching…".
+    private var displays: some View {
+        Menu {
+            Section("Show Display") {
+                ForEach(model.displayPicker.items) { item in
+                    // A toggle per display: its checkmark, and the size underneath the name.
+                    Toggle(isOn: Binding(
+                        get: { item.isShown },
+                        set: { on in
+                            if on { model.selectDisplay(item.id) }
+                            scheduleHide()
+                        })) {
+                        Text(item.name)
+                        Text(item.isPending ? "Switching…" : item.detail)
+                    }
+                }
+            }
+        } label: {
+            Label("Displays", systemImage: "display.2")
+        }
+        .help("Choose which of the Mac’s displays to show")
     }
 
     private var info: some View {
