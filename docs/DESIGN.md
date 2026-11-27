@@ -1282,13 +1282,17 @@ Both tunnels:
   establishment timeout.
 
 Why two tunnels instead of one: the transport is built on the
-`NWConnectionGroup` API, which doesn't model QUIC datagrams alongside
-streams (extracting a datagram flow from the group fails). The
-`NetworkConnection` API does model both, but its datagram send is
-async-only, with no batch or idempotent send, and its usable datagram frame
-size reads 0 after establishment (BENCHMARKS "`NetworkConnection<QUIC>`
-spike"), so the pixel path stays on the group API. **Issue #10** tracks
-moving to one tunnel on `NetworkConnection` (one port, one handshake, no
+`NWConnectionGroup` API, which doesn't document QUIC datagrams alongside
+streams. Extracting a datagram flow from a group fails (ENETDOWN in 2026-09;
+stuck preparing on macOS 27.2) unless the group's own options advertise a
+datagram frame size: then it works on macOS 27.2, untested on older systems,
+but under loss its one congestion controller let datagrams hold up the
+control stream by seconds, where two tunnels kept control near the path's
+round trip (BENCHMARKS "One QUIC tunnel spike on macOS 27"). The `NetworkConnection`
+API does model both, but its datagram send is async-only, with no batch or
+idempotent send, and costs ~5× the Host CPU per datagram (same entry, and
+"`NetworkConnection<QUIC>` spike"), so the pixel path stays on the group
+API. **Issue #10** tracks moving to one tunnel (one port, one handshake, no
 tunnel pairing). The details are in the `## Deviations` note at the top of
 `QUICTransport.swift`.
 

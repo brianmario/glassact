@@ -20,14 +20,19 @@ import GlassActSync
 //
 // Why two: this transport is built on the NWConnectionGroup /
 // NWMultiplexGroup API, which doesn't model QUIC datagrams alongside
-// streams — `group.extract(using: isDatagram options)` fails with ENETDOWN,
-// and Apple DTS guidance is that only the `NetworkConnection` API models
-// datagrams correctly (https://developer.apple.com/forums/thread/813467).
-// That API's datagram send is async-only, with no batch or idempotent send,
-// and its `usableDatagramFrameSize` reads 0 after establishment (BENCHMARKS
-// "`NetworkConnection<QUIC>` spike"), so the pixel path stays on the group
-// API for now. Issue #10 tracks moving to one tunnel via `NetworkConnection`
-// (one port, one handshake, no tunnel pairing).
+// streams — `group.extract(using: isDatagram options)` fails (ENETDOWN, or
+// stuck preparing on macOS 27.2), and Apple DTS guidance is that only the
+// `NetworkConnection` API models datagrams correctly
+// (https://developer.apple.com/forums/thread/813467).
+// On macOS 27.2 the extract does work once the group's own options set
+// `maxDatagramFrameSize` (undocumented; untested below 27.2), but under loss
+// the shared congestion controller let datagrams delay control by seconds,
+// where two tunnels keep control apart (BENCHMARKS "One QUIC tunnel spike on
+// macOS 27"). `NetworkConnection`'s datagram send
+// is async-only, with no batch or idempotent send, at ~5× the Host CPU per
+// datagram (same entry, and "`NetworkConnection<QUIC>` spike"), so the pixel
+// path stays on two group-API tunnels for now. Issue #10 tracks moving to
+// one tunnel (one port, one handshake, no tunnel pairing).
 //
 // The *video stream* is a second stream extracted from the control group
 // (host → viewer, reliable, ordered, head-of-line isolated from control).
