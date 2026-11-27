@@ -101,6 +101,9 @@ jobs:
         # --shaders), so a kernel that doesn't compile fails here; without the toolchain it only
         # warns. The GPU tests, which compile them at run time, don't run on CI's VMs.
         run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: Packages
+        # Sparkle, fetched with retries: a build that clones it itself fails on a GitHub blip.
+        run: scripts/resolve-packages
       - name: Build Host
         run: >
           xcodebuild -project Apps/GlassActApps.xcodeproj -scheme Host
@@ -152,6 +155,9 @@ jobs:
         run: scripts/build-rust --universal
       - name: Build package and tests (x86_64)
         run: swift build --arch x86_64 --build-tests
+      - name: Packages
+        # Sparkle, fetched with retries: a build that clones it itself fails on a GitHub blip.
+        run: scripts/resolve-packages
       # (The apps' Xcode targets build the Rust library universal themselves.)
       - name: Build Host (universal Release)
         run: >
