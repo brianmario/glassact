@@ -1,0 +1,23 @@
+#!/bin/zsh
+# Fetches the apps' Swift packages (Sparkle, pinned in the project's
+# Package.resolved) before CI builds them, retrying on failure. A build
+# otherwise clones them itself, once, and GitHub refusing an anonymous clone
+# for a minute or two fails the job ("could not read Username for
+# 'https://github.com'", 2026-11-27). The checkouts land in the project's
+# default DerivedData, where every later xcodebuild of its schemes finds them
+# without touching the network.
+#
+#   scripts/resolve-packages
+set -euo pipefail
+cd "${0:A:h}/.."
+attempts=5
+for (( i = 1; i <= attempts; i++ )); do
+	xcodebuild -resolvePackageDependencies -project Apps/GlassActApps.xcodeproj \
+		-onlyUsePackageVersionsFromResolvedFile && exit 0
+	if (( i < attempts )); then
+		echo "✗ resolving packages failed (attempt $i of $attempts); retrying in $(( i * 15 )) s"
+		sleep $(( i * 15 ))
+	fi
+done
+echo "✗ resolving packages failed $attempts times"
+exit 1
