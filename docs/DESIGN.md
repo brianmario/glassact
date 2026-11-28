@@ -1299,7 +1299,7 @@ but under loss its one congestion controller let datagrams hold up the
 control stream by seconds, where two tunnels kept control near the path's
 round trip (BENCHMARKS "One QUIC tunnel spike on macOS 27"). The `NetworkConnection`
 API does model both, but its datagram send is async-only, with no batch or
-idempotent send, and costs ~5× the Host CPU per datagram (same entry, and
+idempotent send, and costs 3–4× the Host CPU per datagram (same entry, and
 "`NetworkConnection<QUIC>` spike"), so the pixel path stays on the group
 API. **Issue #10** tracks moving to one tunnel (one port, one handshake, no
 tunnel pairing). The details are in the `## Deviations` note at the top of

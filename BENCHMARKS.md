@@ -353,8 +353,8 @@ the numbers and the reasoning.
 | Auto-scale on the viewer-reported link capacity | kept | lounge Wi-Fi at ~0.3 Mbit/s: neither older rule fired in 61 s; loop cursor-drag 17.2 → 7.2 s | [entry](#auto-scale-from-the-viewers-link-reports-2026-10-26) |
 | Auto-scale on a thin measured video drain | kept | plane Wi-Fi: capture halved 45 s after connect; the video rule fires after 5 s of evidence | [entry](#auto-scale-from-the-video-drain-too-2026-10-22) |
 | Tile records over QUIC streams | prototype removed 2026-10-13; issue #10 | no round converged within 30 s at 1–3 % loss | [entry](#prototype-tile-records-over-quic-streams-2026-09-27) |
-| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09, again 2026-11 on macOS 27.2; issue #10 | no batch or idempotent datagram send: ~5× the Host CPU per datagram (27.4–28.9 vs 5.5 µs) | [2026-09](#networkconnectionquic-spike--not-adopted-2026-09-27), [2026-11](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
-| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | works, not adopted as is, 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; under 1–3 % emulated loss its datagrams held control pings at a 2–3 s median, against 27–29 ms on two tunnels; content priorities and an in-flight cap showed no effect, and paced under capacity control's p95 stayed 4–11× two tunnels' (load 6–56, rough); macOS 27.2 only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
+| `NetworkConnection<QUIC>` (one tunnel) | not adopted 2026-09, again 2026-11 on macOS 27.2; issue #10 | no batch or idempotent datagram send: 3–4× the Host CPU per datagram (23.4–26.0 vs 6.3–7.3 µs idle; ~5× on a busy Mac) | [2026-09](#networkconnectionquic-spike--not-adopted-2026-09-27), [2026-11](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
+| One tunnel on the group API: datagrams advertised on the stream group, a datagram flow extracted at each end | works, not adopted as is, 2026-11; issue #10 | one connection carried control, video and 12,000/12,000 datagrams a round at today's CPU; under 1–3 % emulated loss its datagrams held control pings at a 2–3 s median, against 27–29 ms on two tunnels; content priorities and an in-flight cap showed no effect, and paced under capacity control's p95 stayed 3–21× two tunnels' (loopback re-timed idle; the VM cells at load 6–23, rough); macOS 27.2 only | [entry](#one-quic-tunnel-spike-on-macos-27-2026-11-26) |
 
 **Engine and build**
 
@@ -11135,8 +11135,11 @@ video stream and the datagrams? A re-run of the 2026-09 spike (next entry)
 on macOS 27.2 with the Xcode 27.2 SDK: M4 Pro, loopback, 1150 B datagrams,
 12,000 a round (a 5K full-screen batch is ~14k). A standalone harness, not
 in the repo, with in-memory self-signed identities. The Mac was busy with an
-unrelated job (load average 10–13) throughout, so the timings are rough:
-re-time on an idle Mac before relying on the CPU comparisons.
+unrelated job (load average 10–13) for the first runs. On 2026-11-27 the
+CPU comparisons and the priorities matrix (both on loopback) were re-timed
+on an idle Mac (load 2–4, 7 at the very end), and are noted where they
+appear. The VM cells, the 2 MB/s runs, the in-flight cap and the fan-outs
+weren't re-run, so those stay rough.
 
 **`NetworkConnection<QUIC>`: still not adopted.**
 - The SDK is unchanged for datagrams. `send` on a datagram channel is
@@ -11150,16 +11153,18 @@ re-time on an idle Mac before relying on the CPU comparisons.
 - Host-first works: a stream the server opens reaches the viewer's
   `inboundStreams`, and a datagram the host sends first arrives.
 - CPU per datagram, 12k datagrams, with the host and viewer in separate
-  processes:
+  processes. The idle re-time has three runs of each, with the sequential,
+  paced and mixed rounds as before (fan-outs left out):
 
   | | host, per datagram sent | viewer, per datagram received |
   |---|---|---|
-  | today: datagram-only `NWConnection`, `batch` + idempotent sends, paced at 50 MB/s | 5.5 µs | 13.2–13.9 µs |
-  | `NetworkConnection`, each send awaited | 27.4–28.9 µs | 29.2–30.7 µs |
+  | today: datagram-only `NWConnection`, `batch` + idempotent sends, paced at 50 MB/s | 6.3–7.3 µs (busy: 5.5) | 11.6–13.3 µs (busy: 13.2–13.9) |
+  | `NetworkConnection`, each send awaited | 23.4–26.0 µs (busy: 27.4–28.9) | 25.3–27.6 µs (busy: 29.2–30.7) |
 
-  That's ~5× on the Host and ~2.2× on the Viewer. A 14k-datagram batch
-  would cost ~80 ms of Host CPU today and ~390 ms on `NetworkConnection`,
-  and more on Intel.
+  That's 3.2–4.1× on the Host and ~2.1× on the Viewer. The busy runs read
+  ~5×: both rows moved, so the gap depends on the machine's state, but it
+  stays several times. A 14k-datagram batch would cost ~95 ms of Host CPU
+  today and ~350 ms on `NetworkConnection`, and more on Intel.
 - Awaited one at a time in one process, a send takes 25–28 µs (41–45 MB/s,
   under the 50 MB/s pace) and usually delivers 100 %. It doesn't pace
   reliably, though: a sequential round right after a wide fan-out delivered
@@ -11190,7 +11195,9 @@ advertises them.** This is new.
   - datagrams viewer → host, 4,000 of 4,000.
 - CPU, both ends in one process: 16.1–17.1 µs per datagram, against
   16.3–16.6 µs for today's separate datagram tunnel in the same harness.
-  No cost was seen.
+  No cost was seen. Re-timed idle, the two alternated three times: 16.0–18.8
+  against 16.4–20.0 µs (paced rounds that delivered 100 %; the harness's
+  round right after its unpaced burst delivers 5.6 % and is left out).
 - Each end extracts its own datagram flow. A flow extracted only by the
   host reaches the viewer as an anonymous inbound flow, like a stream.
 - The viewer sees one extra inbound flow that never becomes ready. It's
@@ -11306,6 +11313,32 @@ Below what 1 % loss leaves the controller (1,000 datagrams at 500 and
 - The VM cells (host in the 27.2 VM) didn't run: the Mac was locked, so the
   VM couldn't resume.
 
+Re-timed on an idle Mac (2026-11-27, load 3.2–3.7 for the 50 MB/s runs,
+rising to 7.1 by the last under-capacity cell), the same matrix:
+
+| 1 % loss, 50 MB/s, 4 runs, idle | control ping median, datagrams alone | p95 with the video stream |
+|---|---|---|
+| one connection | 1.6, 1.7, 1.7, 1.9 s | 0.91, 2.0, 2.4, 4.0 s |
+| with priorities | 1.1, 1.7, 1.8, 2.1 s | 2.2, 3.2, 3.6, 4.5 s |
+
+| 1 % loss, idle | control ping p95, datagrams alone | p95 with the video stream |
+|---|---|---|
+| one connection, 500 kB/s | 279, 583 ms | 448, 486 ms |
+| with priorities, 500 kB/s | 129, 334 ms | 305, 307 ms |
+| two tunnels, 500 kB/s | 24, 28 ms | 41, 44 ms |
+| one connection, 250 kB/s | 124, 139 ms | 42, 59 ms |
+| with priorities, 250 kB/s | 124, 139 ms | 208 ms, 5.4 s |
+| two tunnels, 250 kB/s | 31, 36 ms | 40 ms, 1.0 s |
+
+- Idle, the 50 MB/s stall was about a third shorter, but still seconds. The
+  matrix has no two-tunnel cell at 50 MB/s, so the 27–29 ms comparison is
+  the VM table's.
+- Priorities still showed no effect: their spread overlaps the baseline's.
+- Under capacity, one connection's control p95 with datagrams alone was
+  3–21× two tunnels'. Medians were 20–23 ms in every cell.
+- The video stream delivered its 8 MiB in 2 of 8 runs at 50 MB/s, and in
+  most runs under capacity (9–13 s).
+
 **One port, two connections:** a group listener whose options advertise
 datagrams also accepts a datagram-only connection (today's second tunnel)
 as a group, and that connection's datagrams arrive on the group's
@@ -11321,8 +11354,9 @@ keep control near the path's round trip. Content priorities showed no
 effect within the connection, and the app can't see the connection's
 datagram backlog through send completions, so one tunnel would leave
 control's latency to the Host's own pacing. Paced well under capacity at
-1 % loss with datagrams alone, control's p95 was still 4–11× two tunnels'.
-Still open: older macOS, a real link, and re-timing on an idle Mac.
+1 % loss with datagrams alone, control's p95 was still 4–11× two tunnels'
+(3–21× re-timed on an idle Mac). Still open: older macOS, a real link, and
+the VM cells on an idle Mac.
 
 ### `NetworkConnection<QUIC>` spike — not adopted (2026-09-27)
 
