@@ -29,7 +29,7 @@ import GlassActSync
 // the shared congestion controller let datagrams delay control by seconds,
 // where two tunnels keep control apart (BENCHMARKS "One QUIC tunnel spike on
 // macOS 27"). `NetworkConnection`'s datagram send
-// is async-only, with no batch or idempotent send, at ~5× the Host CPU per
+// is async-only, with no batch or idempotent send, at 3–4× the Host CPU per
 // datagram (same entry, and "`NetworkConnection<QUIC>` spike"), so the pixel
 // path stays on two group-API tunnels for now. Issue #10 tracks moving to
 // one tunnel (one port, one handshake, no tunnel pairing).
